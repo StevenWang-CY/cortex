@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//private/tmp/ralph-claude-code/**)",
+      "Bash(export PATH=\"/opt/homebrew/bin:/opt/homebrew/opt/coreutils/libexec/gnubin:$PATH\")",
+      "Bash(./install.sh:*)",
+      "Bash(/opt/homebrew/bin/brew install:*)"
+    ]
+  }
+}
