@@ -65,11 +65,11 @@
 
 ## Phase 7: State Engine — Feature Fusion & Classification
 
-- [ ] Implement services/state_engine/feature_fusion.py — consume PhysioFeatures + KinematicFeatures + TelemetryFeatures, produce unified 12-dim FeatureVector every 500ms, handle missing channels (None values) with confidence weighting, per-channel quality tracking
-- [ ] Implement services/state_engine/rule_scorer.py — hyper_score with configurable weights (w1-w7 per spec), hypo_score, flow_score, recovery_score, all sub-score functions (score_pulse_elevation, score_hrv_drop, score_blink_suppression, score_posture, score_mouse_thrash, score_window_switch, score_workspace_complexity), user baseline comparison, normalization
-- [ ] Implement services/state_engine/smoother.py — EMA (α=0.3) over score history, hysteresis (entry: 0.85, exit: 0.70), dwell time enforcement (HYPER: 8s, HYPO: 15s), rolling buffer, StateEstimate output
-- [ ] Implement services/state_engine/trigger_policy.py — intervention trigger logic (HYPER + confidence > 0.85 + complexity > 0.6 + signal quality + cooldown + dismissal check), cooldown (60s), dismissal tracking (3 in 5 min → 30-min quiet), adaptive threshold (+0.05 per dismissal for 1 hour), dwell check (8s)
-- [ ] Write tests/unit/test_state_scoring.py — test score computation, hysteresis, state transitions, cooldown, dismissal escalation
+- [x] Implement services/state_engine/feature_fusion.py — consume PhysioFeatures + KinematicFeatures + TelemetryFeatures, produce unified 12-dim FeatureVector every 500ms, handle missing channels (None values) with confidence weighting, per-channel quality tracking
+- [x] Implement services/state_engine/rule_scorer.py — hyper_score with configurable weights (w1-w7 per spec), hypo_score, flow_score, recovery_score, all sub-score functions (score_pulse_elevation, score_hrv_drop, score_blink_suppression, score_posture, score_mouse_thrash, score_window_switch, score_workspace_complexity), user baseline comparison, normalization
+- [x] Implement services/state_engine/smoother.py — EMA (α=0.3) over score history, hysteresis (entry: 0.85, exit: 0.70), dwell time enforcement (HYPER: 8s, HYPO: 15s), rolling buffer, StateEstimate output
+- [x] Implement services/state_engine/trigger_policy.py — intervention trigger logic (HYPER + confidence > 0.85 + complexity > 0.6 + signal quality + cooldown + dismissal check), cooldown (60s), dismissal tracking (3 in 5 min → 30-min quiet), adaptive threshold (+0.05 per dismissal for 1 hour), dwell check (8s)
+- [x] Write tests/unit/test_state_scoring.py — test score computation, hysteresis, state transitions, cooldown, dismissal escalation
 
 ## Phase 8: API Gateway & WebSocket Server
 
@@ -168,6 +168,7 @@
 - [x] Phase 4: Physio Engine — rPPG Heart Rate & HRV (all 8 items)
 - [x] Phase 5: Kinematics Engine — Blink, Head Pose, Posture (all 4 items)
 - [x] Phase 6: Telemetry Engine — Mouse, Keyboard, Window Tracking (all 4 items)
+- [x] Phase 7: State Engine — Feature Fusion & Classification (all 5 items)
 
 ## Notes
 - Each task should be completable in one Ralph loop
