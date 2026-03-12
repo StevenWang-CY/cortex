@@ -73,10 +73,10 @@
 
 ## Phase 8: API Gateway & WebSocket Server
 
-- [ ] Implement services/api_gateway/app.py — FastAPI setup, CORS, lifespan events, service dependency injection
-- [ ] Implement services/api_gateway/routes.py — all REST endpoints per spec (capture, features, state, context, llm, intervention, status, health)
-- [ ] Implement services/api_gateway/websocket_server.py — WebSocket on ws://localhost:9473, STATE_UPDATE broadcast (500ms), INTERVENTION_TRIGGER dispatch, USER_ACTION reception, client management
-- [ ] Write integration test for API gateway — test all endpoints with fixtures, verify WebSocket message flow
+- [x] Implement services/api_gateway/app.py — FastAPI setup, CORS, lifespan events, service dependency injection
+- [x] Implement services/api_gateway/routes.py — all REST endpoints per spec (capture, features, state, context, llm, intervention, status, health)
+- [x] Implement services/api_gateway/websocket_server.py — WebSocket on ws://localhost:9473, STATE_UPDATE broadcast (500ms), INTERVENTION_TRIGGER dispatch, USER_ACTION reception, client management
+- [x] Write integration test for API gateway — test all endpoints with fixtures, verify WebSocket message flow
 
 ## Phase 9: Context Engine — Workspace Adapters
 
@@ -169,6 +169,7 @@
 - [x] Phase 5: Kinematics Engine — Blink, Head Pose, Posture (all 4 items)
 - [x] Phase 6: Telemetry Engine — Mouse, Keyboard, Window Tracking (all 4 items)
 - [x] Phase 7: State Engine — Feature Fusion & Classification (all 5 items)
+- [x] Phase 8: API Gateway & WebSocket Server (all 4 items)
 
 ## Notes
 - Each task should be completable in one Ralph loop
