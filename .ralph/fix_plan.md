@@ -88,13 +88,13 @@
 
 ## Phase 10: LLM Engine — Remote Qwen-3-8B Client
 
-- [ ] Implement services/llm_engine/client.py — abstract LLMClient protocol, async generate_intervention_plan interface
-- [ ] Implement services/llm_engine/remote_qwen.py — SSH tunnel management, OpenAI-compatible API via httpx, LLMConfig, timeout (10s), retry (2x), error handling
-- [ ] Implement services/llm_engine/local_ollama.py — local Ollama REST fallback
-- [ ] Implement services/llm_engine/prompts.py — all prompt templates (debug_error_summary, code_focus_reduction, browser_tab_reduction, micro_step_planner, calm_overlay_writer), system prompt with JSON schema, context injection assembly, prompt selection by mode
-- [ ] Implement services/llm_engine/parser.py — fault-tolerant JSON parsing (missing braces, trailing commas, unescaped quotes), Pydantic validation, 2-retry before fallback
-- [ ] Implement services/llm_engine/cache.py — LRU cache by context hash, configurable TTL (5 min)
-- [ ] Write tests/unit/test_json_parsing.py — valid JSON, malformed variants, invalid input, fallback verification
+- [x] Implement services/llm_engine/client.py — abstract LLMClient protocol, async generate_intervention_plan interface
+- [x] Implement services/llm_engine/remote_qwen.py — SSH tunnel management, OpenAI-compatible API via httpx, LLMConfig, timeout (10s), retry (2x), error handling
+- [x] Implement services/llm_engine/local_ollama.py — local Ollama REST fallback
+- [x] Implement services/llm_engine/prompts.py — all prompt templates (debug_error_summary, code_focus_reduction, browser_tab_reduction, micro_step_planner, calm_overlay_writer), system prompt with JSON schema, context injection assembly, prompt selection by mode
+- [x] Implement services/llm_engine/parser.py — fault-tolerant JSON parsing (missing braces, trailing commas, unescaped quotes), Pydantic validation, 2-retry before fallback
+- [x] Implement services/llm_engine/cache.py — LRU cache by context hash, configurable TTL (5 min)
+- [x] Write tests/unit/test_llm_engine.py — valid JSON, malformed variants, invalid input, fallback, prompts, cache, client tests (59 tests)
 
 ## Phase 11: Intervention Engine — Trigger, Execute, Restore
 
@@ -171,6 +171,7 @@
 - [x] Phase 7: State Engine — Feature Fusion & Classification (all 5 items)
 - [x] Phase 8: API Gateway & WebSocket Server (all 4 items)
 - [x] Phase 9: Context Engine — Workspace Adapters (all 5 items)
+- [x] Phase 10: LLM Engine — Remote Qwen-3-8B Client (all 7 items)
 
 ## Notes
 - Each task should be completable in one Ralph loop
