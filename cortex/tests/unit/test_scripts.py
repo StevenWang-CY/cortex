@@ -15,9 +15,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-import time
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -84,6 +83,25 @@ class TestRunDevMain:
         assert "capture_service" in _ASYNC_SERVICES
         assert "physio_engine" in _ASYNC_SERVICES
         assert "state_engine" in _ASYNC_SERVICES
+
+    def test_run_ws_server_uses_api_config_object(self):
+        from cortex.libs.config.settings import CortexConfig
+        from cortex.scripts.run_dev import _run_ws_server
+
+        config = CortexConfig()
+
+        def _close_coro(coro):
+            coro.close()
+
+        with patch("cortex.services.api_gateway.websocket_server.WebSocketServer") as ws_cls:
+            with patch(
+                "cortex.scripts.run_dev.asyncio.run",
+                side_effect=_close_coro,
+            ) as run_mock:
+                _run_ws_server(config)
+
+        ws_cls.assert_called_once_with(config.api)
+        run_mock.assert_called_once()
 
 
 # ============================================================================
@@ -576,19 +594,31 @@ class TestScriptImports:
     """Verify all scripts can be imported without errors."""
 
     def test_import_run_dev(self):
-        import cortex.scripts.run_dev
+        import cortex.scripts.run_dev as run_dev
+
+        assert run_dev is not None
 
     def test_import_run_capture(self):
-        import cortex.scripts.run_capture
+        import cortex.scripts.run_capture as run_capture
+
+        assert run_capture is not None
 
     def test_import_run_llm_server(self):
-        import cortex.scripts.run_llm_server
+        import cortex.scripts.run_llm_server as run_llm_server
+
+        assert run_llm_server is not None
 
     def test_import_calibrate(self):
-        import cortex.scripts.calibrate
+        import cortex.scripts.calibrate as calibrate
+
+        assert calibrate is not None
 
     def test_import_replay_session(self):
-        import cortex.scripts.replay_session
+        import cortex.scripts.replay_session as replay_session
+
+        assert replay_session is not None
 
     def test_import_seed_config(self):
-        import cortex.scripts.seed_config
+        import cortex.scripts.seed_config as seed_config
+
+        assert seed_config is not None

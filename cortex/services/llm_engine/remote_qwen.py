@@ -14,6 +14,7 @@ Features:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import subprocess
 from typing import Any
@@ -49,7 +50,6 @@ class RemoteQwenClient:
         self._config = config
         self._cache = cache or LLMCache()
         self._tunnel_process: subprocess.Popen[bytes] | None = None
-        self._base_url = f"http://localhost:{config.remote.port}"
         self._max_retries = 2
 
     # ------------------------------------------------------------------
@@ -88,7 +88,16 @@ class RemoteQwenClient:
             # Give the tunnel a moment to establish
             await asyncio.sleep(1.0)
             if self._tunnel_process.poll() is not None:
-                logger.error("SSH tunnel exited immediately")
+                stderr = ""
+                if self._tunnel_process.stderr is not None:
+                    stderr = self._tunnel_process.stderr.read().decode(
+                        "utf-8", errors="replace"
+                    ).strip()
+                logger.error(
+                    "SSH tunnel exited immediately%s",
+                    f": {stderr}" if stderr else "",
+                )
+                self._tunnel_process = None
                 return False
             logger.info("SSH tunnel established to %s", self._config.remote.host)
             return True
@@ -127,7 +136,7 @@ class RemoteQwenClient:
     ) -> InterventionPlan:
         """Generate an intervention plan via the remote Qwen model."""
         # Check cache first
-        cached = self._cache.get(context)
+        cached = self._cache.get(context, state, constraints)
         if cached is not None:
             return cached
 
@@ -137,17 +146,20 @@ class RemoteQwenClient:
         last_error: Exception | None = None
         for attempt in range(1, self._max_retries + 1):
             try:
+                if self._config.remote.ssh_tunnel and not self.tunnel_active:
+                    if not await self.open_tunnel():
+                        raise OSError("failed to establish SSH tunnel")
                 raw_response = await self._call_api(messages)
                 plan = parse_and_validate(raw_response)
                 if plan is not None:
-                    self._cache.put(context, plan)
+                    self._cache.put(context, plan, state, constraints)
                     return plan
                 logger.warning(
                     "Parse/validate failed on attempt %d: %s",
                     attempt,
                     raw_response[:200] if raw_response else "<empty>",
                 )
-            except (httpx.HTTPError, asyncio.TimeoutError, OSError) as exc:
+            except (httpx.HTTPError, TimeoutError, OSError) as exc:
                 last_error = exc
                 logger.warning(
                     "API call failed on attempt %d: %s", attempt, exc
@@ -166,8 +178,11 @@ class RemoteQwenClient:
     async def health_check(self) -> bool:
         """Check if the remote LLM server is reachable."""
         try:
+            if self._config.remote.ssh_tunnel and not self.tunnel_active:
+                if not await self.open_tunnel():
+                    return False
             async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(f"{self._base_url}/v1/models")
+                resp = await client.get(f"{self._api_base_url}/v1/models")
                 return resp.status_code == 200
         except (httpx.HTTPError, OSError):
             return False
@@ -197,7 +212,7 @@ class RemoteQwenClient:
 
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
-                f"{self._base_url}/v1/chat/completions",
+                f"{self._api_base_url}/v1/chat/completions",
                 json=payload,
             )
             resp.raise_for_status()
@@ -207,8 +222,39 @@ class RemoteQwenClient:
         if not choices:
             raise LLMError("No choices in API response")
 
-        content = choices[0].get("message", {}).get("content", "")
+        message = choices[0].get("message", {})
+        content = self._extract_content(message.get("content"))
+        if not content:
+            content = self._extract_content(choices[0].get("text"))
         if not content:
             raise LLMError("Empty content in API response")
 
         return content
+
+    @property
+    def _api_base_url(self) -> str:
+        host = "localhost" if self._config.remote.ssh_tunnel else self._config.remote.host
+        return f"http://{host}:{self._config.remote.port}"
+
+    @staticmethod
+    def _extract_content(content: Any) -> str:
+        """Normalize OpenAI-compatible content payloads into plain text."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+                else:
+                    parts.append(str(item))
+            return "".join(parts)
+        if content is None:
+            return ""
+        if isinstance(content, (dict, tuple)):
+            return json.dumps(content)
+        return str(content)

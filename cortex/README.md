@@ -34,6 +34,9 @@ Interventions trigger on HYPER with confidence > 0.85, workspace complexity > 0.
 **Requirements:** Python 3.11+, macOS (primary target), webcam, SSH access to a GPU for LLM inference.
 
 ```bash
+# Enter the Python project root
+cd cortex
+
 # Install
 pip install -e ".[dev]"
 
@@ -44,7 +47,7 @@ cp .env.example .env
 python -m cortex.scripts.seed_config
 
 # Set up SSH tunnel to LLM server
-bash scripts/setup_ssh_tunnel.sh
+bash scripts/setup_ssh_tunnel.sh --background
 
 # Calibrate personal baselines (2 min)
 cortex-calibrate
@@ -122,7 +125,7 @@ All layers communicate via the FastAPI gateway (`api_gateway/`) and WebSocket se
 
 - **No video is ever saved.** Frames are processed in memory and immediately discarded.
 - **No biometrics reach the LLM.** The model sees only workspace context: file paths, error messages, tab titles. Heart rate, HRV, blink data, and posture angles never leave your machine.
-- **Minimal browser permissions.** The Chrome extension requests only `activeTab` and `scripting` — no browsing history.
+- **Minimal browser permissions for the current feature set.** The Chrome extension requests `activeTab`, `scripting`, `tabs`, `tabGroups`, and `storage`. It does not request browsing history.
 - **Local sensing, remote inference.** The only network traffic is the LLM call, routed through an SSH tunnel to your own GPU.
 
 ---
@@ -158,7 +161,7 @@ cortex/
 │   ├── setup_ssh_tunnel.sh  # SSH tunnel to LLM GPU
 │   └── replay_session.py    # Replay recorded sessions
 ├── tests/
-│   ├── unit/                # Per-module unit tests (595 passing)
+│   ├── unit/                # Per-module unit tests
 │   └── integration/         # Pipeline integration tests
 └── docs/
     ├── setup.md

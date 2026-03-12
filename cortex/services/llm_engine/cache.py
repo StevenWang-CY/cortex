@@ -10,10 +10,11 @@ from __future__ import annotations
 import hashlib
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from cortex.libs.schemas.context import TaskContext
-from cortex.libs.schemas.intervention import InterventionPlan
+from cortex.libs.schemas.intervention import InterventionPlan, SimplificationConstraints
+from cortex.libs.schemas.state import StateEstimate
 
 
 @dataclass
@@ -48,14 +49,19 @@ class LLMCache:
         self._misses = 0
 
     def get(
-        self, context: TaskContext, *, now: float | None = None
+        self,
+        context: TaskContext,
+        state: StateEstimate | None = None,
+        constraints: SimplificationConstraints | None = None,
+        *,
+        now: float | None = None,
     ) -> InterventionPlan | None:
         """
         Look up a cached plan for the given context.
 
         Returns None on cache miss or expiration.
         """
-        key = self._context_key(context)
+        key = self._context_key(context, state, constraints)
         entry = self._cache.get(key)
 
         if entry is None:
@@ -77,6 +83,8 @@ class LLMCache:
         self,
         context: TaskContext,
         plan: InterventionPlan,
+        state: StateEstimate | None = None,
+        constraints: SimplificationConstraints | None = None,
         *,
         ttl: float | None = None,
         now: float | None = None,
@@ -86,7 +94,7 @@ class LLMCache:
 
         If the cache is full, the least recently used entry is evicted.
         """
-        key = self._context_key(context)
+        key = self._context_key(context, state, constraints)
         if now is None:
             now = time.monotonic()
         if ttl is None:
@@ -102,9 +110,14 @@ class LLMCache:
 
         self._cache[key] = CacheEntry(plan=plan, created_at=now, ttl=ttl)
 
-    def invalidate(self, context: TaskContext) -> bool:
+    def invalidate(
+        self,
+        context: TaskContext,
+        state: StateEstimate | None = None,
+        constraints: SimplificationConstraints | None = None,
+    ) -> bool:
         """Remove a specific entry. Returns True if it existed."""
-        key = self._context_key(context)
+        key = self._context_key(context, state, constraints)
         if key in self._cache:
             del self._cache[key]
             return True
@@ -150,13 +163,35 @@ class LLMCache:
         return len(expired_keys)
 
     @staticmethod
-    def _context_key(context: TaskContext) -> str:
+    def _context_key(
+        context: TaskContext,
+        state: StateEstimate | None = None,
+        constraints: SimplificationConstraints | None = None,
+    ) -> str:
         """
-        Generate a hash key from the context.
+        Generate a hash key from the prompt inputs.
 
-        Hashes the serialized context to detect meaningful changes.
-        Small variations (like timestamp drift) in identical contexts
-        will produce the same key because TaskContext doesn't include timestamps.
+        Context alone is not sufficient, because prompt generation also depends
+        on the user's current state and any active simplification constraints.
+        Timestamp and dwell are intentionally excluded from the state component
+        so small temporal drift doesn't defeat caching.
         """
-        raw = context.model_dump_json(exclude_none=True)
+        state_key: dict[str, object] | None = None
+        if state is not None:
+            state_key = {
+                "state": state.state,
+                "confidence": round(state.confidence, 3),
+                "signal_quality": state.signal_quality.model_dump(),
+            }
+
+        payload = {
+            "context": context.model_dump(exclude_none=True),
+            "state": state_key,
+            "constraints": (
+                constraints.model_dump(exclude_none=True)
+                if constraints is not None
+                else None
+            ),
+        }
+        raw = str(payload)
         return hashlib.sha256(raw.encode()).hexdigest()[:16]

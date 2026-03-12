@@ -122,10 +122,15 @@ def create_app(
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
-            "http://localhost:*",
-            "http://127.0.0.1:*",
-            "chrome-extension://*",
+            "http://localhost",
+            "http://127.0.0.1",
         ],
+        allow_origin_regex=(
+            r"^(https?://(localhost|127\.0\.0\.1)(:\d+)?"
+            r"|chrome-extension://[a-p]{32}"
+            r"|moz-extension://[A-Za-z0-9-]+"
+            r"|vscode-webview://[A-Za-z0-9-]+)$"
+        ),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

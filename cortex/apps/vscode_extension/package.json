@@ -12,6 +12,9 @@
     "onStartupFinished"
   ],
   "main": "./out/extension.js",
+  "dependencies": {
+    "ws": "^8.18.3"
+  },
   "contributes": {
     "commands": [
       {
@@ -56,7 +59,7 @@
         {
           "id": "cortex-sidebar",
           "title": "Cortex",
-          "icon": "$(pulse)"
+          "icon": "media/cortex.svg"
         }
       ]
     },

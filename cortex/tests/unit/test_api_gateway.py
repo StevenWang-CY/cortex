@@ -15,26 +15,20 @@ Tests verify:
 from __future__ import annotations
 
 import json
-import time
 
 import pytest
 from fastapi.testclient import TestClient
 
-from cortex.libs.schemas.features import (
-    FeatureVector,
-    FrameMeta,
-    KinematicFeatures,
-    PhysioFeatures,
-    TelemetryFeatures,
-)
+from cortex.libs.schemas.intervention import InterventionPlan
 from cortex.libs.schemas.state import (
     SignalQuality,
     StateEstimate,
     StateScores,
 )
 from cortex.services.api_gateway.app import ServiceRegistry, create_app, registry
-from cortex.services.api_gateway.websocket_server import WSMessage, WebSocketServer
-
+from cortex.services.api_gateway.websocket_server import WebSocketServer, WSMessage
+from cortex.services.intervention_engine.executor import InterventionExecutor
+from cortex.services.intervention_engine.restore import RestoreManager
 
 # =============================================================================
 # Fixtures
@@ -345,6 +339,35 @@ class TestContextAndLLMEndpoints:
         data = resp.json()
         assert data["fallback_used"] is True
 
+    def test_llm_plan_with_generate_intervention_plan_client(self, client: TestClient):
+        class MockLLMClient:
+            async def generate_intervention_plan(self, context, state):
+                return InterventionPlan(
+                    level="overlay_only",
+                    situation_summary="Focused plan",
+                    headline="Do the next thing",
+                    primary_focus="Read the current error",
+                    micro_steps=["Inspect the latest stack trace"],
+                    ui_plan={"show_overlay": True, "intervention_type": "overlay_only"},
+                    tone="direct",
+                )
+
+        registry.register("llm_engine", MockLLMClient())
+
+        payload = {
+            "state_estimate": _make_state_estimate(),
+            "task_context": {
+                "mode": "coding_debugging",
+                "active_app": "vscode",
+                "complexity_score": 0.7,
+            },
+        }
+        resp = client.post("/llm/plan", json=payload)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["fallback_used"] is False
+        assert data["plan"]["headline"] == "Do the next thing"
+
 
 # =============================================================================
 # Intervention Endpoints (No-engine fallback)
@@ -385,6 +408,82 @@ class TestInterventionEndpoints:
         assert resp.status_code == 200
         data = resp.json()
         assert data["restored"] is False
+
+    def test_apply_with_executor_and_restore_manager(self, client: TestClient):
+        class OverlayAdapter:
+            async def execute(self, action: str, params: dict) -> bool:
+                return action in {"show_overlay", "hide_overlay"}
+
+        executor = InterventionExecutor()
+        executor.register_adapter("overlay", OverlayAdapter())
+        restore_manager = RestoreManager(executor)
+        registry.register("intervention_executor", executor)
+        registry.register("restore_manager", restore_manager)
+
+        payload = {
+            "plan": {
+                "intervention_id": "int_apply_123",
+                "level": "overlay_only",
+                "situation_summary": "User appears overwhelmed",
+                "headline": "Focus on one error",
+                "primary_focus": "Read the latest stack trace",
+                "micro_steps": ["Inspect the latest stack trace"],
+                "ui_plan": {
+                    "dim_background": False,
+                    "show_overlay": True,
+                    "fold_unrelated_code": False,
+                    "intervention_type": "overlay_only",
+                },
+                "tone": "supportive",
+            },
+        }
+        resp = client.post("/intervention/apply", json=payload)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["applied"] is True
+        assert data["snapshot"]["intervention_id"] == "int_apply_123"
+        assert restore_manager.active_count == 1
+
+    def test_restore_with_restore_manager(self, client: TestClient):
+        class OverlayAdapter:
+            async def execute(self, action: str, params: dict) -> bool:
+                return action in {"show_overlay", "hide_overlay"}
+
+        executor = InterventionExecutor()
+        executor.register_adapter("overlay", OverlayAdapter())
+        restore_manager = RestoreManager(executor)
+        registry.register("intervention_executor", executor)
+        registry.register("restore_manager", restore_manager)
+
+        apply_payload = {
+            "plan": {
+                "intervention_id": "int_restore_123",
+                "level": "overlay_only",
+                "situation_summary": "User appears overwhelmed",
+                "headline": "Focus on one error",
+                "primary_focus": "Read the latest stack trace",
+                "micro_steps": ["Inspect the latest stack trace"],
+                "ui_plan": {
+                    "dim_background": False,
+                    "show_overlay": True,
+                    "fold_unrelated_code": False,
+                    "intervention_type": "overlay_only",
+                },
+                "tone": "supportive",
+            },
+        }
+        apply_resp = client.post("/intervention/apply", json=apply_payload)
+        assert apply_resp.status_code == 200
+
+        restore_resp = client.post(
+            "/intervention/restore",
+            json={"intervention_id": "int_restore_123", "user_action": "dismissed"},
+        )
+        assert restore_resp.status_code == 200
+        data = restore_resp.json()
+        assert data["restored"] is True
+        assert data["outcome"]["intervention_id"] == "int_restore_123"
+        assert restore_manager.active_count == 0
 
 
 # =============================================================================
@@ -535,6 +634,7 @@ class TestAPIGatewayImports:
         assert registry is not None
 
     def test_import_websocket_server(self):
-        from cortex.services.api_gateway import WSMessage, WebSocketServer
+        from cortex.services.api_gateway import WebSocketServer, WSMessage
+
         assert WSMessage is not None
         assert WebSocketServer is not None

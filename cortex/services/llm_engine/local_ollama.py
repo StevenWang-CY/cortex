@@ -7,7 +7,6 @@ unreachable. Communicates via the Ollama REST API (OpenAI-compatible endpoint).
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any
 
@@ -57,7 +56,7 @@ class LocalOllamaClient:
     ) -> InterventionPlan:
         """Generate an intervention plan via local Ollama."""
         # Check cache first
-        cached = self._cache.get(context)
+        cached = self._cache.get(context, state, constraints)
         if cached is not None:
             return cached
 
@@ -69,14 +68,14 @@ class LocalOllamaClient:
                 raw_response = await self._call_api(messages)
                 plan = parse_and_validate(raw_response)
                 if plan is not None:
-                    self._cache.put(context, plan)
+                    self._cache.put(context, plan, state, constraints)
                     return plan
                 logger.warning(
                     "Parse/validate failed on attempt %d: %s",
                     attempt,
                     raw_response[:200] if raw_response else "<empty>",
                 )
-            except (httpx.HTTPError, asyncio.TimeoutError, OSError) as exc:
+            except (httpx.HTTPError, TimeoutError, OSError) as exc:
                 last_error = exc
                 logger.warning(
                     "Ollama API call failed on attempt %d: %s", attempt, exc

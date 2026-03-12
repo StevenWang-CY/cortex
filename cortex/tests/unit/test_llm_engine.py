@@ -50,7 +50,6 @@ from cortex.services.llm_engine.prompts import (
 )
 from cortex.services.llm_engine.remote_qwen import RemoteQwenClient
 
-
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
 # ---------------------------------------------------------------------------
@@ -436,6 +435,20 @@ class TestLLMCache(unittest.TestCase):
         assert removed == 1
         assert self.cache.size == 1
 
+    def test_state_change_busts_cache(self):
+        state1 = _make_state(confidence=0.82)
+        state2 = _make_state(confidence=0.97)
+        self.cache.put(self.ctx, self.plan, state1, now=100.0)
+        assert self.cache.get(self.ctx, state1, now=101.0) is not None
+        assert self.cache.get(self.ctx, state2, now=101.0) is None
+
+    def test_constraints_change_busts_cache(self):
+        constraints1 = SimplificationConstraints(max_visible_tabs=3)
+        constraints2 = SimplificationConstraints(max_visible_tabs=1)
+        self.cache.put(self.ctx, self.plan, None, constraints1, now=100.0)
+        assert self.cache.get(self.ctx, None, constraints1, now=101.0) is not None
+        assert self.cache.get(self.ctx, None, constraints2, now=101.0) is None
+
 
 # ===========================================================================
 # Fallback Plan Tests
@@ -532,6 +545,65 @@ async def test_remote_generate_plan_uses_cache():
 
 
 @pytest.mark.asyncio
+async def test_remote_generate_plan_retries_when_state_changes():
+    client = _make_remote_client()
+    ctx = _make_context()
+    state1 = _make_state(confidence=0.82)
+    state2 = _make_state(confidence=0.97)
+    api_response = {
+        "choices": [{"message": {"content": VALID_PLAN_JSON}}]
+    }
+    mock_resp = _mock_response(200, api_response)
+    mock_post = AsyncMock(return_value=mock_resp)
+    with patch("httpx.AsyncClient.post", mock_post):
+        await client.generate_intervention_plan(ctx, state1)
+        await client.generate_intervention_plan(ctx, state2)
+    assert mock_post.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_remote_generate_plan_opens_tunnel_automatically():
+    config = LLMConfig(mode="remote", timeout_seconds=5.0)
+    client = RemoteQwenClient(config=config)
+    ctx = _make_context()
+    state = _make_state()
+    with patch.object(client, "open_tunnel", AsyncMock(return_value=True)) as open_tunnel:
+        with patch.object(client, "_call_api", AsyncMock(return_value=VALID_PLAN_JSON)):
+            plan = await client.generate_intervention_plan(ctx, state)
+    assert plan.level == "simplified_workspace"
+    open_tunnel.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_remote_generate_plan_handles_content_blocks():
+    config = LLMConfig(mode="remote", timeout_seconds=5.0)
+    config.remote.ssh_tunnel = False
+    client = RemoteQwenClient(config=config)
+    ctx = _make_context()
+    state = _make_state()
+    api_response = {
+        "choices": [{
+            "message": {
+                "content": [{"type": "text", "text": VALID_PLAN_JSON}],
+            }
+        }]
+    }
+    mock_resp = _mock_response(200, api_response)
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock, return_value=mock_resp):
+        plan = await client.generate_intervention_plan(ctx, state)
+    assert plan.level == "simplified_workspace"
+
+
+def test_remote_client_uses_remote_host_without_tunnel():
+    config = LLMConfig(mode="remote")
+    config.remote.host = "llm.example.org"
+    config.remote.port = 9911
+    config.remote.ssh_tunnel = False
+    client = RemoteQwenClient(config=config)
+    assert client._api_base_url == "http://llm.example.org:9911"
+
+
+@pytest.mark.asyncio
 async def test_remote_health_check_success():
     client = _make_remote_client()
     mock_response = httpx.Response(200, json={"data": []})
@@ -623,8 +695,10 @@ class TestImports(unittest.TestCase):
 
     def test_import_client(self):
         from cortex.services.llm_engine import LLMClient, LLMError, build_fallback_plan
+
         assert LLMClient is not None
         assert LLMError is not None
+        assert build_fallback_plan is not None
 
     def test_import_prompts(self):
         from cortex.services.llm_engine import (
@@ -634,18 +708,31 @@ class TestImports(unittest.TestCase):
             build_user_prompt,
             select_prompt_template,
         )
+
         assert len(PROMPT_TEMPLATES) == 5
+        assert SYSTEM_PROMPT is not None
+        assert callable(build_messages)
+        assert callable(build_user_prompt)
+        assert callable(select_prompt_template)
 
     def test_import_parser(self):
-        from cortex.services.llm_engine import parse_and_validate, parse_llm_response, validate_intervention_plan
+        from cortex.services.llm_engine import (
+            parse_and_validate,
+            parse_llm_response,
+            validate_intervention_plan,
+        )
+
+        assert callable(parse_and_validate)
         assert callable(parse_llm_response)
+        assert callable(validate_intervention_plan)
 
     def test_import_cache(self):
         from cortex.services.llm_engine import LLMCache
         assert LLMCache is not None
 
     def test_import_clients(self):
-        from cortex.services.llm_engine import RemoteQwenClient, LocalOllamaClient
+        from cortex.services.llm_engine import LocalOllamaClient, RemoteQwenClient
+
         assert RemoteQwenClient is not None
         assert LocalOllamaClient is not None
 

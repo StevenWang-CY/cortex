@@ -15,10 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import multiprocessing
-import os
 import signal
-import sys
-import time
 from typing import Any
 
 import uvicorn
@@ -91,10 +88,7 @@ def _run_ws_server(config: CortexConfig) -> None:
     """Run the WebSocket server in a subprocess."""
     from cortex.services.api_gateway.websocket_server import WebSocketServer
 
-    server = WebSocketServer(
-        host=config.api.host,
-        port=config.api.ws_port,
-    )
+    server = WebSocketServer(config.api)
 
     async def _serve() -> None:
         await server.start()

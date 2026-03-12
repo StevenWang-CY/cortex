@@ -12,9 +12,8 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
 
 # =============================================================================
 # Sub-configuration Models
@@ -40,6 +39,8 @@ class LLMLocalConfig(BaseModel):
 
 class LLMConfig(BaseModel):
     """LLM engine configuration."""
+
+    model_config = ConfigDict(protected_namespaces=())
 
     mode: Literal["remote", "local", "openai_compat"] = "remote"
     remote: LLMRemoteConfig = Field(default_factory=LLMRemoteConfig)

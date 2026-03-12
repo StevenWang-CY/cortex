@@ -5,6 +5,8 @@ Tests use mock PySide6 modules to verify logic without requiring
 the actual Qt framework to be installed.
 """
 
+# ruff: noqa: E402, I001
+
 from __future__ import annotations
 
 import json
@@ -20,11 +22,9 @@ import pytest
 
 def _setup_pyside6_mocks() -> bool:
     """Create mock PySide6 modules in sys.modules."""
-    try:
-        import PySide6  # noqa: F401
-        return False  # PySide6 is available, no mocking needed
-    except ImportError:
-        pass
+    for name in list(sys.modules):
+        if name == "PySide6" or name.startswith("PySide6."):
+            del sys.modules[name]
 
     # Create module stubs
     pyside6 = types.ModuleType("PySide6")
@@ -299,7 +299,7 @@ def _setup_pyside6_mocks() -> bool:
     class MockLayout:
         def __init__(self, parent=None): pass
         def addWidget(self, w, *args, **kwargs): pass
-        def addLayout(self, l): pass
+        def addLayout(self, layout): pass
         def addStretch(self): pass
         def addRow(self, *args): pass
         def removeWidget(self, w): pass
@@ -372,7 +372,6 @@ from cortex.apps.desktop_shell.tray import (
 from cortex.apps.desktop_shell.dashboard import (
     DashboardWindow,
     HRTracePlot,
-    SignalQualityBar,
 )
 
 

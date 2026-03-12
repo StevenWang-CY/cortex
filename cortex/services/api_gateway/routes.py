@@ -46,6 +46,7 @@ from cortex.libs.schemas.intervention import (
     WorkspaceSnapshot,
 )
 from cortex.libs.schemas.state import SignalQuality, StateEstimate, StateScores
+from cortex.services.intervention_engine import capture_snapshot, prepare_plan
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +164,30 @@ _start_time: float = time.monotonic()
 def _get_registry(request: Request) -> Any:
     """Get the service registry from app state."""
     return request.app.state.registry
+
+
+def _get_first_service(registry: Any, *names: str) -> Any | None:
+    """Return the first registered service that exists."""
+    for name in names:
+        service = registry.get(name)
+        if service is not None:
+            return service
+    return None
+
+
+async def _build_snapshot_for_plan(registry: Any, plan: InterventionPlan) -> WorkspaceSnapshot:
+    """Build the best available workspace snapshot for an intervention."""
+    context = registry.get("latest_task_context")
+    if context is None:
+        context_engine = registry.get("context_engine")
+        if context_engine is not None and hasattr(context_engine, "build_context"):
+            try:
+                context = await context_engine.build_context()
+            except Exception:
+                logger.exception("Failed to build context while snapshotting intervention")
+    snapshot = capture_snapshot(context, intervention_id=plan.intervention_id)
+    registry.register(f"workspace_snapshot:{plan.intervention_id}", snapshot)
+    return snapshot
 
 
 # =============================================================================
@@ -367,9 +392,24 @@ async def request_llm_plan(
     reg = _get_registry(request)
 
     llm_engine = reg.get("llm_engine")
-    if llm_engine is not None and hasattr(llm_engine, "generate_plan"):
-        plan = await llm_engine.generate_plan(
-            body.state_estimate, body.task_context,
+    if llm_engine is not None:
+        if hasattr(llm_engine, "generate_intervention_plan"):
+            plan = await llm_engine.generate_intervention_plan(
+                body.task_context,
+                body.state_estimate,
+            )
+            return LLMPlanResponse(plan=plan)
+        if hasattr(llm_engine, "generate_plan"):
+            plan = await llm_engine.generate_plan(
+                body.state_estimate, body.task_context,
+            )
+            return LLMPlanResponse(plan=plan)
+
+    llm_client = _get_first_service(reg, "llm_client", "remote_qwen_client", "local_ollama_client")
+    if llm_client is not None and hasattr(llm_client, "generate_intervention_plan"):
+        plan = await llm_client.generate_intervention_plan(
+            body.task_context,
+            body.state_estimate,
         )
         return LLMPlanResponse(plan=plan)
 
@@ -393,6 +433,30 @@ async def apply_intervention(
         snapshot = await intervention_engine.apply(body.plan)
         return InterventionApplyResponse(applied=True, snapshot=snapshot)
 
+    executor = _get_first_service(reg, "intervention_executor", "executor")
+    if executor is not None and hasattr(executor, "apply"):
+        validation, commands = prepare_plan(body.plan)
+        if not validation.is_valid:
+            logger.warning(
+                "Rejected intervention plan %s: %s",
+                body.plan.intervention_id,
+                validation.errors,
+            )
+            return InterventionApplyResponse(applied=False)
+
+        snapshot = await _build_snapshot_for_plan(reg, body.plan)
+        mutations = await executor.apply(body.plan, commands)
+        applied = bool(mutations) and all(m.success for m in mutations)
+
+        restore_manager = _get_first_service(reg, "restore_manager", "intervention_restore_manager")
+        if restore_manager is not None and hasattr(restore_manager, "start_intervention"):
+            restore_manager.start_intervention(
+                body.plan.intervention_id,
+                snapshot,
+            )
+
+        return InterventionApplyResponse(applied=applied, snapshot=snapshot)
+
     return InterventionApplyResponse(applied=False)
 
 
@@ -409,5 +473,20 @@ async def restore_intervention(
             body.intervention_id, body.user_action,
         )
         return InterventionRestoreResponse(restored=True, outcome=outcome)
+
+    restore_manager = _get_first_service(reg, "restore_manager", "intervention_restore_manager")
+    if restore_manager is not None:
+        if body.user_action == "engaged" and hasattr(restore_manager, "engage"):
+            outcome = await restore_manager.engage(body.intervention_id)
+        elif hasattr(restore_manager, "dismiss"):
+            outcome = await restore_manager.dismiss(body.intervention_id)
+        else:
+            outcome = None
+
+        if outcome is not None:
+            return InterventionRestoreResponse(
+                restored=outcome.workspace_restored,
+                outcome=outcome,
+            )
 
     return InterventionRestoreResponse(restored=False)

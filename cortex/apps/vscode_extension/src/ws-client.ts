@@ -8,6 +8,7 @@
  */
 
 import * as vscode from "vscode";
+import WebSocket from "ws";
 
 /** WebSocket message envelope matching the daemon's WSMessage format. */
 interface WSMessage {
@@ -85,7 +86,7 @@ export class CortexWSClient {
         try {
             this._ws = new WebSocket(this._url);
 
-            this._ws.onopen = () => {
+            this._ws.on("open", () => {
                 this._connected = true;
                 this._reconnectDelay = 3000; // Reset backoff
                 this._notifyConnection(true);
@@ -102,19 +103,19 @@ export class CortexWSClient {
                     "Cortex: Connected to daemon",
                     3000,
                 );
-            };
+            });
 
-            this._ws.onmessage = (event) => {
-                this._handleMessage(event.data as string);
-            };
+            this._ws.on("message", (data) => {
+                this._handleMessage(data.toString());
+            });
 
-            this._ws.onclose = () => {
+            this._ws.on("close", () => {
                 this._handleDisconnect();
-            };
+            });
 
-            this._ws.onerror = () => {
+            this._ws.on("error", () => {
                 // onclose will follow; no extra handling needed
-            };
+            });
         } catch {
             this._scheduleReconnect();
         }
@@ -132,7 +133,7 @@ export class CortexWSClient {
         }
 
         if (this._ws) {
-            this._ws.onclose = null;
+            this._ws.removeAllListeners("close");
             this._ws.close();
             this._ws = undefined;
         }

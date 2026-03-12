@@ -16,17 +16,7 @@
     "type": "module"
   },
   "action": {
-    "default_popup": "popup.tsx",
-    "default_icon": {
-      "16": "icons/cortex-16.png",
-      "48": "icons/cortex-48.png",
-      "128": "icons/cortex-128.png"
-    }
+    "default_popup": "popup.tsx"
   },
-  "content_scripts": [],
-  "icons": {
-    "16": "icons/cortex-16.png",
-    "48": "icons/cortex-48.png",
-    "128": "icons/cortex-128.png"
-  }
+  "content_scripts": []
 }

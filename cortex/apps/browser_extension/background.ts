@@ -7,6 +7,13 @@
  * Sends IDENTIFY and USER_ACTION messages to the daemon.
  */
 
+import {
+    classifyTabType as classifyBrowserTabType,
+    hideNonActiveTabs as hideTabsForIntervention,
+    restoreAllTabs,
+    restoreHiddenTabs as restoreTabsForIntervention,
+} from "./tab-manager";
+
 // --- Types ---
 
 interface WSMessage {
@@ -188,8 +195,12 @@ async function handleIntervention(
     // Hide tabs if simplified workspace
     if (payload.hide_targets) {
         const targets = payload.hide_targets as string[];
-        if (targets.includes("browser_tabs_except_active")) {
-            await hideNonActiveTabs();
+        const interventionId = payload.intervention_id;
+        if (
+            targets.includes("browser_tabs_except_active") &&
+            typeof interventionId === "string"
+        ) {
+            await hideTabsForIntervention(interventionId);
         }
     }
 
@@ -257,110 +268,15 @@ interface TabData {
     tab_id: number;
 }
 
-/** Tab IDs hidden by Cortex for later restoration. */
-let hiddenTabIds: number[] = [];
-let previousGroupId: number | null = null;
-
 async function collectTabs(): Promise<TabData[]> {
     const chromeTabs = await chrome.tabs.query({});
     return chromeTabs.map((tab) => ({
         title: tab.title ?? "",
         url: tab.url ?? "",
-        tab_type: classifyTabType(tab.url ?? ""),
+        tab_type: classifyBrowserTabType(tab.url ?? ""),
         is_active: tab.active ?? false,
         tab_id: tab.id ?? -1,
     }));
-}
-
-function classifyTabType(url: string): string {
-    const u = url.toLowerCase();
-
-    if (u.includes("stackoverflow.com") || u.includes("stackexchange.com")) {
-        return "stackoverflow";
-    }
-    if (
-        /docs\.|documentation|\/docs\/|developer\.mozilla|devdocs\.io|readthedocs/.test(
-            u,
-        )
-    ) {
-        return "documentation";
-    }
-    if (
-        u.includes("google.com/search") ||
-        u.includes("bing.com/search") ||
-        u.includes("duckduckgo.com")
-    ) {
-        return "search";
-    }
-    if (
-        u.includes("github.com") ||
-        u.includes("gitlab.com") ||
-        u.includes("bitbucket.org")
-    ) {
-        return "code_host";
-    }
-    if (
-        u.includes("twitter.com") ||
-        u.includes("x.com") ||
-        u.includes("reddit.com") ||
-        u.includes("youtube.com") ||
-        u.includes("discord.com")
-    ) {
-        return "social";
-    }
-
-    return "other";
-}
-
-async function hideNonActiveTabs(): Promise<void> {
-    try {
-        const tabs = await chrome.tabs.query({ currentWindow: true });
-        const activeTab = tabs.find((t) => t.active);
-        if (!activeTab?.id) return;
-
-        // Collect non-active tab IDs
-        const toHide = tabs
-            .filter((t) => !t.active && t.id !== undefined)
-            .map((t) => t.id!);
-
-        if (toHide.length === 0) return;
-
-        // Save for restoration
-        hiddenTabIds = toHide;
-
-        // Group hidden tabs (visual hiding via tab groups)
-        try {
-            const groupId = await chrome.tabs.group({ tabIds: toHide });
-            previousGroupId = groupId;
-            await chrome.tabGroups.update(groupId, {
-                collapsed: true,
-                title: "Cortex: Hidden",
-                color: "grey",
-            });
-        } catch {
-            // tabGroups may not be available
-        }
-    } catch {
-        // Tab hiding failed gracefully
-    }
-}
-
-async function restoreHiddenTabs(): Promise<void> {
-    try {
-        // Ungroup hidden tabs
-        if (hiddenTabIds.length > 0) {
-            try {
-                await chrome.tabs.ungroup(hiddenTabIds);
-            } catch {
-                // Tabs may have been closed
-            }
-            hiddenTabIds = [];
-        }
-        previousGroupId = null;
-    } catch {
-        hiddenTabIds = [];
-        previousGroupId = null;
-    }
 }
 
 // --- Content extraction function (injected into page) ---
@@ -462,13 +378,24 @@ chrome.runtime.onMessage.addListener(
                 });
                 if (message.action === "dismissed") {
                     activeIntervention = null;
-                    restoreHiddenTabs();
+                    const interventionId =
+                        typeof message.intervention_id === "string"
+                            ? message.intervention_id
+                            : typeof activeIntervention?.intervention_id ===
+                                "string"
+                              ? (activeIntervention.intervention_id as string)
+                              : null;
+                    if (interventionId) {
+                        restoreTabsForIntervention(interventionId);
+                    } else {
+                        restoreAllTabs();
+                    }
                 }
                 sendResponse({ ok: true });
                 break;
 
             case "RESTORE_TABS":
-                restoreHiddenTabs().then(() => sendResponse({ ok: true }));
+                restoreAllTabs().then(() => sendResponse({ ok: true }));
                 return true; // Async response
 
             case "CONTENT_EXTRACTED":

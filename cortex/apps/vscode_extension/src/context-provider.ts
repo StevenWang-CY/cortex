@@ -173,7 +173,6 @@ export class ContextProvider {
         const symbolAtCursor = await this.getSymbolAtCursor();
 
         return {
-            type: "CONTEXT_RESPONSE",
             file_path: activeFile.file_path,
             visible_range: activeFile.visible_range,
             visible_code: activeFile.visible_code,

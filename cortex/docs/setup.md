@@ -13,7 +13,7 @@
 
 ```bash
 git clone <repo-url>
-cd cortex
+cd <repo-dir>/cortex
 
 # Create virtual environment
 python3.11 -m venv .venv
@@ -113,10 +113,10 @@ The script uses `ServerAliveInterval=30` and `ExitOnForwardFailure=yes` for reli
 
 ```bash
 # Check if vLLM is running on remote, start if needed
-python -m cortex.scripts.run_llm_server start
+python -m cortex.scripts.run_llm_server --start
 
 # Test with a sample inference request
-python -m cortex.scripts.run_llm_server test
+python -m cortex.scripts.run_llm_server --test
 ```
 
 ### Local Fallback (Ollama)
@@ -200,12 +200,12 @@ pytest --cov=cortex --cov-report=html
 pytest -m "not requires_webcam and not requires_gpu"
 ```
 
-## 7. VS Code Extension (Future)
+## 7. VS Code Extension
 
 The VS Code extension provides editor context and intervention UI. Once implemented:
 
 ```bash
-cd apps/vscode-extension
+cd apps/vscode_extension
 npm install
 npm run compile
 
@@ -213,12 +213,12 @@ npm run compile
 code --install-extension cortex-vscode-0.1.0.vsix
 ```
 
-## 8. Chrome Extension (Future)
+## 8. Chrome Extension
 
 The Chrome extension provides browser context and tab management. Once implemented:
 
 ```bash
-cd apps/chrome-extension
+cd apps/browser_extension
 pnpm install
 pnpm build
 

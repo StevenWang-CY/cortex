@@ -30,6 +30,11 @@ DISCONNECTED_COLOR = QColor(158, 158, 158)  # Grey
 
 def _make_circle_icon(color: QColor, size: int = 22) -> QIcon:
     """Create a solid circle icon of the given color."""
+    app_instance = getattr(QApplication, "instance", None)
+    if callable(app_instance) and app_instance() is None:
+        logger.debug("No QApplication instance available; returning empty tray icon")
+        return QIcon()
+
     pixmap = QPixmap(size, size)
     pixmap.fill(QColor(0, 0, 0, 0))  # Transparent background
 
