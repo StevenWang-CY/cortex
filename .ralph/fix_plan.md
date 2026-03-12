@@ -143,11 +143,11 @@
 
 ## Phase 16: Integration & End-to-End Testing
 
-- [ ] Write tests/integration/test_capture_to_state.py — mock webcam → face → physio + kinematics → fusion → state classification
-- [ ] Write tests/integration/test_context_to_llm.py — mock context → prompt → LLM (mock server) → parse → validate InterventionPlan
-- [ ] End-to-end integration test: HYPER → context → LLM → intervention → recovery → restore (< 12s with mocks)
-- [ ] Privacy verification: assert no frames saved, no biometrics in LLM requests, Chrome only activeTab + scripting
-- [ ] Performance benchmarks: frame processing < 50ms, fusion < 10ms, classification < 5ms, signal-to-state < 200ms
+- [x] Write tests/integration/test_capture_to_state.py — mock webcam → face → physio + kinematics → fusion → state classification
+- [x] Write tests/integration/test_context_to_llm.py — mock context → prompt → LLM (mock server) → parse → validate InterventionPlan
+- [x] End-to-end integration test: HYPER → context → LLM → intervention → recovery → restore (< 12s with mocks)
+- [x] Privacy verification: assert no frames saved, no biometrics in LLM requests, Chrome only activeTab + scripting
+- [x] Performance benchmarks: frame processing < 50ms, fusion < 10ms, classification < 5ms, signal-to-state < 200ms
 
 ## Phase 17: Documentation & Polish
 
@@ -174,6 +174,7 @@
 - [x] Phase 10: LLM Engine — Remote Qwen-3-8B Client (all 7 items)
 - [x] Phase 11: Intervention Engine — Trigger, Execute, Restore (all 6 items)
 - [x] Phase 15: Scripts & Developer Tools (all 7 items)
+- [x] Phase 16: Integration & End-to-End Testing (all 5 items)
 
 ## Notes
 - Each task should be completable in one Ralph loop
