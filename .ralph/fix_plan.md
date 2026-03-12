@@ -80,11 +80,11 @@
 
 ## Phase 9: Context Engine — Workspace Adapters
 
-- [ ] Implement services/context_engine/app_classifier.py — active workspace mode detection (coding_debugging, reading_docs, browsing, terminal_errors)
-- [ ] Implement services/context_engine/editor_adapter.py — VS Code extension WebSocket communication, request/receive EditorContext, graceful fallback when extension unavailable
-- [ ] Implement services/context_engine/browser_adapter.py — Chrome extension WebSocket communication, request/receive BrowserContext (active tab, all tabs, content excerpt ≤ 2000 tokens, tab type classification), graceful fallback
-- [ ] Implement services/context_engine/terminal_adapter.py — capture recent N terminal lines, detect error blocks (stack traces), condense errors, identify root-cause region, output TerminalContext
-- [ ] Implement context assembly: gather from all adapters → TaskContext with complexity_score
+- [x] Implement services/context_engine/app_classifier.py — active workspace mode detection (coding_debugging, reading_docs, browsing, terminal_errors)
+- [x] Implement services/context_engine/editor_adapter.py — VS Code extension WebSocket communication, request/receive EditorContext, graceful fallback when extension unavailable
+- [x] Implement services/context_engine/browser_adapter.py — Chrome extension WebSocket communication, request/receive BrowserContext (active tab, all tabs, content excerpt ≤ 2000 tokens, tab type classification), graceful fallback
+- [x] Implement services/context_engine/terminal_adapter.py — capture recent N terminal lines, detect error blocks (stack traces), condense errors, identify root-cause region, output TerminalContext
+- [x] Implement context assembly: gather from all adapters → TaskContext with complexity_score
 
 ## Phase 10: LLM Engine — Remote Qwen-3-8B Client
 
@@ -170,6 +170,7 @@
 - [x] Phase 6: Telemetry Engine — Mouse, Keyboard, Window Tracking (all 4 items)
 - [x] Phase 7: State Engine — Feature Fusion & Classification (all 5 items)
 - [x] Phase 8: API Gateway & WebSocket Server (all 4 items)
+- [x] Phase 9: Context Engine — Workspace Adapters (all 5 items)
 
 ## Notes
 - Each task should be completable in one Ralph loop
