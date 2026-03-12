@@ -1,0 +1,104 @@
+{
+  "name": "cortex-somatic",
+  "displayName": "Cortex — Somatic Workspace Engine",
+  "description": "Real-time biofeedback workspace engine that detects cognitive overwhelm and restructures your VS Code environment.",
+  "version": "0.1.0",
+  "publisher": "cortex",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "cortex.getActiveFile",
+        "title": "Cortex: Get Active File Info"
+      },
+      {
+        "command": "cortex.getDiagnostics",
+        "title": "Cortex: Get Current File Diagnostics"
+      },
+      {
+        "command": "cortex.getSymbolAtCursor",
+        "title": "Cortex: Get Symbol at Cursor"
+      },
+      {
+        "command": "cortex.foldExcept",
+        "title": "Cortex: Fold Except Range"
+      },
+      {
+        "command": "cortex.unfoldAll",
+        "title": "Cortex: Unfold All"
+      },
+      {
+        "command": "cortex.restoreFoldState",
+        "title": "Cortex: Restore Fold State"
+      },
+      {
+        "command": "cortex.showPanel",
+        "title": "Cortex: Show Intervention Panel"
+      },
+      {
+        "command": "cortex.connect",
+        "title": "Cortex: Connect to Daemon"
+      },
+      {
+        "command": "cortex.disconnect",
+        "title": "Cortex: Disconnect from Daemon"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "cortex-sidebar",
+          "title": "Cortex",
+          "icon": "$(pulse)"
+        }
+      ]
+    },
+    "views": {
+      "cortex-sidebar": [
+        {
+          "type": "webview",
+          "id": "cortex.interventionPanel",
+          "name": "Cortex Intervention"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Cortex",
+      "properties": {
+        "cortex.daemonUrl": {
+          "type": "string",
+          "default": "ws://localhost:9473",
+          "description": "WebSocket URL of the Cortex daemon"
+        },
+        "cortex.autoConnect": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically connect to daemon on startup"
+        },
+        "cortex.showStatusBar": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show Cortex state in the status bar"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  }
+}

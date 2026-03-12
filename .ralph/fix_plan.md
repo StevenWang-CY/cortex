@@ -107,12 +107,12 @@
 
 ## Phase 12: VS Code Extension
 
-- [ ] Initialize VS Code extension project: package.json, tsconfig.json, extension.ts entry point with activation events and command registration
-- [ ] Implement src/ws-client.ts — WebSocket to ws://localhost:9473, handle STATE_UPDATE/INTERVENTION_TRIGGER, send USER_ACTION, auto-reconnect
-- [ ] Implement src/context-provider.ts — cortex.getActiveFile, cortex.getDiagnostics, cortex.getSymbolAtCursor, read visible code
-- [ ] Implement src/fold-controller.ts — cortex.foldExcept, cortex.unfoldAll, cortex.restoreFoldState, save/restore fold snapshots
-- [ ] Implement src/panel-provider.ts — Cortex side panel webview: headline, micro-steps checklist, summary, dismiss button, breathing pacer (4-7-8)
-- [ ] Write tests/integration/test_vscode_fold_restore.py — test fold/restore round-trip
+- [x] Initialize VS Code extension project: package.json, tsconfig.json, extension.ts entry point with activation events and command registration
+- [x] Implement src/ws-client.ts — WebSocket to ws://localhost:9473, handle STATE_UPDATE/INTERVENTION_TRIGGER, send USER_ACTION, auto-reconnect
+- [x] Implement src/context-provider.ts — cortex.getActiveFile, cortex.getDiagnostics, cortex.getSymbolAtCursor, read visible code
+- [x] Implement src/fold-controller.ts — cortex.foldExcept, cortex.unfoldAll, cortex.restoreFoldState, save/restore fold snapshots
+- [x] Implement src/panel-provider.ts — Cortex side panel webview: headline, micro-steps checklist, summary, dismiss button, breathing pacer (4-7-8)
+- [x] Write tests/integration/test_vscode_fold_restore.py — test fold/restore round-trip
 
 ## Phase 13: Chrome Extension
 
@@ -177,6 +177,7 @@
 - [x] Phase 16: Integration & End-to-End Testing (all 5 items)
 - [x] Phase 14: Desktop Shell — PySide6 Control Panel & Overlay (all 5 items)
 - [x] Phase 17: Documentation & Polish (all 7 items)
+- [x] Phase 12: VS Code Extension (all 6 items)
 
 ## Notes
 - Each task should be completable in one Ralph loop
