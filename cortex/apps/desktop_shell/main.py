@@ -1,0 +1,305 @@
+"""
+Desktop Shell — Main Application Entry
+
+PySide6 application entry point that sets up:
+- QApplication with system tray
+- WebSocket connection to Cortex daemon
+- Dashboard window, overlay window, and settings dialog
+- Signal routing between WebSocket events and UI components
+
+Usage:
+    python -m cortex.apps.desktop_shell.main
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import signal
+import sys
+import threading
+from typing import Any
+
+from PySide6.QtCore import QObject, QTimer, Signal, Slot
+from PySide6.QtWidgets import QApplication
+
+from cortex.apps.desktop_shell.dashboard import DashboardWindow
+from cortex.apps.desktop_shell.overlay import OverlayWindow
+from cortex.apps.desktop_shell.settings import SettingsDialog
+from cortex.apps.desktop_shell.tray import CortexTrayIcon
+from cortex.libs.config.settings import APIConfig, get_config
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# WebSocket bridge: runs asyncio in a background thread, emits Qt signals
+# ---------------------------------------------------------------------------
+
+class WebSocketBridge(QObject):
+    """Bridges async WebSocket events to Qt signals."""
+
+    state_updated = Signal(dict)
+    intervention_triggered = Signal(dict)
+    connection_changed = Signal(bool)
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 9473) -> None:
+        super().__init__()
+        self._host = host
+        self._port = port
+        self._running = False
+        self._thread: threading.Thread | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._ws: Any = None
+
+    def start(self) -> None:
+        """Start the WebSocket listener in a background thread."""
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop the WebSocket listener."""
+        self._running = False
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+            self._thread = None
+
+    def send_user_action(self, action: str, intervention_id: str) -> None:
+        """Send a USER_ACTION message to the daemon."""
+        if self._loop is None or self._ws is None:
+            return
+        msg = json.dumps({
+            "type": "USER_ACTION",
+            "payload": {"action": action, "intervention_id": intervention_id},
+            "timestamp": 0,
+            "sequence": 0,
+        })
+        asyncio.run_coroutine_threadsafe(self._send(msg), self._loop)
+
+    async def _send(self, msg: str) -> None:
+        """Send a message over the WebSocket."""
+        if self._ws is not None:
+            try:
+                await self._ws.send(msg)
+            except Exception:
+                pass
+
+    def _run_loop(self) -> None:
+        """Run the asyncio event loop in a background thread."""
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_until_complete(self._connect_loop())
+
+    async def _connect_loop(self) -> None:
+        """Connect to WebSocket with auto-reconnect."""
+        while self._running:
+            try:
+                import websockets
+
+                uri = f"ws://{self._host}:{self._port}"
+                async with websockets.connect(uri) as ws:
+                    self._ws = ws
+                    self.connection_changed.emit(True)
+                    logger.info(f"Connected to Cortex daemon at {uri}")
+
+                    # Identify as desktop client
+                    identify_msg = json.dumps({
+                        "type": "IDENTIFY",
+                        "payload": {"client_type": "desktop"},
+                        "timestamp": 0,
+                        "sequence": 0,
+                    })
+                    await ws.send(identify_msg)
+
+                    async for raw in ws:
+                        if not self._running:
+                            break
+                        self._handle_message(raw)
+
+            except ImportError:
+                logger.error("websockets package not installed")
+                break
+            except Exception as e:
+                self._ws = None
+                self.connection_changed.emit(False)
+                logger.debug(f"WebSocket disconnected: {e}")
+                if self._running:
+                    await asyncio.sleep(3.0)  # Reconnect delay
+
+    def _handle_message(self, raw: str) -> None:
+        """Parse and dispatch a WebSocket message."""
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+
+        msg_type = msg.get("type", "")
+        payload = msg.get("payload", {})
+
+        if msg_type == "STATE_UPDATE":
+            self.state_updated.emit(payload)
+        elif msg_type == "INTERVENTION_TRIGGER":
+            self.intervention_triggered.emit(payload)
+
+
+# ---------------------------------------------------------------------------
+# Main application controller
+# ---------------------------------------------------------------------------
+
+class CortexApp:
+    """
+    Main desktop shell application.
+
+    Orchestrates the tray icon, dashboard, overlay, settings dialog,
+    and WebSocket connection to the Cortex daemon.
+    """
+
+    def __init__(self, config: APIConfig | None = None) -> None:
+        self._config = config or get_config().api
+        self._app: QApplication | None = None
+        self._tray: CortexTrayIcon | None = None
+        self._dashboard: DashboardWindow | None = None
+        self._overlay: OverlayWindow | None = None
+        self._settings: SettingsDialog | None = None
+        self._bridge: WebSocketBridge | None = None
+        self._paused = False
+
+    def run(self) -> int:
+        """Run the application. Returns exit code."""
+        self._app = QApplication(sys.argv)
+        self._app.setApplicationName("Cortex")
+        self._app.setOrganizationName("Cortex")
+        self._app.setQuitOnLastWindowClosed(False)  # Keep running in tray
+
+        # Create UI components
+        self._dashboard = DashboardWindow()
+        self._overlay = OverlayWindow()
+        self._settings = SettingsDialog()
+
+        # Create tray icon
+        self._tray = CortexTrayIcon(self._app)
+        self._tray.show_dashboard_requested.connect(self._show_dashboard)
+        self._tray.show_settings_requested.connect(self._show_settings)
+        self._tray.pause_requested.connect(self._toggle_pause)
+        self._tray.quit_requested.connect(self._quit)
+
+        # Create WebSocket bridge
+        self._bridge = WebSocketBridge(
+            host=self._config.host,
+            port=self._config.ws_port,
+        )
+        self._bridge.state_updated.connect(self._on_state_update)
+        self._bridge.intervention_triggered.connect(self._on_intervention)
+        self._bridge.connection_changed.connect(self._on_connection_changed)
+
+        # Connect overlay dismiss to user action
+        self._overlay.dismissed.connect(self._on_overlay_dismissed)
+
+        # Connect settings changes
+        self._settings.settings_changed.connect(self._on_settings_changed)
+
+        # Start WebSocket connection
+        self._bridge.start()
+
+        # Handle SIGINT gracefully
+        signal.signal(signal.SIGINT, lambda *_: self._quit())
+        # Timer to allow Python signal handling
+        timer = QTimer()
+        timer.timeout.connect(lambda: None)
+        timer.start(500)
+
+        # Show tray icon
+        self._tray.show()
+
+        return self._app.exec()
+
+    @Slot(dict)
+    def _on_state_update(self, payload: dict) -> None:
+        """Handle STATE_UPDATE from daemon."""
+        if self._paused:
+            return
+        if self._dashboard is not None:
+            self._dashboard.update_state(payload)
+        if self._tray is not None:
+            state = payload.get("state", "FLOW")
+            confidence = payload.get("confidence", 0.0)
+            self._tray.update_state(state, confidence)
+
+    @Slot(dict)
+    def _on_intervention(self, payload: dict) -> None:
+        """Handle INTERVENTION_TRIGGER from daemon."""
+        if self._paused:
+            return
+        if self._overlay is not None:
+            self._overlay.show_intervention(payload)
+
+    @Slot(bool)
+    def _on_connection_changed(self, connected: bool) -> None:
+        """Handle WebSocket connection state change."""
+        if self._tray is not None:
+            self._tray.set_connected(connected)
+        if self._dashboard is not None:
+            self._dashboard.set_connected(connected)
+
+    @Slot(str)
+    def _on_overlay_dismissed(self, intervention_id: str) -> None:
+        """Handle overlay dismiss by user."""
+        if self._bridge is not None:
+            self._bridge.send_user_action("dismissed", intervention_id)
+
+    @Slot(dict)
+    def _on_settings_changed(self, settings: dict) -> None:
+        """Handle settings changes."""
+        logger.info(f"Settings updated: {settings}")
+
+    def _show_dashboard(self) -> None:
+        """Show the dashboard window."""
+        if self._dashboard is not None:
+            self._dashboard.show()
+            self._dashboard.raise_()
+            self._dashboard.activateWindow()
+
+    def _show_settings(self) -> None:
+        """Show the settings dialog."""
+        if self._settings is not None:
+            self._settings.show()
+            self._settings.raise_()
+            self._settings.activateWindow()
+
+    def _toggle_pause(self) -> None:
+        """Toggle pause/resume state."""
+        self._paused = not self._paused
+        if self._tray is not None:
+            self._tray.set_paused(self._paused)
+        if self._paused and self._overlay is not None:
+            self._overlay.hide()
+        logger.info(f"Cortex {'paused' if self._paused else 'resumed'}")
+
+    def _quit(self) -> None:
+        """Quit the application."""
+        logger.info("Shutting down Cortex desktop shell")
+        if self._bridge is not None:
+            self._bridge.stop()
+        if self._overlay is not None:
+            self._overlay.close()
+        if self._dashboard is not None:
+            self._dashboard.close()
+        if self._app is not None:
+            self._app.quit()
+
+
+def main() -> None:
+    """Entry point for the desktop shell."""
+    logging.basicConfig(level=logging.INFO)
+    app = CortexApp()
+    sys.exit(app.run())
+
+
+if __name__ == "__main__":
+    main()

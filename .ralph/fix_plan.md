@@ -125,11 +125,11 @@
 
 ## Phase 14: Desktop Shell — PySide6 Control Panel & Overlay
 
-- [ ] Implement apps/desktop_shell/main.py — PySide6 app entry, system tray, main window
-- [ ] Implement apps/desktop_shell/tray.py — tray icon with state color, context menu (dashboard, pause/resume, settings, quit)
-- [ ] Implement apps/desktop_shell/dashboard.py — live state indicator, confidence bar, signal quality, HR trace plot, session timeline
-- [ ] Implement apps/desktop_shell/overlay.py — transparent always-on-top intervention window, LLM content rendering, calming palette, breathing pacer (4-7-8), dismiss (Escape/click), auto-fade
-- [ ] Implement apps/desktop_shell/settings.py — webcam toggle, intervention toggle, sensitivity slider (1-5), cooldown, quiet mode, LLM backend selector, debug toggles
+- [x] Implement apps/desktop_shell/main.py — PySide6 app entry, system tray, main window
+- [x] Implement apps/desktop_shell/tray.py — tray icon with state color, context menu (dashboard, pause/resume, settings, quit)
+- [x] Implement apps/desktop_shell/dashboard.py — live state indicator, confidence bar, signal quality, HR trace plot, session timeline
+- [x] Implement apps/desktop_shell/overlay.py — transparent always-on-top intervention window, LLM content rendering, calming palette, breathing pacer (4-7-8), dismiss (Escape/click), auto-fade
+- [x] Implement apps/desktop_shell/settings.py — webcam toggle, intervention toggle, sensitivity slider (1-5), cooldown, quiet mode, LLM backend selector, debug toggles
 
 ## Phase 15: Scripts & Developer Tools
 
@@ -175,6 +175,7 @@
 - [x] Phase 11: Intervention Engine — Trigger, Execute, Restore (all 6 items)
 - [x] Phase 15: Scripts & Developer Tools (all 7 items)
 - [x] Phase 16: Integration & End-to-End Testing (all 5 items)
+- [x] Phase 14: Desktop Shell — PySide6 Control Panel & Overlay (all 5 items)
 - [x] Phase 17: Documentation & Polish (all 7 items)
 
 ## Notes
