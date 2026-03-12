@@ -1,0 +1,126 @@
+# Cortex Default Configuration
+# These values can be overridden by environment variables or .env file
+
+llm:
+  mode: remote
+  remote:
+    host: gwhiz1.cis.upenn.edu
+    port: 8800
+    ssh_tunnel: true
+    ssh_user: wangcy07
+  local:
+    host: localhost
+    port: 11434
+    model: llama3.1:8b
+  model_name: qwen3-8b
+  max_tokens: 1024
+  temperature: 0.3
+  timeout_seconds: 10.0
+  fallback_mode: rule_based
+
+capture:
+  device_id: 0
+  fps: 30
+  width: 640
+  height: 480
+  min_brightness: 50
+  max_jitter_px: 5.0
+  face_lost_tolerance_frames: 5
+
+state:
+  # Hysteresis thresholds
+  entry_threshold: 0.85
+  exit_threshold: 0.70
+
+  # Dwell times (seconds before state transition)
+  hyper_dwell_seconds: 8
+  hypo_dwell_seconds: 15
+  flow_dwell_seconds: 15
+
+  # Exponential moving average alpha for smoothing
+  ema_alpha: 0.3
+
+  # Overwhelm score weights (should sum to 1.0)
+  weights:
+    pulse_elevation: 0.20
+    hrv_drop: 0.15
+    blink_suppression: 0.12
+    posture_collapse: 0.08
+    mouse_thrashing: 0.15
+    window_switching: 0.15
+    workspace_complexity: 0.15
+
+intervention:
+  # Confidence thresholds for intervention levels
+  overlay_threshold: 0.70
+  simplified_threshold: 0.85
+  guided_threshold: 0.95
+
+  # Workspace complexity threshold to trigger
+  complexity_threshold: 0.6
+
+  # Cooldown and dismissal behavior
+  cooldown_seconds: 60
+  quiet_mode_minutes: 30
+  max_dismissals: 3
+  dismissal_window_minutes: 5
+  timeout_minutes: 5
+
+  # Adaptive threshold adjustment on dismissal
+  dismissal_threshold_bump: 0.05
+  dismissal_decay_hours: 1
+
+api:
+  host: "127.0.0.1"
+  port: 9472
+  ws_port: 9473
+
+telemetry:
+  mouse_sample_hz: 60
+  downsample_hz: 10
+  window_seconds: 15
+
+signal:
+  rppg:
+    window_seconds: 10
+    stride_seconds: 1
+    bandpass_low: 0.7
+    bandpass_high: 3.5
+    bandpass_order: 4
+    welch_resolution: 0.1
+
+  blink:
+    ear_threshold: 0.21
+    ear_recovery: 0.25
+    min_frames: 3
+
+  posture:
+    shoulder_drop_threshold: 0.15
+    forward_lean_threshold: 20.0  # degrees
+
+# MediaPipe FaceMesh landmark indices for ROI extraction
+landmarks:
+  forehead: [10, 67, 69, 104, 108, 151, 299, 337, 338]
+  left_cheek: [50, 101, 116, 117, 118, 119, 120, 121]
+  right_cheek: [280, 330, 345, 346, 347, 348, 349, 350]
+  left_eye: [33, 160, 158, 133, 153, 144]
+  right_eye: [362, 385, 387, 263, 373, 380]
+  shoulders: [11, 12]  # MediaPipe Pose landmarks
+
+storage:
+  path: ./storage
+  session_retention_days: 7
+  feature_retention_days: 7
+  error_retention_days: 90
+
+debug:
+  enabled: false
+  capture: false
+  rppg: false
+  state: false
+  llm: false
+
+logging:
+  level: INFO
+  format: json
+  include_timestamp: true

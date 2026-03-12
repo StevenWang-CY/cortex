@@ -1,0 +1,213 @@
+{
+  "description": "Sample workspace context objects for testing",
+  "coding_debugging": {
+    "mode": "coding_debugging",
+    "active_app": "vscode",
+    "current_goal_hint": "Fixing KeyError in parse_config function",
+    "complexity_score": 0.75,
+    "editor_context": {
+      "file_path": "/Users/dev/project/src/config.py",
+      "visible_range": [40, 90],
+      "symbol_at_cursor": "parse_config",
+      "diagnostics": [
+        {
+          "severity": "error",
+          "message": "KeyError: 'database_url' not found in config dict",
+          "line": 47,
+          "column": 15,
+          "source": "python",
+          "code": "KeyError"
+        },
+        {
+          "severity": "warning",
+          "message": "Unused variable 'old_config'",
+          "line": 52,
+          "column": 4,
+          "source": "python",
+          "code": "W0612"
+        }
+      ],
+      "recent_edits": [
+        "Added try/except block around config loading",
+        "Modified database_url parsing"
+      ],
+      "visible_code": "def parse_config(config_path: str) -> dict:\n    \"\"\"Parse configuration from YAML file.\"\"\"\n    with open(config_path) as f:\n        config = yaml.safe_load(f)\n    \n    # This line is causing the error\n    db_url = config['database_url']  # KeyError here\n    \n    return {\n        'database': db_url,\n        'port': config.get('port', 5432)\n    }"
+    },
+    "terminal_context": {
+      "last_n_lines": [
+        "$ python main.py",
+        "Traceback (most recent call last):",
+        "  File \"main.py\", line 15, in <module>",
+        "    config = parse_config('config.yaml')",
+        "  File \"config.py\", line 47, in parse_config",
+        "    db_url = config['database_url']",
+        "KeyError: 'database_url'"
+      ],
+      "detected_errors": [
+        "KeyError: 'database_url' in config.py line 47"
+      ],
+      "repeated_commands": [
+        "python main.py"
+      ],
+      "running_command": null
+    },
+    "browser_context": {
+      "active_tab_title": "python - How to handle KeyError in dictionary - Stack Overflow",
+      "active_tab_url": "https://stackoverflow.com/questions/1234567/how-to-handle-keyerror",
+      "active_tab_content_excerpt": "Use dict.get() method to safely access dictionary keys with a default value. Example: value = my_dict.get('key', default_value). This avoids KeyError exceptions...",
+      "all_tabs": [
+        {
+          "title": "python - How to handle KeyError in dictionary - Stack Overflow",
+          "url": "https://stackoverflow.com/questions/1234567/how-to-handle-keyerror",
+          "tab_type": "stackoverflow",
+          "is_active": true
+        },
+        {
+          "title": "PyYAML Documentation",
+          "url": "https://pyyaml.org/wiki/PyYAMLDocumentation",
+          "tab_type": "documentation",
+          "is_active": false
+        },
+        {
+          "title": "GitHub - myproject",
+          "url": "https://github.com/user/myproject",
+          "tab_type": "code_host",
+          "is_active": false
+        },
+        {
+          "title": "Python dict.get() Method",
+          "url": "https://docs.python.org/3/library/stdtypes.html#dict.get",
+          "tab_type": "documentation",
+          "is_active": false
+        }
+      ],
+      "tab_type_classification": {
+        "stackoverflow": 1,
+        "documentation": 2,
+        "code_host": 1
+      }
+    }
+  },
+  "reading_docs": {
+    "mode": "reading_docs",
+    "active_app": "chrome",
+    "current_goal_hint": "Learning about async/await in Python",
+    "complexity_score": 0.35,
+    "editor_context": null,
+    "terminal_context": null,
+    "browser_context": {
+      "active_tab_title": "Coroutines and Tasks — Python 3.12 documentation",
+      "active_tab_url": "https://docs.python.org/3/library/asyncio-task.html",
+      "active_tab_content_excerpt": "Coroutines declared with the async/await syntax is the preferred way of writing asyncio applications. For example, the following snippet of code prints 'hello', waits 1 second, and then prints 'world'...",
+      "all_tabs": [
+        {
+          "title": "Coroutines and Tasks — Python 3.12 documentation",
+          "url": "https://docs.python.org/3/library/asyncio-task.html",
+          "tab_type": "documentation",
+          "is_active": true
+        },
+        {
+          "title": "asyncio — Python 3.12 documentation",
+          "url": "https://docs.python.org/3/library/asyncio.html",
+          "tab_type": "documentation",
+          "is_active": false
+        }
+      ],
+      "tab_type_classification": {
+        "documentation": 2
+      }
+    }
+  },
+  "terminal_errors": {
+    "mode": "terminal_errors",
+    "active_app": "terminal",
+    "current_goal_hint": "Debugging npm install failure",
+    "complexity_score": 0.65,
+    "editor_context": {
+      "file_path": "/Users/dev/project/package.json",
+      "visible_range": [1, 30],
+      "symbol_at_cursor": null,
+      "diagnostics": [],
+      "recent_edits": [],
+      "visible_code": "{\n  \"name\": \"my-project\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": {\n    \"react\": \"^18.2.0\"\n  }\n}"
+    },
+    "terminal_context": {
+      "last_n_lines": [
+        "$ npm install",
+        "npm ERR! code ERESOLVE",
+        "npm ERR! ERESOLVE unable to resolve dependency tree",
+        "npm ERR! ",
+        "npm ERR! While resolving: my-project@1.0.0",
+        "npm ERR! Found: react@18.2.0",
+        "npm ERR! node_modules/react",
+        "npm ERR!   react@\"^18.2.0\" from the root project"
+      ],
+      "detected_errors": [
+        "npm ERR! ERESOLVE unable to resolve dependency tree"
+      ],
+      "repeated_commands": [
+        "npm install",
+        "npm install --legacy-peer-deps"
+      ],
+      "running_command": null
+    },
+    "browser_context": null
+  },
+  "high_complexity": {
+    "mode": "coding_debugging",
+    "active_app": "vscode",
+    "current_goal_hint": "Multiple errors across files",
+    "complexity_score": 0.92,
+    "editor_context": {
+      "file_path": "/Users/dev/project/src/api/handlers.py",
+      "visible_range": [1, 200],
+      "symbol_at_cursor": "handle_request",
+      "diagnostics": [
+        {"severity": "error", "message": "Import error: module 'auth' not found", "line": 5, "column": 1, "source": "python", "code": "E0401"},
+        {"severity": "error", "message": "Undefined variable: user_id", "line": 45, "column": 10, "source": "python", "code": "E0602"},
+        {"severity": "error", "message": "Type mismatch: expected str, got int", "line": 67, "column": 25, "source": "python", "code": "E1136"},
+        {"severity": "warning", "message": "Unused import: json", "line": 2, "column": 1, "source": "python", "code": "W0611"}
+      ],
+      "recent_edits": [],
+      "visible_code": "# Complex handler code with many issues..."
+    },
+    "terminal_context": {
+      "last_n_lines": [
+        "$ pytest",
+        "FAILED tests/test_api.py::test_handler - ImportError",
+        "FAILED tests/test_api.py::test_auth - AssertionError",
+        "FAILED tests/test_api.py::test_response - TypeError"
+      ],
+      "detected_errors": [
+        "ImportError in test_handler",
+        "AssertionError in test_auth",
+        "TypeError in test_response"
+      ],
+      "repeated_commands": ["pytest"],
+      "running_command": null
+    },
+    "browser_context": {
+      "active_tab_title": "Google Search",
+      "active_tab_url": "https://www.google.com/search?q=python+import+error",
+      "active_tab_content_excerpt": "",
+      "all_tabs": [
+        {"title": "Tab 1", "url": "https://example.com/1", "tab_type": "other", "is_active": false},
+        {"title": "Tab 2", "url": "https://example.com/2", "tab_type": "other", "is_active": false},
+        {"title": "Tab 3", "url": "https://example.com/3", "tab_type": "other", "is_active": false},
+        {"title": "Tab 4", "url": "https://example.com/4", "tab_type": "other", "is_active": false},
+        {"title": "Tab 5", "url": "https://example.com/5", "tab_type": "other", "is_active": false},
+        {"title": "Tab 6", "url": "https://example.com/6", "tab_type": "other", "is_active": false},
+        {"title": "Tab 7", "url": "https://example.com/7", "tab_type": "other", "is_active": false},
+        {"title": "Tab 8", "url": "https://example.com/8", "tab_type": "other", "is_active": false},
+        {"title": "Tab 9", "url": "https://example.com/9", "tab_type": "other", "is_active": false},
+        {"title": "Tab 10", "url": "https://example.com/10", "tab_type": "other", "is_active": false},
+        {"title": "Tab 11", "url": "https://example.com/11", "tab_type": "other", "is_active": false},
+        {"title": "Google Search", "url": "https://www.google.com/search?q=python+import+error", "tab_type": "search", "is_active": true}
+      ],
+      "tab_type_classification": {
+        "other": 10,
+        "search": 1
+      }
+    }
+  }
+}

@@ -1,0 +1,166 @@
+{
+  "description": "Sample LLM intervention plan responses for testing",
+  "valid_responses": {
+    "simplified_workspace": {
+      "intervention_id": "int_abc123def456",
+      "level": "simplified_workspace",
+      "situation_summary": "You're debugging a KeyError in parse_config. The config file is missing the 'database_url' key.",
+      "headline": "Focus on the missing config key",
+      "primary_focus": "Add a default value or check for 'database_url' key in config.py line 47",
+      "micro_steps": [
+        "Check if 'database_url' exists in your config.yaml file",
+        "Use config.get('database_url', default_url) instead of direct access",
+        "Run python main.py to verify the fix"
+      ],
+      "hide_targets": [
+        "browser_tabs_except_active",
+        "editor_symbols_except_current_function"
+      ],
+      "ui_plan": {
+        "dim_background": true,
+        "show_overlay": true,
+        "fold_unrelated_code": true,
+        "intervention_type": "simplified_workspace"
+      },
+      "tone": "direct"
+    },
+    "overlay_only": {
+      "intervention_id": "int_xyz789abc012",
+      "level": "overlay_only",
+      "situation_summary": "npm dependency resolution is failing due to version conflicts.",
+      "headline": "Try the legacy peer deps flag",
+      "primary_focus": "Run npm install with --legacy-peer-deps to bypass strict peer dependency checking",
+      "micro_steps": [
+        "Run: npm install --legacy-peer-deps"
+      ],
+      "hide_targets": [],
+      "ui_plan": {
+        "dim_background": false,
+        "show_overlay": true,
+        "fold_unrelated_code": false,
+        "intervention_type": "overlay_only"
+      },
+      "tone": "minimal"
+    },
+    "guided_mode": {
+      "intervention_id": "int_guided123456",
+      "level": "guided_mode",
+      "situation_summary": "Multiple test failures and import errors indicate a broken module structure. Let's fix this step by step.",
+      "headline": "Fix the import chain first",
+      "primary_focus": "Resolve the ImportError in auth module before addressing other test failures",
+      "micro_steps": [
+        "Create __init__.py in the auth directory if missing",
+        "Check the import path: from auth import validate_user",
+        "Run pytest tests/test_api.py::test_handler -v to verify"
+      ],
+      "hide_targets": [
+        "browser_tabs_except_active",
+        "terminal_lines_before_last_error_block",
+        "editor_symbols_except_current_function"
+      ],
+      "ui_plan": {
+        "dim_background": true,
+        "show_overlay": true,
+        "fold_unrelated_code": true,
+        "intervention_type": "guided_mode"
+      },
+      "tone": "supportive"
+    }
+  },
+  "malformed_responses": {
+    "missing_closing_brace": "{\"level\": \"overlay_only\", \"headline\": \"Test headline\", \"micro_steps\": [\"step 1\"]",
+    "trailing_comma": "{\"level\": \"overlay_only\", \"headline\": \"Test headline\", \"micro_steps\": [\"step 1\",]}",
+    "unescaped_quotes": "{\"level\": \"overlay_only\", \"headline\": \"Use \"quotes\" here\", \"micro_steps\": []}",
+    "markdown_wrapped": "```json\n{\"level\": \"overlay_only\", \"headline\": \"Test\", \"micro_steps\": [\"step\"]}\n```",
+    "with_preamble": "Here is the intervention plan:\n{\"level\": \"overlay_only\", \"headline\": \"Test\", \"micro_steps\": [\"step\"]}",
+    "empty_response": "",
+    "not_json": "I think you should take a break and try again later.",
+    "wrong_schema": {
+      "action": "simplify",
+      "message": "Take a breath",
+      "steps": ["do this", "then that"]
+    }
+  },
+  "invalid_content": {
+    "headline_too_long": {
+      "level": "overlay_only",
+      "situation_summary": "Test",
+      "headline": "This is a very long headline that exceeds the fifteen word limit that we have set for intervention headlines in the spec",
+      "primary_focus": "Test",
+      "micro_steps": ["step"],
+      "hide_targets": [],
+      "ui_plan": {
+        "dim_background": false,
+        "show_overlay": true,
+        "fold_unrelated_code": false,
+        "intervention_type": "overlay_only"
+      },
+      "tone": "direct"
+    },
+    "too_many_steps": {
+      "level": "overlay_only",
+      "situation_summary": "Test",
+      "headline": "Test headline",
+      "primary_focus": "Test",
+      "micro_steps": ["step 1", "step 2", "step 3", "step 4", "step 5"],
+      "hide_targets": [],
+      "ui_plan": {
+        "dim_background": false,
+        "show_overlay": true,
+        "fold_unrelated_code": false,
+        "intervention_type": "overlay_only"
+      },
+      "tone": "direct"
+    },
+    "no_steps": {
+      "level": "overlay_only",
+      "situation_summary": "Test",
+      "headline": "Test headline",
+      "primary_focus": "Test",
+      "micro_steps": [],
+      "hide_targets": [],
+      "ui_plan": {
+        "dim_background": false,
+        "show_overlay": true,
+        "fold_unrelated_code": false,
+        "intervention_type": "overlay_only"
+      },
+      "tone": "direct"
+    },
+    "destructive_action": {
+      "level": "simplified_workspace",
+      "situation_summary": "Let's clean up your workspace",
+      "headline": "Delete all unused files",
+      "primary_focus": "Remove the old config files",
+      "micro_steps": ["Delete config.yaml", "Remove permanently the backup directory"],
+      "hide_targets": [],
+      "ui_plan": {
+        "dim_background": false,
+        "show_overlay": true,
+        "fold_unrelated_code": false,
+        "intervention_type": "simplified_workspace"
+      },
+      "tone": "direct"
+    }
+  },
+  "fallback_intervention": {
+    "level": "overlay_only",
+    "situation_summary": "Unable to analyze workspace context. Let's take it one step at a time.",
+    "headline": "Focus on the function you're in",
+    "primary_focus": "Complete the current task before moving on",
+    "micro_steps": [
+      "Review what you were trying to accomplish",
+      "Check the most recent error message"
+    ],
+    "hide_targets": [
+      "editor_symbols_except_current_function"
+    ],
+    "ui_plan": {
+      "dim_background": false,
+      "show_overlay": true,
+      "fold_unrelated_code": true,
+      "intervention_type": "overlay_only"
+    },
+    "tone": "supportive"
+  }
+}

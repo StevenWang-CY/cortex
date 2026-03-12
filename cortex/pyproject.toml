@@ -1,0 +1,158 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cortex"
+version = "0.1.0"
+description = "Real-time biofeedback workspace engine for detecting cognitive overwhelm"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Cortex Team" }
+]
+keywords = ["biofeedback", "rppg", "workspace", "cognitive-load", "computer-vision"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    # API Framework
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "websockets>=12.0",
+
+    # Data Validation & Config
+    "pydantic>=2.6.0",
+    "pydantic-settings>=2.1.0",
+    "pyyaml>=6.0.1",
+
+    # Computer Vision & Face Tracking
+    "opencv-python>=4.9.0",
+    "mediapipe>=0.10.9",
+
+    # Signal Processing & Numerics
+    "scipy>=1.12.0",
+    "numpy>=1.26.0",
+
+    # Input Telemetry
+    "pynput>=1.7.6",
+
+    # Desktop UI
+    "PySide6>=6.6.0",
+
+    # HTTP Client
+    "httpx>=0.26.0",
+
+    # ML Inference
+    "onnxruntime>=1.17.0",
+
+    # macOS-specific (optional)
+    "pyobjc-framework-Cocoa>=10.1; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz>=10.1; sys_platform == 'darwin'",
+
+    # Structured Logging
+    "structlog>=24.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    # Testing
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-mock>=3.12.0",
+
+    # Type Checking
+    "mypy>=1.8.0",
+
+    # Linting & Formatting
+    "ruff>=0.2.0",
+
+    # Development utilities
+    "ipython>=8.20.0",
+    "rich>=13.7.0",
+]
+
+[project.scripts]
+cortex-dev = "cortex.scripts.run_dev:main"
+cortex-capture = "cortex.scripts.run_capture:main"
+cortex-calibrate = "cortex.scripts.calibrate:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cortex"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--tb=short",
+    "--strict-markers",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "requires_webcam: marks tests that require a webcam",
+    "requires_gpu: marks tests that require GPU",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["cortex"]
+omit = [
+    "*/tests/*",
+    "*/__init__.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+fail_under = 85
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+strict_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+    "B008",  # do not perform function calls in argument defaults
+]
+
+[tool.ruff.isort]
+known-first-party = ["cortex"]
