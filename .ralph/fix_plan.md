@@ -151,13 +151,13 @@
 
 ## Phase 17: Documentation & Polish
 
-- [ ] Write docs/setup.md — installation guide, gwhiz1 SSH setup, extension install
-- [ ] Write docs/architecture.md — system overview, layer diagram, data flow
-- [ ] Write docs/apis.md — REST and WebSocket API docs with examples
-- [ ] Write docs/calibration.md — calibration process, baselines, recalibration
-- [ ] Write docs/adapters.md — how to add new workspace adapters
-- [ ] Write project README.md — overview, quick start, architecture, demo, tech stack, privacy
-- [ ] Create .env.example with all configurable values documented
+- [x] Write docs/setup.md — installation guide, gwhiz1 SSH setup, extension install
+- [x] Write docs/architecture.md — system overview, layer diagram, data flow
+- [x] Write docs/apis.md — REST and WebSocket API docs with examples
+- [x] Write docs/calibration.md — calibration process, baselines, recalibration
+- [x] Write docs/adapters.md — how to add new workspace adapters
+- [x] Write project README.md — overview, quick start, architecture, demo, tech stack, privacy
+- [x] Create .env.example with all configurable values documented
 
 ## Completed
 - [x] Project initialization
@@ -175,6 +175,7 @@
 - [x] Phase 11: Intervention Engine — Trigger, Execute, Restore (all 6 items)
 - [x] Phase 15: Scripts & Developer Tools (all 7 items)
 - [x] Phase 16: Integration & End-to-End Testing (all 5 items)
+- [x] Phase 17: Documentation & Polish (all 7 items)
 
 ## Notes
 - Each task should be completable in one Ralph loop
