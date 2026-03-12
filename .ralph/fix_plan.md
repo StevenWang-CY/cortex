@@ -133,13 +133,13 @@
 
 ## Phase 15: Scripts & Developer Tools
 
-- [ ] Implement scripts/run_dev.py — start all services (capture, physio, kinematics, telemetry, state, context, api_gateway), multiprocessing + asyncio, graceful shutdown
-- [ ] Implement scripts/run_capture.py — standalone webcam test with annotated frame display, FPS counter, quality metrics
-- [ ] Implement scripts/setup_ssh_tunnel.sh — SSH tunnel to gwhiz1, health check, auto-reconnect
-- [ ] Implement scripts/run_llm_server.py — start/verify vLLM on gwhiz1, test with sample request
-- [ ] Implement scripts/calibrate.py — 2-min baseline capture, compute personal baselines (HR, HRV, blink, posture), save profile
-- [ ] Implement scripts/replay_session.py — load JSONL session, replay state transitions, visualize features
-- [ ] Implement scripts/seed_config.py — generate default config files, create storage dirs, init SQLite schema
+- [x] Implement scripts/run_dev.py — start all services (capture, physio, kinematics, telemetry, state, context, api_gateway), multiprocessing + asyncio, graceful shutdown
+- [x] Implement scripts/run_capture.py — standalone webcam test with annotated frame display, FPS counter, quality metrics
+- [x] Implement scripts/setup_ssh_tunnel.sh — SSH tunnel to gwhiz1, health check, auto-reconnect
+- [x] Implement scripts/run_llm_server.py — start/verify vLLM on gwhiz1, test with sample request
+- [x] Implement scripts/calibrate.py — 2-min baseline capture, compute personal baselines (HR, HRV, blink, posture), save profile
+- [x] Implement scripts/replay_session.py — load JSONL session, replay state transitions, visualize features
+- [x] Implement scripts/seed_config.py — generate default config files, create storage dirs, init SQLite schema
 
 ## Phase 16: Integration & End-to-End Testing
 
@@ -173,6 +173,7 @@
 - [x] Phase 9: Context Engine — Workspace Adapters (all 5 items)
 - [x] Phase 10: LLM Engine — Remote Qwen-3-8B Client (all 7 items)
 - [x] Phase 11: Intervention Engine — Trigger, Execute, Restore (all 6 items)
+- [x] Phase 15: Scripts & Developer Tools (all 7 items)
 
 ## Notes
 - Each task should be completable in one Ralph loop
