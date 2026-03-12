@@ -51,10 +51,10 @@
 
 ## Phase 5: Kinematics Engine — Blink, Head Pose, Posture
 
-- [ ] Implement services/kinematics_engine/blink_detector.py — Eye Aspect Ratio (EAR) from FaceMesh landmarks, blink detection (EAR < 0.21 for ≥ 3 frames, recovery > 0.25), blink rate (rolling 60s window), blink suppression score, blink rate delta from baseline
-- [ ] Implement services/kinematics_engine/head_pose.py — head pitch/yaw/roll from FaceMesh landmarks using solvePnP, head movement jitter detection, freeze detection (no movement for extended period)
-- [ ] Implement services/kinematics_engine/posture.py — MediaPipe Pose landmarks 11/12 (shoulders), shoulder drop ratio (vs calibrated neutral, normalized by torso length), forward lean angle (shoulder-ear line vs vertical), slump score (composite 0-1), posture collapse detection (drop > 15% + lean > 20°)
-- [ ] Write tests/unit/test_blink_detection.py — test EAR computation, blink event detection from synthetic EAR sequences, blink rate calculation
+- [x] Implement services/kinematics_engine/blink_detector.py — Eye Aspect Ratio (EAR) from FaceMesh landmarks, blink detection (EAR < 0.21 for ≥ 3 frames, recovery > 0.25), blink rate (rolling 60s window), blink suppression score, blink rate delta from baseline
+- [x] Implement services/kinematics_engine/head_pose.py — head pitch/yaw/roll from FaceMesh landmarks using solvePnP, head movement jitter detection, freeze detection (no movement for extended period)
+- [x] Implement services/kinematics_engine/posture.py — MediaPipe Pose landmarks 11/12 (shoulders), shoulder drop ratio (vs calibrated neutral, normalized by torso length), forward lean angle (shoulder-ear line vs vertical), slump score (composite 0-1), posture collapse detection (drop > 15% + lean > 20°)
+- [x] Write tests/unit/test_kinematics_engine.py — test EAR computation, blink event detection, blink rate, head pose estimation, jitter/freeze detection, posture analysis (face-only and full pose)
 
 ## Phase 6: Telemetry Engine — Mouse, Keyboard, Window Tracking
 
@@ -166,6 +166,7 @@
 - [x] Phase 1: Foundation — Project Scaffold, Schemas, Config (all 16 items)
 - [x] Phase 3: Capture Service — Webcam + Face Tracking (all 6 items)
 - [x] Phase 4: Physio Engine — rPPG Heart Rate & HRV (all 8 items)
+- [x] Phase 5: Kinematics Engine — Blink, Head Pose, Posture (all 4 items)
 
 ## Notes
 - Each task should be completable in one Ralph loop
