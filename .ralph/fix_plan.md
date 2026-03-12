@@ -58,10 +58,10 @@
 
 ## Phase 6: Telemetry Engine — Mouse, Keyboard, Window Tracking
 
-- [ ] Implement services/telemetry_engine/input_hooks.py — pynput mouse listener (position, clicks, scroll at 60Hz → downsample to 10Hz), keyboard listener (inter-keystroke intervals, backspace tracking), platform-specific permission handling (macOS accessibility), graceful degradation on PermissionError
-- [ ] Implement services/telemetry_engine/window_tracker.py — active window detection (macOS: pyobjc, Linux: python-xlib, Windows: ctypes), window switch event logging, app name + window title extraction, platform abstraction interface
-- [ ] Implement services/telemetry_engine/feature_aggregator.py — consume raw events over configurable window (default 15s), compute all derived features: mouse_velocity_mean/variance, mouse_jerk_score, click_burst_score, click_frequency, keyboard_burst_score, keystroke_interval_variance, backspace_density, inactivity_seconds, window_switch_rate, scroll_reversal_score, output TelemetryFeatures
-- [ ] Write tests/unit/test_telemetry_features.py — test feature computation from synthetic event sequences (known mouse paths, keystroke patterns)
+- [x] Implement services/telemetry_engine/input_hooks.py — pynput mouse listener (position, clicks, scroll at 60Hz → downsample to 10Hz), keyboard listener (inter-keystroke intervals, backspace tracking), platform-specific permission handling (macOS accessibility), graceful degradation on PermissionError
+- [x] Implement services/telemetry_engine/window_tracker.py — active window detection (macOS: pyobjc, Linux: python-xlib, Windows: ctypes), window switch event logging, app name + window title extraction, platform abstraction interface
+- [x] Implement services/telemetry_engine/feature_aggregator.py — consume raw events over configurable window (default 15s), compute all derived features: mouse_velocity_mean/variance, mouse_jerk_score, click_burst_score, click_frequency, keyboard_burst_score, keystroke_interval_variance, backspace_density, inactivity_seconds, window_switch_rate, scroll_reversal_score, output TelemetryFeatures
+- [x] Write tests/unit/test_telemetry_features.py — test feature computation from synthetic event sequences (known mouse paths, keystroke patterns)
 
 ## Phase 7: State Engine — Feature Fusion & Classification
 
@@ -167,6 +167,7 @@
 - [x] Phase 3: Capture Service — Webcam + Face Tracking (all 6 items)
 - [x] Phase 4: Physio Engine — rPPG Heart Rate & HRV (all 8 items)
 - [x] Phase 5: Kinematics Engine — Blink, Head Pose, Posture (all 4 items)
+- [x] Phase 6: Telemetry Engine — Mouse, Keyboard, Window Tracking (all 4 items)
 
 ## Notes
 - Each task should be completable in one Ralph loop
