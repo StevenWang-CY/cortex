@@ -98,12 +98,12 @@
 
 ## Phase 11: Intervention Engine — Trigger, Execute, Restore
 
-- [ ] Implement services/intervention_engine/trigger.py — trigger evaluation, level selection (overlay > 0.70, simplified > 0.85, guided > 0.95), cooldown, dismissal tracking
-- [ ] Implement services/intervention_engine/snapshot.py — capture pre-intervention WorkspaceSnapshot (fold state, tab visibility, overlay presence, intervention_id)
-- [ ] Implement services/intervention_engine/planner.py — validate InterventionPlan (no destructive actions, headline < 15 words, 1-3 steps), map hide_targets to adapter commands
-- [ ] Implement services/intervention_engine/executor.py — apply intervention: fold commands to VS Code, tab hide/dim to Chrome, desktop overlay, track mutations
-- [ ] Implement services/intervention_engine/restore.py — restore from snapshot, auto-timeout (5 min), recovery detection (FLOW > 0.70 for 15s), log outcome
-- [ ] Write tests/integration/test_intervention_cycle.py — mock adapters, test full cycle: trigger → snapshot → plan → execute → restore
+- [x] Implement services/intervention_engine/trigger.py — trigger evaluation, level selection (overlay > 0.70, simplified > 0.85, guided > 0.95), cooldown, dismissal tracking
+- [x] Implement services/intervention_engine/snapshot.py — capture pre-intervention WorkspaceSnapshot (fold state, tab visibility, overlay presence, intervention_id)
+- [x] Implement services/intervention_engine/planner.py — validate InterventionPlan (no destructive actions, headline < 15 words, 1-3 steps), map hide_targets to adapter commands
+- [x] Implement services/intervention_engine/executor.py — apply intervention: fold commands to VS Code, tab hide/dim to Chrome, desktop overlay, track mutations
+- [x] Implement services/intervention_engine/restore.py — restore from snapshot, auto-timeout (5 min), recovery detection (FLOW > 0.70 for 15s), log outcome
+- [x] Write tests/unit/test_intervention_engine.py — mock adapters, full cycle test (58 tests)
 
 ## Phase 12: VS Code Extension
 
@@ -172,6 +172,7 @@
 - [x] Phase 8: API Gateway & WebSocket Server (all 4 items)
 - [x] Phase 9: Context Engine — Workspace Adapters (all 5 items)
 - [x] Phase 10: LLM Engine — Remote Qwen-3-8B Client (all 7 items)
+- [x] Phase 11: Intervention Engine — Trigger, Execute, Restore (all 6 items)
 
 ## Notes
 - Each task should be completable in one Ralph loop
