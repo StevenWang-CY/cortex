@@ -1,0 +1,228 @@
+/**
+ * Cortex Chrome Extension — Tab Manager
+ *
+ * Handles tab management for Cortex interventions:
+ * - Collect titles/URLs from all open tabs
+ * - Classify tabs by type (documentation, stackoverflow, search, etc.)
+ * - Temporarily hide/group non-essential tabs
+ * - Restore tab visibility after intervention
+ *
+ * All operations are non-destructive: tabs are grouped and collapsed,
+ * never closed or deleted.
+ */
+
+// --- Types ---
+
+export interface TabData {
+    tabId: number;
+    title: string;
+    url: string;
+    tabType: string;
+    isActive: boolean;
+    windowId: number;
+}
+
+export interface TabSnapshot {
+    interventionId: string;
+    timestamp: number;
+    hiddenTabIds: number[];
+    groupId: number | null;
+    activeTabId: number | null;
+}
+
+// --- Classification ---
+
+const DOC_PATTERNS =
+    /docs\.|documentation|\/docs\/|developer\.mozilla|devdocs\.io|readthedocs|sphinx|javadoc|rustdoc|godoc|pkg\.go\.dev|react\.dev|vuejs\.org\/guide|angular\.io\/docs|pytorch\.org\/docs|numpy\.org\/doc|pandas\.pydata\.org\/docs|fastapi\.tiangolo\.com/i;
+
+/**
+ * Classify a tab by its URL into one of the known categories.
+ */
+export function classifyTabType(url: string): string {
+    const u = url.toLowerCase();
+
+    if (u.includes("stackoverflow.com") || u.includes("stackexchange.com")) {
+        return "stackoverflow";
+    }
+    if (DOC_PATTERNS.test(u)) {
+        return "documentation";
+    }
+    if (
+        u.includes("google.com/search") ||
+        u.includes("bing.com/search") ||
+        u.includes("duckduckgo.com")
+    ) {
+        return "search";
+    }
+    if (
+        u.includes("github.com") ||
+        u.includes("gitlab.com") ||
+        u.includes("bitbucket.org") ||
+        u.includes("codeberg.org")
+    ) {
+        return "code_host";
+    }
+    if (
+        u.includes("twitter.com") ||
+        u.includes("x.com") ||
+        u.includes("reddit.com") ||
+        u.includes("facebook.com") ||
+        u.includes("youtube.com") ||
+        u.includes("discord.com") ||
+        u.includes("slack.com")
+    ) {
+        return "social";
+    }
+
+    return "other";
+}
+
+/**
+ * Compute tab type classification counts from a list of tabs.
+ */
+export function computeTypeClassification(
+    tabs: TabData[],
+): Record<string, number> {
+    const counts: Record<string, number> = {};
+    for (const tab of tabs) {
+        counts[tab.tabType] = (counts[tab.tabType] ?? 0) + 1;
+    }
+    return counts;
+}
+
+// --- Collection ---
+
+/**
+ * Collect information about all open tabs across all windows.
+ */
+export async function collectAllTabs(): Promise<TabData[]> {
+    const chromeTabs = await chrome.tabs.query({});
+    return chromeTabs.map((tab) => ({
+        tabId: tab.id ?? -1,
+        title: tab.title ?? "",
+        url: tab.url ?? "",
+        tabType: classifyTabType(tab.url ?? ""),
+        isActive: tab.active ?? false,
+        windowId: tab.windowId ?? -1,
+    }));
+}
+
+/**
+ * Get tabs in the current window only.
+ */
+export async function collectCurrentWindowTabs(): Promise<TabData[]> {
+    const chromeTabs = await chrome.tabs.query({ currentWindow: true });
+    return chromeTabs.map((tab) => ({
+        tabId: tab.id ?? -1,
+        title: tab.title ?? "",
+        url: tab.url ?? "",
+        tabType: classifyTabType(tab.url ?? ""),
+        isActive: tab.active ?? false,
+        windowId: tab.windowId ?? -1,
+    }));
+}
+
+// --- Hide/Show ---
+
+/** Active snapshots for restoration. */
+const snapshots: Map<string, TabSnapshot> = new Map();
+
+/**
+ * Hide all non-active tabs in the current window by grouping and collapsing them.
+ *
+ * @param interventionId - ID for tracking this hide operation.
+ * @returns The snapshot for later restoration, or null on failure.
+ */
+export async function hideNonActiveTabs(
+    interventionId: string,
+): Promise<TabSnapshot | null> {
+    try {
+        const tabs = await collectCurrentWindowTabs();
+        const activeTab = tabs.find((t) => t.isActive);
+        if (!activeTab) return null;
+
+        const toHide = tabs
+            .filter((t) => !t.isActive && t.tabId !== -1)
+            .map((t) => t.tabId);
+
+        if (toHide.length === 0) return null;
+
+        let groupId: number | null = null;
+        try {
+            groupId = await chrome.tabs.group({ tabIds: toHide });
+            await chrome.tabGroups.update(groupId, {
+                collapsed: true,
+                title: "Cortex: Hidden",
+                color: "grey",
+            });
+        } catch {
+            // tabGroups API may not be available
+        }
+
+        const snapshot: TabSnapshot = {
+            interventionId,
+            timestamp: Date.now(),
+            hiddenTabIds: toHide,
+            groupId,
+            activeTabId: activeTab.tabId,
+        };
+
+        snapshots.set(interventionId, snapshot);
+        return snapshot;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Restore tabs that were hidden by a Cortex intervention.
+ *
+ * @param interventionId - ID of the intervention to restore.
+ * @returns True if restoration succeeded, false otherwise.
+ */
+export async function restoreHiddenTabs(
+    interventionId: string,
+): Promise<boolean> {
+    const snapshot = snapshots.get(interventionId);
+    if (!snapshot) return false;
+
+    try {
+        // Ungroup the tabs (restores them to normal state)
+        if (snapshot.hiddenTabIds.length > 0) {
+            try {
+                await chrome.tabs.ungroup(snapshot.hiddenTabIds);
+            } catch {
+                // Some tabs may have been closed by the user
+            }
+        }
+
+        snapshots.delete(interventionId);
+        return true;
+    } catch {
+        snapshots.delete(interventionId);
+        return false;
+    }
+}
+
+/**
+ * Restore all hidden tabs from all active interventions.
+ */
+export async function restoreAllTabs(): Promise<void> {
+    for (const [interventionId] of snapshots) {
+        await restoreHiddenTabs(interventionId);
+    }
+}
+
+/**
+ * Get the snapshot for an intervention.
+ */
+export function getSnapshot(interventionId: string): TabSnapshot | null {
+    return snapshots.get(interventionId) ?? null;
+}
+
+/**
+ * Check if there are any active tab hiding operations.
+ */
+export function hasActiveHiding(): boolean {
+    return snapshots.size > 0;
+}

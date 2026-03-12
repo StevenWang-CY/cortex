@@ -116,12 +116,12 @@
 
 ## Phase 13: Chrome Extension
 
-- [ ] Initialize Plasmo project: manifest.json (Manifest V3, activeTab + scripting), pnpm deps (React, Plasmo)
-- [ ] Implement background.ts — service worker, WebSocket to daemon, dispatch content script injection
-- [ ] Implement content.tsx — DOM text extraction (TreeWalker, ≤ 2000 tokens), Shadow DOM UI, focus overlay (dim rgba(0,0,0,0.7)), dismiss button
-- [ ] Implement popup.tsx — state indicator, HR estimate, sensitivity toggles, quiet mode, connection status
-- [ ] Implement tab management — collect titles/URLs, type classification, temporary hide/group, restore
-- [ ] Write tests/integration/test_browser_hide_restore.py — test tab hide/restore round-trip
+- [x] Initialize Plasmo project: manifest.json (Manifest V3, activeTab + scripting), pnpm deps (React, Plasmo)
+- [x] Implement background.ts — service worker, WebSocket to daemon, dispatch content script injection
+- [x] Implement content.tsx — DOM text extraction (TreeWalker, ≤ 2000 tokens), Shadow DOM UI, focus overlay (dim rgba(0,0,0,0.7)), dismiss button
+- [x] Implement popup.tsx — state indicator, HR estimate, sensitivity toggles, quiet mode, connection status
+- [x] Implement tab management — collect titles/URLs, type classification, temporary hide/group, restore
+- [x] Write tests/integration/test_browser_hide_restore.py — test tab hide/restore round-trip
 
 ## Phase 14: Desktop Shell — PySide6 Control Panel & Overlay
 
@@ -178,6 +178,7 @@
 - [x] Phase 14: Desktop Shell — PySide6 Control Panel & Overlay (all 5 items)
 - [x] Phase 17: Documentation & Polish (all 7 items)
 - [x] Phase 12: VS Code Extension (all 6 items)
+- [x] Phase 13: Chrome Extension (all 6 items)
 
 ## Notes
 - Each task should be completable in one Ralph loop

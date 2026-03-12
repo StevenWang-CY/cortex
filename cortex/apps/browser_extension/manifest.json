@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Cortex — Somatic Workspace Engine",
+  "version": "0.1.0",
+  "description": "Real-time biofeedback workspace engine that detects cognitive overwhelm and restructures your browser environment.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "tabs",
+    "tabGroups",
+    "storage"
+  ],
+  "host_permissions": [],
+  "background": {
+    "service_worker": "background.ts",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.tsx",
+    "default_icon": {
+      "16": "icons/cortex-16.png",
+      "48": "icons/cortex-48.png",
+      "128": "icons/cortex-128.png"
+    }
+  },
+  "content_scripts": [],
+  "icons": {
+    "16": "icons/cortex-16.png",
+    "48": "icons/cortex-48.png",
+    "128": "icons/cortex-128.png"
+  }
+}
