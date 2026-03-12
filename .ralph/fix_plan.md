@@ -40,14 +40,14 @@
 
 ## Phase 4: Physio Engine — rPPG Heart Rate & HRV
 
-- [ ] Implement services/physio_engine/roi_extractor.py — extract RGB traces from forehead ROI (landmarks 10,67,69,104,108,151,299,337,338), left cheek (50,101,116-121), right cheek (mirrored), spatial averaging per ROI, dynamic ROI selection (highest SNR)
-- [ ] Implement services/physio_engine/rppg.py — POS algorithm: temporal normalization (divide by running mean), chrominance projection (S1/S2 axes), adaptive ratio combination, overlap-add windowing for continuous BVP signal
-- [ ] Implement CHROM algorithm as fallback in rppg.py — chrominance-based method for better cross-skin-tone performance
-- [ ] Implement green-channel baseline method in rppg.py — simplest reference implementation
-- [ ] Implement services/physio_engine/pulse_estimator.py — consume 10s BVP windows, apply Butterworth bandpass (0.7-3.5 Hz), Welch PSD peak detection → instantaneous HR (BPM), IBI series extraction → RMSSD computation, HR delta (5s gradient)
-- [ ] Implement services/physio_engine/quality_scorer.py — signal quality from SNR (peak power / noise floor ratio), confidence scoring, quality-based algorithm switching (POS → CHROM → green-channel)
-- [ ] Write tests/unit/test_roi_extraction.py — verify correct landmark selection, spatial averaging, ROI size validation
-- [ ] Write integration test: synthetic frames with known PPG modulation → verify extracted HR within ±5 BPM
+- [x] Implement services/physio_engine/roi_extractor.py — extract RGB traces from forehead ROI (landmarks 10,67,69,104,108,151,299,337,338), left cheek (50,101,116-121), right cheek (mirrored), spatial averaging per ROI, dynamic ROI selection (highest SNR)
+- [x] Implement services/physio_engine/rppg.py — POS algorithm: temporal normalization (divide by running mean), chrominance projection (S1/S2 axes), adaptive ratio combination, overlap-add windowing for continuous BVP signal
+- [x] Implement CHROM algorithm as fallback in rppg.py — chrominance-based method for better cross-skin-tone performance
+- [x] Implement green-channel baseline method in rppg.py — simplest reference implementation
+- [x] Implement services/physio_engine/pulse_estimator.py — consume 10s BVP windows, apply Butterworth bandpass (0.7-3.5 Hz), Welch PSD peak detection → instantaneous HR (BPM), IBI series extraction → RMSSD computation, HR delta (5s gradient)
+- [x] Implement services/physio_engine/quality_scorer.py — signal quality from SNR (peak power / noise floor ratio), confidence scoring, quality-based algorithm switching (POS → CHROM → green-channel)
+- [x] Write tests/unit/test_roi_extraction.py — verify correct landmark selection, spatial averaging, ROI size validation
+- [x] Write integration test: synthetic frames with known PPG modulation → verify extracted HR within ±5 BPM
 
 ## Phase 5: Kinematics Engine — Blink, Head Pose, Posture
 
@@ -165,6 +165,7 @@
 - [x] Complete specification written (cortex.md)
 - [x] Phase 1: Foundation — Project Scaffold, Schemas, Config (all 16 items)
 - [x] Phase 3: Capture Service — Webcam + Face Tracking (all 6 items)
+- [x] Phase 4: Physio Engine — rPPG Heart Rate & HRV (all 8 items)
 
 ## Notes
 - Each task should be completable in one Ralph loop
