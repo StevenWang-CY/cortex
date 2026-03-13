@@ -102,6 +102,16 @@ Rules for suggested_actions (1-5 actions, or omit if none warranted):
 - Only include error_analysis when errors are present in context.
 - ALWAYS include tab_recommendations when 4+ tabs are listed in context, regardless of mode.
 - For EVERY tab in tab_recommendations, recommend keep/close/group with a reason and relevance_score.
+- NEVER assume a tab is irrelevant based solely on its type. AI assistants (Gemini, ChatGPT, \
+Claude), video platforms (YouTube), and communication tools (Slack, Discord) CAN be \
+task-relevant. Judge relevance by comparing the tab's topic/title against the focus goal.
+- A tab classified as [ai_assistant] is likely a TOOL the user is actively using. Only \
+recommend closing it if the topic is clearly unrelated to the focus goal.
+- A [video_platform] tab showing educational/lecture content related to the focus goal \
+should be kept.
+- Active tabs, learning_platform tabs, and goal-relevant ai_assistant tabs MUST always \
+get action:"keep" with relevance_score >= 0.8.
+- relevance_score should reflect topic alignment with the focus goal, NOT just tab type.
 
 Valid intervention_type values: "overlay_only", "simplified_workspace", "guided_mode"
 Valid tone values: "direct", "supportive", "minimal"
@@ -142,7 +152,7 @@ and what to fold away.
 
 If 4+ browser tabs are listed, ALSO generate tab_recommendations for each tab \
 (keep/close/group with reason and relevance_score) and corresponding close_tab \
-suggested_actions for distraction/social tabs.
+suggested_actions for tabs clearly unrelated to the focus goal.
 
 The user will see a PREVIEW of your plan and confirm before execution.
 
@@ -163,8 +173,8 @@ You MUST generate:
 - tab_recommendations: For EVERY tab in the context, recommend keep/close/group \
 with a reason and relevance_score (0-1). Group related tabs (e.g., all StackOverflow \
 tabs about the same topic) under a shared group_name.
-- suggested_actions: Generate close_tab actions (with tab_index) for the least \
-relevant tabs, and group_tabs actions for related tabs that should be grouped.
+- suggested_actions: Generate close_tab actions (with tab_index) for tabs whose \
+topic is clearly unrelated to the focus goal, and group_tabs actions for related tabs that should be grouped.
 
 Focus goal: {goal_hint}
 
@@ -180,7 +190,7 @@ The user is overwhelmed and needs concrete next steps. Generate 1-3 specific, \
 actionable micro-steps based on the current workspace context.
 
 Generate suggested_actions for any steps that can be automated:
-- If there are distraction tabs open, generate close_tab actions with tab_index.
+- If there are tabs clearly unrelated to the focus goal, generate close_tab actions with tab_index.
 - If there are errors, generate a search_error action.
 - If the user should focus on a specific tab, generate a highlight_tab action.
 - If 4+ tabs are listed, ALSO generate tab_recommendations for each tab (keep/close/group \
@@ -203,7 +213,7 @@ overwhelmed but still capable — just needs help focusing.
 
 If 4+ browser tabs are listed, generate tab_recommendations for each tab \
 (keep/close/group with reason and relevance_score) and corresponding close_tab \
-suggested_actions for any obviously irrelevant tabs using their tab_index.
+suggested_actions for tabs clearly unrelated to the focus goal using their tab_index.
 
 The user will see a PREVIEW of your recommendations and confirm before execution.
 

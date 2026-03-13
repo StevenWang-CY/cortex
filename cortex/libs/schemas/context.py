@@ -98,17 +98,22 @@ class TabInfo(BaseModel):
     url: str = Field(..., description="Tab URL")
     tab_type: Literal[
         "documentation",
+        "ai_assistant",
         "reference",
         "paper",
         "pdf",
         "stackoverflow",
         "search",
         "code_host",
+        "learning_platform",
+        "video_platform",
+        "communication",
         "distraction",
         "social",
         "other",
     ] = Field("other", description="Classified tab type")
     is_active: bool = Field(False, description="Whether this is the active tab")
+    topic_hint: str = Field("", description="Extracted topic/query from tab title")
 
 
 class BrowserContext(BaseModel):
@@ -178,6 +183,10 @@ class TaskContext(BaseModel):
     browser_context: BrowserContext | None = Field(
         None, description="Browser context if available"
     )
+    learned_relevance: dict[str, float] = Field(
+        default_factory=dict,
+        description="Per-domain learned relevance scores from user feedback",
+    )
 
     @property
     def has_editor(self) -> bool:
@@ -209,8 +218,11 @@ class TaskContext(BaseModel):
         """Check if workspace is highly complex (intervention threshold)."""
         return self.complexity_score >= 0.6
 
-    def to_llm_context(self) -> str:
+    def to_llm_context(self, *, learned_relevance: dict[str, float] | None = None) -> str:
         """Generate context string for LLM prompt."""
+        # Use model field as fallback if kwarg not passed
+        if learned_relevance is None and self.learned_relevance:
+            learned_relevance = self.learned_relevance
         parts = []
 
         parts.append(f"Mode: {self.mode}")
@@ -250,8 +262,9 @@ class TaskContext(BaseModel):
             tabs = self.browser_context.all_tabs
             selected = _select_tabs_for_llm(tabs, max_tabs=30)
             for idx, tab in selected:
+                topic = f' — "{tab.topic_hint}"' if tab.topic_hint else ""
                 parts.append(
-                    f"  Tab {idx}: [{tab.tab_type}] {tab.title[:80]} — {tab.url[:120]}"
+                    f"  Tab {idx}: [{tab.tab_type}] {tab.title[:80]}{topic} — {tab.url[:120]}"
                 )
             remainder = len(tabs) - len(selected)
             if remainder > 0:
@@ -266,21 +279,36 @@ class TaskContext(BaseModel):
                     f"Content: {self.browser_context.active_tab_content_excerpt[:500]}"
                 )
 
+        # Inject learned tab relevance preferences
+        if learned_relevance:
+            prefs = [
+                f"User previously kept {domain} open during similar sessions (relevance: {score:.2f})"
+                for domain, score in learned_relevance.items()
+                if score > 0.6
+            ]
+            if prefs:
+                parts.append("\n--- Learned Preferences ---")
+                parts.extend(prefs[:5])
+
         return "\n".join(parts)
 
 
 # Priority order for tab type selection (higher priority types kept first)
 _TAB_TYPE_PRIORITY: dict[str, int] = {
     "documentation": 0,
-    "reference": 1,
-    "paper": 2,
-    "pdf": 3,
-    "stackoverflow": 4,
-    "code_host": 5,
-    "search": 6,
-    "other": 7,
-    "social": 8,
-    "distraction": 9,
+    "ai_assistant": 1,
+    "reference": 2,
+    "paper": 3,
+    "pdf": 4,
+    "stackoverflow": 5,
+    "code_host": 6,
+    "learning_platform": 7,
+    "search": 8,
+    "video_platform": 9,
+    "communication": 10,
+    "other": 11,
+    "social": 12,
+    "distraction": 13,
 }
 
 

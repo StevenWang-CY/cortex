@@ -39,8 +39,18 @@ const PAPER_PATTERNS =
     /(arxiv\.org\/abs\/|openreview\.net\/forum|acm\.org\/doi|ieeexplore\.ieee\.org|paperswithcode\.com\/paper)/i;
 const REFERENCE_PATTERNS =
     /(wikipedia\.org|scholar\.google\.com|semanticscholar\.org|doi\.org|dblp\.org)/i;
+const LEARNING_PLATFORM_PATTERNS =
+    /(leetcode\.com|leetcode\.cn|hackerrank\.com|codeforces\.com|codewars\.com|exercism\.org|neetcode\.io|algoexpert\.io|coursera\.org|edx\.org|khanacademy\.org|udemy\.com|brilliant\.org)/i;
+const AI_ASSISTANT_PATTERNS =
+    /(gemini\.google\.com|chatgpt\.com|chat\.openai\.com|claude\.ai|copilot\.microsoft\.com|perplexity\.ai|phind\.com|you\.com\/chat|poe\.com|bard\.google\.com)/i;
+const VIDEO_PLATFORM_PATTERNS =
+    /(youtube\.com|youtu\.be|vimeo\.com)/i;
+const COMMUNICATION_PATTERNS =
+    /(slack\.com|discord\.com|teams\.microsoft\.com)/i;
+const SOCIAL_PATTERNS =
+    /(twitter\.com|x\.com|reddit\.com|facebook\.com)/i;
 const DISTRACTION_PATTERNS =
-    /(twitter\.com|x\.com|reddit\.com|facebook\.com|youtube\.com|discord\.com|instagram\.com|tiktok\.com|netflix\.com|twitch\.tv|9gag\.com|buzzfeed\.com|tumblr\.com)/i;
+    /(instagram\.com|tiktok\.com|netflix\.com|twitch\.tv|9gag\.com|buzzfeed\.com|tumblr\.com)/i;
 
 /**
  * Classify a tab by its URL into one of the known categories.
@@ -77,6 +87,21 @@ export function classifyTabType(url: string): string {
         u.includes("codeberg.org")
     ) {
         return "code_host";
+    }
+    if (LEARNING_PLATFORM_PATTERNS.test(u)) {
+        return "learning_platform";
+    }
+    if (AI_ASSISTANT_PATTERNS.test(u)) {
+        return "ai_assistant";
+    }
+    if (VIDEO_PLATFORM_PATTERNS.test(u)) {
+        return "video_platform";
+    }
+    if (COMMUNICATION_PATTERNS.test(u)) {
+        return "communication";
+    }
+    if (SOCIAL_PATTERNS.test(u)) {
+        return "social";
     }
     if (DISTRACTION_PATTERNS.test(u)) {
         return "distraction";

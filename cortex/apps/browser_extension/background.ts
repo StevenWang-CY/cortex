@@ -78,14 +78,16 @@ interface DailyStats {
 
 let focusSession: FocusSession | null = null;
 
-// Distraction site patterns
-const DISTRACTION_PATTERNS = [
-    /reddit\.com/i, /twitter\.com/i, /x\.com/i,
-    /facebook\.com/i, /instagram\.com/i, /tiktok\.com/i,
-    /youtube\.com/i, /netflix\.com/i, /twitch\.tv/i,
-    /discord\.com/i, /9gag\.com/i, /buzzfeed\.com/i,
-    /tumblr\.com/i,
+// Two-tier distraction detection
+const ALWAYS_DISTRACTION = [
+    /instagram\.com/i, /tiktok\.com/i, /netflix\.com/i,
+    /twitch\.tv/i, /9gag\.com/i, /buzzfeed\.com/i, /tumblr\.com/i,
 ];
+const CONDITIONAL_DISTRACTION = [
+    /reddit\.com/i, /twitter\.com/i, /x\.com/i, /facebook\.com/i,
+];
+const AI_ASSISTANT_URL_PATTERN = /gemini\.google\.com|chatgpt\.com|chat\.openai\.com|claude\.ai|copilot\.microsoft\.com|perplexity\.ai/i;
+const VIDEO_PLATFORM_URL_PATTERN = /youtube\.com|youtu\.be/i;
 
 // Health alert state
 let lastPostureAlert = 0;
@@ -660,17 +662,38 @@ interface TabData {
     tab_type: string;
     is_active: boolean;
     tab_id: number;
+    topic_hint: string;
+}
+
+function extractTopicHint(title: string, url: string, tabType: string): string {
+    if (tabType === "ai_assistant") {
+        return title.replace(/\s*[-–—]\s*(Gemini|ChatGPT|Claude|Copilot|Perplexity|Phind|Poe).*$/i, "").slice(0, 100);
+    }
+    if (tabType === "video_platform") {
+        return title.replace(/\s*[-–—]\s*(YouTube|Vimeo).*$/i, "").slice(0, 100);
+    }
+    if (tabType === "search") {
+        try { return new URL(url).searchParams.get("q")?.slice(0, 100) || ""; } catch { return ""; }
+    }
+    if (tabType === "communication") {
+        return title.replace(/\s*[-–—]\s*(Slack|Discord|Microsoft Teams).*$/i, "").slice(0, 100);
+    }
+    return "";
 }
 
 async function collectTabs(): Promise<TabData[]> {
     const chromeTabs = await chrome.tabs.query({});
-    return chromeTabs.map((tab) => ({
-        title: tab.title ?? "",
-        url: tab.url ?? "",
-        tab_type: classifyBrowserTabType(tab.url ?? ""),
-        is_active: tab.active ?? false,
-        tab_id: tab.id ?? -1,
-    }));
+    return chromeTabs.map((tab) => {
+        const tabType = classifyBrowserTabType(tab.url ?? "");
+        return {
+            title: tab.title ?? "",
+            url: tab.url ?? "",
+            tab_type: tabType,
+            is_active: tab.active ?? false,
+            tab_id: tab.id ?? -1,
+            topic_hint: extractTopicHint(tab.title ?? "", tab.url ?? "", tabType),
+        };
+    });
 }
 
 // --- Content extraction function (injected into page) ---
@@ -815,8 +838,27 @@ async function saveToDailyStats(session: FocusSession): Promise<void> {
 
 // --- Distraction Blocking ---
 
-function isDistractionUrl(url: string): boolean {
-    return DISTRACTION_PATTERNS.some((p) => p.test(url));
+function isDistractionUrl(url: string, title?: string): boolean {
+    if (ALWAYS_DISTRACTION.some((p) => p.test(url))) return true;
+    if (AI_ASSISTANT_URL_PATTERN.test(url)) return false;
+    if (VIDEO_PLATFORM_URL_PATTERN.test(url)) {
+        // YouTube: check title for goal-relevant keywords
+        if (focusSession?.goal && title) {
+            const goalWords = focusSession.goal.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+            const titleLower = title.toLowerCase();
+            if (goalWords.some(w => titleLower.includes(w))) return false;
+        }
+        return true;
+    }
+    if (CONDITIONAL_DISTRACTION.some((p) => p.test(url))) {
+        if (focusSession?.goal && title) {
+            const goalWords = focusSession.goal.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+            const titleLower = title.toLowerCase();
+            if (goalWords.some(w => titleLower.includes(w))) return false;
+        }
+        return true;
+    }
+    return false;
 }
 
 function injectDistractionInterceptor(
@@ -1668,7 +1710,7 @@ chrome.runtime.onMessage.addListener(
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, _tab) => {
     if (!focusSession || !changeInfo.url) return;
     const url = changeInfo.url;
-    if (isDistractionUrl(url)) {
+    if (isDistractionUrl(url, _tab.title)) {
         // Don't increment distractionsBlocked here — only when user clicks "Go back"
         const snap = getFocusSessionSnapshot();
         chrome.scripting.executeScript({

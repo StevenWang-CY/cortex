@@ -60,8 +60,26 @@ _REFERENCE_URL_PATTERNS = re.compile(
     r"(wikipedia\.org|scholar\.google\.com|semanticscholar\.org|doi\.org|dblp\.org)",
     re.IGNORECASE,
 )
+_AI_ASSISTANT_PATTERNS = re.compile(
+    r"(gemini\.google\.com|chatgpt\.com|chat\.openai\.com|claude\.ai|"
+    r"copilot\.microsoft\.com|perplexity\.ai|phind\.com|you\.com/chat|"
+    r"poe\.com|bard\.google\.com)",
+    re.IGNORECASE,
+)
+_VIDEO_PLATFORM_PATTERNS = re.compile(
+    r"(youtube\.com|youtu\.be|vimeo\.com)",
+    re.IGNORECASE,
+)
+_COMMUNICATION_PATTERNS = re.compile(
+    r"(slack\.com|discord\.com|teams\.microsoft\.com)",
+    re.IGNORECASE,
+)
+_SOCIAL_URL_PATTERNS = re.compile(
+    r"(twitter\.com|x\.com|reddit\.com|facebook\.com)",
+    re.IGNORECASE,
+)
 _DISTRACTION_URL_PATTERNS = re.compile(
-    r"(twitter\.com|x\.com|reddit\.com|facebook\.com|youtube\.com|discord\.com|slack\.com|instagram\.com|tiktok\.com)",
+    r"(instagram\.com|tiktok\.com|netflix\.com|twitch\.tv|9gag\.com|buzzfeed\.com|tumblr\.com)",
     re.IGNORECASE,
 )
 
@@ -170,8 +188,16 @@ def classify_tab_type(url: str) -> str:
     if any(s in url_lower for s in ("github.com", "gitlab.com", "bitbucket.org", "codeberg.org")):
         return "code_host"
 
-    if any(s in url_lower for s in ("twitter.com", "x.com", "reddit.com", "facebook.com",
-                                    "youtube.com", "discord.com", "slack.com")):
+    if _AI_ASSISTANT_PATTERNS.search(url_lower):
+        return "ai_assistant"
+
+    if _VIDEO_PLATFORM_PATTERNS.search(url_lower):
+        return "video_platform"
+
+    if _COMMUNICATION_PATTERNS.search(url_lower):
+        return "communication"
+
+    if _SOCIAL_URL_PATTERNS.search(url_lower):
         return "social"
 
     if _DISTRACTION_URL_PATTERNS.search(url_lower):

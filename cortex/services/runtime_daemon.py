@@ -50,6 +50,7 @@ from cortex.services.consent.ladder import ConsentLadder
 from cortex.services.consent.policy import ConsentPolicy
 from cortex.services.eval.bandit import ContextualBandit
 from cortex.services.eval.helpfulness import HelpfulnessTracker
+from cortex.services.eval.tab_relevance import TabRelevanceTracker
 from cortex.services.handover.briefing import MorningBriefing
 from cortex.services.handover.detector import ShutdownDetector
 from cortex.services.handover.snapshot import HandoverSnapshot
@@ -220,6 +221,9 @@ class CortexDaemon:
 
         # Helpfulness tracker
         self._helpfulness = HelpfulnessTracker(store=self._store)
+
+        # Tab relevance learning
+        self._tab_relevance = TabRelevanceTracker(store=self._store)
 
         # Contextual bandit
         self._bandit = ContextualBandit(store=self._store)
@@ -564,6 +568,18 @@ class CortexDaemon:
     async def _trigger_intervention(
         self, context: Any, estimate: Any, *, template_name: str | None = None,
     ) -> None:
+        # Inject learned tab relevance into context for LLM
+        goal = getattr(context, "current_goal_hint", "") or ""
+        if not goal and hasattr(context, "browser_context") and context.browser_context:
+            goal = context.browser_context.focus_goal or ""
+        if goal:
+            try:
+                overrides = await self._tab_relevance.get_overrides(goal)
+                if overrides and hasattr(context, "learned_relevance"):
+                    context.learned_relevance = overrides
+            except Exception:
+                logger.debug("Failed to load tab relevance overrides", exc_info=True)
+
         plan = await self._llm_client.generate_intervention_plan(
             context, estimate, template_name=template_name,
         )
@@ -704,6 +720,33 @@ class CortexDaemon:
                     bandit_features = np.array(features, dtype=np.float64)
                     # Find arm index from template — use 0 as default
                     self._bandit.update(bandit_features, 0, reward)
+
+        # Record tab relevance feedback
+        await self._record_tab_relevance_feedback(action, outcome)
+
+    async def _record_tab_relevance_feedback(self, action: str, outcome: Any) -> None:
+        """Record tab relevance feedback based on user action."""
+        context = self._latest_context
+        if not context or not hasattr(context, "browser_context") or not context.browser_context:
+            return
+        goal = getattr(context, "current_goal_hint", "") or ""
+        if not goal and context.browser_context.focus_goal:
+            goal = context.browser_context.focus_goal or ""
+        if not goal:
+            return
+
+        try:
+            for tab in context.browser_context.all_tabs:
+                try:
+                    domain = tab.url.split("//", 1)[1].split("/", 1)[0]
+                except (IndexError, ValueError):
+                    continue
+                if action == "dismissed":
+                    await self._tab_relevance.record_kept(domain, goal)
+                elif action == "engaged":
+                    await self._tab_relevance.record_closed(domain, goal)
+        except Exception:
+            logger.debug("Failed to record tab relevance feedback", exc_info=True)
 
     # --- v2.0 helper methods ---
 

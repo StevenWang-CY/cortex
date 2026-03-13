@@ -64,7 +64,17 @@ class TestTabClassification:
     def test_social(self) -> None:
         assert classify_tab_type("https://twitter.com/user") == "social"
         assert classify_tab_type("https://www.reddit.com/r/python") == "social"
-        assert classify_tab_type("https://www.youtube.com/watch?v=abc") == "social"
+
+    def test_video_platform(self) -> None:
+        assert classify_tab_type("https://www.youtube.com/watch?v=abc") == "video_platform"
+
+    def test_ai_assistant(self) -> None:
+        assert classify_tab_type("https://gemini.google.com/app") == "ai_assistant"
+        assert classify_tab_type("https://chatgpt.com/c/123") == "ai_assistant"
+
+    def test_communication(self) -> None:
+        assert classify_tab_type("https://app.slack.com/client") == "communication"
+        assert classify_tab_type("https://discord.com/channels/123") == "communication"
 
     def test_other(self) -> None:
         assert classify_tab_type("https://example.com/page") == "other"
