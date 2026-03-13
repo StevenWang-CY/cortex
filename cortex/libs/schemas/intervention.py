@@ -8,7 +8,7 @@ and intervention outcomes.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -17,6 +17,103 @@ from pydantic import BaseModel, Field
 def generate_intervention_id() -> str:
     """Generate a unique intervention ID."""
     return f"int_{uuid4().hex[:12]}"
+
+
+def _generate_action_id() -> str:
+    return f"act_{uuid4().hex[:8]}"
+
+
+class SuggestedAction(BaseModel):
+    """A single executable action the user can approve with one click."""
+
+    action_id: str = Field(
+        default_factory=_generate_action_id,
+        description="Unique action identifier",
+    )
+    action_type: Literal[
+        "close_tab",
+        "group_tabs",
+        "bookmark_and_close",
+        "open_url",
+        "search_error",
+        "highlight_tab",
+        "save_session",
+        "copy_to_clipboard",
+        "start_timer",
+    ] = Field(..., description="Type of executable action")
+    tab_index: int | None = Field(
+        None,
+        description="Integer index referencing the tab list from context (primary ID for tab actions)",
+    )
+    target: str = Field(
+        "",
+        max_length=500,
+        description="Search query, URL for open_url, session name, etc.",
+    )
+    label: str = Field(
+        ..., max_length=200, description="Human-readable button label"
+    )
+    reason: str = Field(
+        "", max_length=300, description="Why this action helps"
+    )
+    category: Literal["recommended", "optional", "informational"] = Field(
+        "recommended",
+        description="How strongly recommended",
+    )
+    reversible: bool = Field(True, description="Whether this action can be undone")
+    group_id: str | None = Field(
+        None, description="Groups related actions together"
+    )
+    metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Action-specific metadata (tab_title, search_query, etc.)",
+    )
+
+
+class ErrorAnalysis(BaseModel):
+    """LLM analysis of the current error."""
+
+    error_type: str = Field(
+        ..., description="Classified error type (syntax, import, type, runtime, etc.)"
+    )
+    root_cause: str = Field(
+        ..., max_length=500, description="Identified root cause"
+    )
+    suggested_fix: str = Field(
+        "", max_length=1000, description="Suggested code fix or approach"
+    )
+    search_query: str = Field(
+        "", max_length=200, description="Pre-crafted search query for this error"
+    )
+    relevant_doc_url: str = Field(
+        "", description="URL to relevant documentation, if identifiable"
+    )
+
+
+class TabRecommendation(BaseModel):
+    """LLM recommendation for a single tab."""
+
+    tab_index: int = Field(..., description="Integer index into the context tab list")
+    tab_title: str = Field("", description="Tab title for display")
+    action: Literal["keep", "close", "group", "bookmark_and_close"] = Field(
+        ..., description="Recommended action for this tab"
+    )
+    reason: str = Field("", max_length=200, description="Why this recommendation")
+    relevance_score: float = Field(
+        0.5, ge=0.0, le=1.0, description="Relevance to current task"
+    )
+    group_name: str | None = Field(
+        None, description="Group name if action is 'group'"
+    )
+
+
+class TabRecommendations(BaseModel):
+    """Complete tab triage from LLM."""
+
+    tabs: list[TabRecommendation] = Field(default_factory=list)
+    summary: str = Field(
+        "", max_length=300, description="Summary of tab triage reasoning"
+    )
 
 
 class UIPlan(BaseModel):
@@ -90,6 +187,15 @@ class InterventionPlan(BaseModel):
     tone: Literal["direct", "supportive", "minimal"] = Field(
         "direct", description="Tone of intervention text"
     )
+    suggested_actions: list[SuggestedAction] = Field(
+        default_factory=list, description="Executable actions the user can approve"
+    )
+    error_analysis: ErrorAnalysis | None = Field(
+        None, description="Detailed error analysis with suggested fixes"
+    )
+    tab_recommendations: TabRecommendations | None = Field(
+        None, description="Per-tab keep/close/group recommendations"
+    )
 
     @property
     def is_valid(self) -> bool:
@@ -104,15 +210,22 @@ class InterventionPlan(BaseModel):
 
     @property
     def is_destructive(self) -> bool:
-        """Check if plan contains destructive actions (should always be False)."""
-        destructive_keywords = ["delete", "close", "remove permanently", "discard"]
-        all_text = " ".join([
+        """Check if plan contains destructive workspace actions (should always be False)."""
+        destructive_phrases = [
+            "delete file", "delete tab", "delete project",
+            "close tab", "close window", "close application",
+            "remove permanently", "discard changes", "discard file",
+        ]
+        text_parts = [
             self.situation_summary,
             self.headline,
             *self.micro_steps,
             *self.hide_targets,
-        ]).lower()
-        return any(kw in all_text for kw in destructive_keywords)
+        ]
+        for action in self.suggested_actions:
+            text_parts.extend([action.label, action.target])
+        all_text = " ".join(text_parts).lower()
+        return any(phrase in all_text for phrase in destructive_phrases)
 
 
 class FoldState(BaseModel):

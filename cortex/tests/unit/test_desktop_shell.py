@@ -605,7 +605,7 @@ class TestSettings:
         assert result["entry_threshold"] == pytest.approx(0.85, abs=0.01)
         assert result["cooldown_seconds"] == 60
         assert result["quiet_mode"] is False
-        assert result["llm_mode"] == "remote"
+        assert result["llm_mode"] == "azure"
 
     def test_sensitivity_to_threshold(self):
         settings = SettingsDialog()
@@ -619,11 +619,13 @@ class TestSettings:
     def test_llm_mode_mapping(self):
         settings = SettingsDialog()
         settings._llm_backend._index = 0
-        assert settings.get_settings()["llm_mode"] == "remote"
+        assert settings.get_settings()["llm_mode"] == "azure"
         settings._llm_backend._index = 1
         assert settings.get_settings()["llm_mode"] == "local"
         settings._llm_backend._index = 2
         assert settings.get_settings()["llm_mode"] == "rule_based"
+        settings._llm_backend._index = 3
+        assert settings.get_settings()["llm_mode"] == "remote"
 
     def test_apply_emits_signal(self):
         settings = SettingsDialog()

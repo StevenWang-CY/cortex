@@ -3,9 +3,9 @@
 ## Prerequisites
 
 - **Python 3.11+** (3.12 also supported)
-- **macOS** (primary target; Linux and Windows are secondary)
+- **macOS** (primary supported target for Cortex v1)
 - **Webcam** (built-in or USB; 640x480 @ 30 FPS minimum)
-- **SSH access** to `gwhiz1.cis.upenn.edu` (for remote LLM inference)
+- **Azure OpenAI deployment** (recommended production backend)
 - **Node.js 18+** (for VS Code extension development)
 - **pnpm** (for Chrome extension development)
 
@@ -13,20 +13,21 @@
 
 ```bash
 git clone <repo-url>
-cd <repo-dir>/cortex
+cd <repo-dir>
 
 # Create virtual environment
 python3.11 -m venv .venv
 source .venv/bin/activate
 
 # Install in editable mode with dev dependencies
-pip install -e ".[dev]"
+pip install -e "./cortex[dev]"
+export PYTHONPATH="$PWD"
 ```
 
 Verify the installation:
 
 ```bash
-python -c "from cortex.libs.config.settings import get_config; print(get_config())"
+python -c "from cortex.libs.config.settings import get_config; print(get_config().llm.mode)"
 ```
 
 ### macOS Permissions
@@ -44,105 +45,80 @@ To grant accessibility access:
 Copy the example environment file:
 
 ```bash
-cp .env.example .env
+cp cortex/.env.example .env
 ```
 
-Edit `.env` to match your setup. The most important settings:
+Edit `.env` to match your setup. Cortex uses nested environment variables with `__`, not the old flat names.
+
+Recommended Azure configuration:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CORTEX_LLM_MODE` | `remote` | LLM backend: `remote`, `local`, or `openai_compat` |
-| `CORTEX_LLM_SSH_USER` | `wangcy07` | SSH username for gwhiz1 |
-| `CORTEX_LLM_REMOTE_HOST` | `gwhiz1.cis.upenn.edu` | Remote GPU host |
-| `CORTEX_LLM_REMOTE_PORT` | `8800` | vLLM server port on remote host |
-| `CORTEX_API_PORT` | `9472` | REST API port |
-| `CORTEX_WS_PORT` | `9473` | WebSocket port |
-| `CORTEX_CAPTURE_DEVICE_ID` | `0` | Webcam device index |
+| `CORTEX_LLM__MODE` | `azure` | `azure`, `local`, `rule_based`, or `remote` |
+| `CORTEX_LLM__AZURE__ENDPOINT` | empty | Azure OpenAI resource endpoint |
+| `CORTEX_LLM__AZURE__API_KEY` | empty | Azure API key for dev use |
+| `CORTEX_LLM__AZURE__API_VERSION` | `2025-01-01-preview` | Azure API version |
+| `CORTEX_LLM__AZURE__DEPLOYMENT_NAME` | empty | Primary deployment for overlay/simplified plans |
+| `CORTEX_LLM__AZURE__REASONING_DEPLOYMENT_NAME` | empty | Optional deeper-reasoning deployment |
+| `CORTEX_LLM__AZURE__MAX_COMPLETION_TOKENS` | `1024` | Azure-compatible response token limit |
+| `CORTEX_API__PORT` | `9472` | REST API port |
+| `CORTEX_API__WS_PORT` | `9473` | WebSocket port |
+| `CORTEX_CAPTURE__DEVICE_ID` | `0` | Webcam device index |
 
 Configuration loads from `libs/config/defaults.yaml` first, then environment variables override with the `CORTEX_` prefix. See [`.env.example`](../.env.example) for all options.
+
+For packaged macOS installs, store the Azure API key in Keychain instead of `.env`. Cortex will check Keychain first when `CORTEX_LLM__AZURE__USE_KEYCHAIN=true`.
 
 ### Initialize Storage
 
 ```bash
-python -m cortex.scripts.seed_config
+python -m cortex.scripts.seed_config --root .
 ```
 
 This creates:
 - `storage/` directory tree (`sessions/`, `cache/`, `baselines/`, `logs/`, `exports/`)
 - Default `.env` from configuration defaults
-- Default baseline profile at `storage/baselines/default_baselines.json`
+- Default baseline profile at `storage/baselines/default.json`
 - Cortex entries in `.gitignore`
 
 Use `--dry-run` to preview without writing, or `--force` to overwrite existing files.
 
-## 3. Remote LLM Setup (gwhiz1)
+## 3. Azure OpenAI Setup
 
-Cortex uses Qwen-3-8B running on a remote GPU via vLLM with an OpenAI-compatible API.
+Cortex v1 is designed to use Azure OpenAI as the primary planner, then fall back to local Ollama, then to built-in rule-based guidance.
 
-### SSH Key Setup
+Example:
 
 ```bash
-# Generate a key if you don't have one
-ssh-keygen -t ed25519 -C "cortex-dev"
-
-# Copy to remote host
-ssh-copy-id wangcy07@gwhiz1.cis.upenn.edu
-
-# Test connection
-ssh wangcy07@gwhiz1.cis.upenn.edu "hostname"
+CORTEX_LLM__MODE=azure
+CORTEX_LLM__AZURE__ENDPOINT=https://your-resource.openai.azure.com
+CORTEX_LLM__AZURE__API_KEY=...
+CORTEX_LLM__AZURE__API_VERSION=2025-01-01-preview
+CORTEX_LLM__AZURE__DEPLOYMENT_NAME=gpt-5-mini
+CORTEX_LLM__AZURE__REASONING_DEPLOYMENT_NAME=gpt-5-mini
 ```
 
-### SSH Tunnel
+Important:
+- Azure `gpt-5-mini` rejects `max_tokens`; Cortex now sends `max_completion_tokens`.
+- Cortex only sends workspace text context, current state label/confidence, and allowed intervention constraints to Azure. Raw camera frames and biometrics stay local.
 
-The tunnel forwards `localhost:8800` to the remote vLLM server:
-
-```bash
-# Start tunnel (background mode with auto-reconnect)
-bash scripts/setup_ssh_tunnel.sh --background
-
-# Check tunnel status
-bash scripts/setup_ssh_tunnel.sh --check
-
-# Stop tunnel
-bash scripts/setup_ssh_tunnel.sh --stop
-```
-
-The script uses `ServerAliveInterval=30` and `ExitOnForwardFailure=yes` for reliability.
-
-### Start/Verify Remote vLLM
+### Optional Local Fallback (Ollama)
 
 ```bash
-# Check if vLLM is running on remote, start if needed
-python -m cortex.scripts.run_llm_server --start
-
-# Test with a sample inference request
-python -m cortex.scripts.run_llm_server --test
-```
-
-### Local Fallback (Ollama)
-
-If the remote GPU is unavailable, Cortex falls back to local Ollama:
-
-```bash
-# Install Ollama (macOS)
 brew install ollama
-
-# Pull a model
 ollama pull llama3.1:8b
-
-# Start Ollama server
 ollama serve
 ```
 
-Set `CORTEX_LLM_MODE=local` in `.env` to use Ollama exclusively.
+Set `CORTEX_LLM__MODE=local` in `.env` to use Ollama exclusively.
 
 ## 4. Calibration
 
 Cortex uses personal baselines for accurate state detection. Run the calibration script in a relaxed environment:
 
 ```bash
-# Full 2-minute calibration with webcam
-cortex-calibrate
+# Full 2-minute calibration with webcam and live telemetry
+cortex-calibrate --duration 120
 
 # Simulated calibration (no webcam required, for testing)
 cortex-calibrate --simulate
@@ -155,6 +131,7 @@ Calibration measures:
 - Normal mouse/keyboard patterns
 
 Results are saved to `storage/baselines/`. See [calibration.md](calibration.md) for details.
+The calibration command now also refreshes the active baseline file at `storage/baselines/default.json`.
 
 ## 5. Running Cortex
 
@@ -200,9 +177,23 @@ pytest --cov=cortex --cov-report=html
 pytest -m "not requires_webcam and not requires_gpu"
 ```
 
-## 7. VS Code Extension
+## 7. Desktop App
 
-The VS Code extension provides editor context and intervention UI. Once implemented:
+Run the PySide desktop shell:
+
+```bash
+python -m cortex.apps.desktop_shell.main
+```
+
+On first launch, complete onboarding:
+- grant camera and Accessibility/Input Monitoring permissions
+- confirm Azure endpoint and deployment
+- install VS Code and Chrome extensions
+- run calibration
+
+## 8. VS Code Extension
+
+The VS Code extension provides editor context, diagnostics, integrated terminal context, fold/apply, and restore:
 
 ```bash
 cd apps/vscode_extension
@@ -213,9 +204,9 @@ npm run compile
 code --install-extension cortex-vscode-0.1.0.vsix
 ```
 
-## 8. Chrome Extension
+## 9. Chrome Extension
 
-The Chrome extension provides browser context and tab management. Once implemented:
+The Chrome extension provides browser context, PDF/paper classification, tab hide/restore, and research overlays:
 
 ```bash
 cd apps/browser_extension
@@ -225,6 +216,16 @@ pnpm build
 # Load unpacked extension in Chrome
 # chrome://extensions → Developer mode → Load unpacked → dist/
 ```
+
+## 10. Package a macOS App
+
+Build the bundled desktop app:
+
+```bash
+./scripts/build_macos_app.sh
+```
+
+This produces a PyInstaller-based macOS app bundle in `dist/`. Code signing and DMG wrapping are the final release steps for distribution.
 
 ## Troubleshooting
 
@@ -237,18 +238,14 @@ python -c "import cv2; [print(f'Device {i}: {cv2.VideoCapture(i).isOpened()}') f
 
 Set `CORTEX_CAPTURE_DEVICE_ID` to the correct device index.
 
-### SSH tunnel failures
+### Azure connection failures
 
-```bash
-# Check if port is already in use
-lsof -i :8800
-
-# Kill existing tunnel
-bash scripts/setup_ssh_tunnel.sh --stop
-
-# Start fresh
-bash scripts/setup_ssh_tunnel.sh --background
-```
+Check:
+- `CORTEX_LLM__MODE=azure`
+- endpoint matches your Azure resource exactly
+- deployment names exist in Azure
+- API version is `2025-01-01-preview`
+- API key is valid or present in Keychain
 
 ### Accessibility permission denied
 

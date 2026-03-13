@@ -26,7 +26,12 @@
       "scripting",
       "tabs",
       "tabGroups",
-      "storage"
+      "storage",
+      "alarms",
+      "bookmarks"
+    ],
+    "host_permissions": [
+      "<all_urls>"
     ]
   }
 }

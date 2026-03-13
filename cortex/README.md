@@ -11,7 +11,7 @@ Cortex runs a five-layer pipeline at 30 FPS, entirely on your machine:
 1. **Bio-Extraction** — extracts heart rate and HRV from your face via rPPG (no camera storage), tracks blink rate, head pose, and posture via MediaPipe, and monitors mouse/keyboard patterns via pynput.
 2. **State Classification** — fuses seven signals into a cognitive state score every 500ms. Uses rule-based scoring with EMA smoothing and hysteresis to classify you as FLOW, HYPER, HYPO, or RECOVERY.
 3. **Context Engine** — when an intervention is warranted, gathers workspace context: open file + diagnostics from VS Code, active tab + content from Chrome, recent terminal output.
-4. **LLM Scaffolding** — sends workspace context (no biometrics) to a Qwen-3-8B model running on a remote GPU via SSH tunnel. The model returns a structured intervention plan: headline, 1–3 micro-steps, and what to hide.
+4. **LLM Scaffolding** — sends workspace context (no biometrics) to Azure OpenAI first, then local Ollama if Azure is unavailable. The model returns a structured intervention plan: headline, 1–3 micro-steps, and what to hide.
 5. **Intervention Engine** — executes the plan: folds irrelevant code in VS Code, collapses non-essential browser tabs, shows a calming overlay with the steps and a 4-7-8 breathing pacer. Snapshots workspace state first. Restores everything on dismiss or recovery.
 
 ---
@@ -31,32 +31,33 @@ Interventions trigger on HYPER with confidence > 0.85, workspace complexity > 0.
 
 ## Setup
 
-**Requirements:** Python 3.11+, macOS (primary target), webcam, SSH access to a GPU for LLM inference.
+**Requirements:** Python 3.11+, macOS (primary target), webcam, Azure OpenAI deployment, Node.js 18+, pnpm.
 
 ```bash
-# Enter the Python project root
-cd cortex
+# Enter the repo root
+cd /path/to/Ralph
 
 # Install
-pip install -e ".[dev]"
+pip install -e "./cortex[dev]"
+export PYTHONPATH="$PWD"
 
 # Copy and edit config
-cp .env.example .env
+cp cortex/.env.example .env
 
 # Initialize storage and default config
-python -m cortex.scripts.seed_config
-
-# Set up SSH tunnel to LLM server
-bash scripts/setup_ssh_tunnel.sh --background
+python -m cortex.scripts.seed_config --root .
 
 # Calibrate personal baselines (2 min)
 cortex-calibrate
 
 # Start everything
 cortex-dev
+
+# Optional desktop shell
+python -m cortex.apps.desktop_shell.main
 ```
 
-REST API runs at `http://127.0.0.1:9472`. WebSocket at `ws://127.0.0.1:9473`.
+REST API runs at `http://127.0.0.1:9472`. WebSocket runs at `ws://127.0.0.1:9473`.
 
 ---
 
@@ -126,7 +127,7 @@ All layers communicate via the FastAPI gateway (`api_gateway/`) and WebSocket se
 - **No video is ever saved.** Frames are processed in memory and immediately discarded.
 - **No biometrics reach the LLM.** The model sees only workspace context: file paths, error messages, tab titles. Heart rate, HRV, blink data, and posture angles never leave your machine.
 - **Minimal browser permissions for the current feature set.** The Chrome extension requests `activeTab`, `scripting`, `tabs`, `tabGroups`, and `storage`. It does not request browsing history.
-- **Local sensing, remote inference.** The only network traffic is the LLM call, routed through an SSH tunnel to your own GPU.
+- **Local sensing, cloud planning.** The only network traffic is the LLM call, and Cortex sends workspace text context only.
 
 ---
 
@@ -147,7 +148,7 @@ cortex/
 │   ├── telemetry_engine/    # pynput input hooks, window tracker, feature aggregation
 │   ├── state_engine/        # Feature fusion, rule scorer, EMA smoother, trigger policy
 │   ├── context_engine/      # Editor, browser, terminal adapters + app classifier
-│   ├── llm_engine/          # Remote Qwen client, Ollama fallback, prompts, parser, cache
+│   ├── llm_engine/          # Azure OpenAI client, Ollama fallback, prompts, parser, cache
 │   ├── intervention_engine/ # Trigger, snapshot, planner, executor, restore
 │   └── api_gateway/         # FastAPI REST routes, WebSocket server
 ├── apps/
@@ -199,7 +200,8 @@ python -m cortex.scripts.replay_session storage/sessions/latest.jsonl
 
 ## Docs
 
-- [Setup](docs/setup.md) — installation, SSH tunnel, environment config, troubleshooting
+- [Setup](docs/setup.md) — installation, Azure config, packaging, troubleshooting
+- [Azure Deployment](docs/deploy_azure.md) — concrete deploy-and-experience checklist
 - [Architecture](docs/architecture.md) — layer details, data flow, performance targets
 - [API Reference](docs/apis.md) — all REST endpoints and WebSocket message types
 - [Calibration](docs/calibration.md) — personal baseline capture and usage

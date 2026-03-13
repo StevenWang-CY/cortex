@@ -168,7 +168,7 @@ export class FoldController {
             await vscode.commands.executeCommand("editor.unfoldAll");
 
             // Re-fold saved ranges
-            for (const [start, end] of this._snapshot.foldedRanges) {
+            for (const [start] of this._snapshot.foldedRanges) {
                 await vscode.commands.executeCommand("editor.fold", {
                     selectionLines: [start],
                     levels: 1,

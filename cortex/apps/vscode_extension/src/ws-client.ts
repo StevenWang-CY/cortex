@@ -16,12 +16,17 @@ interface WSMessage {
     payload: Record<string, unknown>;
     timestamp: number;
     sequence: number;
+    correlation_id?: string;
+    target_client_types?: string[];
+    source_client_type?: string;
 }
 
 type StateUpdateHandler = (payload: Record<string, unknown>) => void;
 type InterventionHandler = (payload: Record<string, unknown>) => void;
 type ConnectionHandler = (connected: boolean) => void;
 type ContextRequestHandler = () => Promise<Record<string, unknown>>;
+type RestoreHandler = (payload: Record<string, unknown>) => void;
+type SettingsHandler = (payload: Record<string, unknown>) => void;
 
 /**
  * WebSocket client for communication with the Cortex daemon.
@@ -43,6 +48,8 @@ export class CortexWSClient {
     private _interventionHandlers: InterventionHandler[] = [];
     private _connectionHandlers: ConnectionHandler[] = [];
     private _contextRequestHandler: ContextRequestHandler | undefined;
+    private _restoreHandlers: RestoreHandler[] = [];
+    private _settingsHandlers: SettingsHandler[] = [];
 
     constructor(url: string) {
         this._url = url;
@@ -71,6 +78,14 @@ export class CortexWSClient {
     /** Register a handler for CONTEXT_REQUEST messages from daemon. */
     onContextRequest(handler: ContextRequestHandler): void {
         this._contextRequestHandler = handler;
+    }
+
+    onRestore(handler: RestoreHandler): void {
+        this._restoreHandlers.push(handler);
+    }
+
+    onSettingsSync(handler: SettingsHandler): void {
+        this._settingsHandlers.push(handler);
     }
 
     /**
@@ -105,7 +120,7 @@ export class CortexWSClient {
                 );
             });
 
-            this._ws.on("message", (data) => {
+            this._ws.on("message", (data: WebSocket.RawData) => {
                 this._handleMessage(data.toString());
             });
 
@@ -209,6 +224,26 @@ export class CortexWSClient {
                 this._handleContextRequest(msg);
                 break;
 
+            case "INTERVENTION_RESTORE":
+                for (const handler of this._restoreHandlers) {
+                    try {
+                        handler(msg.payload);
+                    } catch {
+                        // Ignore handler errors
+                    }
+                }
+                break;
+
+            case "SETTINGS_SYNC":
+                for (const handler of this._settingsHandlers) {
+                    try {
+                        handler(msg.payload);
+                    } catch {
+                        // Ignore handler errors
+                    }
+                }
+                break;
+
             default:
                 // Unknown message types are silently ignored
                 break;
@@ -222,6 +257,7 @@ export class CortexWSClient {
                 payload: {},
                 timestamp: Date.now() / 1000,
                 sequence: ++this._sequence,
+                correlation_id: msg.correlation_id,
             });
             return;
         }
@@ -233,6 +269,7 @@ export class CortexWSClient {
                 payload: context,
                 timestamp: Date.now() / 1000,
                 sequence: msg.sequence, // Echo request sequence
+                correlation_id: msg.correlation_id,
             });
         } catch {
             this._send({
@@ -240,6 +277,7 @@ export class CortexWSClient {
                 payload: { error: "context_gather_failed" },
                 timestamp: Date.now() / 1000,
                 sequence: msg.sequence,
+                correlation_id: msg.correlation_id,
             });
         }
     }

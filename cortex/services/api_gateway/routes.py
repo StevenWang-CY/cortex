@@ -455,7 +455,17 @@ async def apply_intervention(
                 snapshot,
             )
 
+        ws_server = reg.get("ws_server")
+        if ws_server is not None and hasattr(ws_server, "send_intervention"):
+            await ws_server.send_intervention(body.plan)
+
         return InterventionApplyResponse(applied=applied, snapshot=snapshot)
+
+    # No executor available — still broadcast to WS clients (Chrome overlay)
+    ws_server = reg.get("ws_server")
+    if ws_server is not None and hasattr(ws_server, "send_intervention"):
+        await ws_server.send_intervention(body.plan)
+        return InterventionApplyResponse(applied=True)
 
     return InterventionApplyResponse(applied=False)
 
@@ -484,6 +494,12 @@ async def restore_intervention(
             outcome = None
 
         if outcome is not None:
+            ws_server = reg.get("ws_server")
+            if ws_server is not None and hasattr(ws_server, "send_restore"):
+                await ws_server.send_restore(
+                    body.intervention_id,
+                    user_action=body.user_action,
+                )
             return InterventionRestoreResponse(
                 restored=outcome.workspace_restored,
                 outcome=outcome,

@@ -34,6 +34,13 @@ export interface TabSnapshot {
 
 const DOC_PATTERNS =
     /docs\.|documentation|\/docs\/|developer\.mozilla|devdocs\.io|readthedocs|sphinx|javadoc|rustdoc|godoc|pkg\.go\.dev|react\.dev|vuejs\.org\/guide|angular\.io\/docs|pytorch\.org\/docs|numpy\.org\/doc|pandas\.pydata\.org\/docs|fastapi\.tiangolo\.com/i;
+const PDF_PATTERNS = /(\.pdf(?:$|\?)|arxiv\.org\/pdf\/|openreview\.net\/pdf)/i;
+const PAPER_PATTERNS =
+    /(arxiv\.org\/abs\/|openreview\.net\/forum|acm\.org\/doi|ieeexplore\.ieee\.org|paperswithcode\.com\/paper)/i;
+const REFERENCE_PATTERNS =
+    /(wikipedia\.org|scholar\.google\.com|semanticscholar\.org|doi\.org|dblp\.org)/i;
+const DISTRACTION_PATTERNS =
+    /(twitter\.com|x\.com|reddit\.com|facebook\.com|youtube\.com|discord\.com|slack\.com|instagram\.com|tiktok\.com)/i;
 
 /**
  * Classify a tab by its URL into one of the known categories.
@@ -43,6 +50,15 @@ export function classifyTabType(url: string): string {
 
     if (u.includes("stackoverflow.com") || u.includes("stackexchange.com")) {
         return "stackoverflow";
+    }
+    if (PDF_PATTERNS.test(u)) {
+        return "pdf";
+    }
+    if (PAPER_PATTERNS.test(u)) {
+        return "paper";
+    }
+    if (REFERENCE_PATTERNS.test(u)) {
+        return "reference";
     }
     if (DOC_PATTERNS.test(u)) {
         return "documentation";
@@ -62,18 +78,6 @@ export function classifyTabType(url: string): string {
     ) {
         return "code_host";
     }
-    if (
-        u.includes("twitter.com") ||
-        u.includes("x.com") ||
-        u.includes("reddit.com") ||
-        u.includes("facebook.com") ||
-        u.includes("youtube.com") ||
-        u.includes("discord.com") ||
-        u.includes("slack.com")
-    ) {
-        return "social";
-    }
-
     return "other";
 }
 
@@ -225,4 +229,79 @@ export function getSnapshot(interventionId: string): TabSnapshot | null {
  */
 export function hasActiveHiding(): boolean {
     return snapshots.size > 0;
+}
+
+// --- Targeted tab operations ---
+
+/**
+ * Group specific tabs by their IDs into a named, collapsed group.
+ */
+export async function groupSpecificTabs(
+    tabIds: number[],
+    groupName: string,
+    color: chrome.tabGroups.ColorEnum = "blue",
+): Promise<number | null> {
+    if (tabIds.length === 0) return null;
+    try {
+        const groupId = await chrome.tabs.group({ tabIds });
+        await chrome.tabGroups.update(groupId, {
+            collapsed: true,
+            title: groupName,
+            color,
+        });
+        return groupId;
+    } catch {
+        return null;
+    }
+}
+
+// --- Session management ---
+
+export interface TabSession {
+    name: string;
+    tabs: { title: string; url: string }[];
+    savedAt: number;
+    goal?: string;
+}
+
+const MAX_SAVED_SESSIONS = 20;
+
+/**
+ * Save current tab set as a named session.
+ */
+export async function saveTabSession(
+    sessionName: string,
+    goal?: string,
+): Promise<void> {
+    const tabs = await collectAllTabs();
+    const session: TabSession = {
+        name: sessionName,
+        tabs: tabs.map((t) => ({ title: t.title, url: t.url })),
+        savedAt: Date.now(),
+        goal,
+    };
+    const result = await chrome.storage.local.get("cortex_sessions");
+    const sessions: TabSession[] = (result.cortex_sessions as TabSession[]) || [];
+    sessions.push(session);
+    // Keep last N sessions
+    if (sessions.length > MAX_SAVED_SESSIONS) {
+        sessions.splice(0, sessions.length - MAX_SAVED_SESSIONS);
+    }
+    await chrome.storage.local.set({ cortex_sessions: sessions });
+}
+
+/**
+ * Restore a saved tab session by opening all its tabs.
+ */
+export async function restoreTabSession(
+    sessionName: string,
+): Promise<boolean> {
+    const result = await chrome.storage.local.get("cortex_sessions");
+    const sessions: TabSession[] = (result.cortex_sessions as TabSession[]) || [];
+    const session = sessions.find((s) => s.name === sessionName);
+    if (!session) return false;
+    for (const tab of session.tabs) {
+        await chrome.tabs.create({ url: tab.url, active: false });
+    }
+    return true;
 }

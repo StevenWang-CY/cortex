@@ -244,4 +244,64 @@ def _normalize_plan_data(data: dict[str, Any]) -> dict[str, Any]:
         elif len(steps) > 3:
             result["micro_steps"] = steps[:3]
 
+    # --- Normalize new actionable fields ---
+
+    # suggested_actions: list of dicts, cap at 10
+    actions = result.get("suggested_actions")
+    if isinstance(actions, list):
+        normalized_actions = []
+        for action in actions[:10]:
+            if isinstance(action, dict) and "action_type" in action:
+                action.setdefault("label", action.get("target", "Action")[:200])
+                action.setdefault("reason", "")
+                action.setdefault("category", "recommended")
+                action.setdefault("reversible", True)
+                action.setdefault("metadata", {})
+                action.setdefault("target", "")
+                # Validate tab_index is int or None
+                ti = action.get("tab_index")
+                if ti is not None:
+                    try:
+                        action["tab_index"] = int(ti)
+                    except (ValueError, TypeError):
+                        action["tab_index"] = None
+                normalized_actions.append(action)
+        result["suggested_actions"] = normalized_actions
+    else:
+        result.pop("suggested_actions", None)
+
+    # error_analysis: optional dict
+    ea = result.get("error_analysis")
+    if ea is not None:
+        if not isinstance(ea, dict) or "error_type" not in ea or "root_cause" not in ea:
+            result.pop("error_analysis", None)
+        else:
+            ea.setdefault("suggested_fix", "")
+            ea.setdefault("search_query", "")
+            ea.setdefault("relevant_doc_url", "")
+
+    # tab_recommendations: optional dict with tabs list
+    tr = result.get("tab_recommendations")
+    if tr is not None:
+        if isinstance(tr, dict):
+            tabs = tr.get("tabs")
+            if isinstance(tabs, list):
+                valid_tabs = []
+                for t in tabs:
+                    if isinstance(t, dict) and "tab_index" in t and "action" in t:
+                        try:
+                            t["tab_index"] = int(t["tab_index"])
+                        except (ValueError, TypeError):
+                            continue
+                        t.setdefault("tab_title", "")
+                        t.setdefault("reason", "")
+                        t.setdefault("relevance_score", 0.5)
+                        valid_tabs.append(t)
+                tr["tabs"] = valid_tabs
+            else:
+                tr["tabs"] = []
+            tr.setdefault("summary", "")
+        else:
+            result.pop("tab_recommendations", None)
+
     return result

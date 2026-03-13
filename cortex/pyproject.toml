@@ -78,6 +78,7 @@ dev = [
     # Development utilities
     "ipython>=8.20.0",
     "rich>=13.7.0",
+    "pyinstaller>=6.6.0",
 ]
 
 [project.scripts]

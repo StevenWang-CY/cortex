@@ -14,17 +14,8 @@
 
 const CORTEX_OVERLAY_ID = "cortex-somatic-overlay";
 const MAX_TEXT_CHARS = 8000; // ~2000 tokens
-const DIM_COLOR = "rgba(0, 0, 0, 0.7)";
-const ACCENT_COLOR = "#64a0ff";
-const BG_COLOR = "rgba(14, 21, 37, 0.95)";
-const TEXT_COLOR = "#e6f0ff";
-const TEXT_SECONDARY = "#a0b4d2";
 
-// Breathing pacer timing
-const INHALE_S = 4;
-const HOLD_S = 7;
-const EXHALE_S = 8;
-const CYCLE_S = INHALE_S + HOLD_S + EXHALE_S;
+// Overlay auto-dismiss timeout (5 minutes)
 
 // --- Overlay Management ---
 
@@ -113,6 +104,9 @@ function removeOverlay(): void {
 
 /**
  * Show the intervention overlay with Shadow DOM encapsulation.
+ *
+ * Design: a gentle bottom-right panel that slides in with a soft backdrop.
+ * Breathing pacer uses smooth CSS animations. Minimal, warm, and calming.
  */
 function showOverlay(payload: InterventionPayload): void {
     removeOverlay();
@@ -123,7 +117,7 @@ function showOverlay(payload: InterventionPayload): void {
         position: fixed;
         top: 0; left: 0; right: 0; bottom: 0;
         z-index: 2147483647;
-        pointer-events: auto;
+        pointer-events: none;
     `;
 
     const shadow = host.attachShadow({ mode: "closed" });
@@ -133,133 +127,196 @@ function showOverlay(payload: InterventionPayload): void {
     for (let i = 0; i < payload.micro_steps.length; i++) {
         const step = escapeHtml(payload.micro_steps[i]);
         stepsHtml += `
-            <label class="step">
-                <input type="checkbox" id="step-${i}" />
+            <div class="step" id="step-row-${i}">
+                <div class="step-dot" id="step-dot-${i}"></div>
                 <span>${step}</span>
-            </label>`;
+            </div>`;
     }
 
     const dimBg = payload.ui_plan.dim_background;
 
     shadow.innerHTML = `
         <style>
-            * { box-sizing: border-box; margin: 0; padding: 0; }
-
-            .backdrop {
-                position: fixed;
-                top: 0; left: 0; right: 0; bottom: 0;
-                background: ${dimBg ? DIM_COLOR : "transparent"};
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            @keyframes panelIn {
+                from { transform: translateY(12px) scale(.99); opacity: 0; }
+                to   { transform: translateY(0) scale(1); opacity: 1; }
+            }
+            @keyframes fadeIn {
+                from { opacity: 0; }
+                to   { opacity: 1; }
             }
 
-            .card {
-                background: ${BG_COLOR};
-                border-radius: 16px;
-                padding: 28px 32px;
-                max-width: 440px;
-                width: 90%;
-                border-left: 4px solid ${ACCENT_COLOR};
-                box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+
+            .scrim {
+                position: fixed;
+                top: 0; left: 0; right: 0; bottom: 0;
+                background: ${dimBg ? "rgba(0, 0, 0, 0.35)" : "transparent"};
+                pointer-events: ${dimBg ? "auto" : "none"};
+                animation: fadeIn 0.25s ease;
+            }
+
+            .panel {
+                position: fixed;
+                bottom: 20px;
+                right: 20px;
+                width: 340px;
+                max-height: calc(100vh - 40px);
+                overflow-y: auto;
+                pointer-events: auto;
+
+                background: #111113;
+                border-radius: 12px;
+                border: 1px solid rgba(255, 255, 255, 0.06);
+                box-shadow:
+                    0 0 0 .5px rgba(0,0,0,.3),
+                    0 4px 20px rgba(0,0,0,.4),
+                    0 16px 40px rgba(0,0,0,.2);
+
+                font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'SF Pro Text', system-ui, sans-serif;
+                animation: panelIn 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+                color: #e4e4e7;
+            }
+            .panel::-webkit-scrollbar { width: 0; }
+
+            .panel-inner {
+                padding: 18px 16px 14px;
+            }
+
+            .header {
+                display: flex;
+                align-items: flex-start;
+                justify-content: space-between;
+                gap: 12px;
+                margin-bottom: 4px;
             }
 
             .headline {
-                font-size: 20px;
-                font-weight: 700;
-                color: ${TEXT_COLOR};
-                margin-bottom: 8px;
+                font-size: 13px;
+                font-weight: 600;
+                letter-spacing: -0.2px;
+                line-height: 1.4;
+                color: #e4e4e7;
+            }
+
+            .close-btn {
+                flex-shrink: 0;
+                width: 22px;
+                height: 22px;
+                border: none;
+                background: rgba(255, 255, 255, 0.04);
+                border-radius: 6px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                transition: background 0.12s;
+                margin-top: 1px;
+            }
+            .close-btn:hover { background: rgba(255, 255, 255, 0.08); }
+            .close-btn svg {
+                width: 9px; height: 9px;
+                stroke: #71717a; stroke-width: 2;
             }
 
             .summary {
-                font-size: 14px;
-                color: ${TEXT_SECONDARY};
+                font-size: 12px;
+                color: #71717a;
                 line-height: 1.5;
-                margin-bottom: 16px;
+                margin-bottom: 14px;
             }
 
-            .focus {
-                font-size: 14px;
-                color: ${ACCENT_COLOR};
-                margin-bottom: 16px;
+            .divider {
+                height: 1px;
+                background: rgba(255, 255, 255, 0.04);
+                margin: 0 0 12px;
+            }
+
+            .section-label {
+                font-size: 11px;
+                font-weight: 500;
+                color: #71717a;
+                margin-bottom: 6px;
             }
 
             .steps {
-                margin-bottom: 20px;
+                margin-bottom: 14px;
             }
 
             .step {
                 display: flex;
                 align-items: flex-start;
                 gap: 10px;
-                padding: 8px 0;
+                padding: 4px 0;
                 cursor: pointer;
-                color: ${TEXT_COLOR};
-                font-size: 14px;
+                transition: opacity 0.2s;
+            }
+            .step.done span {
+                color: #3f3f46;
+                text-decoration: line-through;
+                text-decoration-color: rgba(255,255,255,.06);
             }
 
-            .step input[type="checkbox"] {
-                margin-top: 3px;
-                accent-color: ${ACCENT_COLOR};
+            .step-dot {
+                flex-shrink: 0;
                 width: 16px;
                 height: 16px;
+                border-radius: 50%;
+                border: 1.5px solid #3f3f46;
+                margin-top: 1px;
+                transition: all 0.2s ease;
+                position: relative;
+            }
+            .step.done .step-dot {
+                background: #10b981;
+                border-color: #10b981;
+            }
+            .step.done .step-dot::after {
+                content: '';
+                position: absolute;
+                top: 3px; left: 4.5px;
+                width: 4px; height: 7px;
+                border: solid white;
+                border-width: 0 1.5px 1.5px 0;
+                transform: rotate(45deg);
             }
 
             .step span {
-                line-height: 1.4;
-            }
-
-            .pacer {
-                text-align: center;
-                margin: 20px 0;
-            }
-
-            .pacer canvas {
-                display: block;
-                margin: 0 auto 8px;
-            }
-
-            .pacer-label {
-                font-size: 15px;
-                font-weight: 600;
-                color: ${TEXT_COLOR};
-            }
-
-            .pacer-timer {
                 font-size: 12px;
-                color: ${TEXT_SECONDARY};
+                line-height: 1.5;
+                color: #e4e4e7;
             }
 
+            /* Dismiss */
             .dismiss-btn {
                 display: block;
                 width: 100%;
-                padding: 10px;
-                border: 1px solid rgba(255,255,255,0.15);
-                border-radius: 8px;
-                background: rgba(255,255,255,0.06);
-                color: ${TEXT_COLOR};
+                padding: 6px;
+                border: none;
+                border-radius: 6px;
+                background: none;
+                color: #3f3f46;
                 cursor: pointer;
-                font-size: 14px;
-                transition: background 0.2s;
+                font-size: 11px;
+                font-family: inherit;
+                transition: color 0.12s;
             }
-
-            .dismiss-btn:hover {
-                background: rgba(255,255,255,0.12);
-            }
+            .dismiss-btn:hover { color: #71717a; }
         </style>
 
-        <div class="backdrop" id="backdrop">
-            <div class="card">
-                <div class="headline">${escapeHtml(payload.headline)}</div>
-                <div class="summary">${escapeHtml(payload.situation_summary)}</div>
-                <div class="focus"><strong>Focus:</strong> ${escapeHtml(payload.primary_focus)}</div>
-                <div class="steps">${stepsHtml}</div>
-                <div class="pacer">
-                    <canvas id="pacer-canvas" width="120" height="120"></canvas>
-                    <div class="pacer-label" id="pacer-label">Inhale</div>
-                    <div class="pacer-timer" id="pacer-timer">4s</div>
+        <div class="scrim" id="scrim"></div>
+        <div class="panel" id="panel">
+            <div class="panel-inner">
+                <div class="header">
+                    <div class="headline">${escapeHtml(payload.headline)}</div>
+                    <button class="close-btn" id="close-btn" aria-label="Close">
+                        <svg viewBox="0 0 10 10" fill="none"><path d="M1 1l8 8M9 1l-8 8"/></svg>
+                    </button>
                 </div>
+                <div class="summary">${escapeHtml(payload.situation_summary)}</div>
+                <div class="divider"></div>
+                <div class="section-label">Next steps</div>
+                <div class="steps">${stepsHtml}</div>
                 <button class="dismiss-btn" id="dismiss-btn">Dismiss</button>
             </div>
         </div>
@@ -269,114 +326,35 @@ function showOverlay(payload: InterventionPayload): void {
 
     // --- Event Handlers ---
 
-    const dismissBtn = shadow.getElementById("dismiss-btn");
-    if (dismissBtn) {
-        dismissBtn.addEventListener("click", () => {
-            sendUserAction("dismissed", payload.intervention_id);
-            removeOverlay();
-        });
-    }
+    const dismiss = () => {
+        sendUserAction("dismissed", payload.intervention_id);
+        removeOverlay();
+        document.removeEventListener("keydown", escHandler);
+    };
 
-    // Escape key dismissal
+    const closeBtn = shadow.getElementById("close-btn");
+    if (closeBtn) closeBtn.addEventListener("click", dismiss);
+
+    const dismissBtn = shadow.getElementById("dismiss-btn");
+    if (dismissBtn) dismissBtn.addEventListener("click", dismiss);
+
     const escHandler = (e: KeyboardEvent) => {
-        if (e.key === "Escape") {
-            sendUserAction("dismissed", payload.intervention_id);
-            removeOverlay();
-            document.removeEventListener("keydown", escHandler);
-        }
+        if (e.key === "Escape") dismiss();
     };
     document.addEventListener("keydown", escHandler);
 
-    // Checkbox engagement
-    const checkboxes = shadow.querySelectorAll('input[type="checkbox"]');
-    checkboxes.forEach((cb) => {
-        cb.addEventListener("change", () => {
-            sendUserAction("engaged", payload.intervention_id);
-        });
-    });
+    // Scrim click to dismiss (if dimmed)
+    const scrim = shadow.getElementById("scrim");
+    if (scrim) scrim.addEventListener("click", dismiss);
 
-    // Backdrop click to dismiss
-    const backdrop = shadow.getElementById("backdrop");
-    if (backdrop) {
-        backdrop.addEventListener("click", (e) => {
-            if (e.target === backdrop) {
-                sendUserAction("dismissed", payload.intervention_id);
-                removeOverlay();
-                document.removeEventListener("keydown", escHandler);
-            }
-        });
-    }
-
-    // --- Breathing Pacer Animation ---
-    const canvas = shadow.getElementById("pacer-canvas") as HTMLCanvasElement;
-    const labelEl = shadow.getElementById("pacer-label");
-    const timerEl = shadow.getElementById("pacer-timer");
-
-    if (canvas && labelEl && timerEl) {
-        const ctx = canvas.getContext("2d");
-        if (ctx) {
-            const startTime = performance.now();
-            let animFrame: number;
-
-            function drawPacer(): void {
-                const elapsed = (performance.now() - startTime) / 1000;
-                const cyclePos = elapsed % CYCLE_S;
-                const w = canvas.width;
-                const h = canvas.height;
-                const cx = w / 2;
-                const cy = h / 2;
-                const maxR = Math.min(w, h) / 2 - 8;
-
-                let phase: string;
-                let remaining: number;
-                let scale: number;
-
-                if (cyclePos < INHALE_S) {
-                    phase = "Inhale";
-                    remaining = INHALE_S - cyclePos;
-                    scale = 0.3 + 0.7 * (cyclePos / INHALE_S);
-                } else if (cyclePos < INHALE_S + HOLD_S) {
-                    phase = "Hold";
-                    remaining = INHALE_S + HOLD_S - cyclePos;
-                    scale = 1.0;
-                } else {
-                    phase = "Exhale";
-                    const exhalePos = cyclePos - INHALE_S - HOLD_S;
-                    remaining = EXHALE_S - exhalePos;
-                    scale = 1.0 - 0.7 * (exhalePos / EXHALE_S);
-                }
-
-                const r = maxR * scale;
-
-                ctx!.clearRect(0, 0, w, h);
-
-                // Layered circles
-                for (let i = 0; i < 3; i++) {
-                    const ri = r - i * 3;
-                    if (ri < 4) break;
-                    const alpha = 0.45 - i * 0.12;
-                    ctx!.beginPath();
-                    ctx!.arc(cx, cy, ri, 0, Math.PI * 2);
-                    ctx!.fillStyle = `rgba(100, 160, 255, ${alpha})`;
-                    ctx!.fill();
-                }
-
-                labelEl!.textContent = phase;
-                timerEl!.textContent = `${Math.ceil(remaining)}s`;
-
-                animFrame = requestAnimationFrame(drawPacer);
-            }
-
-            animFrame = requestAnimationFrame(drawPacer);
-
-            // Clean up animation when overlay is removed
-            const observer = new MutationObserver(() => {
-                if (!document.getElementById(CORTEX_OVERLAY_ID)) {
-                    cancelAnimationFrame(animFrame);
-                    observer.disconnect();
-                }
+    // Click-to-complete steps
+    for (let i = 0; i < payload.micro_steps.length; i++) {
+        const row = shadow.getElementById(`step-row-${i}`);
+        if (row) {
+            row.addEventListener("click", () => {
+                row.classList.toggle("done");
+                sendUserAction("engaged", payload.intervention_id);
             });
-            observer.observe(document.body, { childList: true });
         }
     }
 

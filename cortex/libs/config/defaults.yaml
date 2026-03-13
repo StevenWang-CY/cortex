@@ -2,7 +2,7 @@
 # These values can be overridden by environment variables or .env file
 
 llm:
-  mode: remote
+  mode: azure
   remote:
     host: gwhiz1.cis.upenn.edu
     port: 8800
@@ -12,11 +12,21 @@ llm:
     host: localhost
     port: 11434
     model: llama3.1:8b
+  azure:
+    endpoint: ""
+    api_key: ""
+    api_version: 2025-01-01-preview
+    deployment_name: ""
+    reasoning_deployment_name: ""
+    max_completion_tokens: 1024
+    use_keychain: true
+    keychain_service: cortex.azure_openai
+    keychain_account: default
   model_name: qwen3-8b
   max_tokens: 1024
   temperature: 0.3
   timeout_seconds: 10.0
-  fallback_mode: rule_based
+  fallback_mode: local_ollama
 
 capture:
   device_id: 0

@@ -87,11 +87,25 @@ def create_env_file(
 
 # LLM Configuration
 CORTEX_LLM__MODE={config.llm.mode}
+CORTEX_LLM__AZURE__ENDPOINT={config.llm.azure.endpoint}
+CORTEX_LLM__AZURE__API_KEY={config.llm.azure.api_key}
+CORTEX_LLM__AZURE__API_VERSION={config.llm.azure.api_version}
+CORTEX_LLM__AZURE__DEPLOYMENT_NAME={config.llm.azure.deployment_name}
+CORTEX_LLM__AZURE__REASONING_DEPLOYMENT_NAME={config.llm.azure.reasoning_deployment_name}
+CORTEX_LLM__AZURE__MAX_COMPLETION_TOKENS={config.llm.azure.max_completion_tokens}
+CORTEX_LLM__AZURE__USE_KEYCHAIN={str(config.llm.azure.use_keychain).lower()}
+CORTEX_LLM__AZURE__KEYCHAIN_SERVICE={config.llm.azure.keychain_service}
+CORTEX_LLM__AZURE__KEYCHAIN_ACCOUNT={config.llm.azure.keychain_account}
 CORTEX_LLM__REMOTE__HOST={config.llm.remote.host}
 CORTEX_LLM__REMOTE__PORT={config.llm.remote.port}
 CORTEX_LLM__REMOTE__SSH_TUNNEL={str(config.llm.remote.ssh_tunnel).lower()}
 CORTEX_LLM__REMOTE__SSH_USER={config.llm.remote.ssh_user}
+CORTEX_LLM__LOCAL__HOST={config.llm.local.host}
+CORTEX_LLM__LOCAL__PORT={config.llm.local.port}
+CORTEX_LLM__LOCAL__MODEL={config.llm.local.model}
 CORTEX_LLM__MODEL_NAME={config.llm.model_name}
+CORTEX_LLM__MAX_TOKENS={config.llm.max_tokens}
+CORTEX_LLM__TEMPERATURE={config.llm.temperature}
 CORTEX_LLM__TIMEOUT_SECONDS={config.llm.timeout_seconds}
 CORTEX_LLM__FALLBACK_MODE={config.llm.fallback_mode}
 

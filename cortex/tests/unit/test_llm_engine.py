@@ -34,7 +34,8 @@ from cortex.libs.schemas.context import (
 from cortex.libs.schemas.intervention import InterventionPlan, SimplificationConstraints, UIPlan
 from cortex.libs.schemas.state import SignalQuality, StateEstimate, StateScores
 from cortex.services.llm_engine.cache import LLMCache
-from cortex.services.llm_engine.client import LLMError, build_fallback_plan
+from cortex.services.llm_engine.client import LLMError, RuleBasedLLMClient, build_fallback_plan
+from cortex.services.llm_engine.azure_openai import AzureOpenAIClient
 from cortex.services.llm_engine.local_ollama import LocalOllamaClient
 from cortex.services.llm_engine.parser import (
     parse_and_validate,
@@ -628,6 +629,17 @@ def _make_ollama_client():
     return LocalOllamaClient(config=config)
 
 
+def _make_azure_client():
+    config = LLMConfig(mode="azure", timeout_seconds=5.0)
+    config.azure.endpoint = "https://example-resource.openai.azure.com/"
+    config.azure.api_key = "test-key"
+    config.azure.deployment_name = "gpt-5-mini"
+    config.azure.reasoning_deployment_name = "gpt-5-mini-reasoning"
+    config.azure.api_version = "2025-01-01-preview"
+    config.fallback_mode = "local_ollama"
+    return AzureOpenAIClient(config=config)
+
+
 @pytest.mark.asyncio
 async def test_ollama_generate_plan_success():
     client = _make_ollama_client()
@@ -668,6 +680,69 @@ async def test_ollama_health_check_failure():
 
 
 # ===========================================================================
+# AzureOpenAIClient Tests (mocked HTTP)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_azure_generate_plan_success():
+    client = _make_azure_client()
+    ctx = _make_context()
+    state = _make_state()
+    api_response = {"choices": [{"message": {"content": VALID_PLAN_JSON}}]}
+    mock_resp = _mock_response(200, api_response)
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock, return_value=mock_resp) as post_mock:
+        plan = await client.generate_intervention_plan(ctx, state)
+    assert isinstance(plan, InterventionPlan)
+    assert plan.level == "simplified_workspace"
+    sent_payload = post_mock.await_args.kwargs["json"]
+    assert "max_completion_tokens" in sent_payload
+    assert "max_tokens" not in sent_payload
+
+
+@pytest.mark.asyncio
+async def test_azure_uses_reasoning_deployment_for_hyper_state():
+    client = _make_azure_client()
+    ctx = _make_context()
+    state = _make_state(state="HYPER", confidence=0.97)
+    api_response = {"choices": [{"message": {"content": VALID_PLAN_JSON}}]}
+    mock_resp = _mock_response(200, api_response)
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock, return_value=mock_resp) as post_mock:
+        await client.generate_intervention_plan(ctx, state)
+    called_url = post_mock.await_args.args[0]
+    assert "gpt-5-mini-reasoning" in called_url
+
+
+@pytest.mark.asyncio
+async def test_azure_falls_back_to_ollama_then_rule_based():
+    client = _make_azure_client()
+    ctx = _make_context()
+    state = _make_state()
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock, side_effect=httpx.ConnectError("refused")):
+        with patch.object(client._ollama, "generate_intervention_plan", AsyncMock(return_value=build_fallback_plan(ctx))) as ollama_mock:
+            plan = await client.generate_intervention_plan(ctx, state)
+    assert plan.level == "overlay_only"
+    ollama_mock.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_azure_health_check_success():
+    client = _make_azure_client()
+    mock_response = httpx.Response(200, json={"data": []})
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=mock_response):
+        assert await client.health_check() is True
+
+
+def test_azure_uses_keychain_when_api_key_missing():
+    config = LLMConfig(mode="azure")
+    config.azure.endpoint = "https://example-resource.openai.azure.com/"
+    config.azure.deployment_name = "gpt-5-mini"
+    with patch("cortex.services.llm_engine.azure_openai.get_keychain_password", return_value="from-keychain"):
+        client = AzureOpenAIClient(config=config)
+        assert client._api_key == "from-keychain"
+
+
+# ===========================================================================
 # LLMError Tests
 # ===========================================================================
 
@@ -694,10 +769,11 @@ class TestImports(unittest.TestCase):
     """Verify all public exports are importable."""
 
     def test_import_client(self):
-        from cortex.services.llm_engine import LLMClient, LLMError, build_fallback_plan
+        from cortex.services.llm_engine import LLMClient, LLMError, RuleBasedLLMClient, build_fallback_plan
 
         assert LLMClient is not None
         assert LLMError is not None
+        assert RuleBasedLLMClient is not None
         assert build_fallback_plan is not None
 
     def test_import_prompts(self):
@@ -731,10 +807,11 @@ class TestImports(unittest.TestCase):
         assert LLMCache is not None
 
     def test_import_clients(self):
-        from cortex.services.llm_engine import LocalOllamaClient, RemoteQwenClient
+        from cortex.services.llm_engine import AzureOpenAIClient, LocalOllamaClient, RemoteQwenClient
 
         assert RemoteQwenClient is not None
         assert LocalOllamaClient is not None
+        assert AzureOpenAIClient is not None
 
 
 if __name__ == "__main__":

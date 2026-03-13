@@ -14,6 +14,7 @@ Tests verify:
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -26,7 +27,7 @@ from cortex.libs.schemas.state import (
     StateScores,
 )
 from cortex.services.api_gateway.app import ServiceRegistry, create_app, registry
-from cortex.services.api_gateway.websocket_server import WebSocketServer, WSMessage
+from cortex.services.api_gateway.websocket_server import WebSocketClient, WebSocketServer, WSMessage
 from cortex.services.intervention_engine.executor import InterventionExecutor
 from cortex.services.intervention_engine.restore import RestoreManager
 
@@ -525,11 +526,15 @@ class TestWSMessage:
             payload={"headline": "Focus on one thing"},
             timestamp=200.0,
             sequence=10,
+            correlation_id="abc123",
+            target_client_types=["vscode"],
         )
         restored = WSMessage.from_json(original.to_json())
         assert restored.type == original.type
         assert restored.payload == original.payload
         assert restored.sequence == original.sequence
+        assert restored.correlation_id == "abc123"
+        assert restored.target_client_types == ["vscode"]
 
 
 class TestWebSocketServer:
@@ -614,6 +619,66 @@ class TestWebSocketServer:
         msg1 = server._make_state_update(estimate)
         msg2 = server._make_state_update(estimate)
         assert msg2.sequence == msg1.sequence + 1
+
+    @pytest.mark.asyncio
+    async def test_request_context_targets_client_and_resolves_response(self):
+        server = WebSocketServer()
+
+        class _MockSocket:
+            def __init__(self) -> None:
+                self.sent: list[str] = []
+
+            async def send(self, raw: str) -> None:
+                self.sent.append(raw)
+
+        socket = _MockSocket()
+        server._clients["c1"] = WebSocketClient(
+            client_id="c1",
+            websocket=socket,
+            client_type="vscode",
+        )
+
+        async def _respond() -> None:
+            while not socket.sent:
+                await asyncio.sleep(0)
+            sent = json.loads(socket.sent[0])
+            server._handle_context_response(
+                WSMessage(
+                    type="CONTEXT_RESPONSE",
+                    payload={"editor_context": {"file_path": "main.py"}},
+                    sequence=sent["sequence"],
+                    correlation_id=sent["correlation_id"],
+                )
+            )
+
+        task = asyncio.create_task(_respond())
+        payload = await server.request_context("vscode", timeout=1.0)
+        await task
+        assert payload["editor_context"]["file_path"] == "main.py"
+
+    @pytest.mark.asyncio
+    async def test_send_restore_broadcasts_restore_message(self):
+        server = WebSocketServer()
+
+        class _MockSocket:
+            def __init__(self) -> None:
+                self.sent: list[str] = []
+
+            async def send(self, raw: str) -> None:
+                self.sent.append(raw)
+
+        socket = _MockSocket()
+        server._clients["c1"] = WebSocketClient(
+            client_id="c1",
+            websocket=socket,
+            client_type="desktop",
+        )
+
+        count = await server.send_restore("int_123", user_action="dismissed")
+        assert count == 1
+        payload = json.loads(socket.sent[0])
+        assert payload["type"] == "INTERVENTION_RESTORE"
+        assert payload["payload"]["intervention_id"] == "int_123"
 
 
 # =============================================================================

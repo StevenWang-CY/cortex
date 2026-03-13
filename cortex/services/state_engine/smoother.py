@@ -85,7 +85,7 @@ class ScoreSmoother:
 
         # Current state
         self._current_state = UserState.FLOW
-        self._state_entered_at: float = 0.0
+        self._state_entered_at: float = time.monotonic()
         self._dwell_seconds: float = 0.0
 
         # Candidate state (being evaluated for transition)
@@ -202,9 +202,10 @@ class ScoreSmoother:
             self._candidate_state = None
             return self._current_state
 
-        # Check exit condition: current state must be below exit threshold
-        if current_score > self._config.exit_threshold:
-            # Current state still strong enough — no transition
+        # Check exit condition: current state must be weaker than dominant state
+        # (dominant must exceed current by at least exit_threshold margin)
+        if current_score > score - self._config.exit_threshold:
+            # Current state still competitive — no transition
             self._candidate_state = None
             return self._current_state
 

@@ -13,7 +13,11 @@ from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
 
 # =============================================================================
 # Sub-configuration Models
@@ -37,14 +41,29 @@ class LLMLocalConfig(BaseModel):
     model: str = "llama3.1:8b"
 
 
+class LLMAzureConfig(BaseModel):
+    """Azure OpenAI configuration."""
+
+    endpoint: str = ""
+    api_key: str = ""
+    api_version: str = "2025-01-01-preview"
+    deployment_name: str = ""
+    reasoning_deployment_name: str = ""
+    max_completion_tokens: int = 1024
+    use_keychain: bool = True
+    keychain_service: str = "cortex.azure_openai"
+    keychain_account: str = "default"
+
+
 class LLMConfig(BaseModel):
     """LLM engine configuration."""
 
     model_config = ConfigDict(protected_namespaces=())
 
-    mode: Literal["remote", "local", "openai_compat"] = "remote"
+    mode: Literal["remote", "local", "azure", "rule_based", "openai_compat"] = "azure"
     remote: LLMRemoteConfig = Field(default_factory=LLMRemoteConfig)
     local: LLMLocalConfig = Field(default_factory=LLMLocalConfig)
+    azure: LLMAzureConfig = Field(default_factory=LLMAzureConfig)
     model_name: str = "qwen3-8b"
     max_tokens: int = 1024
     temperature: float = 0.3
@@ -211,6 +230,8 @@ class CortexConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="CORTEX_",
         env_nested_delimiter="__",
+        env_file=(".env", ".env.local"),
+        env_file_encoding="utf-8",
         extra="ignore",
     )
 
@@ -226,6 +247,33 @@ class CortexConfig(BaseSettings):
     storage: StorageConfig = Field(default_factory=StorageConfig)
     debug: DebugConfig = Field(default_factory=DebugConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            _YamlDefaultsSource(settings_cls),
+            file_secret_settings,
+        )
+
+
+class _YamlDefaultsSource(PydanticBaseSettingsSource):
+    """Expose defaults.yaml as a BaseSettings source with lower precedence than env."""
+
+    def get_field_value(self, field: Any, field_name: str) -> tuple[Any, str, bool]:
+        return None, field_name, False
+
+    def __call__(self) -> dict[str, Any]:
+        return load_yaml_defaults()
 
 
 def load_yaml_defaults() -> dict:
@@ -248,45 +296,7 @@ def get_config() -> CortexConfig:
     Returns:
         CortexConfig: The global configuration instance.
     """
-    yaml_defaults = load_yaml_defaults()
-
-    # Create nested config objects from YAML
-    config_data = {}
-
-    if "llm" in yaml_defaults:
-        config_data["llm"] = LLMConfig(**yaml_defaults["llm"])
-    if "capture" in yaml_defaults:
-        config_data["capture"] = CaptureConfig(**yaml_defaults["capture"])
-    if "state" in yaml_defaults:
-        state_data = yaml_defaults["state"].copy()
-        if "weights" in state_data:
-            state_data["weights"] = StateWeights(**state_data["weights"])
-        config_data["state"] = StateConfig(**state_data)
-    if "intervention" in yaml_defaults:
-        config_data["intervention"] = InterventionConfig(**yaml_defaults["intervention"])
-    if "api" in yaml_defaults:
-        config_data["api"] = APIConfig(**yaml_defaults["api"])
-    if "telemetry" in yaml_defaults:
-        config_data["telemetry"] = TelemetryConfig(**yaml_defaults["telemetry"])
-    if "signal" in yaml_defaults:
-        signal_data = yaml_defaults["signal"].copy()
-        if "rppg" in signal_data:
-            signal_data["rppg"] = RPPGSignalConfig(**signal_data["rppg"])
-        if "blink" in signal_data:
-            signal_data["blink"] = BlinkSignalConfig(**signal_data["blink"])
-        if "posture" in signal_data:
-            signal_data["posture"] = PostureSignalConfig(**signal_data["posture"])
-        config_data["signal"] = SignalConfig(**signal_data)
-    if "landmarks" in yaml_defaults:
-        config_data["landmarks"] = LandmarksConfig(**yaml_defaults["landmarks"])
-    if "storage" in yaml_defaults:
-        config_data["storage"] = StorageConfig(**yaml_defaults["storage"])
-    if "debug" in yaml_defaults:
-        config_data["debug"] = DebugConfig(**yaml_defaults["debug"])
-    if "logging" in yaml_defaults:
-        config_data["logging"] = LoggingConfig(**yaml_defaults["logging"])
-
-    return CortexConfig(**config_data)
+    return CortexConfig()
 
 
 def reset_config() -> None:

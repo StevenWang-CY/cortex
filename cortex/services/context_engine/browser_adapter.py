@@ -45,9 +45,11 @@ class BrowserAdapter:
         self,
         ws_send_fn: Any | None = None,
         ws_receive_fn: Any | None = None,
+        request_context_fn: Any | None = None,
     ) -> None:
         self._ws_send = ws_send_fn
         self._ws_receive = ws_receive_fn
+        self._request_context = request_context_fn
         self._available = False
         self._last_context: BrowserContext | None = None
 
@@ -69,6 +71,24 @@ class BrowserAdapter:
         Returns:
             BrowserContext if extension responds, None otherwise.
         """
+        if self._request_context is not None:
+            try:
+                payload = await asyncio.wait_for(self._request_context("chrome"), timeout=timeout)
+                if not isinstance(payload, dict):
+                    self._available = False
+                    return None
+                browser_payload = payload.get("browser_context", payload)
+                ctx = self._parse_browser_context(
+                    browser_payload if isinstance(browser_payload, dict) else {}
+                )
+                self._available = bool(ctx.active_tab_title or ctx.active_tab_url or ctx.all_tabs)
+                self._last_context = ctx if self._available else None
+                return self._last_context
+            except (asyncio.TimeoutError, ConnectionError, OSError) as e:
+                logger.debug(f"Browser adapter unavailable: {e}")
+                self._available = False
+                return None
+
         if self._ws_send is None or self._ws_receive is None:
             self._available = False
             return None

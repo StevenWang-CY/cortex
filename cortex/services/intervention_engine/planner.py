@@ -104,6 +104,20 @@ def validate_plan(plan: InterventionPlan) -> ValidationResult:
     if plan.level not in valid_levels:
         errors.append(f"invalid level '{plan.level}'")
 
+    # Validate suggested_actions
+    for action in plan.suggested_actions:
+        if action.action_type in ("close_tab", "group_tabs", "bookmark_and_close"):
+            if not action.reversible:
+                errors.append(
+                    f"action {action.action_id} ({action.action_type}) must be reversible"
+                )
+        if not action.label:
+            warnings.append(f"action {action.action_id} has empty label")
+    if len(plan.suggested_actions) > 10:
+        warnings.append(
+            f"excessive suggested_actions ({len(plan.suggested_actions)}), capped at 10"
+        )
+
     # Warnings for unusual but not invalid conditions
     if not plan.hide_targets:
         warnings.append("no hide_targets specified")

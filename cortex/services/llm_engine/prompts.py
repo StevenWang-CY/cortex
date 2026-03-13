@@ -17,15 +17,18 @@ from cortex.libs.schemas.state import StateEstimate
 
 SYSTEM_PROMPT = """\
 You are Cortex, a calm and direct workspace assistant. The user is experiencing \
-cognitive overwhelm while coding/debugging. Your job is to analyze their current \
-workspace context and produce a structured intervention plan.
+cognitive overwhelm while coding/studying. Your job is to analyze their current \
+workspace context and produce a structured intervention plan with ACTIONABLE \
+suggestions the user can execute with one click.
 
 Rules:
-- Only use the provided context. Do not hallucinate file names, line numbers, or errors.
+- Only use the provided context. Do not hallucinate file names, line numbers, URLs, or errors.
 - Identify the ONE immediate bottleneck.
 - Suppress irrelevant details.
 - Return 1-3 concrete micro-steps (not generic advice like "take a break").
-- Specify which workspace elements to hide/fold.
+- Generate suggested_actions: specific executable actions referencing REAL data from the context.
+- For tab actions, use the integer tab_index from the "Tab N:" lines in the context. NEVER fabricate indices.
+- tab_index must be within range [0, N-1] where N = number of tabs shown.
 - Keep the headline under 15 words.
 - Never recommend destructive actions (deleting files, closing unsaved buffers).
 - Output ONLY valid JSON matching the schema below. No markdown, no preamble.
@@ -47,8 +50,50 @@ Output JSON schema:
     "fold_unrelated_code": true,
     "intervention_type": "simplified_workspace"
   },
-  "tone": "direct"
+  "tone": "direct",
+  "suggested_actions": [
+    {
+      "action_type": "close_tab|group_tabs|bookmark_and_close|open_url|search_error|highlight_tab|save_session|copy_to_clipboard|start_timer",
+      "tab_index": 3,
+      "target": "search query, URL to open, or session name (NOT for tab targeting)",
+      "label": "Short button label",
+      "reason": "Why this helps right now",
+      "category": "recommended|optional|informational",
+      "reversible": true,
+      "group_id": "optional grouping key",
+      "metadata": {"tab_title": "...", "search_query": "..."}
+    }
+  ],
+  "error_analysis": {
+    "error_type": "syntax|import|type|runtime|build|test|other",
+    "root_cause": "1-2 sentence root cause",
+    "suggested_fix": "concrete code fix or approach",
+    "search_query": "pre-crafted search query",
+    "relevant_doc_url": "URL if identifiable from context"
+  },
+  "tab_recommendations": {
+    "tabs": [
+      {"tab_index": 0, "tab_title": "...", "action": "keep|close|group|bookmark_and_close", "reason": "...", "relevance_score": 0.9, "group_name": "optional"}
+    ],
+    "summary": "Why these recommendations"
+  }
 }
+
+IMPORTANT: The user will see a PREVIEW of your recommendations before confirming.
+Your output must clearly convey WHAT will happen so the user can approve it.
+- tab_recommendations: show EVERY tab with keep/close/group and a reason — the user \
+sees a preview of "Keep N tabs / Hide N tabs" and confirms with one click.
+- error_analysis: show root cause + suggested_fix — the user sees "Here's what I'll do" and confirms.
+- suggested_actions: these are the EXECUTABLE actions that run when the user confirms.
+
+Rules for suggested_actions (1-5 actions, or omit if none warranted):
+- For close_tab/group_tabs/bookmark_and_close: MUST provide tab_index (integer from context).
+- close_tab must have reversible:true (tabs are grouped, not deleted).
+- search_error: include search_query in metadata.
+- open_url: put the URL in target.
+- Only include error_analysis when errors are present in context.
+- ALWAYS include tab_recommendations when 4+ tabs are listed in context, regardless of mode.
+- For EVERY tab in tab_recommendations, recommend keep/close/group with a reason and relevance_score.
 
 Valid intervention_type values: "overlay_only", "simplified_workspace", "guided_mode"
 Valid tone values: "direct", "supportive", "minimal"
@@ -61,8 +106,20 @@ Valid hide_targets: "browser_tabs_except_active", "terminal_lines_before_last_er
 # ---------------------------------------------------------------------------
 
 _DEBUG_ERROR_SUMMARY = """\
-The user is debugging errors in their code. Condense the terminal error flood \
-into a root cause and a single next action.
+The user is debugging errors. Analyze the error output to identify the root cause.
+
+You MUST generate:
+- error_analysis with: error_type, root_cause, suggested_fix, and a pre-crafted search_query
+- suggested_actions:
+  * A "search_error" action with a well-crafted search query in metadata.search_query
+  * If a documentation URL is identifiable, an "open_url" action
+  * If a relevant StackOverflow tab is already open, a "highlight_tab" action with its tab_index
+- If 4+ tabs are listed below, ALSO generate tab_recommendations for each tab (keep/close/group \
+with reason and relevance_score) so the user can organize their workspace while debugging.
+
+The user will see a PREVIEW of your plan and confirm before execution.
+
+Focus goal: {goal_hint}
 
 {context}
 
@@ -75,6 +132,14 @@ _CODE_FOCUS_REDUCTION = """\
 The user has too much code visible. Identify which code region matters most \
 and what to fold away.
 
+If 4+ browser tabs are listed, ALSO generate tab_recommendations for each tab \
+(keep/close/group with reason and relevance_score) and corresponding close_tab \
+suggested_actions for distraction/social tabs.
+
+The user will see a PREVIEW of your plan and confirm before execution.
+
+Focus goal: {goal_hint}
+
 {context}
 
 State: {state} (confidence {confidence:.0%}, dwelling {dwell:.0f}s)
@@ -83,8 +148,17 @@ Complexity: {complexity:.2f}
 """
 
 _BROWSER_TAB_REDUCTION = """\
-The user has many browser tabs open. Triage tabs by relevance to the current \
-coding task and recommend which to hide.
+The user has many browser tabs open. Analyze EACH tab listed below against \
+the user's current focus goal.
+
+You MUST generate:
+- tab_recommendations: For EVERY tab in the context, recommend keep/close/group \
+with a reason and relevance_score (0-1). Group related tabs (e.g., all StackOverflow \
+tabs about the same topic) under a shared group_name.
+- suggested_actions: Generate close_tab actions (with tab_index) for the least \
+relevant tabs, and group_tabs actions for related tabs that should be grouped.
+
+Focus goal: {goal_hint}
 
 {context}
 
@@ -97,6 +171,17 @@ _MICRO_STEP_PLANNER = """\
 The user is overwhelmed and needs concrete next steps. Generate 1-3 specific, \
 actionable micro-steps based on the current workspace context.
 
+Generate suggested_actions for any steps that can be automated:
+- If there are distraction tabs open, generate close_tab actions with tab_index.
+- If there are errors, generate a search_error action.
+- If the user should focus on a specific tab, generate a highlight_tab action.
+- If 4+ tabs are listed, ALSO generate tab_recommendations for each tab (keep/close/group \
+with reason and relevance_score).
+
+The user will see a PREVIEW of your planned actions and confirm before execution.
+
+Focus goal: {goal_hint}
+
 {context}
 
 State: {state} (confidence {confidence:.0%}, dwelling {dwell:.0f}s)
@@ -107,6 +192,14 @@ Complexity: {complexity:.2f}
 _CALM_OVERLAY_WRITER = """\
 Produce a short, empathetic, non-patronizing intervention message. The user is \
 overwhelmed but still capable — just needs help focusing.
+
+If 4+ browser tabs are listed, generate tab_recommendations for each tab \
+(keep/close/group with reason and relevance_score) and corresponding close_tab \
+suggested_actions for any obviously irrelevant tabs using their tab_index.
+
+The user will see a PREVIEW of your recommendations and confirm before execution.
+
+Focus goal: {goal_hint}
 
 {context}
 
@@ -198,6 +291,15 @@ def build_user_prompt(
             parts.append("Hide terminal history except errors")
         constraints_text = "Constraints: " + "; ".join(parts)
 
+    goal_hint = "Not specified"
+    if context.current_goal_hint:
+        goal_hint = context.current_goal_hint
+    elif (
+        context.browser_context
+        and context.browser_context.focus_goal
+    ):
+        goal_hint = context.browser_context.focus_goal
+
     return template.format(
         context=context.to_llm_context(),
         state=state.state,
@@ -205,6 +307,7 @@ def build_user_prompt(
         dwell=state.dwell_seconds,
         complexity=context.complexity_score,
         constraints_text=constraints_text,
+        goal_hint=goal_hint,
     )
 
 

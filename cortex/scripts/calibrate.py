@@ -150,11 +150,47 @@ def _live_calibration(
         "shoulder_y": [],
     }
 
+    try:
+        import numpy as np
+
+        from cortex.services.capture_service.face_tracker import FaceTracker
+        from cortex.services.kinematics_engine.blink_detector import BlinkDetector
+        from cortex.services.physio_engine.pulse_estimator import PulseEstimator
+        from cortex.services.physio_engine.roi_extractor import RoiExtractor
+        from cortex.services.physio_engine.rppg import extract_bvp
+        from cortex.services.telemetry_engine.feature_aggregator import FeatureAggregator
+        from cortex.services.telemetry_engine.input_hooks import InputHooks
+    except Exception:
+        print("WARNING: Full calibration pipeline unavailable, falling back to simulation")
+        return _simulate_calibration(duration_seconds)
+
+    tracker = FaceTracker(config.capture)
+    extractor = RoiExtractor(config.landmarks)
+    blink_detector = BlinkDetector(
+        blink_config=config.signal.blink,
+        landmarks_config=config.landmarks,
+    )
+    pulse_estimator = PulseEstimator(fs=float(config.capture.fps))
+    input_hooks = InputHooks(config.telemetry)
+    aggregator = FeatureAggregator(input_hooks, config=config.telemetry)
+    rgb_window: list[np.ndarray] = []
+    max_window = max(1, config.signal.rppg.window_seconds * config.capture.fps)
+    last_physio_time = 0.0
+
+    try:
+        tracker.initialize()
+    except Exception as exc:
+        print(f"WARNING: Face tracker failed to initialize ({exc}), falling back to simulation")
+        return _simulate_calibration(duration_seconds)
+
     print(f"\nCalibrating for {duration_seconds}s — please sit calmly and look at the screen")
     print("Press 'q' to abort\n")
 
     start = time.monotonic()
     frame_count = 0
+    hooks_started = input_hooks.start()
+    if not hooks_started:
+        print("INFO: Mouse/keyboard telemetry unavailable; calibration will use camera signals only")
 
     try:
         while True:
@@ -175,35 +211,79 @@ def _live_calibration(
                       f"({frame_count} frames)")
 
             # Basic frame quality check
-            import numpy as np
-
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             brightness = float(np.mean(gray))
 
             if brightness < config.capture.min_brightness:
                 continue  # Skip low-quality frames
 
-            # In live mode, we collect raw brightness as a proxy
-            # (full physio pipeline integration would go here)
-            # For now, store placeholder values that will be
-            # replaced when full pipeline integration is done
-            samples["shoulder_y"].append(0.5)
+            tracking = tracker.process_frame(frame)
+            if not tracking.face_detected or tracking.landmarks_px is None:
+                continue
+
+            roi_frame = extractor.extract(frame, tracking.landmarks_px, elapsed)
+            combined_rgb = roi_frame.combined_rgb()
+            if combined_rgb is not None:
+                rgb_window.append(combined_rgb)
+                if len(rgb_window) > max_window:
+                    rgb_window.pop(0)
+
+            blink_state = blink_detector.update(tracking.landmarks_px, elapsed)
+            if blink_state.blink_rate is not None:
+                samples["blink_rate"].append(blink_state.blink_rate)
+
+            # Approximate neutral shoulder baseline from ear midpoint.
+            ear_mid_y = float(
+                (tracking.landmarks_px[234][1] + tracking.landmarks_px[454][1]) / 2.0
+            ) / float(frame.shape[0])
+            samples["shoulder_y"].append(ear_mid_y)
+
+            if (
+                len(rgb_window) >= max_window
+                and elapsed - last_physio_time >= config.signal.rppg.stride_seconds
+            ):
+                bvp = extract_bvp(np.array(rgb_window, dtype=np.float64), fs=float(config.capture.fps))
+                pulse_estimator.process_window(bvp, timestamp=elapsed)
+                physio = pulse_estimator.get_features(elapsed)
+                if physio.valid and physio.pulse_bpm is not None:
+                    samples["hr"].append(physio.pulse_bpm)
+                if physio.pulse_variability_proxy is not None:
+                    samples["hrv"].append(physio.pulse_variability_proxy)
+                last_physio_time = elapsed
+
+            telemetry = aggregator.build_features(
+                window_seconds=min(config.telemetry.window_seconds, max(1.0, elapsed)),
+                current_time=time.monotonic(),
+            )
+            if telemetry.mouse_velocity_mean > 0.0:
+                samples["mouse_velocity"].append(telemetry.mouse_velocity_mean)
+            if telemetry.mouse_velocity_variance > 0.0:
+                samples["mouse_variance"].append(telemetry.mouse_velocity_variance)
 
             # Check for quit
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 print("\nCalibration aborted by user")
+                input_hooks.stop()
                 cap.release()
                 cv2.destroyAllWindows()
                 sys.exit(1)
 
     finally:
+        input_hooks.stop()
         cap.release()
         cv2.destroyAllWindows()
+        tracker.release()
 
-    # If no real physiological data, generate defaults
-    if not samples["hr"]:
-        print("WARNING: No physiological data captured, using defaults")
+    # Fill missing telemetry baselines conservatively instead of discarding real camera data.
+    if not samples["mouse_velocity"]:
+        samples["mouse_velocity"].append(500.0)
+    if not samples["mouse_variance"]:
+        samples["mouse_variance"].append(10000.0)
+
+    # If the signal path failed entirely, fall back gracefully.
+    if not samples["hr"] and not samples["blink_rate"] and not samples["shoulder_y"]:
+        print("WARNING: No physiological or blink data captured, using defaults")
         return _simulate_calibration(duration_seconds)
 
     return samples
@@ -261,6 +341,11 @@ def save_baselines(
     data = baselines.model_dump(mode="json")
     with open(path, "w") as f:
         json.dump(data, f, indent=2, default=str)
+
+    default_path = path.parent / "default.json"
+    if path != default_path:
+        with open(default_path, "w") as f:
+            json.dump(data, f, indent=2, default=str)
 
     return path
 

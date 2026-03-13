@@ -1,13 +1,8 @@
 /**
  * Cortex Chrome Extension — Popup UI
  *
- * Status dashboard shown when the extension icon is clicked:
- * - Connection status (connected/disconnected to daemon)
- * - Current cognitive state (FLOW/HYPO/HYPER/RECOVERY) + confidence
- * - Estimated heart rate (from signal quality)
- * - Sensitivity slider (1-5 scale)
- * - Quiet mode toggle
- * - Active intervention display
+ * Design: dark, high-end tech aesthetic (Linear/Raycast-inspired).
+ * Monospace numerals, tight spacing, subtle borders, no decoration.
  */
 
 import React, { useCallback, useEffect, useState } from "react";
@@ -15,82 +10,147 @@ import { createRoot } from "react-dom/client";
 
 // --- Types ---
 
+interface Biometrics {
+    heart_rate: number | null;
+    hrv_rmssd: number | null;
+    blink_rate: number | null;
+    forward_lean: number | null;
+}
+
 interface CortexState {
     state: string;
     confidence: number;
     scores: Record<string, number>;
     signal_quality: Record<string, number>;
     dwell_seconds: number;
+    biometrics?: Biometrics;
 }
 
-// --- State Colors ---
+interface FocusSnapshot {
+    elapsedMs: number;
+    focusMs: number;
+    focusPct: number;
+    distractionsBlocked: number;
+    longestStreakMin: number;
+    currentStreakMs: number;
+    goal: string;
+}
 
-const STATE_COLORS: Record<string, string> = {
-    FLOW: "#4CAF50",
-    HYPER: "#F44336",
-    HYPO: "#6495ED",
-    RECOVERY: "#FFC107",
+interface DailyStats {
+    date: string;
+    totalFocusMin: number;
+    totalSessionMin: number;
+    sessions: number;
+    distractionsBlocked: number;
+    longestStreakMin: number;
+}
+
+// --- Design Tokens ---
+
+const C = {
+    bg: "#09090b",
+    surface: "#111113",
+    surfaceHover: "#18181b",
+    border: "rgba(255,255,255,.06)",
+    borderLight: "rgba(255,255,255,.04)",
+    text: "#e4e4e7",
+    textSecondary: "#71717a",
+    textTertiary: "#3f3f46",
+    accent: "#10b981",       // emerald green
+    accentDim: "rgba(16,185,129,.12)",
+    danger: "#ef4444",
+    dangerDim: "rgba(239,68,68,.1)",
+    warn: "#f59e0b",
+    warnDim: "rgba(245,158,11,.1)",
+    blue: "#3b82f6",
+    blueDim: "rgba(59,130,246,.1)",
+    font: "-apple-system, BlinkMacSystemFont, 'Inter', 'SF Pro Text', system-ui, sans-serif",
+    mono: "'SF Mono', 'Fira Code', 'JetBrains Mono', ui-monospace, monospace",
+    radius: 10,
+    radiusSm: 8,
 };
 
-// --- Main Component ---
+const STATE_COLORS: Record<string, string> = {
+    FLOW: C.accent,
+    HYPER: C.danger,
+    HYPO: C.blue,
+    RECOVERY: C.warn,
+};
+
+const STATE_LABELS: Record<string, string> = {
+    FLOW: "Focused",
+    HYPER: "Elevated",
+    HYPO: "Low",
+    RECOVERY: "Recovering",
+};
+
+// --- Main ---
 
 function CortexPopup(): React.ReactElement {
     const [connected, setConnected] = useState(false);
     const [state, setState] = useState<CortexState | null>(null);
-    const [intervention, setIntervention] = useState<Record<
-        string,
-        unknown
-    > | null>(null);
-    const [sensitivity, setSensitivity] = useState(3);
-    const [quietMode, setQuietMode] = useState(false);
+    const [focus, setFocus] = useState<FocusSnapshot | null>(null);
+    const [dailyStats, setDailyStats] = useState<DailyStats | null>(null);
+    const [goalInput, setGoalInput] = useState("");
+    const [alert, setAlert] = useState<{ title: string; body: string } | null>(null);
+    const [activeActions, setActiveActions] = useState<Record<string, unknown>[]>([]);
+    const [tabRecs, setTabRecs] = useState<{ tabs: Record<string, unknown>[]; summary: string } | null>(null);
+    const [errAnalysis, setErrAnalysis] = useState<Record<string, string> | null>(null);
+    const [interventionId, setInterventionId] = useState<string>("");
+    const [applied, setApplied] = useState(false);
 
-    // Load saved settings
     useEffect(() => {
-        chrome.storage.local.get(
-            ["cortex_sensitivity", "cortex_quiet_mode"],
-            (result) => {
-                if (result.cortex_sensitivity !== undefined) {
-                    setSensitivity(result.cortex_sensitivity as number);
-                }
-                if (result.cortex_quiet_mode !== undefined) {
-                    setQuietMode(result.cortex_quiet_mode as boolean);
-                }
-            },
-        );
+        chrome.runtime.sendMessage({ type: "GET_STATE" }, (resp) => {
+            if (!resp) return;
+            setConnected(resp.connected);
+            setState(resp.state);
+            setFocus(resp.focusSession);
+        });
+        chrome.runtime.sendMessage({ type: "GET_DAILY_STATS" }, (stats) => {
+            if (stats) setDailyStats(stats);
+        });
     }, []);
 
-    // Get current state from background
     useEffect(() => {
-        chrome.runtime.sendMessage(
-            { type: "GET_STATE" },
-            (response: {
-                connected: boolean;
-                state: CortexState | null;
-                intervention: Record<string, unknown> | null;
-            }) => {
-                if (response) {
-                    setConnected(response.connected);
-                    setState(response.state);
-                    setIntervention(response.intervention);
-                }
-            },
-        );
-    }, []);
-
-    // Listen for updates from background
-    useEffect(() => {
-        const listener = (message: Record<string, unknown>) => {
-            switch (message.type) {
+        const listener = (msg: Record<string, unknown>) => {
+            switch (msg.type) {
                 case "CONNECTION_CHANGED":
-                    setConnected(message.connected as boolean);
+                    setConnected(msg.connected as boolean);
                     break;
                 case "STATE_UPDATE":
-                    setState(message.payload as CortexState);
+                    setState(msg.payload as CortexState);
+                    if (msg.focusSession) setFocus(msg.focusSession as FocusSnapshot);
                     break;
-                case "INTERVENTION_TRIGGER":
-                    setIntervention(
-                        message.payload as Record<string, unknown>,
-                    );
+                case "FOCUS_SESSION_STARTED":
+                    break;
+                case "FOCUS_SESSION_ENDED":
+                    setFocus(null);
+                    chrome.runtime.sendMessage({ type: "GET_DAILY_STATS" }, (stats) => {
+                        if (stats) setDailyStats(stats);
+                    });
+                    break;
+                case "HEALTH_ALERT":
+                    setAlert({ title: msg.title as string, body: msg.body as string });
+                    setTimeout(() => setAlert(null), 6000);
+                    break;
+                case "BREAK_SUGGESTED":
+                    setAlert({ title: "Time for a break", body: msg.reason as string });
+                    setTimeout(() => setAlert(null), 8000);
+                    break;
+                case "INTERVENTION_TRIGGER": {
+                    const p = msg.payload as Record<string, unknown>;
+                    setActiveActions((p.suggested_actions as Record<string, unknown>[]) || []);
+                    setTabRecs((p.tab_recommendations as { tabs: Record<string, unknown>[]; summary: string }) || null);
+                    setErrAnalysis((p.error_analysis as Record<string, string>) || null);
+                    setInterventionId(String(p.intervention_id || ""));
+                    setApplied(false);
+                    break;
+                }
+                case "INTERVENTION_RESTORE":
+                    setActiveActions([]);
+                    setTabRecs(null);
+                    setErrAnalysis(null);
+                    setApplied(false);
                     break;
             }
         };
@@ -98,297 +158,441 @@ function CortexPopup(): React.ReactElement {
         return () => chrome.runtime.onMessage.removeListener(listener);
     }, []);
 
-    // Handlers
     const handleConnect = useCallback(() => {
         chrome.runtime.sendMessage({ type: "CONNECT" });
     }, []);
 
-    const handleDisconnect = useCallback(() => {
-        chrome.runtime.sendMessage({ type: "DISCONNECT" });
+    const handleStartFocus = useCallback(() => {
+        chrome.runtime.sendMessage({
+            type: "START_FOCUS",
+            goal: goalInput || "Study session",
+        });
+        setGoalInput("");
+    }, [goalInput]);
+
+    const handleStopFocus = useCallback(() => {
+        chrome.runtime.sendMessage({ type: "STOP_FOCUS" });
     }, []);
 
-    const handleSensitivityChange = useCallback(
-        (e: React.ChangeEvent<HTMLInputElement>) => {
-            const value = parseInt(e.target.value, 10);
-            setSensitivity(value);
-            chrome.storage.local.set({ cortex_sensitivity: value });
-        },
-        [],
-    );
+    // Derived
+    const stateStr = state?.state ?? "";
+    const stateColor = STATE_COLORS[stateStr] || C.textTertiary;
+    const stateLabel = STATE_LABELS[stateStr] || "Idle";
+    const hr = state?.biometrics?.heart_rate;
+    const hrv = state?.biometrics?.hrv_rmssd;
+    const blink = state?.biometrics?.blink_rate;
 
-    const handleQuietModeChange = useCallback(
-        (e: React.ChangeEvent<HTMLInputElement>) => {
-            const checked = e.target.checked;
-            setQuietMode(checked);
-            chrome.storage.local.set({ cortex_quiet_mode: checked });
-        },
-        [],
-    );
+    const focusMin = focus ? Math.round(focus.focusMs / 60000) : 0;
+    const elapsedMin = focus ? Math.round(focus.elapsedMs / 60000) : 0;
+    const streakSec = focus ? Math.round(focus.currentStreakMs / 1000) : 0;
+    const streakMin = Math.floor(streakSec / 60);
+    const streakRemSec = streakSec % 60;
 
-    const handleDismiss = useCallback(() => {
-        if (intervention) {
-            chrome.runtime.sendMessage({
-                type: "USER_ACTION",
-                action: "dismissed",
-                intervention_id: intervention.intervention_id,
-            });
-            setIntervention(null);
-        }
-    }, [intervention]);
-
-    // Derived values
-    const stateStr = state?.state ?? "—";
-    const stateColor = STATE_COLORS[stateStr] ?? "#888";
-    const confPct = state ? Math.round(state.confidence * 100) : 0;
-    const signalQuality = state?.signal_quality?.overall ?? 0;
-    const qualityPct = Math.round(signalQuality * 100);
+    const closeTabs = tabRecs?.tabs?.filter(t => t.action === "close" || t.action === "bookmark_and_close") || [];
+    const keepTabs = tabRecs?.tabs?.filter(t => t.action === "keep") || [];
+    const rec = activeActions.filter(a => a.category === "recommended");
+    const hasIntervention = activeActions.length > 0 || tabRecs || errAnalysis;
 
     return (
-        <div style={styles.container}>
+        <div style={S.root}>
+            {/* Alert */}
+            {alert && (
+                <div style={S.alertBox}>
+                    <div style={S.alertTitle}>{alert.title}</div>
+                    <div style={S.alertBody}>{alert.body}</div>
+                </div>
+            )}
+
             {/* Header */}
-            <div style={styles.header}>
-                <span style={styles.title}>Cortex</span>
-                <span
-                    style={{
-                        ...styles.connDot,
-                        backgroundColor: connected ? "#4CAF50" : "#888",
-                    }}
-                />
+            <div style={S.header}>
+                <div style={S.logoRow}>
+                    <div style={S.logoMark} />
+                    <span style={S.logoText}>cortex</span>
+                </div>
+                {!connected ? (
+                    <button style={S.connectBtn} onClick={handleConnect}>Connect</button>
+                ) : (
+                    <div style={S.statusRow}>
+                        <div style={{ ...S.statusDot, background: stateColor, boxShadow: `0 0 6px ${stateColor}40` }} />
+                        <span style={{ ...S.statusText, color: stateColor }}>{stateLabel}</span>
+                    </div>
+                )}
             </div>
 
-            {/* Connection */}
-            <div style={styles.row}>
-                <span style={styles.label}>
-                    {connected ? "Connected" : "Disconnected"}
-                </span>
-                <button
-                    style={styles.btn}
-                    onClick={connected ? handleDisconnect : handleConnect}
-                >
-                    {connected ? "Disconnect" : "Connect"}
-                </button>
-            </div>
-
-            {/* State */}
-            <div style={styles.stateCard}>
-                <div style={styles.stateRow}>
-                    <div
-                        style={{
-                            ...styles.stateDot,
-                            backgroundColor: stateColor,
-                        }}
+            {/* Start Focus */}
+            {connected && !focus && (
+                <div style={S.section}>
+                    <input
+                        style={S.input}
+                        placeholder="What are you working on?"
+                        value={goalInput}
+                        onChange={(e) => setGoalInput(e.target.value)}
+                        onKeyDown={(e) => e.key === "Enter" && handleStartFocus()}
                     />
-                    <span style={styles.stateLabel}>{stateStr}</span>
-                    <span style={styles.confLabel}>{confPct}%</span>
-                </div>
-                <div style={styles.qualityRow}>
-                    <span style={styles.qualityLabel}>Signal Quality</span>
-                    <div style={styles.qualityBarOuter}>
-                        <div
-                            style={{
-                                ...styles.qualityBarInner,
-                                width: `${qualityPct}%`,
-                                backgroundColor:
-                                    qualityPct >= 70
-                                        ? "#4CAF50"
-                                        : qualityPct >= 40
-                                          ? "#FFC107"
-                                          : "#F44336",
-                            }}
-                        />
-                    </div>
-                    <span style={styles.qualityPct}>{qualityPct}%</span>
-                </div>
-            </div>
-
-            {/* Sensitivity */}
-            <div style={styles.settingRow}>
-                <label style={styles.settingLabel}>
-                    Sensitivity: {sensitivity}
-                </label>
-                <input
-                    type="range"
-                    min="1"
-                    max="5"
-                    value={sensitivity}
-                    onChange={handleSensitivityChange}
-                    style={styles.slider}
-                />
-            </div>
-
-            {/* Quiet Mode */}
-            <div style={styles.settingRow}>
-                <label style={styles.settingLabel}>Quiet Mode</label>
-                <input
-                    type="checkbox"
-                    checked={quietMode}
-                    onChange={handleQuietModeChange}
-                    style={styles.checkbox}
-                />
-            </div>
-
-            {/* Active Intervention */}
-            {intervention && (
-                <div style={styles.interventionCard}>
-                    <div style={styles.interventionHeadline}>
-                        {intervention.headline as string}
-                    </div>
-                    <div style={styles.interventionSummary}>
-                        {intervention.situation_summary as string}
-                    </div>
-                    <button style={styles.dismissBtn} onClick={handleDismiss}>
-                        Dismiss
+                    <button style={S.primaryBtn} onClick={handleStartFocus}>
+                        Start session
                     </button>
+                </div>
+            )}
+
+            {/* Active Focus */}
+            {focus && (
+                <div style={S.card}>
+                    <div style={S.focusHeader}>
+                        <div>
+                            <div style={S.focusGoal}>{focus.goal}</div>
+                            <div style={S.muted}>{elapsedMin}m elapsed</div>
+                        </div>
+                        <button style={S.endBtn} onClick={handleStopFocus}>End</button>
+                    </div>
+
+                    <div style={S.bigRow}>
+                        <span style={S.bigNum}>{focusMin}</span>
+                        <div>
+                            <div style={S.bigLabel}>min focused</div>
+                            <div style={S.muted}>{focus.focusPct}%</div>
+                        </div>
+                    </div>
+
+                    <div style={S.trackOuter}>
+                        <div style={{
+                            ...S.trackFill,
+                            width: `${Math.min(focus.focusPct, 100)}%`,
+                            background: focus.focusPct >= 70 ? C.accent :
+                                focus.focusPct >= 40 ? C.warn : C.danger,
+                        }} />
+                    </div>
+
+                    <div style={S.metricsRow}>
+                        <Metric label="streak" value={streakMin > 0 ? `${streakMin}:${String(streakRemSec).padStart(2, "0")}` : `${streakSec}s`} />
+                        <div style={S.metricDiv} />
+                        <Metric label="blocked" value={String(focus.distractionsBlocked)} />
+                        <div style={S.metricDiv} />
+                        <Metric label="best" value={`${focus.longestStreakMin}m`} />
+                    </div>
+                </div>
+            )}
+
+            {/* Biometrics */}
+            {connected && (
+                <div style={S.card}>
+                    <div style={S.metricsRow}>
+                        <Metric label="bpm" value={hr ? String(Math.round(hr)) : "--"} />
+                        <div style={S.metricDiv} />
+                        <Metric label="hrv" value={hrv ? String(Math.round(hrv)) : "--"} />
+                        <div style={S.metricDiv} />
+                        <Metric label="blinks" value={blink ? String(Math.round(blink)) : "--"} />
+                    </div>
+                </div>
+            )}
+
+            {/* Intervention */}
+            {hasIntervention && (
+                <div style={{ ...S.card, borderColor: "rgba(255,255,255,.08)" }}>
+                    {closeTabs.length > 0 && (
+                        <div style={{ marginBottom: 12 }}>
+                            <div style={S.sectionHead}>Closing {closeTabs.length} tab{closeTabs.length !== 1 ? "s" : ""}</div>
+                            {closeTabs.map((t, i) => (
+                                <div key={`c${i}`} style={S.tabRow}>
+                                    <span style={S.tabXMark}>{"\u00d7"}</span>
+                                    <span style={S.tabName}>{String(t.tab_title || "Untitled")}</span>
+                                </div>
+                            ))}
+                            {keepTabs.length > 0 && (
+                                <div style={S.keepLine}>Keeping <span style={{ color: C.accent }}>{keepTabs.length}</span> you need</div>
+                            )}
+                        </div>
+                    )}
+
+                    {errAnalysis && errAnalysis.root_cause && (
+                        <div style={S.errBox}>
+                            <div style={S.errHead}>Error</div>
+                            <div style={S.errBody}>{errAnalysis.root_cause}</div>
+                            {errAnalysis.suggested_fix && (
+                                <pre style={S.errCode}>{errAnalysis.suggested_fix}</pre>
+                            )}
+                        </div>
+                    )}
+
+                    {!tabRecs && !errAnalysis && rec.length > 0 && (
+                        <div style={{ marginBottom: 10 }}>
+                            {rec.map((a, i) => (
+                                <div key={i} style={S.tabRow}>
+                                    <span style={{ ...S.tabXMark, color: C.textSecondary }}>{"\u2022"}</span>
+                                    <span style={{ ...S.tabName, color: C.text }}>{String(a.label || "")}</span>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+
+                    {rec.length > 0 && (
+                        <>
+                            <button
+                                style={applied ? { ...S.primaryBtn, ...S.doneBtnStyle } : S.primaryBtn}
+                                disabled={applied}
+                                onClick={() => {
+                                    chrome.runtime.sendMessage({
+                                        type: "EXECUTE_ALL_RECOMMENDED",
+                                        actions: rec,
+                                        intervention_id: interventionId,
+                                    }, () => setApplied(true));
+                                }}
+                            >
+                                {applied
+                                    ? "Done"
+                                    : closeTabs.length > 0
+                                        ? `Close ${closeTabs.length} tab${closeTabs.length !== 1 ? "s" : ""}`
+                                        : errAnalysis
+                                            ? "Help me fix this"
+                                            : `Apply ${rec.length} change${rec.length !== 1 ? "s" : ""}`}
+                            </button>
+                            {applied && (
+                                <div style={S.undoRow}>
+                                    <span>Done.</span>
+                                    <button
+                                        style={S.undoLink}
+                                        onClick={() => {
+                                            chrome.runtime.sendMessage(
+                                                { type: "UNDO_ALL_RECENT", intervention_id: interventionId },
+                                                () => setApplied(false),
+                                            );
+                                        }}
+                                    >Undo</button>
+                                </div>
+                            )}
+                        </>
+                    )}
+                </div>
+            )}
+
+            {/* Daily Stats */}
+            {dailyStats && (
+                <div style={S.card}>
+                    <div style={S.sectionHead}>Today</div>
+                    <div style={S.dailyGrid}>
+                        <Metric label="focus" value={String(Math.round(dailyStats.totalFocusMin))} unit="m" />
+                        <Metric label="sessions" value={String(dailyStats.sessions)} />
+                        <Metric label="best" value={String(Math.round(dailyStats.longestStreakMin))} unit="m" />
+                        <Metric label="blocked" value={String(dailyStats.distractionsBlocked)} />
+                    </div>
                 </div>
             )}
         </div>
     );
 }
 
+// --- Metric Component ---
+
+function Metric({ label, value, unit }: { label: string; value: string; unit?: string }): React.ReactElement {
+    return (
+        <div style={S.metric}>
+            <span style={S.metricVal}>
+                {value}
+                {unit && <span style={S.metricUnit}>{unit}</span>}
+            </span>
+            <span style={S.metricLabel}>{label}</span>
+        </div>
+    );
+}
+
 // --- Styles ---
 
-const styles: Record<string, React.CSSProperties> = {
-    container: {
-        width: 320,
-        padding: 16,
-        fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+const S: Record<string, React.CSSProperties> = {
+    root: {
+        width: 340,
+        padding: 14,
+        fontFamily: C.font,
         fontSize: 13,
-        color: "#e6f0ff",
-        background: "#0e1525",
+        color: C.text,
+        background: C.bg,
     },
+
+    // Alert
+    alertBox: {
+        padding: "10px 12px",
+        borderRadius: C.radiusSm,
+        background: C.surface,
+        border: `1px solid ${C.border}`,
+        marginBottom: 10,
+    },
+    alertTitle: { fontSize: 12, fontWeight: 600, marginBottom: 2, color: C.text },
+    alertBody: { fontSize: 11, color: C.textSecondary, lineHeight: 1.5 },
+
+    // Header
     header: {
         display: "flex",
         alignItems: "center",
         justifyContent: "space-between",
-        marginBottom: 12,
+        marginBottom: 14,
+        paddingBottom: 12,
+        borderBottom: `1px solid ${C.borderLight}`,
     },
-    title: {
-        fontSize: 16,
-        fontWeight: 700,
-    },
-    connDot: {
+    logoRow: { display: "flex", alignItems: "center", gap: 7 },
+    logoMark: {
         width: 8,
         height: 8,
         borderRadius: "50%",
-        display: "inline-block",
+        background: `linear-gradient(135deg, ${C.accent}, #059669)`,
+        boxShadow: `0 0 8px ${C.accent}30`,
     },
-    row: {
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "space-between",
-        marginBottom: 12,
-    },
-    label: {
-        color: "#a0b4d2",
-        fontSize: 12,
-    },
-    btn: {
-        padding: "4px 12px",
-        border: "1px solid rgba(255,255,255,0.15)",
-        borderRadius: 4,
-        background: "rgba(255,255,255,0.06)",
-        color: "#e6f0ff",
-        cursor: "pointer",
-        fontSize: 12,
-    },
-    stateCard: {
-        background: "#1a2540",
-        borderRadius: 8,
-        padding: 12,
-        marginBottom: 12,
-    },
-    stateRow: {
-        display: "flex",
-        alignItems: "center",
-        gap: 8,
-        marginBottom: 8,
-    },
-    stateDot: {
-        width: 12,
-        height: 12,
-        borderRadius: "50%",
-    },
-    stateLabel: {
+    logoText: {
+        fontSize: 13,
         fontWeight: 600,
-        flex: 1,
+        letterSpacing: -0.3,
+        color: C.text,
     },
-    confLabel: {
-        color: "#a0b4d2",
-        fontSize: 12,
-    },
-    qualityRow: {
-        display: "flex",
-        alignItems: "center",
-        gap: 8,
-    },
-    qualityLabel: {
+    connectBtn: {
+        padding: "4px 12px",
+        border: `1px solid ${C.border}`,
+        borderRadius: 6,
+        background: "transparent",
+        color: C.textSecondary,
+        cursor: "pointer",
         fontSize: 11,
-        color: "#a0b4d2",
-        whiteSpace: "nowrap" as const,
+        fontWeight: 500,
+        fontFamily: C.font,
     },
-    qualityBarOuter: {
-        flex: 1,
-        height: 6,
-        background: "rgba(255,255,255,0.1)",
-        borderRadius: 3,
+    statusRow: { display: "flex", alignItems: "center", gap: 6 },
+    statusDot: { width: 6, height: 6, borderRadius: "50%", transition: "all 1s" },
+    statusText: { fontSize: 11, fontWeight: 600, fontFamily: C.mono, letterSpacing: 0.5, transition: "color 1s" },
+
+    // Sections
+    section: { marginBottom: 10 },
+    input: {
+        width: "100%",
+        padding: "9px 11px",
+        border: `1px solid ${C.border}`,
+        borderRadius: C.radiusSm,
+        background: C.surface,
+        color: C.text,
+        fontSize: 12,
+        marginBottom: 8,
+        outline: "none",
+        boxSizing: "border-box" as const,
+        fontFamily: C.font,
+    },
+    primaryBtn: {
+        width: "100%",
+        padding: "9px 0",
+        border: "none",
+        borderRadius: C.radiusSm,
+        background: C.text,
+        color: C.bg,
+        fontSize: 12,
+        fontWeight: 600,
+        cursor: "pointer",
+        letterSpacing: -0.1,
+        fontFamily: C.font,
+        transition: "opacity .15s",
+    },
+    doneBtnStyle: {
+        background: C.accent,
+        color: "#fff",
+        cursor: "default",
+        pointerEvents: "none" as const,
+    },
+
+    // Card
+    card: {
+        background: C.surface,
+        borderRadius: C.radius,
+        padding: 12,
+        marginBottom: 8,
+        border: `1px solid ${C.borderLight}`,
+    },
+
+    // Focus
+    focusHeader: {
+        display: "flex",
+        alignItems: "flex-start",
+        justifyContent: "space-between",
+        marginBottom: 14,
+    },
+    focusGoal: { fontSize: 12, fontWeight: 600, color: C.text },
+    muted: { fontSize: 10, color: C.textSecondary, marginTop: 2, fontFamily: C.mono },
+    endBtn: {
+        padding: "3px 10px",
+        border: `1px solid ${C.dangerDim}`,
+        borderRadius: 6,
+        background: C.dangerDim,
+        color: C.danger,
+        cursor: "pointer",
+        fontSize: 10,
+        fontWeight: 600,
+        fontFamily: C.font,
+    },
+    bigRow: { display: "flex", alignItems: "baseline", gap: 8, marginBottom: 10 },
+    bigNum: {
+        fontSize: 36,
+        fontWeight: 200,
+        color: C.accent,
+        letterSpacing: -2,
+        lineHeight: 1,
+        fontFamily: C.mono,
+    },
+    bigLabel: { fontSize: 12, color: C.textSecondary },
+
+    // Progress track
+    trackOuter: {
+        height: 2,
+        borderRadius: 1,
+        background: C.borderLight,
+        marginBottom: 14,
         overflow: "hidden",
     },
-    qualityBarInner: {
+    trackFill: {
         height: "100%",
-        borderRadius: 3,
-        transition: "width 0.3s",
+        borderRadius: 1,
+        transition: "width 1s ease, background 2s ease",
     },
-    qualityPct: {
-        fontSize: 11,
-        color: "#a0b4d2",
-        minWidth: 28,
-        textAlign: "right" as const,
+
+    // Metrics row
+    metricsRow: { display: "flex", alignItems: "center", justifyContent: "space-around" },
+    metric: { display: "flex", flexDirection: "column" as const, alignItems: "center", gap: 2 },
+    metricVal: { fontSize: 15, fontWeight: 400, color: C.text, fontFamily: C.mono },
+    metricUnit: { fontSize: 10, color: C.textSecondary, marginLeft: 1 },
+    metricLabel: { fontSize: 9, color: C.textTertiary, letterSpacing: 0.8, fontFamily: C.mono },
+    metricDiv: { width: 1, height: 16, background: C.borderLight },
+
+    // Intervention
+    sectionHead: { fontSize: 11, fontWeight: 500, color: C.textSecondary, marginBottom: 8 },
+    tabRow: { display: "flex", alignItems: "center", gap: 8, padding: "3px 0" },
+    tabXMark: { color: C.danger, fontSize: 13, fontWeight: 500, width: 14, textAlign: "center" as const, flexShrink: 0, fontFamily: C.mono },
+    tabName: {
+        fontSize: 12, color: C.textSecondary,
+        whiteSpace: "nowrap" as const, overflow: "hidden", textOverflow: "ellipsis" as const,
     },
-    settingRow: {
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "space-between",
-        marginBottom: 8,
+    keepLine: { fontSize: 11, color: C.textTertiary, marginTop: 6 },
+
+    // Error
+    errBox: {
+        padding: "10px 12px",
+        background: C.dangerDim,
+        borderRadius: C.radiusSm,
+        border: `1px solid rgba(239,68,68,.08)`,
+        marginBottom: 12,
     },
-    settingLabel: {
-        fontSize: 12,
-        color: "#a0b4d2",
+    errHead: { fontSize: 10, fontWeight: 600, color: C.danger, marginBottom: 4, fontFamily: C.mono, letterSpacing: 0.5 },
+    errBody: { fontSize: 12, color: C.text, lineHeight: 1.5 },
+    errCode: {
+        fontSize: 11, color: C.textSecondary, marginTop: 8, fontFamily: C.mono,
+        padding: "8px 10px", background: "rgba(0,0,0,.3)", borderRadius: 6, lineHeight: 1.5,
+        whiteSpace: "pre-wrap" as const, border: "none", margin: 0,
     },
-    slider: {
-        width: 120,
-        accentColor: "#64a0ff",
+
+    // Undo
+    undoRow: {
+        display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+        marginTop: 6, fontSize: 11, color: C.textTertiary,
     },
-    checkbox: {
-        accentColor: "#64a0ff",
+    undoLink: {
+        background: "none", border: "none", color: C.blue, fontSize: 11,
+        fontWeight: 500, cursor: "pointer", padding: 0, fontFamily: C.font,
     },
-    interventionCard: {
-        background: "#1a2540",
-        borderRadius: 8,
-        padding: 12,
-        marginTop: 8,
-        borderLeft: "3px solid #64a0ff",
-    },
-    interventionHeadline: {
-        fontWeight: 600,
-        fontSize: 14,
-        marginBottom: 4,
-    },
-    interventionSummary: {
-        fontSize: 12,
-        color: "#a0b4d2",
-        marginBottom: 8,
-        lineHeight: 1.4,
-    },
-    dismissBtn: {
-        padding: "6px 16px",
-        border: "1px solid rgba(255,255,255,0.15)",
-        borderRadius: 4,
-        background: "rgba(255,255,255,0.06)",
-        color: "#e6f0ff",
-        cursor: "pointer",
-        fontSize: 12,
-        width: "100%",
-    },
+
+    // Daily stats
+    dailyGrid: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 4 },
+    dailyItem: { display: "flex", flexDirection: "column" as const, alignItems: "center", gap: 2 },
 };
 
 // --- Mount ---

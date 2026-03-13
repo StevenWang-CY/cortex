@@ -585,6 +585,45 @@ class TestSeedConfig:
         assert args.dry_run is False
 
 
+class TestSettingsLoading:
+    """Tests for dotenv + environment precedence."""
+
+    def test_dotenv_loading_uses_nested_env_names(self, monkeypatch: pytest.MonkeyPatch):
+        from cortex.libs.config.settings import get_config, reset_config
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            monkeypatch.chdir(root)
+            (root / ".env").write_text(
+                "\n".join(
+                    [
+                        "CORTEX_LLM__MODE=azure",
+                        "CORTEX_LLM__AZURE__ENDPOINT=https://dotenv.example/",
+                        "CORTEX_LLM__AZURE__DEPLOYMENT_NAME=gpt-5-mini",
+                    ]
+                )
+            )
+            reset_config()
+            config = get_config()
+            assert config.llm.mode == "azure"
+            assert config.llm.azure.endpoint == "https://dotenv.example/"
+            assert config.llm.azure.deployment_name == "gpt-5-mini"
+            reset_config()
+
+    def test_environment_overrides_dotenv(self, monkeypatch: pytest.MonkeyPatch):
+        from cortex.libs.config.settings import get_config, reset_config
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            monkeypatch.chdir(root)
+            (root / ".env").write_text("CORTEX_LLM__MODE=local\n")
+            monkeypatch.setenv("CORTEX_LLM__MODE", "rule_based")
+            reset_config()
+            config = get_config()
+            assert config.llm.mode == "rule_based"
+            reset_config()
+
+
 # ============================================================================
 # Import tests
 # ============================================================================

@@ -103,7 +103,7 @@ The seed config script creates a default baseline:
 
 ```bash
 python -m cortex.scripts.seed_config
-# Creates storage/baselines/default_baselines.json
+# Creates storage/baselines/default.json
 ```
 
 ## Computation Details

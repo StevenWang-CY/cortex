@@ -51,6 +51,19 @@ _DOC_URL_PATTERNS = re.compile(
     r"|fastapi\.tiangolo\.com|pydantic-docs)",
     re.IGNORECASE,
 )
+_PDF_URL_PATTERNS = re.compile(r"(\.pdf(?:$|\?)|arxiv\.org/pdf/|openreview\.net/pdf)", re.IGNORECASE)
+_PAPER_URL_PATTERNS = re.compile(
+    r"(arxiv\.org/abs/|openreview\.net/forum|acm\.org/doi|ieeexplore\.ieee\.org|paperswithcode\.com/paper)",
+    re.IGNORECASE,
+)
+_REFERENCE_URL_PATTERNS = re.compile(
+    r"(wikipedia\.org|scholar\.google\.com|semanticscholar\.org|doi\.org|dblp\.org)",
+    re.IGNORECASE,
+)
+_DISTRACTION_URL_PATTERNS = re.compile(
+    r"(twitter\.com|x\.com|reddit\.com|facebook\.com|youtube\.com|discord\.com|slack\.com|instagram\.com|tiktok\.com)",
+    re.IGNORECASE,
+)
 
 
 def classify_app(app_name: str | None) -> ActiveApp:
@@ -105,9 +118,12 @@ def classify_mode(
         return "mixed"
 
     if active_app == "chrome" and browser_context is not None:
-        doc_count = browser_context.tab_type_classification.get("documentation", 0)
+        reading_count = sum(
+            browser_context.tab_type_classification.get(kind, 0)
+            for kind in ("documentation", "paper", "pdf", "reference")
+        )
         total = browser_context.tab_count
-        if total > 0 and doc_count / total > 0.5:
+        if total > 0 and reading_count / total > 0.4:
             return "reading_docs"
         return "browsing"
 
@@ -136,6 +152,15 @@ def classify_tab_type(url: str) -> str:
     if "stackoverflow.com" in url_lower or "stackexchange.com" in url_lower:
         return "stackoverflow"
 
+    if _PDF_URL_PATTERNS.search(url_lower):
+        return "pdf"
+
+    if _PAPER_URL_PATTERNS.search(url_lower):
+        return "paper"
+
+    if _REFERENCE_URL_PATTERNS.search(url_lower):
+        return "reference"
+
     if _DOC_URL_PATTERNS.search(url_lower):
         return "documentation"
 
@@ -145,10 +170,11 @@ def classify_tab_type(url: str) -> str:
     if any(s in url_lower for s in ("github.com", "gitlab.com", "bitbucket.org", "codeberg.org")):
         return "code_host"
 
-    if any(s in url_lower for s in (
-        "twitter.com", "x.com", "reddit.com", "facebook.com",
-        "youtube.com", "discord.com", "slack.com",
-    )):
+    if any(s in url_lower for s in ("twitter.com", "x.com", "reddit.com", "facebook.com",
+                                    "youtube.com", "discord.com", "slack.com")):
         return "social"
+
+    if _DISTRACTION_URL_PATTERNS.search(url_lower):
+        return "distraction"
 
     return "other"

@@ -61,6 +61,9 @@ class CortexTrayIcon(QSystemTrayIcon):
     show_dashboard_requested = Signal()
     show_settings_requested = Signal()
     pause_requested = Signal()
+    restore_requested = Signal()
+    snooze_requested = Signal()
+    disable_session_requested = Signal()
     quit_requested = Signal()
 
     def __init__(self, app: QApplication) -> None:
@@ -103,6 +106,18 @@ class CortexTrayIcon(QSystemTrayIcon):
         self._pause_action = QAction("Pause", self._menu)
         self._pause_action.triggered.connect(self.pause_requested.emit)
         self._menu.addAction(self._pause_action)
+
+        restore_action = QAction("Restore Workspace", self._menu)
+        restore_action.triggered.connect(self.restore_requested.emit)
+        self._menu.addAction(restore_action)
+
+        snooze_action = QAction("Snooze 15m", self._menu)
+        snooze_action.triggered.connect(self.snooze_requested.emit)
+        self._menu.addAction(snooze_action)
+
+        disable_action = QAction("Turn Off This Session", self._menu)
+        disable_action.triggered.connect(self.disable_session_requested.emit)
+        self._menu.addAction(disable_action)
 
         # Settings
         settings_action = QAction("Settings", self._menu)

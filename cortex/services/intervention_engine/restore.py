@@ -183,6 +183,34 @@ class RestoreManager:
         now = current_time if current_time is not None else time.monotonic()
         return await self._end_intervention(active, "engaged", now)
 
+    async def snooze(
+        self,
+        intervention_id: str,
+        *,
+        current_time: float | None = None,
+    ) -> InterventionOutcome | None:
+        """Handle user snooze of an intervention."""
+        active = self._active.get(intervention_id)
+        if active is None:
+            return None
+
+        now = current_time if current_time is not None else time.monotonic()
+        return await self._end_intervention(active, "snoozed", now)
+
+    async def cancel(
+        self,
+        intervention_id: str,
+        *,
+        current_time: float | None = None,
+    ) -> InterventionOutcome | None:
+        """Handle system cancellation of an intervention."""
+        active = self._active.get(intervention_id)
+        if active is None:
+            return None
+
+        now = current_time if current_time is not None else time.monotonic()
+        return await self._end_intervention(active, "system_cancelled", now)
+
     async def _end_intervention(
         self,
         active: ActiveIntervention,

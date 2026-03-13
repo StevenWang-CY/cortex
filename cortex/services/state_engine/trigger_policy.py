@@ -48,6 +48,7 @@ class TriggerDecision:
     cooldown_remaining: float  # Seconds until cooldown expires
     quiet_mode_active: bool
     effective_threshold: float  # Adjusted threshold after dismissals
+    context_complexity: float | None = None
 
 
 class TriggerPolicy:
@@ -95,6 +96,8 @@ class TriggerPolicy:
     def evaluate(
         self,
         estimate: StateEstimate,
+        *,
+        context_complexity: float | None = None,
         current_time: float | None = None,
     ) -> TriggerDecision:
         """
@@ -126,6 +129,7 @@ class TriggerPolicy:
                 cooldown_remaining=cooldown_remaining,
                 quiet_mode_active=True,
                 effective_threshold=effective_threshold,
+                context_complexity=context_complexity,
             )
 
         # Check cooldown
@@ -137,6 +141,7 @@ class TriggerPolicy:
                 cooldown_remaining=cooldown_remaining,
                 quiet_mode_active=False,
                 effective_threshold=effective_threshold,
+                context_complexity=context_complexity,
             )
 
         # Check state is HYPER
@@ -148,6 +153,7 @@ class TriggerPolicy:
                 cooldown_remaining=0.0,
                 quiet_mode_active=False,
                 effective_threshold=effective_threshold,
+                context_complexity=context_complexity,
             )
 
         # Check confidence exceeds effective threshold
@@ -159,6 +165,24 @@ class TriggerPolicy:
                 cooldown_remaining=0.0,
                 quiet_mode_active=False,
                 effective_threshold=effective_threshold,
+                context_complexity=context_complexity,
+            )
+
+        if (
+            context_complexity is not None
+            and context_complexity < self._config.complexity_threshold
+        ):
+            return TriggerDecision(
+                should_trigger=False,
+                reason=(
+                    f"Workspace complexity {context_complexity:.2f} below "
+                    f"{self._config.complexity_threshold:.2f}"
+                ),
+                confidence=confidence,
+                cooldown_remaining=0.0,
+                quiet_mode_active=False,
+                effective_threshold=effective_threshold,
+                context_complexity=context_complexity,
             )
 
         # Check signal quality
@@ -170,6 +194,7 @@ class TriggerPolicy:
                 cooldown_remaining=0.0,
                 quiet_mode_active=False,
                 effective_threshold=effective_threshold,
+                context_complexity=context_complexity,
             )
 
         # Check dwell time (must be in HYPER for >= hyper_dwell_seconds)
@@ -183,6 +208,7 @@ class TriggerPolicy:
                 cooldown_remaining=0.0,
                 quiet_mode_active=False,
                 effective_threshold=effective_threshold,
+                context_complexity=context_complexity,
             )
 
         # All conditions met — trigger intervention
@@ -193,6 +219,7 @@ class TriggerPolicy:
             cooldown_remaining=0.0,
             quiet_mode_active=False,
             effective_threshold=effective_threshold,
+            context_complexity=context_complexity,
         )
 
     def record_intervention(self, timestamp: float | None = None) -> None:
@@ -229,15 +256,28 @@ class TriggerPolicy:
                 f"({recent_dismissals} dismissals in {self._config.dismissal_window_minutes} min)"
             )
 
+    def activate_quiet_mode(
+        self,
+        *,
+        duration_minutes: int | None = None,
+        current_time: float | None = None,
+    ) -> None:
+        """Force quiet mode on for an explicit duration."""
+        now = current_time or time.monotonic()
+        minutes = duration_minutes or self._config.quiet_mode_minutes
+        self._quiet_mode_until = now + max(1, minutes) * 60.0
+
+    def clear_quiet_mode(self) -> None:
+        """Disable quiet mode immediately."""
+        self._quiet_mode_until = 0.0
+
     def _compute_effective_threshold(self, now: float) -> float:
         """
         Compute the effective trigger threshold.
 
         Base threshold (0.85) + active dismissal bumps.
         """
-        base = self._config.overlay_threshold  # 0.70 for overlay
-        # But for HYPER intervention trigger, we use the higher threshold
-        base = 0.85  # Per spec: HYPER confidence > 0.85
+        base = self._config.overlay_threshold
 
         # Add active threshold bumps
         total_bump = sum(

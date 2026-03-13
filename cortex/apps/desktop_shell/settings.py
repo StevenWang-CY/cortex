@@ -130,9 +130,10 @@ class SettingsDialog(QWidget):
 
         self._llm_backend = QComboBox()
         self._llm_backend.addItems([
-            "Remote (Qwen-3-8B on gwhiz1)",
+            "Azure OpenAI",
             "Local (Ollama)",
             "Rule-based (no LLM)",
+            "Remote (dev only)",
         ])
         llm_layout.addRow("Backend:", self._llm_backend)
 
@@ -177,7 +178,7 @@ class SettingsDialog(QWidget):
         threshold_offset = (3 - sensitivity) * 0.05
 
         # Map LLM backend combo to mode string
-        llm_modes = ["remote", "local", "rule_based"]
+        llm_modes = ["azure", "local", "rule_based", "remote"]
         llm_mode = llm_modes[self._llm_backend.currentIndex()]
 
         return {

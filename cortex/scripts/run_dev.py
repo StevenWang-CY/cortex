@@ -21,6 +21,7 @@ from typing import Any
 import uvicorn
 
 from cortex.libs.config.settings import CortexConfig, get_config
+from cortex.services.runtime_daemon import CortexDaemon
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +119,7 @@ class DevServer:
         self._processes: list[ServiceProcess] = []
         self._shutdown_event = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
+        self._daemon = CortexDaemon(self.config)
 
     def _setup_signal_handlers(self) -> None:
         """Register signal handlers for graceful shutdown."""
@@ -142,27 +144,11 @@ class DevServer:
             self.config.api.ws_port,
         )
 
-        # Start subprocess-based services
-        api_proc = ServiceProcess(
-            "api-gateway", _run_api_server, (self.config,)
-        )
-        ws_proc = ServiceProcess(
-            "ws-server", _run_ws_server, (self.config,)
-        )
-
-        self._processes = [api_proc, ws_proc]
-        for proc in self._processes:
-            proc.start()
-
-        # Give servers a moment to bind
+        self._tasks = [
+            asyncio.create_task(self._daemon.start(), name="cortex-daemon"),
+        ]
         await asyncio.sleep(0.5)
-
-        # Log service status
-        logger.info(
-            "Services started: api=%s ws=%s",
-            api_proc.alive,
-            ws_proc.alive,
-        )
+        logger.info("Services started: daemon=%s", True)
         logger.info(
             "Cortex dev server ready. Press Ctrl+C to stop."
         )
@@ -174,15 +160,11 @@ class DevServer:
         """Stop all services gracefully."""
         logger.info("Shutting down Cortex services...")
 
-        # Cancel async tasks
+        await self._daemon.stop()
         for task in self._tasks:
             task.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
-
-        # Stop subprocess services
-        for proc in reversed(self._processes):
-            proc.stop()
 
         logger.info("All services stopped.")
 

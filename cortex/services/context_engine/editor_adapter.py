@@ -21,7 +21,7 @@ import json
 import logging
 from typing import Any
 
-from cortex.libs.schemas.context import Diagnostic, EditorContext
+from cortex.libs.schemas.context import Diagnostic, EditorContext, TerminalContext
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,7 @@ class EditorAdapter:
         self,
         ws_send_fn: Any | None = None,
         ws_receive_fn: Any | None = None,
+        request_context_fn: Any | None = None,
     ) -> None:
         """
         Args:
@@ -51,8 +52,10 @@ class EditorAdapter:
         """
         self._ws_send = ws_send_fn
         self._ws_receive = ws_receive_fn
+        self._request_context = request_context_fn
         self._available = False
         self._last_context: EditorContext | None = None
+        self._last_terminal_context: TerminalContext | None = None
 
     @property
     def available(self) -> bool:
@@ -61,6 +64,20 @@ class EditorAdapter:
     @property
     def last_context(self) -> EditorContext | None:
         return self._last_context
+
+    @property
+    def last_terminal_context(self) -> TerminalContext | None:
+        return self._last_terminal_context
+
+    async def get_terminal_context(self) -> TerminalContext | None:
+        """Return latest terminal context captured from the VS Code bridge."""
+        if self._request_context is not None:
+            payload = await self._request_context("vscode")
+            if isinstance(payload, dict):
+                terminal_payload = payload.get("terminal_context")
+                if isinstance(terminal_payload, dict):
+                    self._last_terminal_context = self._parse_terminal_context(terminal_payload)
+        return self._last_terminal_context
 
     async def get_context(self, timeout: float = 2.0) -> EditorContext | None:
         """
@@ -72,6 +89,25 @@ class EditorAdapter:
         Returns:
             EditorContext if extension responds, None otherwise.
         """
+        if self._request_context is not None:
+            try:
+                payload = await asyncio.wait_for(self._request_context("vscode"), timeout=timeout)
+                if not isinstance(payload, dict):
+                    self._available = False
+                    return None
+                editor_payload = payload.get("editor_context", payload)
+                terminal_payload = payload.get("terminal_context")
+                if isinstance(terminal_payload, dict):
+                    self._last_terminal_context = self._parse_terminal_context(terminal_payload)
+                ctx = self._parse_editor_context(editor_payload if isinstance(editor_payload, dict) else {})
+                self._available = bool(ctx.file_path)
+                self._last_context = ctx if self._available else None
+                return self._last_context
+            except (asyncio.TimeoutError, ConnectionError, OSError) as e:
+                logger.debug(f"Editor adapter unavailable: {e}")
+                self._available = False
+                return None
+
         if self._ws_send is None or self._ws_receive is None:
             self._available = False
             return None
@@ -154,7 +190,17 @@ class EditorAdapter:
             visible_code=payload.get("visible_code", ""),
         )
 
+    @staticmethod
+    def _parse_terminal_context(payload: dict) -> TerminalContext:
+        return TerminalContext(
+            last_n_lines=payload.get("last_n_lines", []),
+            detected_errors=payload.get("detected_errors", []),
+            repeated_commands=payload.get("repeated_commands", []),
+            running_command=payload.get("running_command"),
+        )
+
     def reset(self) -> None:
         """Reset adapter state."""
         self._available = False
         self._last_context = None
+        self._last_terminal_context = None

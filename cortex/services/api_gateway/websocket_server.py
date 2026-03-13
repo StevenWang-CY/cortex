@@ -46,6 +46,9 @@ class WSMessage:
     payload: dict[str, Any]
     timestamp: float = field(default_factory=time.monotonic)
     sequence: int = 0
+    correlation_id: str | None = None
+    target_client_types: list[str] | None = None
+    source_client_type: str | None = None
 
     def to_json(self) -> str:
         return json.dumps({
@@ -53,6 +56,9 @@ class WSMessage:
             "payload": self.payload,
             "timestamp": self.timestamp,
             "sequence": self.sequence,
+            "correlation_id": self.correlation_id,
+            "target_client_types": self.target_client_types,
+            "source_client_type": self.source_client_type,
         })
 
     @classmethod
@@ -63,6 +69,9 @@ class WSMessage:
             payload=parsed.get("payload", {}),
             timestamp=parsed.get("timestamp", time.monotonic()),
             sequence=parsed.get("sequence", 0),
+            correlation_id=parsed.get("correlation_id"),
+            target_client_types=parsed.get("target_client_types"),
+            source_client_type=parsed.get("source_client_type"),
         )
 
 
@@ -91,9 +100,11 @@ class WebSocketServer:
 
         # Callbacks for received messages
         self._user_action_callback: Any = None
+        self._settings_callback: Any = None
 
         # Latest state for new connections
         self._latest_state: StateEstimate | None = None
+        self._pending_context_requests: dict[str, asyncio.Future[dict[str, Any]]] = {}
 
     @property
     def client_count(self) -> int:
@@ -110,6 +121,10 @@ class WebSocketServer:
     def set_user_action_callback(self, callback: Any) -> None:
         """Set callback for USER_ACTION messages from extensions."""
         self._user_action_callback = callback
+
+    def set_settings_callback(self, callback: Any) -> None:
+        """Set callback for SETTINGS_SYNC messages from clients."""
+        self._settings_callback = callback
 
     async def start(self) -> bool:
         """
@@ -200,12 +215,18 @@ class WebSocketServer:
 
         if msg.type == "USER_ACTION":
             await self._handle_user_action(client, msg)
+        elif msg.type == "ACTION_EXECUTE":
+            await self._handle_user_action(client, msg)
         elif msg.type == "IDENTIFY":
             # Client identifying its type
             client.client_type = msg.payload.get("client_type", "unknown")
             logger.info(
                 f"Client {client.client_id} identified as {client.client_type}"
             )
+        elif msg.type == "CONTEXT_RESPONSE":
+            self._handle_context_response(msg)
+        elif msg.type == "SETTINGS_SYNC":
+            await self._handle_settings_sync(client, msg)
         else:
             logger.debug(f"Unknown message type from {client.client_id}: {msg.type}")
 
@@ -230,18 +251,44 @@ class WebSocketServer:
             except Exception as e:
                 logger.error(f"User action callback error: {e}")
 
-    async def broadcast_state(self, estimate: StateEstimate) -> int:
+    def _handle_context_response(self, msg: WSMessage) -> None:
+        """Resolve a pending context request."""
+        correlation_id = msg.correlation_id
+        if not correlation_id:
+            return
+        future = self._pending_context_requests.pop(correlation_id, None)
+        if future is not None and not future.done():
+            future.set_result(msg.payload)
+
+    async def _handle_settings_sync(self, client: WebSocketClient, msg: WSMessage) -> None:
+        """Forward settings updates to the daemon."""
+        if self._settings_callback is None:
+            return
+        try:
+            if asyncio.iscoroutinefunction(self._settings_callback):
+                await self._settings_callback(msg.payload)
+            else:
+                self._settings_callback(msg.payload)
+        except Exception as exc:
+            logger.error("Settings callback error from %s: %s", client.client_id, exc)
+
+    async def broadcast_state(
+        self,
+        estimate: StateEstimate,
+        biometrics: dict[str, float | None] | None = None,
+    ) -> int:
         """
         Broadcast STATE_UPDATE to all connected clients.
 
         Args:
             estimate: Current state estimate.
+            biometrics: Optional raw biometric values for ambient UI.
 
         Returns:
             Number of clients successfully sent to.
         """
         self._latest_state = estimate
-        msg = self._make_state_update(estimate)
+        msg = self._make_state_update(estimate, biometrics)
         return await self._broadcast(msg)
 
     async def send_intervention(self, plan: InterventionPlan) -> int:
@@ -257,6 +304,69 @@ class WebSocketServer:
         msg = self._make_intervention_trigger(plan)
         return await self._broadcast(msg)
 
+    async def send_restore(self, intervention_id: str, *, user_action: str) -> int:
+        """Broadcast an explicit restore event to all clients."""
+        self._sequence += 1
+        return await self._broadcast(
+            WSMessage(
+                type="INTERVENTION_RESTORE",
+                payload={
+                    "intervention_id": intervention_id,
+                    "user_action": user_action,
+                },
+                sequence=self._sequence,
+            )
+        )
+
+    async def broadcast_settings(self, settings: dict[str, Any]) -> int:
+        """Broadcast settings to all clients."""
+        self._sequence += 1
+        return await self._broadcast(
+            WSMessage(
+                type="SETTINGS_SYNC",
+                payload=settings,
+                sequence=self._sequence,
+            )
+        )
+
+    async def request_context(
+        self,
+        client_type: str,
+        *,
+        timeout: float = 5.0,
+    ) -> dict[str, Any]:
+        """Request context from the first connected client of a given type."""
+        target = next(
+            (client for client in self._clients.values() if client.client_type == client_type),
+            None,
+        )
+        if target is None:
+            return {}
+
+        self._sequence += 1
+        correlation_id = f"ctx_{client_type}_{self._sequence}"
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self._pending_context_requests[correlation_id] = future
+        message = WSMessage(
+            type="CONTEXT_REQUEST",
+            payload={},
+            sequence=self._sequence,
+            correlation_id=correlation_id,
+            target_client_types=[client_type],
+            source_client_type="daemon",
+        )
+        try:
+            await target.websocket.send(message.to_json())
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            self._pending_context_requests.pop(correlation_id, None)
+            logger.debug("Context request to %s timed out", client_type)
+            return {}
+        except Exception:
+            self._pending_context_requests.pop(correlation_id, None)
+            logger.exception("Context request to %s failed", client_type)
+            return {}
+
     async def _broadcast(self, msg: WSMessage) -> int:
         """Broadcast a message to all connected clients."""
         if not self._clients:
@@ -265,9 +375,12 @@ class WebSocketServer:
         sent = 0
         dead_clients: list[str] = []
 
+        target_types = set(msg.target_client_types or [])
         for client_id, client in self._clients.items():
+            if target_types and client.client_type not in target_types:
+                continue
             try:
-                await client.websocket.send(msg.to_json())
+                await asyncio.wait_for(client.websocket.send(msg.to_json()), timeout=1.0)
                 sent += 1
             except Exception:
                 dead_clients.append(client_id)
@@ -279,30 +392,38 @@ class WebSocketServer:
 
         return sent
 
-    def _make_state_update(self, estimate: StateEstimate) -> WSMessage:
+    def _make_state_update(
+        self,
+        estimate: StateEstimate,
+        biometrics: dict[str, float | None] | None = None,
+    ) -> WSMessage:
         """Create a STATE_UPDATE message."""
         self._sequence += 1
+        payload: dict[str, Any] = {
+            "state": estimate.state,
+            "confidence": estimate.confidence,
+            "scores": {
+                "flow": estimate.scores.flow,
+                "hypo": estimate.scores.hypo,
+                "hyper": estimate.scores.hyper,
+                "recovery": estimate.scores.recovery,
+            },
+            "signal_quality": {
+                "physio": estimate.signal_quality.physio,
+                "kinematics": estimate.signal_quality.kinematics,
+                "telemetry": estimate.signal_quality.telemetry,
+                "overall": estimate.signal_quality.overall,
+            },
+            "dwell_seconds": estimate.dwell_seconds,
+            "reasons": estimate.reasons,
+        }
+        if biometrics:
+            payload["biometrics"] = biometrics
         return WSMessage(
             type="STATE_UPDATE",
-            payload={
-                "state": estimate.state,
-                "confidence": estimate.confidence,
-                "scores": {
-                    "flow": estimate.scores.flow,
-                    "hypo": estimate.scores.hypo,
-                    "hyper": estimate.scores.hyper,
-                    "recovery": estimate.scores.recovery,
-                },
-                "signal_quality": {
-                    "physio": estimate.signal_quality.physio,
-                    "kinematics": estimate.signal_quality.kinematics,
-                    "telemetry": estimate.signal_quality.telemetry,
-                    "overall": estimate.signal_quality.overall,
-                },
-                "dwell_seconds": estimate.dwell_seconds,
-                "reasons": estimate.reasons,
-            },
+            payload=payload,
             sequence=self._sequence,
+            source_client_type="daemon",
         )
 
     def _make_intervention_trigger(
@@ -310,23 +431,31 @@ class WebSocketServer:
     ) -> WSMessage:
         """Create an INTERVENTION_TRIGGER message."""
         self._sequence += 1
+        payload: dict[str, Any] = {
+            "intervention_id": plan.intervention_id,
+            "level": plan.level,
+            "headline": plan.headline,
+            "situation_summary": plan.situation_summary,
+            "primary_focus": plan.primary_focus,
+            "micro_steps": plan.micro_steps,
+            "hide_targets": plan.hide_targets,
+            "ui_plan": plan.ui_plan.model_dump(),
+            "tone": plan.tone,
+            "suggested_actions": [a.model_dump() for a in plan.suggested_actions],
+        }
+        if plan.error_analysis is not None:
+            payload["error_analysis"] = plan.error_analysis.model_dump()
+        if plan.tab_recommendations is not None:
+            payload["tab_recommendations"] = plan.tab_recommendations.model_dump()
         return WSMessage(
             type="INTERVENTION_TRIGGER",
-            payload={
-                "intervention_id": plan.intervention_id,
-                "level": plan.level,
-                "headline": plan.headline,
-                "situation_summary": plan.situation_summary,
-                "primary_focus": plan.primary_focus,
-                "micro_steps": plan.micro_steps,
-                "hide_targets": plan.hide_targets,
-                "ui_plan": plan.ui_plan.model_dump(),
-                "tone": plan.tone,
-            },
+            payload=payload,
             sequence=self._sequence,
+            source_client_type="daemon",
         )
 
     def reset(self) -> None:
         """Reset server state (does not stop the server)."""
         self._sequence = 0
         self._latest_state = None
+        self._pending_context_requests.clear()

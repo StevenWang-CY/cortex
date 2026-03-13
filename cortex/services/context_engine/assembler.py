@@ -193,8 +193,15 @@ class ContextAssembler:
     def _gather_terminal(self) -> TerminalContext | None:
         """Gather terminal context (synchronous)."""
         if self._terminal is None:
+            if self._editor is not None and hasattr(self._editor, "last_terminal_context"):
+                return self._editor.last_terminal_context
             return None
-        return self._terminal.get_context()
+        context = self._terminal.get_context()
+        if context is not None:
+            return context
+        if self._editor is not None and hasattr(self._editor, "last_terminal_context"):
+            return self._editor.last_terminal_context
+        return None
 
     @staticmethod
     def _infer_goal(

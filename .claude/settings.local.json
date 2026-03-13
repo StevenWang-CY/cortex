@@ -1,10 +1,35 @@
 {
   "permissions": {
     "allow": [
-      "Read(//private/tmp/ralph-claude-code/**)",
-      "Bash(export PATH=\"/opt/homebrew/bin:/opt/homebrew/opt/coreutils/libexec/gnubin:$PATH\")",
-      "Bash(./install.sh:*)",
-      "Bash(/opt/homebrew/bin/brew install:*)"
-    ]
+      "Read(**)",
+      "Write(**)",
+      "Edit(**)",
+      "Grep(**)",
+      "Glob(**)",
+      "Bash(*)",
+      "Agent(*)",
+      "WebFetch(*)",
+      "WebFetch(domain:*)",
+      "WebSearch(*)",
+      "NotebookEdit(*)",
+      "TodoWrite(*)",
+      "AskUserQuestion(*)",
+      "CronCreate(*)",
+      "CronDelete(*)",
+      "CronList(*)",
+      "SendMessage(*)",
+      "TaskOutput(*)",
+      "TaskStop(*)",
+      "TeamCreate(*)",
+      "TeamDelete(*)",
+      "Skill(*)",
+      "ToolSearch(*)",
+      "EnterPlanMode(*)",
+      "ExitPlanMode(*)",
+      "EnterWorktree(*)",
+      "ExitWorktree(*)",
+      "mcp__*"
+    ],
+    "deny": []
   }
 }

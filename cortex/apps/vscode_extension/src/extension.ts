@@ -69,6 +69,24 @@ export function activate(context: vscode.ExtensionContext): void {
         }
     });
 
+    wsClient.onRestore((payload) => {
+        if (foldController?.hasPendingFolds) {
+            void foldController.restoreFoldState();
+        }
+        panelProvider?.showPanel();
+        vscode.window.setStatusBarMessage(
+            `Cortex restored workspace (${String(payload.user_action ?? "done")})`,
+            3000,
+        );
+    });
+
+    wsClient.onSettingsSync((payload) => {
+        const quietMode = Boolean(payload.quiet_mode);
+        if (statusBarItem && quietMode) {
+            statusBarItem.tooltip = "Cortex — Quiet mode enabled";
+        }
+    });
+
     // --- Panel provider ---
     panelProvider = new CortexPanelProvider(context.extensionUri, wsClient);
     context.subscriptions.push(

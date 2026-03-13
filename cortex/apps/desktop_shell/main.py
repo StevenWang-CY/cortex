@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import signal
+import subprocess
 import sys
 import threading
 from typing import Any
@@ -25,6 +26,7 @@ from PySide6.QtCore import QObject, QTimer, Signal, Slot
 from PySide6.QtWidgets import QApplication
 
 from cortex.apps.desktop_shell.dashboard import DashboardWindow
+from cortex.apps.desktop_shell.onboarding import OnboardingWindow, onboarding_marker_path
 from cortex.apps.desktop_shell.overlay import OverlayWindow
 from cortex.apps.desktop_shell.settings import SettingsDialog
 from cortex.apps.desktop_shell.tray import CortexTrayIcon
@@ -42,6 +44,8 @@ class WebSocketBridge(QObject):
 
     state_updated = Signal(dict)
     intervention_triggered = Signal(dict)
+    intervention_restored = Signal(dict)
+    settings_synced = Signal(dict)
     connection_changed = Signal(bool)
 
     def __init__(self, host: str = "127.0.0.1", port: int = 9473) -> None:
@@ -77,6 +81,18 @@ class WebSocketBridge(QObject):
         msg = json.dumps({
             "type": "USER_ACTION",
             "payload": {"action": action, "intervention_id": intervention_id},
+            "timestamp": 0,
+            "sequence": 0,
+        })
+        asyncio.run_coroutine_threadsafe(self._send(msg), self._loop)
+
+    def send_settings(self, settings: dict[str, Any]) -> None:
+        """Send SETTINGS_SYNC to the daemon."""
+        if self._loop is None or self._ws is None:
+            return
+        msg = json.dumps({
+            "type": "SETTINGS_SYNC",
+            "payload": settings,
             "timestamp": 0,
             "sequence": 0,
         })
@@ -146,6 +162,10 @@ class WebSocketBridge(QObject):
             self.state_updated.emit(payload)
         elif msg_type == "INTERVENTION_TRIGGER":
             self.intervention_triggered.emit(payload)
+        elif msg_type == "INTERVENTION_RESTORE":
+            self.intervention_restored.emit(payload)
+        elif msg_type == "SETTINGS_SYNC":
+            self.settings_synced.emit(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -167,8 +187,10 @@ class CortexApp:
         self._dashboard: DashboardWindow | None = None
         self._overlay: OverlayWindow | None = None
         self._settings: SettingsDialog | None = None
+        self._onboarding: OnboardingWindow | None = None
         self._bridge: WebSocketBridge | None = None
         self._paused = False
+        self._active_intervention_id: str | None = None
 
     def run(self) -> int:
         """Run the application. Returns exit code."""
@@ -181,12 +203,16 @@ class CortexApp:
         self._dashboard = DashboardWindow()
         self._overlay = OverlayWindow()
         self._settings = SettingsDialog()
+        self._onboarding = OnboardingWindow()
 
         # Create tray icon
         self._tray = CortexTrayIcon(self._app)
         self._tray.show_dashboard_requested.connect(self._show_dashboard)
         self._tray.show_settings_requested.connect(self._show_settings)
         self._tray.pause_requested.connect(self._toggle_pause)
+        self._tray.restore_requested.connect(self._restore_workspace)
+        self._tray.snooze_requested.connect(self._snooze_fifteen_minutes)
+        self._tray.disable_session_requested.connect(self._disable_for_session)
         self._tray.quit_requested.connect(self._quit)
 
         # Create WebSocket bridge
@@ -196,6 +222,8 @@ class CortexApp:
         )
         self._bridge.state_updated.connect(self._on_state_update)
         self._bridge.intervention_triggered.connect(self._on_intervention)
+        self._bridge.intervention_restored.connect(self._on_restore)
+        self._bridge.settings_synced.connect(self._on_settings_synced)
         self._bridge.connection_changed.connect(self._on_connection_changed)
 
         # Connect overlay dismiss to user action
@@ -203,6 +231,9 @@ class CortexApp:
 
         # Connect settings changes
         self._settings.settings_changed.connect(self._on_settings_changed)
+        self._onboarding.open_settings_requested.connect(self._show_settings)
+        self._onboarding.run_calibration_requested.connect(self._run_calibration)
+        self._onboarding.completed.connect(self._complete_onboarding)
 
         # Start WebSocket connection
         self._bridge.start()
@@ -216,6 +247,8 @@ class CortexApp:
 
         # Show tray icon
         self._tray.show()
+        if not onboarding_marker_path().exists():
+            self._onboarding.show()
 
         return self._app.exec()
 
@@ -236,6 +269,7 @@ class CortexApp:
         """Handle INTERVENTION_TRIGGER from daemon."""
         if self._paused:
             return
+        self._active_intervention_id = payload.get("intervention_id")
         if self._overlay is not None:
             self._overlay.show_intervention(payload)
 
@@ -256,7 +290,21 @@ class CortexApp:
     @Slot(dict)
     def _on_settings_changed(self, settings: dict) -> None:
         """Handle settings changes."""
+        if self._bridge is not None:
+            self._bridge.send_settings(settings)
         logger.info(f"Settings updated: {settings}")
+
+    @Slot(dict)
+    def _on_restore(self, payload: dict) -> None:
+        """Handle explicit restore events from the daemon."""
+        self._active_intervention_id = None
+        if self._overlay is not None:
+            self._overlay.hide()
+
+    @Slot(dict)
+    def _on_settings_synced(self, payload: dict) -> None:
+        """Handle settings sync from the daemon."""
+        logger.info(f"Settings synced: {payload}")
 
     def _show_dashboard(self) -> None:
         """Show the dashboard window."""
@@ -272,6 +320,21 @@ class CortexApp:
             self._settings.raise_()
             self._settings.activateWindow()
 
+    def _run_calibration(self) -> None:
+        """Kick off calibration in a detached subprocess."""
+        try:
+            subprocess.Popen([sys.executable, "-m", "cortex.scripts.calibrate"])
+        except OSError as exc:
+            logger.error("Failed to launch calibration: %s", exc)
+
+    def _complete_onboarding(self) -> None:
+        """Mark onboarding complete for future launches."""
+        marker = onboarding_marker_path()
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("completed\n")
+        if self._onboarding is not None:
+            self._onboarding.hide()
+
     def _toggle_pause(self) -> None:
         """Toggle pause/resume state."""
         self._paused = not self._paused
@@ -280,6 +343,31 @@ class CortexApp:
         if self._paused and self._overlay is not None:
             self._overlay.hide()
         logger.info(f"Cortex {'paused' if self._paused else 'resumed'}")
+
+    def _restore_workspace(self) -> None:
+        """Restore the current intervention if one is active."""
+        if self._bridge is not None and self._active_intervention_id:
+            self._bridge.send_user_action("dismissed", self._active_intervention_id)
+
+    def _snooze_fifteen_minutes(self) -> None:
+        """Enable 15-minute quiet mode."""
+        if self._bridge is not None:
+            self._bridge.send_settings({
+                "quiet_mode": True,
+                "quiet_duration_minutes": 15,
+            })
+
+    def _disable_for_session(self) -> None:
+        """Turn off auto-interventions for the rest of the session."""
+        if self._bridge is not None:
+            self._bridge.send_settings({
+                "interventions_enabled": False,
+            })
+        self._paused = True
+        if self._tray is not None:
+            self._tray.set_paused(True)
+        if self._overlay is not None:
+            self._overlay.hide()
 
     def _quit(self) -> None:
         """Quit the application."""

@@ -99,3 +99,18 @@ def build_fallback_plan(context: TaskContext | None = None) -> InterventionPlan:
         ),
         tone="supportive",
     )
+
+
+class RuleBasedLLMClient:
+    """Minimal LLM client that always returns the built-in fallback plan."""
+
+    async def generate_intervention_plan(
+        self,
+        context: TaskContext,
+        state: StateEstimate,
+        constraints: SimplificationConstraints | None = None,
+    ) -> InterventionPlan:
+        return build_fallback_plan(context)
+
+    async def health_check(self) -> bool:
+        return True

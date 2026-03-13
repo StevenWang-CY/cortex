@@ -1,0 +1,18 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Cortex VS Code Extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "runtimeExecutable": "${execPath}",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}/cortex/apps/vscode_extension"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/cortex/apps/vscode_extension/out/**/*.js"
+      ],
+      "preLaunchTask": "compile-cortex-vscode-extension"
+    }
+  ]
+}

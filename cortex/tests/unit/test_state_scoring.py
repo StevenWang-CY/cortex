@@ -500,7 +500,7 @@ class TestTriggerPolicy:
     def test_no_trigger_low_confidence(self):
         """Should not trigger when confidence below threshold."""
         policy = self._make_policy()
-        est = self._make_hyper_estimate(confidence=0.7, dwell=10.0)
+        est = self._make_hyper_estimate(confidence=0.65, dwell=10.0)
         decision = policy.evaluate(est, current_time=200.0)
         assert decision.should_trigger is False
         assert "below threshold" in decision.reason

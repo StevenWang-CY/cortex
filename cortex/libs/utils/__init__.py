@@ -24,6 +24,7 @@ from cortex.libs.utils.platform import (
     is_windows,
     request_camera_permission,
 )
+from cortex.libs.utils.secrets import get_keychain_password
 
 __all__ = [
     # Platform utilities
@@ -48,4 +49,5 @@ __all__ = [
     "with_timeout",
     "retry_async",
     "timeout_context",
+    "get_keychain_password",
 ]

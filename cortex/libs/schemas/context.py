@@ -93,13 +93,18 @@ class TerminalContext(BaseModel):
 class TabInfo(BaseModel):
     """Information about a browser tab."""
 
+    tab_id: int = Field(-1, description="Chrome runtime tab ID for action targeting")
     title: str = Field(..., description="Tab title")
     url: str = Field(..., description="Tab URL")
     tab_type: Literal[
         "documentation",
+        "reference",
+        "paper",
+        "pdf",
         "stackoverflow",
         "search",
         "code_host",
+        "distraction",
         "social",
         "other",
     ] = Field("other", description="Classified tab type")
@@ -120,6 +125,9 @@ class BrowserContext(BaseModel):
     tab_type_classification: dict[str, int] = Field(
         default_factory=dict,
         description="Count of tabs by type",
+    )
+    focus_goal: str | None = Field(
+        None, description="Current focus session goal, if active"
     )
 
     @property
@@ -232,11 +240,97 @@ class TaskContext(BaseModel):
 
         if self.browser_context:
             parts.append("\n--- Browser Context ---")
-            parts.append(f"Tabs: {self.browser_context.tab_count}")
+            parts.append(f"Total tabs: {self.browser_context.tab_count}")
             parts.append(f"Active: {self.browser_context.active_tab_title}")
+            if self.browser_context.focus_goal:
+                parts.append(f"Focus goal: {self.browser_context.focus_goal}")
+
+            # List tabs with integer indices for LLM tab targeting.
+            # Pre-filter to max 30 tabs to stay within token budget.
+            tabs = self.browser_context.all_tabs
+            selected = _select_tabs_for_llm(tabs, max_tabs=30)
+            for idx, tab in selected:
+                parts.append(
+                    f"  Tab {idx}: [{tab.tab_type}] {tab.title[:80]} — {tab.url[:120]}"
+                )
+            remainder = len(tabs) - len(selected)
+            if remainder > 0:
+                type_counts = self.browser_context.tab_type_classification
+                summary_parts = [f"{v} {k}" for k, v in type_counts.items() if v > 0]
+                parts.append(
+                    f"  ... and {remainder} more tabs ({', '.join(summary_parts)})"
+                )
+
             if self.browser_context.active_tab_content_excerpt:
                 parts.append(
                     f"Content: {self.browser_context.active_tab_content_excerpt[:500]}"
                 )
 
         return "\n".join(parts)
+
+
+# Priority order for tab type selection (higher priority types kept first)
+_TAB_TYPE_PRIORITY: dict[str, int] = {
+    "documentation": 0,
+    "reference": 1,
+    "paper": 2,
+    "pdf": 3,
+    "stackoverflow": 4,
+    "code_host": 5,
+    "search": 6,
+    "other": 7,
+    "social": 8,
+    "distraction": 9,
+}
+
+
+def _select_tabs_for_llm(
+    tabs: list[TabInfo], *, max_tabs: int = 30
+) -> list[tuple[int, TabInfo]]:
+    """Select and index tabs for LLM context, capped at *max_tabs*.
+
+    Selection: active tab first, then deduplicate by hostname,
+    then prioritize by tab type (reference/code > distraction).
+    Returns list of ``(original_index, tab)`` tuples.
+    """
+    if len(tabs) <= max_tabs:
+        return list(enumerate(tabs))
+
+    indexed = list(enumerate(tabs))
+    # Active tab always first
+    active = [(i, t) for i, t in indexed if t.is_active]
+    rest = [(i, t) for i, t in indexed if not t.is_active]
+
+    # Deduplicate by hostname (keep first per host)
+    seen_hosts: set[str] = set()
+    for _, t in active:
+        try:
+            host = t.url.split("//", 1)[1].split("/", 1)[0]
+            seen_hosts.add(host)
+        except (IndexError, ValueError):
+            pass
+
+    deduped: list[tuple[int, TabInfo]] = []
+    duplicates: list[tuple[int, TabInfo]] = []
+    for i, t in rest:
+        try:
+            host = t.url.split("//", 1)[1].split("/", 1)[0]
+        except (IndexError, ValueError):
+            host = t.url
+        if host not in seen_hosts:
+            seen_hosts.add(host)
+            deduped.append((i, t))
+        else:
+            duplicates.append((i, t))
+
+    # Sort by type priority (lower = higher priority)
+    deduped.sort(key=lambda x: _TAB_TYPE_PRIORITY.get(x[1].tab_type, 7))
+
+    selected = active + deduped
+    # Fill remaining slots with duplicates if needed
+    remaining_slots = max_tabs - len(selected)
+    if remaining_slots > 0:
+        duplicates.sort(key=lambda x: _TAB_TYPE_PRIORITY.get(x[1].tab_type, 7))
+        selected.extend(duplicates[:remaining_slots])
+
+    return selected[:max_tabs]

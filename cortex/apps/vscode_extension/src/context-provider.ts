@@ -31,6 +31,38 @@ interface ActiveFileInfo {
  * Provides VS Code editor context to the Cortex daemon.
  */
 export class ContextProvider {
+    private _terminalLines: string[] = [];
+    private _commandHistory: string[] = [];
+
+    constructor() {
+        const windowAny = vscode.window as typeof vscode.window & {
+            onDidWriteTerminalData?: (
+                listener: (event: { data: string; terminal: vscode.Terminal }) => void,
+            ) => vscode.Disposable;
+        };
+
+        if (typeof windowAny.onDidWriteTerminalData === "function") {
+            windowAny.onDidWriteTerminalData((event) => {
+                const chunks = event.data
+                    .split(/\r?\n/)
+                    .map((line) => line.trimEnd())
+                    .filter((line) => line.length > 0);
+                for (const chunk of chunks) {
+                    this._terminalLines.push(chunk);
+                    if (this._terminalLines.length > 200) {
+                        this._terminalLines.shift();
+                    }
+                    if (/^\s*(\$|>|%|#)\s+/.test(chunk)) {
+                        this._commandHistory.push(chunk.replace(/^\s*(\$|>|%|#)\s+/, ""));
+                        if (this._commandHistory.length > 50) {
+                            this._commandHistory.shift();
+                        }
+                    }
+                }
+            });
+        }
+    }
+
     /**
      * Get active file path and visible range.
      *
@@ -165,20 +197,44 @@ export class ContextProvider {
      */
     async gatherFullContext(): Promise<Record<string, unknown>> {
         const activeFile = this.getActiveFile();
-        if (!activeFile) {
-            return {};
-        }
-
         const diagnostics = this.getDiagnostics();
         const symbolAtCursor = await this.getSymbolAtCursor();
 
+        const editorContext = activeFile
+            ? {
+                  file_path: activeFile.file_path,
+                  visible_range: activeFile.visible_range,
+                  visible_code: activeFile.visible_code,
+                  symbol_at_cursor: symbolAtCursor,
+                  diagnostics: diagnostics,
+                  recent_edits: [],
+              }
+            : {};
+
         return {
-            file_path: activeFile.file_path,
-            visible_range: activeFile.visible_range,
-            visible_code: activeFile.visible_code,
-            symbol_at_cursor: symbolAtCursor,
-            diagnostics: diagnostics,
-            recent_edits: [],
+            editor_context: editorContext,
+            terminal_context: this.getTerminalContext(),
+        };
+    }
+
+    getTerminalContext(): Record<string, unknown> {
+        const lines = this._terminalLines.slice(-50);
+        const detectedErrors = lines.filter((line) =>
+            /(error:|failed|traceback|exception|command not found|permission denied)/i.test(line),
+        );
+        const repeatedCommands = Array.from(
+            new Set(
+                this._commandHistory.filter(
+                    (command, index, all) => all.indexOf(command) !== index,
+                ),
+            ),
+        );
+
+        return {
+            last_n_lines: lines,
+            detected_errors: detectedErrors.slice(-10),
+            repeated_commands: repeatedCommands,
+            running_command: vscode.window.activeTerminal?.name ?? null,
         };
     }
 
