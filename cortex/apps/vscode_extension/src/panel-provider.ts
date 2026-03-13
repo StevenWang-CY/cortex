@@ -79,6 +79,15 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
         }
     }
 
+    public showMorningBriefing(payload: Record<string, unknown>): void {
+        if (this._view) {
+            this._view.webview.postMessage({
+                type: 'morningBriefing',
+                payload,
+            });
+        }
+    }
+
     /**
      * Clear the current intervention display.
      */
@@ -168,10 +177,18 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                     </label>`;
             }
 
+            const causalExplanation = this._escapeHtml(
+                (payload.causal_explanation as string) ?? "",
+            );
+
             interventionHtml = `
                 <div class="intervention">
                     <h2 class="headline">${headline}</h2>
                     <p class="summary">${summary}</p>
+                    <div class="causal" style="font-size:11px;color:#71717a;margin-top:6px;cursor:pointer;" onclick="this.querySelector('.causal-body').style.display = this.querySelector('.causal-body').style.display === 'none' ? 'block' : 'none'">
+                        <span style="font-weight:500;">Why this?</span> ›
+                        <div class="causal-body" style="display:none;margin-top:4px;line-height:1.5;">${causalExplanation}</div>
+                    </div>
                     <div class="focus">
                         <strong>Focus:</strong> ${focus}
                     </div>

@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from cortex.libs.adapters.registry import AdapterRegistry
 from cortex.libs.schemas.intervention import InterventionPlan
 from cortex.services.intervention_engine.planner import AdapterCommand
 
@@ -76,8 +77,9 @@ class InterventionExecutor:
     Tracks all mutations for restoration. Ensures no destructive operations.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, adapter_registry: AdapterRegistry | None = None) -> None:
         self._adapters: dict[str, WorkspaceAdapter] = {}
+        self._registry: AdapterRegistry | None = adapter_registry
         self._active_mutations: dict[str, list[Mutation]] = {}
         # intervention_id → list of mutations
 
@@ -87,7 +89,21 @@ class InterventionExecutor:
 
     def has_adapter(self, name: str) -> bool:
         """Check if an adapter is registered."""
+        if self._registry is not None and self._registry.has(name):
+            return True
         return name in self._adapters
+
+    def set_registry(self, registry: AdapterRegistry) -> None:
+        """Set the adapter registry for new-style adapters."""
+        self._registry = registry
+
+    def _get_adapter(self, name: str) -> WorkspaceAdapter | None:
+        """Get adapter by name, checking registry first, then legacy dict."""
+        if self._registry is not None:
+            adapter = self._registry.get(name)
+            if adapter is not None:
+                return adapter  # type: ignore[return-value]
+        return self._adapters.get(name)
 
     async def apply(
         self,
@@ -119,7 +135,7 @@ class InterventionExecutor:
                 reverse_action=_REVERSE_ACTIONS.get(cmd.action),
             )
 
-            adapter = self._adapters.get(cmd.adapter)
+            adapter = self._get_adapter(cmd.adapter)
             if adapter is None:
                 logger.warning(
                     "No adapter registered for '%s', skipping %s",
@@ -167,7 +183,7 @@ class InterventionExecutor:
             if not m.success or not m.is_reversible:
                 continue
 
-            adapter = self._adapters.get(m.adapter)
+            adapter = self._get_adapter(m.adapter)
             if adapter is None:
                 continue
 

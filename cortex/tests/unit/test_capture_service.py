@@ -452,6 +452,28 @@ class TestWebcamCapture:
             mock_cap.release.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_default_device_prefers_builtin_macos_camera(self) -> None:
+        """Default camera selection should prefer the built-in macOS camera."""
+        capture = WebcamCapture(CaptureConfig(device_id=None, fps=30))
+
+        with patch("cortex.services.capture_service.webcam.is_macos", return_value=True), \
+             patch(
+                 "cortex.services.capture_service.webcam._list_macos_video_device_names",
+                 return_value=["Logitech BRIO", "FaceTime HD Camera"],
+             ), \
+             patch("cortex.services.capture_service.webcam.cv2.VideoCapture") as MockCap:
+            mock_cap = MagicMock()
+            mock_cap.isOpened.return_value = True
+            mock_cap.read.return_value = (True, make_synthetic_frame())
+            MockCap.return_value = mock_cap
+
+            await capture.start()
+            try:
+                assert MockCap.call_args_list[0].args == (1, cv2.CAP_AVFOUNDATION)
+            finally:
+                await capture.stop()
+
+    @pytest.mark.asyncio
     async def test_start_fails_if_camera_unavailable(self) -> None:
         """Start should raise RuntimeError if camera can't be opened."""
         capture = WebcamCapture()

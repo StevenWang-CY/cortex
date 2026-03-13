@@ -18,6 +18,10 @@ import sys
 import time
 
 from cortex.libs.config.settings import CaptureConfig, get_config
+from cortex.services.capture_service.webcam import (
+    describe_requested_camera,
+    open_video_capture,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,9 +76,9 @@ def _run_capture_loop(
         print("ERROR: opencv-python is required. Install with: pip install opencv-python")
         sys.exit(1)
 
-    cap = cv2.VideoCapture(config.device_id)
-    if not cap.isOpened():
-        print(f"ERROR: Cannot open webcam device {config.device_id}")
+    cap, selection = open_video_capture(config)
+    if cap is None:
+        print(f"ERROR: Cannot open webcam device {describe_requested_camera(config)}")
         sys.exit(1)
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.width)
@@ -88,8 +92,12 @@ def _run_capture_loop(
     start_time = time.monotonic()
     last_frame_time = start_time
 
-    print(f"Capture started: device={config.device_id} "
-          f"resolution={config.width}x{config.height} fps={config.fps}")
+    selected_device = selection.device_id if selection is not None else describe_requested_camera(config)
+    selected_name = f" ({selection.device_name})" if selection and selection.device_name else ""
+    print(
+        f"Capture started: device={selected_device}{selected_name} "
+        f"resolution={config.width}x{config.height} fps={config.fps}"
+    )
     if display:
         print("Press 'q' to quit")
 
@@ -238,7 +246,7 @@ def main() -> None:
     print("=" * 50)
     print("  Cortex Capture Test")
     print("=" * 50)
-    print(f"  Device:     {cap_config.device_id}")
+    print(f"  Device:     {describe_requested_camera(cap_config)}")
     print(f"  Resolution: {cap_config.width}x{cap_config.height}")
     print(f"  Target FPS: {cap_config.fps}")
     print(f"  Display:    {not args.no_display}")

@@ -45,6 +45,41 @@ interface DailyStats {
     longestStreakMin: number;
 }
 
+interface MorningBriefing {
+    summary: string;
+    action_items: string[];
+    left_off_at: string;
+}
+
+/**
+ * Synthesize close_tab actions from tab_recommendations when the LLM
+ * generated recommendations but no matching suggested_actions.
+ */
+function synthesizeActions(
+    actions: Record<string, unknown>[],
+    tabRecs: { tabs: Record<string, unknown>[]; summary: string } | null,
+): Record<string, unknown>[] {
+    if (!tabRecs || !tabRecs.tabs || tabRecs.tabs.length === 0) return actions;
+    const hasClose = actions.some(a => a.action_type === "close_tab" || a.action_type === "bookmark_and_close");
+    if (hasClose) return actions;
+    const closeable = tabRecs.tabs.filter(t => t.action === "close" || t.action === "bookmark_and_close");
+    if (closeable.length === 0) return actions;
+    return [
+        ...actions,
+        ...closeable.map((t, i) => ({
+            action_id: `synth_${Date.now()}_${i}`,
+            action_type: t.action === "bookmark_and_close" ? "bookmark_and_close" : "close_tab",
+            tab_index: typeof t.tab_index === "number" ? t.tab_index : Number(t.tab_index),
+            target: "",
+            label: `Close ${t.tab_title || "tab"}`,
+            reason: t.reason || "",
+            category: "recommended",
+            reversible: true,
+            metadata: {},
+        })),
+    ];
+}
+
 // --- Design Tokens ---
 
 const C = {
@@ -98,6 +133,8 @@ function CortexPopup(): React.ReactElement {
     const [errAnalysis, setErrAnalysis] = useState<Record<string, string> | null>(null);
     const [interventionId, setInterventionId] = useState<string>("");
     const [applied, setApplied] = useState(false);
+    const [causalExplanation, setCausalExplanation] = useState<string>("");
+    const [briefing, setBriefing] = useState<MorningBriefing | null>(null);
 
     useEffect(() => {
         chrome.runtime.sendMessage({ type: "GET_STATE" }, (resp) => {
@@ -105,6 +142,17 @@ function CortexPopup(): React.ReactElement {
             setConnected(resp.connected);
             setState(resp.state);
             setFocus(resp.focusSession);
+            // Load active intervention if one exists
+            if (resp.intervention) {
+                const p = resp.intervention as Record<string, unknown>;
+                const rawActions = (p.suggested_actions as Record<string, unknown>[]) || [];
+                const recs = (p.tab_recommendations as { tabs: Record<string, unknown>[]; summary: string }) || null;
+                setActiveActions(synthesizeActions(rawActions, recs));
+                setTabRecs(recs);
+                setErrAnalysis((p.error_analysis as Record<string, string>) || null);
+                setInterventionId(String(p.intervention_id || ""));
+                setApplied(false);
+            }
         });
         chrome.runtime.sendMessage({ type: "GET_DAILY_STATS" }, (stats) => {
             if (stats) setDailyStats(stats);
@@ -139,10 +187,13 @@ function CortexPopup(): React.ReactElement {
                     break;
                 case "INTERVENTION_TRIGGER": {
                     const p = msg.payload as Record<string, unknown>;
-                    setActiveActions((p.suggested_actions as Record<string, unknown>[]) || []);
-                    setTabRecs((p.tab_recommendations as { tabs: Record<string, unknown>[]; summary: string }) || null);
+                    const rawActions = (p.suggested_actions as Record<string, unknown>[]) || [];
+                    const recs = (p.tab_recommendations as { tabs: Record<string, unknown>[]; summary: string }) || null;
+                    setActiveActions(synthesizeActions(rawActions, recs));
+                    setTabRecs(recs);
                     setErrAnalysis((p.error_analysis as Record<string, string>) || null);
                     setInterventionId(String(p.intervention_id || ""));
+                    setCausalExplanation(String(p.causal_explanation || ""));
                     setApplied(false);
                     break;
                 }
@@ -150,8 +201,18 @@ function CortexPopup(): React.ReactElement {
                     setActiveActions([]);
                     setTabRecs(null);
                     setErrAnalysis(null);
+                    setCausalExplanation("");
                     setApplied(false);
                     break;
+                case "MORNING_BRIEFING": {
+                    const b = msg.payload as Record<string, unknown>;
+                    setBriefing({
+                        summary: String(b.summary || ""),
+                        action_items: (b.action_items as string[]) || [],
+                        left_off_at: String(b.left_off_at || ""),
+                    });
+                    break;
+                }
             }
         };
         chrome.runtime.onMessage.addListener(listener);
@@ -218,6 +279,28 @@ function CortexPopup(): React.ReactElement {
                     </div>
                 )}
             </div>
+
+            {/* Morning Briefing */}
+            {briefing && (
+                <div style={{ ...S.card, borderColor: "rgba(16,185,129,.15)" }}>
+                    <div style={S.sectionHead}>Where you left off</div>
+                    <div style={{ fontSize: 12, color: C.text, lineHeight: 1.5, marginBottom: 8 }}>{briefing.summary}</div>
+                    {briefing.action_items.length > 0 && (
+                        <div style={{ marginBottom: 6 }}>
+                            {briefing.action_items.map((item, i) => (
+                                <div key={i} style={{ ...S.tabRow, padding: "2px 0" }}>
+                                    <span style={{ ...S.tabXMark, color: C.accent }}>{i + 1}.</span>
+                                    <span style={{ fontSize: 11, color: C.textSecondary }}>{item}</span>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                    <button
+                        style={{ ...S.primaryBtn, fontSize: 11, padding: "6px 0" }}
+                        onClick={() => setBriefing(null)}
+                    >Got it</button>
+                </div>
+            )}
 
             {/* Start Focus */}
             {connected && !focus && (
@@ -314,6 +397,12 @@ function CortexPopup(): React.ReactElement {
                         </div>
                     )}
 
+                    {causalExplanation && (
+                        <div style={{ fontSize: 11, color: C.textTertiary, lineHeight: 1.5, marginBottom: 10, fontStyle: "italic" }}>
+                            {causalExplanation}
+                        </div>
+                    )}
+
                     {!tabRecs && !errAnalysis && rec.length > 0 && (
                         <div style={{ marginBottom: 10 }}>
                             {rec.map((a, i) => (
@@ -335,7 +424,21 @@ function CortexPopup(): React.ReactElement {
                                         type: "EXECUTE_ALL_RECOMMENDED",
                                         actions: rec,
                                         intervention_id: interventionId,
-                                    }, () => setApplied(true));
+                                    }, (results: Array<{ success: boolean }> | undefined) => {
+                                        const succeeded = Array.isArray(results) && results.some(r => r.success);
+                                        if (succeeded) {
+                                            // Show "Done" briefly, then clear the intervention card
+                                            setApplied(true);
+                                            setTimeout(() => {
+                                                setActiveActions([]);
+                                                setTabRecs(null);
+                                                setErrAnalysis(null);
+                                                setApplied(false);
+                                            }, 1500);
+                                        } else {
+                                            setApplied(true);
+                                        }
+                                    });
                                 }}
                             >
                                 {applied

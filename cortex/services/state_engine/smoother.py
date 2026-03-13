@@ -85,7 +85,7 @@ class ScoreSmoother:
 
         # Current state
         self._current_state = UserState.FLOW
-        self._state_entered_at: float = time.monotonic()
+        self._state_entered_at: float | None = None
         self._dwell_seconds: float = 0.0
 
         # Candidate state (being evaluated for transition)
@@ -127,7 +127,11 @@ class ScoreSmoother:
         Returns:
             StateEstimate with smoothed state, confidence, and reasons.
         """
-        now = timestamp or time.monotonic()
+        now = timestamp if timestamp is not None else time.monotonic()
+
+        # Initialize state_entered_at on first update
+        if self._state_entered_at is None:
+            self._state_entered_at = now
 
         # Apply EMA smoothing
         self._smoothed.flow = self._ema(self._smoothed.flow, raw_scores.flow)
@@ -285,7 +289,7 @@ class ScoreSmoother:
         """Reset smoother state."""
         self._smoothed = SmoothedScores()
         self._current_state = UserState.FLOW
-        self._state_entered_at = 0.0
+        self._state_entered_at = None
         self._dwell_seconds = 0.0
         self._candidate_state = None
         self._candidate_since = 0.0

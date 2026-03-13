@@ -40,7 +40,7 @@ const PAPER_PATTERNS =
 const REFERENCE_PATTERNS =
     /(wikipedia\.org|scholar\.google\.com|semanticscholar\.org|doi\.org|dblp\.org)/i;
 const DISTRACTION_PATTERNS =
-    /(twitter\.com|x\.com|reddit\.com|facebook\.com|youtube\.com|discord\.com|slack\.com|instagram\.com|tiktok\.com)/i;
+    /(twitter\.com|x\.com|reddit\.com|facebook\.com|youtube\.com|discord\.com|instagram\.com|tiktok\.com|netflix\.com|twitch\.tv|9gag\.com|buzzfeed\.com|tumblr\.com)/i;
 
 /**
  * Classify a tab by its URL into one of the known categories.
@@ -77,6 +77,9 @@ export function classifyTabType(url: string): string {
         u.includes("codeberg.org")
     ) {
         return "code_host";
+    }
+    if (DISTRACTION_PATTERNS.test(u)) {
+        return "distraction";
     }
     return "other";
 }

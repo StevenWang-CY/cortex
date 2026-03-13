@@ -92,7 +92,10 @@ class RuleScorer:
         s3 = self.score_blink_suppression(fv.blink_rate)
         s4 = self.score_posture_collapse(fv.forward_lean_angle, fv.shoulder_drop_ratio)
         s5 = self.score_mouse_thrash(fv.mouse_velocity_variance)
-        s6 = self.score_window_switch(fv.tab_switch_frequency)
+        s6_switch = self.score_window_switch(fv.tab_switch_frequency)
+        s6_thrash = fv.thrashing_score  # 0-1, from focus graph
+        # Blend: thrashing_score is more accurate when available
+        s6 = max(s6_switch, s6_thrash) if s6_thrash > 0.1 else s6_switch
         s7 = self.score_workspace_complexity(fv)
 
         # Weighted sum (weights should sum to 1.0)
@@ -153,6 +156,11 @@ class RuleScorer:
             scores.append(0.3)
         else:
             scores.append(0.0)
+
+        # Screen apnea indicator (low respiration + fixation)
+        apnea = self.score_screen_apnea(fv.respiration_rate, fv.blink_rate)
+        if apnea > 0.3:
+            scores.append(apnea)
 
         if not scores:
             return 0.0
@@ -292,6 +300,28 @@ class RuleScorer:
         # Linear from 8 → 0 maps to 0 → 1
         score = (8.0 - blink_rate) / 8.0
         return float(np.clip(score, 0.0, 1.0))
+
+    def score_screen_apnea(self, respiration_rate: float | None, blink_rate: float | None) -> float:
+        """
+        Score screen apnea: respiration_rate < 8 AND blink suppression.
+        Returns 0-1 indicating screen apnea severity.
+        """
+        if respiration_rate is None:
+            return 0.0
+
+        resp_score = 0.0
+        if respiration_rate < self._baselines.resp_baseline * 0.5:  # < half baseline
+            resp_score = 1.0
+        elif respiration_rate < self._baselines.resp_baseline * 0.7:
+            resp_score = (self._baselines.resp_baseline * 0.7 - respiration_rate) / (self._baselines.resp_baseline * 0.2)
+
+        # Combine with blink suppression (low blink = fixating = apnea risk)
+        blink_score = self.score_blink_suppression(blink_rate)
+
+        # Both must be present for screen apnea
+        if resp_score > 0.3 and blink_score > 0.3:
+            return float(np.clip(0.6 * resp_score + 0.4 * blink_score, 0.0, 1.0))
+        return 0.0
 
     def score_posture_collapse(
         self, forward_lean: float | None, shoulder_drop: float | None,

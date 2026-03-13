@@ -54,11 +54,15 @@ dependencies = [
     "onnxruntime>=1.17.0",
 
     # macOS-specific (optional)
+    "pyobjc-framework-AVFoundation>=10.1; sys_platform == 'darwin'",
     "pyobjc-framework-Cocoa>=10.1; sys_platform == 'darwin'",
     "pyobjc-framework-Quartz>=10.1; sys_platform == 'darwin'",
 
     # Structured Logging
     "structlog>=24.1.0",
+
+    # Redis
+    "redis[hiredis]>=5.0.0",
 ]
 
 [project.optional-dependencies]
@@ -74,6 +78,9 @@ dev = [
 
     # Linting & Formatting
     "ruff>=0.2.0",
+
+    # Redis testing
+    "fakeredis>=2.21.0",
 
     # Development utilities
     "ipython>=8.20.0",

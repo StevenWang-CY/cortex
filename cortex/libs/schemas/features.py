@@ -42,6 +42,9 @@ class PhysioFeatures(BaseModel):
     hr_delta_5s: float | None = Field(
         None, description="Heart rate change over last 5 seconds (BPM/5s)"
     )
+    respiration_rate_bpm: float | None = Field(
+        None, ge=0.0, le=60.0, description="Respiration rate in breaths per minute"
+    )
     valid: bool = Field(..., description="Whether physiological features are valid")
 
 
@@ -113,7 +116,7 @@ class TelemetryFeatures(BaseModel):
 
 class FeatureVector(BaseModel):
     """
-    Unified 12-dimensional feature vector produced every 500ms.
+    Unified 14-dimensional feature vector produced every 500ms.
 
     Combines physiological, kinematic, and telemetry features into a single
     vector for state classification.
@@ -160,6 +163,12 @@ class FeatureVector(BaseModel):
     tab_switch_frequency: float = Field(
         0.0, ge=0.0, description="Tab/window switches per minute"
     )
+    respiration_rate: float | None = Field(
+        None, ge=0.0, le=60.0, description="Respiration rate (breaths/min)"
+    )
+    thrashing_score: float = Field(
+        0.0, ge=0.0, le=1.0, description="Focus thrashing score from transition graph"
+    )
 
     def to_array(self) -> list[float | None]:
         """Convert feature vector to a list for ML inference."""
@@ -176,12 +185,19 @@ class FeatureVector(BaseModel):
             self.click_frequency,
             self.keystroke_interval_variance,
             self.tab_switch_frequency,
+            self.respiration_rate,
+            self.thrashing_score,
         ]
 
     @property
     def has_physio(self) -> bool:
         """Check if physiological features are available."""
         return self.hr is not None
+
+    @property
+    def has_respiration(self) -> bool:
+        """Check if respiration features are available."""
+        return self.respiration_rate is not None
 
     @property
     def has_kinematics(self) -> bool:

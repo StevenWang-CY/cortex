@@ -18,14 +18,23 @@ import asyncio
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Iterable
 
 import cv2
 import numpy as np
 
 from cortex.libs.config.settings import CaptureConfig
+from cortex.libs.utils.platform import is_macos
 
 logger = logging.getLogger(__name__)
+_AUTO_CAMERA_DEVICE_ID = 0
+_BUILTIN_MAC_CAMERA_KEYWORDS = (
+    "facetime",
+    "built-in",
+    "macbook",
+    "imac",
+)
 
 
 @dataclass(frozen=True)
@@ -35,6 +44,145 @@ class CapturedFrame:
     frame: np.ndarray  # BGR uint8, shape (H, W, 3)
     timestamp: float  # time.monotonic() seconds
     sequence: int  # monotonically increasing frame counter
+
+
+@dataclass(frozen=True)
+class CameraSelection:
+    """Concrete camera selection used to open a VideoCapture device."""
+
+    device_id: int
+    backend: int | None
+    source: str
+    device_name: str | None = None
+
+
+def describe_requested_camera(config: CaptureConfig) -> str:
+    """Human-readable description of the configured camera preference."""
+    return "auto" if config.device_id is None else str(config.device_id)
+
+
+def _extract_objc_string(obj: object, attr: str) -> str:
+    """Best-effort conversion of an Objective-C property/method to str."""
+    value = getattr(obj, attr, None)
+    if value is None:
+        return ""
+    try:
+        value = value() if callable(value) else value
+    except TypeError:
+        pass
+    return str(value or "")
+
+
+def _list_macos_video_device_names() -> list[str]:
+    """Enumerate macOS camera names in AVFoundation order."""
+    if not is_macos():
+        return []
+
+    try:
+        import AVFoundation
+    except ImportError:
+        return []
+
+    try:
+        devices = (
+            AVFoundation.AVCaptureDevice.devicesWithMediaType_(
+                AVFoundation.AVMediaTypeVideo
+            )
+            or []
+        )
+    except Exception:
+        logger.exception("Failed to enumerate macOS cameras")
+        return []
+
+    return [_extract_objc_string(device, "localizedName") for device in devices]
+
+
+def _find_builtin_macos_camera() -> tuple[int | None, str | None]:
+    """Return the first built-in Mac camera if one is visible to AVFoundation."""
+    for index, name in enumerate(_list_macos_video_device_names()):
+        normalized = name.casefold()
+        if any(keyword in normalized for keyword in _BUILTIN_MAC_CAMERA_KEYWORDS):
+            return index, name
+    return None, None
+
+
+def _iter_camera_candidates(config: CaptureConfig) -> Iterable[CameraSelection]:
+    """
+    Yield camera candidates in preference order.
+
+    If no device is configured, macOS prefers the built-in camera first and then
+    falls back to the platform default device ordering.
+    """
+    requested_device_id = (
+        _AUTO_CAMERA_DEVICE_ID if config.device_id is None else config.device_id
+    )
+
+    candidates: list[CameraSelection] = []
+
+    if config.device_id is None and is_macos():
+        builtin_index, builtin_name = _find_builtin_macos_camera()
+        if builtin_index is not None:
+            candidates.append(
+                CameraSelection(
+                    device_id=builtin_index,
+                    backend=cv2.CAP_AVFOUNDATION,
+                    source="builtin_mac_camera",
+                    device_name=builtin_name,
+                )
+            )
+            candidates.append(
+                CameraSelection(
+                    device_id=builtin_index,
+                    backend=None,
+                    source="builtin_mac_camera",
+                    device_name=builtin_name,
+                )
+            )
+
+    if is_macos():
+        candidates.append(
+            CameraSelection(
+                device_id=requested_device_id,
+                backend=cv2.CAP_AVFOUNDATION,
+                source="configured_device",
+            )
+        )
+
+    candidates.append(
+        CameraSelection(
+            device_id=requested_device_id,
+            backend=None,
+            source="configured_device",
+        )
+    )
+
+    seen: set[tuple[int, int | None]] = set()
+    for candidate in candidates:
+        key = (candidate.device_id, candidate.backend)
+        if key in seen:
+            continue
+        seen.add(key)
+        yield candidate
+
+
+def open_video_capture(
+    config: CaptureConfig,
+) -> tuple[cv2.VideoCapture | None, CameraSelection | None]:
+    """Open the best matching webcam device for the given configuration."""
+    last_candidate: CameraSelection | None = None
+
+    for candidate in _iter_camera_candidates(config):
+        last_candidate = candidate
+        capture = (
+            cv2.VideoCapture(candidate.device_id, candidate.backend)
+            if candidate.backend is not None
+            else cv2.VideoCapture(candidate.device_id)
+        )
+        if capture.isOpened():
+            return capture, candidate
+        capture.release()
+
+    return None, last_candidate
 
 
 class WebcamCapture:
@@ -77,6 +225,7 @@ class WebcamCapture:
         self._last_fps_time = 0.0
         self._fps_frame_count = 0
         self._measured_fps = 0.0
+        self._camera_selection: CameraSelection | None = None
 
     @property
     def is_running(self) -> bool:
@@ -113,10 +262,10 @@ class WebcamCapture:
         self._queue = asyncio.Queue(maxsize=self._queue_maxsize)
 
         # Open camera
-        self._cap = cv2.VideoCapture(self._config.device_id)
-        if not self._cap.isOpened():
+        self._cap, self._camera_selection = open_video_capture(self._config)
+        if self._cap is None or not self._cap.isOpened():
             raise RuntimeError(
-                f"Cannot open webcam device {self._config.device_id}"
+                f"Cannot open webcam device {describe_requested_camera(self._config)}"
             )
 
         # Configure camera
@@ -143,7 +292,10 @@ class WebcamCapture:
         logger.info(
             "WebcamCapture started",
             extra={
-                "device_id": self._config.device_id,
+                "requested_device_id": describe_requested_camera(self._config),
+                "device_id": self._camera_selection.device_id,
+                "camera_source": self._camera_selection.source,
+                "camera_name": self._camera_selection.device_name,
                 "resolution": f"{self._config.width}x{self._config.height}",
                 "target_fps": self._config.fps,
             },

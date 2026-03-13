@@ -27,6 +27,7 @@ type ConnectionHandler = (connected: boolean) => void;
 type ContextRequestHandler = () => Promise<Record<string, unknown>>;
 type RestoreHandler = (payload: Record<string, unknown>) => void;
 type SettingsHandler = (payload: Record<string, unknown>) => void;
+type GenericMessageHandler = (msg: { type: string; payload: Record<string, unknown> }) => void;
 
 /**
  * WebSocket client for communication with the Cortex daemon.
@@ -50,6 +51,7 @@ export class CortexWSClient {
     private _contextRequestHandler: ContextRequestHandler | undefined;
     private _restoreHandlers: RestoreHandler[] = [];
     private _settingsHandlers: SettingsHandler[] = [];
+    private _genericMessageHandlers: GenericMessageHandler[] = [];
 
     constructor(url: string) {
         this._url = url;
@@ -86,6 +88,11 @@ export class CortexWSClient {
 
     onSettingsSync(handler: SettingsHandler): void {
         this._settingsHandlers.push(handler);
+    }
+
+    /** Register a handler for any message type (called for all messages). */
+    onMessage(handler: GenericMessageHandler): void {
+        this._genericMessageHandlers.push(handler);
     }
 
     /**
@@ -245,7 +252,14 @@ export class CortexWSClient {
                 break;
 
             default:
-                // Unknown message types are silently ignored
+                // Forward to generic message handlers
+                for (const handler of this._genericMessageHandlers) {
+                    try {
+                        handler(msg);
+                    } catch {
+                        // Handler error should not crash the client
+                    }
+                }
                 break;
         }
     }

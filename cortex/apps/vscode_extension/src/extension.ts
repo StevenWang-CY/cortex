@@ -87,6 +87,39 @@ export function activate(context: vscode.ExtensionContext): void {
         }
     });
 
+    // --- v2.0: Handle MORNING_BRIEFING and COPILOT_THROTTLE messages ---
+    wsClient.onMessage((msg) => {
+        switch (msg.type) {
+            case 'MORNING_BRIEFING': {
+                const summary = msg.payload?.summary || 'Welcome back!';
+                const items = msg.payload?.action_items || [];
+                const leftOff = msg.payload?.left_off_at || '';
+                const detail = (items as string[]).length > 0
+                    ? (items as string[]).map((item: string, i: number) => `${i + 1}. ${item}`).join('\n')
+                    : leftOff as string;
+                vscode.window.showInformationMessage(
+                    `☀️ ${summary}`,
+                    { modal: false, detail },
+                    'Show Details',
+                ).then(choice => {
+                    if (choice === 'Show Details' && panelProvider) {
+                        panelProvider.showMorningBriefing(msg.payload);
+                    }
+                });
+                break;
+            }
+            case 'COPILOT_THROTTLE': {
+                const action = msg.payload?.action;
+                if (action === 'disable') {
+                    vscode.commands.executeCommand('cortex.disableInlineSuggestions');
+                } else if (action === 'enable') {
+                    vscode.commands.executeCommand('cortex.enableInlineSuggestions');
+                }
+                break;
+            }
+        }
+    });
+
     // --- Panel provider ---
     panelProvider = new CortexPanelProvider(context.extensionUri, wsClient);
     context.subscriptions.push(
@@ -135,6 +168,29 @@ export function activate(context: vscode.ExtensionContext): void {
 
         vscode.commands.registerCommand("cortex.disconnect", () => {
             wsClient?.disconnect();
+        }),
+    );
+
+    // v2.0: Copilot throttle commands
+    context.subscriptions.push(
+        vscode.commands.registerCommand('cortex.disableInlineSuggestions', async () => {
+            const config = vscode.workspace.getConfiguration();
+            await config.update('editor.inlineSuggest.enabled', false, vscode.ConfigurationTarget.Global);
+            // Also try to disable GitHub Copilot if available
+            try {
+                await config.update('github.copilot.enable', { '*': false }, vscode.ConfigurationTarget.Global);
+            } catch {
+                // Copilot not installed
+            }
+        }),
+        vscode.commands.registerCommand('cortex.enableInlineSuggestions', async () => {
+            const config = vscode.workspace.getConfiguration();
+            await config.update('editor.inlineSuggest.enabled', true, vscode.ConfigurationTarget.Global);
+            try {
+                await config.update('github.copilot.enable', { '*': true }, vscode.ConfigurationTarget.Global);
+            } catch {
+                // Copilot not installed
+            }
         }),
     );
 

@@ -44,6 +44,21 @@ from cortex.services.telemetry_engine.feature_aggregator import FeatureAggregato
 from cortex.services.telemetry_engine.input_hooks import InputHooks
 from cortex.services.telemetry_engine.window_tracker import WindowTracker
 
+# v2.0 imports
+from cortex.libs.store import RedisStore, InMemoryStore
+from cortex.services.consent.ladder import ConsentLadder
+from cortex.services.consent.policy import ConsentPolicy
+from cortex.services.eval.bandit import ContextualBandit
+from cortex.services.eval.helpfulness import HelpfulnessTracker
+from cortex.services.handover.briefing import MorningBriefing
+from cortex.services.handover.detector import ShutdownDetector
+from cortex.services.handover.snapshot import HandoverSnapshot
+from cortex.services.state_engine.longitudinal import LongitudinalTracker
+from cortex.services.state_engine.rabbit_hole import RabbitHoleDetector
+from cortex.services.state_engine.stress_integral import StressIntegralTracker
+from cortex.services.state_engine.zombie_detector import ZombieReadingDetector
+from cortex.services.throttle.copilot_throttle import CopilotThrottle
+
 logger = logging.getLogger(__name__)
 
 
@@ -165,6 +180,56 @@ class CortexDaemon:
         self._interventions_enabled = True
         self._latest_context: Any = None
 
+        # --- v2.0 services ---
+        # Store (Redis with in-memory fallback)
+        self._store: RedisStore | InMemoryStore
+        if self.config.redis.enabled:
+            try:
+                self._store = RedisStore(
+                    host=self.config.redis.host,
+                    port=self.config.redis.port,
+                    db=self.config.redis.db,
+                    key_prefix=self.config.redis.key_prefix,
+                )
+            except Exception:
+                logger.warning("Redis unavailable, falling back to in-memory store")
+                self._store = InMemoryStore()
+        else:
+            self._store = InMemoryStore()
+
+        # Stress integral tracker (biological pomodoros)
+        self._stress_tracker = StressIntegralTracker(
+            hrv_baseline=self._load_baselines().hrv_baseline,
+        )
+
+        # Longitudinal tracker (baseline drift)
+        self._longitudinal = LongitudinalTracker(store=self._store)
+
+        # Zombie reading detector
+        self._zombie_detector = ZombieReadingDetector()
+
+        # Rabbit hole detector
+        self._rabbit_hole = RabbitHoleDetector()
+
+        # Shutdown detector (morning handover)
+        self._shutdown_detector = ShutdownDetector()
+
+        # Consent ladder
+        self._consent_policy = ConsentPolicy()
+        self._consent_ladder = ConsentLadder(store=self._store, policy=self._consent_policy)
+
+        # Helpfulness tracker
+        self._helpfulness = HelpfulnessTracker(store=self._store)
+
+        # Contextual bandit
+        self._bandit = ContextualBandit(store=self._store)
+
+        # Copilot throttle
+        self._copilot_throttle = CopilotThrottle(ws_server=self._ws_server)
+
+        # Track previous state for copilot throttle transitions
+        self._prev_state: str = "FLOW"
+
     async def start(self) -> None:
         """Start the runtime and block until shutdown."""
         self._register_services()
@@ -184,8 +249,13 @@ class CortexDaemon:
             asyncio.create_task(self._telemetry_loop(), name="cortex-telemetry-loop"),
             asyncio.create_task(self._state_loop(), name="cortex-state-loop"),
             asyncio.create_task(self._context_loop(), name="cortex-context-loop"),
+            asyncio.create_task(self._longitudinal_loop(), name="cortex-longitudinal-loop"),
         ]
-        logger.info("Cortex daemon started")
+
+        # v2.0: Check for morning briefing on startup
+        await self._check_morning_briefing()
+
+        logger.info("Cortex daemon started (v2.0)")
         await self._shutdown.wait()
 
     async def stop(self) -> None:
@@ -224,6 +294,17 @@ class CortexDaemon:
             "restore_manager": self._restore_manager,
             "ws_server": self._ws_server,
             "trigger_policy": self._trigger_policy,
+            # v2.0 services
+            "store": self._store,
+            "stress_integral_tracker": self._stress_tracker,
+            "longitudinal_tracker": self._longitudinal,
+            "zombie_detector": self._zombie_detector,
+            "rabbit_hole_detector": self._rabbit_hole,
+            "shutdown_detector": self._shutdown_detector,
+            "consent_ladder": self._consent_ladder,
+            "helpfulness_tracker": self._helpfulness,
+            "contextual_bandit": self._bandit,
+            "copilot_throttle": self._copilot_throttle,
         }.items():
             registry.register(name, service)
         registry.healthy = True
@@ -348,18 +429,47 @@ class CortexDaemon:
                 timestamp = time.monotonic()
                 try:
                     vector, quality = self._feature_fusion.fuse(timestamp=timestamp)
+
+                    # v2.0: Inject thrashing score from aggregator
+                    if hasattr(self._aggregator, 'thrashing_score'):
+                        vector.thrashing_score = self._aggregator.thrashing_score
+
                     scores = self._scorer.compute_scores(vector)
                     estimate = self._smoother.update(scores, quality, timestamp=timestamp)
+
+                    # v2.0: Update stress integral
+                    if vector.hrv_rmssd is not None:
+                        self._stress_tracker.update(vector.hrv_rmssd, timestamp)
+                        estimate.stress_integral = self._stress_tracker.current_load
+
+                    # v2.0: Feed longitudinal tracker per-sample data
+                    self._longitudinal.accumulate(
+                        hr=vector.hr,
+                        hrv=vector.hrv_rmssd,
+                        resp=vector.respiration_rate,
+                        state=estimate.state,
+                    )
+
                     registry.register("latest_state_estimate", estimate)
-                    self._recorder.append("state", estimate.model_dump(mode="json"))
+                    self._recorder.append("state_estimate", estimate.model_dump(mode="json"))
                     biometrics = {
                         "heart_rate": vector.hr,
                         "hrv_rmssd": vector.hrv_rmssd,
                         "hr_delta": vector.hr_delta,
                         "blink_rate": vector.blink_rate,
                         "forward_lean": vector.forward_lean_angle,
+                        "respiration_rate": vector.respiration_rate,
+                        "thrashing_score": vector.thrashing_score,
+                        "stress_integral": self._stress_tracker.current_load,
                     }
                     await self._ws_server.broadcast_state(estimate, biometrics)
+
+                    # v2.0: Copilot throttle on state transitions
+                    if estimate.state != self._prev_state:
+                        await self._copilot_throttle.on_state_change(
+                            estimate.state, estimate.confidence,
+                        )
+                        self._prev_state = estimate.state
 
                     context = self._latest_context
                     if context is not None:
@@ -371,13 +481,77 @@ class CortexDaemon:
                         registry.register("latest_trigger_decision", decision)
                         await self._handle_restore_updates(estimate, timestamp)
 
+                        # v2.0: Check zombie reading
+                        active_app = self._current_app_name()
+                        telemetry = registry.get("latest_telemetry")
+                        kinematics = self._latest_kinematics
+                        if self._zombie_detector.update(
+                            state=estimate.state,
+                            active_app=active_app,
+                            mouse_velocity=telemetry.mouse_velocity_mean if telemetry else 0.0,
+                            blink_rate=kinematics.blink_rate,
+                            blink_baseline=self._scorer.baselines.blink_rate_baseline,
+                        ):
+                            logger.info("Zombie reading detected — triggering active recall")
+                            await self._trigger_special_intervention(
+                                context, estimate, template_name="active_recall",
+                                ws_type="ACTIVE_RECALL",
+                            )
+
+                        # v2.0: Check rabbit hole drift
+                        goal = context.current_goal_hint or ""
+                        if goal:
+                            current_file = getattr(context, "file_path", "") or ""
+                            alert = self._rabbit_hole.check(
+                                goal=goal,
+                                current_file=current_file,
+                                current_app=active_app,
+                                state=estimate.state,
+                                current_time=timestamp,
+                            )
+                            if alert is not None:
+                                logger.info("Rabbit hole detected — goal drift intervention")
+                                await self._trigger_special_intervention(
+                                    context, estimate, template_name="rabbit_hole",
+                                    ws_type="INTERVENTION_TRIGGER",
+                                )
+
+                        # v2.0: Check stress integral break
+                        if self._stress_tracker.should_break():
+                            logger.info("Stress integral threshold — biological break")
+                            await self._trigger_special_intervention(
+                                context, estimate, template_name="breathing_overlay",
+                                ws_type="BREATHING_OVERLAY",
+                            )
+                            self._stress_tracker.reset()
+
+                        # v2.0: Check shutdown detection
+                        if self._shutdown_detector.should_handover(
+                            posture_slump=kinematics.slump_score or 0.0,
+                            hrv=vector.hrv_rmssd,
+                            error_count=context.total_errors if hasattr(context, 'total_errors') else 0,
+                        ):
+                            logger.info("Shutdown signal detected — generating handover")
+                            await self._generate_handover(context)
+
+                        # Standard intervention trigger
                         if (
                             self._interventions_enabled
                             and decision.should_trigger
                             and self._active_intervention_id is None
                             and estimate.signal_quality.acceptable
                         ):
-                            await self._trigger_intervention(context, estimate)
+                            # v2.0: Consult bandit for intervention type
+                            bandit_features = np.array(
+                                self._build_bandit_features(estimate, context),
+                                dtype=np.float64,
+                            )
+                            selected_arm = self._bandit.select_arm(bandit_features)
+                            template_name = self._arm_to_template(selected_arm)
+
+                            await self._trigger_intervention(
+                                context, estimate, template_name=template_name,
+                            )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -387,11 +561,28 @@ class CortexDaemon:
         except asyncio.CancelledError:
             pass
 
-    async def _trigger_intervention(self, context: Any, estimate: Any) -> None:
-        plan = await self._llm_client.generate_intervention_plan(context, estimate)
+    async def _trigger_intervention(
+        self, context: Any, estimate: Any, *, template_name: str | None = None,
+    ) -> None:
+        plan = await self._llm_client.generate_intervention_plan(
+            context, estimate, template_name=template_name,
+        )
         validation, commands = prepare_plan(plan)
         if not validation.is_valid:
             logger.warning("Rejected intervention plan %s: %s", plan.intervention_id, validation.errors)
+            return
+
+        # v2.0: Check consent ladder
+        consent_level_map = {
+            "observe": 0, "suggest": 1, "preview": 2,
+            "reversible_act": 3, "autonomous_act": 4,
+        }
+        requested_level = consent_level_map.get(plan.consent_level, 2)
+        consent = await self._consent_ladder.check(
+            action_type=plan.level, requested_level=requested_level,
+        )
+        if not consent.allowed:
+            logger.info("Consent ladder blocked intervention %s (level=%s)", plan.intervention_id, plan.consent_level)
             return
 
         snapshot = capture_snapshot(context, intervention_id=plan.intervention_id)
@@ -402,6 +593,36 @@ class CortexDaemon:
         registry.register(f"workspace_snapshot:{plan.intervention_id}", snapshot)
         self._recorder.append("intervention_plan", plan.model_dump(mode="json"))
         await self._ws_server.send_intervention(plan)
+
+        # v2.0: Start helpfulness tracking
+        self._helpfulness.start_tracking(
+            intervention_id=plan.intervention_id,
+            intervention_type=plan.level,
+            state=estimate.state,
+            confidence=estimate.confidence,
+        )
+
+    async def _trigger_special_intervention(
+        self,
+        context: Any,
+        estimate: Any,
+        *,
+        template_name: str,
+        ws_type: str = "INTERVENTION_TRIGGER",
+    ) -> None:
+        """Trigger a special v2.0 intervention (breathing, active recall, rabbit hole)."""
+        if self._active_intervention_id is not None:
+            return  # Don't stack interventions
+
+        try:
+            plan = await self._llm_client.generate_intervention_plan(
+                context, estimate, template_name=template_name,
+            )
+            self._active_intervention_id = plan.intervention_id
+            self._recorder.append("intervention_plan", plan.model_dump(mode="json"))
+            await self._ws_server.send_message(ws_type, plan.model_dump(mode="json"))
+        except Exception:
+            logger.exception("Failed to trigger special intervention (%s)", template_name)
 
     async def _handle_restore_updates(self, estimate: Any, timestamp: float) -> None:
         outcomes = await self._restore_manager.update(estimate, current_time=timestamp)
@@ -424,6 +645,18 @@ class CortexDaemon:
             })
             return
 
+        # v2.0: Handle user ratings
+        if payload.get("type") == "USER_RATING":
+            iid = str(payload.get("intervention_id", ""))
+            rating = str(payload.get("rating", ""))
+            if iid and rating:
+                self._helpfulness.record_rating(iid, rating)
+                self._recorder.append("helpfulness", {
+                    "intervention_id": iid,
+                    "user_rating": rating,
+                })
+            return
+
         intervention_id = str(payload.get("intervention_id", ""))
         action = str(payload.get("action", "dismissed"))
         if not intervention_id:
@@ -431,6 +664,8 @@ class CortexDaemon:
 
         if action == "engaged":
             outcome = await self._restore_manager.engage(intervention_id)
+            # v2.0: Record consent approval (using intervention level as action_type)
+            await self._consent_ladder.record_approval("intervention")
         elif action == "snoozed":
             self._trigger_policy.activate_quiet_mode(duration_minutes=15)
             outcome = await self._restore_manager.snooze(intervention_id)
@@ -438,6 +673,8 @@ class CortexDaemon:
             outcome = await self._restore_manager.dismiss(intervention_id)
             if action == "dismissed":
                 self._trigger_policy.record_dismissal()
+                # v2.0: Record consent rejection
+                await self._consent_ladder.record_rejection("intervention")
 
         if outcome is None:
             return
@@ -445,6 +682,105 @@ class CortexDaemon:
         self._active_intervention_id = None
         self._recorder.append("intervention_outcome", outcome.model_dump(mode="json"))
         await self._ws_server.send_restore(intervention_id, user_action=action)
+
+        # v2.0: End helpfulness tracking and update bandit
+        context = self._latest_context
+        state_estimate = registry.get("latest_state_estimate")
+        if state_estimate:
+            reward = await self._helpfulness.end_tracking(
+                intervention_id=intervention_id,
+                state=state_estimate.state,
+                confidence=state_estimate.confidence,
+                complexity=context.complexity_score if context and hasattr(context, 'complexity_score') else 0.0,
+            )
+            if reward is not None:
+                self._recorder.append("helpfulness", {
+                    "intervention_id": intervention_id,
+                    "reward_signal": reward,
+                })
+                # Update bandit with reward
+                if context:
+                    features = self._build_bandit_features(state_estimate, context)
+                    bandit_features = np.array(features, dtype=np.float64)
+                    # Find arm index from template — use 0 as default
+                    self._bandit.update(bandit_features, 0, reward)
+
+    # --- v2.0 helper methods ---
+
+    def _build_bandit_features(self, estimate: Any, context: Any) -> list[float]:
+        """Build 8-dimensional feature vector for the contextual bandit."""
+        state_map = {"FLOW": 0.0, "HYPO": 0.25, "RECOVERY": 0.5, "HYPER": 1.0}
+        import datetime as dt
+        hour = dt.datetime.now().hour
+        return [
+            state_map.get(estimate.state, 0.5),
+            context.complexity_score if hasattr(context, 'complexity_score') else 0.0,
+            float(context.browser_context.tab_count if context.browser_context else 0) / 20.0,
+            float(context.total_errors if hasattr(context, 'total_errors') else 0) / 10.0,
+            hour / 24.0,
+            self._aggregator.thrashing_score if hasattr(self._aggregator, 'thrashing_score') else 0.0,
+            self._stress_tracker.current_load / 500.0,
+            0.5,  # consent level placeholder
+        ]
+
+    @staticmethod
+    def _arm_to_template(arm_index: int) -> str | None:
+        """Map bandit arm index to prompt template name."""
+        arm_templates = {
+            0: None,  # overlay_only → auto-select
+            1: "code_focus_reduction",  # simplified_workspace
+            2: "micro_step_planner",  # guided_mode
+            3: "breathing_overlay",
+            4: "active_recall",
+            5: "rabbit_hole",
+            6: None,  # no intervention
+        }
+        return arm_templates.get(arm_index)
+
+    async def _check_morning_briefing(self) -> None:
+        """Check for yesterday's handover and generate morning briefing."""
+        try:
+            briefing = MorningBriefing(storage_root=self.config.storage.path)
+            content = briefing.check_and_generate()
+            if content is not None:
+                logger.info("Morning briefing available: %s", content.summary[:80])
+                await self._ws_server.send_message("MORNING_BRIEFING", {
+                    "summary": content.summary,
+                    "action_items": content.action_items,
+                    "left_off_at": content.left_off_at,
+                })
+        except Exception:
+            logger.debug("No morning briefing available")
+
+    async def _generate_handover(self, context: Any) -> None:
+        """Generate a handover snapshot for tomorrow's morning briefing."""
+        try:
+            snapshot = HandoverSnapshot(storage_root=self.config.storage.path)
+            snapshot.capture(
+                context=context,
+                window_tracker=self._window_tracker,
+            )
+            logger.info("Handover snapshot saved")
+        except Exception:
+            logger.exception("Failed to generate handover snapshot")
+
+    async def _longitudinal_loop(self) -> None:
+        """5th async loop: snapshot daily data every hour for longitudinal tracking."""
+        try:
+            while True:
+                try:
+                    # Snapshot daily data to store
+                    await self._longitudinal.snapshot_daily()
+                    # Compute trend and update sensitivity
+                    trend = await self._longitudinal.compute_trend()
+                    multiplier = trend.get("sensitivity_multiplier", 1.0)
+                    self._stress_tracker.update_sensitivity(multiplier)
+                    logger.debug("Longitudinal snapshot: multiplier=%.2f", multiplier)
+                except Exception:
+                    logger.exception("Longitudinal loop error")
+                await asyncio.sleep(3600.0)  # every hour
+        except asyncio.CancelledError:
+            pass
 
     async def apply_settings(self, settings: dict[str, Any]) -> None:
         """Apply user-facing settings live when possible."""

@@ -24,6 +24,16 @@ from pydantic_settings import (
 # =============================================================================
 
 
+class RedisConfig(BaseModel):
+    """Redis connection configuration."""
+
+    host: str = "localhost"
+    port: int = 6379
+    db: int = 0
+    enabled: bool = True
+    key_prefix: str = "cortex"
+
+
 class LLMRemoteConfig(BaseModel):
     """Remote LLM server configuration (gwhiz1)."""
 
@@ -74,7 +84,7 @@ class LLMConfig(BaseModel):
 class CaptureConfig(BaseModel):
     """Webcam capture configuration."""
 
-    device_id: int = 0
+    device_id: int | None = None
     fps: int = 30
     width: int = 640
     height: int = 480
@@ -247,6 +257,7 @@ class CortexConfig(BaseSettings):
     storage: StorageConfig = Field(default_factory=StorageConfig)
     debug: DebugConfig = Field(default_factory=DebugConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    redis: RedisConfig = Field(default_factory=RedisConfig)
 
     @classmethod
     def settings_customise_sources(

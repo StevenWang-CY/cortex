@@ -21,6 +21,7 @@ from typing import Any
 import uvicorn
 
 from cortex.libs.config.settings import CortexConfig, get_config
+from cortex.services.capture_service.webcam import describe_requested_camera
 from cortex.services.runtime_daemon import CortexDaemon
 
 logger = logging.getLogger(__name__)
@@ -193,7 +194,10 @@ def main() -> None:
     print(f"  API:       http://{config.api.host}:{config.api.port}")
     print(f"  WebSocket: ws://{config.api.host}:{config.api.ws_port}")
     print(f"  LLM Mode:  {config.llm.mode}")
-    print(f"  Capture:   device {config.capture.device_id} @ {config.capture.fps} FPS")
+    print(
+        f"  Capture:   device {describe_requested_camera(config.capture)} @ "
+        f"{config.capture.fps} FPS"
+    )
     print("=" * 60)
 
     try:

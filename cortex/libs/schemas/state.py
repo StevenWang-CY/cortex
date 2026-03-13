@@ -20,6 +20,7 @@ class UserState(str, Enum):
     HYPO = "HYPO"  # Under-arousal, disengagement
     HYPER = "HYPER"  # Over-arousal, overwhelm
     RECOVERY = "RECOVERY"  # Transitioning back to flow
+    HYPO_APNEA = "HYPO_APNEA"
 
 
 class SignalQuality(BaseModel):
@@ -95,6 +96,9 @@ class StateEstimate(BaseModel):
     dwell_seconds: float = Field(
         0.0, ge=0.0, description="Seconds in current state"
     )
+    stress_integral: float | None = Field(
+        None, ge=0.0, description="Cumulative stress load integral (ms*s)"
+    )
 
     @property
     def is_overwhelmed(self) -> bool:
@@ -147,6 +151,9 @@ class UserBaselines(BaseModel):
     )
     shoulder_neutral_y: float = Field(
         0.5, ge=0.0, le=1.0, description="Neutral shoulder Y position (normalized)"
+    )
+    resp_baseline: float = Field(
+        15.0, ge=4.0, le=30.0, description="Baseline respiration rate (breaths/min)"
     )
     calibrated_at: datetime | None = Field(
         None, description="When calibration was performed"

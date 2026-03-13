@@ -29,7 +29,7 @@ llm:
   fallback_mode: local_ollama
 
 capture:
-  device_id: 0
+  device_id: null
   fps: 30
   width: 640
   height: 480

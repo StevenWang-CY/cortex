@@ -131,11 +131,17 @@ def _live_calibration(
         return _simulate_calibration(duration_seconds)
 
     config = get_config()
+    from cortex.services.capture_service.webcam import (
+        describe_requested_camera,
+        open_video_capture,
+    )
 
-    cap = cv2.VideoCapture(config.capture.device_id)
-    if not cap.isOpened():
-        print(f"WARNING: Cannot open webcam device {config.capture.device_id}, "
-              "falling back to simulation")
+    cap, _selection = open_video_capture(config.capture)
+    if cap is None:
+        print(
+            f"WARNING: Cannot open webcam device {describe_requested_camera(config.capture)}, "
+            "falling back to simulation"
+        )
         return _simulate_calibration(duration_seconds)
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.capture.width)

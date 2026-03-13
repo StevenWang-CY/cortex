@@ -82,9 +82,9 @@ let focusSession: FocusSession | null = null;
 const DISTRACTION_PATTERNS = [
     /reddit\.com/i, /twitter\.com/i, /x\.com/i,
     /facebook\.com/i, /instagram\.com/i, /tiktok\.com/i,
-    /youtube\.com(?!.*(?:lecture|tutorial|course|edu))/i,
-    /netflix\.com/i, /twitch\.tv/i, /discord\.com/i,
-    /9gag\.com/i, /buzzfeed\.com/i, /tumblr\.com/i,
+    /youtube\.com/i, /netflix\.com/i, /twitch\.tv/i,
+    /discord\.com/i, /9gag\.com/i, /buzzfeed\.com/i,
+    /tumblr\.com/i,
 ];
 
 // Health alert state
@@ -189,9 +189,22 @@ function scheduleReconnect(): void {
     reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
 }
 
+// --- Text Scraping ---
+
+async function scrapeVisibleText(tabId?: number): Promise<string> {
+    try {
+        const targetTabId = tabId || (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id;
+        if (!targetTabId) return "";
+        const response = await chrome.tabs.sendMessage(targetTabId, { type: "EXTRACT_TEXT" });
+        return response?.text || "";
+    } catch {
+        return "";
+    }
+}
+
 // --- Message Handling ---
 
-function handleMessage(raw: string): void {
+async function handleMessage(raw: string): Promise<void> {
     let msg: WSMessage;
     try {
         msg = JSON.parse(raw) as WSMessage;
@@ -219,6 +232,8 @@ function handleMessage(raw: string): void {
 
         case "INTERVENTION_TRIGGER":
             activeIntervention = msg.payload;
+            // Persist so popup can load it after SW restart
+            try { chrome.storage.session.set({ cortex_active_intervention: msg.payload }); } catch {}
             handleIntervention(msg.payload);
             break;
 
@@ -234,6 +249,30 @@ function handleMessage(raw: string): void {
             quietMode = Boolean(msg.payload.quiet_mode);
             broadcastToPopup({ type: "SETTINGS_SYNC", payload: msg.payload });
             break;
+
+        case "BREATHING_OVERLAY": {
+            // Route to active tab's content script
+            const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+            if (activeTab?.id) {
+                chrome.tabs.sendMessage(activeTab.id, {
+                    type: "SHOW_BREATHING_OVERLAY",
+                    payload: msg.payload,
+                });
+            }
+            break;
+        }
+        case "ACTIVE_RECALL": {
+            // Get visible text, add to payload, then route to content script
+            const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+            if (tab?.id) {
+                const visibleText = await scrapeVisibleText(tab.id);
+                chrome.tabs.sendMessage(tab.id, {
+                    type: "SHOW_ACTIVE_RECALL",
+                    payload: { ...msg.payload, visible_text: visibleText },
+                });
+            }
+            break;
+        }
     }
 }
 
@@ -254,9 +293,33 @@ function injectOverlay(payload: Record<string, unknown>): void {
     const esc = (s: string) =>
         s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
-    const actions = (payload.suggested_actions as Array<Record<string, unknown>>) || [];
+    const actions: Array<Record<string, unknown>> = [...((payload.suggested_actions as Array<Record<string, unknown>>) || [])];
     const tabRecs = payload.tab_recommendations as { tabs: Array<Record<string, unknown>>; summary: string } | undefined;
     const errA = payload.error_analysis as Record<string, string> | undefined;
+
+    // Synthesize close_tab actions from tab_recommendations when the LLM
+    // generated recommendations but no matching suggested_actions.
+    if (tabRecs && tabRecs.tabs && tabRecs.tabs.length > 0) {
+        const hasCloseAction = actions.some(a => a.action_type === "close_tab" || a.action_type === "bookmark_and_close");
+        if (!hasCloseAction) {
+            const closeable = tabRecs.tabs.filter(t => t.action === "close" || t.action === "bookmark_and_close");
+            for (let ci = 0; ci < closeable.length; ci++) {
+                const t = closeable[ci];
+                actions.push({
+                    action_id: `synth_${Date.now()}_${ci}`,
+                    action_type: t.action === "bookmark_and_close" ? "bookmark_and_close" : "close_tab",
+                    tab_index: typeof t.tab_index === "number" ? t.tab_index : Number(t.tab_index),
+                    target: "",
+                    label: `Close ${t.tab_title || "tab"}`,
+                    reason: t.reason || "",
+                    category: "recommended",
+                    reversible: true,
+                    metadata: {},
+                });
+            }
+        }
+    }
+
     const recommended = actions.filter(a => a.category === "recommended");
 
     // --- Build tab list ---
@@ -510,6 +573,9 @@ async function handleIntervention(
 async function handleContextRequest(msg: WSMessage): Promise<void> {
     try {
         const tabs = await collectTabs();
+        // Save this tab list so the intervention snapshot uses the same ordering
+        // the LLM will see — prevents tab_index misalignment.
+        lastContextTabs = tabs;
         const activeTab = tabs.find((t) => t.is_active);
 
         // Get active tab content
@@ -582,6 +648,7 @@ async function handleRestore(payload: Record<string, unknown>): Promise<void> {
         // Ignore overlay cleanup failures
     }
     activeIntervention = null;
+    try { chrome.storage.session.remove(["cortex_active_intervention", "cortex_tab_snapshot"]); } catch {}
     broadcastToPopup({ type: "INTERVENTION_RESTORE", payload });
 }
 
@@ -793,6 +860,8 @@ function injectDistractionInterceptor(
     document.body.appendChild(container);
 
     document.getElementById("cortex-go-back")?.addEventListener("click", () => {
+        // Notify background that user resisted distraction
+        try { chrome.runtime.sendMessage({ type: "DISTRACTION_BLOCKED" }); } catch {}
         history.back();
     });
     document.getElementById("cortex-continue")?.addEventListener("click", () => {
@@ -829,21 +898,57 @@ interface UndoEntry {
     timestamp: number;
 }
 
-// Tab snapshot: maps tab_index → {chromeTabId, url, title} at intervention time
+// Tab snapshot: maps tab_index → {chromeTabId, url, title} at intervention time.
+// Also persisted to chrome.storage.session so it survives MV3 service worker restarts.
 let interventionTabSnapshot: Map<number, { chromeTabId: number; url: string; title: string }> = new Map();
+// Saved tab list from the most recent CONTEXT_RESPONSE — used to ensure tab_index
+// alignment between what the LLM saw and what the action executor targets.
+let lastContextTabs: TabData[] | null = null;
 const undoStack: UndoEntry[] = [];
 const MAX_UNDO_ENTRIES = 50;
 
-/** Snapshot current tabs when an intervention arrives, so actions can resolve tab_index → real tab. */
+/**
+ * Snapshot tabs for intervention action resolution.
+ * Uses the saved context-time tab list (from the last CONTEXT_RESPONSE) to ensure
+ * tab_index values from the LLM align with the actual Chrome tab IDs.
+ * Falls back to a fresh query if no saved list exists.
+ * Persists to chrome.storage.session for service worker restart resilience.
+ */
 async function snapshotTabsForIntervention(): Promise<void> {
     interventionTabSnapshot = new Map();
-    const tabs = await collectTabs();
+    const tabs = lastContextTabs ?? await collectTabs();
+    const snapData: Record<string, { chromeTabId: number; url: string; title: string }> = {};
     for (let i = 0; i < tabs.length; i++) {
-        interventionTabSnapshot.set(i, {
+        const entry = {
             chromeTabId: tabs[i].tab_id,
             url: tabs[i].url,
             title: tabs[i].title,
-        });
+        };
+        interventionTabSnapshot.set(i, entry);
+        snapData[String(i)] = entry;
+    }
+    // Persist for service worker restart resilience
+    try {
+        await chrome.storage.session.set({ cortex_tab_snapshot: snapData });
+    } catch {
+        // storage.session may not be available
+    }
+}
+
+/** Load snapshot from session storage (after service worker restart). */
+async function loadSnapshotFromStorage(): Promise<void> {
+    if (interventionTabSnapshot.size > 0) return; // already in memory
+    try {
+        const data = await chrome.storage.session.get("cortex_tab_snapshot");
+        const snapData = data.cortex_tab_snapshot as Record<string, { chromeTabId: number; url: string; title: string }> | undefined;
+        if (snapData) {
+            interventionTabSnapshot = new Map();
+            for (const [key, entry] of Object.entries(snapData)) {
+                interventionTabSnapshot.set(Number(key), entry);
+            }
+        }
+    } catch {
+        // storage.session not available
     }
 }
 
@@ -851,6 +956,9 @@ async function snapshotTabsForIntervention(): Promise<void> {
 async function validateTab(
     tabIndex: number,
 ): Promise<{ valid: boolean; tabId: number; message: string }> {
+    // Ensure snapshot is loaded (handles service worker restart)
+    await loadSnapshotFromStorage();
+
     const snap = interventionTabSnapshot.get(tabIndex);
     if (!snap) {
         return { valid: false, tabId: -1, message: `Tab index ${tabIndex} not in snapshot` };
@@ -922,31 +1030,61 @@ async function executeAction(action: SuggestedAction): Promise<ActionExecuteResu
 }
 
 async function executeCloseTab(action: SuggestedAction): Promise<ActionExecuteResult> {
-    if (action.tab_index === null || action.tab_index === undefined) {
-        return { action_id: action.action_id, success: false, message: "No tab_index provided", undo_available: false };
+    const aid = action.action_id || `close_${Date.now()}`;
+    const tabIndex = typeof action.tab_index === "number" ? action.tab_index : Number(action.tab_index);
+    if (isNaN(tabIndex)) {
+        return { action_id: aid, success: false, message: "No tab_index provided", undo_available: false };
     }
-    const v = await validateTab(action.tab_index);
-    if (!v.valid) {
-        return { action_id: action.action_id, success: false, message: v.message, undo_available: false };
+
+    // Primary path: use snapshot
+    const v = await validateTab(tabIndex);
+    let tabId = v.valid ? v.tabId : -1;
+    let tabUrl = "";
+    let tabTitle = "";
+
+    if (v.valid) {
+        const snap = interventionTabSnapshot.get(tabIndex);
+        tabUrl = snap?.url || "";
+        tabTitle = snap?.title || "";
+    } else {
+        // Fallback: find the tab by matching title from the action label.
+        // This handles cases where the snapshot was lost (SW restart) or stale.
+        const targetTitle = action.label?.replace(/^Close\s+/i, "") || "";
+        if (targetTitle) {
+            try {
+                const allTabs = await chrome.tabs.query({});
+                const match = allTabs.find(t => t.title?.includes(targetTitle));
+                if (match?.id) {
+                    tabId = match.id;
+                    tabUrl = match.url || "";
+                    tabTitle = match.title || "";
+                }
+            } catch {
+                // query failed
+            }
+        }
+        if (tabId === -1) {
+            return { action_id: aid, success: false, message: v.message || "Tab not found", undo_available: false };
+        }
     }
-    const snap = interventionTabSnapshot.get(action.tab_index);
-    // Actually close the tab — save URL for undo (reopen)
+
     try {
-        await chrome.tabs.remove(v.tabId);
+        await chrome.tabs.remove(tabId);
     } catch {
-        return { action_id: action.action_id, success: false, message: "Failed to close tab", undo_available: false };
+        return { action_id: aid, success: false, message: "Failed to close tab", undo_available: false };
     }
     pushUndo({
-        action_id: action.action_id,
+        action_id: aid,
         action_type: "close_tab",
-        undo_data: { url: snap?.url || "", title: snap?.title || "" },
+        undo_data: { url: tabUrl, title: tabTitle },
         timestamp: Date.now(),
     });
-    return { action_id: action.action_id, success: true, message: "Tab closed", undo_available: true };
+    return { action_id: aid, success: true, message: "Tab closed", undo_available: true };
 }
 
 async function executeGroupTabs(action: SuggestedAction): Promise<ActionExecuteResult> {
-    const tabIndices = (action.metadata.tab_indices as number[]) || [];
+    const meta = action.metadata || {};
+    const tabIndices = (meta.tab_indices as number[]) || [];
     if (action.tab_index !== null && action.tab_index !== undefined) {
         tabIndices.push(action.tab_index);
     }
@@ -958,7 +1096,7 @@ async function executeGroupTabs(action: SuggestedAction): Promise<ActionExecuteR
     if (tabIds.length === 0) {
         return { action_id: action.action_id, success: false, message: "No valid tabs to group", undo_available: false };
     }
-    const groupName = (action.metadata.group_name as string) || action.label || "Grouped";
+    const groupName = ((action.metadata || {}).group_name as string) || action.label || "Grouped";
     const groupId = await groupSpecificTabs(tabIds, groupName, "blue");
     pushUndo({
         action_id: action.action_id,
@@ -970,35 +1108,56 @@ async function executeGroupTabs(action: SuggestedAction): Promise<ActionExecuteR
 }
 
 async function executeBookmarkAndClose(action: SuggestedAction): Promise<ActionExecuteResult> {
-    if (action.tab_index === null || action.tab_index === undefined) {
-        return { action_id: action.action_id, success: false, message: "No tab_index", undo_available: false };
+    const aid = action.action_id || `bmc_${Date.now()}`;
+    const tabIndex = typeof action.tab_index === "number" ? action.tab_index : Number(action.tab_index);
+    if (isNaN(tabIndex)) {
+        return { action_id: aid, success: false, message: "No tab_index", undo_available: false };
     }
-    const v = await validateTab(action.tab_index);
-    if (!v.valid) {
-        return { action_id: action.action_id, success: false, message: v.message, undo_available: false };
+
+    const v = await validateTab(tabIndex);
+    let tabId = v.valid ? v.tabId : -1;
+    let tabUrl = "";
+    let tabTitle = "";
+
+    if (v.valid) {
+        const snap = interventionTabSnapshot.get(tabIndex);
+        tabUrl = snap?.url || "";
+        tabTitle = snap?.title || "";
+    } else {
+        const targetTitle = action.label?.replace(/^Close\s+/i, "") || "";
+        if (targetTitle) {
+            try {
+                const allTabs = await chrome.tabs.query({});
+                const match = allTabs.find(t => t.title?.includes(targetTitle));
+                if (match?.id) {
+                    tabId = match.id;
+                    tabUrl = match.url || "";
+                    tabTitle = match.title || "";
+                }
+            } catch { /* query failed */ }
+        }
+        if (tabId === -1) {
+            return { action_id: aid, success: false, message: v.message || "Tab not found", undo_available: false };
+        }
     }
-    const snap = interventionTabSnapshot.get(action.tab_index);
+
     try {
-        await chrome.bookmarks.create({
-            title: snap?.title || "Cortex bookmark",
-            url: snap?.url || "",
-        });
+        await chrome.bookmarks.create({ title: tabTitle || "Cortex bookmark", url: tabUrl });
     } catch {
         // Bookmark permission may not be available
     }
-    // Actually close the tab after bookmarking
     try {
-        await chrome.tabs.remove(v.tabId);
+        await chrome.tabs.remove(tabId);
     } catch {
-        return { action_id: action.action_id, success: false, message: "Failed to close tab", undo_available: false };
+        return { action_id: aid, success: false, message: "Failed to close tab", undo_available: false };
     }
     pushUndo({
-        action_id: action.action_id,
+        action_id: aid,
         action_type: "bookmark_and_close",
-        undo_data: { url: snap?.url || "", title: snap?.title || "" },
+        undo_data: { url: tabUrl, title: tabTitle },
         timestamp: Date.now(),
     });
-    return { action_id: action.action_id, success: true, message: "Bookmarked & closed", undo_available: true };
+    return { action_id: aid, success: true, message: "Bookmarked & closed", undo_available: true };
 }
 
 async function executeOpenUrl(action: SuggestedAction): Promise<ActionExecuteResult> {
@@ -1016,7 +1175,7 @@ async function executeOpenUrl(action: SuggestedAction): Promise<ActionExecuteRes
 }
 
 async function executeSearchError(action: SuggestedAction): Promise<ActionExecuteResult> {
-    const query = (action.metadata.search_query as string) || action.target || "";
+    const query = ((action.metadata || {}).search_query as string) || action.target || "";
     if (!query) {
         return { action_id: action.action_id, success: false, message: "No search query", undo_available: false };
     }
@@ -1050,7 +1209,7 @@ async function executeSaveSession(action: SuggestedAction): Promise<ActionExecut
 }
 
 async function executeCopyToClipboard(action: SuggestedAction): Promise<ActionExecuteResult> {
-    const text = action.target || (action.metadata.text as string) || "";
+    const text = action.target || ((action.metadata || {}).text as string) || "";
     if (!text) {
         return { action_id: action.action_id, success: false, message: "Nothing to copy", undo_available: false };
     }
@@ -1070,7 +1229,7 @@ async function executeCopyToClipboard(action: SuggestedAction): Promise<ActionEx
 }
 
 async function executeStartTimer(action: SuggestedAction): Promise<ActionExecuteResult> {
-    const minutes = (action.metadata.minutes as number) || 5;
+    const minutes = ((action.metadata || {}).minutes as number) || 5;
     await chrome.alarms.create("cortex-break-timer", { delayInMinutes: minutes });
     injectToast("Break timer started", `Timer set for ${minutes} minutes. We'll remind you when it's done.`);
     return { action_id: action.action_id, success: true, message: `${minutes}min timer started`, undo_available: false };
@@ -1134,6 +1293,31 @@ async function executeAllRecommended(
             results.push(await executeAction(action));
         }
     }
+
+    // Clear the intervention after execution so popup doesn't show stale data
+    const hadIntervention = activeIntervention !== null;
+    const interventionId = activeIntervention?.intervention_id;
+    activeIntervention = null;
+    // Persist cleared state
+    try { await chrome.storage.session.remove(["cortex_active_intervention", "cortex_tab_snapshot"]); } catch {}
+
+    // Notify daemon that user engaged with the intervention
+    if (hadIntervention && interventionId) {
+        send({
+            type: "USER_ACTION",
+            payload: {
+                action: "engaged",
+                intervention_id: interventionId,
+                timestamp: Date.now() / 1000,
+            },
+            timestamp: Date.now() / 1000,
+            sequence: ++sequence,
+        });
+    }
+
+    // Broadcast to popup so it clears the intervention card
+    broadcastToPopup({ type: "INTERVENTION_RESTORE", payload: { intervention_id: interventionId } });
+
     return results;
 }
 
@@ -1314,6 +1498,20 @@ chrome.runtime.onMessage.addListener(
     ) => {
         switch (message.type) {
             case "GET_STATE":
+                // If activeIntervention was lost (SW restart), load from session storage
+                if (!activeIntervention) {
+                    chrome.storage.session.get("cortex_active_intervention", (data) => {
+                        const stored = data?.cortex_active_intervention || null;
+                        if (stored) activeIntervention = stored;
+                        sendResponse({
+                            connected,
+                            state: currentState,
+                            intervention: activeIntervention,
+                            focusSession: focusSession ? getFocusSessionSnapshot() : null,
+                        });
+                    });
+                    return true; // async
+                }
                 sendResponse({
                     connected,
                     state: currentState,
@@ -1369,6 +1567,7 @@ chrome.runtime.onMessage.addListener(
                               ? (activeIntervention.intervention_id as string)
                               : null;
                     activeIntervention = null;
+                    try { chrome.storage.session.remove(["cortex_active_intervention", "cortex_tab_snapshot"]); } catch {}
                     if (interventionId) {
                         restoreTabsForIntervention(interventionId);
                     } else {
@@ -1384,6 +1583,27 @@ chrome.runtime.onMessage.addListener(
 
             case "CONTENT_EXTRACTED":
                 // Content script extracted text for us
+                sendResponse({ ok: true });
+                break;
+
+            case "DISTRACTION_BLOCKED":
+                // User clicked "Go back" on the distraction interceptor
+                if (focusSession) {
+                    focusSession.distractionsBlocked++;
+                }
+                sendResponse({ ok: true });
+                break;
+
+            case "USER_RATING":
+                send({
+                    type: "USER_RATING",
+                    payload: {
+                        intervention_id: message.intervention_id,
+                        rating: message.rating,
+                    },
+                    timestamp: Date.now() / 1000,
+                    sequence: ++sequence,
+                });
                 sendResponse({ ok: true });
                 break;
 
@@ -1445,11 +1665,11 @@ chrome.runtime.onMessage.addListener(
 
 // --- Distraction Blocking (tab navigation listener) ---
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, _tab) => {
     if (!focusSession || !changeInfo.url) return;
     const url = changeInfo.url;
     if (isDistractionUrl(url)) {
-        focusSession.distractionsBlocked++;
+        // Don't increment distractionsBlocked here — only when user clicks "Go back"
         const snap = getFocusSessionSnapshot();
         chrome.scripting.executeScript({
             target: { tabId },
@@ -1461,7 +1681,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
                 url,
             ],
         }).catch(() => {
-            // Injection failed — fall back to just closing the tab
+            // Injection failed
         });
     }
 });

@@ -1,5 +1,12 @@
 # Pydantic schemas for Cortex
 
+from cortex.libs.schemas.consent import (
+    ActionConsentState,
+    ConsentDecision,
+    ConsentLadderState,
+    ConsentLevel,
+    ConsentRecord,
+)
 from cortex.libs.schemas.context import (
     BrowserContext,
     Diagnostic,
@@ -7,6 +14,11 @@ from cortex.libs.schemas.context import (
     TabInfo,
     TaskContext,
     TerminalContext,
+)
+from cortex.libs.schemas.eval import (
+    BanditWeights,
+    HelpfulnessRecord,
+    InterventionSnapshot,
 )
 from cortex.libs.schemas.features import (
     FeatureVector,
@@ -25,6 +37,12 @@ from cortex.libs.schemas.intervention import (
     UIPlan,
     WorkspaceSnapshot,
 )
+from cortex.libs.schemas.longitudinal import (
+    ChronotypeModel,
+    DailyBaseline,
+    HourlyOverloadRate,
+    TaskOverloadPattern,
+)
 from cortex.libs.schemas.state import (
     SignalQuality,
     StateEstimate,
@@ -32,6 +50,11 @@ from cortex.libs.schemas.state import (
     StateTransition,
     UserBaselines,
     UserState,
+)
+from cortex.libs.schemas.transition_graph import (
+    FocusEdge,
+    FocusNode,
+    FocusTransitionGraph,
 )
 
 __all__ = [
@@ -64,4 +87,23 @@ __all__ = [
     "WorkspaceSnapshot",
     "InterventionOutcome",
     "DismissalRecord",
+    # Transition Graph
+    "FocusNode",
+    "FocusEdge",
+    "FocusTransitionGraph",
+    # Longitudinal
+    "DailyBaseline",
+    "HourlyOverloadRate",
+    "TaskOverloadPattern",
+    "ChronotypeModel",
+    # Consent
+    "ConsentLevel",
+    "ConsentRecord",
+    "ActionConsentState",
+    "ConsentLadderState",
+    "ConsentDecision",
+    # Eval
+    "InterventionSnapshot",
+    "HelpfulnessRecord",
+    "BanditWeights",
 ]

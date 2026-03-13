@@ -52,6 +52,14 @@
       {
         "command": "cortex.disconnect",
         "title": "Cortex: Disconnect from Daemon"
+      },
+      {
+        "command": "cortex.disableInlineSuggestions",
+        "title": "Cortex: Disable Inline Suggestions (HYPER mode)"
+      },
+      {
+        "command": "cortex.enableInlineSuggestions",
+        "title": "Cortex: Enable Inline Suggestions (FLOW mode)"
       }
     ],
     "viewsContainers": {

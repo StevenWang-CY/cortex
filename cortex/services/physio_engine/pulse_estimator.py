@@ -33,6 +33,7 @@ from cortex.libs.signal.peak_detection import (
     detect_bvp_peaks,
     estimate_hr_welch,
 )
+from cortex.services.physio_engine.respiration import RespirationEstimator
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,9 @@ class PulseEstimator:
         # Latest estimates
         self._latest_estimate: PulseEstimate | None = None
         self._latest_timestamp: float = 0.0
+
+        # Respiration estimator (runs alongside cardiac estimation)
+        self._resp_estimator = RespirationEstimator(fs=fs)
 
     @property
     def latest_estimate(self) -> PulseEstimate | None:
@@ -176,6 +180,9 @@ class PulseEstimator:
         self._latest_estimate = estimate
         self._latest_timestamp = timestamp
 
+        # Also estimate respiration from the same BVP window
+        self._resp_estimator.process_bvp_window(bvp_window, blink_suppression=0.0)
+
         return estimate
 
     def compute_hr_delta(self, current_time: float, window_seconds: float = 5.0) -> float | None:
@@ -230,16 +237,28 @@ class PulseEstimator:
 
         hr_delta = self.compute_hr_delta(timestamp)
 
+        resp_rate = None
+        resp_est = self._resp_estimator.latest_estimate
+        if resp_est is not None:
+            resp_rate = resp_est.resp_rate_bpm
+
         return PhysioFeatures(
             pulse_bpm=est.hr_bpm,
             pulse_quality=est.signal_quality,
             pulse_variability_proxy=est.rmssd_ms,
             hr_delta_5s=hr_delta,
+            respiration_rate_bpm=resp_rate,
             valid=est.signal_quality > 0.1,
         )
+
+    @property
+    def resp_estimator(self) -> RespirationEstimator:
+        """Access the respiration sub-estimator."""
+        return self._resp_estimator
 
     def reset(self) -> None:
         """Reset all state."""
         self._hr_history.clear()
         self._latest_estimate = None
         self._latest_timestamp = 0.0
+        self._resp_estimator.reset()

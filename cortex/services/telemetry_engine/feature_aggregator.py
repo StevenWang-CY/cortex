@@ -37,6 +37,7 @@ from cortex.services.telemetry_engine.input_hooks import (
     MouseScrollEvent,
     ScrollDirection,
 )
+from cortex.services.telemetry_engine.focus_graph import FocusGraphBuilder
 from cortex.services.telemetry_engine.window_tracker import WindowFocusEvent, WindowTracker
 
 logger = logging.getLogger(__name__)
@@ -83,6 +84,7 @@ class FeatureAggregator:
         self._window_tracker = window_tracker
         self._config = config or TelemetryConfig()
         self._tab_count_provider = tab_count_provider
+        self._focus_graph = FocusGraphBuilder()
 
     def build_features(
         self,
@@ -114,6 +116,14 @@ class FeatureAggregator:
         if self._window_tracker is not None:
             window_events = self._window_tracker.get_events_in_window(window, now)
 
+        # Feed window events to focus graph for thrashing detection
+        for we in window_events:
+            self._focus_graph.add_event(
+                app_name=we.app_name,
+                window_title=we.window_title,
+                timestamp=we.timestamp,
+            )
+
         # Compute all features
         vel_mean, vel_var = self._compute_mouse_velocity(mouse_moves)
         jerk_score = self._compute_mouse_jerk(mouse_moves)
@@ -127,6 +137,7 @@ class FeatureAggregator:
         )
         switch_rate = self._compute_window_switch_rate(window_events, window)
         scroll_rev = self._compute_scroll_reversal_score(mouse_scrolls)
+        thrashing = self._focus_graph.compute_thrashing_score(current_time=now)
 
         # Tab count from external provider
         tab_count = None
@@ -135,6 +146,8 @@ class FeatureAggregator:
                 tab_count = self._tab_count_provider()
             except Exception:
                 pass
+
+        self._latest_thrashing_score = thrashing
 
         return TelemetryFeatures(
             mouse_velocity_mean=vel_mean,
@@ -150,6 +163,16 @@ class FeatureAggregator:
             tab_count=tab_count,
             scroll_reversal_score=scroll_rev,
         )
+
+    @property
+    def thrashing_score(self) -> float:
+        """Get the latest thrashing score from focus graph analysis."""
+        return getattr(self, '_latest_thrashing_score', 0.0)
+
+    @property
+    def focus_graph(self) -> FocusGraphBuilder:
+        """Access the focus graph builder."""
+        return self._focus_graph
 
     @staticmethod
     def _compute_mouse_velocity(

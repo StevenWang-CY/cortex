@@ -31,6 +31,9 @@ Rules:
 - tab_index must be within range [0, N-1] where N = number of tabs shown.
 - Keep the headline under 15 words.
 - Never recommend destructive actions (deleting files, closing unsaved buffers).
+- ALWAYS include a "causal_explanation" field: 1-2 sentences explaining WHY you are \
+intervening, referencing specific signals (e.g., "Your heart rate rose 18% while \
+switching between 4 tabs in 45 seconds").
 - Output ONLY valid JSON matching the schema below. No markdown, no preamble.
 
 Output JSON schema:
@@ -38,6 +41,7 @@ Output JSON schema:
   "situation_summary": "string, 1-2 sentences",
   "primary_focus": "string, the one thing to look at",
   "headline": "string, under 15 words",
+  "causal_explanation": "string, 1-2 sentences explaining WHY this intervention was triggered, referencing specific biometric/behavioral signals",
   "micro_steps": ["step 1", "step 2", "step 3"],
   "hide_targets": [
     "browser_tabs_except_active",
@@ -69,7 +73,11 @@ Output JSON schema:
     "root_cause": "1-2 sentence root cause",
     "suggested_fix": "concrete code fix or approach",
     "search_query": "pre-crafted search query",
-    "relevant_doc_url": "URL if identifiable from context"
+    "relevant_doc_url": "URL if identifiable from context",
+    "failing_abstraction": "the specific function/class/module that is failing",
+    "symbol_location": "file:line location of the failing symbol",
+    "root_cause_category": "type_mismatch|null_reference|missing_import|logic_error|api_misuse|concurrency|config|other",
+    "minimal_edit": "smallest code change that fixes the issue"
   },
   "tab_recommendations": {
     "tabs": [
@@ -209,6 +217,135 @@ Complexity: {complexity:.2f}
 """
 
 # ---------------------------------------------------------------------------
+# v2.0 Templates — New intervention modes
+# ---------------------------------------------------------------------------
+
+_BREATHING_OVERLAY = """\
+The user's respiration rate has dropped dangerously low (screen apnea detected). \
+They are fixating intensely — likely holding their breath while reading a stack trace \
+or complex code.
+
+Generate a CALMING intervention that guides them through a 4-7-8 breathing pattern:
+- Inhale for 4 seconds
+- Hold for 7 seconds
+- Exhale for 8 seconds
+
+The intervention must NOT break their mental model. Use a gentle ambient overlay, \
+not a modal dialog. The headline should acknowledge what they're working on.
+
+Include a causal_explanation referencing the specific respiration and blink suppression signals.
+
+Focus goal: {goal_hint}
+
+{context}
+
+State: {state} (confidence {confidence:.0%}, dwelling {dwell:.0f}s)
+Complexity: {complexity:.2f}
+Respiration: {extra_context}
+{constraints_text}
+"""
+
+_ACTIVE_RECALL = """\
+The user has been passively reading for an extended period (zombie-reading detected). \
+They are scrolling slowly with minimal interaction — likely not absorbing the content.
+
+Based on the visible page text provided below, generate a SPECIFIC, TECHNICAL \
+fill-in-the-blank question that tests comprehension of the material. The question \
+must be directly based on the actual text content, not generic.
+
+Output a JSON object with these additional fields:
+- "recall_question": the fill-in-the-blank question (use ___ for the blank)
+- "recall_answer": the correct answer
+- "recall_context_sentence": the original sentence the question was derived from
+
+The intervention will blur the screen and show the question. The user must answer \
+correctly to unblur.
+
+Include a causal_explanation referencing blink rate, scroll velocity, and mouse inactivity.
+
+Visible page text:
+{extra_context}
+
+Focus goal: {goal_hint}
+State: {state} (confidence {confidence:.0%}, dwelling {dwell:.0f}s)
+{constraints_text}
+"""
+
+_RABBIT_HOLE_PROMPT = """\
+The user has drifted from their session goal. They set out to work on one thing \
+but have been deep in unrelated code/content for an extended period.
+
+Goal: {goal_hint}
+Current context (what they're actually doing):
+{context}
+
+Drift information:
+{extra_context}
+
+Generate an intervention that:
+1. Acknowledges what they're currently working on (don't dismiss it)
+2. Reminds them of the original goal
+3. Suggests bringing the goal-relevant file/tab to the front
+4. Makes the workspace rearrangement REVERSIBLE (include an undo option)
+
+Include a causal_explanation referencing the alignment score and drift duration.
+
+State: {state} (confidence {confidence:.0%}, dwelling {dwell:.0f}s)
+{constraints_text}
+"""
+
+_ALIGNMENT_SUMMARY = """\
+The user is thrashing between multiple windows/tabs rapidly. Analyze the focus \
+transition graph data below to identify what they're trying to accomplish and \
+where they're stuck.
+
+Focus transition data:
+{extra_context}
+
+You MUST generate:
+- A situation_summary that identifies the SPECIFIC pattern (e.g., "bouncing between \
+Terminal (OAuth Error 400), auth.ts, and AWS docs")
+- An error_analysis if the transitions suggest debugging
+- Concrete micro_steps to resolve the underlying confusion
+- A causal_explanation referencing switching velocity and specific apps/tabs involved
+
+Focus goal: {goal_hint}
+
+{context}
+
+State: {state} (confidence {confidence:.0%}, dwelling {dwell:.0f}s)
+Complexity: {complexity:.2f}
+{constraints_text}
+"""
+
+_DEEP_BOTTLENECK_DIAGNOSIS = """\
+The user is stuck debugging and needs expert-level assistance. Your job is to \
+minimize their unblock time by providing the most direct path to resolution.
+
+You MUST:
+1. Isolate the FAILING ABSTRACTION (which function/class/module is broken)
+2. Locate the RELEVANT SYMBOLS (file:line references from the context)
+3. State the LIKELY ROOT CAUSE (be specific, not generic)
+4. Provide the MINIMAL EDIT (smallest code change that fixes it)
+5. Classify the root_cause_category: type_mismatch, null_reference, missing_import, \
+logic_error, api_misuse, concurrency, config, or other
+
+The error_analysis MUST include failing_abstraction, symbol_location, \
+root_cause_category, and minimal_edit fields.
+
+Include a causal_explanation referencing error persistence, time spent debugging, \
+and workspace complexity signals.
+
+Focus goal: {goal_hint}
+
+{context}
+
+State: {state} (confidence {confidence:.0%}, dwelling {dwell:.0f}s)
+Complexity: {complexity:.2f}
+{constraints_text}
+"""
+
+# ---------------------------------------------------------------------------
 # Template registry
 # ---------------------------------------------------------------------------
 
@@ -218,6 +355,12 @@ PROMPT_TEMPLATES: dict[str, str] = {
     "browser_tab_reduction": _BROWSER_TAB_REDUCTION,
     "micro_step_planner": _MICRO_STEP_PLANNER,
     "calm_overlay_writer": _CALM_OVERLAY_WRITER,
+    # v2.0 templates
+    "breathing_overlay": _BREATHING_OVERLAY,
+    "active_recall": _ACTIVE_RECALL,
+    "rabbit_hole": _RABBIT_HOLE_PROMPT,
+    "alignment_summary": _ALIGNMENT_SUMMARY,
+    "deep_bottleneck_diagnosis": _DEEP_BOTTLENECK_DIAGNOSIS,
 }
 
 

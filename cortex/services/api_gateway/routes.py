@@ -506,3 +506,94 @@ async def restore_intervention(
             )
 
     return InterventionRestoreResponse(restored=False)
+
+
+# =============================================================================
+# v2.0 Endpoints — Stress, Helpfulness, Projects
+# =============================================================================
+
+
+class StressIntegralResponse(BaseModel):
+    """Stress integral current value."""
+    current_value: float = 0.0
+    threshold: float = 500.0
+    should_break: bool = False
+    sensitivity_multiplier: float = 1.0
+    timestamp: float = Field(default_factory=time.monotonic)
+
+
+@router.get("/api/stress-integral", response_model=StressIntegralResponse)
+async def get_stress_integral(request: Request) -> StressIntegralResponse:
+    """Get current stress integral value and break recommendation."""
+    reg = _get_registry(request)
+    tracker = reg.get("stress_integral_tracker")
+    if tracker is not None:
+        data = tracker.to_dict()
+        return StressIntegralResponse(
+            current_value=data.get("current_value", 0.0),
+            threshold=data.get("threshold", 500.0),
+            should_break=tracker.should_break(),
+            sensitivity_multiplier=data.get("sensitivity_multiplier", 1.0),
+        )
+    return StressIntegralResponse()
+
+
+class HelpfulnessSummaryResponse(BaseModel):
+    """Summary of helpfulness metrics."""
+    total_interventions: int = 0
+    mean_reward: float = 0.0
+    engagement_rate: float = 0.0
+    recent_rewards: list[float] = Field(default_factory=list)
+    timestamp: float = Field(default_factory=time.monotonic)
+
+
+@router.get("/api/helpfulness/summary", response_model=HelpfulnessSummaryResponse)
+async def get_helpfulness_summary(request: Request) -> HelpfulnessSummaryResponse:
+    """Get helpfulness metrics summary."""
+    reg = _get_registry(request)
+    tracker = reg.get("helpfulness_tracker")
+    if tracker is not None and hasattr(tracker, "get_summary"):
+        summary = tracker.get_summary()
+        return HelpfulnessSummaryResponse(**summary)
+    return HelpfulnessSummaryResponse()
+
+
+class ProjectListResponse(BaseModel):
+    """List of configured projects."""
+    projects: list[dict] = Field(default_factory=list)
+
+
+@router.get("/api/projects", response_model=ProjectListResponse)
+async def list_projects(request: Request) -> ProjectListResponse:
+    """List all configured project launch profiles."""
+    reg = _get_registry(request)
+    launcher = reg.get("project_launcher")
+    if launcher is not None and hasattr(launcher, "list_projects"):
+        projects = launcher.list_projects()
+        return ProjectListResponse(projects=[p.model_dump() if hasattr(p, 'model_dump') else p for p in projects])
+    return ProjectListResponse()
+
+
+class LaunchProjectResponse(BaseModel):
+    """Result of launching a project."""
+    launched: bool = False
+    project_name: str = ""
+    errors: list[str] = Field(default_factory=list)
+
+
+@router.post("/api/launch/{project_name}", response_model=LaunchProjectResponse)
+async def launch_project(project_name: str, request: Request) -> LaunchProjectResponse:
+    """Launch a project workspace configuration."""
+    reg = _get_registry(request)
+    launcher = reg.get("project_launcher")
+    if launcher is not None and hasattr(launcher, "launch"):
+        try:
+            await launcher.launch(project_name)
+            return LaunchProjectResponse(launched=True, project_name=project_name)
+        except Exception as e:
+            return LaunchProjectResponse(
+                launched=False,
+                project_name=project_name,
+                errors=[str(e)],
+            )
+    return LaunchProjectResponse(errors=["No project launcher available"])

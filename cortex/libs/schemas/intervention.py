@@ -88,6 +88,21 @@ class ErrorAnalysis(BaseModel):
     relevant_doc_url: str = Field(
         "", description="URL to relevant documentation, if identifiable"
     )
+    failing_abstraction: str = Field(
+        "", max_length=200, description="The specific abstraction or function that is failing"
+    )
+    symbol_location: str = Field(
+        "", max_length=200, description="File:line location of the failing symbol"
+    )
+    root_cause_category: Literal[
+        "type_mismatch", "null_reference", "missing_import", "logic_error",
+        "api_misuse", "concurrency", "config", "other"
+    ] = Field(
+        "other", description="Classified root cause category"
+    )
+    minimal_edit: str = Field(
+        "", max_length=1000, description="Smallest code change that fixes the issue"
+    )
 
 
 class TabRecommendation(BaseModel):
@@ -195,6 +210,14 @@ class InterventionPlan(BaseModel):
     )
     tab_recommendations: TabRecommendations | None = Field(
         None, description="Per-tab keep/close/group recommendations"
+    )
+    causal_explanation: str = Field(
+        "", max_length=500, description="Why Cortex triggered this intervention, referencing specific signals"
+    )
+    consent_level: Literal[
+        "observe", "suggest", "preview", "reversible_act", "autonomous_act"
+    ] = Field(
+        "suggest", description="Consent ladder level for this intervention"
     )
 
     @property
@@ -327,6 +350,12 @@ class InterventionOutcome(BaseModel):
     )
     restore_errors: list[str] = Field(
         default_factory=list, description="Errors during restoration"
+    )
+    helpfulness_score: float | None = Field(
+        None, ge=-1.0, le=1.0, description="Computed helpfulness reward signal"
+    )
+    user_rating: Literal["thumbs_up", "thumbs_down", None] = Field(
+        None, description="Explicit user rating of intervention"
     )
 
     @property

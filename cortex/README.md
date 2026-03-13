@@ -8,11 +8,11 @@
 
 Cortex runs a five-layer pipeline at 30 FPS, entirely on your machine:
 
-1. **Bio-Extraction** — extracts heart rate and HRV from your face via rPPG (no camera storage), tracks blink rate, head pose, and posture via MediaPipe, and monitors mouse/keyboard patterns via pynput.
-2. **State Classification** — fuses seven signals into a cognitive state score every 500ms. Uses rule-based scoring with EMA smoothing and hysteresis to classify you as FLOW, HYPER, HYPO, or RECOVERY.
+1. **Bio-Extraction** — extracts heart rate, HRV, and respiratory rate from your face via rPPG (no camera storage), tracks blink rate, head pose, and posture via MediaPipe, and monitors mouse/keyboard patterns via pynput.
+2. **State Classification** — fuses signals into a cognitive state score every 500ms. Uses rule-based scoring with EMA smoothing, hysteresis, focus-graph thrashing analysis, and screen-apnea detection to classify you as FLOW, HYPER, HYPO, or RECOVERY.
 3. **Context Engine** — when an intervention is warranted, gathers workspace context: open file + diagnostics from VS Code, active tab + content from Chrome, recent terminal output. Tabs are pre-filtered (30 cap with type-diverse sampling) to fit LLM context windows.
-4. **LLM Engine** — sends workspace context (no biometrics) to Azure OpenAI first, then local Ollama if unavailable. The model returns a structured intervention plan: headline, micro-steps, suggested actions, error analysis, and per-tab recommendations.
-5. **Intervention Engine** — validates and executes the plan: closes distraction tabs, groups related tabs, folds irrelevant code in VS Code, shows an overlay with one-click actions. Snapshots workspace state first. All actions are reversible via undo.
+4. **LLM Engine** — sends workspace context (no biometrics) to Azure OpenAI first, then local Ollama if unavailable. The model returns a structured intervention plan: headline, micro-steps, causal explanation, suggested actions, error analysis, and per-tab recommendations. A contextual bandit selects the optimal intervention type per context.
+5. **Intervention Engine** — validates and executes the plan through a pluggable adapter registry: closes distraction tabs, groups related tabs, folds irrelevant code in VS Code, shows an overlay with one-click actions. All interventions are gated by a consent ladder. Snapshots workspace state first. All actions are reversible via undo.
 
 ---
 
@@ -31,9 +31,25 @@ Interventions trigger on HYPER with confidence > 0.85, workspace complexity > 0.
 
 ## Active Interventions
 
-When Cortex detects you need help, the LLM analyzes your full workspace context and generates specific, executable actions. The intervention overlay appears in the bottom-right of your active tab.
+When Cortex detects you need help, the LLM analyzes your full workspace context and generates specific, executable actions. A contextual bandit (LinUCB) selects the best intervention type based on learned user preferences. The intervention overlay appears in the bottom-right of your active tab.
+
+### Intervention Types
+
+The bandit selects from these arms based on context and learned reward signals:
+
+| Arm | When It Fires | What It Does |
+|-----|---------------|-------------|
+| `overlay_only` | Default HYPER | Standard tab/workspace cleanup overlay |
+| `simplified_workspace` | High complexity | Aggressive workspace simplification |
+| `guided_mode` | Mixed/overwhelmed | Micro-step task decomposition |
+| `breathing` | Screen apnea detected | 4-7-8 breathing guide overlay |
+| `active_recall` | Zombie reading detected | Fill-in-the-blank comprehension test |
+| `circuit_breaker` | Sustained stress | Break recommendation with stress data |
+| `none` | Low confidence | No intervention (bandit learns when to stay quiet) |
 
 ### What the LLM generates
+
+**Causal Explanation** — every intervention includes a 1-2 sentence explanation of *why* it was triggered (e.g., "Your heart rate spiked 18% above baseline while switching between 6 tabs in 30 seconds").
 
 **Suggested Actions** — 1-5 concrete actions per intervention:
 
@@ -51,7 +67,8 @@ When Cortex detects you need help, the LLM analyzes your full workspace context 
 
 **Error Analysis** — when terminal/editor errors are detected:
 - Error type classification (syntax, import, runtime, build, test)
-- Root cause explanation
+- Root cause category and failing abstraction identification
+- Symbol location and minimal edit suggestion
 - Concrete suggested fix
 - Pre-crafted search query
 
@@ -62,10 +79,66 @@ When Cortex detects you need help, the LLM analyzes your full workspace context 
 
 ### Safety
 
+- **Consent ladder** — actions are gated by a progressive trust system. Cortex starts at SUGGEST level and earns autonomy through repeated user approvals. 3 rejections de-escalate. 5 consent levels: OBSERVE → SUGGEST → ASK_BEFORE_ACT → ACT_AND_NOTIFY → AUTONOMOUS_ACT
 - **Validate-before-execute** — every tab action checks the tab still exists and hasn't navigated away (10-40s can elapse between context snapshot and user click)
+- **Tab index stabilization** — the tab list from context gathering is saved and reused when the intervention arrives, so the LLM's tab_index values always map to the correct Chrome tabs even if tabs changed between context capture and execution
 - **Tab targeting by index** — LLM references tabs by integer index from the context list, never by URL (prevents hallucination)
 - **Context overflow protection** — 150+ tabs are filtered to 30 with type-diverse sampling
 - **Full undo stack** — all destructive actions are reversible (FIFO, max 50 entries)
+
+---
+
+## v2.0 Detectors
+
+Beyond the core HYPER/HYPO classification, Cortex v2.0 runs specialized detectors that trigger targeted interventions:
+
+### Stress Integral (Biological Pomodoro)
+
+Replaces arbitrary 25-minute timers with biology-driven break detection. Continuously integrates HRV suppression: `L += (hrv_baseline - hrv_current) * dt`. When the accumulated stress load crosses a dynamic threshold (adjusted by the longitudinal tracker's sensitivity multiplier), Cortex flags that a break is needed. You can ride deep FLOW indefinitely until your biology says stop.
+
+### Zombie Reading Detector
+
+Detects passive reading — staring at text without absorbing content. Triggers when: HYPO state + browser active + low mouse velocity (<30 px/s) + elevated blink rate (>115% baseline) sustained for 90+ seconds. Fires an Active Recall intervention: a fill-in-the-blank comprehension question generated from the visible page text.
+
+### Rabbit Hole Detector
+
+Detects goal drift — when you've wandered far from your session goal. Compares active file/tab titles against goal keywords. Triggers after 10+ minutes below 30% alignment. Only fires in FLOW/HYPO (not HYPER, where you're already struggling). Suggests bringing back recently on-task files.
+
+### Screen Apnea Detector
+
+Detects breath-holding during intense focus. Uses respiratory rate extracted from the BVP signal (Butterworth bandpass 0.15–0.4 Hz + Welch PSD). Triggers when respiration drops below 8 bpm while blink suppression indicates visual fixation. Fires a breathing overlay with guided 4-7-8 pattern.
+
+### Shutdown Detector (End-of-Day Handover)
+
+Detects when you should stop working based on compound fatigue signals: posture collapse (>0.6), HRV drop (<70% baseline), error rate (3+ per 5 min), late hour (10 PM+). Requires 2/3 signals sustained for 5+ minutes. Triggers a handover snapshot — captures full workspace state (editor, terminal, browser, git diff) and writes a Markdown brief to `storage/handovers/`. Next morning, a briefing notification shows where you left off.
+
+### Focus Transition Graph
+
+Builds a directed graph of app/tab focus transitions in real time. Computes a thrashing score from: node diversity (30%), switch velocity (30%), dwell time (25%), and revisit ratio (15%). The thrashing score feeds into state classification, replacing simple window-switch frequency.
+
+### Longitudinal Tracker
+
+Tracks physiological baselines (HR, HRV, respiration) over days and weeks. Detects trends via linear regression on daily HRV snapshots. Declining HRV → sensitivity multiplier drops (0.5–1.0), triggering breaks sooner. Improving HRV → multiplier rises (1.0–1.5), fewer interruptions. Hourly snapshots run automatically.
+
+---
+
+## Learning Loop
+
+Cortex learns from every intervention to get better over time:
+
+1. **Helpfulness Tracker** — captures pre/post intervention state and computes a reward signal from implicit signals (was it undone? ignored? engaged with?) and explicit signals (thumbs up/down rating). Reward = recovery weight (40%) + complexity reduction (15%) + explicit rating (30%) + implicit signals (15%).
+
+2. **Contextual Bandit (LinUCB)** — selects which intervention type to deploy based on 8 context features: state code, complexity, tab count, error count, hour of day, thrashing score, stress integral, and consent level. Updates A matrices and b vectors after each intervention. Persists weights to store every 10 updates.
+
+3. **Replay Harness** — offline A/B testing. Load JSONL session recordings and replay them through alternative scoring policies and prompt configurations. Compare baseline vs. variant on reward delta, engagement delta, and intervention count.
+
+```bash
+# Offline evaluation
+python -m cortex.scripts.replay_harness --scorer v2 --prompts v2 sessions/*.jsonl
+
+# Batch bandit training
+python -m cortex.services.eval.bandit_trainer --data sessions/ --output models/
+```
 
 ---
 
@@ -75,30 +148,50 @@ Built with Plasmo + React (Manifest V3). Lives in `apps/browser_extension/`.
 
 ### Popup Dashboard
 
-Dark, high-end interface showing:
-- Connection status with live cognitive state indicator
-- Focus session controls with goal input
-- Real-time focus metrics (focus minutes, percentage, streak)
+Dark, high-end interface (Linear/Raycast-inspired) showing:
+- Connection status with live cognitive state indicator (FLOW/HYPER/HYPO/RECOVERY)
+- Morning briefing card ("Where you left off" summary from yesterday's handover)
+- Focus session controls with goal input and Enter-to-start
+- Big number display of real focus minutes with color-coded progress bar
+- Current streak timer, distractions blocked, and longest streak
 - Live biometrics (BPM, HRV, blink rate) in monospace
-- Intervention preview with one-click "Close N tabs" button
-- Daily stats grid
+- Active intervention preview: causal explanation, tab close list, error analysis card, one-click CTA, undo
+- Thumbs up/down rating buttons for intervention feedback
+- Daily stats grid (total focus, sessions, best streak, distractions blocked)
+- Health alerts and break suggestions appear as dismissible cards
 
 ### Intervention Overlay
 
 Injected via Shadow DOM into the active tab:
+- Causal explanation (italicized, explains *why* this intervention fired)
 - Tab close list with red `x` marks
 - "Keeping N you need" count
 - Error analysis with monospace suggested fix
 - Single CTA button that executes all recommended actions
 - Undo link to reverse all changes
+- Auto-dismisses 1.5s after action execution
+
+### Breathing Overlay
+
+Full-screen guided breathing when screen apnea is detected:
+- 4-7-8 breathing pattern (inhale 4s, hold 7s, exhale 8s)
+- Visual animation synced to breath phases
+
+### Active Recall Overlay
+
+Comprehension test when zombie reading is detected:
+- Scrapes visible page text via `scrapeVisibleText()`
+- LLM generates fill-in-the-blank question from content
+- Tests whether you're actually absorbing what you're reading
 
 ### Ambient Somatic Feedback
 
-Sub-threshold content script running on every page:
-- **Aura** — barely-visible vignette that shifts color based on state
-- **Somatic filter** — color temperature overlay (warm vs cool, 0-4% opacity)
-- **Weather particles** — canvas with 6-45 particles (rain when stressed, calm when focused)
-- **Flow Shield** — gradually fades distracting page elements (sidebars, recommendation feeds) during focus
+Sub-threshold content script running on every page. Receives `AMBIENT_STATE_UPDATE` from the background service worker every 2 seconds and updates four visual layers:
+
+- **Aura** — barely-visible radial vignette at screen edges, color shifts with cognitive state (emerald when focused, red when stressed, blue when disengaged). Max 3% opacity at edges, 3-second transitions.
+- **Somatic filter** — full-screen color temperature overlay using `mix-blend-mode: multiply`. Cool blue tint during focus (1.5% opacity), warm amber during stress (3.5% opacity). 45-second transitions so changes are imperceptible.
+- **Weather particles** — canvas at 15fps with state-dependent particle count. HYPER: 35 rain-like vertical streaks falling from top. FLOW: 6 gentle floating dots. Particles are 3-7% opacity.
+- **Flow Shield** — during FLOW state, gradually fades known distraction elements (YouTube recommendations, Twitter trends, Reddit sidebars, GitHub feed) to 5% opacity over 3 minutes. Saves original opacity and fully restores on state change. Targets site-specific CSS selectors.
 
 ### Pulse Room (New Tab)
 
@@ -112,14 +205,18 @@ Replaces new tab with a dark canvas visualization:
 
 - Start with an optional goal ("Studying PyTorch CUDA debugging")
 - Tracks real focus minutes, focus percentage, current/best streaks
-- Blocks distraction sites with a full-page interceptor showing your stats
+- Blocks distraction sites (Reddit, Twitter/X, YouTube, Facebook, Instagram, TikTok, Netflix, Twitch, Discord) with a full-page interceptor showing your stats. Distraction counter only increments when you actually click "Go back" (not just on page load).
 - Focus goal flows through the entire pipeline to inform LLM tab relevance scoring
+
+### Tab Classification
+
+Every tab is classified by URL pattern into: `documentation`, `stackoverflow`, `pdf`, `paper`, `reference`, `search`, `code_host`, `distraction`, or `other`. The `distraction` type matches social media, streaming, and entertainment sites. Classification feeds into the LLM context and tab pre-filtering.
 
 ### Health Alerts
 
-- Eye strain detection (low blink rate triggers 20-20-20 rule reminder)
-- Posture alerts (forward lean threshold)
-- Break recommendations based on session duration and stress
+- **Eye strain** — if blink rate stays below 10/min for 3 minutes, shows a 20-20-20 rule reminder (look 20ft away for 20 seconds). 5-minute cooldown between alerts.
+- **Posture** — if forward lean exceeds threshold for 3 minutes, shows a posture correction notification. 5-minute cooldown.
+- **Break recommendations** — biology-driven via stress integral (replaces static timers). Shows a toast with specific reason (e.g., "Your HRV has been suppressed for 40 minutes").
 
 ---
 
@@ -127,13 +224,70 @@ Replaces new tab with a dark canvas visualization:
 
 Built with TypeScript. Lives in `apps/vscode_extension/`.
 
-Provides active file, diagnostics, and symbol at cursor. Receives fold commands from the intervention engine to collapse irrelevant code sections.
+- Provides active file, diagnostics, and symbol at cursor
+- Receives fold commands from the intervention engine to collapse irrelevant code sections
+- **Morning briefing** — shows notification with summary and action items from yesterday's handover on startup
+- **Copilot throttle** — disables inline suggestions (VS Code + GitHub Copilot) during HYPER state, re-enables in FLOW. Reduces cognitive noise when overwhelmed
+- Commands: `cortex.disableInlineSuggestions`, `cortex.enableInlineSuggestions`
+
+---
+
+## Consent Ladder
+
+Cortex uses a progressive trust system to gate intervention autonomy. Every action type starts at a low consent level and earns autonomy through repeated user approvals.
+
+| Level | Name | Behavior |
+|-------|------|----------|
+| 0 | OBSERVE | Cortex watches, no interventions |
+| 1 | SUGGEST | Shows overlay, user must click to execute |
+| 2 | ASK_BEFORE_ACT | Asks permission, then executes on approval |
+| 3 | ACT_AND_NOTIFY | Executes immediately, shows notification |
+| 4 | AUTONOMOUS_ACT | Executes silently |
+
+- 5 consecutive approvals → escalate one level
+- 3 rejections → de-escalate one level
+- Global max level cap (user-configurable)
+- Per-action type tracking (e.g., `close_tab` may reach level 3 while `group_tabs` stays at level 1)
+- State persists to store (Redis or in-memory)
+
+---
+
+## Project Launcher
+
+Zero-friction project onboarding. Define launch profiles in YAML with VS Code workspace, Chrome URLs, terminal commands, apps to hide, focus goal, and screen layout. One command opens everything.
+
+```bash
+# List configured projects
+curl http://127.0.0.1:9472/api/projects
+
+# Launch a project
+curl -X POST http://127.0.0.1:9472/api/launch/my-project
+```
+
+---
+
+## Storage
+
+Dual-backend persistence layer (Redis with automatic in-memory fallback). All services persist state, weights, and metrics without a hard dependency on Redis running.
+
+- **Redis store** — async Redis client using sorted sets for timeseries, JSON serialization for state. Auto-falls back to in-memory on connection failure.
+- **In-memory store** — dict-backed with deque-based timeseries. Used when Redis is unavailable or disabled.
+- Helpfulness records persist with 90-day TTL
+- Bandit weights persist every 10 updates
+- Consent ladder state persists across restarts
+- Longitudinal daily baselines persist indefinitely
+
+---
+
+## Adapter Registry
+
+Pluggable architecture for workspace integrations. Adapters implement the `CortexAdapter` protocol (name, capabilities, execute, get_context, health_check). The registry handles discovery, capability querying, action routing, and health checks. Supports plugin discovery via Python entry points. Legacy adapters are auto-wrapped for backward compatibility.
 
 ---
 
 ## Setup
 
-**Requirements:** Python 3.11+, macOS (primary target), webcam, Azure OpenAI deployment, Node.js 18+, pnpm.
+**Requirements:** Python 3.11+, macOS (primary target), webcam, Azure OpenAI deployment, Node.js 18+, pnpm. Optional: Redis 7+ (falls back to in-memory).
 
 ```bash
 cd /path/to/Ralph
@@ -185,6 +339,19 @@ python -m cortex.scripts.test_intervention
 
 ---
 
+## API Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/state` | Current cognitive state estimate |
+| GET | `/api/stress-integral` | Current stress load, threshold, and break recommendation |
+| GET | `/api/helpfulness/summary` | Intervention helpfulness metrics |
+| GET | `/api/projects` | List configured project launch profiles |
+| POST | `/api/launch/{name}` | Launch a project workspace |
+| WS | `ws://127.0.0.1:9473` | Real-time state, interventions, briefings |
+
+---
+
 ## Signals & Weights
 
 | Signal | Weight | How It's Measured |
@@ -193,9 +360,13 @@ python -m cortex.scripts.test_intervention
 | HRV drop | 15% | RMSSD from inter-beat intervals |
 | Blink suppression | 12% | Eye Aspect Ratio below threshold for extended period |
 | Mouse thrashing | 15% | Velocity variance + jerk score |
-| Window switching | 15% | App/tab switch rate per minute |
+| Thrashing (focus graph) | 15% | Focus transition graph: diversity, velocity, dwell, revisit |
 | Workspace complexity | 15% | Diagnostic count + tab count + context density |
 | Posture collapse | 8% | Shoulder drop ratio + forward lean angle |
+
+Additional signals (not weighted into state score, used by detectors):
+- **Respiratory rate** — BVP-derived via Butterworth bandpass + Welch PSD (screen apnea detector)
+- **Stress integral** — cumulative HRV suppression over time (biological pomodoro)
 
 ---
 
@@ -208,27 +379,37 @@ python -m cortex.scripts.test_intervention
                            │
           ┌────────────────▼─────────────────┐
           │  L1: Bio-Extraction              │
-          │  rPPG · Blink · Pose · Telemetry │
+          │  rPPG · Respiration · Blink ·    │
+          │  Pose · Telemetry                │
           └────────────────┬─────────────────┘
-                           │  FeatureVector (500ms)
+                           │  FeatureVector (500ms, 14-dim)
           ┌────────────────▼─────────────────┐
           │  L2: State Engine                │
-          │  Fusion · Scoring · Smoothing    │
+          │  Fusion · Focus Graph · Scoring  │
+          │  · Smoothing · Detectors         │
           └────────────────┬─────────────────┘
-                           │  StateEstimate
+                           │  StateEstimate + stress_integral
           ┌────────────────▼─────────────────┐
           │  L3: Context Engine              │
           │  VS Code · Chrome · Terminal     │
+          │  Adapter Registry                │
           └────────────────┬─────────────────┘
                            │  TaskContext
           ┌────────────────▼─────────────────┐
           │  L4: LLM Engine                  │
           │  Azure OpenAI · Ollama fallback  │
+          │  Contextual Bandit arm selection  │
           └────────────────┬─────────────────┘
-                           │  InterventionPlan
+                           │  InterventionPlan + causal_explanation
           ┌────────────────▼─────────────────┐
           │  L5: Intervention Engine         │
-          │  Validate · Execute · Undo       │
+          │  Consent · Validate · Execute ·  │
+          │  Undo · Helpfulness Tracking     │
+          └──────────────────────────────────┘
+                           │
+          ┌────────────────▼─────────────────┐
+          │  Store (Redis / In-Memory)       │
+          │  Weights · State · Timeseries    │
           └──────────────────────────────────┘
 ```
 
@@ -243,13 +424,19 @@ All layers communicate via the FastAPI gateway (`api_gateway/`) and WebSocket se
 | `browser_tab_reduction` | 5+ tabs open | Per-tab recommendations + close/group actions |
 | `micro_step_planner` | Mixed/overwhelmed state | Actions for automatable steps |
 | `calm_overlay_writer` | Reading docs / mild state | Actions for obviously irrelevant tabs |
+| `breathing_overlay` | Screen apnea detected | 4-7-8 breathing guide |
+| `active_recall` | Zombie reading detected | Fill-in-the-blank comprehension question |
+| `rabbit_hole` | Goal drift >10 min | Goal reminder + workspace rearrangement |
+| `alignment_summary` | High thrashing score | Focus transition analysis |
+| `deep_bottleneck_diagnosis` | Complex debugging | Failing abstraction isolation + minimal edit |
 
 ---
 
 ## Privacy
 
 - **No video is ever saved.** Frames are processed in memory and immediately discarded.
-- **No biometrics reach the LLM.** The model sees only workspace context: file paths, error messages, tab titles. Heart rate, HRV, blink data, and posture angles never leave your machine.
+- **No biometrics reach the LLM.** The model sees only workspace context: file paths, error messages, tab titles. Heart rate, HRV, respiration, blink data, and posture angles never leave your machine.
+- **Consent-gated autonomy.** No action executes without earned trust. Users control the maximum autonomy level.
 - **Minimal browser permissions.** The Chrome extension requests `activeTab`, `scripting`, `tabs`, `tabGroups`, `storage`, `alarms`, and `bookmarks`. It does not request browsing history.
 - **Local sensing, cloud planning.** The only network traffic is the LLM call, and Cortex sends workspace text context only.
 
@@ -260,35 +447,47 @@ All layers communicate via the FastAPI gateway (`api_gateway/`) and WebSocket se
 ```
 cortex/
 ├── libs/
-│   ├── config/              # CortexConfig, defaults.yaml, .env loading
-│   ├── schemas/             # Pydantic models (state, context, intervention, actions)
+│   ├── adapters/            # CortexAdapter protocol, AdapterRegistry, plugin discovery
+│   ├── config/              # CortexConfig, RedisConfig, defaults.yaml, .env loading
+│   ├── schemas/             # Pydantic models (state, context, intervention, consent,
+│   │                        #   eval, longitudinal, transition_graph, actions)
+│   ├── store/               # RedisStore + InMemoryStore (auto-fallback)
 │   ├── signal/              # Butterworth filters, Welch PSD, windowing
 │   ├── logging/             # structlog JSON event logging
 │   └── utils/               # Platform detection, async helpers, secrets
 ├── services/
 │   ├── capture_service/     # Webcam capture, MediaPipe face tracking, quality gating
-│   ├── physio_engine/       # POS/CHROM rPPG, BVP peak detection, HR/HRV
+│   ├── physio_engine/       # POS/CHROM rPPG, BVP peak detection, HR/HRV, respiration
 │   ├── kinematics_engine/   # EAR blink detection, solvePnP head pose, shoulder posture
-│   ├── telemetry_engine/    # pynput input hooks, window tracker, feature aggregation
-│   ├── state_engine/        # Feature fusion, rule scorer, EMA smoother, trigger policy
+│   ├── telemetry_engine/    # pynput input hooks, window tracker, focus graph, aggregation
+│   ├── state_engine/        # Feature fusion, rule scorer, EMA smoother, trigger policy,
+│   │                        #   stress integral, longitudinal, zombie detector, rabbit hole
 │   ├── context_engine/      # Editor, browser, terminal adapters + app classifier
 │   ├── llm_engine/          # Azure OpenAI client, Ollama fallback, prompts, parser, cache
-│   ├── intervention_engine/ # Trigger, snapshot, planner, executor, restore
+│   ├── intervention_engine/ # Trigger, snapshot, planner, executor (adapter registry), restore
+│   ├── consent/             # ConsentPolicy + ConsentLadder (progressive trust)
+│   ├── eval/                # HelpfulnessTracker, ContextualBandit (LinUCB), bandit trainer
+│   ├── handover/            # ShutdownDetector, HandoverSnapshot, MorningBriefing
+│   ├── launcher/            # ProjectConfig (YAML profiles), ProjectLauncher
+│   ├── throttle/            # CopilotThrottle (silence inline suggestions in HYPER)
 │   ├── api_gateway/         # FastAPI REST routes, WebSocket server
-│   └── runtime_daemon.py    # Main orchestrator — ties all services together
+│   └── runtime_daemon.py    # Main orchestrator — ties all v1 + v2 services together
 ├── apps/
 │   ├── desktop_shell/       # PySide6: tray, dashboard, overlay, settings, onboarding
-│   ├── vscode_extension/    # TypeScript: WS client, context provider, fold controller
+│   ├── vscode_extension/    # TypeScript: WS client, context provider, fold controller,
+│   │                        #   morning briefing, copilot throttle
 │   └── browser_extension/   # Plasmo/React: background SW, content script, popup, newtab,
-│                            #   tab manager, ambient engine, action executor, undo stack
+│                            #   tab manager, ambient engine, action executor, undo stack,
+│                            #   breathing overlay, active recall overlay
 ├── scripts/
 │   ├── run_dev.py           # Start all services
 │   ├── calibrate.py         # Capture personal baselines
 │   ├── seed_config.py       # Initialize storage and config
 │   ├── test_intervention.py # Mock intervention test server
+│   ├── replay_harness.py    # Offline session replay and A/B evaluation
 │   └── build_macos_app.sh   # macOS app packaging
 ├── tests/
-│   ├── unit/                # Per-module unit tests
+│   ├── unit/                # Per-module unit tests (30+ test files)
 │   └── integration/         # Pipeline integration tests
 └── docs/
     ├── setup.md
@@ -320,8 +519,11 @@ cd cortex/apps/browser_extension && npx plasmo build
 # Test intervention overlay without full daemon
 python -m cortex.scripts.test_intervention
 
-# Replay a session
-python -m cortex.scripts.replay_session storage/sessions/latest.jsonl
+# Replay a session with alternative config
+python -m cortex.scripts.replay_harness --scorer v2 --prompts v2 sessions/*.jsonl
+
+# Train bandit offline
+python -m cortex.services.eval.bandit_trainer --data sessions/ --output models/
 ```
 
 ---

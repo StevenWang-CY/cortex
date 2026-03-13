@@ -9,6 +9,7 @@ from cortex.libs.config.settings import (
     LandmarksConfig,
     LLMConfig,
     LoggingConfig,
+    RedisConfig,
     SignalConfig,
     StateConfig,
     StorageConfig,
@@ -30,6 +31,7 @@ __all__ = [
     "StorageConfig",
     "DebugConfig",
     "LoggingConfig",
+    "RedisConfig",
     "get_config",
     "reset_config",
 ]
