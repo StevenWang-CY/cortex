@@ -36,7 +36,7 @@ def _extract_domain(url: str) -> str:
 def _goal_hash(goal: str) -> str:
     """Create a stable hash from goal keywords for storage key."""
     words = sorted(set(goal.lower().split()))
-    key = " ".join(w for w in words if len(w) > 2)
+    key = " ".join(w for w in words if len(w) > 1)
     return hashlib.md5(key.encode()).hexdigest()[:8]
 
 

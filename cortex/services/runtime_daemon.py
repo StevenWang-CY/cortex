@@ -225,6 +225,7 @@ class CortexDaemon:
 
         # Tab relevance learning
         self._tab_relevance = TabRelevanceTracker(store=self._store)
+        self._per_tab_feedback_ids: deque[str] = deque(maxlen=50)  # intervention IDs with per-tab feedback
 
         # Contextual bandit
         self._bandit = ContextualBandit(store=self._store)
@@ -235,6 +236,7 @@ class CortexDaemon:
         # Activity tracker aggregator
         self._activity_aggregator = ActivityAggregator(store=self._store)
         self._ws_server.set_activity_sync_callback(self._handle_activity_sync)
+        self._ws_server.set_tab_relevance_feedback_callback(self._handle_tab_relevance_feedback)
 
         # Track previous state for copilot throttle transitions
         self._prev_state: str = "FLOW"
@@ -726,11 +728,26 @@ class CortexDaemon:
                     # Find arm index from template — use 0 as default
                     self._bandit.update(bandit_features, 0, reward)
 
-        # Record tab relevance feedback
-        await self._record_tab_relevance_feedback(action, outcome)
+        # Record tab relevance feedback (skip if per-tab feedback was already received)
+        await self._record_tab_relevance_feedback(action, outcome, intervention_id)
 
-    async def _record_tab_relevance_feedback(self, action: str, outcome: Any) -> None:
-        """Record tab relevance feedback based on user action."""
+    async def _record_tab_relevance_feedback(
+        self, action: str, outcome: Any, intervention_id: str = "",
+    ) -> None:
+        """Record tab relevance feedback based on user action.
+
+        Skipped when per-tab feedback was already received via TAB_RELEVANCE_FEEDBACK
+        (which provides accurate per-tab kept/closed data instead of all-or-nothing).
+        """
+        # Skip if per-tab feedback was already received for this intervention
+        if intervention_id and intervention_id in self._per_tab_feedback_ids:
+            try:
+                self._per_tab_feedback_ids.remove(intervention_id)
+            except ValueError:
+                pass
+            logger.debug("Skipping legacy tab feedback — per-tab feedback already received")
+            return
+
         context = self._latest_context
         if not context or not hasattr(context, "browser_context") or not context.browser_context:
             return
@@ -752,6 +769,47 @@ class CortexDaemon:
                     await self._tab_relevance.record_closed(domain, goal)
         except Exception:
             logger.debug("Failed to record tab relevance feedback", exc_info=True)
+
+    async def _handle_tab_relevance_feedback(self, payload: dict[str, Any]) -> None:
+        """Handle per-tab relevance feedback from browser extension.
+
+        Receives specific kept/closed tab data instead of the all-or-nothing
+        approach in _record_tab_relevance_feedback.
+        """
+        context = self._latest_context
+        goal = ""
+        if context and hasattr(context, "browser_context") and context.browser_context:
+            goal = getattr(context.browser_context, "focus_goal", "") or ""
+        if not goal:
+            goal = getattr(context, "current_goal_hint", "") or "" if context else ""
+        if not goal:
+            return
+
+        intervention_id = payload.get("intervention_id", "")
+        try:
+            for tab in payload.get("kept_tabs", []):
+                url = tab.get("url", "")
+                if url:
+                    try:
+                        domain = url.split("//", 1)[1].split("/", 1)[0]
+                    except (IndexError, ValueError):
+                        continue
+                    await self._tab_relevance.record_kept(domain, goal)
+
+            for tab in payload.get("closed_tabs", []):
+                url = tab.get("url", "")
+                if url:
+                    try:
+                        domain = url.split("//", 1)[1].split("/", 1)[0]
+                    except (IndexError, ValueError):
+                        continue
+                    await self._tab_relevance.record_closed(domain, goal)
+
+            # Mark that per-tab feedback was received for this intervention
+            # so the legacy all-or-nothing feedback is skipped
+            self._per_tab_feedback_ids.append(intervention_id)
+        except Exception:
+            logger.debug("Failed to handle tab relevance feedback", exc_info=True)
 
     async def _handle_activity_sync(self, payload: dict[str, Any]) -> None:
         """Handle ACTIVITY_SYNC from browser extension — aggregate into daily timeline."""

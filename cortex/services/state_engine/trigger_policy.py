@@ -7,15 +7,15 @@ estimates, signal quality, cooldown periods, and dismissal tracking.
 Trigger conditions (all must be met):
 1. State is HYPER
 2. Confidence > 0.85
-3. Workspace complexity > 0.6 (placeholder: uses overall confidence)
+3. Workspace complexity > 0.7
 4. Signal quality acceptable
 5. Cooldown period elapsed (60s since last intervention)
-6. Not in quiet mode (3 dismissals in 5 min → 30-min quiet)
-7. Dwell time met (8s in HYPER state)
+6. Not in quiet mode (3 dismissals in 5 min → progressive quiet: 15/30/60 min)
+7. Dwell time met (15s in HYPER state — sustained overwhelm, not transient spikes)
 
 Adaptive behavior:
 - Each dismissal raises trigger threshold by +0.05 for 1 hour
-- 3 dismissals within 5 minutes → 30-minute quiet mode
+- 3 dismissals within 5 minutes → progressive quiet mode (15→30→60 min)
 """
 
 from __future__ import annotations
@@ -80,6 +80,8 @@ class TriggerPolicy:
 
         # Quiet mode
         self._quiet_mode_until: float = 0.0
+        self._quiet_mode_count: int = 0
+        self._quiet_mode_count_reset_at: float = 0.0
 
         # Intervention counter
         self._intervention_count: int = 0
@@ -198,9 +200,8 @@ class TriggerPolicy:
             )
 
         # Check dwell time (must be in HYPER for >= hyper_dwell_seconds)
-        if estimate.dwell_seconds < self._config.cooldown_seconds / 7.5:
-            # Use ~8 seconds as dwell requirement (cooldown/7.5 ≈ 8)
-            dwell_required = 8.0
+        dwell_required = self._config.hyper_dwell_seconds
+        if estimate.dwell_seconds < dwell_required:
             return TriggerDecision(
                 should_trigger=False,
                 reason=f"Dwell time {estimate.dwell_seconds:.1f}s < {dwell_required:.0f}s required",
@@ -250,10 +251,24 @@ class TriggerPolicy:
         )
 
         if recent_dismissals >= self._config.max_dismissals:
-            self._quiet_mode_until = now + self._config.quiet_mode_minutes * 60.0
+            # Reset escalation counter if >2 hours since last quiet mode
+            if now > self._quiet_mode_count_reset_at:
+                self._quiet_mode_count = 0
+
+            self._quiet_mode_count += 1
+            # Progressive escalation: 15min → 30min → 60min
+            durations = [
+                self._config.quiet_mode_minutes,       # 15 min (base)
+                self._config.quiet_mode_minutes * 2,    # 30 min
+                self._config.quiet_mode_minutes * 4,    # 60 min
+            ]
+            minutes = durations[min(self._quiet_mode_count - 1, len(durations) - 1)]
+            self._quiet_mode_until = now + minutes * 60.0
+            self._quiet_mode_count_reset_at = now + 2 * 3600.0  # Reset after 2 hours
+
             logger.info(
-                f"Quiet mode activated for {self._config.quiet_mode_minutes} minutes "
-                f"({recent_dismissals} dismissals in {self._config.dismissal_window_minutes} min)"
+                f"Quiet mode activated for {minutes} minutes (level {self._quiet_mode_count}, "
+                f"{recent_dismissals} dismissals in {self._config.dismissal_window_minutes} min)"
             )
 
     def activate_quiet_mode(
@@ -294,4 +309,6 @@ class TriggerPolicy:
         self._dismissals.clear()
         self._threshold_bumps.clear()
         self._quiet_mode_until = 0.0
+        self._quiet_mode_count = 0
+        self._quiet_mode_count_reset_at = 0.0
         self._intervention_count = 0

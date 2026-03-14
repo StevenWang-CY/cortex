@@ -102,6 +102,7 @@ class WebSocketServer:
         self._user_action_callback: Any = None
         self._settings_callback: Any = None
         self._activity_sync_callback: Any = None
+        self._tab_relevance_feedback_callback: Any = None
 
         # Latest state for new connections
         self._latest_state: StateEstimate | None = None
@@ -130,6 +131,10 @@ class WebSocketServer:
     def set_activity_sync_callback(self, callback: Any) -> None:
         """Set callback for ACTIVITY_SYNC messages from browser extension."""
         self._activity_sync_callback = callback
+
+    def set_tab_relevance_feedback_callback(self, callback: Any) -> None:
+        """Set callback for TAB_RELEVANCE_FEEDBACK messages from browser extension."""
+        self._tab_relevance_feedback_callback = callback
 
     async def start(self) -> bool:
         """
@@ -234,6 +239,8 @@ class WebSocketServer:
             await self._handle_settings_sync(client, msg)
         elif msg.type == "ACTIVITY_SYNC":
             await self._handle_activity_sync(client, msg)
+        elif msg.type == "TAB_RELEVANCE_FEEDBACK":
+            await self._handle_tab_relevance_feedback(client, msg)
         else:
             logger.debug(f"Unknown message type from {client.client_id}: {msg.type}")
 
@@ -291,6 +298,19 @@ class WebSocketServer:
                 callback(msg.payload)
         except Exception as exc:
             logger.error("Activity sync callback error from %s: %s", client.client_id, exc)
+
+    async def _handle_tab_relevance_feedback(self, client: WebSocketClient, msg: WSMessage) -> None:
+        """Forward per-tab relevance feedback to the daemon."""
+        callback = self._tab_relevance_feedback_callback
+        if callback is None:
+            return
+        try:
+            if asyncio.iscoroutinefunction(callback):
+                await callback(msg.payload)
+            else:
+                callback(msg.payload)
+        except Exception as exc:
+            logger.error("Tab relevance feedback error from %s: %s", client.client_id, exc)
 
     async def broadcast_state(
         self,

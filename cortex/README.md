@@ -11,7 +11,7 @@ Cortex runs a five-layer pipeline at 30 FPS, entirely on your machine:
 1. **Bio-Extraction** — extracts heart rate, HRV, and respiratory rate from your face via rPPG (no camera storage), tracks blink rate, head pose, and posture via MediaPipe, and monitors mouse/keyboard patterns via pynput.
 2. **State Classification** — fuses signals into a cognitive state score every 500ms. Uses rule-based scoring with EMA smoothing, hysteresis, focus-graph thrashing analysis, and screen-apnea detection to classify you as FLOW, HYPER, HYPO, or RECOVERY.
 3. **Context Engine** — when an intervention is warranted, gathers workspace context: open file + diagnostics from VS Code, active tab + content from Chrome, recent terminal output. Tabs are pre-filtered (30 cap with type-diverse sampling) to fit LLM context windows.
-4. **LLM Engine** — sends workspace context (no biometrics) to Azure OpenAI first, then local Ollama if unavailable. The model returns a structured intervention plan: headline, micro-steps, causal explanation, suggested actions, error analysis, and per-tab recommendations. A contextual bandit selects the optimal intervention type per context.
+4. **LLM Engine** — sends workspace context (no biometrics) to the configured LLM backend — Azure OpenAI, Remote Qwen-3-8B (via SSH tunnel), or local Ollama. Backend selected by `LLM_MODE` in config. The model returns a structured intervention plan: headline, micro-steps, causal explanation, suggested actions, error analysis, and per-tab recommendations. A contextual bandit selects the optimal intervention type per context.
 5. **Intervention Engine** — validates and executes the plan through a pluggable adapter registry: closes distraction tabs, groups related tabs, folds irrelevant code in VS Code, shows an overlay with one-click actions. All interventions are gated by a consent ladder. Snapshots workspace state first. All actions are reversible via undo.
 
 ---
@@ -25,7 +25,7 @@ Cortex runs a five-layer pipeline at 30 FPS, entirely on your machine:
 | **HYPO** | Disengaged, drifting | Low blink rate + inactivity + flat telemetry |
 | **RECOVERY** | Returning to focus | Transitioning out of HYPER/HYPO |
 
-Interventions trigger on HYPER with confidence > 0.85, workspace complexity > 0.6, and a 60-second cooldown between triggers.
+Interventions trigger on HYPER with confidence > 0.85, workspace complexity > 0.7, sustained for 15+ seconds (not transient spikes), with a 60-second cooldown between triggers. Minimum 5 tabs must be open for tab interventions. Progressive quiet mode (15 → 30 → 60 min) activates after repeated dismissals.
 
 ---
 
@@ -80,7 +80,11 @@ The bandit selects from these arms based on context and learned reward signals:
 ### Safety
 
 - **Consent ladder** — actions are gated by a progressive trust system. Cortex starts at SUGGEST level and earns autonomy through repeated user approvals. 3 rejections de-escalate. 5 consent levels: OBSERVE → SUGGEST → ASK_BEFORE_ACT → ACT_AND_NOTIFY → AUTONOMOUS_ACT
-- **Validate-before-execute** — every tab action checks the tab still exists and hasn't navigated away (10-40s can elapse between context snapshot and user click)
+- **Validate-before-execute** — every tab action checks the tab still exists and hasn't navigated away (30s staleness limit on context snapshots)
+- **Recently-visited protection** — tabs activated within the last 5 minutes are automatically protected from closing. The LLM receives `last_activated_ago_seconds` per tab and is instructed to keep recently-used tabs
+- **Goal-aware classification** — tabs whose titles match focus goal keywords get `goal_relevant` type, which the LLM must keep with relevance ≥ 0.95. AI assistants (Gemini, ChatGPT, Claude) are reclassified as goal-relevant when title matches the goal
+- **Smart tab hiding** — simplified workspace mode never hides AI assistants, documentation, learning platforms, code hosts, or recently-active/goal-relevant tabs
+- **Minimum tab count** — tab interventions only fire when 5+ tabs are open
 - **Tab index stabilization** — the tab list from context gathering is saved and reused when the intervention arrives, so the LLM's tab_index values always map to the correct Chrome tabs even if tabs changed between context capture and execution
 - **Tab targeting by index** — LLM references tabs by integer index from the context list, never by URL (prevents hallucination)
 - **Context overflow protection** — 150+ tabs are filtered to 30 with type-diverse sampling
@@ -196,7 +200,7 @@ Cortex learns from every intervention to get better over time:
 
 2. **Contextual Bandit (LinUCB)** — selects which intervention type to deploy based on 8 context features: state code, complexity, tab count, error count, hour of day, thrashing score, stress integral, and consent level. Updates A matrices and b vectors after each intervention. Persists weights to store every 10 updates.
 
-3. **Tab Relevance Tracker** — learns per-domain relevance from user feedback on tab close recommendations. Uses exponential moving average (α=0.3) to update domain scores: keeping/undoing a close → relevant (1.0), confirming a close → irrelevant (0.0). Scores persist with 90-day TTL and are scoped per focus goal. Personalizes which tabs Cortex recommends closing.
+3. **Tab Relevance Tracker** — learns per-domain relevance from user feedback on tab close recommendations. Uses exponential moving average (α=0.3) to update domain scores: keeping a tab → relevant (1.0), confirming a close → irrelevant (0.0). Per-tab feedback: when the user uses Keep buttons on individual tabs in the overlay, each tab's kept/closed decision is recorded separately (not all-or-nothing). Scores persist with 90-day TTL and are scoped per focus goal. Personalizes which tabs Cortex recommends closing.
 
 4. **Replay Harness** — offline A/B testing. Load JSONL session recordings and replay them through alternative scoring policies and prompt configurations. Compare baseline vs. variant on reward delta, engagement delta, and intervention count.
 
@@ -217,6 +221,7 @@ Built with Plasmo + React (Manifest V3). Lives in `apps/browser_extension/`.
 ### Popup Dashboard
 
 Dark, high-end interface (Linear/Raycast-inspired) showing:
+- **Launch Cortex / Restart Camera** button — connects to the daemon and enables webcam capture in one click. Shows "Launch Cortex" when disconnected, "Restart Camera" when connected (re-sends `webcam_enabled` to restart the capture pipeline). Displays inline error with `cortex-dev` instructions if the daemon isn't running.
 - Connection status with live cognitive state indicator (FLOW/HYPER/HYPO/RECOVERY)
 - Morning briefing card ("Where you left off" summary from yesterday's handover)
 - Focus session controls with goal input and Enter-to-start
@@ -282,12 +287,55 @@ Replaces new tab with a dark canvas visualization:
 
 - Start with an optional goal ("Studying PyTorch CUDA debugging")
 - Tracks real focus minutes, focus percentage, current/best streaks
-- Blocks distraction sites (Reddit, Twitter/X, YouTube, Facebook, Instagram, TikTok, Netflix, Twitch, Discord) with a full-page interceptor showing your stats. Distraction counter only increments when you actually click "Go back" (not just on page load).
+- Blocks distraction sites (Reddit, Twitter/X, YouTube, Facebook, Instagram, TikTok, Netflix, Twitch, Discord) with an overlay interceptor showing your stats. Clicking "Continue" removes the overlay and reveals the original page (no reload). Clicking "Go back" navigates away. Distraction counter only increments on "Go back". Goal-relevant content on YouTube/Reddit (title matches goal keywords) bypasses the block.
 - Focus goal flows through the entire pipeline to inform LLM tab relevance scoring
+
+### Activity Tracker
+
+Universal content script (`activity-tracker.ts`) that tracks learning progress across all platforms and enables one-click resume.
+
+**Supported platforms:**
+
+| Platform | Position Type | What It Tracks |
+|----------|---------------|----------------|
+| YouTube, Bilibili | video | timestamp, duration, chapter, playlist position |
+| Coursera, edX, Khan Academy, Udemy | video | timestamp, duration (course lecture context) |
+| HackerRank, Codeforces | code_problem | stage, wrong answers, code snapshot |
+| Jupyter, Google Colab | notebook | cell index, scroll position |
+| PDF viewers (Chrome, pdf.js) | pdf | page number, total pages |
+| Google Slides, reveal.js | slides | slide index, total slides |
+| Docs, articles, blogs (fallback) | scroll | scroll percentage, max reached |
+
+**How it works:**
+- Detects platform via URL + DOM inspection, polls position every 5s
+- Canonical URL normalization (strips tracking params, normalizes YouTube/Bilibili/LeetCode URLs)
+- SPA navigation detection: YouTube custom events + 2s URL polling + visibilitychange + beforeunload
+- Dwell time tracking: only accumulates when page is visible, avoids double-counting across 5s updates
+- LeetCode is handled by the existing LeetCodeObserver — the activity tracker bridges session data automatically
+
+**Exclusions:** Videos < 60s, live streams, `chrome://` URLs, login/auth pages, search engines, incognito mode, dwell < 120s.
+
+**Resume Card:** When you return to tracked content after > 1 hour, a Shadow DOM card appears (bottom-right, 300px). Shows platform, title, position with progress bar, and a "Resume" button that actively restores your position:
+- Video: seeks to saved timestamp (verifies same content via duration check)
+- Scroll: smooth scrolls to saved position
+- Code: pastes saved code snapshot into Monaco editor
+- PDF: jumps to saved page via PDFViewerApplication or URL hash
+- Notebook: scrolls to saved cell
+- Slides: navigates to saved slide
+
+Auto-dismisses after 15s. ESC key or scroll dismisses. "Dismiss" marks the activity so the card won't reappear.
+
+**New Tab:** The Pulse Room shows up to 3 recent incomplete activities below the heartbeat visualization. Each shows title, position, and time ago. Clicking navigates with timestamp in URL for videos.
+
+**Daemon integration:** ActivityAggregator stores daily timelines (90-day TTL). ActivitySummarizer generates LLM recaps. Activity data feeds into handover snapshots and morning briefings.
+
+### Tab Closing Toggle
+
+Toggle switch in the popup settings card. When disabled, all `close_tab` and `bookmark_and_close` actions are blocked — Cortex still suggests which tabs to close but won't execute the closes. Persisted in `chrome.storage.local`, survives browser and extension restarts. Re-enabling immediately restores full tab management capability.
 
 ### Tab Classification
 
-Every tab is classified by URL pattern into: `documentation`, `stackoverflow`, `pdf`, `paper`, `reference`, `search`, `code_host`, `distraction`, or `other`. The `distraction` type matches social media, streaming, and entertainment sites. Classification feeds into the LLM context and tab pre-filtering.
+Every tab is classified by URL pattern into: `documentation`, `stackoverflow`, `pdf`, `paper`, `reference`, `search`, `code_host`, `learning_platform`, `ai_assistant`, `video_platform`, `communication`, `social`, `distraction`, or `other`. During a focus session, goal-aware classification reclassifies ambiguous types (`video_platform`, `social`, `communication`, `distraction`, `ai_assistant`, `other`) as `goal_relevant` when the tab title contains focus goal keywords — including short tech terms ("Go", "ML", "AI", "CSS", "SQL", "Vue") via a curated allowlist. Goal-relevant tabs receive the strongest LLM protection (relevance ≥ 0.95, never close).
 
 ### Health Alerts
 
@@ -405,6 +453,22 @@ npx plasmo build
 # 4. Select build/chrome-mv3-prod/
 ```
 
+### Edge Extension
+
+```bash
+cd cortex/apps/browser_extension
+pnpm install
+npx plasmo build --target=edge-mv3
+
+# Load in Edge:
+# 1. Open edge://extensions
+# 2. Enable Developer mode
+# 3. Click "Load unpacked"
+# 4. Select build/edge-mv3-prod/
+```
+
+Dev/build/package scripts: `pnpm dev:edge`, `pnpm build:edge`, `pnpm package:edge`. Tab group APIs have graceful fallback for Edge quirks (collapse may silently fail). All other APIs (storage, tabs, scripting, webNavigation) work identically.
+
 ### Native Messaging Host (Auto-Launch Daemon)
 
 Allows the Chrome extension to automatically start the Cortex daemon when it connects:
@@ -488,7 +552,7 @@ Additional signals (not weighted into state score, used by detectors):
                            │  TaskContext
           ┌────────────────▼─────────────────┐
           │  L4: LLM Engine                  │
-          │  Azure OpenAI · Ollama fallback  │
+          │  Azure OpenAI · Qwen-3 · Ollama │
           │  Contextual Bandit arm selection  │
           └────────────────┬─────────────────┘
                            │  InterventionPlan + causal_explanation
@@ -542,7 +606,7 @@ cortex/
 │   │                        #   LeetCodeAdapter (WebSocket bridge to browser extension)
 │   ├── config/              # CortexConfig, RedisConfig, defaults.yaml, .env loading
 │   ├── schemas/             # Pydantic models (state, context, intervention, consent,
-│   │                        #   eval, longitudinal, transition_graph, actions, leetcode)
+│   │                        #   eval, longitudinal, transition_graph, actions, leetcode, activity)
 │   ├── store/               # RedisStore + InMemoryStore (auto-fallback)
 │   ├── signal/              # Butterworth filters, Welch PSD, windowing
 │   ├── logging/             # structlog JSON event logging
@@ -564,6 +628,7 @@ cortex/
 │   ├── eval/                # HelpfulnessTracker, ContextualBandit (LinUCB), bandit trainer,
 │   │                        #   TabRelevanceTracker (per-domain EMA learning)
 │   ├── handover/            # ShutdownDetector, HandoverSnapshot, MorningBriefing
+│   ├── activity_tracker/    # ActivityAggregator (daily timelines), ActivitySummarizer (LLM recaps)
 │   ├── launcher/            # ProjectConfig (YAML profiles), ProjectLauncher
 │   ├── throttle/            # CopilotThrottle (silence inline suggestions in HYPER)
 │   ├── api_gateway/         # FastAPI REST routes, WebSocket server
@@ -575,7 +640,8 @@ cortex/
 │   └── browser_extension/   # Plasmo/React: background SW, content script, popup, newtab,
 │                            #   tab manager, ambient engine, action executor, undo stack,
 │                            #   breathing overlay, active recall overlay, LeetCode observer,
-│                            #   intervention dismissal cooldown
+│                            #   intervention dismissal cooldown, activity tracker, resume card,
+│                            #   tab-close toggle
 ├── scripts/
 │   ├── run_dev.py           # Start all services
 │   ├── calibrate.py         # Capture personal baselines

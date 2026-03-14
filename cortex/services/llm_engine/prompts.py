@@ -105,16 +105,23 @@ Rules for suggested_actions (1-5 actions, or omit if none warranted):
 - NEVER assume a tab is irrelevant based solely on its type. AI assistants (Gemini, ChatGPT, \
 Claude), video platforms (YouTube), and communication tools (Slack, Discord) CAN be \
 task-relevant. Judge relevance by comparing the tab's topic/title against the focus goal.
-- A tab classified as [ai_assistant] is likely a TOOL the user is actively using. Only \
-recommend closing it if the topic is clearly unrelated to the focus goal.
-- A [video_platform] tab showing educational/lecture content related to the focus goal \
-should be kept.
+- A tab classified as [ai_assistant] is a TOOL the user is actively using for research. \
+NEVER recommend closing an ai_assistant tab during a focus session — it is almost always \
+being used to complement the user's current learning (e.g., asking Gemini about a concept \
+from a YouTube lecture). Give it action:"keep" with relevance_score >= 0.9.
+- A [video_platform] tab showing educational/lecture/tutorial content related to the focus \
+goal MUST be kept with relevance_score >= 0.9. Users often switch between video tutorials \
+and AI assistants — both are part of the same learning workflow.
 - Active tabs, learning_platform tabs, and goal-relevant ai_assistant tabs MUST always \
 get action:"keep" with relevance_score >= 0.8.
 - Tabs with type "goal_relevant" MUST get action:"keep" with relevance_score >= 0.95. \
 NEVER recommend closing them under any circumstance — they have been verified to match \
 the user's focus goal by title keyword analysis.
 - relevance_score should reflect topic alignment with the focus goal, NOT just tab type.
+- Tabs with last_activated_ago_seconds < 300 (visited in last 5 minutes) should be \
+kept with relevance_score >= 0.7 — the user was recently using them. Only close a \
+recently-visited tab if it is clearly a distraction (social media, entertainment) \
+unrelated to the focus goal.
 
 Valid intervention_type values: "overlay_only", "simplified_workspace", "guided_mode"
 Valid tone values: "direct", "supportive", "minimal"

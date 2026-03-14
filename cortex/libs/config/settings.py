@@ -123,9 +123,10 @@ class InterventionConfig(BaseModel):
     overlay_threshold: float = 0.70
     simplified_threshold: float = 0.85
     guided_threshold: float = 0.95
-    complexity_threshold: float = 0.6
+    complexity_threshold: float = 0.7
     cooldown_seconds: int = 60
-    quiet_mode_minutes: int = 30
+    hyper_dwell_seconds: float = 15.0
+    quiet_mode_minutes: int = 15
     max_dismissals: int = 3
     dismissal_window_minutes: int = 5
     timeout_minutes: int = 5

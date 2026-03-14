@@ -459,7 +459,7 @@ class TestTriggerPolicy:
         return TriggerPolicy(config=config)
 
     def _make_hyper_estimate(
-        self, confidence: float = 0.9, dwell: float = 10.0,
+        self, confidence: float = 0.9, dwell: float = 20.0,
     ) -> StateEstimate:
         return StateEstimate(
             state="HYPER",
@@ -485,7 +485,7 @@ class TestTriggerPolicy:
     def test_trigger_on_hyper_with_confidence(self):
         """Should trigger when HYPER with high confidence and sufficient dwell."""
         policy = self._make_policy()
-        est = self._make_hyper_estimate(confidence=0.92, dwell=10.0)
+        est = self._make_hyper_estimate(confidence=0.92, dwell=20.0)
         decision = policy.evaluate(est, current_time=200.0)
         assert decision.should_trigger is True
 
@@ -500,7 +500,7 @@ class TestTriggerPolicy:
     def test_no_trigger_low_confidence(self):
         """Should not trigger when confidence below threshold."""
         policy = self._make_policy()
-        est = self._make_hyper_estimate(confidence=0.65, dwell=10.0)
+        est = self._make_hyper_estimate(confidence=0.65, dwell=20.0)
         decision = policy.evaluate(est, current_time=200.0)
         assert decision.should_trigger is False
         assert "below threshold" in decision.reason
@@ -510,7 +510,7 @@ class TestTriggerPolicy:
         policy = self._make_policy(cooldown_seconds=60)
         policy.record_intervention(timestamp=150.0)
 
-        est = self._make_hyper_estimate(confidence=0.92, dwell=10.0)
+        est = self._make_hyper_estimate(confidence=0.92, dwell=20.0)
         decision = policy.evaluate(est, current_time=180.0)  # 30s into 60s cooldown
         assert decision.should_trigger is False
         assert "Cooldown" in decision.reason
@@ -521,7 +521,7 @@ class TestTriggerPolicy:
         policy = self._make_policy(cooldown_seconds=60)
         policy.record_intervention(timestamp=100.0)
 
-        est = self._make_hyper_estimate(confidence=0.92, dwell=10.0)
+        est = self._make_hyper_estimate(confidence=0.92, dwell=20.0)
         decision = policy.evaluate(est, current_time=200.0)  # 100s after, cooldown expired
         assert decision.should_trigger is True
 
@@ -535,7 +535,7 @@ class TestTriggerPolicy:
             reasons=["Test"],
             signal_quality=make_poor_quality(),
             timestamp=100.0,
-            dwell_seconds=10.0,
+            dwell_seconds=20.0,
         )
         decision = policy.evaluate(est, current_time=200.0)
         assert decision.should_trigger is False

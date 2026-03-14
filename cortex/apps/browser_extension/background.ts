@@ -98,6 +98,19 @@ const CONDITIONAL_DISTRACTION = [
 const AI_ASSISTANT_URL_PATTERN = /gemini\.google\.com|chatgpt\.com|chat\.openai\.com|claude\.ai|copilot\.microsoft\.com|perplexity\.ai/i;
 const VIDEO_PLATFORM_URL_PATTERN = /youtube\.com|youtu\.be/i;
 
+// --- Recently-visited tab protection ---
+// Track when each tab was last activated so we can protect recently-used tabs from closing
+const tabLastActivated = new Map<number, number>();
+const RECENTLY_ACTIVE_PROTECTION_MS = 5 * 60 * 1000; // 5 minutes
+
+chrome.tabs.onActivated.addListener((activeInfo) => {
+    tabLastActivated.set(activeInfo.tabId, Date.now());
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+    tabLastActivated.delete(tabId);
+});
+
 // Health alert state
 let lastPostureAlert = 0;
 let lastBlinkAlert = 0;
@@ -505,6 +518,15 @@ async function handleMessage(raw: string): Promise<void> {
                 dismissedUrlPatterns.delete(urlKey);
             }
 
+            // Minimum tab count gate: don't intervene with few tabs open
+            try {
+                const allTabs = await chrome.tabs.query({});
+                if (allTabs.length < 5) {
+                    console.log(`Cortex: skipping intervention — only ${allTabs.length} tabs open (minimum: 5)`);
+                    break;
+                }
+            } catch {}
+
             activeIntervention = msg.payload;
             // Persist so popup can load it after SW restart
             try { chrome.storage.session.set({ cortex_active_intervention: msg.payload }); } catch {}
@@ -821,10 +843,27 @@ function injectOverlay(payload: Record<string, unknown>): void {
             ctaEl.textContent = "Working\u2026";
             ctaEl.style.opacity = "0.5";
 
+            // Build per-tab feedback: which tabs were kept vs closed
+            const closeTabs = tabRecs?.tabs?.filter(
+                t => t.action === "close" || t.action === "bookmark_and_close"
+            ) || [];
+            const keptTabData = Array.from(keptIndices).map(i => ({
+                url: String(closeTabs[i]?.url || ""),
+                title: String(closeTabs[i]?.tab_title || ""),
+            })).filter(t => t.url);
+            const closedTabData = closeTabs
+                .filter((_, i) => !keptIndices.has(i))
+                .map(t => ({
+                    url: String(t.url || ""),
+                    title: String(t.tab_title || ""),
+                })).filter(t => t.url);
+
             chrome.runtime.sendMessage({
                 type: "EXECUTE_ALL_RECOMMENDED",
                 actions: toExecute,
                 intervention_id: payload.intervention_id,
+                kept_tabs: keptTabData,
+                closed_tabs: closedTabData,
             }, (results: Array<Record<string, unknown>>) => {
                 const failCount = Array.isArray(results) ? results.filter(r => !r.success).length : 0;
                 const successCount = (Array.isArray(results) ? results.length : 0) - failCount;
@@ -891,7 +930,7 @@ async function handleIntervention(
         }
     }
 
-    // Hide tabs if simplified workspace
+    // Hide tabs if simplified workspace — but protect goal-relevant and recently-active tabs
     if (payload.hide_targets) {
         const targets = payload.hide_targets as string[];
         const interventionId = payload.intervention_id;
@@ -899,7 +938,31 @@ async function handleIntervention(
             targets.includes("browser_tabs_except_active") &&
             typeof interventionId === "string"
         ) {
-            await hideTabsForIntervention(interventionId);
+            // Build set of protected tab IDs: recently-active tabs + goal-relevant tabs
+            const protectedIds = new Set<number>();
+            const now = Date.now();
+            for (const [tabId, lastActive] of tabLastActivated) {
+                if (now - lastActive < RECENTLY_ACTIVE_PROTECTION_MS) {
+                    protectedIds.add(tabId);
+                }
+            }
+            // Also protect tabs that match goal keywords
+            if (focusSession?.goal) {
+                const goalKw = extractGoalKeywords(focusSession.goal);
+                if (goalKw.length > 0) {
+                    try {
+                        const allTabs = await chrome.tabs.query({});
+                        for (const tab of allTabs) {
+                            if (!tab.id) continue;
+                            const titleLower = (tab.title ?? "").toLowerCase();
+                            if (goalKw.some(kw => titleLower.includes(kw))) {
+                                protectedIds.add(tab.id);
+                            }
+                        }
+                    } catch {}
+                }
+            }
+            await hideTabsForIntervention(interventionId, protectedIds);
         }
     }
 
@@ -1001,6 +1064,7 @@ interface TabData {
     is_active: boolean;
     tab_id: number;
     topic_hint: string;
+    last_activated_ago_seconds: number | null;
 }
 
 function extractTopicHint(title: string, url: string, tabType: string): string {
@@ -1023,14 +1087,16 @@ async function collectTabs(): Promise<TabData[]> {
     const chromeTabs = await chrome.tabs.query({});
     // LAYER 2: Extract goal keywords for goal-aware classification
     const goalKeywords: string[] = focusSession?.goal
-        ? focusSession.goal.toLowerCase().split(/\s+/).filter(w => w.length > 2)
+        ? extractGoalKeywords(focusSession.goal)
         : [];
 
+    const now = Date.now();
     return chromeTabs.map((tab) => {
         // Use goal-aware classification when a focus session is active
         const tabType = goalKeywords.length > 0
             ? classifyTabTypeWithGoal(tab.url ?? "", tab.title ?? "", goalKeywords)
             : classifyBrowserTabType(tab.url ?? "");
+        const lastActive = tabLastActivated.get(tab.id ?? -1);
         return {
             title: tab.title ?? "",
             url: tab.url ?? "",
@@ -1038,6 +1104,9 @@ async function collectTabs(): Promise<TabData[]> {
             is_active: tab.active ?? false,
             tab_id: tab.id ?? -1,
             topic_hint: extractTopicHint(tab.title ?? "", tab.url ?? "", tabType),
+            last_activated_ago_seconds: lastActive != null
+                ? Math.floor((now - lastActive) / 1000)
+                : null,
         };
     });
 }
@@ -1184,13 +1253,26 @@ async function saveToDailyStats(session: FocusSession): Promise<void> {
 
 // --- Distraction Blocking ---
 
+// Short but meaningful tech terms that should not be filtered out of goal keywords
+const TECH_SHORT_WORDS = new Set([
+    "go", "ml", "ai", "css", "sql", "vue", "rx", "aws", "gcp", "api",
+    "cli", "gui", "dom", "npm", "pip", "git", "ux", "ui", "db",
+    "os", "ci", "cd", "qa", "c++", "c#", "r", "dx", "io", "jwt",
+]);
+
+function extractGoalKeywords(goal: string): string[] {
+    return goal.toLowerCase().split(/\s+/).filter(
+        w => w.length > 1 || TECH_SHORT_WORDS.has(w.toLowerCase())
+    );
+}
+
 function isDistractionUrl(url: string, title?: string): boolean {
     if (ALWAYS_DISTRACTION.some((p) => p.test(url))) return true;
     if (AI_ASSISTANT_URL_PATTERN.test(url)) return false;
     if (VIDEO_PLATFORM_URL_PATTERN.test(url)) {
         // YouTube: check title for goal-relevant keywords
         if (focusSession?.goal && title) {
-            const goalWords = focusSession.goal.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+            const goalWords = extractGoalKeywords(focusSession.goal);
             const titleLower = title.toLowerCase();
             if (goalWords.some(w => titleLower.includes(w))) return false;
         }
@@ -1198,7 +1280,7 @@ function isDistractionUrl(url: string, title?: string): boolean {
     }
     if (CONDITIONAL_DISTRACTION.some((p) => p.test(url))) {
         if (focusSession?.goal && title) {
-            const goalWords = focusSession.goal.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+            const goalWords = extractGoalKeywords(focusSession.goal);
             const titleLower = title.toLowerCase();
             if (goalWords.some(w => titleLower.includes(w))) return false;
         }
@@ -1214,9 +1296,15 @@ function injectDistractionInterceptor(
     url: string,
 ): void {
     const domain = new URL(url).hostname.replace("www.", "");
-    document.body.innerHTML = "";
-    document.body.style.cssText =
-        "margin:0;padding:0;display:flex;align-items:center;justify-content:center;height:100vh;" +
+
+    // Create a full-screen overlay instead of replacing body content.
+    // This preserves the original page underneath so "Continue" can reveal it
+    // without a reload flash.
+    const overlay = document.createElement("div");
+    overlay.id = "cortex-distraction-interceptor";
+    overlay.style.cssText =
+        "position:fixed;inset:0;z-index:2147483647;" +
+        "display:flex;align-items:center;justify-content:center;" +
         "background:#09090b;font-family:-apple-system,BlinkMacSystemFont,'Inter','SF Pro Text',system-ui,sans-serif;color:#e4e4e7;";
 
     const container = document.createElement("div");
@@ -1245,7 +1333,8 @@ function injectDistractionInterceptor(
             ${distractionsBlocked} blocked
         </p>
     `;
-    document.body.appendChild(container);
+    overlay.appendChild(container);
+    document.body.appendChild(overlay);
 
     document.getElementById("cortex-go-back")?.addEventListener("click", () => {
         // Notify background that user resisted distraction
@@ -1253,7 +1342,8 @@ function injectDistractionInterceptor(
         history.back();
     });
     document.getElementById("cortex-continue")?.addEventListener("click", () => {
-        location.reload();
+        // Remove overlay to reveal the original page — no reload needed
+        overlay.remove();
     });
 }
 
@@ -1293,7 +1383,7 @@ let interventionTabSnapshot: Map<number, { chromeTabId: number; url: string; tit
 // alignment between what the LLM saw and what the action executor targets.
 let lastContextTabs: TabData[] | null = null;
 let lastContextTabsTimestamp = 0; // LAYER 3: track when context was captured
-const CONTEXT_STALENESS_LIMIT = 60_000; // 60s max age for tab snapshots
+const CONTEXT_STALENESS_LIMIT = 30_000; // 30s max age for tab snapshots
 const undoStack: UndoEntry[] = [];
 const MAX_UNDO_ENTRIES = 50;
 
@@ -1306,9 +1396,9 @@ const MAX_UNDO_ENTRIES = 50;
  */
 async function snapshotTabsForIntervention(): Promise<void> {
     interventionTabSnapshot = new Map();
-    // LAYER 3: Discard stale context (>60s old) to prevent wrong-tab targeting
+    // LAYER 3: Discard stale context (>30s old) to prevent wrong-tab targeting
     if (lastContextTabs && Date.now() - lastContextTabsTimestamp > CONTEXT_STALENESS_LIMIT) {
-        console.log("Cortex: discarding stale tab context (>60s old), refreshing");
+        console.log("Cortex: discarding stale tab context (>30s old), refreshing");
         lastContextTabs = null;
     }
     const tabs = lastContextTabs ?? await collectTabs();
@@ -1322,6 +1412,18 @@ async function snapshotTabsForIntervention(): Promise<void> {
         interventionTabSnapshot.set(i, entry);
         snapData[String(i)] = entry;
     }
+    // Verify all snapshot tab IDs still exist (tabs may have been closed)
+    try {
+        const liveTabs = await chrome.tabs.query({});
+        const liveIds = new Set(liveTabs.map(t => t.id));
+        for (const [idx, entry] of interventionTabSnapshot) {
+            if (!liveIds.has(entry.chromeTabId)) {
+                interventionTabSnapshot.delete(idx);
+                delete snapData[String(idx)];
+            }
+        }
+    } catch {}
+
     // Persist for service worker restart resilience
     try {
         await chrome.storage.session.set({ cortex_tab_snapshot: snapData });
@@ -1366,6 +1468,12 @@ async function validateTab(
         // LAYER 1: Never allow closing the active tab
         if (tab.active) {
             return { valid: false, tabId: snap.chromeTabId, message: "Tab is currently active — refusing to close" };
+        }
+        // LAYER 1b: Protect recently-visited tabs (activated within last 5 minutes)
+        const lastActive = tabLastActivated.get(snap.chromeTabId);
+        if (lastActive && Date.now() - lastActive < RECENTLY_ACTIVE_PROTECTION_MS) {
+            const agoSec = Math.round((Date.now() - lastActive) / 1000);
+            return { valid: false, tabId: snap.chromeTabId, message: `Tab was recently active (${agoSec}s ago) — protected` };
         }
         // Check hostname still matches
         try {
@@ -1443,6 +1551,14 @@ async function executeAction(action: SuggestedAction): Promise<ActionExecuteResu
 
 async function executeCloseTab(action: SuggestedAction): Promise<ActionExecuteResult> {
     const aid = action.action_id || `close_${Date.now()}`;
+
+    // Check if tab closing is disabled by user toggle
+    try {
+        const { cortex_tab_close_disabled } = await chrome.storage.local.get("cortex_tab_close_disabled");
+        if (cortex_tab_close_disabled === true) {
+            return { action_id: aid, success: false, message: "Tab closing is disabled", undo_available: false };
+        }
+    } catch { /* storage read failed — proceed normally */ }
     const tabIndex = typeof action.tab_index === "number" ? action.tab_index : Number(action.tab_index);
     if (isNaN(tabIndex)) {
         return { action_id: aid, success: false, message: "No tab_index provided", undo_available: false };
@@ -1545,6 +1661,14 @@ async function executeGroupTabs(action: SuggestedAction): Promise<ActionExecuteR
 
 async function executeBookmarkAndClose(action: SuggestedAction): Promise<ActionExecuteResult> {
     const aid = action.action_id || `bmc_${Date.now()}`;
+
+    // Check if tab closing is disabled by user toggle
+    try {
+        const { cortex_tab_close_disabled } = await chrome.storage.local.get("cortex_tab_close_disabled");
+        if (cortex_tab_close_disabled === true) {
+            return { action_id: aid, success: false, message: "Tab closing is disabled", undo_available: false };
+        }
+    } catch { /* storage read failed — proceed normally */ }
     const tabIndex = typeof action.tab_index === "number" ? action.tab_index : Number(action.tab_index);
     if (isNaN(tabIndex)) {
         return { action_id: aid, success: false, message: "No tab_index", undo_available: false };
@@ -1993,6 +2117,27 @@ chrome.runtime.onMessage.addListener(
                 sendResponse({ ok: true });
                 break;
 
+            case "LAUNCH_CORTEX":
+                // Connect if not connected, then enable webcam capture
+                if (!connected) {
+                    connect();
+                }
+                // Wait briefly for connection, then send webcam enable
+                setTimeout(() => {
+                    if (connected && ws) {
+                        send({
+                            type: "SETTINGS_SYNC",
+                            payload: { webcam_enabled: true },
+                            timestamp: Date.now() / 1000,
+                            sequence: ++sequence,
+                        });
+                        sendResponse({ ok: true, status: "camera_enabled" });
+                    } else {
+                        sendResponse({ ok: false, status: "not_connected" });
+                    }
+                }, 1500);
+                return true; // async
+
             case "USER_ACTION":
                 send({
                     type: "USER_ACTION",
@@ -2096,7 +2241,24 @@ chrome.runtime.onMessage.addListener(
 
             case "EXECUTE_ALL_RECOMMENDED":
                 executeAllRecommended(message.actions as SuggestedAction[])
-                    .then((results) => sendResponse(results));
+                    .then((results) => {
+                        sendResponse(results);
+                        // Send per-tab relevance feedback to daemon
+                        const keptTabs = message.kept_tabs as Array<{url: string; title: string}> | undefined;
+                        const closedTabs = message.closed_tabs as Array<{url: string; title: string}> | undefined;
+                        if ((keptTabs && keptTabs.length > 0) || (closedTabs && closedTabs.length > 0)) {
+                            send({
+                                type: "TAB_RELEVANCE_FEEDBACK",
+                                payload: {
+                                    intervention_id: message.intervention_id,
+                                    kept_tabs: keptTabs || [],
+                                    closed_tabs: closedTabs || [],
+                                },
+                                timestamp: Date.now() / 1000,
+                                sequence: ++sequence,
+                            });
+                        }
+                    });
                 return true; // async
 
             case "UNDO_ACTION":

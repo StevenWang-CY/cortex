@@ -123,9 +123,13 @@ export function classifyTabTypeWithGoal(
     const baseType = classifyTabType(url);
     if (goalKeywords.length === 0) return baseType;
 
-    // Only reclassify ambiguous types — docs/code/learning are already safe
+    // Reclassify ambiguous types + AI assistants when they match the goal.
+    // AI assistants are tools that could be used for ANY topic — if the user's
+    // goal keywords appear in the title, the assistant is actively helping with
+    // the goal and should get full goal_relevant protection.
     const ambiguousTypes = new Set([
         "video_platform", "social", "communication", "distraction", "other",
+        "ai_assistant",
     ]);
     if (!ambiguousTypes.has(baseType)) return baseType;
 
@@ -189,21 +193,37 @@ export async function collectCurrentWindowTabs(): Promise<TabData[]> {
 const snapshots: Map<string, TabSnapshot> = new Map();
 
 /**
- * Hide all non-active tabs in the current window by grouping and collapsing them.
+ * Hide non-active tabs in the current window by grouping and collapsing them.
+ * Excludes protected tabs (goal-relevant, AI assistants, recently-active, etc.)
  *
  * @param interventionId - ID for tracking this hide operation.
+ * @param protectedTabIds - Set of tab IDs that should NOT be hidden.
  * @returns The snapshot for later restoration, or null on failure.
  */
 export async function hideNonActiveTabs(
     interventionId: string,
+    protectedTabIds?: Set<number>,
 ): Promise<TabSnapshot | null> {
     try {
         const tabs = await collectCurrentWindowTabs();
         const activeTab = tabs.find((t) => t.isActive);
         if (!activeTab) return null;
 
+        // Safe types that should never be hidden — they are tools the user is actively using
+        const safeTypes = new Set([
+            "ai_assistant", "learning_platform", "documentation",
+            "reference", "code_host", "stackoverflow",
+        ]);
+
         const toHide = tabs
-            .filter((t) => !t.isActive && t.tabId !== -1)
+            .filter((t) => {
+                if (t.isActive || t.tabId === -1) return false;
+                // Don't hide tabs with safe types
+                if (safeTypes.has(t.tabType)) return false;
+                // Don't hide explicitly protected tabs
+                if (protectedTabIds?.has(t.tabId)) return false;
+                return true;
+            })
             .map((t) => t.tabId);
 
         if (toHide.length === 0) return null;

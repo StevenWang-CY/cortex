@@ -135,6 +135,38 @@ function CortexPopup(): React.ReactElement {
     const [applied, setApplied] = useState(false);
     const [causalExplanation, setCausalExplanation] = useState<string>("");
     const [briefing, setBriefing] = useState<MorningBriefing | null>(null);
+    const [tabCloseDisabled, setTabCloseDisabled] = useState(false);
+    const [launching, setLaunching] = useState(false);
+    const [launchError, setLaunchError] = useState(false);
+
+    // Load tab-close toggle state on mount
+    useEffect(() => {
+        chrome.storage.local.get("cortex_tab_close_disabled", (result) => {
+            if (result.cortex_tab_close_disabled === true) {
+                setTabCloseDisabled(true);
+            }
+        });
+    }, []);
+
+    const handleTabCloseToggle = useCallback(() => {
+        const newValue = !tabCloseDisabled;
+        setTabCloseDisabled(newValue);
+        chrome.storage.local.set({ cortex_tab_close_disabled: newValue });
+    }, [tabCloseDisabled]);
+
+    const handleLaunchCortex = useCallback(() => {
+        setLaunching(true);
+        setLaunchError(false);
+        chrome.runtime.sendMessage({ type: "LAUNCH_CORTEX" }, (resp) => {
+            if (resp?.ok && resp.status === "camera_enabled") {
+                setLaunching(false);
+            } else {
+                setLaunching(false);
+                setLaunchError(true);
+                setTimeout(() => setLaunchError(false), 5000);
+            }
+        });
+    }, []);
 
     useEffect(() => {
         chrome.runtime.sendMessage({ type: "GET_STATE" }, (resp) => {
@@ -279,6 +311,33 @@ function CortexPopup(): React.ReactElement {
                     </div>
                 )}
             </div>
+
+            {/* Launch / Camera */}
+            <button
+                style={{
+                    ...S.primaryBtn,
+                    marginBottom: 10,
+                    background: launchError ? C.dangerDim
+                        : launching ? C.surfaceHover
+                        : connected ? C.surface : C.accent,
+                    color: launchError ? C.danger
+                        : launching ? C.textSecondary
+                        : connected ? C.text : "#fff",
+                    border: connected && !launchError ? `1px solid ${C.border}` : "none",
+                    cursor: launching ? "default" : "pointer",
+                    pointerEvents: launching ? "none" as const : "auto" as const,
+                }}
+                onClick={handleLaunchCortex}
+                disabled={launching}
+            >
+                {launchError
+                    ? "Daemon not running \u2014 run cortex-dev first"
+                    : launching
+                        ? "Starting\u2026"
+                        : connected
+                            ? "Restart Camera"
+                            : "Launch Cortex"}
+            </button>
 
             {/* Morning Briefing */}
             {briefing && (
@@ -467,6 +526,31 @@ function CortexPopup(): React.ReactElement {
                     )}
                 </div>
             )}
+
+            {/* Settings */}
+            <div style={S.card}>
+                <div style={S.toggleRow}>
+                    <div>
+                        <div style={S.toggleLabel}>Tab closing</div>
+                        <div style={S.toggleDesc}>
+                            {tabCloseDisabled ? "Cortex won\u2019t close tabs" : "Cortex can close distracting tabs"}
+                        </div>
+                    </div>
+                    <button
+                        style={{
+                            ...S.toggleTrack,
+                            background: tabCloseDisabled ? C.borderLight : C.accent,
+                        }}
+                        onClick={handleTabCloseToggle}
+                        aria-label={tabCloseDisabled ? "Enable tab closing" : "Disable tab closing"}
+                    >
+                        <div style={{
+                            ...S.toggleThumb,
+                            transform: tabCloseDisabled ? "translateX(0)" : "translateX(16px)",
+                        }} />
+                    </button>
+                </div>
+            </div>
 
             {/* Daily Stats */}
             {dailyStats && (
@@ -696,6 +780,37 @@ const S: Record<string, React.CSSProperties> = {
     // Daily stats
     dailyGrid: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 4 },
     dailyItem: { display: "flex", flexDirection: "column" as const, alignItems: "center", gap: 2 },
+
+    // Toggle
+    toggleRow: {
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: 12,
+    },
+    toggleLabel: { fontSize: 12, fontWeight: 500, color: C.text },
+    toggleDesc: { fontSize: 10, color: C.textTertiary, marginTop: 2 },
+    toggleTrack: {
+        position: "relative" as const,
+        width: 36,
+        height: 20,
+        borderRadius: 10,
+        border: "none",
+        cursor: "pointer",
+        padding: 0,
+        flexShrink: 0,
+        transition: "background .2s",
+    },
+    toggleThumb: {
+        position: "absolute" as const,
+        top: 2,
+        left: 2,
+        width: 16,
+        height: 16,
+        borderRadius: "50%",
+        background: "#fff",
+        transition: "transform .2s",
+    },
 };
 
 // --- Mount ---
