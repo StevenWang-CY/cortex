@@ -101,6 +101,7 @@ class WebSocketServer:
         # Callbacks for received messages
         self._user_action_callback: Any = None
         self._settings_callback: Any = None
+        self._activity_sync_callback: Any = None
 
         # Latest state for new connections
         self._latest_state: StateEstimate | None = None
@@ -125,6 +126,10 @@ class WebSocketServer:
     def set_settings_callback(self, callback: Any) -> None:
         """Set callback for SETTINGS_SYNC messages from clients."""
         self._settings_callback = callback
+
+    def set_activity_sync_callback(self, callback: Any) -> None:
+        """Set callback for ACTIVITY_SYNC messages from browser extension."""
+        self._activity_sync_callback = callback
 
     async def start(self) -> bool:
         """
@@ -227,6 +232,8 @@ class WebSocketServer:
             self._handle_context_response(msg)
         elif msg.type == "SETTINGS_SYNC":
             await self._handle_settings_sync(client, msg)
+        elif msg.type == "ACTIVITY_SYNC":
+            await self._handle_activity_sync(client, msg)
         else:
             logger.debug(f"Unknown message type from {client.client_id}: {msg.type}")
 
@@ -271,6 +278,19 @@ class WebSocketServer:
                 self._settings_callback(msg.payload)
         except Exception as exc:
             logger.error("Settings callback error from %s: %s", client.client_id, exc)
+
+    async def _handle_activity_sync(self, client: WebSocketClient, msg: WSMessage) -> None:
+        """Forward activity sync to the daemon for aggregation."""
+        callback = getattr(self, "_activity_sync_callback", None)
+        if callback is None:
+            return
+        try:
+            if asyncio.iscoroutinefunction(callback):
+                await callback(msg.payload)
+            else:
+                callback(msg.payload)
+        except Exception as exc:
+            logger.error("Activity sync callback error from %s: %s", client.client_id, exc)
 
     async def broadcast_state(
         self,

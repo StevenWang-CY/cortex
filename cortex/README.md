@@ -122,6 +122,72 @@ Tracks physiological baselines (HR, HRV, respiration) over days and weeks. Detec
 
 ---
 
+## LeetCode Mode
+
+Cortex v2.1 adds a domain-specific pipeline for competitive programming on LeetCode. A content script observes the LeetCode DOM at 1 Hz, three biological detectors analyze your physiological response to problem-solving, a mode resolver maps signals to intervention decisions, and five concrete interventions gate your workflow.
+
+### Observer (Browser Extension)
+
+The `LeetCodeObserver` content script extracts problem-solving context in real time:
+
+- **Problem metadata** — title, difficulty, tags, submission history (via resilient multi-selector DOM scraping)
+- **Code telemetry** — rolling 60-second keystroke window tracking insertions/deletions and chars/min via Monaco/CodeMirror APIs
+- **Behavioral signals** — reread count (scroll-back detection), solutions tab attempts
+- **Stage inference** — classifies your current phase:
+  - `READ` — first 60s or editor unfocused
+  - `PLAN` — editor focused + <20 chars/min
+  - `IMPLEMENT` — editor focused + ≥20 chars/min
+  - `DEBUG` — post-submission with wrong answer
+  - `REFLECT` — post-accept
+
+Emits `LEETCODE_CONTEXT_UPDATE` every second. Saves session state to `chrome.storage.local` on tab close. Handles SPA navigation via URL polling.
+
+### Biological Detectors
+
+| Detector | What It Detects | Formula / Conditions | Threshold |
+|----------|----------------|---------------------|-----------|
+| **Amygdala Hijack** | Acute emotional flooding after Wrong Answer | `AAI = 0.4·max(0, dHR/dt) - 0.3·ΔBlinks(t) + 0.3·Velocity_keys(t)` | AAI > 0.7 within 5s of WA |
+| **Destructive Struggle** | Productive→destructive transition | Path 1: reread > 2 + dwell > 5min + rising allostatic load. Path 2: WA > 2 in 10min + delete ratio > 0.5 + HRV < 80% baseline | Either pathway |
+| **Parasympathetic Rebound** | Optimal learning window post-accept | Problem accepted + HR within 5% of baseline + HRV rising | All conditions met |
+
+### Mode Resolver
+
+Combines cognitive state + detector outputs into a `LeetCodeModeEstimate` (stage × mode). Priority order:
+
+| Mode | Trigger | Priority |
+|------|---------|----------|
+| `PANIC` | WA count ≥ 4 AND stress_integral ≥ 400 | Highest |
+| `AMYGDALA_HIJACK` | AAI > 0.7 | High |
+| `DESTRUCTIVE_STRUGGLE` | Either detector pathway active | Medium |
+| `FATIGUE` | Allostatic load > 400 | Medium |
+| `PRODUCTIVE_STRUGGLE` | Active struggle, not destructive | Low |
+| `FLOW` | Baseline | Lowest |
+
+### Interventions (Stage × Mode Matrix)
+
+| Intervention | Stage × Mode | What It Does |
+|-------------|-------------|-------------|
+| **Restatement Scratchpad** | READ/PLAN × DESTRUCTIVE_STRUGGLE | Opens a scratchpad prompting you to restate the problem in your own words. 5-minute cooldown. |
+| **Pattern Ladder** | PLAN/IMPLEMENT × PRODUCTIVE_STRUGGLE | 4-level progressive hint system (category → technique → pseudocode → code skeleton). 2-minute cooldown. |
+| **Amygdala Lockout** | DEBUG × AMYGDALA_HIJACK | Locks editor for 90s (escalates +30s per WA above 3, capped at 180s). Forces a physiological reset before retrying. |
+| **Submission Discipline Guard** | IMPLEMENT/DEBUG × any | Fires when WA > 2. Gates submission with a checklist requiring you to articulate what changed. |
+| **Solution Escape Friction** | any × PANIC/FATIGUE | Intercepts solutions tab navigation. Adds deliberate friction (60s cooldown) before allowing access. |
+
+### Longitudinal (LeetCode)
+
+Tracks per-session problem metrics and per-tag skill growth:
+
+- **Session metrics** — problems attempted/accepted, panic episodes, lockout count, solution escapes, pattern ladder depth, peak allostatic load
+- **Skill metrics** — per-tag (e.g., "dynamic-programming", "trees") attempt/accept counts and acceptance rate
+- **Daily load budget** — 600 units; triggers session-end recommendation when exceeded
+- Midnight rollover resets session metrics while preserving skill metrics
+
+### Adapter
+
+The `LeetCodeAdapter` bridges the runtime to the browser extension over WebSocket. Supports 15 action types including `lock_editor`, `intercept_submit`, `gate_solutions`, `show_scratchpad`, `show_pattern_ladder`, `show_lockout`, `show_consolidation`, `show_submission_gate`, `show_solution_friction`, and `show_session_briefing`. Also proxies AI-powered checks: restatement, comprehension, hypothesis, stuck analysis, and session briefing.
+
+---
+
 ## Learning Loop
 
 Cortex learns from every intervention to get better over time:
@@ -130,7 +196,9 @@ Cortex learns from every intervention to get better over time:
 
 2. **Contextual Bandit (LinUCB)** — selects which intervention type to deploy based on 8 context features: state code, complexity, tab count, error count, hour of day, thrashing score, stress integral, and consent level. Updates A matrices and b vectors after each intervention. Persists weights to store every 10 updates.
 
-3. **Replay Harness** — offline A/B testing. Load JSONL session recordings and replay them through alternative scoring policies and prompt configurations. Compare baseline vs. variant on reward delta, engagement delta, and intervention count.
+3. **Tab Relevance Tracker** — learns per-domain relevance from user feedback on tab close recommendations. Uses exponential moving average (α=0.3) to update domain scores: keeping/undoing a close → relevant (1.0), confirming a close → irrelevant (0.0). Scores persist with 90-day TTL and are scoped per focus goal. Personalizes which tabs Cortex recommends closing.
+
+4. **Replay Harness** — offline A/B testing. Load JSONL session recordings and replay them through alternative scoring policies and prompt configurations. Compare baseline vs. variant on reward delta, engagement delta, and intervention count.
 
 ```bash
 # Offline evaluation
@@ -170,6 +238,15 @@ Injected via Shadow DOM into the active tab:
 - Single CTA button that executes all recommended actions
 - Undo link to reverse all changes
 - Auto-dismisses 1.5s after action execution
+
+### Dismissal Cooldown
+
+When you dismiss an intervention (click Dismiss, X, backdrop, or press Escape), Cortex enforces two cooldown layers to prevent the popup from reappearing:
+
+- **Intervention ID cooldown** — the same intervention won't re-trigger for 30 minutes
+- **URL-based cooldown** — no intervention will fire for the same hostname for 10 minutes
+- **Active guard** — if an intervention is already showing, all incoming triggers are dropped
+- Old cooldown entries are pruned automatically
 
 ### Breathing Overlay
 
@@ -328,6 +405,20 @@ npx plasmo build
 # 4. Select build/chrome-mv3-prod/
 ```
 
+### Native Messaging Host (Auto-Launch Daemon)
+
+Allows the Chrome extension to automatically start the Cortex daemon when it connects:
+
+```bash
+# One-time setup: register native messaging host with Chrome
+python -m cortex.scripts.install_native_host
+
+# Or specify extension ID manually
+python -m cortex.scripts.install_native_host --extension-id abcdef1234567890
+```
+
+The host (`native_host.py`) uses Chrome's native messaging protocol (4-byte length-prefixed JSON over stdio). On "launch" command, it spawns the daemon as a detached process and waits up to 8 seconds for port 9473 readiness. On "status" command, it checks if the daemon is already running.
+
 ### Testing Interventions
 
 A standalone test script sends a mock intervention without the full daemon:
@@ -447,10 +538,11 @@ All layers communicate via the FastAPI gateway (`api_gateway/`) and WebSocket se
 ```
 cortex/
 ├── libs/
-│   ├── adapters/            # CortexAdapter protocol, AdapterRegistry, plugin discovery
+│   ├── adapters/            # CortexAdapter protocol, AdapterRegistry, plugin discovery,
+│   │                        #   LeetCodeAdapter (WebSocket bridge to browser extension)
 │   ├── config/              # CortexConfig, RedisConfig, defaults.yaml, .env loading
 │   ├── schemas/             # Pydantic models (state, context, intervention, consent,
-│   │                        #   eval, longitudinal, transition_graph, actions)
+│   │                        #   eval, longitudinal, transition_graph, actions, leetcode)
 │   ├── store/               # RedisStore + InMemoryStore (auto-fallback)
 │   ├── signal/              # Butterworth filters, Welch PSD, windowing
 │   ├── logging/             # structlog JSON event logging
@@ -461,12 +553,16 @@ cortex/
 │   ├── kinematics_engine/   # EAR blink detection, solvePnP head pose, shoulder posture
 │   ├── telemetry_engine/    # pynput input hooks, window tracker, focus graph, aggregation
 │   ├── state_engine/        # Feature fusion, rule scorer, EMA smoother, trigger policy,
-│   │                        #   stress integral, longitudinal, zombie detector, rabbit hole
+│   │                        #   stress integral, longitudinal, zombie detector, rabbit hole,
+│   │                        #   amygdala hijack, destructive struggle, parasympathetic rebound,
+│   │                        #   LeetCode mode resolver, LeetCode longitudinal tracker
 │   ├── context_engine/      # Editor, browser, terminal adapters + app classifier
 │   ├── llm_engine/          # Azure OpenAI client, Ollama fallback, prompts, parser, cache
-│   ├── intervention_engine/ # Trigger, snapshot, planner, executor (adapter registry), restore
+│   ├── intervention_engine/ # Trigger, snapshot, planner, executor (adapter registry), restore,
+│   │                        #   LeetCode interventions (lockout, scratchpad, ladder, guards)
 │   ├── consent/             # ConsentPolicy + ConsentLadder (progressive trust)
-│   ├── eval/                # HelpfulnessTracker, ContextualBandit (LinUCB), bandit trainer
+│   ├── eval/                # HelpfulnessTracker, ContextualBandit (LinUCB), bandit trainer,
+│   │                        #   TabRelevanceTracker (per-domain EMA learning)
 │   ├── handover/            # ShutdownDetector, HandoverSnapshot, MorningBriefing
 │   ├── launcher/            # ProjectConfig (YAML profiles), ProjectLauncher
 │   ├── throttle/            # CopilotThrottle (silence inline suggestions in HYPER)
@@ -478,16 +574,19 @@ cortex/
 │   │                        #   morning briefing, copilot throttle
 │   └── browser_extension/   # Plasmo/React: background SW, content script, popup, newtab,
 │                            #   tab manager, ambient engine, action executor, undo stack,
-│                            #   breathing overlay, active recall overlay
+│                            #   breathing overlay, active recall overlay, LeetCode observer,
+│                            #   intervention dismissal cooldown
 ├── scripts/
 │   ├── run_dev.py           # Start all services
 │   ├── calibrate.py         # Capture personal baselines
 │   ├── seed_config.py       # Initialize storage and config
 │   ├── test_intervention.py # Mock intervention test server
 │   ├── replay_harness.py    # Offline session replay and A/B evaluation
+│   ├── native_host.py       # Chrome native messaging host (daemon auto-launch)
+│   ├── install_native_host.py # Register native messaging host manifest
 │   └── build_macos_app.sh   # macOS app packaging
 ├── tests/
-│   ├── unit/                # Per-module unit tests (30+ test files)
+│   ├── unit/                # Per-module unit tests (40 test files)
 │   └── integration/         # Pipeline integration tests
 └── docs/
     ├── setup.md

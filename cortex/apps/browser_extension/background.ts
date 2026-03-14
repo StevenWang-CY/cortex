@@ -9,6 +9,7 @@
 
 import {
     classifyTabType as classifyBrowserTabType,
+    classifyTabTypeWithGoal,
     groupSpecificTabs,
     hideNonActiveTabs as hideTabsForIntervention,
     restoreAllTabs,
@@ -51,6 +52,14 @@ let sequence = 0;
 let currentState: CortexState | null = null;
 let activeIntervention: Record<string, unknown> | null = null;
 let quietMode = false;
+
+// Dismissal cooldown: maps intervention_id → timestamp when dismissed
+// Prevents the same intervention from re-triggering within the cooldown window
+const dismissedInterventions = new Map<string, number>();
+const INTERVENTION_DISMISS_COOLDOWN = 30 * 60 * 1000; // 30 min cooldown after dismiss
+// Also track by URL pattern to prevent same-site re-triggers
+const dismissedUrlPatterns = new Map<string, number>();
+const URL_DISMISS_COOLDOWN = 10 * 60 * 1000; // 10 min cooldown for same URL
 
 // --- Focus Session State ---
 
@@ -101,6 +110,238 @@ const BLINK_ALERT_THRESHOLD = 180_000;  // 3 min low blink rate
 // Break recommendation state
 let lastBreakSuggestion = 0;
 let consecutiveStressUpdates = 0;
+
+// --- Activity Tracking State ---
+
+interface ActivityPosition {
+    type: "video" | "scroll" | "code_problem" | "notebook" | "pdf" | "slides" | "general";
+    [key: string]: unknown;
+}
+
+interface ActivityRecord {
+    content_id: string;
+    platform: string;
+    content_type: "video" | "article" | "code_problem" | "documentation"
+        | "course_lecture" | "notebook" | "pdf" | "slides" | "general";
+    title: string;
+    url: string;
+    favicon_url: string;
+    position: ActivityPosition;
+    content_duration_s: number;
+    duration_spent_s: number;
+    session_duration_s: number;
+    first_visited: number;
+    last_visited: number;
+    context_snapshot: string;
+    topic_tags: string[];
+    completion_pct: number;
+    max_completion_pct: number;
+    cognitive_state: string;
+    visit_count: number;
+    dismissed: boolean;
+    is_playlist: boolean;
+    playlist_id: string;
+    playlist_index: number;
+    related_tabs: string[];
+}
+
+let lastActivitySyncTime = 0;
+const ACTIVITY_SYNC_INTERVAL = 60_000; // Sync to daemon every 60s
+const ACTIVITY_STORAGE_KEY = "cortex_activities";
+const MAX_ACTIVITIES = 200;
+
+async function loadActivities(): Promise<Record<string, ActivityRecord>> {
+    const data = await chrome.storage.local.get(ACTIVITY_STORAGE_KEY);
+    return (data[ACTIVITY_STORAGE_KEY] as Record<string, ActivityRecord>) || {};
+}
+
+async function saveActivities(activities: Record<string, ActivityRecord>): Promise<void> {
+    await chrome.storage.local.set({ [ACTIVITY_STORAGE_KEY]: activities });
+}
+
+async function upsertActivity(record: ActivityRecord): Promise<void> {
+    const activities = await loadActivities();
+    const existing = activities[record.content_id];
+
+    if (existing) {
+        // Determine if this is a continuation of the same session or a new visit.
+        // Same session: first_visited matches (content script uses sessionStartTime).
+        // New visit: first_visited differs (content script reset via resetForNewPage).
+        const isSameSession = existing.first_visited === record.first_visited
+            || (record.first_visited > existing.last_visited - 10_000); // within 10s = same session
+
+        if (isSameSession) {
+            // Replace session contribution: subtract old session time, add new
+            existing.duration_spent_s = (existing.duration_spent_s - existing.session_duration_s) + record.duration_spent_s;
+            existing.session_duration_s = record.duration_spent_s;
+        } else {
+            // New visit: add the new session's dwell time
+            existing.duration_spent_s += record.duration_spent_s;
+            existing.session_duration_s = record.duration_spent_s;
+            existing.visit_count++;
+            // Re-visiting means user may want resume card next time
+            existing.dismissed = false;
+        }
+
+        existing.position = record.position;
+        existing.last_visited = record.last_visited;
+        existing.context_snapshot = record.context_snapshot;
+        if (record.cognitive_state) existing.cognitive_state = record.cognitive_state;
+        // Only increase completion, never decrease
+        existing.completion_pct = Math.max(existing.completion_pct, record.completion_pct);
+        existing.max_completion_pct = Math.max(existing.max_completion_pct, record.completion_pct);
+        // Merge related tabs
+        const tabSet = new Set([...existing.related_tabs, ...record.related_tabs]);
+        existing.related_tabs = Array.from(tabSet).slice(0, 5);
+        // Update title if non-empty
+        if (record.title) existing.title = record.title;
+        // Keep the original first_visited
+        activities[record.content_id] = existing;
+    } else {
+        activities[record.content_id] = record;
+    }
+
+    // Enforce cap with LRU eviction
+    const entries = Object.entries(activities);
+    if (entries.length > MAX_ACTIVITIES) {
+        const now = Date.now();
+        const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000;
+        // Sort by last_visited ascending (oldest first)
+        entries.sort((a, b) => a[1].last_visited - b[1].last_visited);
+        while (entries.length > MAX_ACTIVITIES) {
+            const oldest = entries[0];
+            // Prefer evicting entries older than 7 days
+            if (now - oldest[1].last_visited > SEVEN_DAYS || entries.length > MAX_ACTIVITIES + 10) {
+                delete activities[oldest[0]];
+                entries.shift();
+            } else {
+                break;
+            }
+        }
+        // If still over cap, evict oldest regardless
+        while (Object.keys(activities).length > MAX_ACTIVITIES) {
+            const allEntries = Object.entries(activities).sort((a, b) => a[1].last_visited - b[1].last_visited);
+            delete activities[allEntries[0][0]];
+        }
+    }
+
+    await saveActivities(activities);
+
+    // Sync to daemon if connected and enough time has passed
+    const now = Date.now();
+    if (connected && now - lastActivitySyncTime > ACTIVITY_SYNC_INTERVAL) {
+        lastActivitySyncTime = now;
+        syncActivitiesToDaemon(activities);
+    }
+}
+
+function syncActivitiesToDaemon(activities: Record<string, ActivityRecord>): void {
+    const top10 = Object.values(activities)
+        .sort((a, b) => b.last_visited - a.last_visited)
+        .slice(0, 10)
+        .map(a => ({
+            content_id: a.content_id,
+            platform: a.platform,
+            content_type: a.content_type,
+            title: a.title,
+            url: a.url,
+            position_description: formatPositionDescription(a),
+            duration_spent_s: a.duration_spent_s,
+            last_visited: a.last_visited,
+            completion_pct: a.completion_pct,
+            topic_tags: a.topic_tags,
+            context_snapshot: a.context_snapshot,
+        }));
+
+    send({
+        type: "ACTIVITY_SYNC",
+        payload: { activities: top10 },
+        timestamp: Date.now() / 1000,
+        sequence: ++sequence,
+    });
+}
+
+function formatPositionDescription(a: ActivityRecord): string {
+    const pos = a.position;
+    switch (pos.type) {
+        case "video": {
+            const ts = pos.timestamp_s as number;
+            const dur = pos.duration_s as number;
+            return `${formatTime(ts)} / ${formatTime(dur)}`;
+        }
+        case "scroll":
+            return `${Math.round(pos.scroll_pct as number)}% read`;
+        case "code_problem":
+            return `Stage: ${pos.stage} · ${pos.wrong_answer_count} WA`;
+        case "notebook":
+            return `Cell ${(pos.cell_index as number) + 1}`;
+        case "pdf":
+            return `Page ${pos.page}/${pos.total_pages}`;
+        case "slides":
+            return `Slide ${(pos.slide_index as number) + 1}/${pos.total_slides}`;
+        case "general":
+            return `${Math.round(pos.scroll_pct as number)}% scrolled`;
+        default:
+            return "";
+    }
+}
+
+function formatTime(seconds: number): string {
+    const s = Math.floor(seconds);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+    return `${m}:${String(sec).padStart(2, "0")}`;
+}
+
+function canonicalizeUrl(rawUrl: string): string {
+    let u: URL;
+    try { u = new URL(rawUrl); } catch { return rawUrl; }
+
+    const STRIP = ["utm_source","utm_medium","utm_campaign","utm_term","utm_content",
+                    "fbclid","gclid","ref","source","si","feature","pp"];
+    for (const p of STRIP) u.searchParams.delete(p);
+    u.hostname = u.hostname.replace(/^www\./, "");
+
+    if (u.hostname.includes("youtube.com") || u.hostname.includes("youtu.be")) {
+        const v = u.searchParams.get("v");
+        if (v) return `https://youtube.com/watch?v=${v}`;
+        if (u.hostname === "youtu.be") return `https://youtube.com/watch?v=${u.pathname.slice(1)}`;
+    }
+    if (u.hostname.includes("bilibili.com")) {
+        const match = u.pathname.match(/\/video\/(BV\w+)/);
+        const p = u.searchParams.get("p") || "1";
+        if (match) return `https://bilibili.com/video/${match[1]}?p=${p}`;
+    }
+    if (u.hostname.includes("leetcode")) {
+        const match = u.pathname.match(/\/problems\/([^/]+)/);
+        if (match) return `https://${u.hostname}/problems/${match[1]}`;
+    }
+
+    const KEEP_HASH = [/docs\.google\.com\/presentation/, /\.pdf$/i];
+    if (!KEEP_HASH.some(p => p.test(rawUrl))) u.hash = "";
+
+    return u.toString();
+}
+
+async function enrichWithRelatedTabs(record: ActivityRecord): Promise<void> {
+    try {
+        const allTabs = await chrome.tabs.query({});
+        const activities = await loadActivities();
+        const relatedIds: string[] = [];
+        for (const tab of allTabs) {
+            if (!tab.url || tab.url === record.url) continue;
+            const canonical = canonicalizeUrl(tab.url);
+            if (activities[canonical]) {
+                relatedIds.push(canonical);
+            }
+        }
+        record.related_tabs = relatedIds.slice(0, 5);
+    } catch {
+        // tabs query may fail
+    }
+}
 
 // --- WebSocket Connection ---
 
@@ -232,12 +473,44 @@ async function handleMessage(raw: string): Promise<void> {
             });
             break;
 
-        case "INTERVENTION_TRIGGER":
+        case "INTERVENTION_TRIGGER": {
+            // Skip if an intervention is already being shown
+            if (activeIntervention) {
+                console.log("Cortex: skipping intervention — one is already active");
+                break;
+            }
+
+            const iid = typeof msg.payload.intervention_id === "string" ? msg.payload.intervention_id : null;
+            const now = Date.now();
+
+            // Check cooldown: skip if this intervention was recently dismissed
+            if (iid && dismissedInterventions.has(iid)) {
+                const dismissedAt = dismissedInterventions.get(iid)!;
+                if (now - dismissedAt < INTERVENTION_DISMISS_COOLDOWN) {
+                    console.log(`Cortex: skipping intervention ${iid} — dismissed ${Math.round((now - dismissedAt) / 1000)}s ago`);
+                    break;
+                }
+                dismissedInterventions.delete(iid);
+            }
+
+            // Check URL-based cooldown: don't re-trigger for same site within window
+            const triggerUrl = typeof msg.payload.trigger_url === "string" ? msg.payload.trigger_url : null;
+            const urlKey = triggerUrl ? new URL(triggerUrl).hostname : null;
+            if (urlKey && dismissedUrlPatterns.has(urlKey)) {
+                const dismissedAt = dismissedUrlPatterns.get(urlKey)!;
+                if (now - dismissedAt < URL_DISMISS_COOLDOWN) {
+                    console.log(`Cortex: skipping intervention for ${urlKey} — dismissed ${Math.round((now - dismissedAt) / 1000)}s ago`);
+                    break;
+                }
+                dismissedUrlPatterns.delete(urlKey);
+            }
+
             activeIntervention = msg.payload;
             // Persist so popup can load it after SW restart
             try { chrome.storage.session.set({ cortex_active_intervention: msg.payload }); } catch {}
             handleIntervention(msg.payload);
             break;
+        }
 
         case "CONTEXT_REQUEST":
             handleContextRequest(msg);
@@ -316,7 +589,10 @@ function injectOverlay(payload: Record<string, unknown>): void {
                     reason: t.reason || "",
                     category: "recommended",
                     reversible: true,
-                    metadata: {},
+                    metadata: {
+                        expected_title: t.tab_title || "",
+                        expected_url: t.url || "",
+                    },
                 });
             }
         }
@@ -324,7 +600,7 @@ function injectOverlay(payload: Record<string, unknown>): void {
 
     const recommended = actions.filter(a => a.category === "recommended");
 
-    // --- Build tab list ---
+    // --- Build tab list with per-tab Keep buttons (LAYER 5) ---
     let closingHtml = "";
     let keepCount = 0;
     let closeCount = 0;
@@ -336,8 +612,9 @@ function injectOverlay(payload: Record<string, unknown>): void {
 
         if (closeTabs.length > 0) {
             closingHtml = `<div class="tl">`;
-            for (const t of closeTabs) {
-                closingHtml += `<div class="tr"><span class="tx">\u00d7</span><span class="tn">${esc(String(t.tab_title || "Untitled"))}</span></div>`;
+            for (let ti = 0; ti < closeTabs.length; ti++) {
+                const t = closeTabs[ti];
+                closingHtml += `<div class="tr" id="tr-${ti}" data-tab-idx="${ti}"><span class="tx">\u00d7</span><span class="tn">${esc(String(t.tab_title || "Untitled"))}</span><button class="kb" data-keep-idx="${ti}">Keep</button></div>`;
             }
             closingHtml += `</div>`;
         }
@@ -439,6 +716,13 @@ function injectOverlay(payload: Record<string, unknown>): void {
 .ul{color:#3b82f6;cursor:pointer;font-weight:500;text-decoration:none;border:none;background:none;font-size:11px;font-family:inherit;padding:0}
 .ul:hover{text-decoration:underline}
 
+/* Keep button (per-tab) */
+.kb{margin-left:auto;padding:2px 8px;border:1px solid rgba(255,255,255,.08);border-radius:4px;background:none;color:#71717a;font-size:10px;cursor:pointer;font-family:inherit;flex-shrink:0;transition:all .12s}
+.kb:hover{color:#10b981;border-color:rgba(16,185,129,.3)}
+.tr.kept{opacity:.35;text-decoration:line-through}
+.tr.kept .kb{color:#10b981;border-color:#10b981}
+.tr.kept .tx{color:#3f3f46}
+
 /* Dismiss */
 .dm{display:block;width:100%;padding:6px;margin-top:6px;border:none;border-radius:6px;background:none;color:#3f3f46;cursor:pointer;font-size:11px;font-family:inherit;transition:color .12s}
 .dm:hover{color:#71717a}
@@ -460,7 +744,16 @@ function injectOverlay(payload: Record<string, unknown>): void {
 
     document.body.appendChild(host);
 
+    let dismissed = false;
     const dismiss = () => {
+        if (dismissed) return;
+        dismissed = true;
+        // Notify background to record cooldown and restore tabs
+        chrome.runtime.sendMessage({
+            type: "USER_ACTION",
+            action: "dismissed",
+            intervention_id: payload.intervention_id,
+        }).catch(() => {});
         const el = document.getElementById(OID);
         if (el) {
             el.style.transition = "opacity .2s ease";
@@ -475,11 +768,55 @@ function injectOverlay(payload: Record<string, unknown>): void {
         if (e.key === "Escape") dismiss();
     }, { once: true });
 
+    // LAYER 5: Per-tab Keep buttons — remove individual tabs from pending closes
+    const keptIndices = new Set<number>();
+    const keepBtns = shadow.querySelectorAll(".kb");
+    const updateCtaLabel = () => {
+        const remaining = closeCount - keptIndices.size;
+        if (ctaEl) {
+            if (remaining <= 0) {
+                (ctaEl as HTMLButtonElement).disabled = true;
+                ctaEl.textContent = "All tabs kept";
+                ctaEl.style.opacity = "0.4";
+            } else {
+                (ctaEl as HTMLButtonElement).disabled = false;
+                ctaEl.textContent = `Close ${remaining} tab${remaining !== 1 ? "s" : ""}`;
+                ctaEl.style.opacity = "1";
+            }
+        }
+    };
+    keepBtns.forEach(btn => {
+        btn.addEventListener("click", (e) => {
+            const idx = Number((e.currentTarget as HTMLElement).dataset.keepIdx);
+            const row = shadow.getElementById(`tr-${idx}`);
+            if (keptIndices.has(idx)) {
+                keptIndices.delete(idx);
+                row?.classList.remove("kept");
+                (e.currentTarget as HTMLElement).textContent = "Keep";
+            } else {
+                keptIndices.add(idx);
+                row?.classList.add("kept");
+                (e.currentTarget as HTMLElement).textContent = "Kept";
+            }
+            updateCtaLabel();
+        });
+    });
+
     // CTA
     const ctaEl = shadow.getElementById("cta");
     if (ctaEl) {
         ctaEl.addEventListener("click", () => {
-            const toExecute = actions.filter(a => a.category === "recommended");
+            // Filter out actions for tabs the user chose to keep
+            const toExecute = actions.filter((a) => {
+                if (a.category !== "recommended") return false;
+                // Match kept indices to close actions by their position among recommended close actions
+                const closeActions = actions.filter(x =>
+                    x.category === "recommended" && (x.action_type === "close_tab" || x.action_type === "bookmark_and_close"));
+                const closeIdx = closeActions.indexOf(a);
+                if (closeIdx >= 0 && keptIndices.has(closeIdx)) return false;
+                return true;
+            });
+            if (toExecute.length === 0) return;
             (ctaEl as HTMLButtonElement).disabled = true;
             ctaEl.textContent = "Working\u2026";
             ctaEl.style.opacity = "0.5";
@@ -578,6 +915,7 @@ async function handleContextRequest(msg: WSMessage): Promise<void> {
         // Save this tab list so the intervention snapshot uses the same ordering
         // the LLM will see — prevents tab_index misalignment.
         lastContextTabs = tabs;
+        lastContextTabsTimestamp = Date.now();
         const activeTab = tabs.find((t) => t.is_active);
 
         // Get active tab content
@@ -683,8 +1021,16 @@ function extractTopicHint(title: string, url: string, tabType: string): string {
 
 async function collectTabs(): Promise<TabData[]> {
     const chromeTabs = await chrome.tabs.query({});
+    // LAYER 2: Extract goal keywords for goal-aware classification
+    const goalKeywords: string[] = focusSession?.goal
+        ? focusSession.goal.toLowerCase().split(/\s+/).filter(w => w.length > 2)
+        : [];
+
     return chromeTabs.map((tab) => {
-        const tabType = classifyBrowserTabType(tab.url ?? "");
+        // Use goal-aware classification when a focus session is active
+        const tabType = goalKeywords.length > 0
+            ? classifyTabTypeWithGoal(tab.url ?? "", tab.title ?? "", goalKeywords)
+            : classifyBrowserTabType(tab.url ?? "");
         return {
             title: tab.title ?? "",
             url: tab.url ?? "",
@@ -946,6 +1292,8 @@ let interventionTabSnapshot: Map<number, { chromeTabId: number; url: string; tit
 // Saved tab list from the most recent CONTEXT_RESPONSE — used to ensure tab_index
 // alignment between what the LLM saw and what the action executor targets.
 let lastContextTabs: TabData[] | null = null;
+let lastContextTabsTimestamp = 0; // LAYER 3: track when context was captured
+const CONTEXT_STALENESS_LIMIT = 60_000; // 60s max age for tab snapshots
 const undoStack: UndoEntry[] = [];
 const MAX_UNDO_ENTRIES = 50;
 
@@ -958,6 +1306,11 @@ const MAX_UNDO_ENTRIES = 50;
  */
 async function snapshotTabsForIntervention(): Promise<void> {
     interventionTabSnapshot = new Map();
+    // LAYER 3: Discard stale context (>60s old) to prevent wrong-tab targeting
+    if (lastContextTabs && Date.now() - lastContextTabsTimestamp > CONTEXT_STALENESS_LIMIT) {
+        console.log("Cortex: discarding stale tab context (>60s old), refreshing");
+        lastContextTabs = null;
+    }
     const tabs = lastContextTabs ?? await collectTabs();
     const snapData: Record<string, { chromeTabId: number; url: string; title: string }> = {};
     for (let i = 0; i < tabs.length; i++) {
@@ -1010,6 +1363,10 @@ async function validateTab(
         if (!tab) {
             return { valid: false, tabId: snap.chromeTabId, message: "Tab already closed" };
         }
+        // LAYER 1: Never allow closing the active tab
+        if (tab.active) {
+            return { valid: false, tabId: snap.chromeTabId, message: "Tab is currently active — refusing to close" };
+        }
         // Check hostname still matches
         try {
             const snapHost = new URL(snap.url).hostname;
@@ -1023,6 +1380,19 @@ async function validateTab(
             }
         } catch {
             // URL parse failed, skip host check
+        }
+        // LAYER 4: Check title similarity — reject if tab content changed significantly
+        if (snap.title && tab.title) {
+            const snapWords = new Set(snap.title.toLowerCase().split(/\s+/).filter(w => w.length > 1));
+            const liveWords = new Set(tab.title!.toLowerCase().split(/\s+/).filter(w => w.length > 1));
+            if (snapWords.size > 0 && liveWords.size > 0) {
+                let overlap = 0;
+                for (const w of snapWords) { if (liveWords.has(w)) overlap++; }
+                const similarity = overlap / Math.max(snapWords.size, liveWords.size);
+                if (similarity < 0.4) {
+                    return { valid: false, tabId: snap.chromeTabId, message: "Tab content changed significantly" };
+                }
+            }
         }
         return { valid: true, tabId: snap.chromeTabId, message: "ok" };
     } catch {
@@ -1110,6 +1480,30 @@ async function executeCloseTab(action: SuggestedAction): Promise<ActionExecuteRe
         }
     }
 
+    // LAYER 1 (redundant): Final active-tab guard before close
+    try {
+        const liveTab = await chrome.tabs.get(tabId);
+        if (liveTab.active) {
+            return { action_id: aid, success: false, message: "Refusing to close the active tab", undo_available: false };
+        }
+    } catch {
+        return { action_id: aid, success: false, message: "Tab already closed", undo_available: false };
+    }
+
+    // LAYER 4: Verify expected title if provided
+    if (action.metadata?.expected_title) {
+        try {
+            const liveTab = await chrome.tabs.get(tabId);
+            const expected = String(action.metadata.expected_title).toLowerCase();
+            const actual = (liveTab.title || "").toLowerCase();
+            if (!actual.includes(expected) && !expected.includes(actual)) {
+                return { action_id: aid, success: false, message: "Tab title doesn't match expected — skipping", undo_available: false };
+            }
+        } catch {
+            return { action_id: aid, success: false, message: "Tab already closed", undo_available: false };
+        }
+    }
+
     try {
         await chrome.tabs.remove(tabId);
     } catch {
@@ -1181,6 +1575,16 @@ async function executeBookmarkAndClose(action: SuggestedAction): Promise<ActionE
         if (tabId === -1) {
             return { action_id: aid, success: false, message: v.message || "Tab not found", undo_available: false };
         }
+    }
+
+    // LAYER 1: Final active-tab guard
+    try {
+        const liveTab = await chrome.tabs.get(tabId);
+        if (liveTab.active) {
+            return { action_id: aid, success: false, message: "Refusing to close the active tab", undo_available: false };
+        }
+    } catch {
+        return { action_id: aid, success: false, message: "Tab already closed", undo_available: false };
     }
 
     try {
@@ -1608,6 +2012,28 @@ chrome.runtime.onMessage.addListener(
                                 "string"
                               ? (activeIntervention.intervention_id as string)
                               : null;
+
+                    // Record dismissal for cooldown
+                    const now = Date.now();
+                    if (interventionId) {
+                        dismissedInterventions.set(interventionId, now);
+                    }
+                    // Also record URL-based cooldown from the active tab
+                    chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
+                        if (tab?.url) {
+                            try {
+                                dismissedUrlPatterns.set(new URL(tab.url).hostname, now);
+                            } catch {}
+                        }
+                    }).catch(() => {});
+                    // Prune old entries
+                    for (const [k, t] of dismissedInterventions) {
+                        if (now - t > INTERVENTION_DISMISS_COOLDOWN) dismissedInterventions.delete(k);
+                    }
+                    for (const [k, t] of dismissedUrlPatterns) {
+                        if (now - t > URL_DISMISS_COOLDOWN) dismissedUrlPatterns.delete(k);
+                    }
+
                     activeIntervention = null;
                     try { chrome.storage.session.remove(["cortex_active_intervention", "cortex_tab_snapshot"]); } catch {}
                     if (interventionId) {
@@ -1700,37 +2126,172 @@ chrome.runtime.onMessage.addListener(
                     sendResponse(data.cortex_sessions || []);
                 });
                 return true; // async
+
+            case "ACTIVITY_UPDATE": {
+                const record = message.record as ActivityRecord;
+                if (record?.content_id) {
+                    enrichWithRelatedTabs(record).then(() => upsertActivity(record));
+                }
+                sendResponse({ ok: true });
+                break;
+            }
+
+            case "GET_RECENT_ACTIVITIES":
+                loadActivities().then((activities) => {
+                    const recent = Object.values(activities)
+                        .filter(a => a.max_completion_pct < 95 && !a.dismissed)
+                        .sort((a, b) => b.last_visited - a.last_visited)
+                        .slice(0, (message.limit as number) || 5);
+                    sendResponse(recent);
+                });
+                return true; // async
+
+            case "DISMISS_RESUME": {
+                const contentId = message.content_id as string;
+                if (contentId) {
+                    loadActivities().then(async (activities) => {
+                        if (activities[contentId]) {
+                            activities[contentId].dismissed = true;
+                            await saveActivities(activities);
+                        }
+                        sendResponse({ ok: true });
+                    });
+                    return true; // async
+                }
+                sendResponse({ ok: true });
+                break;
+            }
         }
         return false;
     },
 );
 
+// --- LeetCode → Activity Bridge ---
+// Bridges leetcode-observer.ts session data into the unified ActivityRecord format
+
+chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== "local" || !changes.cortex_leetcode_session) return;
+    const session = changes.cortex_leetcode_session.newValue;
+    if (!session?.problem_id) return;
+
+    const record: ActivityRecord = {
+        content_id: canonicalizeUrl(`https://leetcode.com/problems/${session.problem_id}`),
+        platform: "leetcode",
+        content_type: "code_problem",
+        title: session.title || session.problem_id,
+        url: `https://leetcode.com/problems/${session.problem_id}`,
+        favicon_url: "",
+        position: {
+            type: "code_problem",
+            stage: session.stage || "IMPLEMENT",
+            wrong_answer_count: session.wrong_answer_count || 0,
+            accepted: session.accepted || false,
+            time_elapsed_s: session.time_elapsed_s || 0,
+            code_snapshot: session.code_snapshot,
+        },
+        content_duration_s: 0,
+        duration_spent_s: session.time_elapsed_s || 0,
+        session_duration_s: session.time_elapsed_s || 0,
+        first_visited: (session.saved_at || Date.now()) - (session.time_elapsed_s || 0) * 1000,
+        last_visited: session.saved_at || Date.now(),
+        context_snapshot: `${session.difficulty || ""} — ${session.tags?.join(", ") || ""}`,
+        topic_tags: session.tags || [],
+        completion_pct: session.accepted ? 100 : Math.min((session.time_elapsed_s || 0) / 1800 * 50, 50),
+        max_completion_pct: session.accepted ? 100 : 0,
+        cognitive_state: "",
+        visit_count: 1,
+        dismissed: false,
+        is_playlist: false,
+        playlist_id: "",
+        playlist_index: -1,
+        related_tabs: [],
+    };
+    upsertActivity(record);
+});
+
 // --- Distraction Blocking (tab navigation listener) ---
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, _tab) => {
-    if (!focusSession || !changeInfo.url) return;
-    const url = changeInfo.url;
-    if (isDistractionUrl(url, _tab.title)) {
-        // Don't increment distractionsBlocked here — only when user clicks "Go back"
-        const snap = getFocusSessionSnapshot();
-        chrome.scripting.executeScript({
-            target: { tabId },
-            func: injectDistractionInterceptor,
-            args: [
-                Math.round((snap?.focusMs ?? 0) / 60000),
-                snap?.longestStreakMin ?? 0,
-                snap?.distractionsBlocked ?? 0,
-                url,
-            ],
-        }).catch(() => {
-            // Injection failed
+    // Distraction blocking during focus sessions
+    if (focusSession && changeInfo.url) {
+        const url = changeInfo.url;
+        if (isDistractionUrl(url, _tab.title)) {
+            const snap = getFocusSessionSnapshot();
+            chrome.scripting.executeScript({
+                target: { tabId },
+                func: injectDistractionInterceptor,
+                args: [
+                    Math.round((snap?.focusMs ?? 0) / 60000),
+                    snap?.longestStreakMin ?? 0,
+                    snap?.distractionsBlocked ?? 0,
+                    url,
+                ],
+            }).catch(() => {
+                // Injection failed
+            });
+        }
+    }
+
+    // --- Resume trigger: show resume card when returning to tracked content ---
+    if (changeInfo.status === "complete" && _tab.url) {
+        const tabUrl = _tab.url;
+        // Skip chrome:// and extension pages
+        if (tabUrl.startsWith("chrome://") || tabUrl.startsWith("chrome-extension://") || tabUrl.startsWith("edge://")) return;
+
+        const canonical = canonicalizeUrl(tabUrl);
+        loadActivities().then((activities) => {
+            const activity = activities[canonical];
+            if (
+                activity
+                && Date.now() - activity.last_visited > 3600_000   // >1 hour since last visit
+                && activity.max_completion_pct < 95                 // Not completed
+                && !activity.dismissed                              // Not dismissed
+                && activity.duration_spent_s >= 120                 // Was meaningful (>2 min)
+            ) {
+                chrome.tabs.sendMessage(tabId, {
+                    type: "SHOW_RESUME_CARD",
+                    activity,
+                }).catch(() => {
+                    // Content script not ready yet
+                });
+            }
         });
     }
 });
 
+// --- SPA Navigation Resume Trigger (backup for tabs.onUpdated) ---
+
+try {
+    chrome.webNavigation.onHistoryStateUpdated.addListener(async (details) => {
+        if (details.frameId !== 0) return; // Only main frame
+        const url = details.url;
+        if (!url || url.startsWith("chrome://") || url.startsWith("edge://")) return;
+
+        const canonical = canonicalizeUrl(url);
+        const activities = await loadActivities();
+        const activity = activities[canonical];
+
+        if (
+            activity
+            && Date.now() - activity.last_visited > 3600_000
+            && activity.max_completion_pct < 95
+            && !activity.dismissed
+            && activity.duration_spent_s >= 120
+        ) {
+            chrome.tabs.sendMessage(details.tabId, {
+                type: "SHOW_RESUME_CARD",
+                activity,
+            }).catch(() => {});
+        }
+    });
+} catch {
+    // webNavigation permission may not be available
+}
+
 // --- Keepalive alarm (prevents MV3 service worker from going idle) ---
 
 chrome.alarms.create("cortex-keepalive", { periodInMinutes: 0.4 });
+chrome.alarms.create("cortex-activity-cleanup", { periodInMinutes: 1440 }); // Daily
 
 chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === "cortex-keepalive") {
@@ -1740,6 +2301,20 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     } else if (alarm.name === "cortex-break-timer") {
         injectToast("Break's over!", "Time to get back to work. You've got this.");
         broadcastToPopup({ type: "BREAK_TIMER_DONE" });
+    } else if (alarm.name === "cortex-activity-cleanup") {
+        // Evict activities older than 90 days
+        loadActivities().then(async (activities) => {
+            const now = Date.now();
+            const TTL_MS = 90 * 24 * 60 * 60 * 1000;
+            let changed = false;
+            for (const [id, a] of Object.entries(activities)) {
+                if (now - a.last_visited > TTL_MS) {
+                    delete activities[id];
+                    changed = true;
+                }
+            }
+            if (changed) await saveActivities(activities);
+        });
     }
 });
 

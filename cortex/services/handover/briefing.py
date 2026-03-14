@@ -22,6 +22,7 @@ class BriefingContent:
     action_items: list[str]
     handover_path: str
     raw_markdown: str
+    recent_activities: list[dict] | None = None
 
 
 class MorningBriefing:
@@ -114,19 +115,37 @@ class MorningBriefing:
                 "Continue from where you left off",
             ]
 
+        # Extract learning activities section
+        recent_activities: list[dict] = []
+        in_activity = False
+        for line in lines:
+            if "## Learning Activity" in line:
+                in_activity = True
+                continue
+            if in_activity:
+                if line.startswith("## "):
+                    break
+                if line.strip().startswith("- **"):
+                    # Parse: "- **Platform**: Title — Position (Pct%) [Duration]"
+                    recent_activities.append({"raw": line.strip()})
+
         return BriefingContent(
             title=title,
             summary=summary[:500],
             action_items=action_items[:5],
             handover_path=str(path),
             raw_markdown=markdown,
+            recent_activities=recent_activities if recent_activities else None,
         )
 
     def to_ws_payload(self, briefing: BriefingContent) -> dict:
         """Convert briefing to WebSocket message payload."""
-        return {
+        payload: dict = {
             "title": briefing.title,
             "summary": briefing.summary,
             "action_items": briefing.action_items,
             "handover_path": briefing.handover_path,
         }
+        if briefing.recent_activities:
+            payload["recent_activities"] = briefing.recent_activities
+        return payload

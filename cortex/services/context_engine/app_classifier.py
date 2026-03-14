@@ -204,3 +204,26 @@ def classify_tab_type(url: str) -> str:
         return "distraction"
 
     return "other"
+
+
+_AMBIGUOUS_TYPES = {"video_platform", "social", "communication", "distraction", "other"}
+
+
+def classify_tab_type_with_goal(url: str, title: str, goal: str) -> str:
+    """Goal-aware tab classification.
+
+    If the tab's title contains keywords from the user's focus goal AND the
+    base type is ambiguous (video, social, communication, distraction, other),
+    reclassify as ``goal_relevant`` so downstream systems never recommend
+    closing it.
+    """
+    base_type = classify_tab_type(url)
+    if not goal or base_type not in _AMBIGUOUS_TYPES:
+        return base_type
+
+    keywords = [w.lower() for w in goal.split() if len(w) > 2]
+    title_lower = title.lower()
+    for kw in keywords:
+        if kw in title_lower:
+            return "goal_relevant"
+    return base_type

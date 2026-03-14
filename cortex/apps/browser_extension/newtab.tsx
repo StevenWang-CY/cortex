@@ -24,6 +24,21 @@ interface Ring {
     opacity: number;
 }
 
+interface RecentActivity {
+    content_id: string;
+    platform: string;
+    content_type: string;
+    title: string;
+    url: string;
+    position: Record<string, unknown>;
+    content_duration_s: number;
+    duration_spent_s: number;
+    last_visited: number;
+    completion_pct: number;
+    max_completion_pct: number;
+    related_tabs: string[];
+}
+
 function PulseRoom(): React.ReactElement {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const stateRef = useRef({
@@ -44,6 +59,10 @@ function PulseRoom(): React.ReactElement {
     const [displayHR, setDisplayHR] = useState(0);
     const [displayState, setDisplayState] = useState("");
     const [displayConnected, setDisplayConnected] = useState(false);
+
+    // Activity tracking — "Continue where you left off"
+    const [activities, setActivities] = useState<RecentActivity[]>([]);
+    const [showActivities, setShowActivities] = useState(false);
 
     // Poll background for state
     useEffect(() => {
@@ -96,6 +115,22 @@ function PulseRoom(): React.ReactElement {
             clearInterval(interval);
             chrome.runtime.onMessage.removeListener(listener);
         };
+    }, []);
+
+    // Fetch recent activities with delay (keeps Pulse Room's ghostly feel)
+    useEffect(() => {
+        const timer = setTimeout(() => {
+            try {
+                chrome.runtime.sendMessage({ type: "GET_RECENT_ACTIVITIES", limit: 3 }, (result) => {
+                    if (chrome.runtime.lastError || !Array.isArray(result)) return;
+                    setActivities(result);
+                    if (result.length > 0) {
+                        setTimeout(() => setShowActivities(true), 500);
+                    }
+                });
+            } catch { /* context lost */ }
+        }, 2000);
+        return () => clearTimeout(timer);
     }, []);
 
     // Canvas animation loop
@@ -311,8 +346,114 @@ function PulseRoom(): React.ReactElement {
             >
                 {displayConnected ? displayState.toLowerCase() || "connecting" : "connecting"}
             </div>
+            {/* Continue where you left off */}
+            {showActivities && activities.length > 0 && (
+                <div
+                    style={{
+                        position: "fixed",
+                        bottom: 80,
+                        left: "50%",
+                        transform: "translateX(-50%)",
+                        display: "flex",
+                        flexDirection: "column",
+                        alignItems: "center",
+                        gap: 6,
+                        opacity: 0,
+                        animation: "activityFadeIn 2s ease forwards",
+                    }}
+                >
+                    <style>{`
+                        @keyframes activityFadeIn {
+                            from { opacity: 0; transform: translateY(8px); }
+                            to { opacity: 1; transform: translateY(0); }
+                        }
+                    `}</style>
+                    {activities.map((a) => {
+                        const posLabel = formatActivityPosition(a.position);
+                        const resumeUrl = getResumeUrl(a);
+                        return (
+                            <a
+                                key={a.content_id}
+                                href={resumeUrl}
+                                style={{
+                                    display: "block",
+                                    textDecoration: "none",
+                                    color: "rgba(228, 228, 231, 0.08)",
+                                    fontFamily: "'SF Mono', 'Fira Code', ui-monospace, monospace",
+                                    fontSize: 10,
+                                    letterSpacing: 0.5,
+                                    padding: "3px 8px",
+                                    borderRadius: 4,
+                                    transition: "color 0.5s ease, background 0.3s ease",
+                                    background: "transparent",
+                                    maxWidth: 400,
+                                    overflow: "hidden",
+                                    textOverflow: "ellipsis",
+                                    whiteSpace: "nowrap" as const,
+                                    cursor: "pointer",
+                                }}
+                                onMouseEnter={(e) => {
+                                    e.currentTarget.style.color = "rgba(228, 228, 231, 0.25)";
+                                    e.currentTarget.style.background = "rgba(255,255,255,0.02)";
+                                }}
+                                onMouseLeave={(e) => {
+                                    e.currentTarget.style.color = "rgba(228, 228, 231, 0.08)";
+                                    e.currentTarget.style.background = "transparent";
+                                }}
+                                title={a.title}
+                            >
+                                {a.title.slice(0, 40)}{a.title.length > 40 ? "..." : ""} — {posLabel}
+                            </a>
+                        );
+                    })}
+                </div>
+            )}
         </div>
     );
+}
+
+function formatActivityPosition(pos: Record<string, unknown>): string {
+    switch (pos.type) {
+        case "video": {
+            const ts = pos.timestamp_s as number;
+            const dur = pos.duration_s as number;
+            return `${fmtSec(ts)} / ${fmtSec(dur)}`;
+        }
+        case "scroll":
+            return `${Math.round(pos.scroll_pct as number)}% read`;
+        case "code_problem":
+            return `${pos.stage} · ${pos.wrong_answer_count} WA`;
+        case "notebook":
+            return `cell ${(pos.cell_index as number) + 1}`;
+        case "pdf":
+            return `p${pos.page}/${pos.total_pages}`;
+        case "slides":
+            return `slide ${(pos.slide_index as number) + 1}`;
+        default:
+            return `${Math.round((pos.scroll_pct as number) || 0)}%`;
+    }
+}
+
+function fmtSec(s: number): string {
+    const total = Math.floor(s);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const sec = total % 60;
+    if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+    return `${m}:${String(sec).padStart(2, "0")}`;
+}
+
+function getResumeUrl(a: { url: string; position: Record<string, unknown> }): string {
+    let url = a.url;
+    if (a.position.type === "video") {
+        const t = Math.floor(a.position.timestamp_s as number);
+        if (url.includes("youtube.com") || url.includes("youtu.be")) {
+            url += (url.includes("?") ? "&" : "?") + `t=${t}`;
+        } else if (url.includes("bilibili.com")) {
+            url += (url.includes("?") ? "&" : "?") + `t=${t}`;
+        }
+    }
+    return url;
 }
 
 export default PulseRoom;

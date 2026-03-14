@@ -820,6 +820,327 @@ function showActiveRecall(payload: Record<string, unknown>): void {
     });
 }
 
+// --- Resume Card ---
+
+const CORTEX_RESUME_ID = "cortex-resume-card";
+let resumeAutoDismissTimer: ReturnType<typeof setTimeout> | null = null;
+
+function removeResumeCard(): void {
+    const el = document.getElementById(CORTEX_RESUME_ID);
+    if (el) el.remove();
+    if (resumeAutoDismissTimer) { clearTimeout(resumeAutoDismissTimer); resumeAutoDismissTimer = null; }
+}
+
+function fmtTime(seconds: number): string {
+    const s = Math.floor(seconds);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+    return `${m}:${String(sec).padStart(2, "0")}`;
+}
+
+function timeAgo(epochMs: number): string {
+    const diff = Date.now() - epochMs;
+    const mins = Math.floor(diff / 60000);
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    const days = Math.floor(hrs / 24);
+    return `${days}d ago`;
+}
+
+function getPositionDisplay(pos: Record<string, unknown>): { label: string; pct: number } {
+    switch (pos.type) {
+        case "video": {
+            const ts = pos.timestamp_s as number;
+            const dur = pos.duration_s as number;
+            const pct = dur > 0 ? (ts / dur) * 100 : 0;
+            return { label: `▶ ${fmtTime(ts)} / ${fmtTime(dur)}`, pct };
+        }
+        case "scroll":
+            return { label: `📄 ${Math.round(pos.scroll_pct as number)}% read`, pct: pos.max_scroll_pct as number };
+        case "code_problem":
+            return {
+                label: `Stage: ${pos.stage} · ${pos.wrong_answer_count} WA · ${Math.round((pos.time_elapsed_s as number) / 60)} min`,
+                pct: Math.min((pos.time_elapsed_s as number) / 1800 * 100, 100),
+            };
+        case "notebook":
+            return { label: `Cell ${(pos.cell_index as number) + 1} · ${Math.round(pos.scroll_pct as number)}% scrolled`, pct: pos.scroll_pct as number };
+        case "pdf": {
+            const total = pos.total_pages as number;
+            const pct = total > 0 ? ((pos.page as number) / total) * 100 : 0;
+            return { label: `Page ${pos.page} / ${total || "?"}`, pct };
+        }
+        case "slides": {
+            const total = pos.total_slides as number;
+            const pct = total > 0 ? (((pos.slide_index as number) + 1) / total) * 100 : 0;
+            return { label: `Slide ${(pos.slide_index as number) + 1} / ${total || "?"}`, pct };
+        }
+        case "general":
+            return { label: `📄 ${Math.round(pos.scroll_pct as number)}% scrolled`, pct: pos.max_scroll_pct as number || pos.scroll_pct as number };
+        default:
+            return { label: "", pct: 0 };
+    }
+}
+
+function showResumeCard(activity: Record<string, unknown>): void {
+    removeResumeCard();
+
+    const pos = activity.position as Record<string, unknown>;
+    const { label: posLabel, pct: progressPct } = getPositionDisplay(pos);
+    const platform = (activity.platform as string) || "";
+    const title = (activity.title as string) || "";
+    const chapter = pos.type === "video" && pos.chapter ? pos.chapter as string : "";
+    const lastVisited = activity.last_visited as number;
+
+    const host = document.createElement("div");
+    host.id = CORTEX_RESUME_ID;
+    host.style.cssText = "position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483646;pointer-events:none;";
+
+    const shadow = host.attachShadow({ mode: "closed" });
+
+    const platformLabel = escapeHtml(platform.charAt(0).toUpperCase() + platform.slice(1));
+    const safeTitle = escapeHtml(title);
+    const chapterHtml = chapter ? `<div class="chapter">${escapeHtml(chapter)}</div>` : "";
+    const barWidth = Math.min(100, Math.max(0, progressPct));
+
+    shadow.innerHTML = `
+        <style>
+            @keyframes panelIn {
+                from { transform: translateY(12px) scale(.99); opacity: 0; }
+                to   { transform: translateY(0) scale(1); opacity: 1; }
+            }
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+            .card {
+                position: fixed; bottom: 20px; right: 20px; width: 300px;
+                pointer-events: auto;
+                background: #111113; border-radius: 12px;
+                border: 1px solid rgba(255, 255, 255, 0.06);
+                box-shadow: 0 0 0 .5px rgba(0,0,0,.3), 0 4px 20px rgba(0,0,0,.4), 0 16px 40px rgba(0,0,0,.2);
+                font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'SF Pro Text', system-ui, sans-serif;
+                animation: panelIn 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+                color: #e4e4e7;
+                padding: 16px;
+            }
+            .top-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+            .platform { font-size: 11px; color: #71717a; letter-spacing: 0.3px; }
+            .close-btn {
+                width: 20px; height: 20px; border: none; background: rgba(255,255,255,.04);
+                border-radius: 5px; cursor: pointer; display: flex; align-items: center;
+                justify-content: center; transition: background .12s;
+            }
+            .close-btn:hover { background: rgba(255,255,255,.08); }
+            .close-btn svg { width: 8px; height: 8px; stroke: #71717a; stroke-width: 2; }
+            .title { font-size: 13px; font-weight: 600; letter-spacing: -0.2px; line-height: 1.4; margin-bottom: 2px; color: #e4e4e7; }
+            .chapter { font-size: 11px; color: #52525b; margin-bottom: 6px; }
+            .position { font-size: 12px; color: #a1a1aa; font-family: 'SF Mono', 'Fira Code', ui-monospace, monospace; margin: 8px 0 6px; }
+            .bar-bg { width: 100%; height: 3px; background: rgba(255,255,255,.06); border-radius: 2px; margin-bottom: 4px; }
+            .bar-fill { height: 100%; border-radius: 2px; background: #10b981; transition: width .3s; }
+            .pct { font-size: 10px; color: #52525b; text-align: right; margin-bottom: 12px; }
+            .resume-btn {
+                display: block; width: 100%; padding: 8px; border: none; border-radius: 8px;
+                background: rgba(16, 185, 129, 0.12); color: #10b981; cursor: pointer;
+                font-size: 12px; font-weight: 600; font-family: inherit; letter-spacing: 0.2px;
+                transition: background .12s;
+            }
+            .resume-btn:hover { background: rgba(16, 185, 129, 0.2); }
+            .dismiss-btn {
+                display: block; width: 100%; padding: 5px; margin-top: 4px;
+                border: none; background: none; color: #3f3f46; cursor: pointer;
+                font-size: 11px; font-family: inherit; transition: color .12s;
+            }
+            .dismiss-btn:hover { color: #71717a; }
+        </style>
+        <div class="card" id="resume-card">
+            <div class="top-row">
+                <span class="platform">${platformLabel} · ${timeAgo(lastVisited)}</span>
+                <button class="close-btn" id="resume-close">
+                    <svg viewBox="0 0 10 10" fill="none"><path d="M1 1l8 8M9 1l-8 8"/></svg>
+                </button>
+            </div>
+            <div class="title">${safeTitle}</div>
+            ${chapterHtml}
+            <div class="position">${escapeHtml(posLabel)}</div>
+            <div class="bar-bg"><div class="bar-fill" style="width:${barWidth}%"></div></div>
+            <div class="pct">${Math.round(progressPct)}%</div>
+            <button class="resume-btn" id="resume-action">Resume ▸</button>
+            <button class="dismiss-btn" id="resume-dismiss">Dismiss</button>
+        </div>
+    `;
+
+    document.body.appendChild(host);
+
+    // Wire up buttons
+    const closeBtn = shadow.getElementById("resume-close");
+    const resumeBtn = shadow.getElementById("resume-action");
+    const dismissBtn = shadow.getElementById("resume-dismiss");
+
+    closeBtn?.addEventListener("click", () => removeResumeCard());
+
+    resumeBtn?.addEventListener("click", () => {
+        executeResume(activity);
+        removeResumeCard();
+    });
+
+    dismissBtn?.addEventListener("click", () => {
+        removeResumeCard();
+        try {
+            chrome.runtime.sendMessage({
+                type: "DISMISS_RESUME",
+                content_id: activity.content_id,
+            }).catch(() => {});
+        } catch { /* context invalidated */ }
+    });
+
+    // ESC dismisses
+    const escHandler = (e: KeyboardEvent) => {
+        if (e.key === "Escape") { removeResumeCard(); document.removeEventListener("keydown", escHandler); }
+    };
+    document.addEventListener("keydown", escHandler);
+
+    // Auto-dismiss after 15s
+    resumeAutoDismissTimer = setTimeout(removeResumeCard, 15000);
+
+    // If user scrolls, fade out sooner
+    let scrollDismissTimer: ReturnType<typeof setTimeout> | null = null;
+    const scrollHandler = () => {
+        if (!scrollDismissTimer) {
+            scrollDismissTimer = setTimeout(removeResumeCard, 5000);
+        }
+    };
+    window.addEventListener("scroll", scrollHandler, { once: true });
+}
+
+function executeResume(activity: Record<string, unknown>): void {
+    const pos = activity.position as Record<string, unknown>;
+
+    switch (pos.type) {
+        case "video": {
+            const targetTime = pos.timestamp_s as number;
+            const savedDuration = activity.content_duration_s as number;
+
+            // Wait for video element, then seek
+            const trySeek = (video: HTMLVideoElement) => {
+                // Verify same content: duration within 5s tolerance
+                if (savedDuration > 0 && Math.abs(video.duration - savedDuration) > 5) {
+                    showResumeToast("Different video detected", `Your saved position was ${fmtTime(targetTime)}`);
+                    return;
+                }
+                video.currentTime = targetTime;
+                video.play().catch(() => {}); // Some browsers block autoplay
+                showResumeToast("Resumed", `Jumped to ${fmtTime(targetTime)}`);
+            };
+
+            // Try to find video now; if not found, use MutationObserver
+            const selectors = ["video.html5-main-video", ".bpx-player-video-wrap video", "video"];
+            let found = false;
+            for (const sel of selectors) {
+                const v = document.querySelector<HTMLVideoElement>(sel);
+                if (v && v.readyState >= 1) { trySeek(v); found = true; break; }
+            }
+            if (!found) {
+                // Wait for video to appear
+                const observer = new MutationObserver(() => {
+                    for (const sel of selectors) {
+                        const v = document.querySelector<HTMLVideoElement>(sel);
+                        if (v) {
+                            observer.disconnect();
+                            clearTimeout(timeout);
+                            if (v.readyState >= 1) { trySeek(v); }
+                            else { v.addEventListener("loadedmetadata", () => trySeek(v), { once: true }); }
+                            return;
+                        }
+                    }
+                });
+                observer.observe(document.body, { childList: true, subtree: true });
+                const timeout = setTimeout(() => {
+                    observer.disconnect();
+                    showResumeToast("Video not loaded", `Your position was ${fmtTime(targetTime)}`);
+                }, 15000);
+            }
+            break;
+        }
+        case "scroll": {
+            const px = pos.scroll_px as number;
+            window.scrollTo({ top: px, behavior: "smooth" });
+            showResumeToast("Resumed", `Scrolled to ${Math.round(pos.scroll_pct as number)}%`);
+            break;
+        }
+        case "code_problem": {
+            if (pos.code_snapshot) {
+                const editor = document.querySelector(".monaco-editor") as any;
+                if (editor) {
+                    const monacoInstance = editor?.__vue__?.$refs?.monaco?.getEditor?.();
+                    if (monacoInstance) {
+                        const currentCode = monacoInstance.getValue();
+                        if (!currentCode || currentCode.trim().length < 20) {
+                            monacoInstance.setValue(pos.code_snapshot as string);
+                            showResumeToast("Code restored", "Your previous code has been pasted");
+                        }
+                    }
+                }
+            }
+            showResumeToast("Welcome back", `You were in ${pos.stage} stage · ${pos.wrong_answer_count} WA`);
+            break;
+        }
+        case "notebook": {
+            const cells = document.querySelectorAll("colab-cell, .cell, .jp-Cell");
+            const idx = pos.cell_index as number;
+            if (cells[idx]) {
+                cells[idx].scrollIntoView({ behavior: "smooth" });
+                showResumeToast("Resumed", `Scrolled to cell ${idx + 1}`);
+            }
+            break;
+        }
+        case "pdf": {
+            const pdfApp = (window as any).PDFViewerApplication;
+            if (pdfApp) {
+                pdfApp.page = pos.page as number;
+            } else {
+                location.hash = `#page=${pos.page}`;
+            }
+            showResumeToast("Resumed", `Jumped to page ${pos.page}/${pos.total_pages}`);
+            break;
+        }
+        case "slides": {
+            const reveal = (window as any).Reveal;
+            if (reveal) {
+                reveal.slide(pos.slide_index as number);
+            } else {
+                location.hash = `#slide=id.p${pos.slide_index}`;
+            }
+            showResumeToast("Resumed", `Jumped to slide ${(pos.slide_index as number) + 1}`);
+            break;
+        }
+        case "general": {
+            const px = (pos as any).scroll_px ?? 0;
+            window.scrollTo({ top: px, behavior: "smooth" });
+            break;
+        }
+    }
+}
+
+function showResumeToast(title: string, body: string): void {
+    const id = "cortex-resume-toast";
+    document.getElementById(id)?.remove();
+    const el = document.createElement("div");
+    el.id = id;
+    el.style.cssText =
+        "position:fixed;top:16px;right:16px;z-index:2147483647;max-width:280px;" +
+        "padding:10px 14px;border-radius:10px;font-family:-apple-system,BlinkMacSystemFont,'Inter',system-ui,sans-serif;" +
+        "background:#111113;color:#e4e4e7;border:1px solid rgba(255,255,255,.06);" +
+        "box-shadow:0 4px 20px rgba(0,0,0,.4);animation:cortexSlideIn .25s ease;font-size:12px;line-height:1.5;" +
+        "cursor:pointer;";
+    el.innerHTML =
+        `<style>@keyframes cortexSlideIn{from{transform:translateY(-12px);opacity:0}to{transform:translateY(0);opacity:1}}</style>` +
+        `<div style="font-weight:600;margin-bottom:2px;font-size:12px;color:#10b981">${escapeHtml(title)}</div>` +
+        `<div style="color:#71717a;font-size:11px">${escapeHtml(body)}</div>`;
+    el.addEventListener("click", () => el.remove());
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), 5000);
+}
+
 // --- Message Listener ---
 
 chrome.runtime.onMessage.addListener(
@@ -856,6 +1177,13 @@ chrome.runtime.onMessage.addListener(
             case "AMBIENT_STATE_UPDATE": {
                 const payload = message.payload as Record<string, unknown>;
                 updateAmbient(payload);
+                sendResponse({ ok: true });
+                break;
+            }
+
+            case "SHOW_RESUME_CARD": {
+                const activity = message.activity as Record<string, unknown>;
+                if (activity) showResumeCard(activity);
                 sendResponse({ ok: true });
                 break;
             }

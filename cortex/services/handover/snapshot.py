@@ -42,6 +42,7 @@ class HandoverSnapshot:
         browser_context: dict[str, Any] | None = None,
         diagnostics: list[dict] | None = None,
         llm_client: Any = None,
+        activity_timeline: list[dict] | None = None,
     ) -> Path:
         """
         Capture workspace state and write the handover brief.
@@ -140,6 +141,25 @@ class HandoverSnapshot:
                     sections.insert(2, f"## Summary\n\n{summary}\n")
             except Exception:
                 logger.debug("LLM summary generation failed, skipping")
+
+        # Learning activity section
+        if activity_timeline:
+            sections.append("## Learning Activity")
+            for act in activity_timeline[:10]:
+                platform = act.get("platform", "unknown")
+                title = act.get("title", "untitled")[:60]
+                pos_desc = act.get("position_description", "")
+                completion = act.get("completion_pct", 0)
+                duration_m = round(act.get("duration_spent_s", 0) / 60, 1)
+                line = f"- **{platform.capitalize()}**: {title}"
+                if pos_desc:
+                    line += f" — {pos_desc}"
+                if completion > 0:
+                    line += f" ({completion:.0f}%)"
+                if duration_m > 0:
+                    line += f" [{duration_m}m]"
+                sections.append(line)
+            sections.append("")
 
         # TODO marker
         sections.append("## TODO")

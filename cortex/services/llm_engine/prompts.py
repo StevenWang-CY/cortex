@@ -111,6 +111,9 @@ recommend closing it if the topic is clearly unrelated to the focus goal.
 should be kept.
 - Active tabs, learning_platform tabs, and goal-relevant ai_assistant tabs MUST always \
 get action:"keep" with relevance_score >= 0.8.
+- Tabs with type "goal_relevant" MUST get action:"keep" with relevance_score >= 0.95. \
+NEVER recommend closing them under any circumstance — they have been verified to match \
+the user's focus goal by title keyword analysis.
 - relevance_score should reflect topic alignment with the focus goal, NOT just tab type.
 
 Valid intervention_type values: "overlay_only", "simplified_workspace", "guided_mode"

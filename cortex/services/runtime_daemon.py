@@ -54,6 +54,7 @@ from cortex.services.eval.tab_relevance import TabRelevanceTracker
 from cortex.services.handover.briefing import MorningBriefing
 from cortex.services.handover.detector import ShutdownDetector
 from cortex.services.handover.snapshot import HandoverSnapshot
+from cortex.services.activity_tracker.aggregator import ActivityAggregator
 from cortex.services.state_engine.longitudinal import LongitudinalTracker
 from cortex.services.state_engine.rabbit_hole import RabbitHoleDetector
 from cortex.services.state_engine.stress_integral import StressIntegralTracker
@@ -230,6 +231,10 @@ class CortexDaemon:
 
         # Copilot throttle
         self._copilot_throttle = CopilotThrottle(ws_server=self._ws_server)
+
+        # Activity tracker aggregator
+        self._activity_aggregator = ActivityAggregator(store=self._store)
+        self._ws_server.set_activity_sync_callback(self._handle_activity_sync)
 
         # Track previous state for copilot throttle transitions
         self._prev_state: str = "FLOW"
@@ -748,6 +753,16 @@ class CortexDaemon:
         except Exception:
             logger.debug("Failed to record tab relevance feedback", exc_info=True)
 
+    async def _handle_activity_sync(self, payload: dict[str, Any]) -> None:
+        """Handle ACTIVITY_SYNC from browser extension — aggregate into daily timeline."""
+        activities = payload.get("activities")
+        if isinstance(activities, list):
+            try:
+                await self._activity_aggregator.ingest(activities)
+                logger.debug("Ingested %d activities from browser", len(activities))
+            except Exception:
+                logger.debug("Activity sync ingestion failed", exc_info=True)
+
     # --- v2.0 helper methods ---
 
     def _build_bandit_features(self, estimate: Any, context: Any) -> list[float]:
@@ -798,10 +813,23 @@ class CortexDaemon:
     async def _generate_handover(self, context: Any) -> None:
         """Generate a handover snapshot for tomorrow's morning briefing."""
         try:
-            snapshot = HandoverSnapshot(storage_root=self.config.storage.path)
-            snapshot.capture(
-                context=context,
-                window_tracker=self._window_tracker,
+            snapshot = HandoverSnapshot(str(self.config.storage.path))
+
+            # Gather recent activity data for the handover
+            activity_timeline: list[dict] | None = None
+            try:
+                recent = await self._activity_aggregator.get_recent_activities(limit=10)
+                if recent:
+                    activity_timeline = [a.model_dump() for a in recent]
+            except Exception:
+                logger.debug("Failed to fetch activities for handover")
+
+            await snapshot.capture_and_write(
+                browser_context=context.browser_context.model_dump() if hasattr(context, "browser_context") and context.browser_context else None,
+                editor_context=context.editor_context.model_dump() if hasattr(context, "editor_context") and context.editor_context else None,
+                terminal_context=context.terminal_context.model_dump() if hasattr(context, "terminal_context") and context.terminal_context else None,
+                activity_timeline=activity_timeline,
+                llm_client=self._llm_client,
             )
             logger.info("Handover snapshot saved")
         except Exception:

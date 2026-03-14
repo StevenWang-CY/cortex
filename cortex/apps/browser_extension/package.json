@@ -5,8 +5,14 @@
   "description": "Real-time biofeedback workspace engine for Chrome.",
   "scripts": {
     "dev": "plasmo dev",
+    "dev:chrome": "plasmo dev",
+    "dev:edge": "plasmo dev --target=edge-mv3",
     "build": "plasmo build",
-    "package": "plasmo package"
+    "build:chrome": "plasmo build",
+    "build:edge": "plasmo build --target=edge-mv3",
+    "package": "plasmo package",
+    "package:chrome": "plasmo package",
+    "package:edge": "plasmo build --target=edge-mv3"
   },
   "dependencies": {
     "plasmo": "^0.88.0",
@@ -28,7 +34,8 @@
       "tabGroups",
       "storage",
       "alarms",
-      "bookmarks"
+      "bookmarks",
+      "webNavigation"
     ],
     "host_permissions": [
       "<all_urls>"

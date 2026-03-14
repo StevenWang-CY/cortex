@@ -110,6 +110,35 @@ export function classifyTabType(url: string): string {
 }
 
 /**
+ * Goal-aware tab classification. If the tab's title contains keywords from
+ * the user's focus goal AND the base type is ambiguous (video, social,
+ * communication), reclassify as "goal_relevant" so the LLM never recommends
+ * closing it.
+ */
+export function classifyTabTypeWithGoal(
+    url: string,
+    title: string,
+    goalKeywords: string[],
+): string {
+    const baseType = classifyTabType(url);
+    if (goalKeywords.length === 0) return baseType;
+
+    // Only reclassify ambiguous types — docs/code/learning are already safe
+    const ambiguousTypes = new Set([
+        "video_platform", "social", "communication", "distraction", "other",
+    ]);
+    if (!ambiguousTypes.has(baseType)) return baseType;
+
+    const titleLower = title.toLowerCase();
+    for (const kw of goalKeywords) {
+        if (titleLower.includes(kw)) {
+            return "goal_relevant";
+        }
+    }
+    return baseType;
+}
+
+/**
  * Compute tab type classification counts from a list of tabs.
  */
 export function computeTypeClassification(
