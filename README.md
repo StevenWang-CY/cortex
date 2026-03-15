@@ -1,6 +1,6 @@
-# Ralph
+# Cortex
 
-**Ralph** is a monorepo containing **Cortex** — a real-time biofeedback engine that watches you work through your webcam and input devices, detects cognitive overwhelm, and actively restructures your digital workspace so you can stay focused. Unlike timer-based productivity tools, Cortex uses your biology to decide when you need help, and uses LLMs to decide how to help.
+**Cortex** is a real-time biofeedback engine that watches you work through your webcam and input devices, detects cognitive overwhelm, and actively restructures your digital workspace so you can stay focused. Unlike timer-based productivity tools, Cortex uses your biology to decide when you need help, and uses LLMs to decide how to help.
 
 ---
 
