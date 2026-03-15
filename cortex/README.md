@@ -6,10 +6,10 @@
 
 ## How It Works
 
-Cortex runs a five-layer pipeline at 30 FPS, entirely on your machine:
+Cortex captures at 30 FPS and fuses signals into state estimates every 500ms, entirely on your machine:
 
 1. **Bio-Extraction** — extracts heart rate, HRV, and respiratory rate from your face via rPPG (no camera storage), tracks blink rate, head pose, and posture via MediaPipe, and monitors mouse/keyboard patterns via pynput.
-2. **State Classification** — fuses signals into a cognitive state score every 500ms. Uses rule-based scoring with EMA smoothing, hysteresis, focus-graph thrashing analysis, and screen-apnea detection to classify you as FLOW, HYPER, HYPO, or RECOVERY.
+2. **State Classification** — fuses signals into a cognitive state score every 500ms. Uses rule-based scoring with EMA smoothing, hysteresis, and focus-graph thrashing analysis to classify you as FLOW, HYPER, HYPO, or RECOVERY. When webcam signal quality is low (poor lighting), falls back to telemetry-only mode with stricter confidence thresholds.
 3. **Context Engine** — when an intervention is warranted, gathers workspace context: open file + diagnostics from VS Code, active tab + content from Chrome, recent terminal output. Tabs are pre-filtered (30 cap with type-diverse sampling) to fit LLM context windows.
 4. **LLM Engine** — sends workspace context (no biometrics) to the configured LLM backend — Azure OpenAI, Remote Qwen-3-8B (via SSH tunnel), or local Ollama. Backend selected by `LLM_MODE` in config. The model returns a structured intervention plan: headline, micro-steps, causal explanation, suggested actions, error analysis, and per-tab recommendations. A contextual bandit selects the optimal intervention type per context.
 5. **Intervention Engine** — validates and executes the plan through a pluggable adapter registry: closes distraction tabs, groups related tabs, folds irrelevant code in VS Code, shows an overlay with one-click actions. All interventions are gated by a consent ladder. Snapshots workspace state first. All actions are reversible via undo.
@@ -25,7 +25,7 @@ Cortex runs a five-layer pipeline at 30 FPS, entirely on your machine:
 | **HYPO** | Disengaged, drifting | Low blink rate + inactivity + flat telemetry |
 | **RECOVERY** | Returning to focus | Transitioning out of HYPER/HYPO |
 
-Interventions trigger on HYPER with confidence > 0.85, workspace complexity > 0.7, sustained for 15+ seconds (not transient spikes), with a 60-second cooldown between triggers. Minimum 5 tabs must be open for tab interventions. Progressive quiet mode (15 → 30 → 60 min) activates after repeated dismissals.
+Interventions trigger on HYPER with confidence > 0.85, workspace complexity > 0.7, sustained for 15+ seconds (not transient spikes), with a 60-second cooldown between triggers. When webcam signal quality is low but telemetry (mouse/keyboard/tabs) is strong, interventions still fire with stricter confidence thresholds. Minimum 3 tabs must remain open after any close action. Progressive quiet mode (15 → 30 → 60 min) activates after repeated dismissals.
 
 ---
 
@@ -42,14 +42,14 @@ The bandit selects from these arms based on context and learned reward signals:
 | `overlay_only` | Default HYPER | Standard tab/workspace cleanup overlay |
 | `simplified_workspace` | High complexity | Aggressive workspace simplification |
 | `guided_mode` | Mixed/overwhelmed | Micro-step task decomposition |
-| `breathing` | Screen apnea detected | 4-7-8 breathing guide overlay |
+| `breathing` | Screen apnea detected | Gentle stretch/break reminder (auto-dismisses after 15s) |
 | `active_recall` | Zombie reading detected | Fill-in-the-blank comprehension test |
 | `circuit_breaker` | Sustained stress | Break recommendation with stress data |
 | `none` | Low confidence | No intervention (bandit learns when to stay quiet) |
 
 ### What the LLM generates
 
-**Causal Explanation** — every intervention includes a 1-2 sentence explanation of *why* it was triggered (e.g., "Your heart rate spiked 18% above baseline while switching between 6 tabs in 30 seconds").
+**Causal Explanation** — every intervention includes a 1-2 sentence explanation of *why* it was triggered, referencing observable workspace behavior (e.g., "You've been switching between 6 tabs every 30 seconds for the past 2 minutes").
 
 **Suggested Actions** — 1-5 concrete actions per intervention:
 
@@ -79,12 +79,12 @@ The bandit selects from these arms based on context and learned reward signals:
 
 ### Safety
 
-- **Consent ladder** — actions are gated by a progressive trust system. Cortex starts at SUGGEST level and earns autonomy through repeated user approvals. 3 rejections de-escalate. 5 consent levels: OBSERVE → SUGGEST → ASK_BEFORE_ACT → ACT_AND_NOTIFY → AUTONOMOUS_ACT
+- **Consent ladder** — actions are gated by a progressive trust system. Cortex starts at SUGGEST level and earns autonomy through repeated user approvals. 3 rejections de-escalate. 5 consent levels: OBSERVE → SUGGEST → PREVIEW → REVERSIBLE_ACT → AUTONOMOUS_ACT
 - **Validate-before-execute** — every tab action checks the tab still exists and hasn't navigated away (30s staleness limit on context snapshots)
 - **Recently-visited protection** — tabs activated within the last 5 minutes are automatically protected from closing. The LLM receives `last_activated_ago_seconds` per tab and is instructed to keep recently-used tabs
 - **Goal-aware classification** — tabs whose titles match focus goal keywords get `goal_relevant` type, which the LLM must keep with relevance ≥ 0.95. AI assistants (Gemini, ChatGPT, Claude) are reclassified as goal-relevant when title matches the goal
 - **Smart tab hiding** — simplified workspace mode never hides AI assistants, documentation, learning platforms, code hosts, or recently-active/goal-relevant tabs
-- **Minimum tab count** — tab interventions only fire when 5+ tabs are open
+- **Minimum tab count** — tab close actions are blocked when the current window has 3 or fewer tabs open
 - **Tab index stabilization** — the tab list from context gathering is saved and reused when the intervention arrives, so the LLM's tab_index values always map to the correct Chrome tabs even if tabs changed between context capture and execution
 - **Tab targeting by index** — LLM references tabs by integer index from the context list, never by URL (prevents hallucination)
 - **Context overflow protection** — 150+ tabs are filtered to 30 with type-diverse sampling
@@ -102,7 +102,7 @@ Replaces arbitrary 25-minute timers with biology-driven break detection. Continu
 
 ### Zombie Reading Detector
 
-Detects passive reading — staring at text without absorbing content. Triggers when: HYPO state + browser active + low mouse velocity (<30 px/s) + elevated blink rate (>115% baseline) sustained for 90+ seconds. Fires an Active Recall intervention: a fill-in-the-blank comprehension question generated from the visible page text.
+Detects passive reading — staring at text without absorbing content. Triggers when: HYPO state + browser active + low mouse velocity (<30 px/s) + blink rate below baseline sustained for 90+ seconds. Fires an Active Recall intervention: a fill-in-the-blank comprehension question generated from the visible page text.
 
 ### Rabbit Hole Detector
 
@@ -110,7 +110,7 @@ Detects goal drift — when you've wandered far from your session goal. Compares
 
 ### Screen Apnea Detector
 
-Detects breath-holding during intense focus. Uses respiratory rate extracted from the BVP signal (Butterworth bandpass 0.15–0.4 Hz + Welch PSD). Triggers when respiration drops below 8 bpm while blink suppression indicates visual fixation. Fires a breathing overlay with guided 4-7-8 pattern.
+Detects breath-holding during intense focus. Uses respiratory rate extracted from the BVP signal (Butterworth bandpass 0.15–0.4 Hz + Welch PSD), propagated through the feature fusion pipeline. Triggers when respiration drops below 8 bpm while blink suppression indicates visual fixation. Fires a gentle stretch/break reminder that auto-dismisses after 15 seconds.
 
 ### Shutdown Detector (End-of-Day Handover)
 
@@ -255,9 +255,10 @@ When you dismiss an intervention (click Dismiss, X, backdrop, or press Escape), 
 
 ### Breathing Overlay
 
-Full-screen guided breathing when screen apnea is detected:
-- 4-7-8 breathing pattern (inhale 4s, hold 7s, exhale 8s)
-- Visual animation synced to breath phases
+Gentle stretch/break reminder when screen apnea is detected:
+- Casual, non-clinical tone ("Quick stretch?" / "Still with us?")
+- Auto-dismisses after 15 seconds if unacknowledged
+- Ambient overlay, not a modal dialog
 
 ### Active Recall Overlay
 
@@ -341,7 +342,7 @@ Every tab is classified by URL pattern into: `documentation`, `stackoverflow`, `
 
 - **Eye strain** — if blink rate stays below 10/min for 3 minutes, shows a 20-20-20 rule reminder (look 20ft away for 20 seconds). 5-minute cooldown between alerts.
 - **Posture** — if forward lean exceeds threshold for 3 minutes, shows a posture correction notification. 5-minute cooldown.
-- **Break recommendations** — biology-driven via stress integral (replaces static timers). Shows a toast with specific reason (e.g., "Your HRV has been suppressed for 40 minutes").
+- **Break recommendations** — biology-driven via stress integral (replaces static timers). Shows a toast with behavioral context (e.g., "You've been coding for 90 minutes without a break").
 
 ---
 
@@ -365,8 +366,8 @@ Cortex uses a progressive trust system to gate intervention autonomy. Every acti
 |-------|------|----------|
 | 0 | OBSERVE | Cortex watches, no interventions |
 | 1 | SUGGEST | Shows overlay, user must click to execute |
-| 2 | ASK_BEFORE_ACT | Asks permission, then executes on approval |
-| 3 | ACT_AND_NOTIFY | Executes immediately, shows notification |
+| 2 | PREVIEW | Shows preview, user confirms before execution |
+| 3 | REVERSIBLE_ACT | Executes immediately, shows undo option |
 | 4 | AUTONOMOUS_ACT | Executes silently |
 
 - 5 consecutive approvals → escalate one level
@@ -395,7 +396,7 @@ curl -X POST http://127.0.0.1:9472/api/launch/my-project
 
 Dual-backend persistence layer (Redis with automatic in-memory fallback). All services persist state, weights, and metrics without a hard dependency on Redis running.
 
-- **Redis store** — async Redis client using sorted sets for timeseries, JSON serialization for state. Auto-falls back to in-memory on connection failure.
+- **Redis store** — async Redis client using sorted sets for timeseries, JSON serialization for state. Auto-falls back to in-memory on connection failure (no automatic reconnection to Redis after fallback).
 - **In-memory store** — dict-backed with deque-based timeseries. Used when Redis is unavailable or disabled.
 - Helpfulness records persist with 90-day TTL
 - Bandit weights persist every 10 updates
@@ -517,11 +518,13 @@ python -m cortex.scripts.test_intervention
 | Mouse thrashing | 15% | Velocity variance + jerk score |
 | Thrashing (focus graph) | 15% | Focus transition graph: diversity, velocity, dwell, revisit |
 | Workspace complexity | 15% | Diagnostic count + tab count + context density |
-| Posture collapse | 8% | Shoulder drop ratio + forward lean angle |
+| Posture collapse | 8% | Shoulder drop ratio + forward lean (lean estimated from FaceMesh ear-chin geometry; full pose mode lean is a stub) |
 
 Additional signals (not weighted into state score, used by detectors):
 - **Respiratory rate** — BVP-derived via Butterworth bandpass + Welch PSD (screen apnea detector)
 - **Stress integral** — cumulative HRV suppression over time (biological pomodoro)
+
+**Limitations:** rPPG-derived HRV has ±33ms temporal resolution at 30 FPS, producing ~3-5% RMSSD error at resting heart rates. HRV values should be interpreted as trends, not absolute measurements. Blink detection uses hardcoded EAR thresholds (0.21 close, 0.25 recovery) that are not per-user calibrated.
 
 ---
 
@@ -579,7 +582,7 @@ All layers communicate via the FastAPI gateway (`api_gateway/`) and WebSocket se
 | `browser_tab_reduction` | 5+ tabs open | Per-tab recommendations + close/group actions |
 | `micro_step_planner` | Mixed/overwhelmed state | Actions for automatable steps |
 | `calm_overlay_writer` | Reading docs / mild state | Actions for obviously irrelevant tabs |
-| `breathing_overlay` | Screen apnea detected | 4-7-8 breathing guide |
+| `breathing_overlay` | Screen apnea detected | Gentle stretch/break reminder |
 | `active_recall` | Zombie reading detected | Fill-in-the-blank comprehension question |
 | `rabbit_hole` | Goal drift >10 min | Goal reminder + workspace rearrangement |
 | `alignment_summary` | High thrashing score | Focus transition analysis |
@@ -652,7 +655,7 @@ cortex/
 │   ├── install_native_host.py # Register native messaging host manifest
 │   └── build_macos_app.sh   # macOS app packaging
 ├── tests/
-│   ├── unit/                # Per-module unit tests (40 test files)
+│   ├── unit/                # Per-module unit tests (41 test files)
 │   └── integration/         # Pipeline integration tests
 └── docs/
     ├── setup.md

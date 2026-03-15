@@ -1402,6 +1402,7 @@ let lastContextTabsTimestamp = 0; // LAYER 3: track when context was captured
 const CONTEXT_STALENESS_LIMIT = 30_000; // 30s max age for tab snapshots
 const undoStack: UndoEntry[] = [];
 const MAX_UNDO_ENTRIES = 50;
+const MIN_TABS_TO_KEEP = 3; // Never close tabs if it would leave fewer than this many open
 
 /**
  * Snapshot tabs for intervention action resolution.
@@ -1611,6 +1612,14 @@ async function executeCloseTab(action: SuggestedAction): Promise<ActionExecuteRe
             return { action_id: aid, success: false, message: v.message || "Tab not found", undo_available: false };
         }
     }
+
+    // LAYER 0: Minimum tab count — never leave fewer than MIN_TABS_TO_KEEP tabs open
+    try {
+        const currentWindowTabs = await chrome.tabs.query({ currentWindow: true });
+        if (currentWindowTabs.length <= MIN_TABS_TO_KEEP) {
+            return { action_id: aid, success: false, message: `Only ${currentWindowTabs.length} tabs open — refusing to close (minimum ${MIN_TABS_TO_KEEP})`, undo_available: false };
+        }
+    } catch { /* query failed — proceed with other guards */ }
 
     // LAYER 1 (redundant): Final active-tab guard before close
     try {

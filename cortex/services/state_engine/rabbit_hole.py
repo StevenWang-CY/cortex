@@ -95,8 +95,17 @@ class RabbitHoleDetector:
             "implement", "build", "create", "make", "fix", "add", "write",
             "core", "main", "basic", "simple",
         }
+        # Short technical terms that should be kept as keywords
+        tech_short = {
+            "go", "ml", "ai", "css", "sql", "vue", "rx", "aws", "gcp", "api",
+            "cli", "gui", "dom", "npm", "pip", "git", "ux", "ui", "db",
+            "os", "ci", "cd", "qa", "c++", "c#", "r", "dx", "io", "jwt",
+        }
         words = goal.lower().replace("-", " ").replace("_", " ").split()
-        keywords = [w for w in words if len(w) > 2 and w not in stop_words]
+        keywords = [
+            w for w in words
+            if w not in stop_words and (len(w) > 2 or w in tech_short)
+        ]
         return keywords
 
     def record_on_task_file(self, file_path: str) -> None:

@@ -187,17 +187,25 @@ class TriggerPolicy:
                 context_complexity=context_complexity,
             )
 
-        # Check signal quality
+        # Check signal quality — with telemetry-only fallback
+        # In poor lighting (dorm rooms at night), webcam signals degrade but
+        # behavioral telemetry (mouse, keyboard, tab switching) remains reliable.
+        # Allow interventions when telemetry is strong, with stricter confidence.
         if not estimate.signal_quality.acceptable:
-            return TriggerDecision(
-                should_trigger=False,
-                reason=f"Signal quality too low ({estimate.signal_quality.overall:.2f})",
-                confidence=confidence,
-                cooldown_remaining=0.0,
-                quiet_mode_active=False,
-                effective_threshold=effective_threshold,
-                context_complexity=context_complexity,
+            telemetry_fallback = (
+                estimate.signal_quality.telemetry >= 0.7
+                and confidence >= min(0.95, effective_threshold + 0.10)
             )
+            if not telemetry_fallback:
+                return TriggerDecision(
+                    should_trigger=False,
+                    reason=f"Signal quality too low ({estimate.signal_quality.overall:.2f})",
+                    confidence=confidence,
+                    cooldown_remaining=0.0,
+                    quiet_mode_active=False,
+                    effective_threshold=effective_threshold,
+                    context_complexity=context_complexity,
+                )
 
         # Check dwell time (must be in HYPER for >= hyper_dwell_seconds)
         dwell_required = self._config.hyper_dwell_seconds

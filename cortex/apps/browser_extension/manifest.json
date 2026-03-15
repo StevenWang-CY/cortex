@@ -8,9 +8,12 @@
     "scripting",
     "tabs",
     "tabGroups",
-    "storage"
+    "storage",
+    "alarms",
+    "bookmarks",
+    "webNavigation"
   ],
-  "host_permissions": [],
+  "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background.ts",
     "type": "module"

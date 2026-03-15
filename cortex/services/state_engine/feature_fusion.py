@@ -86,14 +86,16 @@ class FeatureFusion:
         """
         now = timestamp or time.monotonic()
 
-        # Physio features (dimensions 1-3)
+        # Physio features (dimensions 1-3 + respiration)
         hr = None
         hrv_rmssd = None
         hr_delta = None
+        respiration_rate = None
         if self._physio is not None and self._physio.valid:
             hr = self._physio.pulse_bpm
             hrv_rmssd = self._physio.pulse_variability_proxy
             hr_delta = self._physio.hr_delta_5s
+            respiration_rate = self._physio.respiration_rate_bpm
 
         # Kinematic features (dimensions 4-7)
         blink_rate = None
@@ -135,6 +137,7 @@ class FeatureFusion:
             click_frequency=click_frequency,
             keystroke_interval_variance=keystroke_interval_variance,
             tab_switch_frequency=tab_switch_frequency,
+            respiration_rate=respiration_rate,
         )
 
         quality = self._compute_signal_quality(now)

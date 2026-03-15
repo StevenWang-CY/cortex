@@ -6,13 +6,13 @@
 
 ## Key Features
 
-- **Bio-extraction at 30 FPS** — heart rate, HRV, and respiratory rate via rPPG from your face (no video stored); blink rate, head pose, and posture via MediaPipe; mouse/keyboard patterns via pynput
-- **Cognitive state classification** — fuses signals every 500ms into FLOW, HYPER (overwhelmed), HYPO (disengaged), or RECOVERY using rule-based scoring with EMA smoothing and hysteresis
+- **Bio-extraction at 30 FPS** — heart rate, HRV, and respiratory rate via rPPG from your face (no video stored); blink rate, head pose, and posture via MediaPipe; mouse/keyboard patterns via pynput. Gracefully degrades to telemetry-only mode in poor lighting
+- **Cognitive state classification** — captures at 30 FPS and fuses signals into state estimates every 500ms as FLOW, HYPER (overwhelmed), HYPO (disengaged), or RECOVERY using rule-based scoring with EMA smoothing and hysteresis
 - **LLM-powered interventions** — workspace context (never biometrics) is sent to the LLM, which returns executable actions: close distraction tabs, group related tabs, surface error fixes, decompose tasks into micro-steps. Smart tab algorithm protects recently-visited tabs, AI assistants, and goal-relevant content from being closed
 - **Activity tracking and resume** — tracks learning progress across YouTube, Bilibili, Coursera, LeetCode, PDFs, Jupyter, and more. On return, shows a one-click resume card that seeks video, scrolls to position, or pastes saved code
 - **LeetCode mode** — DOM observer, stage inference (READ/PLAN/IMPLEMENT/DEBUG/REFLECT), amygdala hijack lockout, pattern ladder hints, submission discipline guard
 - **Biology-driven breaks** — cumulative HRV suppression integral replaces arbitrary Pomodoro timers; you can ride deep FLOW until your body says stop
-- **Progressive consent** — 5-level trust ladder per action type; Cortex earns autonomy through repeated approvals
+- **Progressive consent** — 5-level trust ladder (OBSERVE → SUGGEST → PREVIEW → REVERSIBLE_ACT → AUTONOMOUS_ACT) per action type; Cortex earns autonomy through repeated approvals
 - **Learning loop** — contextual bandit (LinUCB) selects intervention type; helpfulness tracker computes reward from user engagement and explicit ratings; per-tab relevance tracker learns individual tab preferences from Keep button feedback
 - **Ambient somatic feedback** — sub-threshold color vignettes, weather particles, and flow shield that fades distraction elements during sustained focus
 - **Chrome + Edge** — Plasmo/React Manifest V3 extension with popup dashboard, one-click daemon launch and camera restart, intervention overlay, Pulse Room new tab, and focus sessions with distraction blocking
@@ -67,7 +67,7 @@ All layers communicate via FastAPI (port 9472) and WebSocket (port 9473). The de
 | **VS Code Extension** | TypeScript, VS Code Extension API |
 | **LLM** | Azure OpenAI, Qwen-3-8B (remote via SSH tunnel), Ollama (local) |
 | **Storage** | Redis 7+ with automatic in-memory fallback |
-| **Testing** | pytest (48 test files), mypy (strict), ruff |
+| **Testing** | pytest (45 test files), mypy (strict), ruff |
 
 ---
 

@@ -206,10 +206,10 @@ class ScoreSmoother:
             self._candidate_state = None
             return self._current_state
 
-        # Check exit condition: current state must be weaker than dominant state
-        # (dominant must exceed current by at least exit_threshold margin)
-        if current_score > score - self._config.exit_threshold:
-            # Current state still competitive — no transition
+        # Check exit condition: current state must have weakened below exit_threshold
+        # (proper Schmitt trigger — separate entry and exit thresholds)
+        if current_score > self._config.exit_threshold:
+            # Current state still strong — no transition
             self._candidate_state = None
             return self._current_state
 

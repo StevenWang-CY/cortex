@@ -208,6 +208,27 @@ def classify_tab_type(url: str) -> str:
 
 _AMBIGUOUS_TYPES = {"video_platform", "social", "communication", "distraction", "other"}
 
+# Short technical terms that should be treated as valid goal keywords
+# despite being <= 2 characters. Mirrors TECH_SHORT_WORDS in background.ts.
+_TECH_SHORT_WORDS = frozenset({
+    "go", "ml", "ai", "css", "sql", "vue", "rx", "aws", "gcp", "api",
+    "cli", "gui", "dom", "npm", "pip", "git", "ux", "ui", "db",
+    "os", "ci", "cd", "qa", "c++", "c#", "r", "dx", "io", "jwt",
+})
+
+
+def _extract_goal_keywords(goal: str) -> list[str]:
+    """Extract meaningful keywords from a goal string.
+
+    Keeps words > 2 chars plus recognized tech short words (ML, AI, Go, etc.).
+    Uses word-boundary matching to prevent false positives from common substrings.
+    """
+    words = goal.lower().replace("-", " ").replace("_", " ").split()
+    return [
+        w for w in words
+        if len(w) > 2 or w in _TECH_SHORT_WORDS
+    ]
+
 
 def classify_tab_type_with_goal(url: str, title: str, goal: str) -> str:
     """Goal-aware tab classification.
@@ -216,14 +237,18 @@ def classify_tab_type_with_goal(url: str, title: str, goal: str) -> str:
     base type is ambiguous (video, social, communication, distraction, other),
     reclassify as ``goal_relevant`` so downstream systems never recommend
     closing it.
+
+    Uses word-boundary matching to prevent false positives (e.g., "project"
+    in goal matching "HTML project starter" unrelated to the actual goal).
     """
     base_type = classify_tab_type(url)
     if not goal or base_type not in _AMBIGUOUS_TYPES:
         return base_type
 
-    keywords = [w.lower() for w in goal.split() if len(w) > 2]
+    keywords = _extract_goal_keywords(goal)
     title_lower = title.lower()
     for kw in keywords:
-        if kw in title_lower:
+        # Use word-boundary matching to avoid substring false positives
+        if re.search(r'\b' + re.escape(kw) + r'\b', title_lower):
             return "goal_relevant"
     return base_type

@@ -561,8 +561,14 @@ class CortexDaemon:
                             selected_arm = self._bandit.select_arm(bandit_features)
                             template_name = self._arm_to_template(selected_arm)
 
-                            await self._trigger_intervention(
-                                context, estimate, template_name=template_name,
+                            # Run intervention in background so the state
+                            # loop keeps updating while the LLM responds.
+                            self._active_intervention_id = "__pending__"
+                            asyncio.create_task(
+                                self._trigger_intervention(
+                                    context, estimate, template_name=template_name,
+                                ),
+                                name="cortex-intervention",
                             )
                 except asyncio.CancelledError:
                     raise
@@ -576,56 +582,70 @@ class CortexDaemon:
     async def _trigger_intervention(
         self, context: Any, estimate: Any, *, template_name: str | None = None,
     ) -> None:
-        # Inject learned tab relevance into context for LLM
-        goal = getattr(context, "current_goal_hint", "") or ""
-        if not goal and hasattr(context, "browser_context") and context.browser_context:
-            goal = context.browser_context.focus_goal or ""
-        if goal:
-            try:
-                overrides = await self._tab_relevance.get_overrides(goal)
-                if overrides and hasattr(context, "learned_relevance"):
-                    context.learned_relevance = overrides
-            except Exception:
-                logger.debug("Failed to load tab relevance overrides", exc_info=True)
+        try:
+            # Inject learned tab relevance into context for LLM
+            goal = getattr(context, "current_goal_hint", "") or ""
+            if not goal and hasattr(context, "browser_context") and context.browser_context:
+                goal = context.browser_context.focus_goal or ""
+            if goal:
+                try:
+                    overrides = await self._tab_relevance.get_overrides(goal)
+                    if overrides and hasattr(context, "learned_relevance"):
+                        context.learned_relevance = overrides
+                except Exception:
+                    logger.debug("Failed to load tab relevance overrides", exc_info=True)
 
-        plan = await self._llm_client.generate_intervention_plan(
-            context, estimate,
-        )
-        plan = enrich_plan_with_context(plan, context)
-        validation, commands = prepare_plan(plan)
-        if not validation.is_valid:
-            logger.warning("Rejected intervention plan %s: %s", plan.intervention_id, validation.errors)
-            return
+            plan = await asyncio.wait_for(
+                self._llm_client.generate_intervention_plan(
+                    context, estimate,
+                ),
+                timeout=self.config.llm.timeout_seconds + 5.0,
+            )
+            plan = enrich_plan_with_context(plan, context)
+            validation, commands = prepare_plan(plan)
+            if not validation.is_valid:
+                logger.warning("Rejected intervention plan %s: %s", plan.intervention_id, validation.errors)
+                return
 
-        # v2.0: Check consent ladder
-        consent_level_map = {
-            "observe": 0, "suggest": 1, "preview": 2,
-            "reversible_act": 3, "autonomous_act": 4,
-        }
-        requested_level = consent_level_map.get(plan.consent_level, 2)
-        consent = await self._consent_ladder.check(
-            action_type=plan.level, requested_level=requested_level,
-        )
-        if not consent.allowed:
-            logger.info("Consent ladder blocked intervention %s (level=%s)", plan.intervention_id, plan.consent_level)
-            return
+            # v2.0: Check consent ladder
+            consent_level_map = {
+                "observe": 0, "suggest": 1, "preview": 2,
+                "reversible_act": 3, "autonomous_act": 4,
+            }
+            requested_level = consent_level_map.get(plan.consent_level, 2)
+            consent = await self._consent_ladder.check(
+                action_type=plan.level, requested_level=requested_level,
+            )
+            if not consent.allowed:
+                logger.info("Consent ladder blocked intervention %s (level=%s)", plan.intervention_id, plan.consent_level)
+                return
 
-        snapshot = capture_snapshot(context, intervention_id=plan.intervention_id)
-        await self._executor.apply(plan, commands)
-        self._restore_manager.start_intervention(plan.intervention_id, snapshot)
-        self._trigger_policy.record_intervention()
-        self._active_intervention_id = plan.intervention_id
-        registry.register(f"workspace_snapshot:{plan.intervention_id}", snapshot)
-        self._recorder.append("intervention_plan", plan.model_dump(mode="json"))
-        await self._ws_server.send_intervention(plan)
+            snapshot = capture_snapshot(context, intervention_id=plan.intervention_id)
+            await self._executor.apply(plan, commands)
+            self._restore_manager.start_intervention(plan.intervention_id, snapshot)
+            self._trigger_policy.record_intervention()
+            self._active_intervention_id = plan.intervention_id
+            registry.register(f"workspace_snapshot:{plan.intervention_id}", snapshot)
+            self._recorder.append("intervention_plan", plan.model_dump(mode="json"))
+            await self._ws_server.send_intervention(plan)
 
-        # v2.0: Start helpfulness tracking
-        self._helpfulness.start_tracking(
-            intervention_id=plan.intervention_id,
-            intervention_type=plan.level,
-            state=estimate.state,
-            confidence=estimate.confidence,
-        )
+            # v2.0: Start helpfulness tracking
+            self._helpfulness.start_tracking(
+                intervention_id=plan.intervention_id,
+                intervention_type=plan.level,
+                state=estimate.state,
+                confidence=estimate.confidence,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Intervention LLM call timed out")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Failed to trigger intervention")
+        finally:
+            # Clear __pending__ sentinel if intervention didn't complete
+            if self._active_intervention_id == "__pending__":
+                self._active_intervention_id = None
 
     async def _trigger_special_intervention(
         self,
