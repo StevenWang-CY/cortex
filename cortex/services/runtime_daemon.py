@@ -35,6 +35,7 @@ from cortex.services.kinematics_engine.blink_detector import BlinkDetector
 from cortex.services.kinematics_engine.head_pose import HeadPoseEstimator
 from cortex.services.kinematics_engine.posture import PostureAnalyzer
 from cortex.services.llm_engine import create_llm_client
+from cortex.services.llm_engine.parser import enrich_plan_with_context
 from cortex.services.physio_engine.pulse_estimator import PulseEstimator
 from cortex.services.physio_engine.roi_extractor import RoiExtractor
 from cortex.services.physio_engine.rppg import extract_bvp
@@ -588,8 +589,9 @@ class CortexDaemon:
                 logger.debug("Failed to load tab relevance overrides", exc_info=True)
 
         plan = await self._llm_client.generate_intervention_plan(
-            context, estimate, template_name=template_name,
+            context, estimate,
         )
+        plan = enrich_plan_with_context(plan, context)
         validation, commands = prepare_plan(plan)
         if not validation.is_valid:
             logger.warning("Rejected intervention plan %s: %s", plan.intervention_id, validation.errors)
@@ -639,8 +641,9 @@ class CortexDaemon:
 
         try:
             plan = await self._llm_client.generate_intervention_plan(
-                context, estimate, template_name=template_name,
+                context, estimate,
             )
+            plan = enrich_plan_with_context(plan, context)
             self._active_intervention_id = plan.intervention_id
             self._recorder.append("intervention_plan", plan.model_dump(mode="json"))
             await self._ws_server.send_message(ws_type, plan.model_dump(mode="json"))

@@ -123,6 +123,21 @@ kept with relevance_score >= 0.7 — the user was recently using them. Only clos
 recently-visited tab if it is clearly a distraction (social media, entertainment) \
 unrelated to the focus goal.
 
+CRITICAL — specificity requirements:
+- For tab_title, you MUST copy the EXACT title from the "Tab N:" lines in the context. \
+Do NOT paraphrase, summarize, or use placeholder names like "Distraction Tab". \
+Example: if context says 'Tab 3: [distraction] Twitter / X — https://x.com', \
+then tab_title must be "Twitter / X", NOT "Distraction Tab".
+- Only include error_analysis when actual error text appears in the context (terminal \
+errors or editor errors). If there are no errors, OMIT the error_analysis field \
+entirely — do NOT generate a placeholder like "No specific errors detected".
+- micro_steps must be SPECIFIC to the workspace context. Each step must reference a \
+concrete file, tab, error, or action visible in the context. Never generate generic \
+advice like "take a break", "breathe", "focus on your task", or "stay focused".
+- causal_explanation must reference SPECIFIC data: tab count, switching frequency, \
+time in HYPER state, complexity score. Never say "you are feeling overwhelmed" \
+without citing numbers from the state data provided.
+
 Valid intervention_type values: "overlay_only", "simplified_workspace", "guided_mode"
 Valid tone values: "direct", "supportive", "minimal"
 Valid hide_targets: "browser_tabs_except_active", "terminal_lines_before_last_error_block", \

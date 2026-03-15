@@ -636,15 +636,26 @@ function injectOverlay(payload: Record<string, unknown>): void {
             closingHtml = `<div class="tl">`;
             for (let ti = 0; ti < closeTabs.length; ti++) {
                 const t = closeTabs[ti];
-                closingHtml += `<div class="tr" id="tr-${ti}" data-tab-idx="${ti}"><span class="tx">\u00d7</span><span class="tn">${esc(String(t.tab_title || "Untitled"))}</span><button class="kb" data-keep-idx="${ti}">Keep</button></div>`;
+                const tabTitle = esc(String(t.tab_title || "Untitled"));
+                const genericReasonPhrases = ["not essential for", "not relevant to", "not related to",
+                    "may be distracting", "could be a distraction", "is a distraction", "not needed for",
+                    "distracting you from", "not useful for"];
+                const rawReason = String(t.reason || "");
+                const cleanReason = genericReasonPhrases.some(p => rawReason.toLowerCase().includes(p)) ? "" : rawReason;
+                const tabReason = cleanReason ? `<div class="trr">${esc(cleanReason)}</div>` : "";
+                closingHtml += `<div class="tr" id="tr-${ti}" data-tab-idx="${ti}"><span class="tx">\u00d7</span><div class="tc"><span class="tn">${tabTitle}</span>${tabReason}</div><button class="kb" data-keep-idx="${ti}">Keep</button></div>`;
             }
             closingHtml += `</div>`;
         }
     }
 
-    // --- Error ---
+    // --- Error (filter generic placeholders) ---
     let errHtml = "";
-    if (errA && errA.root_cause) {
+    const genericErrPhrases = ["no specific errors", "no errors detected", "not applicable", "no error", "n/a", "none detected"];
+    const hasRealError = errA && errA.root_cause && !genericErrPhrases.some(
+        p => (errA.root_cause ?? "").toLowerCase().includes(p)
+    );
+    if (hasRealError && errA) {
         errHtml = `<div class="eb"><div class="eh">Error</div><div class="et">${esc(errA.root_cause)}</div>`;
         if (errA.suggested_fix) {
             errHtml += `<pre class="ec">${esc(errA.suggested_fix)}</pre>`;
@@ -652,11 +663,14 @@ function injectOverlay(payload: Record<string, unknown>): void {
         errHtml += `</div>`;
     }
 
-    // --- Steps ---
+    // --- Steps (filter generic advice) ---
+    const genericStepPhrases = ["take a moment to breathe", "take a break", "focus on your current task",
+        "continue focusing", "focus on the task at hand", "stay focused", "keep going", "take a deep breath"];
+    const realSteps = steps.filter(s => !genericStepPhrases.some(p => s.toLowerCase().includes(p)));
     let stepsHtml = "";
-    if (steps.length > 0) {
+    if (realSteps.length > 0) {
         stepsHtml = `<div class="sl">`;
-        for (const s of steps) {
+        for (const s of realSteps) {
             stepsHtml += `<div class="si">${esc(s)}</div>`;
         }
         stepsHtml += `</div>`;
@@ -666,7 +680,7 @@ function injectOverlay(payload: Record<string, unknown>): void {
     let ctaLabel = "Clean up";
     if (closeCount > 0) {
         ctaLabel = `Close ${closeCount} tab${closeCount !== 1 ? "s" : ""}`;
-    } else if (errA && errA.root_cause) {
+    } else if (hasRealError) {
         ctaLabel = "Help me fix this";
     } else if (recommended.length > 0) {
         ctaLabel = `Apply ${recommended.length} change${recommended.length !== 1 ? "s" : ""}`;
@@ -713,7 +727,9 @@ function injectOverlay(payload: Record<string, unknown>): void {
 .tl{margin-bottom:10px}
 .tr{display:flex;align-items:center;gap:7px;padding:3px 0}
 .tx{color:#ef4444;font-size:12px;font-weight:500;width:13px;text-align:center;flex-shrink:0;font-family:'SF Mono','Fira Code',ui-monospace,monospace}
-.tn{font-size:12px;color:#71717a;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tc{overflow:hidden;min-width:0}
+.tn{font-size:12px;color:#71717a;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block}
+.trr{font-size:10px;color:#3f3f46;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .kn{font-size:11px;color:#3f3f46;margin-bottom:12px}
 .kc{color:#10b981}
 

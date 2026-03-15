@@ -11,7 +11,14 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
 from cortex.libs.schemas.context import TaskContext
-from cortex.libs.schemas.intervention import InterventionPlan, SimplificationConstraints, UIPlan
+from cortex.libs.schemas.intervention import (
+    InterventionPlan,
+    SimplificationConstraints,
+    SuggestedAction,
+    TabRecommendation,
+    TabRecommendations,
+    UIPlan,
+)
 from cortex.libs.schemas.state import StateEstimate
 
 
@@ -56,10 +63,10 @@ class LLMError(Exception):
 
 def build_fallback_plan(context: TaskContext | None = None) -> InterventionPlan:
     """
-    Build a generic rule-based intervention plan when LLM is unavailable.
+    Build a context-aware rule-based intervention plan when LLM is unavailable.
 
-    This is the last-resort fallback used when the LLM server is unreachable
-    or returns unparseable responses after all retries.
+    Uses actual workspace data (tab titles, error messages, file paths) instead
+    of generic placeholders. This is the last-resort fallback.
     """
     summary = "Unable to analyze workspace context. Let's take it one step at a time."
     headline = "Focus on the function you're in"
@@ -68,8 +75,9 @@ def build_fallback_plan(context: TaskContext | None = None) -> InterventionPlan:
         "Review what you were trying to accomplish",
         "Check the most recent error message",
     ]
+    tab_recs: TabRecommendations | None = None
+    actions: list[SuggestedAction] = []
 
-    # If we have context, try to make the fallback slightly more useful
     if context is not None:
         if context.terminal_context and context.terminal_context.has_errors:
             summary = f"Error detected: {context.terminal_context.error_summary}"
@@ -83,6 +91,65 @@ def build_fallback_plan(context: TaskContext | None = None) -> InterventionPlan:
             summary = f"{context.editor_context.error_count} error(s) in {context.editor_context.file_path}"
             headline = "Resolve editor errors one at a time"
             primary_focus = f"Start with the first error in {context.editor_context.file_path}"
+
+        # Generate real tab recommendations from context
+        if context.browser_context and context.browser_context.all_tabs:
+            tabs = context.browser_context.all_tabs
+            active_title = context.browser_context.active_tab_title
+            distraction_types = {"distraction", "social"}
+            safe_types = {
+                "ai_assistant", "documentation", "learning_platform",
+                "reference", "code_host", "stackoverflow",
+            }
+
+            rec_tabs: list[TabRecommendation] = []
+            for i, tab in enumerate(tabs):
+                if tab.is_active:
+                    rec_tabs.append(TabRecommendation(
+                        tab_index=i, tab_title=tab.title,
+                        action="keep", reason="Active tab",
+                        relevance_score=1.0,
+                    ))
+                elif tab.tab_type in safe_types:
+                    rec_tabs.append(TabRecommendation(
+                        tab_index=i, tab_title=tab.title,
+                        action="keep", reason=f"{tab.tab_type} tab",
+                        relevance_score=0.8,
+                    ))
+                elif tab.tab_type in distraction_types:
+                    rec_tabs.append(TabRecommendation(
+                        tab_index=i, tab_title=tab.title,
+                        action="close", reason="Likely distracting",
+                        relevance_score=0.1,
+                    ))
+                    actions.append(SuggestedAction(
+                        action_type="close_tab",
+                        tab_index=i,
+                        label=f"Close {tab.title}",
+                        reason="Likely distracting",
+                    ))
+                else:
+                    rec_tabs.append(TabRecommendation(
+                        tab_index=i, tab_title=tab.title,
+                        action="keep", reason="May be relevant",
+                        relevance_score=0.5,
+                    ))
+
+            close_count = sum(1 for r in rec_tabs if r.action == "close")
+            tab_recs = TabRecommendations(
+                tabs=rec_tabs,
+                summary=f"{close_count} distraction tab(s) found among {len(tabs)} open tabs",
+            )
+
+            if not summary.startswith("Error"):
+                summary = f"{len(tabs)} tabs open, {close_count} appear distracting"
+                headline = f"Focus on {active_title[:60]}" if active_title else headline
+                primary_focus = "Close distraction tabs to reduce visual clutter"
+                if close_count > 0:
+                    titles = [r.tab_title for r in rec_tabs if r.action == "close"][:3]
+                    micro_steps = [f"Close {t}" for t in titles]
+                    if not micro_steps:
+                        micro_steps = ["Review open tabs for relevance"]
 
     return InterventionPlan(
         level="overlay_only",
@@ -98,6 +165,8 @@ def build_fallback_plan(context: TaskContext | None = None) -> InterventionPlan:
             intervention_type="overlay_only",
         ),
         tone="supportive",
+        tab_recommendations=tab_recs,
+        suggested_actions=actions,
     )
 
 

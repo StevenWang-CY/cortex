@@ -156,6 +156,7 @@ class BrowserAdapter:
             is_active = t.get("is_active", False)
 
             tabs.append(TabInfo(
+                tab_id=t.get("tab_id", -1),
                 title=t.get("title", ""),
                 url=url,
                 tab_type=tab_type,

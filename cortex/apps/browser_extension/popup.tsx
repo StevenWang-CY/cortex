@@ -281,10 +281,24 @@ function CortexPopup(): React.ReactElement {
     const streakMin = Math.floor(streakSec / 60);
     const streakRemSec = streakSec % 60;
 
+    const genericReasonPhrases = ["not essential for", "not relevant to", "not related to",
+        "may be distracting", "could be a distraction", "is a distraction", "not needed for",
+        "distracting you from", "not useful for"];
     const closeTabs = tabRecs?.tabs?.filter(t => t.action === "close" || t.action === "bookmark_and_close") || [];
     const keepTabs = tabRecs?.tabs?.filter(t => t.action === "keep") || [];
     const rec = activeActions.filter(a => a.category === "recommended");
-    const hasIntervention = activeActions.length > 0 || tabRecs || errAnalysis;
+
+    // Filter out generic error_analysis that has no real content
+    const genericErrPhrases = ["no specific errors", "no errors detected", "not applicable", "no error", "n/a"];
+    const realErrAnalysis = errAnalysis?.root_cause && !genericErrPhrases.some(
+        p => (errAnalysis.root_cause ?? "").toLowerCase().includes(p)
+    ) ? errAnalysis : null;
+
+    // Filter out generic causal explanation
+    const realCausal = causalExplanation && causalExplanation.length > 20
+        && /\d/.test(causalExplanation) ? causalExplanation : "";
+
+    const hasIntervention = activeActions.length > 0 || tabRecs || realErrAnalysis;
 
     return (
         <div style={S.root}>
@@ -434,35 +448,45 @@ function CortexPopup(): React.ReactElement {
                     {closeTabs.length > 0 && (
                         <div style={{ marginBottom: 12 }}>
                             <div style={S.sectionHead}>Closing {closeTabs.length} tab{closeTabs.length !== 1 ? "s" : ""}</div>
-                            {closeTabs.map((t, i) => (
-                                <div key={`c${i}`} style={S.tabRow}>
-                                    <span style={S.tabXMark}>{"\u00d7"}</span>
-                                    <span style={S.tabName}>{String(t.tab_title || "Untitled")}</span>
-                                </div>
-                            ))}
+                            {closeTabs.map((t, i) => {
+                                const title = String(t.tab_title || "Untitled");
+                                const rawReason = String(t.reason || "");
+                                const reason = genericReasonPhrases.some(p => rawReason.toLowerCase().includes(p)) ? "" : rawReason;
+                                return (
+                                    <div key={`c${i}`} style={{ padding: "3px 0" }}>
+                                        <div style={S.tabRow}>
+                                            <span style={S.tabXMark}>{"\u00d7"}</span>
+                                            <span style={S.tabName}>{title}</span>
+                                        </div>
+                                        {reason && (
+                                            <div style={{ fontSize: 10, color: C.textTertiary, marginLeft: 22, lineHeight: 1.3 }}>{reason}</div>
+                                        )}
+                                    </div>
+                                );
+                            })}
                             {keepTabs.length > 0 && (
                                 <div style={S.keepLine}>Keeping <span style={{ color: C.accent }}>{keepTabs.length}</span> you need</div>
                             )}
                         </div>
                     )}
 
-                    {errAnalysis && errAnalysis.root_cause && (
+                    {realErrAnalysis && realErrAnalysis.root_cause && (
                         <div style={S.errBox}>
                             <div style={S.errHead}>Error</div>
-                            <div style={S.errBody}>{errAnalysis.root_cause}</div>
-                            {errAnalysis.suggested_fix && (
-                                <pre style={S.errCode}>{errAnalysis.suggested_fix}</pre>
+                            <div style={S.errBody}>{realErrAnalysis.root_cause}</div>
+                            {realErrAnalysis.suggested_fix && (
+                                <pre style={S.errCode}>{realErrAnalysis.suggested_fix}</pre>
                             )}
                         </div>
                     )}
 
-                    {causalExplanation && (
+                    {realCausal && (
                         <div style={{ fontSize: 11, color: C.textTertiary, lineHeight: 1.5, marginBottom: 10, fontStyle: "italic" }}>
-                            {causalExplanation}
+                            {realCausal}
                         </div>
                     )}
 
-                    {!tabRecs && !errAnalysis && rec.length > 0 && (
+                    {!tabRecs && !realErrAnalysis && rec.length > 0 && (
                         <div style={{ marginBottom: 10 }}>
                             {rec.map((a, i) => (
                                 <div key={i} style={S.tabRow}>

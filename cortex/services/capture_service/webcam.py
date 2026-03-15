@@ -36,6 +36,12 @@ _BUILTIN_MAC_CAMERA_KEYWORDS = (
     "imac",
 )
 
+_CONTINUITY_CAMERA_KEYWORDS = (
+    "iphone",
+    "ipad",
+    "continuity",
+)
+
 
 @dataclass(frozen=True)
 class CapturedFrame:
@@ -78,30 +84,62 @@ def _list_macos_video_device_names() -> list[str]:
     if not is_macos():
         return []
 
+    # Try the pyobjc AVFoundation wrapper first
     try:
         import AVFoundation
-    except ImportError:
-        return []
-
-    try:
         devices = (
             AVFoundation.AVCaptureDevice.devicesWithMediaType_(
                 AVFoundation.AVMediaTypeVideo
             )
             or []
         )
+        return [_extract_objc_string(device, "localizedName") for device in devices]
+    except ImportError:
+        pass
     except Exception:
-        logger.exception("Failed to enumerate macOS cameras")
+        logger.exception("Failed to enumerate macOS cameras via AVFoundation")
         return []
 
-    return [_extract_objc_string(device, "localizedName") for device in devices]
+    # Fallback: load AVFoundation via objc bridge (pyobjc-core only)
+    try:
+        import objc
+        bundle = objc.loadBundle(
+            "AVFoundation",
+            bundle_path="/System/Library/Frameworks/AVFoundation.framework",
+            module_globals={},
+        )
+        # After loading, AVCaptureDevice is in the module globals
+        ns = bundle.__dict__ if hasattr(bundle, "__dict__") else {}
+        AVCaptureDevice = objc.lookUpClass("AVCaptureDevice")
+        devices = AVCaptureDevice.devicesWithMediaType_("vide") or []
+        return [_extract_objc_string(device, "localizedName") for device in devices]
+    except Exception:
+        logger.debug("Failed to enumerate macOS cameras via objc bridge", exc_info=True)
+        return []
 
 
 def _find_builtin_macos_camera() -> tuple[int | None, str | None]:
-    """Return the first built-in Mac camera if one is visible to AVFoundation."""
-    for index, name in enumerate(_list_macos_video_device_names()):
+    """Return the first built-in Mac camera, skipping Continuity Camera devices.
+
+    AVFoundation may list an iPhone Continuity Camera before the built-in camera,
+    or macOS may reorder devices when the iPhone connects.  We walk the list in
+    order, skipping anything that looks like a Continuity Camera, and return the
+    first device whose name contains a built-in keyword.  If no built-in keyword
+    matches we fall back to the first non-Continuity device.
+    """
+    names = _list_macos_video_device_names()
+    # First pass: find a device that matches built-in keywords and is NOT a Continuity Camera
+    for index, name in enumerate(names):
         normalized = name.casefold()
+        is_continuity = any(kw in normalized for kw in _CONTINUITY_CAMERA_KEYWORDS)
+        if is_continuity:
+            continue
         if any(keyword in normalized for keyword in _BUILTIN_MAC_CAMERA_KEYWORDS):
+            return index, name
+    # Second pass: return the first non-Continuity device (even without keyword match)
+    for index, name in enumerate(names):
+        normalized = name.casefold()
+        if not any(kw in normalized for kw in _CONTINUITY_CAMERA_KEYWORDS):
             return index, name
     return None, None
 
@@ -110,8 +148,14 @@ def _iter_camera_candidates(config: CaptureConfig) -> Iterable[CameraSelection]:
     """
     Yield camera candidates in preference order.
 
-    If no device is configured, macOS prefers the built-in camera first and then
-    falls back to the platform default device ordering.
+    When no device_id is configured on macOS, we enumerate all cameras and
+    yield built-in Mac cameras first, then other non-phone cameras, then
+    Continuity Camera (iPhone/iPad) last.  This ensures the Mac's own camera
+    is always preferred over Continuity Camera.
+
+    Because AVFoundation's device enumeration index doesn't always match the
+    OpenCV device index (especially when Continuity Camera is present), we
+    try ALL available device indices — not just the one AVFoundation reports.
     """
     requested_device_id = (
         _AUTO_CAMERA_DEVICE_ID if config.device_id is None else config.device_id
@@ -120,25 +164,55 @@ def _iter_camera_candidates(config: CaptureConfig) -> Iterable[CameraSelection]:
     candidates: list[CameraSelection] = []
 
     if config.device_id is None and is_macos():
-        builtin_index, builtin_name = _find_builtin_macos_camera()
-        if builtin_index is not None:
-            candidates.append(
-                CameraSelection(
-                    device_id=builtin_index,
-                    backend=cv2.CAP_AVFOUNDATION,
-                    source="builtin_mac_camera",
-                    device_name=builtin_name,
-                )
-            )
-            candidates.append(
-                CameraSelection(
-                    device_id=builtin_index,
-                    backend=None,
-                    source="builtin_mac_camera",
-                    device_name=builtin_name,
-                )
-            )
+        names = _list_macos_video_device_names()
+        if names:
+            # Partition into builtin, other, and continuity camera groups
+            builtin: list[tuple[int, str]] = []
+            other: list[tuple[int, str]] = []
+            continuity: list[tuple[int, str]] = []
 
+            for idx, name in enumerate(names):
+                normalized = name.casefold()
+                if any(kw in normalized for kw in _CONTINUITY_CAMERA_KEYWORDS):
+                    continuity.append((idx, name))
+                elif any(kw in normalized for kw in _BUILTIN_MAC_CAMERA_KEYWORDS):
+                    builtin.append((idx, name))
+                else:
+                    other.append((idx, name))
+
+            # Yield in order: builtin first, then other, then continuity last
+            for group, source in [
+                (builtin, "builtin_mac_camera"),
+                (other, "other_camera"),
+                (continuity, "continuity_camera"),
+            ]:
+                for idx, name in group:
+                    candidates.append(
+                        CameraSelection(
+                            device_id=idx,
+                            backend=cv2.CAP_AVFOUNDATION,
+                            source=source,
+                            device_name=name,
+                        )
+                    )
+
+            # Also try ALL indices without explicit backend (in same order)
+            for group, source in [
+                (builtin, "builtin_mac_camera"),
+                (other, "other_camera"),
+                (continuity, "continuity_camera"),
+            ]:
+                for idx, name in group:
+                    candidates.append(
+                        CameraSelection(
+                            device_id=idx,
+                            backend=None,
+                            source=source,
+                            device_name=name,
+                        )
+                    )
+
+    # Fallback: try the configured/default device id
     if is_macos():
         candidates.append(
             CameraSelection(
@@ -168,7 +242,14 @@ def _iter_camera_candidates(config: CaptureConfig) -> Iterable[CameraSelection]:
 def open_video_capture(
     config: CaptureConfig,
 ) -> tuple[cv2.VideoCapture | None, CameraSelection | None]:
-    """Open the best matching webcam device for the given configuration."""
+    """Open the best matching webcam device for the given configuration.
+
+    Validates each candidate by reading a test frame — some cameras report as
+    open but fail to deliver frames (e.g. when permissions are denied or the
+    device is in an incompatible mode).
+    """
+    import time as _time
+
     last_candidate: CameraSelection | None = None
 
     for candidate in _iter_camera_candidates(config):
@@ -179,7 +260,22 @@ def open_video_capture(
             else cv2.VideoCapture(candidate.device_id)
         )
         if capture.isOpened():
-            return capture, candidate
+            # Validate with a test frame read (give camera 0.5s to initialise)
+            _time.sleep(0.5)
+            ret, frame = capture.read()
+            if ret and frame is not None:
+                logger.info(
+                    "Opened camera device %d (%s) — %s",
+                    candidate.device_id,
+                    candidate.device_name or candidate.source,
+                    f"{frame.shape[1]}x{frame.shape[0]}",
+                )
+                return capture, candidate
+            logger.debug(
+                "Camera device %d (%s) opened but no frames, skipping",
+                candidate.device_id,
+                candidate.device_name or candidate.source,
+            )
         capture.release()
 
     return None, last_candidate

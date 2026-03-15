@@ -20,6 +20,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from cortex.libs.schemas.context import TaskContext
 from cortex.libs.schemas.intervention import InterventionPlan, UIPlan
 
 
@@ -114,6 +115,128 @@ def parse_and_validate(raw: str) -> InterventionPlan | None:
     if data is None:
         return None
     return validate_intervention_plan(data)
+
+
+# ---------------------------------------------------------------------------
+# Post-parse enrichment — cross-reference LLM output with actual context
+# ---------------------------------------------------------------------------
+
+# Phrases that indicate the LLM generated a placeholder instead of real data
+_GENERIC_ERROR_PHRASES = [
+    "no specific errors",
+    "no errors detected",
+    "not applicable",
+    "no error",
+    "none detected",
+    "no issues found",
+    "no errors found",
+    "n/a",
+]
+
+_GENERIC_STEP_PHRASES = [
+    "take a moment to breathe",
+    "take a break",
+    "focus on your current task",
+    "focus on the active tab",
+    "focus on your active",
+    "continue focusing",
+    "focus on the task at hand",
+    "stay focused",
+    "keep going",
+    "take a deep breath",
+    "reset your focus",
+    "close unnecessary",
+    "close distraction",
+    "close the distraction",
+    "review open tabs",
+    "reduce visual clutter",
+]
+
+
+_GENERIC_REASON_PHRASES = [
+    "not essential for",
+    "not relevant to",
+    "not related to",
+    "may be distracting",
+    "could be a distraction",
+    "is a distraction",
+    "not needed for",
+    "unrelated to your",
+    "distracting you from",
+    "not useful for",
+]
+
+
+def enrich_plan_with_context(
+    plan: InterventionPlan,
+    context: TaskContext,
+) -> InterventionPlan:
+    """
+    Enrich an LLM-generated plan with real data from the workspace context.
+
+    ALWAYS overwrites LLM-generated tab titles and action labels with real data
+    from context when tab_index is valid. The LLM cannot be trusted to copy
+    exact tab titles — it generates placeholders like "Distraction Tab",
+    "Another Distraction Tab", etc.
+    """
+    tabs = (
+        context.browser_context.all_tabs
+        if context.browser_context
+        else []
+    )
+
+    # --- ALWAYS replace tab_recommendations titles with real titles ---
+    if plan.tab_recommendations and tabs:
+        for rec in plan.tab_recommendations.tabs:
+            if 0 <= rec.tab_index < len(tabs):
+                real_title = tabs[rec.tab_index].title
+                # Unconditionally use the real title
+                rec.tab_title = real_title
+                # Replace generic reasons
+                if rec.reason and any(
+                    phrase in rec.reason.lower()
+                    for phrase in _GENERIC_REASON_PHRASES
+                ):
+                    tab_type = getattr(tabs[rec.tab_index], "tab_type", "")
+                    if rec.action in ("close", "bookmark_and_close"):
+                        rec.reason = (
+                            f"{tab_type.replace('_', ' ').title()} — not related to your current work"
+                            if tab_type
+                            else f"Not related to your current work"
+                        )
+
+    # --- ALWAYS replace suggested_action labels with real tab titles ---
+    if plan.suggested_actions and tabs:
+        for action in plan.suggested_actions:
+            if action.action_type in ("close_tab", "bookmark_and_close") and action.tab_index is not None:
+                if 0 <= action.tab_index < len(tabs):
+                    real_title = tabs[action.tab_index].title
+                    # Unconditionally use the real title
+                    action.label = f"Close {real_title}"
+                    # Replace generic reasons on actions too
+                    if action.reason and any(
+                        phrase in action.reason.lower()
+                        for phrase in _GENERIC_REASON_PHRASES
+                    ):
+                        action.reason = "Likely distracting"
+
+    # --- Drop generic error_analysis ---
+    if plan.error_analysis:
+        rc = plan.error_analysis.root_cause.lower().strip()
+        if any(phrase in rc for phrase in _GENERIC_ERROR_PHRASES) or len(rc) < 10:
+            plan.error_analysis = None
+
+    # --- Filter generic micro_steps ---
+    if plan.micro_steps:
+        filtered = [
+            step for step in plan.micro_steps
+            if not any(phrase in step.lower() for phrase in _GENERIC_STEP_PHRASES)
+        ]
+        if filtered:
+            plan.micro_steps = filtered
+        # If all steps were generic, keep the originals (schema requires ≥1)
+
+    return plan
 
 
 # ---------------------------------------------------------------------------
