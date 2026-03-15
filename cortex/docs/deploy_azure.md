@@ -5,7 +5,7 @@ Use this flow to experience Cortex as a real product on macOS.
 ### 1. Install and configure
 
 ```bash
-cd /path/to/Ralph
+cd /path/to/cortex-repo
 python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -e "./cortex[dev]"

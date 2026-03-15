@@ -196,12 +196,12 @@ On first launch, complete onboarding:
 The VS Code extension provides editor context, diagnostics, integrated terminal context, fold/apply, and restore:
 
 ```bash
-cd apps/vscode_extension
+cd cortex/apps/vscode_extension
 npm install
 npm run compile
 
 # Install in VS Code
-code --install-extension cortex-vscode-0.1.0.vsix
+code --install-extension cortex-somatic-0.1.0.vsix
 ```
 
 ## 9. Chrome Extension
@@ -209,12 +209,12 @@ code --install-extension cortex-vscode-0.1.0.vsix
 The Chrome extension provides browser context, PDF/paper classification, tab hide/restore, and research overlays:
 
 ```bash
-cd apps/browser_extension
+cd cortex/apps/browser_extension
 pnpm install
 pnpm build
 
 # Load unpacked extension in Chrome
-# chrome://extensions → Developer mode → Load unpacked → dist/
+# chrome://extensions → Developer mode → Load unpacked → build/chrome-mv3-prod/
 ```
 
 ## 10. Package a macOS App
@@ -236,7 +236,7 @@ This produces a PyInstaller-based macOS app bundle in `dist/`. Code signing and 
 python -c "import cv2; [print(f'Device {i}: {cv2.VideoCapture(i).isOpened()}') for i in range(5)]"
 ```
 
-Set `CORTEX_CAPTURE_DEVICE_ID` to the correct device index.
+Set `CORTEX_CAPTURE__DEVICE_ID` to the correct device index.
 
 ### Azure connection failures
 

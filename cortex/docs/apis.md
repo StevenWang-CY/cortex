@@ -355,6 +355,76 @@ Valid `user_action` values: `dismissed`, `engaged`, `snoozed`, `timed_out`, `nat
 
 ---
 
+### Stress & Learning
+
+#### `GET /api/stress-integral`
+
+Current cumulative HRV suppression integral.
+
+**Response:**
+```json
+{
+  "stress_integral": 12.5,
+  "threshold": 30.0,
+  "percentage": 41.7,
+  "timestamp": 1000.5
+}
+```
+
+#### `GET /api/helpfulness/summary`
+
+Summary of intervention helpfulness and bandit state.
+
+**Response:**
+```json
+{
+  "total_interventions": 15,
+  "mean_reward": 0.62,
+  "best_arm": "simplified_workspace",
+  "arm_counts": {
+    "overlay_only": 3,
+    "simplified_workspace": 5,
+    "guided_mode": 2,
+    "breathing": 2,
+    "active_recall": 1,
+    "circuit_breaker": 1,
+    "none": 1
+  },
+  "timestamp": 1000.5
+}
+```
+
+---
+
+### Project Launcher
+
+#### `GET /api/projects`
+
+List available project profiles.
+
+**Response:**
+```json
+{
+  "projects": ["default", "research", "leetcode"],
+  "timestamp": 1000.5
+}
+```
+
+#### `POST /api/launch/{project_name}`
+
+Launch a project profile (opens VS Code workspace, Chrome URLs, terminal commands).
+
+**Response:**
+```json
+{
+  "launched": true,
+  "project": "research",
+  "timestamp": 1000.5
+}
+```
+
+---
+
 ## WebSocket Protocol
 
 Endpoint: `ws://127.0.0.1:9473`
@@ -468,6 +538,55 @@ Sent by extensions on connection to identify their type.
 ```
 
 Valid client types: `vscode`, `chrome`, `desktop`.
+
+#### `SETTINGS_SYNC` (bidirectional)
+
+Sent by clients to update settings, or by the server to broadcast settings changes.
+
+```json
+{
+  "type": "SETTINGS_SYNC",
+  "payload": {
+    "consent_levels": { "close_tabs": 3, "fold_code": 4 },
+    "quiet_mode": false,
+    "max_autonomy": "REVERSIBLE_ACT"
+  },
+  "timestamp": 12350.0,
+  "sequence": 2
+}
+```
+
+#### `ACTIVITY_SYNC` (client → server)
+
+Sent by the browser extension to report learning activity progress.
+
+```json
+{
+  "type": "ACTIVITY_SYNC",
+  "payload": {
+    "platform": "youtube",
+    "url": "https://youtube.com/watch?v=...",
+    "title": "Data Structures Lecture 5",
+    "position": { "type": "video", "timestamp_seconds": 1234 },
+    "duration_seconds": 300
+  },
+  "timestamp": 12360.0,
+  "sequence": 3
+}
+```
+
+#### `CONTEXT_REQUEST` (server → client)
+
+Sent by the daemon to request context from a specific extension.
+
+```json
+{
+  "type": "CONTEXT_REQUEST",
+  "payload": {},
+  "timestamp": 12370.0,
+  "sequence": 44
+}
+```
 
 ### Connection Behavior
 

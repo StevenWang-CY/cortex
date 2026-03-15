@@ -2,6 +2,10 @@
 
 Workspace adapters connect Cortex to external applications (VS Code, Chrome, terminals) to gather context for LLM-powered interventions. This guide explains how to add a new adapter.
 
+## Formal Adapter Protocol
+
+Cortex defines a formal `CortexAdapter` protocol in `libs/adapters/base.py` with properties `name` and `capabilities`, and methods `execute`, `get_context`, and `health_check`. The `AdapterRegistry` in `libs/adapters/registry.py` handles discovery, capability querying, and action routing across all registered adapters.
+
 ## Adapter Interface
 
 All adapters follow the same pattern:
