@@ -735,6 +735,21 @@ async def test_azure_health_check_success():
         assert await client.health_check() is True
 
 
+@pytest.mark.asyncio
+async def test_azure_payload_includes_json_response_format():
+    """Azure API payload must include response_format for structured JSON output."""
+    client = _make_azure_client()
+    ctx = _make_context()
+    state = _make_state()
+    api_response = {"choices": [{"message": {"content": VALID_PLAN_JSON}}]}
+    mock_resp = _mock_response(200, api_response)
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock, return_value=mock_resp) as post_mock:
+        await client.generate_intervention_plan(ctx, state)
+    sent_payload = post_mock.await_args.kwargs["json"]
+    assert "response_format" in sent_payload
+    assert sent_payload["response_format"] == {"type": "json_object"}
+
+
 def test_azure_uses_keychain_when_api_key_missing():
     config = LLMConfig(mode="azure")
     config.azure.endpoint = "https://example-resource.openai.azure.com/"

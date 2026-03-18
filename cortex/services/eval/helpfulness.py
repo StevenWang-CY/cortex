@@ -230,9 +230,19 @@ class HelpfulnessTracker:
         Components:
         1. Recovery signal: Did user return to FLOW?
         2. Complexity reduction: Did workspace simplify?
-        3. Explicit rating: Thumbs up/down
+        3. Explicit rating: Thumbs up/down (30% weight when present)
         4. Implicit signal: Engaged vs ignored vs undone
+
+        When explicit rating is absent, the 30% rating weight is
+        redistributed proportionally among the other three signals.
         """
+        # Determine weights based on whether explicit rating is present
+        explicit_rating = tracked.user_rating
+        if explicit_rating is None:
+            w_recovery, w_complexity, w_implicit = (0.57, 0.21, 0.22)
+        else:
+            w_recovery, w_complexity, w_implicit = (0.40, 0.15, 0.15)
+
         reward = 0.0
 
         # 1. Recovery (0 to 1)
@@ -243,19 +253,18 @@ class HelpfulnessTracker:
             recovery = 0.5
         elif tracked.post_state in ("HYPO", "HYPER"):
             recovery = -0.3
-        reward += _RECOVERY_WEIGHT * recovery
+        reward += w_recovery * recovery
 
         # 2. Complexity reduction (-0.5 to 1)
         complexity_delta = tracked.pre_complexity - tracked.post_complexity
         complexity_signal = min(1.0, max(-0.5, complexity_delta * 2.0))
-        reward += _COMPLEXITY_WEIGHT * complexity_signal
+        reward += w_complexity * complexity_signal
 
-        # 3. Explicit rating (-1 to 1)
-        if tracked.user_rating == "thumbs_up":
+        # 3. Explicit rating (-1 to 1) — only contributes when present
+        if explicit_rating == "thumbs_up":
             reward += _RATING_WEIGHT * 1.0
-        elif tracked.user_rating == "thumbs_down":
+        elif explicit_rating == "thumbs_down":
             reward += _RATING_WEIGHT * -1.0
-        # No rating → 0 contribution
 
         # 4. Implicit signals (-1 to 1)
         implicit = 0.0
@@ -265,7 +274,7 @@ class HelpfulnessTracker:
             implicit = -0.5
         elif tracked.was_engaged:
             implicit = 0.5
-        reward += _IMPLICIT_WEIGHT * implicit
+        reward += w_implicit * implicit
 
         return float(max(-1.0, min(1.0, reward)))
 

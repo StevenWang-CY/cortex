@@ -141,3 +141,78 @@ class TestV2TemplateFormatting:
                 ctx, state, template_name=name, extra_context="ignored",
             )
             assert isinstance(prompt, str)
+
+
+# ---------------------------------------------------------------------------
+# Token budget enforcement tests
+# ---------------------------------------------------------------------------
+
+
+class TestTokenBudgetEnforcement:
+    """Test that build_messages enforces an 80% token budget hard cap."""
+
+    def test_small_context_not_truncated(self):
+        """Normal-sized context should not be truncated."""
+        from cortex.services.llm_engine.prompts import build_messages
+
+        ctx = _make_context()
+        state = _make_state()
+        msgs = build_messages(ctx, state)
+        # Should have 2 messages (system + user), unmodified
+        assert len(msgs) == 2
+        assert msgs[0]["role"] == "system"
+        assert msgs[1]["role"] == "user"
+
+    def test_large_context_is_truncated(self):
+        """Context exceeding 80% of budget must be truncated under the limit."""
+        from cortex.services.llm_engine.prompts import (
+            _estimate_tokens,
+            _total_message_tokens,
+            build_messages,
+        )
+
+        # Create a context with extremely large terminal output to exceed budget
+        terminal = TerminalContext(
+            last_n_lines=["error line " * 100] * 500,
+            detected_errors=["big error " * 200] * 50,
+            repeated_commands=[],
+        )
+        editor = EditorContext(
+            file_path="/src/main.py",
+            visible_range=(1, 50),
+            symbol_at_cursor="handle_request",
+            visible_code="x = 1\n" * 5000,
+        )
+        ctx = TaskContext(
+            mode="terminal_errors",
+            active_app="vscode",
+            complexity_score=0.75,
+            editor_context=editor,
+            terminal_context=terminal,
+        )
+        state = _make_state()
+
+        # Use a budget that forces truncation but fits the system prompt
+        max_tokens = 8000
+        msgs = build_messages(ctx, state, max_context_tokens=max_tokens)
+
+        total = _total_message_tokens(msgs)
+        budget = int(max_tokens * 0.80)
+        assert total <= budget, (
+            f"Total tokens {total} exceeds budget {budget}"
+        )
+
+    def test_budget_respects_80_percent_cap(self):
+        """Verify the 80% cap arithmetic."""
+        from cortex.services.llm_engine.prompts import _enforce_token_budget, _total_message_tokens
+
+        # Build messages that are clearly over budget
+        big_content = "word " * 50000  # ~50000 chars = ~12500 tokens
+        messages = [
+            {"role": "system", "content": "System prompt."},
+            {"role": "user", "content": big_content},
+        ]
+        max_ctx = 5000  # budget = 4000 tokens = 16000 chars
+        result = _enforce_token_budget(messages, max_context_tokens=max_ctx)
+        total = _total_message_tokens(result)
+        assert total <= int(max_ctx * 0.80)

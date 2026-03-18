@@ -171,3 +171,23 @@ class TestEncodeContext:
 
     def test_arm_labels_count(self):
         assert len(ARM_LABELS) == N_ARMS
+
+
+# ---------------------------------------------------------------------------
+# Regularization scalar (cold-start fix)
+# ---------------------------------------------------------------------------
+
+class TestRegularizationScalar:
+    def test_initial_A_diagonal_is_5(self):
+        """A matrices should be initialized with 5.0 on the diagonal, not 1.0."""
+        bandit = ContextualBandit()
+        for a_matrix in bandit._A:
+            expected = np.eye(N_FEATURES) * 5.0
+            np.testing.assert_array_equal(a_matrix, expected)
+
+    def test_custom_features_also_uses_5(self):
+        """Custom n_features should still use 5.0 regularization."""
+        bandit = ContextualBandit(n_features=4)
+        for a_matrix in bandit._A:
+            assert a_matrix.shape == (4, 4)
+            np.testing.assert_array_equal(np.diag(a_matrix), np.full(4, 5.0))

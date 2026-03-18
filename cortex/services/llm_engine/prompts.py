@@ -7,9 +7,14 @@ that picks the right template based on workspace mode and context.
 
 from __future__ import annotations
 
+import logging
+import re
+
 from cortex.libs.schemas.context import TaskContext
 from cortex.libs.schemas.intervention import SimplificationConstraints
 from cortex.libs.schemas.state import StateEstimate
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # System prompt (shared across all modes)
@@ -305,7 +310,7 @@ Output a JSON object with these additional fields:
 The intervention will blur the screen and show the question. The user must answer \
 correctly to unblur.
 
-Include a causal_explanation referencing blink rate, scroll velocity, and mouse inactivity.
+Include a causal_explanation referencing workspace patterns and behavior signals (not raw biometric numbers).
 
 Visible page text:
 {extra_context}
@@ -509,6 +514,7 @@ def build_messages(
     *,
     template_name: str | None = None,
     extra_context: str = "",
+    max_context_tokens: int = 128_000,
 ) -> list[dict[str, str]]:
     """
     Build the full message list for the OpenAI-compatible chat API.
@@ -520,7 +526,136 @@ def build_messages(
         context, state, constraints, template_name=template_name,
         extra_context=extra_context,
     )
-    return [
+    messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
+
+    messages = _enforce_token_budget(messages, max_context_tokens=max_context_tokens)
+    return messages
+
+
+# ---------------------------------------------------------------------------
+# Token budget enforcement
+# ---------------------------------------------------------------------------
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate using chars/4 heuristic."""
+    return len(text) // 4
+
+
+def _total_message_tokens(messages: list[dict[str, str]]) -> int:
+    """Estimate total tokens across all messages."""
+    return sum(_estimate_tokens(m.get("content", "")) for m in messages)
+
+
+def _enforce_token_budget(
+    messages: list[dict[str, str]],
+    *,
+    max_context_tokens: int = 128_000,
+) -> list[dict[str, str]]:
+    """
+    Enforce an 80% token budget hard cap on the message list.
+
+    Truncation priority (applied to the user message only):
+    1. Terminal output lines
+    2. Tab titles (truncated to 50 chars each)
+    3. File/code content
+
+    Logs a warning with pre/post sizes when truncation occurs.
+    """
+    budget = int(max_context_tokens * 0.80)
+    pre_tokens = _total_message_tokens(messages)
+
+    if pre_tokens <= budget:
+        return messages
+
+    # Work on the user message (index 1); leave system prompt untouched
+    user_content = messages[1]["content"]
+
+    # --- Pass 1: Truncate terminal output ---
+    user_content = _truncate_section(
+        user_content,
+        start_marker="--- Terminal Errors ---",
+        max_lines=10,
+    )
+
+    if _estimate_tokens(messages[0]["content"]) + _estimate_tokens(user_content) <= budget:
+        messages = [messages[0], {"role": "user", "content": user_content}]
+        logger.warning(
+            "Token budget: truncated terminal output (%d -> %d tokens)",
+            pre_tokens,
+            _total_message_tokens(messages),
+        )
+        return messages
+
+    # --- Pass 2: Truncate tab titles to 50 chars each ---
+    user_content = re.sub(
+        r"(Tab \d+: \[[^\]]*\] )(.{50,}?)( — https?://)",
+        lambda m: m.group(1) + m.group(2)[:50] + "..." + m.group(3),
+        user_content,
+    )
+
+    if _estimate_tokens(messages[0]["content"]) + _estimate_tokens(user_content) <= budget:
+        messages = [messages[0], {"role": "user", "content": user_content}]
+        logger.warning(
+            "Token budget: truncated tab titles (%d -> %d tokens)",
+            pre_tokens,
+            _total_message_tokens(messages),
+        )
+        return messages
+
+    # --- Pass 3: Truncate file/code content ---
+    user_content = _truncate_section(
+        user_content,
+        start_marker="Code:",
+        max_lines=30,
+    )
+
+    # Final hard truncation if still over budget
+    system_tokens = _estimate_tokens(messages[0]["content"])
+    remaining_budget = budget - system_tokens
+    if _estimate_tokens(user_content) > remaining_budget:
+        user_content = user_content[: remaining_budget * 4]
+
+    messages = [messages[0], {"role": "user", "content": user_content}]
+    post_tokens = _total_message_tokens(messages)
+    logger.warning(
+        "Token budget: truncated content (%d -> %d tokens)",
+        pre_tokens,
+        post_tokens,
+    )
+    return messages
+
+
+def _truncate_section(text: str, *, start_marker: str, max_lines: int) -> str:
+    """Truncate a section of text starting at *start_marker* to *max_lines* lines."""
+    idx = text.find(start_marker)
+    if idx == -1:
+        return text
+
+    before = text[:idx]
+    after_marker = text[idx:]
+
+    # Find the next section boundary ("---") after the marker line
+    lines = after_marker.split("\n")
+    section_lines: list[str] = []
+    rest_lines: list[str] = []
+    in_section = True
+    for i, line in enumerate(lines):
+        if i == 0:
+            section_lines.append(line)
+            continue
+        if in_section and line.strip().startswith("---"):
+            in_section = False
+        if in_section:
+            section_lines.append(line)
+        else:
+            rest_lines.append(line)
+
+    if len(section_lines) > max_lines:
+        truncated_count = len(section_lines) - max_lines
+        section_lines = section_lines[:max_lines]
+        section_lines.append(f"  ... ({truncated_count} lines truncated)")
+
+    return before + "\n".join(section_lines) + ("\n" + "\n".join(rest_lines) if rest_lines else "")

@@ -1,5 +1,11 @@
 """
-Intervention Engine — Trigger Evaluation
+Intervention Engine — Trigger Evaluation (DEPRECATED)
+
+.. deprecated::
+    This module is superseded by ``cortex.services.state_engine.trigger_policy``
+    which is the implementation used by the runtime daemon. This module is kept
+    only for backward compatibility with existing tests. New code should use
+    ``TriggerPolicy`` from ``cortex.services.state_engine.trigger_policy``.
 
 Evaluates whether an intervention should fire and selects the
 appropriate level based on state confidence, complexity, signal quality,
@@ -14,6 +20,7 @@ Levels:
 from __future__ import annotations
 
 import time
+import warnings
 from dataclasses import dataclass, field
 
 from cortex.libs.schemas.state import StateEstimate
@@ -42,6 +49,10 @@ class InterventionTrigger:
     """
     Evaluates whether an intervention should fire.
 
+    .. deprecated::
+        Use ``cortex.services.state_engine.trigger_policy.TriggerPolicy`` instead.
+        This class is kept for backward compatibility only.
+
     Uses state engine output + workspace complexity to decide. Manages
     cooldown, dismissal history, adaptive thresholds, and quiet mode.
     """
@@ -61,6 +72,12 @@ class InterventionTrigger:
         dismissal_bump: float = 0.05,
         dismissal_decay_seconds: float = 3600.0,  # 1 hour
     ) -> None:
+        warnings.warn(
+            "InterventionTrigger is deprecated; use "
+            "cortex.services.state_engine.trigger_policy.TriggerPolicy instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._overlay_threshold = overlay_threshold
         self._simplified_threshold = simplified_threshold
         self._guided_threshold = guided_threshold

@@ -106,7 +106,8 @@ class ContextualBandit:
         self._store = store
 
         # LinUCB parameters: A = d×d identity, b = d×1 zero
-        self._A = [np.eye(n_features) for _ in range(n_arms)]
+        # Regularization scalar 5.0 (not 1.0) to reduce cold-start variance
+        self._A = [np.eye(n_features) * 5.0 for _ in range(n_arms)]
         self._b = [np.zeros(n_features) for _ in range(n_arms)]
         self._total_updates = 0
         self._loaded = False

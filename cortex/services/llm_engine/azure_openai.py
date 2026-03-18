@@ -141,6 +141,7 @@ class AzureOpenAIClient:
                 self._config.azure.max_completion_tokens, 2048
             ),
             "stream": False,
+            "response_format": {"type": "json_object"},
         }
 
         timeout = httpx.Timeout(self._config.timeout_seconds, connect=5.0)
