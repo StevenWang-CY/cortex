@@ -48,6 +48,8 @@ class RuleScorer:
         self._config = config or StateConfig()
         self._baselines = baselines or UserBaselines()
         self._weights = self._config.weights
+        # Optional tab category context for same-category discount
+        self._tab_categories: list[str] | None = None
 
     @property
     def baselines(self) -> UserBaselines:
@@ -56,6 +58,33 @@ class RuleScorer:
     @baselines.setter
     def baselines(self, value: UserBaselines) -> None:
         self._baselines = value
+
+    def set_tab_categories(self, categories: list[str] | None) -> None:
+        """Set the current tab categories for same-category switching discount.
+
+        When the user is switching between tabs that all belong to the same
+        category (e.g., all ``educational``), the window-switching penalty
+        should be reduced because the switching is topically coherent.
+
+        Args:
+            categories: List of tab type strings (one per open tab),
+                or None to disable the discount.
+        """
+        self._tab_categories = categories
+
+    def _same_category_ratio(self) -> float:
+        """Compute the ratio of tabs sharing the most common category.
+
+        Returns 0.0 when no tab categories are set or there is only one tab,
+        and approaches 1.0 when all tabs share the same type.
+        """
+        cats = self._tab_categories
+        if not cats or len(cats) < 2:
+            return 0.0
+        from collections import Counter
+        counts = Counter(cats)
+        most_common_count = counts.most_common(1)[0][1]
+        return most_common_count / len(cats)
 
     def compute_scores(self, fv: FeatureVector) -> StateScores:
         """
@@ -96,6 +125,14 @@ class RuleScorer:
         s6_thrash = fv.thrashing_score  # 0-1, from focus graph
         # Blend: thrashing_score is more accurate when available
         s6 = (0.6 * s6_thrash + 0.4 * s6_switch) if s6_thrash > 0.1 else s6_switch
+
+        # Same-category discount: switching between tabs of the same type
+        # (e.g., all educational) is topically coherent, not thrashing.
+        cat_ratio = self._same_category_ratio()
+        if cat_ratio > 0.6:
+            # Discount proportional to homogeneity (max 50% reduction)
+            discount = 0.5 * cat_ratio
+            s6 *= (1.0 - discount)
         s7 = self.score_workspace_complexity(fv)
 
         # Weighted sum (weights should sum to 1.0)

@@ -22,6 +22,7 @@ from pydantic import ValidationError
 
 from cortex.libs.schemas.context import TaskContext
 from cortex.libs.schemas.intervention import InterventionPlan, UIPlan
+from cortex.services.context_engine.tab_classifier import classify_tab
 
 
 def parse_llm_response(raw: str) -> dict[str, Any] | None:
@@ -150,6 +151,9 @@ _GENERIC_STEP_PHRASES = [
     "close the distraction",
     "review open tabs",
     "reduce visual clutter",
+    "focus on the current task",
+    "workspace analysis complete",
+    "review the current error or task",
 ]
 
 
@@ -204,6 +208,29 @@ def enrich_plan_with_context(
                             if tab_type
                             else f"Not related to your current work"
                         )
+
+    # --- Enforce tab-type safety rules via classifier ---
+    if plan.tab_recommendations and tabs:
+        # Determine if the user is likely debugging/coding
+        is_debugging = (
+            context.mode in ("coding_debugging", "terminal_errors")
+            or context.total_errors > 0
+        )
+        for rec in plan.tab_recommendations.tabs:
+            if 0 <= rec.tab_index < len(tabs):
+                tab_url = tabs[rec.tab_index].url
+                tab_title = tabs[rec.tab_index].title
+                tab_type = classify_tab(tab_url, tab_title)
+
+                # AI assistant tabs are ALWAYS kept — they are tools, not distractions
+                if tab_type == "ai_assistant":
+                    rec.action = "keep"
+                    rec.relevance_score = max(rec.relevance_score, 0.9)
+
+                # Documentation tabs kept when user is debugging/coding
+                if tab_type == "documentation" and is_debugging:
+                    rec.action = "keep"
+                    rec.relevance_score = max(rec.relevance_score, 0.8)
 
     # --- ALWAYS replace suggested_action labels with real tab titles ---
     if plan.suggested_actions and tabs:
