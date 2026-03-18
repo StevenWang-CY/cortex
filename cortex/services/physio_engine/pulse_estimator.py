@@ -156,8 +156,8 @@ class PulseEstimator:
         # Step 3: Peak detection for IBI
         peaks = detect_bvp_peaks(filtered, fs=self._fs)
 
-        # Step 4: IBI and RMSSD
-        ibi = compute_ibi_series(peaks, fs=self._fs)
+        # Step 4: IBI and RMSSD (with parabolic peak interpolation)
+        ibi = compute_ibi_series(peaks, fs=self._fs, signal=filtered)
         rmssd = compute_rmssd(ibi)
         ibi_count = len(ibi)
 
@@ -245,10 +245,10 @@ class PulseEstimator:
         return PhysioFeatures(
             pulse_bpm=est.hr_bpm,
             pulse_quality=est.signal_quality,
-            pulse_variability_proxy=est.rmssd_ms,
+            pulse_variability_proxy=est.rmssd_ms if est.ibi_count >= 5 else None,
             hr_delta_5s=hr_delta,
             respiration_rate_bpm=resp_rate,
-            valid=est.signal_quality > 0.1,
+            valid=est.signal_quality > 0.4,
         )
 
     @property

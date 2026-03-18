@@ -44,6 +44,26 @@ class TestShutdownDetector:
             )
             assert result is False
 
+    def test_default_late_hour_from_config(self):
+        """Default late_hour should be 23 from HandoverConfig."""
+        from cortex.libs.config.settings import HandoverConfig
+        detector = ShutdownDetector()
+        assert detector._late_hour == 23
+
+    def test_late_hour_from_config_object(self):
+        """late_hour should be read from HandoverConfig when provided."""
+        from cortex.libs.config.settings import HandoverConfig
+        cfg = HandoverConfig(late_hour=23)
+        detector = ShutdownDetector(config=cfg)
+        assert detector._late_hour == 23
+
+    def test_late_hour_explicit_overrides_config(self):
+        """Explicit late_hour parameter should override config."""
+        from cortex.libs.config.settings import HandoverConfig
+        cfg = HandoverConfig(late_hour=23)
+        detector = ShutdownDetector(late_hour=21, config=cfg)
+        assert detector._late_hour == 21
+
     def test_cooldown(self):
         detector = ShutdownDetector(hrv_baseline=50.0, late_hour=22, cooldown=3600.0)
         with patch("cortex.services.handover.detector.datetime") as mock_dt:

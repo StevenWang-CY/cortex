@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 # Quality thresholds for algorithm switching
 _QUALITY_GOOD = 0.4  # Above this, current algorithm is fine
-_QUALITY_POOR = 0.15  # Below this, switch to fallback
+_QUALITY_POOR = 0.40  # Below this, switch to fallback
 _SWITCH_COOLDOWN_WINDOWS = 5  # Minimum windows before reconsidering
 
 

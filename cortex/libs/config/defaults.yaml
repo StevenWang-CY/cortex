@@ -80,6 +80,9 @@ intervention:
   dismissal_threshold_bump: 0.05
   dismissal_decay_hours: 1
 
+handover:
+  late_hour: 23
+
 api:
   host: "127.0.0.1"
   port: 9472

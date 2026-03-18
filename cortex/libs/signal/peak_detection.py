@@ -130,13 +130,18 @@ def detect_bvp_peaks(
 def compute_ibi_series(
     peak_indices: NDArray[np.intp],
     fs: float = 30.0,
+    signal: NDArray[np.float64] | None = None,
 ) -> NDArray[np.float64]:
     """
     Compute inter-beat interval (IBI) series from peak indices.
 
+    If the original signal is provided, applies parabolic interpolation
+    to refine peak locations to sub-sample precision before computing IBI.
+
     Args:
         peak_indices: Array of peak sample indices.
         fs: Sampling frequency in Hz.
+        signal: Optional original signal for parabolic peak refinement.
 
     Returns:
         Array of inter-beat intervals in milliseconds.
@@ -144,8 +149,22 @@ def compute_ibi_series(
     if len(peak_indices) < 2:
         return np.array([], dtype=np.float64)
 
-    # Convert sample differences to milliseconds
-    ibi_samples = np.diff(peak_indices)
+    # Apply parabolic interpolation for sub-sample peak refinement
+    if signal is not None and len(signal) > 2:
+        refined = []
+        for pk in peak_indices:
+            if 0 < pk < len(signal) - 1:
+                a, b, c = signal[pk - 1], signal[pk], signal[pk + 1]
+                denom = a - 2 * b + c
+                offset = 0.5 * (a - c) / denom if abs(denom) > 1e-10 else 0.0
+                refined.append(pk + offset)
+            else:
+                refined.append(float(pk))
+        ibi_samples = np.diff(refined)
+    else:
+        # Convert sample differences to milliseconds
+        ibi_samples = np.diff(peak_indices)
+
     ibi_ms = ibi_samples * (1000.0 / fs)
 
     return ibi_ms

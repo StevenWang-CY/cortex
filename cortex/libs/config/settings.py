@@ -123,15 +123,21 @@ class InterventionConfig(BaseModel):
     overlay_threshold: float = 0.70
     simplified_threshold: float = 0.85
     guided_threshold: float = 0.95
-    complexity_threshold: float = 0.7
+    complexity_threshold: float = 0.6
     cooldown_seconds: int = 60
     hyper_dwell_seconds: float = 15.0
-    quiet_mode_minutes: int = 15
+    quiet_mode_minutes: int = 30
     max_dismissals: int = 3
     dismissal_window_minutes: int = 5
     timeout_minutes: int = 5
     dismissal_threshold_bump: float = 0.05
     dismissal_decay_hours: int = 1
+
+
+class HandoverConfig(BaseModel):
+    """Handover / shutdown detector configuration."""
+
+    late_hour: int = 23
 
 
 class APIConfig(BaseModel):
@@ -251,6 +257,7 @@ class CortexConfig(BaseSettings):
     capture: CaptureConfig = Field(default_factory=CaptureConfig)
     state: StateConfig = Field(default_factory=StateConfig)
     intervention: InterventionConfig = Field(default_factory=InterventionConfig)
+    handover: HandoverConfig = Field(default_factory=HandoverConfig)
     api: APIConfig = Field(default_factory=APIConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     signal: SignalConfig = Field(default_factory=SignalConfig)

@@ -89,13 +89,13 @@ class RuleScorer:
 
         s1 = self.score_pulse_elevation(fv.hr)
         s2 = self.score_hrv_drop(fv.hrv_rmssd)
-        s3 = self.score_blink_suppression(fv.blink_rate)
+        s3 = self.score_blink_suppression(fv.blink_rate, hr=fv.hr)
         s4 = self.score_posture_collapse(fv.forward_lean_angle, fv.shoulder_drop_ratio)
         s5 = self.score_mouse_thrash(fv.mouse_velocity_variance)
         s6_switch = self.score_window_switch(fv.tab_switch_frequency)
         s6_thrash = fv.thrashing_score  # 0-1, from focus graph
         # Blend: thrashing_score is more accurate when available
-        s6 = max(s6_switch, s6_thrash) if s6_thrash > 0.1 else s6_switch
+        s6 = (0.6 * s6_thrash + 0.4 * s6_switch) if s6_thrash > 0.1 else s6_switch
         s7 = self.score_workspace_complexity(fv)
 
         # Weighted sum (weights should sum to 1.0)
@@ -285,11 +285,12 @@ class RuleScorer:
         score = (40.0 - hrv_rmssd) / 30.0
         return float(np.clip(score, 0.0, 1.0))
 
-    def score_blink_suppression(self, blink_rate: float | None) -> float:
+    def score_blink_suppression(self, blink_rate: float | None, hr: float | None = None) -> float:
         """
         Score blink suppression: blink rate < 8/min.
 
         Returns 0-1, where 1.0 = near-zero blinking.
+        If HR is within 110% of baseline, attenuate score (concentration, not stress).
         """
         if blink_rate is None:
             return 0.0
@@ -299,7 +300,13 @@ class RuleScorer:
 
         # Linear from 8 → 0 maps to 0 → 1
         score = (8.0 - blink_rate) / 8.0
-        return float(np.clip(score, 0.0, 1.0))
+        score = float(np.clip(score, 0.0, 1.0))
+
+        # Attenuate if HR is normal — this is concentration, not stress
+        if hr is not None and hr <= self._baselines.hr_baseline * 1.10:
+            score *= 0.3
+
+        return score
 
     def score_screen_apnea(self, respiration_rate: float | None, blink_rate: float | None) -> float:
         """

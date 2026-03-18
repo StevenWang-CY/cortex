@@ -16,10 +16,12 @@ import logging
 import time
 from datetime import datetime
 
+from cortex.libs.config.settings import HandoverConfig
+
 logger = logging.getLogger(__name__)
 
 # Detection thresholds
-_DEFAULT_LATE_HOUR = 22  # 10 PM
+_DEFAULT_LATE_HOUR = 23  # 11 PM
 _POSTURE_SLUMP_THRESHOLD = 0.6
 _HRV_DROP_THRESHOLD = 0.7  # HRV at 70% of baseline
 _ERROR_RATE_THRESHOLD = 3  # errors per 5 minutes
@@ -43,11 +45,13 @@ class ShutdownDetector:
     def __init__(
         self,
         hrv_baseline: float = 50.0,
-        late_hour: int = _DEFAULT_LATE_HOUR,
+        late_hour: int | None = None,
         cooldown: float = _COOLDOWN_SECONDS,
+        config: HandoverConfig | None = None,
     ) -> None:
         self._hrv_baseline = hrv_baseline
-        self._late_hour = late_hour
+        cfg = config or HandoverConfig()
+        self._late_hour = late_hour if late_hour is not None else cfg.late_hour
         self._cooldown = cooldown
         self._fatigue_start: float | None = None
         self._last_trigger: float = 0.0

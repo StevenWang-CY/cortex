@@ -337,6 +337,50 @@ class TestSubScores:
         score = scorer.score_window_switch(5.0)
         assert score == 0.0
 
+    def test_s6_weighted_blend(self):
+        """thrashing_score=0.2, switch_rate=25 → s6 weighted blend result."""
+        scorer = self._make_scorer()
+        fv = FeatureVector(
+            timestamp=1.0,
+            hr=72.0,
+            hrv_rmssd=50.0,
+            blink_rate=16.0,
+            mouse_velocity_mean=400.0,
+            mouse_velocity_variance=5000.0,
+            tab_switch_frequency=25.0,
+            thrashing_score=0.2,
+        )
+        s6_switch = scorer.score_window_switch(25.0)
+        # thrashing_score=0.2 > 0.1, so weighted blend applies
+        expected_s6 = 0.6 * 0.2 + 0.4 * s6_switch
+        # Verify the blend formula: 0.6 * thrash + 0.4 * switch
+        assert abs(expected_s6 - (0.6 * 0.2 + 0.4 * s6_switch)) < 1e-9
+
+    def test_blink_suppression_attenuated_with_normal_hr(self):
+        """Normal HR + low blink → attenuated score (x0.3)."""
+        scorer = self._make_scorer()
+        # HR=72.0 is exactly baseline (72.0), within 110% of baseline
+        score = scorer.score_blink_suppression(3.0, hr=72.0)
+        # Without HR attenuation: (8-3)/8 = 0.625
+        # With attenuation: 0.625 * 0.3 = 0.1875
+        expected = (8.0 - 3.0) / 8.0 * 0.3
+        assert abs(score - expected) < 1e-6
+
+    def test_blink_suppression_full_with_high_hr(self):
+        """High HR + low blink → full score (no attenuation)."""
+        scorer = self._make_scorer()
+        # HR=95.0 is well above 72 * 1.10 = 79.2
+        score = scorer.score_blink_suppression(3.0, hr=95.0)
+        expected = (8.0 - 3.0) / 8.0  # 0.625
+        assert abs(score - expected) < 1e-6
+
+    def test_blink_suppression_no_hr_full_score(self):
+        """No HR provided → full score (no attenuation)."""
+        scorer = self._make_scorer()
+        score = scorer.score_blink_suppression(3.0, hr=None)
+        expected = (8.0 - 3.0) / 8.0  # 0.625
+        assert abs(score - expected) < 1e-6
+
 
 # =============================================================================
 # Score Smoother Tests

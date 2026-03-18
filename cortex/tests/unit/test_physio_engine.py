@@ -489,3 +489,64 @@ class TestQualityScorer:
         assert scorer.current_algorithm == RPPGAlgorithm.POS
         assert scorer.get_mean_quality() == 0.0
         assert scorer.latest_assessment is None
+
+
+# =============================================================================
+# Wave 1A — SQI validity, IBI count guard, parabolic interpolation
+# =============================================================================
+
+
+class TestSQIValidityThreshold:
+    """Tests for raised SQI validity threshold (C-01) and IBI count guard (C-03)."""
+
+    def test_low_sqi_with_few_peaks_invalid_and_no_hrv(self) -> None:
+        """SQI=0.3 with 2 peaks → valid=False, hrv=None."""
+        estimator = PulseEstimator(fs=30.0)
+
+        # Create a signal that will produce a low signal quality (~0.3)
+        # and very few peaks (2 peaks = 1 IBI, well below the 5 IBI guard)
+        est = PulseEstimate(
+            hr_bpm=72.0,
+            hr_confidence=0.5,
+            rmssd_ms=40.0,
+            ibi_count=2,
+            signal_quality=0.3,
+        )
+        estimator._latest_estimate = est
+
+        features = estimator.get_features(timestamp=10.0)
+        # SQI 0.3 < 0.4 threshold → invalid
+        assert features.valid is False
+        # ibi_count 2 < 5 → hrv should be None
+        assert features.pulse_variability_proxy is None
+
+
+class TestParabolicInterpolation:
+    """Tests for parabolic peak interpolation (C-02)."""
+
+    def test_parabolic_interpolation_reduces_ibi_std(self) -> None:
+        """Parabolic interpolation should reduce IBI std on a synthetic 70 BPM signal."""
+        from cortex.libs.signal.peak_detection import compute_ibi_series, detect_bvp_peaks
+        from cortex.libs.signal.filters import bandpass_filter
+
+        fs = 30.0
+        duration_s = 10.0
+        hr_bpm = 70.0
+        n_samples = int(fs * duration_s)
+        t = np.arange(n_samples) / fs
+
+        # Clean cardiac sinusoid
+        cardiac_freq = hr_bpm / 60.0
+        signal = np.sin(2 * np.pi * cardiac_freq * t)
+
+        filtered = bandpass_filter(signal, low_hz=0.7, high_hz=3.5, fs=fs, order=4)
+        peaks = detect_bvp_peaks(filtered, fs=fs)
+
+        if len(peaks) < 3:
+            pytest.skip("Not enough peaks for meaningful IBI comparison")
+
+        ibi_no_interp = compute_ibi_series(peaks, fs=fs, signal=None)
+        ibi_with_interp = compute_ibi_series(peaks, fs=fs, signal=filtered)
+
+        # Parabolic interpolation should produce equal or lower IBI std
+        assert np.std(ibi_with_interp) <= np.std(ibi_no_interp) + 1e-6
