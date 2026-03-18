@@ -93,6 +93,18 @@ See [`cortex/README.md`](cortex/README.md) for full documentation — setup, arc
 
 ---
 
+## What To Expect
+
+Cortex watches you through your webcam while you study — not to record you, but to read your pulse and breathing from subtle color changes in your face (a technique called remote photoplethysmography). It combines those biological signals with what's happening on your screen — which tabs are open, what errors your code is throwing, how fast you're switching between windows — to figure out whether you're in a productive flow, spiraling into overwhelm, or zoning out. When it detects you're struggling, it uses an AI model to figure out *how* to help: closing distraction tabs, surfacing the error fix you need, breaking your task into smaller steps, or just telling you to take a break because your body's stress accumulator says so. It also has a dedicated LeetCode mode that detects panic-coding patterns and tries to get you to slow down before you submit your fifth wrong answer in a row.
+
+What works well today: the state classification system is conservative and well-tuned — in testing, it correctly avoids false alarms for caffeinated studying, debugging sessions, and deep reading. The biological break timer (which replaces arbitrary Pomodoro intervals with actual HRV-based fatigue tracking) is a genuinely novel feature that works as designed. The LeetCode mode's multi-selector DOM strategy is resilient to LeetCode's frequent UI changes, and the intervention matrix covers real failure modes students hit. The context-aware fallback system means you still get useful help even when the AI model is slow or unavailable. The progressive consent system lets Cortex earn your trust gradually — it starts by just observing, and only takes actions after you've approved similar ones multiple times.
+
+Cortex asks for your webcam (for pulse and posture — no video is saved or sent anywhere), broad browser permissions (to read tab titles and URLs for context — the AI model never sees your biometrics), and a 2-minute baseline calibration session where you sit still so it can learn your resting heart rate. It runs a local daemon on your machine that communicates with a Chrome extension and optionally a VS Code extension. The AI model (Azure OpenAI, Qwen, or a local Ollama instance) sees only workspace context: file paths, error messages, and tab titles. Your physiological data stays on your machine.
+
+Cortex is not a study planner, a to-do app, or a replacement for actually understanding the material. The heart rate signal from a webcam is noisier than a chest strap — in dim lighting or if you move a lot, the biological signals degrade and the system falls back to behavioral-only detection. The HRV measurement at 30 FPS is at the edge of what's physiologically meaningful and works best as a trend indicator over minutes, not a precise beat-by-beat measurement. The AI-generated interventions are sometimes generic or slightly off-target, especially early on before the learning system has calibrated to your preferences. And if you're the kind of student who studies past midnight, you'll want to adjust the wind-down hour from its default — it was set for an earlier bedtime than most college students keep.
+
+---
+
 ## Privacy
 
 - **No video is ever saved.** Frames are processed in memory and immediately discarded.
