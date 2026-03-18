@@ -233,22 +233,20 @@ class InterventionPlan(BaseModel):
 
     @property
     def is_destructive(self) -> bool:
-        """Check if plan contains destructive workspace actions (should always be False)."""
-        destructive_phrases = [
-            "delete file", "delete tab", "delete project",
-            "close tab", "close window", "close application",
-            "remove permanently", "discard changes", "discard file",
-        ]
-        text_parts = [
-            self.situation_summary,
-            self.headline,
-            *self.micro_steps,
-            *self.hide_targets,
-        ]
+        """Check if plan contains destructive workspace actions (should always be False).
+
+        Uses action_type checking instead of substring matching on labels,
+        which avoids false positives on benign labels like 'Close New Tab'.
+        close_tab is NOT inherently destructive (it's reversible via undo).
+        """
+        destructive_action_types = {
+            "delete_file", "delete_project", "close_application", "discard_changes",
+        }
         for action in self.suggested_actions:
-            text_parts.extend([action.label, action.target])
-        all_text = " ".join(text_parts).lower()
-        return any(phrase in all_text for phrase in destructive_phrases)
+            if action.action_type in destructive_action_types:
+                return True
+        # close_tab is NOT inherently destructive (it's reversible via undo)
+        return False
 
 
 class FoldState(BaseModel):

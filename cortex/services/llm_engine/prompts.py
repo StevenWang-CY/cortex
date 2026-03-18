@@ -449,6 +449,7 @@ def build_user_prompt(
     constraints: SimplificationConstraints | None = None,
     *,
     template_name: str | None = None,
+    extra_context: str = "",
 ) -> str:
     """
     Build the complete user prompt from context, state, and constraints.
@@ -458,6 +459,8 @@ def build_user_prompt(
         state: User state estimate.
         constraints: Optional simplification constraints.
         template_name: Override automatic template selection.
+        extra_context: Additional context for v2 templates (e.g. respiration
+            data, visible page text, drift info, focus transition data).
 
     Returns:
         Formatted user prompt string.
@@ -495,6 +498,7 @@ def build_user_prompt(
         complexity=context.complexity_score,
         constraints_text=constraints_text,
         goal_hint=goal_hint,
+        extra_context=extra_context,
     )
 
 
@@ -504,6 +508,7 @@ def build_messages(
     constraints: SimplificationConstraints | None = None,
     *,
     template_name: str | None = None,
+    extra_context: str = "",
 ) -> list[dict[str, str]]:
     """
     Build the full message list for the OpenAI-compatible chat API.
@@ -512,7 +517,8 @@ def build_messages(
         List of {"role": ..., "content": ...} dicts.
     """
     user_prompt = build_user_prompt(
-        context, state, constraints, template_name=template_name
+        context, state, constraints, template_name=template_name,
+        extra_context=extra_context,
     )
     return [
         {"role": "system", "content": SYSTEM_PROMPT},

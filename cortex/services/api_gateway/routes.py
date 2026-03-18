@@ -558,6 +558,47 @@ async def get_helpfulness_summary(request: Request) -> HelpfulnessSummaryRespons
     return HelpfulnessSummaryResponse()
 
 
+# =============================================================================
+# Consent Endpoints
+# =============================================================================
+
+
+class ConsentLevelResponse(BaseModel):
+    """Current consent state."""
+    levels: dict[str, dict] = Field(default_factory=dict)
+    timestamp: float = Field(default_factory=time.monotonic)
+
+
+class ConsentResetResponse(BaseModel):
+    """Result of consent reset."""
+    reset: bool = False
+    levels: dict[str, dict] = Field(default_factory=dict)
+    timestamp: float = Field(default_factory=time.monotonic)
+
+
+@router.get("/consent/level", response_model=ConsentLevelResponse)
+async def get_consent_level(request: Request) -> ConsentLevelResponse:
+    """Get current consent ladder state for all action types."""
+    reg = _get_registry(request)
+    ladder = reg.get("consent_ladder")
+    if ladder is not None and hasattr(ladder, "get_all_states"):
+        states = await ladder.get_all_states()
+        return ConsentLevelResponse(levels=states)
+    return ConsentLevelResponse()
+
+
+@router.post("/consent/reset", response_model=ConsentResetResponse)
+async def reset_consent(request: Request) -> ConsentResetResponse:
+    """Reset consent ladder to defaults and return new state."""
+    reg = _get_registry(request)
+    ladder = reg.get("consent_ladder")
+    if ladder is not None and hasattr(ladder, "reset"):
+        await ladder.reset()
+        states = await ladder.get_all_states()
+        return ConsentResetResponse(reset=True, levels=states)
+    return ConsentResetResponse()
+
+
 class ProjectListResponse(BaseModel):
     """List of configured projects."""
     projects: list[dict] = Field(default_factory=list)

@@ -602,6 +602,27 @@ class CortexDaemon:
                 timeout=self.config.llm.timeout_seconds + 5.0,
             )
             plan = enrich_plan_with_context(plan, context)
+
+            # Staleness check: suppress if student genuinely recovered
+            current_state = registry.get("latest_state_estimate")
+            if current_state:
+                # Suppress only if student is in FLOW for >3s (genuine recovery)
+                if (current_state.state == "FLOW"
+                        and current_state.dwell_seconds >= 3.0):
+                    logger.info("Suppressing stale intervention: student in FLOW for %.1fs", current_state.dwell_seconds)
+                    self._active_intervention_id = None
+                    return
+                # Also check if workspace context changed significantly
+                if hasattr(context, 'browser_context') and context.browser_context:
+                    current_tab_count = len(context.browser_context.all_tabs) if context.browser_context.all_tabs else 0
+                    if plan.suggested_actions:
+                        stale_actions = sum(1 for a in plan.suggested_actions
+                                            if a.tab_index is not None and a.tab_index >= current_tab_count)
+                        if stale_actions > len(plan.suggested_actions) * 0.5:
+                            logger.info("Suppressing stale intervention: >50%% tab references invalid")
+                            self._active_intervention_id = None
+                            return
+
             validation, commands = prepare_plan(plan)
             if not validation.is_valid:
                 logger.warning("Rejected intervention plan %s: %s", plan.intervention_id, validation.errors)

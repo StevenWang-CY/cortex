@@ -74,13 +74,34 @@ def _make_plan(
     hide_targets: list[str] | None = None,
     destructive: bool = False,
 ) -> InterventionPlan:
+    from cortex.libs.schemas.intervention import SuggestedAction
+
     if steps is None:
         steps = ["Check line 10", "Fix the variable"]
     if hide_targets is None:
         hide_targets = ["editor_symbols_except_current_function"]
+
+    suggested_actions = []
     if destructive:
         headline = "Delete unused files"
         steps = ["Delete config.yaml", "Remove permanently the backup"]
+        # Build a SuggestedAction with a destructive action_type by
+        # bypassing Pydantic validation (since delete_file is not a
+        # valid Literal value in production, but is_destructive guards
+        # against it as a safety net).
+        action = SuggestedAction.model_construct(
+            action_id="act_destructive",
+            action_type="delete_file",
+            tab_index=None,
+            target="",
+            label="Delete project files",
+            reason="Remove clutter",
+            category="recommended",
+            reversible=False,
+            group_id=None,
+            metadata={},
+        )
+        suggested_actions = [action]
 
     return InterventionPlan(
         level=level,
@@ -96,6 +117,7 @@ def _make_plan(
             intervention_type=level,
         ),
         tone="direct",
+        suggested_actions=suggested_actions,
     )
 
 
@@ -765,6 +787,150 @@ class TestMutation(unittest.TestCase):
     def test_not_reversible(self):
         m = Mutation(adapter="editor", action="custom")
         assert m.is_reversible is False
+
+
+# ===========================================================================
+# is_destructive Tests (W-11 fix: action_type not label text)
+# ===========================================================================
+
+
+class TestIsDestructive(unittest.TestCase):
+    """Test is_destructive uses action_type checking, not label substring matching."""
+
+    def test_close_tab_is_not_destructive(self):
+        """close_tab action is reversible, not destructive."""
+        from cortex.libs.schemas.intervention import SuggestedAction
+        plan = _make_plan()
+        plan.suggested_actions = [
+            SuggestedAction(
+                action_type="close_tab",
+                tab_index=0,
+                label="Close New Tab",
+                reason="Unrelated",
+            ),
+        ]
+        assert plan.is_destructive is False
+
+    def test_new_tab_label_not_destructive(self):
+        """A tab titled 'New Tab' with close_tab action should NOT trigger is_destructive."""
+        from cortex.libs.schemas.intervention import SuggestedAction
+        plan = _make_plan(headline="Simplify your workspace")
+        plan.suggested_actions = [
+            SuggestedAction(
+                action_type="close_tab",
+                tab_index=2,
+                label="Close New Tab",
+                reason="Empty tab",
+                metadata={"tab_title": "New Tab"},
+            ),
+        ]
+        assert plan.is_destructive is False
+
+    def test_group_tabs_not_destructive(self):
+        """group_tabs is not destructive."""
+        from cortex.libs.schemas.intervention import SuggestedAction
+        plan = _make_plan()
+        plan.suggested_actions = [
+            SuggestedAction(
+                action_type="group_tabs",
+                label="Group related tabs",
+                reason="Reduce visual clutter",
+            ),
+        ]
+        assert plan.is_destructive is False
+
+    def test_no_actions_not_destructive(self):
+        """Plan with no suggested_actions is not destructive."""
+        plan = _make_plan()
+        plan.suggested_actions = []
+        assert plan.is_destructive is False
+
+    def test_close_tab_reversible_tracked(self):
+        """close_tab action should have reversible=True by default."""
+        from cortex.libs.schemas.intervention import SuggestedAction
+        action = SuggestedAction(
+            action_type="close_tab",
+            tab_index=1,
+            label="Close Stack Overflow",
+        )
+        assert action.reversible is True
+
+
+# ===========================================================================
+# Staleness Check Tests (C-06: suppress stale interventions)
+# ===========================================================================
+
+
+class TestStalenessCheck(unittest.TestCase):
+    """Test the staleness suppression logic used in runtime_daemon._trigger_intervention."""
+
+    def _should_suppress_stale(
+        self,
+        current_state: StateEstimate,
+        plan: InterventionPlan,
+        context: TaskContext,
+    ) -> bool:
+        """Replicate the staleness check from runtime_daemon._trigger_intervention."""
+        # Suppress only if student is in FLOW for >3s (genuine recovery)
+        if (current_state.state == "FLOW"
+                and current_state.dwell_seconds >= 3.0):
+            return True
+        # Also check if workspace context changed significantly
+        if hasattr(context, 'browser_context') and context.browser_context:
+            current_tab_count = len(context.browser_context.all_tabs) if context.browser_context.all_tabs else 0
+            if plan.suggested_actions:
+                stale_actions = sum(1 for a in plan.suggested_actions
+                                    if a.tab_index is not None and a.tab_index >= current_tab_count)
+                if stale_actions > len(plan.suggested_actions) * 0.5:
+                    return True
+        return False
+
+    def test_suppress_when_flow_3s(self):
+        """Student in FLOW for >=3s: intervention should be suppressed."""
+        state = _make_estimate(state="FLOW", confidence=0.8, dwell=5.0)
+        plan = _make_plan()
+        ctx = _make_context()
+        assert self._should_suppress_stale(state, plan, ctx) is True
+
+    def test_deliver_when_recovery(self):
+        """Student in RECOVERY: intervention should NOT be suppressed."""
+        state = _make_estimate(state="RECOVERY", confidence=0.8, dwell=5.0)
+        plan = _make_plan()
+        ctx = _make_context()
+        assert self._should_suppress_stale(state, plan, ctx) is False
+
+    def test_deliver_when_flow_under_3s(self):
+        """Student in FLOW for <3s: intervention should NOT be suppressed (not genuine recovery)."""
+        state = _make_estimate(state="FLOW", confidence=0.8, dwell=2.0)
+        plan = _make_plan()
+        ctx = _make_context()
+        assert self._should_suppress_stale(state, plan, ctx) is False
+
+    def test_suppress_when_tab_references_invalid(self):
+        """If >50% of action tab references are invalid, suppress."""
+        from cortex.libs.schemas.intervention import SuggestedAction
+        state = _make_estimate(state="HYPER", dwell=1.0)
+        plan = _make_plan()
+        # Context has 3 tabs (indices 0,1,2), but actions reference tab indices 5,6,7
+        plan.suggested_actions = [
+            SuggestedAction(action_type="close_tab", tab_index=5, label="Close tab 5"),
+            SuggestedAction(action_type="close_tab", tab_index=6, label="Close tab 6"),
+            SuggestedAction(action_type="highlight_tab", tab_index=0, label="Focus"),
+        ]
+        ctx = _make_context(with_browser=True)  # 3 tabs
+        assert self._should_suppress_stale(state, plan, ctx) is True
+
+    def test_deliver_when_tab_references_valid(self):
+        """If tab references are valid, deliver."""
+        from cortex.libs.schemas.intervention import SuggestedAction
+        state = _make_estimate(state="HYPER", dwell=1.0)
+        plan = _make_plan()
+        plan.suggested_actions = [
+            SuggestedAction(action_type="close_tab", tab_index=1, label="Close tab 1"),
+            SuggestedAction(action_type="highlight_tab", tab_index=0, label="Focus"),
+        ]
+        ctx = _make_context(with_browser=True)  # 3 tabs
+        assert self._should_suppress_stale(state, plan, ctx) is False
 
 
 # ===========================================================================

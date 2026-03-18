@@ -190,3 +190,41 @@ class TestCheckDecision:
 
         decision = _run(ladder.check("show_overlay", requested_level=PREVIEW))
         assert decision.effective_level <= SUGGEST
+
+
+# ---------------------------------------------------------------------------
+# Reset clears all state
+# ---------------------------------------------------------------------------
+
+class TestReset:
+    def test_reset_clears_all_action_states(self, ladder):
+        """After reset(), all earned levels should be gone."""
+        for _ in range(5):
+            _run(ladder.record_approval("close_tab"))
+        assert _run(ladder.get_level("close_tab")) > PREVIEW
+
+        _run(ladder.reset())
+        # After reset, getting the level re-creates from policy defaults
+        level = _run(ladder.get_level("close_tab"))
+        assert level == PREVIEW  # back to policy minimum
+
+    def test_reset_single_action(self, ladder):
+        """Resetting a single action type should not affect others."""
+        for _ in range(5):
+            _run(ladder.record_approval("close_tab"))
+            _run(ladder.record_approval("show_overlay"))
+
+        _run(ladder.reset("close_tab"))
+        # close_tab should be reset
+        assert _run(ladder.get_level("close_tab")) == PREVIEW
+        # show_overlay should still be escalated
+        assert _run(ladder.get_level("show_overlay")) > SUGGEST
+
+    def test_get_all_states_returns_dict(self, ladder):
+        """get_all_states should return all tracked action types."""
+        _run(ladder.check("close_tab"))
+        _run(ladder.check("show_overlay"))
+        states = _run(ladder.get_all_states())
+        assert isinstance(states, dict)
+        assert "close_tab" in states
+        assert "show_overlay" in states

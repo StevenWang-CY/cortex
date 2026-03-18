@@ -682,6 +682,62 @@ class TestWebSocketServer:
 
 
 # =============================================================================
+# Consent Endpoint Tests
+# =============================================================================
+
+
+class TestConsentEndpoints:
+    """Test consent level and reset endpoints."""
+
+    def test_get_consent_level_no_ladder(self, client: TestClient):
+        """Without consent_ladder registered, should return empty levels."""
+        resp = client.get("/consent/level")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["levels"] == {}
+
+    def test_get_consent_level_with_ladder(self, client: TestClient):
+        from cortex.services.consent.ladder import ConsentLadder
+        from cortex.services.consent.policy import ConsentPolicy
+        ladder = ConsentLadder(policy=ConsentPolicy(), store=None)
+        registry.register("consent_ladder", ladder)
+
+        # Prime the ladder by checking an action (creates initial state)
+        import asyncio
+        asyncio.get_event_loop().run_until_complete(ladder.check("close_tab"))
+
+        resp = client.get("/consent/level")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "close_tab" in data["levels"]
+
+    def test_reset_consent_no_ladder(self, client: TestClient):
+        """Without consent_ladder registered, reset returns not-reset."""
+        resp = client.post("/consent/reset")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["reset"] is False
+
+    def test_reset_consent_with_ladder(self, client: TestClient):
+        from cortex.services.consent.ladder import ConsentLadder
+        from cortex.services.consent.policy import ConsentPolicy
+        ladder = ConsentLadder(policy=ConsentPolicy(), store=None)
+        registry.register("consent_ladder", ladder)
+
+        import asyncio
+        # Record some approvals to change state
+        for _ in range(5):
+            asyncio.get_event_loop().run_until_complete(ladder.record_approval("close_tab"))
+
+        # Reset
+        resp = client.post("/consent/reset")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["reset"] is True
+        assert data["levels"] == {}  # All states cleared after reset
+
+
+# =============================================================================
 # Module Import Tests
 # =============================================================================
 
