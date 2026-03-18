@@ -122,6 +122,7 @@ function CortexPopup(): React.ReactElement {
     const [causalExplanation, setCausalExplanation] = useState<string>("");
     const [briefing, setBriefing] = useState<MorningBriefing | null>(null);
     const [tabCloseDisabled, setTabCloseDisabled] = useState(false);
+    const [quietMode, setQuietMode] = useState(false);
     const [launching, setLaunching] = useState(false);
     const [launchError, setLaunchError] = useState(false);
     const [tabsExpanded, setTabsExpanded] = useState(false);
@@ -137,11 +138,16 @@ function CortexPopup(): React.ReactElement {
         return () => { style.remove(); };
     }, []);
 
-    // Load tab-close toggle state on mount
+    // Load tab-close and quiet-mode toggle states on mount
     useEffect(() => {
         chrome.storage.local.get("cortex_tab_close_disabled", (result) => {
             if (result.cortex_tab_close_disabled === true) {
                 setTabCloseDisabled(true);
+            }
+        });
+        chrome.storage.session.get("quietMode", (result) => {
+            if (result.quietMode === true) {
+                setQuietMode(true);
             }
         });
     }, []);
@@ -151,6 +157,12 @@ function CortexPopup(): React.ReactElement {
         setTabCloseDisabled(newValue);
         chrome.storage.local.set({ cortex_tab_close_disabled: newValue });
     }, [tabCloseDisabled]);
+
+    const handleQuietModeToggle = useCallback(() => {
+        const newValue = !quietMode;
+        setQuietMode(newValue);
+        chrome.runtime.sendMessage({ type: "TOGGLE_QUIET_MODE", quiet: newValue });
+    }, [quietMode]);
 
     const handleLaunchCortex = useCallback(() => {
         setLaunching(true);
@@ -234,6 +246,13 @@ function CortexPopup(): React.ReactElement {
                     setCausalExplanation("");
                     setApplied(false);
                     break;
+                case "SETTINGS_SYNC": {
+                    const settings = msg.payload as Record<string, unknown>;
+                    if (typeof settings.quiet_mode === "boolean") {
+                        setQuietMode(settings.quiet_mode);
+                    }
+                    break;
+                }
                 case "MORNING_BRIEFING": {
                     const b = msg.payload as Record<string, unknown>;
                     setBriefing({
@@ -586,6 +605,29 @@ function CortexPopup(): React.ReactElement {
                         <div style={{
                             ...S.toggleThumb,
                             transform: tabCloseDisabled ? "translateX(0)" : "translateX(16px)",
+                        }} />
+                    </button>
+                </div>
+
+                {/* Quiet Mode toggle */}
+                <div style={S.toggleRow}>
+                    <div>
+                        <div style={S.toggleLabel}>Quiet mode</div>
+                        <div style={S.toggleDesc}>
+                            {quietMode ? "Interventions paused" : "Interventions active"}
+                        </div>
+                    </div>
+                    <button
+                        style={{
+                            ...S.toggleTrack,
+                            background: quietMode ? CX.accent : "rgba(255, 255, 255, 0.04)",
+                        }}
+                        onClick={handleQuietModeToggle}
+                        aria-label={quietMode ? "Disable quiet mode" : "Enable quiet mode"}
+                    >
+                        <div style={{
+                            ...S.toggleThumb,
+                            transform: quietMode ? "translateX(16px)" : "translateX(0)",
                         }} />
                     </button>
                 </div>

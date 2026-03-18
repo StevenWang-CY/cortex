@@ -56,10 +56,12 @@ let quietMode = false;
 // Dismissal cooldown: maps intervention_id → timestamp when dismissed
 // Prevents the same intervention from re-triggering within the cooldown window
 const dismissedInterventions = new Map<string, number>();
-const INTERVENTION_DISMISS_COOLDOWN = 30 * 60 * 1000; // 30 min cooldown after dismiss
+const DEFAULT_INTERVENTION_DISMISS_COOLDOWN = 30 * 60 * 1000; // 30 min cooldown after dismiss
+let interventionDismissCooldown = DEFAULT_INTERVENTION_DISMISS_COOLDOWN;
 // Also track by URL pattern to prevent same-site re-triggers
 const dismissedUrlPatterns = new Map<string, number>();
-const URL_DISMISS_COOLDOWN = 10 * 60 * 1000; // 10 min cooldown for same URL
+const DEFAULT_URL_DISMISS_COOLDOWN = 10 * 60 * 1000; // 10 min cooldown for same URL
+let urlDismissCooldown = DEFAULT_URL_DISMISS_COOLDOWN;
 
 // --- Focus Session State ---
 
@@ -544,7 +546,7 @@ async function handleMessage(raw: string): Promise<void> {
             // Check cooldown: skip if this intervention was recently dismissed
             if (iid && dismissedInterventions.has(iid)) {
                 const dismissedAt = dismissedInterventions.get(iid)!;
-                if (now - dismissedAt < INTERVENTION_DISMISS_COOLDOWN) {
+                if (now - dismissedAt < interventionDismissCooldown) {
                     console.log(`Cortex: skipping intervention ${iid} — dismissed ${Math.round((now - dismissedAt) / 1000)}s ago`);
                     break;
                 }
@@ -557,7 +559,7 @@ async function handleMessage(raw: string): Promise<void> {
             const urlKey = triggerUrl ? new URL(triggerUrl).hostname : null;
             if (urlKey && dismissedUrlPatterns.has(urlKey)) {
                 const dismissedAt = dismissedUrlPatterns.get(urlKey)!;
-                if (now - dismissedAt < URL_DISMISS_COOLDOWN) {
+                if (now - dismissedAt < urlDismissCooldown) {
                     console.log(`Cortex: skipping intervention for ${urlKey} — dismissed ${Math.round((now - dismissedAt) / 1000)}s ago`);
                     break;
                 }
@@ -591,6 +593,13 @@ async function handleMessage(raw: string): Promise<void> {
 
         case "SETTINGS_SYNC":
             quietMode = Boolean(msg.payload.quiet_mode);
+            // Sync cooldown values from daemon config, keeping defaults as fallbacks
+            if (typeof msg.payload.intervention_dismiss_cooldown_ms === "number") {
+                interventionDismissCooldown = msg.payload.intervention_dismiss_cooldown_ms as number;
+            }
+            if (typeof msg.payload.url_dismiss_cooldown_ms === "number") {
+                urlDismissCooldown = msg.payload.url_dismiss_cooldown_ms as number;
+            }
             schedulePersist();
             broadcastToPopup({ type: "SETTINGS_SYNC", payload: msg.payload });
             break;
@@ -762,7 +771,7 @@ function injectOverlay(payload: Record<string, unknown>): void {
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
 *{box-sizing:border-box;margin:0;padding:0}
 
-.bk{position:fixed;inset:0;background:rgba(0,0,0,.35);pointer-events:auto;animation:fadeIn .25s ease}
+.bk{position:fixed;inset:0;background:transparent;pointer-events:none;animation:fadeIn .25s ease}
 
 .pn{
   position:fixed;bottom:20px;right:20px;width:340px;max-height:calc(100vh - 40px);overflow-y:auto;
@@ -2303,6 +2312,21 @@ chrome.runtime.onMessage.addListener(
                 sendResponse({ ok: true });
                 break;
 
+            case "TOGGLE_QUIET_MODE":
+                quietMode = Boolean(message.quiet);
+                schedulePersist();
+                // Notify daemon if connected
+                if (connected && ws) {
+                    send({
+                        type: "SETTINGS_SYNC",
+                        payload: { quiet_mode: quietMode },
+                        timestamp: Date.now() / 1000,
+                        sequence: ++sequence,
+                    });
+                }
+                sendResponse({ ok: true, quietMode });
+                break;
+
             case "LAUNCH_CORTEX":
                 // Connect if not connected, then enable webcam capture
                 if (!connected) {
@@ -2360,10 +2384,10 @@ chrome.runtime.onMessage.addListener(
                     }).catch(() => {});
                     // Prune old entries
                     for (const [k, t] of dismissedInterventions) {
-                        if (now - t > INTERVENTION_DISMISS_COOLDOWN) dismissedInterventions.delete(k);
+                        if (now - t > interventionDismissCooldown) dismissedInterventions.delete(k);
                     }
                     for (const [k, t] of dismissedUrlPatterns) {
-                        if (now - t > URL_DISMISS_COOLDOWN) dismissedUrlPatterns.delete(k);
+                        if (now - t > urlDismissCooldown) dismissedUrlPatterns.delete(k);
                     }
                     schedulePersist();
 

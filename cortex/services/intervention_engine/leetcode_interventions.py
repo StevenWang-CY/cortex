@@ -9,6 +9,7 @@ and cooldown logic for a specific cell (or set of cells) in the matrix.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import Any
 
@@ -281,14 +282,32 @@ class SolutionEscapeFriction:
     Triggers at (*any stage*, PANIC|FATIGUE) when ``ctx.solutions_tab_attempted``
     is True.  Presents a reflection prompt before allowing access to solutions.
 
-    Cooldown: 60 s (1 min).
+    Cooldown: adaptive — starts at 60s and decays exponentially toward 10s
+    as the user spends more time on the problem.  Scaled by difficulty.
     """
 
-    _COOLDOWN_S: float = 60.0
     _TRIGGER_MODES = {LeetCodeMode.PANIC, LeetCodeMode.FATIGUE}
 
     def __init__(self) -> None:
         self._last_trigger_time: float | None = None
+
+    @staticmethod
+    def _compute_friction(time_elapsed_s: float, difficulty: str) -> float:
+        """Compute adaptive cooldown using exponential decay.
+
+        Early in a problem the friction is high (up to 60s * difficulty_mult).
+        As the user spends more time, friction decays toward a 10s floor.
+
+        Args:
+            time_elapsed_s: Seconds elapsed since the user started the problem.
+            difficulty: Problem difficulty ("Easy", "Medium", "Hard").
+
+        Returns:
+            Cooldown duration in seconds.
+        """
+        difficulty_mult = {"Easy": 0.5, "Medium": 1.0, "Hard": 1.5}.get(difficulty, 1.0)
+        base = max(10, 60 * math.exp(-time_elapsed_s / 600))
+        return base * difficulty_mult
 
     def should_trigger(
         self,
@@ -302,7 +321,10 @@ class SolutionEscapeFriction:
             return False
         if self._last_trigger_time is not None:
             elapsed = time.monotonic() - self._last_trigger_time
-            if elapsed < self._COOLDOWN_S:
+            cooldown = self._compute_friction(
+                leetcode_ctx.time_elapsed_s, leetcode_ctx.difficulty,
+            )
+            if elapsed < cooldown:
                 return False
         return True
 
@@ -313,10 +335,14 @@ class SolutionEscapeFriction:
     ) -> dict[str, Any]:
         """Build the action payload to send via the LeetCode adapter."""
         self._last_trigger_time = time.monotonic()
+        friction = self._compute_friction(
+            leetcode_ctx.time_elapsed_s, leetcode_ctx.difficulty,
+        )
         logger.info(
-            "SolutionEscapeFriction fired at stage %s (elapsed %.0f s)",
+            "SolutionEscapeFriction fired at stage %s (elapsed %.0f s, friction=%.1f s)",
             leetcode_ctx.stage.value,
             leetcode_ctx.time_elapsed_s,
+            friction,
         )
         return {
             "action": "show_solution_friction",
@@ -324,6 +350,7 @@ class SolutionEscapeFriction:
                 "stage": leetcode_ctx.stage.value,
                 "time_elapsed_s": leetcode_ctx.time_elapsed_s,
                 "difficulty": leetcode_ctx.difficulty,
+                "friction_s": friction,
             },
         }
 

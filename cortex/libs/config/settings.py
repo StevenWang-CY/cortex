@@ -138,6 +138,9 @@ class HandoverConfig(BaseModel):
     """Handover / shutdown detector configuration."""
 
     late_hour: int = 23
+    posture_slump_threshold: float = 0.6
+    hrv_drop_threshold: float = 0.7
+    error_rate_threshold: int = 3
 
 
 class APIConfig(BaseModel):

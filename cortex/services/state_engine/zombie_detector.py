@@ -4,12 +4,13 @@ State Engine — Zombie-Reading Interception
 Detects when the user is passively reading without absorbing content:
 - HYPO state active (low arousal)
 - Browser is the active app
-- Rhythmic, slow vertical scrolling (< 50 px/s)
 - Limited mouse XY movement (< 30 px/s)
 - Blink rate above baseline (glazed eyes)
 
-When detected, triggers an Active Recall overlay that scrapes the visible
-text and generates a fill-in-the-blank question to break the trance.
+All four conditions must be sustained for a minimum duration (default 90s)
+before triggering. When detected, triggers an Active Recall overlay that
+scrapes the visible text and generates a fill-in-the-blank question to
+break the trance.
 """
 
 from __future__ import annotations
