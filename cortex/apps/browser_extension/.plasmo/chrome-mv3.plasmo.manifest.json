@@ -18,7 +18,7 @@
     "default_popup": "./popup.html"
   },
   "version": "0.1.0",
-  "name": "DEV | Cortex — Somatic Workspace Engine",
+  "name": "Cortex — Somatic Workspace Engine",
   "description": "Real-time biofeedback workspace engine for Chrome.",
   "background": {
     "service_worker": "./static/background/index.ts"
@@ -58,5 +58,15 @@
   ],
   "host_permissions": [
     "<all_urls>"
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "assets/fonts/*"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
   ]
 }

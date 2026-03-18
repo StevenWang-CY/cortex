@@ -9,13 +9,7 @@
  */
 
 import React, { useEffect, useRef, useState } from "react";
-
-const STATE_COLORS: Record<string, { r: number; g: number; b: number }> = {
-    FLOW: { r: 16, g: 185, b: 129 },     // emerald #10b981
-    HYPER: { r: 239, g: 68, b: 68 },      // red #ef4444
-    HYPO: { r: 59, g: 130, b: 246 },      // blue #3b82f6
-    RECOVERY: { r: 245, g: 158, b: 11 },  // amber #f59e0b
-};
+import { CX, STATE_COLORS_RGB, CX_KEYFRAMES } from "./design-tokens";
 
 interface Ring {
     born: number;
@@ -57,12 +51,38 @@ function PulseRoom(): React.ReactElement {
     });
 
     const [displayHR, setDisplayHR] = useState(0);
-    const [displayState, setDisplayState] = useState("");
     const [displayConnected, setDisplayConnected] = useState(false);
+    const [reducedMotion, setReducedMotion] = useState(false);
 
-    // Activity tracking — "Continue where you left off"
+    // Activity tracking — resume cards at bottom
     const [activities, setActivities] = useState<RecentActivity[]>([]);
     const [showActivities, setShowActivities] = useState(false);
+
+    // Inject fonts + keyframes
+    useEffect(() => {
+        const id = "cortex-newtab-styles";
+        if (document.getElementById(id)) { return; }
+        const style = document.createElement("style");
+        style.id = id;
+        style.textContent = `
+            ${CX_KEYFRAMES}
+            @keyframes activityFadeIn {
+                from { opacity: 0; transform: translateY(8px); }
+                to { opacity: 1; transform: translateY(0); }
+            }
+        `;
+        document.head.appendChild(style);
+
+        const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+        setReducedMotion(mq.matches);
+        const handler = (e: MediaQueryListEvent) => setReducedMotion(e.matches);
+        mq.addEventListener("change", handler);
+
+        return () => {
+            document.head.removeChild(style);
+            mq.removeEventListener("change", handler);
+        };
+    }, []);
 
     // Poll background for state
     useEffect(() => {
@@ -75,7 +95,6 @@ function PulseRoom(): React.ReactElement {
                     if (response.state) {
                         stateRef.current.state = response.state.state || "";
                         stateRef.current.confidence = response.state.confidence || 0;
-                        setDisplayState(response.state.state || "");
                         const bio = response.state.biometrics;
                         if (bio?.heart_rate) {
                             stateRef.current.heartRate = Math.round(bio.heart_rate);
@@ -92,14 +111,12 @@ function PulseRoom(): React.ReactElement {
         poll();
         const interval = setInterval(poll, 3000);
 
-        // Listen for live updates
         const listener = (message: Record<string, unknown>) => {
             if (message.type === "STATE_UPDATE" && message.payload) {
                 const payload = message.payload as Record<string, unknown>;
                 stateRef.current.state = (payload.state as string) || "";
                 stateRef.current.confidence = (payload.confidence as number) || 0;
                 stateRef.current.connected = true;
-                setDisplayState((payload.state as string) || "");
                 setDisplayConnected(true);
                 const bio = payload.biometrics as Record<string, number> | undefined;
                 if (bio?.heart_rate) {
@@ -117,7 +134,7 @@ function PulseRoom(): React.ReactElement {
         };
     }, []);
 
-    // Fetch recent activities with delay (keeps Pulse Room's ghostly feel)
+    // Fetch recent activities with delay
     useEffect(() => {
         const timer = setTimeout(() => {
             try {
@@ -135,6 +152,8 @@ function PulseRoom(): React.ReactElement {
 
     // Canvas animation loop
     useEffect(() => {
+        if (reducedMotion) return;
+
         const canvas = canvasRef.current;
         if (!canvas) return;
 
@@ -164,10 +183,11 @@ function PulseRoom(): React.ReactElement {
 
             const sr = stateRef.current;
             const anim = animRef.current;
-            const col = STATE_COLORS[sr.state] || STATE_COLORS.FLOW;
+            const col = STATE_COLORS_RGB[sr.state] || STATE_COLORS_RGB.FLOW;
+            const isHyper = sr.state === "HYPER";
 
-            // Fade trail
-            ctx.fillStyle = "rgba(9, 9, 11, 0.15)";
+            // Fade trail — use warm bg color
+            ctx.fillStyle = "rgba(12, 12, 14, 0.15)";
             ctx.fillRect(0, 0, w, h);
 
             // Beat timing
@@ -178,81 +198,87 @@ function PulseRoom(): React.ReactElement {
                 if (timeSinceBeat >= anim.beatInterval) {
                     anim.lastBeatTime = now;
                     anim.pulsePhase = 0;
-                    anim.rings.push({
-                        born: now,
-                        radius: 0,
-                        maxRadius: 150 + Math.random() * 80,
-                        opacity: 0.3,
-                    });
+                    if (!isHyper || anim.rings.length % 2 === 0) {
+                        anim.rings.push({
+                            born: now,
+                            radius: 0,
+                            maxRadius: 150 + Math.random() * 80,
+                            opacity: isHyper ? 0.15 : 0.3,
+                        });
+                    }
                 }
             }
 
-            // Background breathing
-            anim.breathPhase += 0.002;
+            // Background breathing (disabled during HYPER)
+            if (!isHyper) {
+                anim.breathPhase += 0.002;
+            }
             const breathVal = Math.sin(anim.breathPhase) * 0.5 + 0.5;
             const bgGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(w, h) * 0.7);
             bgGrad.addColorStop(0, `rgba(${col.r}, ${col.g}, ${col.b}, ${0.02 + breathVal * 0.01})`);
-            bgGrad.addColorStop(1, "rgba(9, 9, 11, 0)");
+            bgGrad.addColorStop(1, "rgba(12, 12, 14, 0)");
             ctx.fillStyle = bgGrad;
             ctx.fillRect(0, 0, w, h);
 
-            // Ripple rings
+            // Ripple rings — state color at 3% opacity, fade over 3 seconds
             anim.rings = anim.rings.filter((ring) => {
                 const age = (now - ring.born) / 1000;
-                if (age > 4) return false;
+                if (age > 3) return false;
 
                 ring.radius = ring.maxRadius * (1 - Math.exp(-age * 1.5));
-                const fadeAlpha = Math.max(0, ring.opacity * (1 - age / 4));
+                const fadeAlpha = Math.max(0, 0.03 * (1 - age / 3));
 
                 ctx.beginPath();
                 ctx.arc(cx, cy, ring.radius, 0, Math.PI * 2);
                 ctx.strokeStyle = `rgba(${col.r}, ${col.g}, ${col.b}, ${fadeAlpha})`;
-                ctx.lineWidth = 1.5 * (1 - age / 4);
+                ctx.lineWidth = 1.5 * (1 - age / 3);
                 ctx.stroke();
                 return true;
             });
 
-            // Central pulse orb
+            // Central pulse orb — 8-12% opacity glow
             if (sr.heartRate > 0) {
                 const systole =
                     anim.pulsePhase < 0.15
                         ? Math.sin((anim.pulsePhase / 0.15) * (Math.PI / 2))
                         : Math.exp(-(anim.pulsePhase - 0.15) * 4);
 
-                const orbRadius = 20 + systole * 25;
-                const orbOpacity = 0.3 + systole * 0.5;
+                const dampened = isHyper ? systole * 0.5 : systole;
+                const orbRadius = 20 + dampened * 25;
+                const orbOpacity = 0.08 + dampened * 0.04; // 8-12% per guide
 
                 // Outer glow
-                const glowGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, orbRadius * 4);
-                glowGrad.addColorStop(0, `rgba(${col.r}, ${col.g}, ${col.b}, ${orbOpacity * 0.15})`);
-                glowGrad.addColorStop(0.5, `rgba(${col.r}, ${col.g}, ${col.b}, ${orbOpacity * 0.05})`);
+                const glowRadius = isHyper ? orbRadius * 2.5 : orbRadius * 4;
+                const glowGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, glowRadius);
+                glowGrad.addColorStop(0, `rgba(${col.r}, ${col.g}, ${col.b}, ${orbOpacity})`);
+                glowGrad.addColorStop(0.5, `rgba(${col.r}, ${col.g}, ${col.b}, ${orbOpacity * 0.4})`);
                 glowGrad.addColorStop(1, `rgba(${col.r}, ${col.g}, ${col.b}, 0)`);
                 ctx.fillStyle = glowGrad;
                 ctx.beginPath();
-                ctx.arc(cx, cy, orbRadius * 4, 0, Math.PI * 2);
+                ctx.arc(cx, cy, glowRadius, 0, Math.PI * 2);
                 ctx.fill();
 
                 // Core
                 const coreGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, orbRadius);
-                coreGrad.addColorStop(0, `rgba(255, 255, 255, ${orbOpacity * 0.9})`);
-                coreGrad.addColorStop(0.3, `rgba(${col.r}, ${col.g}, ${col.b}, ${orbOpacity * 0.7})`);
+                coreGrad.addColorStop(0, `rgba(255, 255, 255, ${orbOpacity * 3})`);
+                coreGrad.addColorStop(0.3, `rgba(${col.r}, ${col.g}, ${col.b}, ${orbOpacity * 2})`);
                 coreGrad.addColorStop(1, `rgba(${col.r}, ${col.g}, ${col.b}, 0)`);
                 ctx.fillStyle = coreGrad;
                 ctx.beginPath();
                 ctx.arc(cx, cy, orbRadius, 0, Math.PI * 2);
                 ctx.fill();
 
-                // ECG trace
+                // ECG trace — 1px, state color at 30% opacity
                 anim.traceHistory.push(systole);
                 if (anim.traceHistory.length > 200) anim.traceHistory.shift();
 
-                const traceY = h - 100;
+                const traceY = cy + 70;
                 const traceW = Math.min(w * 0.6, 600);
                 const traceX = (w - traceW) / 2;
 
                 ctx.beginPath();
-                ctx.strokeStyle = `rgba(${col.r}, ${col.g}, ${col.b}, 0.12)`;
-                ctx.lineWidth = 1.5;
+                ctx.strokeStyle = `rgba(${col.r}, ${col.g}, ${col.b}, 0.3)`;
+                ctx.lineWidth = 1;
                 for (let i = 0; i < anim.traceHistory.length; i++) {
                     const x = traceX + (i / 200) * traceW;
                     const y = traceY - anim.traceHistory[i] * 30;
@@ -267,7 +293,7 @@ function PulseRoom(): React.ReactElement {
                     const dotY = traceY - anim.traceHistory[anim.traceHistory.length - 1] * 30;
                     ctx.beginPath();
                     ctx.arc(dotX, dotY, 3, 0, Math.PI * 2);
-                    ctx.fillStyle = `rgba(${col.r}, ${col.g}, ${col.b}, 0.4)`;
+                    ctx.fillStyle = `rgba(${col.r}, ${col.g}, ${col.b}, 0.3)`;
                     ctx.fill();
                 }
             } else {
@@ -289,9 +315,9 @@ function PulseRoom(): React.ReactElement {
             cancelAnimationFrame(rafId);
             window.removeEventListener("resize", resize);
         };
-    }, []);
+    }, [reducedMotion]);
 
-    const col = STATE_COLORS[displayState] || STATE_COLORS.FLOW;
+    const col = STATE_COLORS_RGB[displayConnected ? stateRef.current.state : ""] || STATE_COLORS_RGB.FLOW;
 
     return (
         <div
@@ -299,7 +325,7 @@ function PulseRoom(): React.ReactElement {
                 width: "100vw",
                 height: "100vh",
                 overflow: "hidden",
-                background: "#09090b",
+                background: CX.bg,
                 margin: 0,
                 padding: 0,
             }}
@@ -308,67 +334,56 @@ function PulseRoom(): React.ReactElement {
                 ref={canvasRef}
                 style={{ display: "block", width: "100%", height: "100%" }}
             />
+
+            {/* Static orb for reduced motion */}
+            {reducedMotion && (
+                <div style={{
+                    position: "fixed",
+                    top: "50%",
+                    left: "50%",
+                    transform: "translate(-50%, -50%)",
+                    width: 40,
+                    height: 40,
+                    borderRadius: "50%",
+                    background: `radial-gradient(circle, rgba(${col.r},${col.g},${col.b},0.1), rgba(${col.r},${col.g},${col.b},0.02))`,
+                }} />
+            )}
+
+            {/* BPM readout — 36px, mono, centered below orb (48px gap). No label. Just the number. */}
             <div
                 style={{
                     position: "fixed",
-                    bottom: 56,
+                    top: "calc(50% + 60px)",
                     left: "50%",
                     transform: "translateX(-50%)",
-                    fontFamily: "'SF Mono', 'Fira Code', 'JetBrains Mono', ui-monospace, monospace",
+                    fontFamily: CX.mono,
                     fontSize: 36,
-                    fontWeight: 200,
-                    letterSpacing: -1,
-                    color: "rgba(228, 228, 231, 0.06)",
+                    fontWeight: 600,
+                    color: CX.text,
                     userSelect: "none",
                     transition: "color 3s ease",
+                    lineHeight: 1.15,
                 }}
+                aria-label={displayHR > 0 ? `${displayHR} beats per minute` : "no heart rate data"}
             >
-                {displayHR > 0 ? displayHR : "--"}
-                <span style={{ fontSize: 11, letterSpacing: 1, color: "rgba(228,228,231,0.04)", marginLeft: 4 }}>
-                    bpm
-                </span>
+                {displayHR > 0 ? displayHR : "\u2014"}
             </div>
-            <div
-                style={{
-                    position: "fixed",
-                    bottom: 34,
-                    left: "50%",
-                    transform: "translateX(-50%)",
-                    fontFamily: "'SF Mono', 'Fira Code', ui-monospace, monospace",
-                    fontSize: 10,
-                    letterSpacing: 1.5,
-                    color: displayConnected
-                        ? `rgba(${col.r}, ${col.g}, ${col.b}, 0.15)`
-                        : "rgba(228, 228, 231, 0.06)",
-                    userSelect: "none",
-                    transition: "color 3s ease",
-                }}
-            >
-                {displayConnected ? displayState.toLowerCase() || "connecting" : "connecting"}
-            </div>
-            {/* Continue where you left off */}
+
+            {/* Resume cards — bottom, horizontal, max 3, each max 200px */}
             {showActivities && activities.length > 0 && (
                 <div
                     style={{
                         position: "fixed",
-                        bottom: 80,
-                        left: "50%",
-                        transform: "translateX(-50%)",
+                        bottom: 24,
+                        left: 24,
                         display: "flex",
-                        flexDirection: "column",
-                        alignItems: "center",
-                        gap: 6,
+                        gap: 12,
                         opacity: 0,
                         animation: "activityFadeIn 2s ease forwards",
                     }}
                 >
-                    <style>{`
-                        @keyframes activityFadeIn {
-                            from { opacity: 0; transform: translateY(8px); }
-                            to { opacity: 1; transform: translateY(0); }
-                        }
-                    `}</style>
-                    {activities.map((a) => {
+                    {activities.slice(0, 3).map((a) => {
+                        const pct = Math.round(a.completion_pct || a.max_completion_pct || 0);
                         const posLabel = formatActivityPosition(a.position);
                         const resumeUrl = getResumeUrl(a);
                         return (
@@ -378,36 +393,55 @@ function PulseRoom(): React.ReactElement {
                                 style={{
                                     display: "block",
                                     textDecoration: "none",
-                                    color: "rgba(228, 228, 231, 0.08)",
-                                    fontFamily: "'SF Mono', 'Fira Code', ui-monospace, monospace",
-                                    fontSize: 10,
-                                    letterSpacing: 0.5,
-                                    padding: "3px 8px",
-                                    borderRadius: 4,
-                                    transition: "color 0.5s ease, background 0.3s ease",
-                                    background: "transparent",
-                                    maxWidth: 400,
-                                    overflow: "hidden",
-                                    textOverflow: "ellipsis",
-                                    whiteSpace: "nowrap" as const,
+                                    maxWidth: 200,
+                                    padding: 12,
+                                    borderRadius: CX.radiusLg,
+                                    background: CX.surface,
                                     cursor: "pointer",
+                                    transition: `background ${CX.durationMicro} ${CX.easeDefault}`,
                                 }}
-                                onMouseEnter={(e) => {
-                                    e.currentTarget.style.color = "rgba(228, 228, 231, 0.25)";
-                                    e.currentTarget.style.background = "rgba(255,255,255,0.02)";
-                                }}
-                                onMouseLeave={(e) => {
-                                    e.currentTarget.style.color = "rgba(228, 228, 231, 0.08)";
-                                    e.currentTarget.style.background = "transparent";
-                                }}
+                                onMouseEnter={(e) => { e.currentTarget.style.background = CX.tertiary; }}
+                                onMouseLeave={(e) => { e.currentTarget.style.background = CX.surface; }}
                                 title={a.title}
                             >
-                                {a.title.slice(0, 40)}{a.title.length > 40 ? "..." : ""} — {posLabel}
+                                <div style={{
+                                    fontSize: 13,
+                                    color: CX.text,
+                                    whiteSpace: "nowrap" as const,
+                                    overflow: "hidden",
+                                    textOverflow: "ellipsis",
+                                    fontFamily: CX.font,
+                                    marginBottom: 8,
+                                }}>{a.title}</div>
+                                {/* Progress bar — 4px, accent fill */}
+                                <div style={{ height: 4, borderRadius: 2, background: CX.tertiary, marginBottom: 6, overflow: "hidden" }}>
+                                    <div style={{ height: "100%", borderRadius: 2, background: CX.accent, width: `${pct}%` }} />
+                                </div>
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                                    <span style={{ fontSize: 10, color: CX.textTertiary, fontFamily: CX.mono }}>{posLabel}</span>
+                                    <span style={{ fontSize: 11, fontWeight: 500, color: CX.accent, letterSpacing: "0.04em", textTransform: "uppercase" as const }}>Resume</span>
+                                </div>
                             </a>
                         );
                     })}
                 </div>
             )}
+
+            {/* Brand watermark — bottom-right, whispered */}
+            <div
+                style={{
+                    position: "fixed",
+                    bottom: 16,
+                    right: 16,
+                    fontSize: 10,
+                    color: CX.textTertiary,
+                    opacity: 0.5,
+                    fontFamily: CX.font,
+                    userSelect: "none",
+                }}
+            >
+                Cortex
+            </div>
         </div>
     );
 }
@@ -422,7 +456,7 @@ function formatActivityPosition(pos: Record<string, unknown>): string {
         case "scroll":
             return `${Math.round(pos.scroll_pct as number)}% read`;
         case "code_problem":
-            return `${pos.stage} · ${pos.wrong_answer_count} WA`;
+            return `${pos.stage} \u00b7 ${pos.wrong_answer_count} WA`;
         case "notebook":
             return `cell ${(pos.cell_index as number) + 1}`;
         case "pdf":

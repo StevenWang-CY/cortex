@@ -119,64 +119,21 @@ interface Particle {
     vx: number;
     vy: number;
     size: number;
-    opacity: number;
     life: number;
     maxLife: number;
-    type: "mist" | "rain" | "warmth" | "calm";
 }
 
-function createParticle(type: Particle["type"], w: number, h: number): Particle {
-    switch (type) {
-        case "rain":
-            return {
-                x: Math.random() * w,
-                y: -10,
-                vx: -0.5 + Math.random() * -1,
-                vy: 3 + Math.random() * 4,
-                size: 1 + Math.random(),
-                opacity: 0.03 + Math.random() * 0.04,
-                life: 0,
-                maxLife: h / 3,
-                type,
-            };
-        case "mist":
-            return {
-                x: Math.random() * w,
-                y: Math.random() * h,
-                vx: (Math.random() - 0.5) * 0.3,
-                vy: (Math.random() - 0.5) * 0.2,
-                size: 30 + Math.random() * 60,
-                opacity: 0.01 + Math.random() * 0.015,
-                life: 0,
-                maxLife: 300 + Math.random() * 200,
-                type,
-            };
-        case "warmth":
-            return {
-                x: Math.random() * w,
-                y: h + 10,
-                vx: (Math.random() - 0.5) * 0.5,
-                vy: -0.3 - Math.random() * 0.5,
-                size: 3 + Math.random() * 4,
-                opacity: 0.02 + Math.random() * 0.03,
-                life: 0,
-                maxLife: 200 + Math.random() * 150,
-                type,
-            };
-        case "calm":
-        default:
-            return {
-                x: Math.random() * w,
-                y: Math.random() * h,
-                vx: (Math.random() - 0.5) * 0.1,
-                vy: -0.1 - Math.random() * 0.1,
-                size: 2 + Math.random() * 3,
-                opacity: 0.015 + Math.random() * 0.02,
-                life: 0,
-                maxLife: 400 + Math.random() * 200,
-                type,
-            };
-    }
+function createParticle(_type: string, w: number, h: number): Particle {
+    // Gentle floating dots — slow drift, long life
+    return {
+        x: Math.random() * w,
+        y: Math.random() * h,
+        vx: (Math.random() - 0.5) * 0.1,
+        vy: -0.1 - Math.random() * 0.1,
+        size: 2 + Math.random() * 3,
+        life: 0,
+        maxLife: 400 + Math.random() * 200,
+    };
 }
 
 // --- Initialization ---
@@ -194,7 +151,7 @@ function init(): void {
     auraElement = document.createElement("div");
     auraElement.style.cssText = `
         position:absolute;top:0;left:0;right:0;bottom:0;
-        transition: background 60s ease, box-shadow 60s ease;
+        transition: background 3s ease, box-shadow 3s ease;
         pointer-events:none;
     `;
     host.appendChild(auraElement);
@@ -203,7 +160,7 @@ function init(): void {
     filterElement = document.createElement("div");
     filterElement.style.cssText = `
         position:absolute;top:0;left:0;right:0;bottom:0;
-        mix-blend-mode:color;
+        mix-blend-mode:multiply;
         transition: background-color 45s ease;
         opacity:0;
         pointer-events:none;
@@ -286,40 +243,43 @@ function updateAura(): void {
 
     const saturation = 40 + Math.max(flowVal, stressVal) * 30;
     const lightness = 50 + flowVal * 10;
-    const intensity = 0.03 + Math.max(flowVal, stressVal) * 0.04; // 3-7% max
+    const intensity = Math.min(0.02, 0.01 + Math.max(flowVal, stressVal) * 0.01); // max 2% at edge
 
     auraElement.style.boxShadow =
         `inset 0 0 120px 40px hsla(${hue}, ${saturation}%, ${lightness}%, ${intensity}),` +
-        `inset 0 0 300px 100px hsla(${hue}, ${saturation}%, ${lightness}%, ${intensity * 0.4})`;
+        `inset 0 0 300px 100px hsla(${hue}, ${saturation}%, ${lightness}%, ${intensity * 0.3})`;
 }
 
 // --- Layer 2: Somatic Filter ---
+// FLOW: cool blue tint, 1% opacity
+// HYPER: warm amber, 2% opacity
+// HYPO: neutral, 0% opacity (no tint when disengaged)
+// Transition: 45s (set in CSS)
+
+const SOMATIC_MAP: Record<string, { r: number; g: number; b: number; opacity: number }> = {
+    FLOW: { r: 100, g: 180, b: 220, opacity: 0.01 },
+    HYPER: { r: 249, g: 150, b: 80, opacity: 0.02 },
+    HYPO: { r: 140, g: 160, b: 210, opacity: 0 },
+    RECOVERY: { r: 180, g: 160, b: 220, opacity: 0.015 },
+};
 
 function updateFilter(): void {
     if (!filterElement) return;
 
-    // Color temperature shift:
-    // Low HRV / high stress → cooler, desaturated (institutional feel)
-    // High HRV / flow → warmer, richer (golden afternoon)
-    const flowVal = smoothedFlow;
-    const stressVal = smoothedStress;
+    const state = currentState?.state ?? "";
+    const temp = SOMATIC_MAP[state];
 
-    if (flowVal > 0.3 || stressVal > 0.3) {
-        const warmth = flowVal - stressVal; // -1 to +1
-        // Warm: rgba(255, 200, 100, 0.03), Cool: rgba(100, 140, 220, 0.03)
-        const r = Math.round(warmth > 0 ? 255 : 100 + (1 + warmth) * 77);
-        const g = Math.round(warmth > 0 ? 200 - warmth * 40 : 140 + (1 + warmth) * 30);
-        const b = Math.round(warmth > 0 ? 100 : 220 - (1 + warmth) * 40);
-        const opacity = Math.min(0.04, Math.abs(warmth) * 0.05);
-
-        filterElement.style.backgroundColor = `rgba(${r}, ${g}, ${b}, ${opacity})`;
-        filterElement.style.opacity = "1";
+    if (temp && temp.opacity > 0) {
+        filterElement.style.backgroundColor = `rgba(${temp.r}, ${temp.g}, ${temp.b}, 1)`;
+        filterElement.style.opacity = String(temp.opacity);
     } else {
         filterElement.style.opacity = "0";
     }
 }
 
-// --- Layer 3: Biometric Weather ---
+// --- Layer 3: Weather Particles ---
+// Just gentle floating dots. No rain streaks. No storm metaphors.
+// FLOW: 4 dots, HYPER: 4 dots (same — Cortex gets quiet when stressed), HYPO: 2 dots
 
 function updateWeather(): void {
     if (!weatherCanvas || !weatherCtx) return;
@@ -330,37 +290,27 @@ function updateWeather(): void {
 
     ctx.clearRect(0, 0, w, h);
 
-    const stressVal = smoothedStress;
-    const flowVal = smoothedFlow;
     const state = currentState?.state ?? "FLOW";
 
-    // Determine weather type and particle target count
-    let targetType: Particle["type"] = "calm";
-    let targetCount = 8;
-
-    if (stressVal > 0.6) {
-        targetType = "rain";
-        targetCount = 20 + Math.round(stressVal * 25);
-    } else if (stressVal > 0.35) {
-        targetType = "mist";
-        targetCount = 12 + Math.round(stressVal * 15);
-    } else if (flowVal > 0.4) {
-        targetType = "warmth";
-        targetCount = 10 + Math.round(flowVal * 12);
-    } else if (state === "RECOVERY") {
-        targetType = "warmth";
-        targetCount = 8;
-    } else {
-        targetType = "calm";
-        targetCount = 6;
-    }
+    // Target count per guide: FLOW 4, HYPER 4, HYPO 2, RECOVERY 4
+    let targetCount = 4;
+    if (state === "HYPO") targetCount = 2;
 
     // Spawn particles gradually
-    if (particles.length < targetCount && Math.random() < 0.3) {
-        particles.push(createParticle(targetType, w, h));
+    while (particles.length < targetCount) {
+        particles.push(createParticle("calm", w, h));
     }
 
-    // Update and draw particles
+    // Get state color for dots
+    const STATE_COLORS_RGB: Record<string, { r: number; g: number; b: number }> = {
+        FLOW: { r: 52, g: 211, b: 153 },
+        HYPER: { r: 249, g: 115, b: 22 },
+        HYPO: { r: 96, g: 165, b: 250 },
+        RECOVERY: { r: 167, g: 139, b: 250 },
+    };
+    const col = STATE_COLORS_RGB[state] || STATE_COLORS_RGB.FLOW;
+
+    // Update and draw — all gentle floating dots at 4% opacity
     particles = particles.filter((p) => {
         p.life++;
         if (p.life > p.maxLife) return false;
@@ -368,71 +318,30 @@ function updateWeather(): void {
         p.x += p.vx;
         p.y += p.vy;
 
+        // Wrap around
+        if (p.x < -10) p.x = w + 10;
+        if (p.x > w + 10) p.x = -10;
+        if (p.y < -10) p.y = h + 10;
+        if (p.y > h + 10) p.y = -10;
+
         // Fade in/out
         const lifeFrac = p.life / p.maxLife;
         const fadeAlpha =
             lifeFrac < 0.1 ? lifeFrac / 0.1 :
             lifeFrac > 0.8 ? (1 - lifeFrac) / 0.2 : 1;
-        const alpha = p.opacity * fadeAlpha;
 
-        if (p.x < -50 || p.x > w + 50 || p.y < -50 || p.y > h + 50) return false;
-
-        ctx.globalAlpha = alpha;
-
-        switch (p.type) {
-            case "rain": {
-                // Thin diagonal streaks
-                ctx.strokeStyle = "rgba(150, 180, 220, 1)";
-                ctx.lineWidth = p.size * 0.5;
-                ctx.beginPath();
-                ctx.moveTo(p.x, p.y);
-                ctx.lineTo(p.x + p.vx * 3, p.y + p.vy * 3);
-                ctx.stroke();
-                break;
-            }
-            case "mist": {
-                // Soft blurred circles
-                const gradient = ctx.createRadialGradient(
-                    p.x, p.y, 0, p.x, p.y, p.size,
-                );
-                gradient.addColorStop(0, "rgba(180, 200, 220, 0.8)");
-                gradient.addColorStop(1, "rgba(180, 200, 220, 0)");
-                ctx.fillStyle = gradient;
-                ctx.beginPath();
-                ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
-                ctx.fill();
-                break;
-            }
-            case "warmth": {
-                // Golden floating particles rising upward
-                const grad = ctx.createRadialGradient(
-                    p.x, p.y, 0, p.x, p.y, p.size,
-                );
-                grad.addColorStop(0, "rgba(255, 200, 100, 0.9)");
-                grad.addColorStop(0.5, "rgba(255, 160, 60, 0.4)");
-                grad.addColorStop(1, "rgba(255, 140, 40, 0)");
-                ctx.fillStyle = grad;
-                ctx.beginPath();
-                ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
-                ctx.fill();
-                break;
-            }
-            case "calm": {
-                // Gentle drifting motes
-                const cg = ctx.createRadialGradient(
-                    p.x, p.y, 0, p.x, p.y, p.size,
-                );
-                cg.addColorStop(0, "rgba(150, 200, 255, 0.7)");
-                cg.addColorStop(1, "rgba(150, 200, 255, 0)");
-                ctx.fillStyle = cg;
-                ctx.beginPath();
-                ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
-                ctx.fill();
-                break;
-            }
-        }
+        ctx.globalAlpha = 0.04 * fadeAlpha;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+        ctx.fillStyle = `rgb(${col.r},${col.g},${col.b})`;
+        ctx.fill();
         return true;
     });
+
+    // Remove excess particles gradually
+    while (particles.length > targetCount) {
+        particles.pop();
+    }
 
     ctx.globalAlpha = 1;
 }
@@ -447,7 +356,7 @@ function updateFlowShield(): void {
     const state = currentState.state;
 
     // Activate flow shield after 120s of sustained FLOW state
-    const shouldShield = state === "FLOW" && dwell > 120 && flowVal > 0.4;
+    const shouldShield = state === "FLOW" && dwell > 180 && flowVal > 0.4;
 
     if (shouldShield && !flowShieldActive) {
         flowShieldActive = true;
@@ -487,13 +396,13 @@ function activateFlowShield(): void {
 function deactivateFlowShield(): void {
     shieldedElements.forEach((originalStyle, el) => {
         const htmlEl = el as HTMLElement;
-        htmlEl.style.transition = "opacity 60s ease-in, filter 60s ease-in";
+        htmlEl.style.transition = "opacity 5s ease-in, filter 5s ease-in";
         htmlEl.style.opacity = "";
         htmlEl.style.filter = "";
         // Restore original styles after transition
         setTimeout(() => {
             htmlEl.style.cssText = originalStyle;
-        }, 62000);
+        }, 5500);
     });
     shieldedElements.clear();
 }

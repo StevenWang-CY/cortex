@@ -1,8 +1,9 @@
 /**
  * Cortex Chrome Extension — Popup UI
  *
- * Design: Cortex Design System — dark, calm, Linear/Raycast-inspired.
+ * Design: Cortex Visual Identity Guide — dark, calm, Linear/Claude-inspired.
  * Inter + JetBrains Mono typography, indigo accent, 4px grid spacing.
+ * No emoji. No motivational copy. Sentence case everywhere.
  */
 
 import React, { useCallback, useEffect, useState } from "react";
@@ -85,8 +86,8 @@ function synthesizeActions(
 
 function getStateDotStyle(stateStr: string, stateColor: string): React.CSSProperties {
     const base: React.CSSProperties = {
-        width: 6,
-        height: 6,
+        width: 8,
+        height: 8,
         borderRadius: "50%",
         background: stateColor,
         flexShrink: 0,
@@ -133,7 +134,16 @@ function CortexPopup(): React.ReactElement {
         if (document.getElementById(id)) return;
         const style = document.createElement("style");
         style.id = id;
-        style.textContent = CX_KEYFRAMES;
+        style.textContent = CX_KEYFRAMES + `
+            @keyframes cxAlertIn {
+                from { transform: translateY(-8px); opacity: 0; }
+                to { transform: translateY(0); opacity: 1; }
+            }
+            .cortex-goal-input:focus-visible {
+                outline: 2px solid ${CX.accent};
+                outline-offset: 2px;
+            }
+        `;
         document.head.appendChild(style);
         return () => { style.remove(); };
     }, []);
@@ -184,7 +194,6 @@ function CortexPopup(): React.ReactElement {
             setConnected(resp.connected);
             setState(resp.state);
             setFocus(resp.focusSession);
-            // Load active intervention if one exists
             if (resp.intervention) {
                 const p = resp.intervention as Record<string, unknown>;
                 const rawActions = (p.suggested_actions as Record<string, unknown>[]) || [];
@@ -221,11 +230,11 @@ function CortexPopup(): React.ReactElement {
                     break;
                 case "HEALTH_ALERT":
                     setAlert({ title: msg.title as string, body: msg.body as string });
-                    setTimeout(() => setAlert(null), 6000);
+                    setTimeout(() => setAlert(null), 10000);
                     break;
                 case "BREAK_SUGGESTED":
                     setAlert({ title: "Time for a break", body: msg.reason as string });
-                    setTimeout(() => setAlert(null), 8000);
+                    setTimeout(() => setAlert(null), 10000);
                     break;
                 case "INTERVENTION_TRIGGER": {
                     const p = msg.payload as Record<string, unknown>;
@@ -305,17 +314,14 @@ function CortexPopup(): React.ReactElement {
     const keepTabs = tabRecs?.tabs?.filter(t => t.action === "keep") || [];
     const rec = activeActions.filter(a => a.category === "recommended");
 
-    // Cap visible tabs at 5, expandable on click
     const visibleCloseTabs = tabsExpanded ? closeTabs : closeTabs.slice(0, 5);
     const overflowCount = tabsExpanded ? 0 : closeTabs.length - visibleCloseTabs.length;
 
-    // Filter out generic error_analysis that has no real content
     const genericErrPhrases = ["no specific errors", "no errors detected", "not applicable", "no error", "n/a"];
     const realErrAnalysis = errAnalysis?.root_cause && !genericErrPhrases.some(
         p => (errAnalysis.root_cause ?? "").toLowerCase().includes(p)
     ) ? errAnalysis : null;
 
-    // Filter out generic causal explanation
     const realCausal = causalExplanation && causalExplanation.length > 20
         && /\d/.test(causalExplanation) ? causalExplanation : "";
 
@@ -323,200 +329,182 @@ function CortexPopup(): React.ReactElement {
 
     return (
         <div style={S.root}>
-            {/* Alert */}
+            {/* Alert toast — top-right, auto-dismiss 10s */}
             {alert && (
                 <div style={S.alertBox}>
-                    <div style={S.alertTitle}>{alert.title}</div>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                        <div style={S.alertTitle}>{alert.title}</div>
+                        <button
+                            style={{ background: "none", border: "none", color: CX.textTertiary, cursor: "pointer", fontSize: 13, padding: 0, fontFamily: CX.font, lineHeight: 1 }}
+                            onClick={() => setAlert(null)}
+                        >{"\u00d7"}</button>
+                    </div>
                     <div style={S.alertBody}>{alert.body}</div>
                 </div>
             )}
 
-            {/* Header */}
+            {/* Header — 44px total, 20px horizontal, 12px vertical */}
             <div style={S.header}>
-                <div style={S.logoRow}>
-                    <div style={S.logoMark} />
-                    <span style={S.logoText}>cortex</span>
-                </div>
+                <span style={S.logoText}>Cortex</span>
                 {!connected ? (
-                    <button style={S.connectBtn} onClick={handleConnect}>Connect</button>
+                    <button style={S.connectBtn} onClick={handleConnect}>CONNECT</button>
                 ) : (
                     <div style={S.statusRow} aria-live="polite">
                         <div style={getStateDotStyle(stateStr, stateColor)} />
-                        <span style={{ ...S.statusText, color: stateColor }}>{stateLabel}</span>
+                        <span style={{ ...S.statusLabel, color: stateColor }}>{stateLabel}</span>
                     </div>
                 )}
             </div>
 
-            {/* Not connected banner */}
-            {!connected && (
-                <div style={S.disconnectedBanner}>
-                    <div style={S.disconnectedTitle}>Not connected</div>
-                    <div style={S.disconnectedBody}>Start the Cortex daemon to begin</div>
-                </div>
-            )}
-
-            {/* Launch / Camera */}
-            <button
-                style={{
-                    ...S.primaryBtn,
-                    marginBottom: 12,
-                    background: launchError ? CX.dangerDim
-                        : launching ? CX.tertiary
-                        : connected ? CX.surface : CX.accent,
-                    color: launchError ? CX.danger
-                        : launching ? CX.textSecondary
-                        : connected ? CX.text : CX.textInverse,
-                    border: connected && !launchError ? `1px solid ${CX.border}` : "none",
-                    cursor: launching ? "default" : "pointer",
-                    pointerEvents: launching ? "none" as const : "auto" as const,
-                }}
-                onClick={handleLaunchCortex}
-                disabled={launching}
-            >
-                {launchError
-                    ? "Daemon not running \u2014 run cortex-dev first"
-                    : launching
-                        ? "Starting\u2026"
-                        : connected
-                            ? "Restart Camera"
-                            : "Start Cortex daemon"}
-            </button>
-
-            {/* Morning Briefing */}
+            {/* Morning briefing — below header, before session card */}
             {briefing && (
-                <div style={{ ...S.card, borderColor: "rgba(129, 140, 248, 0.15)" }}>
-                    <div style={S.sectionHead}>Where you left off</div>
-                    <div style={{ fontSize: 13, color: CX.text, lineHeight: 1.5, marginBottom: 8 }}>{briefing.summary}</div>
-                    {briefing.action_items.length > 0 && (
-                        <div style={{ marginBottom: 8 }}>
-                            {briefing.action_items.map((item, i) => (
-                                <div key={i} style={{ ...S.tabRow, padding: "2px 0" }}>
-                                    <span style={{ ...S.tabXMark, color: CX.accent }}>{i + 1}.</span>
-                                    <span style={{ fontSize: 11, color: CX.textSecondary }}>{item}</span>
-                                </div>
-                            ))}
+                <div style={S.briefingCard}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                        <div>
+                            <div style={S.briefingTitle}>Where you left off</div>
+                            <div style={S.briefingBody}>{briefing.summary}</div>
                         </div>
-                    )}
-                    <button
-                        style={{ ...S.primaryBtn, fontSize: 11, padding: "8px 0" }}
-                        onClick={() => setBriefing(null)}
-                    >Got it</button>
+                        <button
+                            style={{ background: "none", border: "none", color: CX.textTertiary, cursor: "pointer", fontSize: 13, padding: 0, fontFamily: CX.font, lineHeight: 1, flexShrink: 0, marginLeft: 8 }}
+                            onClick={() => setBriefing(null)}
+                        >{"\u00d7"}</button>
+                    </div>
+                    <div style={{ marginTop: 8 }}>
+                        <button style={S.ghostBtn} onClick={() => {
+                            if (briefing.left_off_at) {
+                                chrome.runtime.sendMessage({ type: "START_FOCUS", goal: briefing.left_off_at });
+                            }
+                            setBriefing(null);
+                        }}>Resume</button>
+                    </div>
                 </div>
             )}
 
-            {/* Start Focus */}
+            {/* Disconnected state — centered, quiet notice */}
+            {!connected && (
+                <div style={S.disconnectedArea}>
+                    <div style={{ width: 12, height: 12, borderRadius: "50%", border: `1.5px solid ${CX.textTertiary}`, flexShrink: 0 }} />
+                    <div style={S.disconnectedTitle}>Not connected</div>
+                    <div style={S.disconnectedBody}>Start the Cortex daemon</div>
+                    <button
+                        style={{
+                            ...S.ghostBtn,
+                            marginTop: 12,
+                            opacity: launching ? 0.5 : 1,
+                            pointerEvents: launching ? "none" as const : "auto" as const,
+                        }}
+                        onClick={handleLaunchCortex}
+                        disabled={launching}
+                    >
+                        {launchError
+                            ? "Daemon not running"
+                            : launching
+                                ? "Starting\u2026"
+                                : "Start Cortex"}
+                    </button>
+                </div>
+            )}
+
+            {/* Goal input — one input, Enter to start, no separate button */}
             {connected && !focus && (
-                <div style={S.section}>
+                <div style={{ marginBottom: CX.space6, position: "relative" as const }}>
                     <input
-                        style={S.input}
+                        className="cortex-goal-input"
+                        style={S.goalInput}
                         placeholder="What are you working on?"
                         value={goalInput}
                         onChange={(e) => setGoalInput(e.target.value)}
                         onKeyDown={(e) => e.key === "Enter" && handleStartFocus()}
                     />
-                    <button style={S.primaryBtn} onClick={handleStartFocus}>
-                        Start session
-                    </button>
+                    <span style={S.goalEnterIcon}>{"\u23CE"}</span>
                 </div>
             )}
 
-            {/* Active Focus — sticky so it stays visible when scrolling */}
+            {/* Active focus session — sticky */}
             {focus && (
-                <div style={{ ...S.card, position: "sticky" as const, top: 0, zIndex: 10 }}>
+                <div style={{ ...S.sessionCard, position: "sticky" as const, top: 0, zIndex: 10 }}>
+                    {/* First row: "Study session · Xm" + End */}
                     <div style={S.focusHeader}>
-                        <div>
-                            <div style={S.focusGoal}>{focus.goal}</div>
-                            <div style={S.muted}>{elapsedMin}m elapsed</div>
+                        <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+                            <span style={S.focusTitle}>{focus.goal}</span>
+                            <span style={S.focusDuration}>{"\u00b7"} {elapsedMin}m</span>
                         </div>
                         <button style={S.endBtn} onClick={handleStopFocus}>End</button>
                     </div>
 
+                    {/* Big number + percentage on same baseline */}
                     <div style={S.bigRow}>
                         <span style={{ ...S.bigNum, color: stateColor }}>{focusMin}</span>
-                        <div>
-                            <div style={S.bigLabel}>min focused</div>
-                            <div style={S.muted}>{focus.focusPct}%</div>
-                        </div>
+                        <span style={S.bigPct}>{focus.focusPct}%</span>
                     </div>
+                    <div style={S.bigLabel}>min focused</div>
 
+                    {/* Progress bar — 6px tall */}
                     <div style={S.trackOuter}>
                         <div style={{
                             ...S.trackFill,
-                            width: `${Math.min(focus.focusPct, 100)}%`,
+                            width: `${Math.max(Math.min(focus.focusPct, 100), 0)}%`,
+                            minWidth: 6,
                             background: stateColor,
                         }} />
                     </div>
 
-                    <div style={S.metricsRow}>
-                        <Metric label="streak" value={streakMin > 0 ? `${streakMin}:${String(streakRemSec).padStart(2, "0")}` : `${streakSec}s`} />
-                        <div style={S.metricDiv} />
-                        <Metric label="blocked" value={String(focus.distractionsBlocked)} />
-                        <div style={S.metricDiv} />
-                        <Metric label="best" value={`${focus.longestStreakMin}m`} />
+                    {/* Stats row — three columns, center-aligned */}
+                    <div style={S.statsRow}>
+                        <div style={S.statCol}>
+                            <span style={S.statVal}>{streakMin > 0 ? `${streakMin}:${String(streakRemSec).padStart(2, "0")}` : `${streakSec}s`}</span>
+                            <span style={{ ...S.statLabel, fontWeight: 500 }}>STREAK</span>
+                        </div>
+                        <div style={S.statCol}>
+                            <span style={S.statVal}>{focus.distractionsBlocked}</span>
+                            <span style={S.statLabel}>BLOCKED</span>
+                        </div>
+                        <div style={S.statCol}>
+                            <span style={S.statVal}>{focus.longestStreakMin}m</span>
+                            <span style={S.statLabel}>BEST</span>
+                        </div>
                     </div>
                 </div>
             )}
 
-            {/* Biometrics */}
-            {connected && (
-                <div style={S.card}>
-                    <div style={S.metricsRow}>
-                        <Metric label="bpm" value={hr ? String(Math.round(hr)) : "--"} labelColor={CX.bioHr} ariaLabel={hr ? `${Math.round(hr)} beats per minute` : "no heart rate data"} />
-                        <div style={S.metricDiv} />
-                        <Metric label="hrv" value={hrv ? String(Math.round(hrv)) : "--"} labelColor={CX.bioHrv} ariaLabel={hrv ? `${Math.round(hrv)} milliseconds heart rate variability` : "no HRV data"} />
-                        <div style={S.metricDiv} />
-                        <Metric label="blinks" value={blink ? String(Math.round(blink)) : "--"} labelColor={CX.bioBlink} ariaLabel={blink ? `${Math.round(blink)} blinks per minute` : "no blink rate data"} />
-                    </div>
-                </div>
-            )}
-
-            {/* Intervention */}
+            {/* Intervention preview */}
             {hasIntervention && (
-                <div style={{ ...S.card, borderColor: CX.borderMed }}>
+                <div style={S.interventionCard}>
                     {/* Causal explanation */}
                     {realCausal && (
-                        <div style={{ fontSize: 13, color: CX.textSecondary, lineHeight: 1.5, marginBottom: 12, fontStyle: "italic" }}>
-                            {realCausal}
-                        </div>
+                        <div style={S.causalText}>{realCausal}</div>
                     )}
 
                     {visibleCloseTabs.length > 0 && (
                         <div style={{ marginBottom: 12 }}>
-                            <div style={S.sectionHead}>Closing {closeTabs.length} tab{closeTabs.length !== 1 ? "s" : ""}</div>
                             {visibleCloseTabs.map((t, i) => {
                                 const title = String(t.tab_title || "Untitled");
                                 const rawReason = String(t.reason || "");
                                 const reason = genericReasonPhrases.some(p => rawReason.toLowerCase().includes(p)) ? "" : rawReason;
                                 return (
-                                    <div key={`c${i}`} style={{ padding: "3px 0" }}>
-                                        <div style={S.tabRow}>
-                                            <span style={S.tabXMark}>{"\u00d7"}</span>
-                                            <span style={S.tabName}>{title}</span>
-                                        </div>
-                                        {reason && (
-                                            <div style={{ fontSize: 10, color: CX.textTertiary, marginLeft: 22, lineHeight: 1.3 }}>{reason}</div>
-                                        )}
+                                    <div key={`c${i}`} style={S.tabRow}>
+                                        <span style={S.tabXMark}>{"\u2715"}</span>
+                                        <span style={S.tabName}>{title}</span>
                                     </div>
                                 );
                             })}
                             {overflowCount > 0 && (
                                 <button
-                                    style={{ fontSize: 11, color: CX.accent, marginTop: 4, background: "none", border: "none", cursor: "pointer", padding: 0, fontFamily: CX.font }}
+                                    style={{ fontSize: 10, color: CX.accent, marginTop: 4, background: "none", border: "none", cursor: "pointer", padding: 0, fontFamily: CX.font }}
                                     onClick={() => setTabsExpanded(true)}
                                 >+{overflowCount} more</button>
                             )}
                             {keepTabs.length > 0 && (
-                                <div style={S.keepLine}>Keeping <span style={{ color: STATE_COLORS.FLOW }}>{keepTabs.length}</span> you need</div>
+                                <div style={S.keepLine}>Keeping {keepTabs.length} you need</div>
                             )}
                         </div>
                     )}
 
                     {realErrAnalysis && realErrAnalysis.root_cause && (
                         <div style={S.errBox}>
-                            <div style={S.errHead}>Error</div>
                             <div style={S.errBody}>{realErrAnalysis.root_cause}</div>
                             {realErrAnalysis.suggested_fix && (
-                                <pre style={S.errCode}>{realErrAnalysis.suggested_fix}</pre>
+                                <pre style={S.errCode}>{"\u2192 "}{realErrAnalysis.suggested_fix}</pre>
                             )}
                         </div>
                     )}
@@ -532,6 +520,7 @@ function CortexPopup(): React.ReactElement {
                         </div>
                     )}
 
+                    {/* Summary + single CTA */}
                     {rec.length > 0 && (
                         <>
                             <button
@@ -551,7 +540,7 @@ function CortexPopup(): React.ReactElement {
                                                 setTabRecs(null);
                                                 setErrAnalysis(null);
                                                 setApplied(false);
-                                            }, 1500);
+                                            }, 10000);
                                         } else {
                                             setApplied(true);
                                         }
@@ -585,15 +574,28 @@ function CortexPopup(): React.ReactElement {
                 </div>
             )}
 
-            {/* Settings */}
-            <div style={S.card}>
-                <div style={S.toggleRow}>
-                    <div>
-                        <div style={S.toggleLabel}>Tab closing</div>
-                        <div style={S.toggleDesc}>
-                            {tabCloseDisabled ? "Cortex won\u2019t close tabs" : "Cortex can close distracting tabs"}
-                        </div>
+            {/* Biometrics row — no card, 1px separators above/below */}
+            {connected && (
+                <div style={S.bioRow}>
+                    <div style={S.bioCol}>
+                        <span style={{ ...S.bioLabel, color: `${CX.bioHr}80` }}>BPM</span>
+                        <span style={S.bioVal} aria-label={hr ? `${Math.round(hr)} beats per minute` : "no heart rate data"}>{hr ? Math.round(hr) : "\u2014"}</span>
                     </div>
+                    <div style={S.bioCol}>
+                        <span style={{ ...S.bioLabel, color: `${CX.bioHrv}80` }}>HRV</span>
+                        <span style={S.bioVal} aria-label={hrv ? `${Math.round(hrv)} milliseconds heart rate variability` : "no HRV data"}>{hrv ? `${Math.round(hrv)}ms` : "\u2014"}</span>
+                    </div>
+                    <div style={S.bioCol}>
+                        <span style={{ ...S.bioLabel, color: `${CX.bioBlink}80` }}>BLK</span>
+                        <span style={S.bioVal} aria-label={blink ? `${Math.round(blink)} blinks per minute` : "no blink rate data"}>{blink ? `${Math.round(blink)}/m` : "\u2014"}</span>
+                    </div>
+                </div>
+            )}
+
+            {/* Settings — no card, just label + toggle, 1px separator above */}
+            <div style={S.settingsArea}>
+                <div style={S.toggleRow}>
+                    <span style={S.toggleLabel}>Tab closing</span>
                     <button
                         style={{
                             ...S.toggleTrack,
@@ -609,14 +611,8 @@ function CortexPopup(): React.ReactElement {
                     </button>
                 </div>
 
-                {/* Quiet Mode toggle */}
-                <div style={S.toggleRow}>
-                    <div>
-                        <div style={S.toggleLabel}>Quiet mode</div>
-                        <div style={S.toggleDesc}>
-                            {quietMode ? "Interventions paused" : "Interventions active"}
-                        </div>
-                    </div>
+                <div style={{ ...S.toggleRow, marginTop: 12 }}>
+                    <span style={S.toggleLabel}>Quiet mode</span>
                     <button
                         style={{
                             ...S.toggleTrack,
@@ -633,38 +629,27 @@ function CortexPopup(): React.ReactElement {
                 </div>
             </div>
 
-            {/* Daily Stats */}
+            {/* Today footer — no card, lowest hierarchy */}
             {dailyStats && (
-                <div style={S.card}>
-                    <div style={S.sectionHead}>Today</div>
-                    <div style={S.dailyGrid}>
-                        <Metric label="focus" value={String(Math.round(dailyStats.totalFocusMin))} unit="m" />
-                        <Metric label="sessions" value={String(dailyStats.sessions)} />
-                        <Metric label="best" value={String(Math.round(dailyStats.longestStreakMin))} unit="m" />
-                        <Metric label="blocked" value={String(dailyStats.distractionsBlocked)} />
+                <div style={S.todayFooter}>
+                    <div style={S.todayCol}>
+                        <span style={S.todayVal}>{Math.round(dailyStats.totalFocusMin)}m</span>
+                        <span style={S.todayLabel}>FOCUS</span>
+                    </div>
+                    <div style={S.todayCol}>
+                        <span style={S.todayVal}>{dailyStats.sessions}</span>
+                        <span style={S.todayLabel}>SESSIONS</span>
+                    </div>
+                    <div style={S.todayCol}>
+                        <span style={S.todayVal}>{Math.round(dailyStats.longestStreakMin)}m</span>
+                        <span style={S.todayLabel}>BEST</span>
+                    </div>
+                    <div style={S.todayCol}>
+                        <span style={S.todayVal}>{dailyStats.distractionsBlocked}</span>
+                        <span style={S.todayLabel}>BLOCKED</span>
                     </div>
                 </div>
             )}
-        </div>
-    );
-}
-
-// --- Metric Component ---
-
-function Metric({ label, value, unit, labelColor, ariaLabel }: {
-    label: string;
-    value: string;
-    unit?: string;
-    labelColor?: string;
-    ariaLabel?: string;
-}): React.ReactElement {
-    return (
-        <div style={S.metric} aria-label={ariaLabel}>
-            <span style={S.metricVal}>
-                {value}
-                {unit && <span style={S.metricUnit}>{unit}</span>}
-            </span>
-            <span style={{ ...S.metricLabel, color: labelColor ? `${labelColor}99` : CX.textTertiary }}>{label}</span>
         </div>
     );
 }
@@ -676,49 +661,43 @@ const S: Record<string, React.CSSProperties> = {
         width: 380,
         maxHeight: 540,
         overflowY: "auto",
-        padding: 16,
+        padding: "0 20px 20px 20px",
         fontFamily: CX.font,
         fontSize: 13,
         color: CX.text,
         background: CX.bg,
     },
 
-    // Alert
+    // Alert toast
     alertBox: {
         padding: "12px 14px",
         borderRadius: CX.radiusMd,
         background: CX.surface,
-        border: `1px solid ${CX.border}`,
         marginBottom: 12,
+        animation: "cxAlertIn 0.2s cubic-bezier(0, 0, 0.2, 1)",
     },
-    alertTitle: { fontSize: 13, fontWeight: 600, marginBottom: 2, color: CX.text },
-    alertBody: { fontSize: 11, color: CX.textSecondary, lineHeight: 1.5 },
+    alertTitle: { fontSize: 13, fontWeight: 500, marginBottom: 2, color: CX.text },
+    alertBody: { fontSize: 10, color: CX.textTertiary, lineHeight: 1.4 },
 
-    // Header
+    // Header — 44px total
     header: {
         display: "flex",
         alignItems: "center",
         justifyContent: "space-between",
-        marginBottom: 16,
-        paddingBottom: 12,
-        borderBottom: `1px solid ${CX.border}`,
-    },
-    logoRow: { display: "flex", alignItems: "center", gap: 8 },
-    logoMark: {
-        width: 8,
-        height: 8,
-        borderRadius: "50%",
-        background: `linear-gradient(135deg, ${CX.accent}, ${CX.accentHover})`,
+        height: 44,
+        padding: "0",
+        marginBottom: 0,
+        borderBottom: `1px solid ${CX.borderDefault}`,
     },
     logoText: {
-        fontSize: 13,
+        fontSize: 15,
         fontWeight: 600,
-        letterSpacing: -0.3,
+        letterSpacing: "-0.02em",
         color: CX.text,
     },
     connectBtn: {
         padding: "4px 12px",
-        border: `1px solid ${CX.borderMed}`,
+        border: `1px solid ${CX.borderDefault}`,
         borderRadius: CX.radiusSm,
         background: "transparent",
         color: CX.textSecondary,
@@ -726,46 +705,199 @@ const S: Record<string, React.CSSProperties> = {
         fontSize: 11,
         fontWeight: 500,
         fontFamily: CX.font,
+        letterSpacing: "0.04em",
+        textTransform: "uppercase" as const,
     },
     statusRow: { display: "flex", alignItems: "center", gap: 6 },
-    statusText: {
+    statusLabel: {
         fontSize: 11,
         fontWeight: 500,
-        fontFamily: CX.mono,
-        letterSpacing: 0.5,
+        letterSpacing: "0.04em",
+        textTransform: "uppercase" as const,
+        fontFamily: CX.font,
         transition: `color ${CX.durationSlow} ${CX.easeDefault}`,
     },
 
-    // Disconnected banner
-    disconnectedBanner: {
-        padding: "12px 14px",
+    // Disconnected area — centered vertically
+    disconnectedArea: {
+        display: "flex",
+        flexDirection: "column" as const,
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "32px 0",
+        gap: 4,
+    },
+    disconnectedTitle: { fontSize: 15, fontWeight: 600, color: CX.textSecondary, letterSpacing: "-0.015em" },
+    disconnectedBody: { fontSize: 13, color: CX.textTertiary },
+
+    // Morning briefing
+    briefingCard: {
+        background: CX.surface,
+        borderRadius: CX.radiusLg,
+        padding: 16,
+        marginTop: CX.space6,
+        borderLeft: `3px solid ${CX.accent}`,
+    },
+    briefingTitle: { fontSize: 15, fontWeight: 600, letterSpacing: "-0.015em", color: CX.text },
+    briefingBody: { fontSize: 13, color: CX.textSecondary, lineHeight: 1.5, marginTop: 4 },
+
+    // Ghost button
+    ghostBtn: {
+        padding: "6px 16px",
+        border: `1px solid ${CX.borderDefault}`,
+        borderRadius: CX.radiusMd,
+        background: "transparent",
+        color: CX.textSecondary,
+        cursor: "pointer",
+        fontSize: 11,
+        fontWeight: 500,
+        fontFamily: CX.font,
+        letterSpacing: "0.04em",
+        textTransform: "uppercase" as const,
+    },
+
+    // Goal input — tertiary bg, 40px height, enter icon
+    goalInput: {
+        width: "100%",
+        height: 40,
+        padding: "0 32px 0 12px",
+        border: "none",
         borderRadius: CX.radiusMd,
         background: CX.tertiary,
-        border: `1px solid ${CX.border}`,
-        marginBottom: 12,
-        textAlign: "center" as const,
-    },
-    disconnectedTitle: { fontSize: 13, fontWeight: 600, color: CX.textSecondary, marginBottom: 2 },
-    disconnectedBody: { fontSize: 11, color: CX.textTertiary, lineHeight: 1.4 },
-
-    // Sections
-    section: { marginBottom: 12 },
-    input: {
-        width: "100%",
-        padding: "10px 12px",
-        border: `1px solid ${CX.border}`,
-        borderRadius: CX.radiusMd,
-        background: CX.surface,
         color: CX.text,
         fontSize: 13,
-        marginBottom: 8,
+        letterSpacing: "-0.005em",
         outline: "none",
         boxSizing: "border-box" as const,
         fontFamily: CX.font,
+        marginTop: CX.space6,
     },
+    goalEnterIcon: {
+        position: "absolute" as const,
+        right: 12,
+        top: CX.space6 + 10,
+        color: CX.textTertiary,
+        fontSize: 14,
+        pointerEvents: "none" as const,
+    },
+
+    // Session card — surface bg, no visible border
+    sessionCard: {
+        background: CX.surface,
+        borderRadius: CX.radiusLg,
+        padding: 16,
+        marginTop: CX.space6,
+    },
+    focusHeader: {
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        marginBottom: 16,
+    },
+    focusTitle: { fontSize: 15, fontWeight: 600, color: CX.text, letterSpacing: "-0.015em" },
+    focusDuration: { fontSize: 13, color: CX.textTertiary },
+    endBtn: {
+        padding: "4px 12px",
+        border: `1px solid ${CX.borderDefault}`,
+        borderRadius: CX.radiusSm,
+        background: "transparent",
+        color: CX.textSecondary,
+        cursor: "pointer",
+        fontSize: 11,
+        fontWeight: 500,
+        fontFamily: CX.font,
+        letterSpacing: "0.04em",
+        textTransform: "uppercase" as const,
+    },
+    bigRow: {
+        display: "flex",
+        alignItems: "baseline",
+        justifyContent: "space-between",
+        marginBottom: 4,
+    },
+    bigNum: {
+        fontSize: 28,
+        fontWeight: 600,
+        letterSpacing: "-0.03em",
+        lineHeight: 1.15,
+        fontFamily: CX.mono,
+    },
+    bigPct: {
+        fontSize: 16,
+        fontWeight: 500,
+        fontFamily: CX.mono,
+        color: CX.textTertiary,
+    },
+    bigLabel: {
+        fontSize: 13,
+        color: CX.textSecondary,
+        letterSpacing: "-0.005em",
+        marginBottom: 12,
+    },
+
+    // Progress track — 6px tall
+    trackOuter: {
+        height: 6,
+        borderRadius: CX.radiusSm,
+        background: CX.tertiary,
+        marginBottom: 16,
+        overflow: "hidden",
+    },
+    trackFill: {
+        height: "100%",
+        borderRadius: CX.radiusSm,
+        transition: `width 1s ease, background ${CX.durationSlow} ${CX.easeDefault}`,
+    },
+
+    // Stats row — three columns
+    statsRow: { display: "flex", justifyContent: "space-around" },
+    statCol: { display: "flex", flexDirection: "column" as const, alignItems: "center", gap: 2 },
+    statVal: { fontSize: 16, fontWeight: 500, color: CX.text, fontFamily: CX.mono },
+    statLabel: { fontSize: 11, fontWeight: 400, color: CX.textTertiary, letterSpacing: "0.04em", textTransform: "uppercase" as const },
+
+    // Intervention preview — left border for HYPER
+    interventionCard: {
+        background: CX.surface,
+        borderRadius: CX.radiusLg,
+        padding: 16,
+        marginTop: CX.space6,
+        borderLeft: `3px solid ${STATE_COLORS.HYPER}`,
+    },
+    causalText: {
+        fontSize: 13,
+        color: CX.textSecondary,
+        lineHeight: 1.5,
+        marginBottom: 12,
+        fontStyle: "italic",
+        letterSpacing: "-0.005em",
+    },
+    tabRow: { display: "flex", alignItems: "center", gap: 8, height: 32 },
+    tabXMark: { color: `${CX.danger}99`, fontSize: 12, fontWeight: 400, width: 14, textAlign: "center" as const, flexShrink: 0, fontFamily: CX.mono },
+    tabName: {
+        fontSize: 12, color: CX.text, fontFamily: CX.mono,
+        whiteSpace: "nowrap" as const, overflow: "hidden", textOverflow: "ellipsis" as const,
+    },
+    keepLine: { fontSize: 10, color: CX.textTertiary, marginTop: 6 },
+
+    // Error — tertiary bg, not danger
+    errBox: {
+        padding: 12,
+        background: CX.tertiary,
+        borderRadius: CX.radiusMd,
+        marginBottom: 12,
+    },
+    errBody: { fontSize: 12, color: CX.text, lineHeight: 1.5, fontFamily: CX.mono },
+    errCode: {
+        fontSize: 12, color: CX.accent, marginTop: 8, fontFamily: CX.mono,
+        lineHeight: 1.5, whiteSpace: "pre-wrap" as const, border: "none", margin: 0,
+        padding: 0, background: "none",
+    },
+
+    // Primary CTA — full width, accent bg, 40px height
     primaryBtn: {
         width: "100%",
-        padding: "10px 20px",
+        height: 40,
+        padding: "0 20px",
         border: "none",
         borderRadius: CX.radiusMd,
         background: CX.accent,
@@ -773,7 +905,7 @@ const S: Record<string, React.CSSProperties> = {
         fontSize: 11,
         fontWeight: 500,
         cursor: "pointer",
-        letterSpacing: 0.5,
+        letterSpacing: "0.04em",
         textTransform: "uppercase" as const,
         fontFamily: CX.font,
         transition: `background ${CX.durationFast} ${CX.easeDefault}`,
@@ -785,115 +917,50 @@ const S: Record<string, React.CSSProperties> = {
         pointerEvents: "none" as const,
     },
 
-    // Card
-    card: {
-        background: CX.surface,
-        borderRadius: CX.radiusLg,
-        padding: 16,
-        marginBottom: 8,
-        border: `1px solid ${CX.border}`,
-    },
-
-    // Focus
-    focusHeader: {
-        display: "flex",
-        alignItems: "flex-start",
-        justifyContent: "space-between",
-        marginBottom: 16,
-    },
-    focusGoal: { fontSize: 13, fontWeight: 600, color: CX.text, letterSpacing: -0.2 },
-    muted: { fontSize: 10, color: CX.textSecondary, marginTop: 2, fontFamily: CX.mono },
-    endBtn: {
-        padding: "4px 12px",
-        border: `1px solid ${CX.dangerDim}`,
-        borderRadius: CX.radiusSm,
-        background: CX.dangerDim,
-        color: CX.danger,
-        cursor: "pointer",
-        fontSize: 10,
-        fontWeight: 600,
-        fontFamily: CX.font,
-    },
-    bigRow: { display: "flex", alignItems: "baseline", gap: 8, marginBottom: 12 },
-    bigNum: {
-        fontSize: 28,
-        fontWeight: 600,
-        letterSpacing: -1,
-        lineHeight: 1.15,
-        fontFamily: CX.mono,
-    },
-    bigLabel: { fontSize: 13, color: CX.textSecondary },
-
-    // Progress track
-    trackOuter: {
-        height: 2,
-        borderRadius: 1,
-        background: CX.border,
-        marginBottom: 16,
-        overflow: "hidden",
-    },
-    trackFill: {
-        height: "100%",
-        borderRadius: 1,
-        transition: `width 1s ease, background ${CX.durationSlow} ${CX.easeDefault}`,
-    },
-
-    // Metrics row
-    metricsRow: { display: "flex", alignItems: "center", justifyContent: "space-around" },
-    metric: { display: "flex", flexDirection: "column" as const, alignItems: "center", gap: 2 },
-    metricVal: { fontSize: 15, fontWeight: 400, color: CX.text, fontFamily: CX.mono, transition: `all 0.3s ${CX.easeDefault}` },
-    metricUnit: { fontSize: 10, color: CX.textSecondary, marginLeft: 1 },
-    metricLabel: { fontSize: 9, color: CX.textTertiary, letterSpacing: 0.8, fontFamily: CX.mono, textTransform: "uppercase" as const },
-    metricDiv: { width: 1, height: 16, background: CX.border },
-
-    // Intervention
-    sectionHead: { fontSize: 11, fontWeight: 500, color: CX.textSecondary, marginBottom: 8, letterSpacing: 0.2 },
-    tabRow: { display: "flex", alignItems: "center", gap: 8, padding: "3px 0" },
-    tabXMark: { color: CX.danger, fontSize: 13, fontWeight: 500, width: 14, textAlign: "center" as const, flexShrink: 0, fontFamily: CX.mono },
-    tabName: {
-        fontSize: 12, color: CX.textSecondary,
-        whiteSpace: "nowrap" as const, overflow: "hidden", textOverflow: "ellipsis" as const,
-    },
-    keepLine: { fontSize: 11, color: CX.textTertiary, marginTop: 6 },
-
-    // Error
-    errBox: {
-        padding: "12px 14px",
-        background: CX.dangerDim,
-        borderRadius: CX.radiusMd,
-        border: `1px solid rgba(239, 68, 68, 0.08)`,
-        marginBottom: 12,
-    },
-    errHead: { fontSize: 10, fontWeight: 600, color: CX.danger, marginBottom: 4, fontFamily: CX.mono, letterSpacing: 0.5, textTransform: "uppercase" as const },
-    errBody: { fontSize: 13, color: CX.text, lineHeight: 1.5 },
-    errCode: {
-        fontSize: 12, color: CX.textSecondary, marginTop: 8, fontFamily: CX.mono,
-        padding: "8px 10px", background: "rgba(0,0,0,.3)", borderRadius: CX.radiusSm, lineHeight: 1.5,
-        whiteSpace: "pre-wrap" as const, border: "none", margin: 0,
-    },
-
     // Undo
     undoRow: {
         display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
-        marginTop: 8, fontSize: 11, color: CX.textTertiary,
+        marginTop: 8, fontSize: 10, color: CX.textTertiary,
     },
     undoLink: {
-        background: "none", border: "none", color: CX.accent, fontSize: 11,
+        background: "none", border: "none", color: CX.accent, fontSize: 10,
         fontWeight: 500, cursor: "pointer", padding: 0, fontFamily: CX.font,
     },
 
-    // Daily stats
-    dailyGrid: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 4 },
+    // Biometrics row — no card, 1px separators
+    bioRow: {
+        display: "flex",
+        justifyContent: "space-around",
+        padding: "12px 0",
+        marginTop: CX.space6,
+        borderTop: `1px solid ${CX.borderDefault}`,
+        borderBottom: `1px solid ${CX.borderDefault}`,
+    },
+    bioCol: { display: "flex", alignItems: "center", gap: 6 },
+    bioLabel: {
+        fontSize: 11,
+        fontWeight: 500,
+        letterSpacing: "0.04em",
+        textTransform: "uppercase" as const,
+    },
+    bioVal: {
+        fontSize: 12,
+        fontFamily: CX.mono,
+        color: CX.text,
+    },
 
-    // Toggle
+    // Settings — no card, separator above
+    settingsArea: {
+        padding: "16px 0",
+        borderTop: `1px solid ${CX.borderDefault}`,
+        marginTop: CX.space6,
+    },
     toggleRow: {
         display: "flex",
         alignItems: "center",
         justifyContent: "space-between",
-        gap: 12,
     },
-    toggleLabel: { fontSize: 13, fontWeight: 500, color: CX.text },
-    toggleDesc: { fontSize: 10, color: CX.textTertiary, marginTop: 2 },
+    toggleLabel: { fontSize: 13, color: CX.textSecondary },
     toggleTrack: {
         position: "relative" as const,
         width: 36,
@@ -915,6 +982,18 @@ const S: Record<string, React.CSSProperties> = {
         background: "#fff",
         transition: `transform ${CX.durationNormal} ${CX.easeDefault}`,
     },
+
+    // Today footer — no card, visual basement
+    todayFooter: {
+        display: "flex",
+        justifyContent: "space-around",
+        padding: "16px 0 0 0",
+        borderTop: `1px solid ${CX.borderDefault}`,
+        marginTop: CX.space6,
+    },
+    todayCol: { display: "flex", flexDirection: "column" as const, alignItems: "center", gap: 2 },
+    todayVal: { fontSize: 12, fontFamily: CX.mono, color: CX.textSecondary },
+    todayLabel: { fontSize: 10, color: CX.textTertiary, letterSpacing: "0.02em", textTransform: "uppercase" as const },
 };
 
 // --- Mount ---

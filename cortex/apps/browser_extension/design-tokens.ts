@@ -8,16 +8,16 @@
 // --- Core Tokens ---
 
 export const CX = {
-    // Canvas
-    bg: "#0A0A0B",
-    surface: "#111113",
-    tertiary: "#18181B",
-    overlay: "rgba(10, 10, 11, 0.85)",
+    // Canvas (warm-shifted from pure black per design guide)
+    bg: "#0C0C0E",
+    surface: "#131316",
+    tertiary: "#1A1A1E",
+    overlay: "rgba(12, 12, 14, 0.88)",
 
-    // Borders
-    border: "rgba(255, 255, 255, 0.06)",
-    borderMed: "rgba(255, 255, 255, 0.10)",
-    borderStrong: "rgba(255, 255, 255, 0.15)",
+    // Borders (reduced — feel structure without seeing lines)
+    border: "rgba(255, 255, 255, 0.03)",       // subtle — card edges, barely there
+    borderDefault: "rgba(255, 255, 255, 0.07)", // section separators
+    borderEmphasis: "rgba(255, 255, 255, 0.12)", // active/focus states
 
     // Text
     text: "#EDEDEF",
@@ -41,8 +41,8 @@ export const CX = {
     bioBlink: "#FBBF24",
 
     // Fonts
-    font: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif",
-    mono: "'JetBrains Mono', 'SF Mono', 'Fira Code', 'Cascadia Code', monospace",
+    font: "'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif",
+    mono: "'JetBrains Mono', 'SF Mono', 'Cascadia Code', monospace",
 
     // Radius
     radiusSm: 6,
@@ -66,10 +66,11 @@ export const CX = {
     easeExit: "cubic-bezier(0.4, 0, 1, 1)",
 
     // Durations
-    durationFast: "100ms",
-    durationNormal: "200ms",
-    durationSlow: "400ms",
-    durationAmbient: "3000ms",
+    durationMicro: "100ms",   // hover, focus ring
+    durationFast: "150ms",    // overlay exit, button press
+    durationNormal: "200ms",  // overlay enter, card expand
+    durationSlow: "400ms",    // state color transitions
+    durationAmbient: "3000ms", // aura, somatic filter
 } as const;
 
 // --- State Colors (hex, for React inline styles) ---
@@ -111,10 +112,10 @@ export const STATE_LABELS: Record<string, string> = {
 // --- Somatic Temperatures (ambient color filter) ---
 
 export const SOMATIC_TEMPS: Record<string, { r: number; g: number; b: number; opacity: number }> = {
-    FLOW: { r: 100, g: 180, b: 220, opacity: 0.015 },
-    HYPER: { r: 249, g: 150, b: 80, opacity: 0.035 },
-    HYPO: { r: 140, g: 160, b: 210, opacity: 0.02 },
-    RECOVERY: { r: 180, g: 160, b: 220, opacity: 0.02 },
+    FLOW: { r: 100, g: 180, b: 220, opacity: 0.01 },     // cool blue tint, 1%
+    HYPER: { r: 249, g: 150, b: 80, opacity: 0.02 },      // warm amber, 2%
+    HYPO: { r: 140, g: 160, b: 210, opacity: 0 },         // neutral, 0%
+    RECOVERY: { r: 180, g: 160, b: 220, opacity: 0.015 },
 };
 
 // --- Font Loading ---
@@ -196,8 +197,8 @@ export function cxVars(): string {
         "tertiary": CX.tertiary,
         "overlay": CX.overlay,
         "border": CX.border,
-        "border-med": CX.borderMed,
-        "border-strong": CX.borderStrong,
+        "border-default": CX.borderDefault,
+        "border-emphasis": CX.borderEmphasis,
         "text": CX.text,
         "text-secondary": CX.textSecondary,
         "text-tertiary": CX.textTertiary,
@@ -220,6 +221,7 @@ export function cxVars(): string {
         "ease-default": CX.easeDefault,
         "ease-enter": CX.easeEnter,
         "ease-exit": CX.easeExit,
+        "duration-micro": CX.durationMicro,
         "duration-fast": CX.durationFast,
         "duration-normal": CX.durationNormal,
         "duration-slow": CX.durationSlow,
@@ -241,7 +243,10 @@ export function cxBaseCSS(): string {
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
         @media (prefers-reduced-motion: reduce) {
-            * { animation: none !important; transition: none !important; }
+            *, *::before, *::after {
+                animation-duration: 0.001ms !important;
+                transition-duration: 0.001ms !important;
+            }
         }
     `;
 }
@@ -259,6 +264,9 @@ export const CX_KEYFRAMES = `
         50% { opacity: 0.3; }
     }
     @media (prefers-reduced-motion: reduce) {
-        * { animation: none !important; transition: none !important; }
+        *, *::before, *::after {
+            animation-duration: 0.001ms !important;
+            transition-duration: 0.001ms !important;
+        }
     }
 `;

@@ -145,7 +145,7 @@ const S: Record<string, React.CSSProperties> = {
         width: "100%",
         background: CX.surface,
         borderRadius: CX.radiusXl,
-        border: `1px solid ${CX.border}`,
+        border: `1px solid ${CX.borderDefault}`,
         padding: 40,
     },
     progressRow: {
@@ -162,7 +162,7 @@ const S: Record<string, React.CSSProperties> = {
     stepLabel: {
         fontSize: 11,
         color: CX.textTertiary,
-        letterSpacing: 0.8,
+        letterSpacing: "0.04em",
         textTransform: "uppercase" as const,
         fontFamily: CX.mono,
         marginBottom: 8,
@@ -183,7 +183,7 @@ const S: Record<string, React.CSSProperties> = {
     },
     codeBlock: {
         background: CX.bg,
-        border: `1px solid ${CX.border}`,
+        border: `1px solid ${CX.borderDefault}`,
         borderRadius: CX.radiusMd,
         padding: "14px 18px",
         fontFamily: CX.mono,
@@ -243,7 +243,7 @@ const S: Record<string, React.CSSProperties> = {
     },
     backBtn: {
         padding: "10px 20px",
-        border: `1px solid ${CX.border}`,
+        border: `1px solid ${CX.borderDefault}`,
         borderRadius: CX.radiusMd,
         background: "transparent",
         color: CX.textSecondary,

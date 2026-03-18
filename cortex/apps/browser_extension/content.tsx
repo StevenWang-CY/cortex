@@ -8,27 +8,13 @@
  *   weather particles, and flow shield — all sub-threshold
  */
 
+import { CX, STATE_COLORS_RGB, SOMATIC_TEMPS, cxBaseCSS } from "./design-tokens";
+
 // --- Constants ---
 
 const CORTEX_OVERLAY_ID = "cortex-somatic-overlay";
 const CORTEX_AMBIENT_ID = "cortex-ambient-layer";
 const MAX_TEXT_CHARS = 8000; // ~2000 tokens
-
-// State colors (matches design system)
-const STATE_COLORS: Record<string, { r: number; g: number; b: number }> = {
-    FLOW: { r: 16, g: 185, b: 129 },     // emerald
-    HYPER: { r: 239, g: 68, b: 68 },      // red
-    HYPO: { r: 59, g: 130, b: 246 },      // blue
-    RECOVERY: { r: 245, g: 158, b: 11 },  // amber
-};
-
-// Somatic filter: warm = stressed, cool = focused
-const SOMATIC_TEMPS: Record<string, { r: number; g: number; b: number; opacity: number }> = {
-    FLOW: { r: 100, g: 180, b: 220, opacity: 0.015 },     // cool blue tint
-    HYPER: { r: 230, g: 160, b: 100, opacity: 0.035 },     // warm amber tint
-    HYPO: { r: 140, g: 160, b: 210, opacity: 0.02 },       // muted cool
-    RECOVERY: { r: 200, g: 180, b: 140, opacity: 0.02 },   // neutral warm
-};
 
 // Flow shield: known distraction element selectors per domain
 const FLOW_SHIELD_SELECTORS: Record<string, string[]> = {
@@ -44,7 +30,7 @@ const FLOW_SHIELD_SELECTORS: Record<string, string[]> = {
 interface AmbientState {
     state: string;
     confidence: number;
-    inFocus: boolean;  // whether the user is in FLOW state
+    inFocus: boolean;
 }
 
 let ambientState: AmbientState = { state: "", confidence: 0, inFocus: false };
@@ -159,11 +145,19 @@ interface InterventionPayload {
 
 function removeOverlay(): void {
     const existing = document.getElementById(CORTEX_OVERLAY_ID);
-    if (existing) existing.remove();
+    if (existing) {
+        // Fade out over 150ms, then remove
+        existing.style.transition = "opacity 150ms cubic-bezier(0.4, 0, 1, 1)";
+        existing.style.opacity = "0";
+        existing.style.pointerEvents = "none";
+        setTimeout(() => existing.remove(), 150);
+    }
 }
 
 function showOverlay(payload: InterventionPayload): void {
-    removeOverlay();
+    // Remove any existing overlay immediately (no fade for replacement)
+    const prev = document.getElementById(CORTEX_OVERLAY_ID);
+    if (prev) prev.remove();
 
     const host = document.createElement("div");
     host.id = CORTEX_OVERLAY_ID;
@@ -180,7 +174,7 @@ function showOverlay(payload: InterventionPayload): void {
         <div class="causal-section" id="causal-toggle">
             <div class="causal-header">
                 <span class="causal-label">Why this?</span>
-                <span class="causal-chevron" id="causal-chevron">›</span>
+                <span class="causal-chevron" id="causal-chevron">\u203A</span>
             </div>
             <div class="causal-body" id="causal-body" style="display:none;">
                 ${escapeHtml(payload.causal_explanation)}
@@ -202,62 +196,70 @@ function showOverlay(payload: InterventionPayload): void {
 
     shadow.innerHTML = `
         <style>
+            ${cxBaseCSS()}
             @keyframes panelIn {
-                from { transform: translateY(12px) scale(.99); opacity: 0; }
-                to   { transform: translateY(0) scale(1); opacity: 1; }
+                from { transform: translateY(8px); opacity: 0; }
+                to   { transform: translateY(0); opacity: 1; }
             }
             @keyframes fadeIn {
                 from { opacity: 0; }
                 to   { opacity: 1; }
             }
-            * { box-sizing: border-box; margin: 0; padding: 0; }
             .scrim {
                 position: fixed; inset: 0;
                 background: ${dimBg ? "rgba(0, 0, 0, 0.35)" : "transparent"};
                 pointer-events: ${dimBg ? "auto" : "none"};
-                animation: fadeIn 0.25s ease;
+                animation: fadeIn 0.2s var(--cx-ease-default);
             }
             .panel {
-                position: fixed; bottom: 20px; right: 20px; width: 340px;
+                position: fixed; bottom: 16px; right: 16px; width: 360px;
                 max-height: calc(100vh - 40px); overflow-y: auto; pointer-events: auto;
-                background: #111113; border-radius: 12px;
+                background: rgba(12, 12, 14, 0.88);
+                backdrop-filter: blur(24px) saturate(1.3);
+                -webkit-backdrop-filter: blur(24px) saturate(1.3);
+                border-radius: var(--cx-radius-xl);
                 border: 1px solid rgba(255, 255, 255, 0.06);
-                box-shadow: 0 0 0 .5px rgba(0,0,0,.3), 0 4px 20px rgba(0,0,0,.4), 0 16px 40px rgba(0,0,0,.2);
-                font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'SF Pro Text', system-ui, sans-serif;
-                animation: panelIn 0.3s cubic-bezier(0.16, 1, 0.3, 1); color: #e4e4e7;
+                box-shadow: 0 8px 40px rgba(0,0,0,0.5);
+                font-family: var(--cx-font);
+                animation: panelIn 0.2s var(--cx-ease-enter);
+                color: var(--cx-text);
+                padding: 20px;
             }
-            .panel::-webkit-scrollbar { width: 0; }
-            .panel-inner { padding: 18px 16px 14px; }
+            .panel-inner { }
             .header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 4px; }
-            .headline { font-size: 13px; font-weight: 600; letter-spacing: -0.2px; line-height: 1.4; color: #e4e4e7; }
-            .close-btn { flex-shrink: 0; width: 22px; height: 22px; border: none; background: rgba(255,255,255,.04); border-radius: 6px; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: background .12s; margin-top: 1px; }
+            .headline { font-size: 16px; font-weight: 600; letter-spacing: -0.3px; line-height: 1.3; color: var(--cx-text); }
+            .close-btn { flex-shrink: 0; width: 22px; height: 22px; border: none; background: rgba(255,255,255,.04); border-radius: var(--cx-radius-sm); cursor: pointer; display: flex; align-items: center; justify-content: center; transition: background var(--cx-duration-fast); margin-top: 1px; }
             .close-btn:hover { background: rgba(255,255,255,.08); }
-            .close-btn svg { width: 9px; height: 9px; stroke: #71717a; stroke-width: 2; }
-            .summary { font-size: 12px; color: #71717a; line-height: 1.5; margin-bottom: 14px; }
+            .close-btn:focus-visible { outline: 2px solid var(--cx-accent); outline-offset: 2px; }
+            .close-btn svg { width: 9px; height: 9px; stroke: var(--cx-text-secondary); stroke-width: 2; }
+            .summary { font-size: 13px; color: var(--cx-text-secondary); line-height: 1.5; margin-bottom: 14px; font-style: italic; }
             .divider { height: 1px; background: rgba(255,255,255,.04); margin: 0 0 12px; }
-            .section-label { font-size: 11px; font-weight: 500; color: #71717a; margin-bottom: 6px; }
+            .section-label { font-size: 11px; font-weight: 500; color: var(--cx-text-secondary); margin-bottom: 6px; letter-spacing: 0.2px; }
             .steps { margin-bottom: 14px; }
-            .step { display: flex; align-items: flex-start; gap: 10px; padding: 4px 0; cursor: pointer; transition: opacity .2s; }
-            .step.done span { color: #3f3f46; text-decoration: line-through; text-decoration-color: rgba(255,255,255,.06); }
-            .step-dot { flex-shrink: 0; width: 16px; height: 16px; border-radius: 50%; border: 1.5px solid #3f3f46; margin-top: 1px; transition: all .2s ease; position: relative; }
-            .step.done .step-dot { background: #10b981; border-color: #10b981; }
+            .step { display: flex; align-items: flex-start; gap: 10px; padding: 4px 0; cursor: pointer; transition: opacity 0.2s; }
+            .step.done span { color: var(--cx-text-tertiary); text-decoration: line-through; text-decoration-color: rgba(255,255,255,.06); }
+            .step-dot { flex-shrink: 0; width: 16px; height: 16px; border-radius: 50%; border: 1.5px solid var(--cx-text-tertiary); margin-top: 1px; transition: all 0.2s ease; position: relative; }
+            .step.done .step-dot { background: var(--cx-accent); border-color: var(--cx-accent); }
             .step.done .step-dot::after { content: ''; position: absolute; top: 3px; left: 4.5px; width: 4px; height: 7px; border: solid white; border-width: 0 1.5px 1.5px 0; transform: rotate(45deg); }
-            .step span { font-size: 12px; line-height: 1.5; color: #e4e4e7; }
-            .dismiss-btn { display: block; width: 100%; padding: 6px; border: none; border-radius: 6px; background: none; color: #3f3f46; cursor: pointer; font-size: 11px; font-family: inherit; transition: color .12s; }
-            .dismiss-btn:hover { color: #71717a; }
+            .step span { font-size: 13px; line-height: 1.5; color: var(--cx-text); }
+            .step:focus-visible { outline: 2px solid var(--cx-accent); outline-offset: 2px; border-radius: 4px; }
+            .dismiss-btn { display: block; width: 100%; padding: 6px; border: none; border-radius: var(--cx-radius-sm); background: none; color: var(--cx-text-tertiary); cursor: pointer; font-size: 11px; font-family: inherit; transition: color var(--cx-duration-fast); }
+            .dismiss-btn:hover { color: var(--cx-text-secondary); }
+            .dismiss-btn:focus-visible { outline: 2px solid var(--cx-accent); outline-offset: 2px; }
             .causal-section { margin-bottom: 10px; }
             .causal-header { display: flex; align-items: center; gap: 4px; cursor: pointer; }
-            .causal-label { font-size: 11px; color: #3f3f46; font-weight: 500; }
-            .causal-chevron { font-size: 11px; color: #3f3f46; transition: transform .15s; }
+            .causal-label { font-size: 11px; color: var(--cx-text-tertiary); font-weight: 500; }
+            .causal-chevron { font-size: 11px; color: var(--cx-text-tertiary); transition: transform 0.15s; }
             .causal-chevron.open { transform: rotate(90deg); }
-            .causal-body { font-size: 11px; color: #52525b; line-height: 1.5; padding: 6px 0 2px; }
+            .causal-body { font-size: 13px; color: var(--cx-text-secondary); line-height: 1.5; padding: 6px 0 2px; font-style: italic; }
             .rating-row { display: flex; justify-content: center; gap: 8px; margin-top: 6px; }
-            .rating-btn { width: 28px; height: 28px; border: 1px solid rgba(255,255,255,.06); border-radius: 6px; background: none; cursor: pointer; font-size: 12px; display: flex; align-items: center; justify-content: center; transition: background .12s; }
+            .rating-btn { width: 28px; height: 28px; border: 1px solid var(--cx-border-default); border-radius: var(--cx-radius-sm); background: none; cursor: pointer; font-size: 12px; display: flex; align-items: center; justify-content: center; transition: background var(--cx-duration-fast); }
             .rating-btn:hover { background: rgba(255,255,255,.06); }
-            .rating-btn.selected { background: rgba(16,185,129,.15); border-color: rgba(16,185,129,.2); }
+            .rating-btn:focus-visible { outline: 2px solid var(--cx-accent); outline-offset: 2px; }
+            .rating-btn.selected { background: var(--cx-accent-dim); border-color: rgba(129,140,248,.2); }
         </style>
         <div class="scrim" id="scrim"></div>
-        <div class="panel" id="panel">
+        <div class="panel" id="panel" role="alertdialog" aria-modal="true" aria-label="Cortex intervention">
             <div class="panel-inner">
                 <div class="header">
                     <div class="headline">${escapeHtml(payload.headline)}</div>
@@ -272,14 +274,18 @@ function showOverlay(payload: InterventionPayload): void {
                 <div class="steps">${stepsHtml}</div>
                 <button class="dismiss-btn" id="dismiss-btn">Dismiss</button>
                 <div class="rating-row">
-                    <button class="rating-btn" id="thumbs-up" aria-label="Helpful">👍</button>
-                    <button class="rating-btn" id="thumbs-down" aria-label="Not helpful">👎</button>
+                    <button class="rating-btn" id="thumbs-up" aria-label="Helpful">\uD83D\uDC4D</button>
+                    <button class="rating-btn" id="thumbs-down" aria-label="Not helpful">\uD83D\uDC4E</button>
                 </div>
             </div>
         </div>
     `;
 
     document.body.appendChild(host);
+
+    // Focus trap: focus the panel on open
+    const panel = shadow.getElementById("panel");
+    if (panel) panel.focus();
 
     const dismiss = () => {
         sendUserAction("dismissed", payload.intervention_id);
@@ -428,9 +434,8 @@ function updateAmbient(payload: Record<string, unknown>): void {
 
 function updateAura(state: string, confidence: number): void {
     if (!auraEl) return;
-    const col = STATE_COLORS[state] || STATE_COLORS.FLOW;
-    // Vignette: radial gradient from transparent center to subtle colored edges
-    const alpha = Math.min(confidence * 0.03, 0.03); // max 3% opacity at edges
+    const col = STATE_COLORS_RGB[state] || STATE_COLORS_RGB.FLOW;
+    const alpha = Math.min(confidence * 0.02, 0.02);
     auraEl.style.background =
         `radial-gradient(ellipse at center, transparent 50%, rgba(${col.r},${col.g},${col.b},${alpha}) 100%)`;
     auraEl.style.opacity = state ? "1" : "0";
@@ -450,19 +455,23 @@ let lastFrameTime = 0;
 const PARTICLE_FPS = 15;
 const FRAME_INTERVAL = 1000 / PARTICLE_FPS;
 
+/**
+ * HYPER state: fewer particles = more visual stillness.
+ * Cortex gets quieter when the student is overwhelmed.
+ */
 function updateParticleTarget(state: string): void {
     switch (state) {
         case "HYPER":
-            targetParticleCount = 35; // rain-like, stressed
+            targetParticleCount = 4; // same as FLOW — Cortex gets quiet when stressed
             break;
         case "HYPO":
-            targetParticleCount = 12; // slow drift
+            targetParticleCount = 2; // very slow, nearly invisible
             break;
         case "FLOW":
-            targetParticleCount = 6; // minimal, calm
+            targetParticleCount = 4; // gentle floating dots
             break;
         case "RECOVERY":
-            targetParticleCount = 10;
+            targetParticleCount = 4;
             break;
         default:
             targetParticleCount = 0;
@@ -476,11 +485,11 @@ function spawnParticle(): Particle {
 
     return {
         x: Math.random() * w,
-        y: isStressed ? -10 : Math.random() * h, // rain from top when stressed
-        vx: (Math.random() - 0.5) * (isStressed ? 0.3 : 0.15),
-        vy: isStressed ? 1.5 + Math.random() * 2 : (Math.random() - 0.5) * 0.2,
-        size: isStressed ? 1 : 1.5 + Math.random(),
-        opacity: 0.03 + Math.random() * 0.04, // 3-7% opacity
+        y: isStressed ? -10 : Math.random() * h,
+        vx: (Math.random() - 0.5) * 0.15,
+        vy: isStressed ? 0.5 + Math.random() * 0.5 : (Math.random() - 0.5) * 0.2,
+        size: 1.5 + Math.random(),
+        opacity: 0.02 + Math.random() * 0.03, // 2-5% opacity — even subtler during HYPER
         life: 1,
     };
 }
@@ -506,14 +515,13 @@ function startParticleLoop(): void {
             particles.push(spawnParticle());
         }
         if (particles.length > targetParticleCount) {
-            // Fade out extras
             for (let i = targetParticleCount; i < particles.length; i++) {
                 particles[i].life -= 0.02;
             }
             particles = particles.filter(p => p.life > 0);
         }
 
-        const col = STATE_COLORS[ambientState.state] || STATE_COLORS.FLOW;
+        const col = STATE_COLORS_RGB[ambientState.state] || STATE_COLORS_RGB.FLOW;
 
         for (const p of particles) {
             p.x += p.vx;
@@ -528,19 +536,10 @@ function startParticleLoop(): void {
             const alpha = p.opacity * p.life;
             particleCtx.beginPath();
 
-            if (ambientState.state === "HYPER") {
-                // Rain: vertical streaks
-                particleCtx.moveTo(p.x, p.y);
-                particleCtx.lineTo(p.x + p.vx * 2, p.y + p.vy * 3);
-                particleCtx.strokeStyle = `rgba(${col.r},${col.g},${col.b},${alpha})`;
-                particleCtx.lineWidth = 0.8;
-                particleCtx.stroke();
-            } else {
-                // Calm: gentle dots
-                particleCtx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
-                particleCtx.fillStyle = `rgba(${col.r},${col.g},${col.b},${alpha})`;
-                particleCtx.fill();
-            }
+            // All states use gentle dots — no rain streaks even during HYPER
+            particleCtx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+            particleCtx.fillStyle = `rgba(${col.r},${col.g},${col.b},${alpha})`;
+            particleCtx.fill();
         }
     }
 
@@ -568,7 +567,6 @@ function updateFlowShield(state: string): void {
     // Calculate fade progress (0→1 over 3 minutes)
     const elapsed = Date.now() - flowShieldStartTime;
     const progress = Math.min(elapsed / FLOW_SHIELD_RAMP_MS, 1);
-    // Target opacity: fade to 5% over 3 minutes
     const targetOpacity = 1 - (progress * 0.95); // 1.0 → 0.05
 
     const hostname = window.location.hostname.replace("www.", "");
@@ -583,7 +581,6 @@ function updateFlowShield(state: string): void {
             const els = document.querySelectorAll<HTMLElement>(sel);
             for (const el of els) {
                 if (!shieldedElements.has(el)) {
-                    // Save original opacity
                     el.dataset.cortexOriginalOpacity = el.style.opacity || "";
                     el.style.transition = "opacity 30s ease";
                     shieldedElements.add(el);
@@ -598,9 +595,12 @@ function updateFlowShield(state: string): void {
 
 function restoreShieldedElements(): void {
     for (const el of shieldedElements) {
+        el.style.transition = "opacity 5s ease-in";
         el.style.opacity = el.dataset.cortexOriginalOpacity || "";
-        el.style.transition = "";
-        delete el.dataset.cortexOriginalOpacity;
+        setTimeout(() => {
+            el.style.transition = "";
+            delete el.dataset.cortexOriginalOpacity;
+        }, 5500);
     }
     shieldedElements.clear();
 }
@@ -610,7 +610,7 @@ setInterval(() => {
     if (flowShieldActive) {
         updateFlowShield(ambientState.state);
     }
-}, 10_000); // every 10s
+}, 10_000);
 
 // --- Helpers ---
 
@@ -637,7 +637,9 @@ function sendUserAction(action: string, interventionId: string): void {
 // --- Breathing Overlay ---
 
 function showBreathingOverlay(payload: Record<string, unknown>): void {
-    removeOverlay();
+    // Remove existing immediately for replacement
+    const prev = document.getElementById(CORTEX_OVERLAY_ID);
+    if (prev) prev.remove();
 
     const host = document.createElement("div");
     host.id = CORTEX_OVERLAY_ID;
@@ -645,72 +647,93 @@ function showBreathingOverlay(payload: Record<string, unknown>): void {
 
     const shadow = host.attachShadow({ mode: "closed" });
 
-    const headline = escapeHtml(String(payload.headline || "Take a breath"));
-
     shadow.innerHTML = `
         <style>
+            ${cxBaseCSS()}
             @keyframes breathe {
-                0%, 100% { transform: scale(0.6); opacity: 0.3; }
-                21% { transform: scale(1); opacity: 0.6; }  /* 4s inhale at ~19s cycle */
-                58% { transform: scale(1); opacity: 0.6; }  /* 7s hold */
-                100% { transform: scale(0.6); opacity: 0.3; } /* 8s exhale */
+                0% { transform: scale(1); }
+                21% { transform: scale(1.25); }
+                58% { transform: scale(1.25); opacity: 1; }
+                59% { opacity: 0.8; }
+                62% { opacity: 1; }
+                65% { opacity: 0.8; }
+                68% { opacity: 1; }
+                100% { transform: scale(0.75); }
             }
             @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-            * { box-sizing: border-box; margin: 0; padding: 0; }
             .scrim {
                 position: fixed; inset: 0;
-                background: rgba(0, 0, 0, 0.5);
+                background: rgba(12, 12, 14, 0.92);
+                backdrop-filter: blur(32px);
+                -webkit-backdrop-filter: blur(32px);
                 pointer-events: auto;
-                animation: fadeIn 1s ease;
+                animation: fadeIn 1s var(--cx-ease-default);
                 display: flex; align-items: center; justify-content: center; flex-direction: column;
             }
             .circle {
-                width: 120px; height: 120px; border-radius: 50%;
-                background: radial-gradient(circle, rgba(16,185,129,.4), rgba(16,185,129,.05));
+                width: 160px; height: 160px; border-radius: 50%;
+                border: 2px solid var(--cx-bio-resp);
+                background: none;
                 animation: breathe 19s ease-in-out infinite;
             }
-            .label { color: #a1a1aa; font-size: 13px; margin-top: 20px; font-family: -apple-system, system-ui, sans-serif; }
-            .phase { color: #e4e4e7; font-size: 16px; margin-top: 8px; font-weight: 300; font-family: -apple-system, system-ui, sans-serif; }
-            .headline { color: #e4e4e7; font-size: 12px; margin-top: 24px; max-width: 280px; text-align: center; line-height: 1.5; font-family: -apple-system, system-ui, sans-serif; }
-            .dismiss { color: #3f3f46; font-size: 11px; margin-top: 16px; cursor: pointer; background: none; border: none; font-family: -apple-system, system-ui, sans-serif; }
-            .dismiss:hover { color: #71717a; }
+            .phase { color: var(--cx-text-secondary); font-size: 15px; margin-top: 24px; font-weight: 600; font-family: var(--cx-font); letter-spacing: -0.015em; }
+            .timer { color: var(--cx-text-tertiary); font-size: 12px; margin-top: 4px; font-family: var(--cx-mono); }
+            .dismiss { color: var(--cx-text-tertiary); font-size: 10px; position: fixed; bottom: 32px; left: 50%; transform: translateX(-50%); opacity: 0.5; cursor: default; background: none; border: none; font-family: var(--cx-font); letter-spacing: 0.02em; }
         </style>
-        <div class="scrim" id="scrim">
+        <div class="scrim" id="scrim" role="dialog" aria-modal="true" aria-label="Breathing exercise">
             <div class="circle" id="circle"></div>
-            <div class="label">4-7-8 breathing</div>
-            <div class="phase" id="phase">Inhale...</div>
-            <div class="headline">${headline}</div>
-            <button class="dismiss" id="dismiss-btn">Skip</button>
+            <div class="phase" id="phase">Breathe in</div>
+            <div class="timer" id="timer"></div>
+            <div class="dismiss">Press Esc to close</div>
         </div>
     `;
 
     document.body.appendChild(host);
 
-    // Animate phase text
+    // Animate phase text + timer
     const phaseEl = shadow.getElementById("phase");
+    const timerEl = shadow.getElementById("timer");
     if (phaseEl) {
         const phases = [
-            { text: "Inhale...", duration: 4000 },
-            { text: "Hold...", duration: 7000 },
-            { text: "Exhale...", duration: 8000 },
+            { text: "Breathe in", duration: 4000 },
+            { text: "Hold", duration: 7000 },
+            { text: "Breathe out", duration: 8000 },
         ];
         let idx = 0;
+        let phaseStart = Date.now();
+
         const cyclePhase = () => {
             if (!document.getElementById(CORTEX_OVERLAY_ID)) return;
             phaseEl.textContent = phases[idx].text;
+            phaseStart = Date.now();
             setTimeout(() => { idx = (idx + 1) % phases.length; cyclePhase(); }, phases[idx].duration);
         };
         cyclePhase();
+
+        // Update timer countdown
+        const timerInterval = setInterval(() => {
+            if (!document.getElementById(CORTEX_OVERLAY_ID)) { clearInterval(timerInterval); return; }
+            if (timerEl) {
+                const elapsed = Date.now() - phaseStart;
+                const remaining = Math.max(0, Math.ceil((phases[idx].duration - elapsed) / 1000));
+                timerEl.textContent = `${remaining}s`;
+            }
+        }, 200);
     }
 
     const dismiss = () => {
         sendUserAction("dismissed", String(payload.intervention_id || ""));
         removeOverlay();
     };
-    shadow.getElementById("dismiss-btn")?.addEventListener("click", dismiss);
     shadow.getElementById("scrim")?.addEventListener("click", (e) => {
         if (e.target === shadow.getElementById("scrim")) dismiss();
     });
+
+    // Escape dismisses
+    const escHandler = (e: KeyboardEvent) => {
+        if (e.key === "Escape") { dismiss(); document.removeEventListener("keydown", escHandler); }
+    };
+    document.addEventListener("keydown", escHandler);
 
     // Auto-dismiss after 3 cycles (57 seconds)
     setTimeout(() => {
@@ -723,7 +746,8 @@ function showBreathingOverlay(payload: Record<string, unknown>): void {
 // --- Active Recall ---
 
 function showActiveRecall(payload: Record<string, unknown>): void {
-    removeOverlay();
+    const prev = document.getElementById(CORTEX_OVERLAY_ID);
+    if (prev) prev.remove();
 
     const host = document.createElement("div");
     host.id = CORTEX_OVERLAY_ID;
@@ -733,56 +757,67 @@ function showActiveRecall(payload: Record<string, unknown>): void {
 
     const question = escapeHtml(String(payload.recall_question || "What was the key concept?"));
     const answer = String(payload.recall_answer || "");
-    const headline = escapeHtml(String(payload.headline || "Quick check"));
 
     shadow.innerHTML = `
         <style>
+            ${cxBaseCSS()}
             @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-            * { box-sizing: border-box; margin: 0; padding: 0; }
             .scrim {
                 position: fixed; inset: 0;
-                backdrop-filter: blur(12px);
-                background: rgba(0,0,0,0.6);
-                pointer-events: auto;
-                animation: fadeIn 0.5s ease;
-                display: flex; align-items: center; justify-content: center;
+                pointer-events: none;
+                animation: fadeIn 0.2s var(--cx-ease-enter);
             }
             .card {
-                background: #111113; border-radius: 12px; padding: 24px;
-                border: 1px solid rgba(255,255,255,.06); max-width: 380px; width: 90%;
-                box-shadow: 0 16px 40px rgba(0,0,0,.4);
-                font-family: -apple-system, system-ui, sans-serif;
+                position: fixed; bottom: 16px; right: 16px; max-width: 360px; width: 360px;
+                pointer-events: auto;
+                background: rgba(12, 12, 14, 0.88);
+                backdrop-filter: blur(24px) saturate(1.3);
+                -webkit-backdrop-filter: blur(24px) saturate(1.3);
+                border-radius: var(--cx-radius-xl);
+                border: 1px solid rgba(255, 255, 255, 0.06);
+                box-shadow: 0 8px 40px rgba(0,0,0,0.5);
+                padding: 20px;
+                font-family: var(--cx-font);
+                animation: panelIn 0.2s var(--cx-ease-enter);
             }
-            .title { font-size: 11px; color: #71717a; margin-bottom: 12px; letter-spacing: 0.5px; font-weight: 500; }
-            .question { font-size: 14px; color: #e4e4e7; line-height: 1.6; margin-bottom: 16px; }
-            .input-row { display: flex; gap: 8px; }
+            @keyframes panelIn {
+                from { transform: translateY(8px); opacity: 0; }
+                to   { transform: translateY(0); opacity: 1; }
+            }
+            .title { font-size: 15px; font-weight: 600; color: var(--cx-text); margin-bottom: 12px; letter-spacing: -0.015em; }
+            .question { font-size: 13px; color: var(--cx-text-secondary); line-height: 1.5; margin-bottom: 16px; letter-spacing: -0.005em; }
             .input {
-                flex: 1; padding: 8px 12px; border: 1px solid rgba(255,255,255,.08);
-                border-radius: 8px; background: rgba(255,255,255,.04); color: #e4e4e7;
-                font-size: 13px; outline: none; font-family: inherit;
+                width: 100%; padding: 8px 12px; border: none;
+                border-radius: var(--cx-radius-md); background: var(--cx-tertiary); color: var(--cx-text);
+                font-size: 13px; outline: none; font-family: inherit; height: 36px;
+                box-sizing: border-box; margin-bottom: 12px;
             }
-            .input:focus { border-color: rgba(16,185,129,.3); }
+            .input:focus { border: 1px solid var(--cx-accent); }
+            .input:focus-visible { outline: 2px solid var(--cx-accent); outline-offset: 2px; }
+            .btn-row { display: flex; justify-content: space-between; align-items: center; }
             .submit-btn {
-                padding: 8px 16px; border: none; border-radius: 8px;
-                background: #e4e4e7; color: #09090b; font-size: 12px; font-weight: 600;
-                cursor: pointer; font-family: inherit;
+                width: 100%; height: 40px; border: none; border-radius: var(--cx-radius-md);
+                background: var(--cx-accent); color: var(--cx-text-inverse); font-size: 11px; font-weight: 500;
+                cursor: pointer; font-family: inherit; text-transform: uppercase; letter-spacing: 0.04em;
             }
-            .feedback { font-size: 12px; margin-top: 10px; }
-            .correct { color: #10b981; }
-            .incorrect { color: #ef4444; }
-            .skip { display: block; color: #3f3f46; font-size: 11px; margin-top: 12px; cursor: pointer; background: none; border: none; text-align: center; width: 100%; font-family: inherit; }
-            .skip:hover { color: #71717a; }
+            .submit-btn:focus-visible { outline: 2px solid var(--cx-accent); outline-offset: 2px; }
+            .feedback { font-size: 13px; margin-top: 10px; font-family: var(--cx-font); }
+            .correct { color: var(--cx-bio-resp); }
+            .incorrect { color: var(--cx-text-tertiary); }
+            .skip { color: var(--cx-text-tertiary); font-size: 10px; cursor: pointer; background: none; border: none; font-family: inherit; }
+            .skip:hover { color: var(--cx-text-secondary); }
+            .skip:focus-visible { outline: 2px solid var(--cx-accent); outline-offset: 2px; }
         </style>
-        <div class="scrim" id="scrim">
+        <div class="scrim" id="scrim" role="dialog" aria-modal="true" aria-label="Active recall check">
             <div class="card">
-                <div class="title">${headline}</div>
+                <div class="title">Quick check</div>
                 <div class="question">${question}</div>
-                <div class="input-row">
-                    <input class="input" id="recall-input" placeholder="Your answer..." autofocus />
-                    <button class="submit-btn" id="submit-btn">Check</button>
+                <input class="input" id="recall-input" placeholder="Your answer..." autofocus />
+                <div class="btn-row">
+                    <button class="submit-btn" id="submit-btn" style="flex:1">Check</button>
+                    <button class="skip" id="skip-btn" style="margin-left:12px">Skip</button>
                 </div>
                 <div class="feedback" id="feedback"></div>
-                <button class="skip" id="skip-btn">Skip</button>
             </div>
         </div>
     `;
@@ -800,13 +835,13 @@ function showActiveRecall(payload: Record<string, unknown>): void {
         const correct = answer.toLowerCase();
         if (userAnswer && (correct.includes(userAnswer) || userAnswer.includes(correct))) {
             feedback.className = "feedback correct";
-            feedback.textContent = "Correct! Unblurring...";
+            feedback.textContent = "Correct";
             sendUserAction("engaged", String(payload.intervention_id || ""));
-            setTimeout(removeOverlay, 1000);
+            setTimeout(removeOverlay, 5000);
         } else {
             feedback.className = "feedback incorrect";
-            feedback.textContent = "Not quite. The answer is: " + answer;
-            setTimeout(removeOverlay, 3000);
+            feedback.textContent = "The answer: " + answer;
+            setTimeout(removeOverlay, 5000);
         }
     };
 
@@ -818,6 +853,12 @@ function showActiveRecall(payload: Record<string, unknown>): void {
         sendUserAction("dismissed", String(payload.intervention_id || ""));
         removeOverlay();
     });
+
+    // Escape dismisses
+    const escHandler = (e: KeyboardEvent) => {
+        if (e.key === "Escape") { removeOverlay(); document.removeEventListener("keydown", escHandler); }
+    };
+    document.addEventListener("keydown", escHandler);
 }
 
 // --- Resume Card ---
@@ -827,7 +868,12 @@ let resumeAutoDismissTimer: ReturnType<typeof setTimeout> | null = null;
 
 function removeResumeCard(): void {
     const el = document.getElementById(CORTEX_RESUME_ID);
-    if (el) el.remove();
+    if (el) {
+        el.style.transition = "opacity 150ms cubic-bezier(0.4, 0, 1, 1)";
+        el.style.opacity = "0";
+        el.style.pointerEvents = "none";
+        setTimeout(() => el.remove(), 150);
+    }
     if (resumeAutoDismissTimer) { clearTimeout(resumeAutoDismissTimer); resumeAutoDismissTimer = null; }
 }
 
@@ -856,17 +902,17 @@ function getPositionDisplay(pos: Record<string, unknown>): { label: string; pct:
             const ts = pos.timestamp_s as number;
             const dur = pos.duration_s as number;
             const pct = dur > 0 ? (ts / dur) * 100 : 0;
-            return { label: `▶ ${fmtTime(ts)} / ${fmtTime(dur)}`, pct };
+            return { label: `\u25B6 ${fmtTime(ts)} / ${fmtTime(dur)}`, pct };
         }
         case "scroll":
-            return { label: `📄 ${Math.round(pos.scroll_pct as number)}% read`, pct: pos.max_scroll_pct as number };
+            return { label: `\uD83D\uDCC4 ${Math.round(pos.scroll_pct as number)}% read`, pct: pos.max_scroll_pct as number };
         case "code_problem":
             return {
-                label: `Stage: ${pos.stage} · ${pos.wrong_answer_count} WA · ${Math.round((pos.time_elapsed_s as number) / 60)} min`,
+                label: `Stage: ${pos.stage} \u00B7 ${pos.wrong_answer_count} WA \u00B7 ${Math.round((pos.time_elapsed_s as number) / 60)} min`,
                 pct: Math.min((pos.time_elapsed_s as number) / 1800 * 100, 100),
             };
         case "notebook":
-            return { label: `Cell ${(pos.cell_index as number) + 1} · ${Math.round(pos.scroll_pct as number)}% scrolled`, pct: pos.scroll_pct as number };
+            return { label: `Cell ${(pos.cell_index as number) + 1} \u00B7 ${Math.round(pos.scroll_pct as number)}% scrolled`, pct: pos.scroll_pct as number };
         case "pdf": {
             const total = pos.total_pages as number;
             const pct = total > 0 ? ((pos.page as number) / total) * 100 : 0;
@@ -878,7 +924,7 @@ function getPositionDisplay(pos: Record<string, unknown>): { label: string; pct:
             return { label: `Slide ${(pos.slide_index as number) + 1} / ${total || "?"}`, pct };
         }
         case "general":
-            return { label: `📄 ${Math.round(pos.scroll_pct as number)}% scrolled`, pct: pos.max_scroll_pct as number || pos.scroll_pct as number };
+            return { label: `\uD83D\uDCC4 ${Math.round(pos.scroll_pct as number)}% scrolled`, pct: pos.max_scroll_pct as number || pos.scroll_pct as number };
         default:
             return { label: "", pct: 0 };
     }
@@ -889,10 +935,8 @@ function showResumeCard(activity: Record<string, unknown>): void {
 
     const pos = activity.position as Record<string, unknown>;
     const { label: posLabel, pct: progressPct } = getPositionDisplay(pos);
-    const platform = (activity.platform as string) || "";
     const title = (activity.title as string) || "";
     const chapter = pos.type === "video" && pos.chapter ? pos.chapter as string : "";
-    const lastVisited = activity.last_visited as number;
 
     const host = document.createElement("div");
     host.id = CORTEX_RESUME_ID;
@@ -900,83 +944,70 @@ function showResumeCard(activity: Record<string, unknown>): void {
 
     const shadow = host.attachShadow({ mode: "closed" });
 
-    const platformLabel = escapeHtml(platform.charAt(0).toUpperCase() + platform.slice(1));
     const safeTitle = escapeHtml(title);
     const chapterHtml = chapter ? `<div class="chapter">${escapeHtml(chapter)}</div>` : "";
     const barWidth = Math.min(100, Math.max(0, progressPct));
 
     shadow.innerHTML = `
         <style>
+            ${cxBaseCSS()}
             @keyframes panelIn {
-                from { transform: translateY(12px) scale(.99); opacity: 0; }
-                to   { transform: translateY(0) scale(1); opacity: 1; }
+                from { transform: translateY(8px); opacity: 0; }
+                to   { transform: translateY(0); opacity: 1; }
             }
-            * { box-sizing: border-box; margin: 0; padding: 0; }
             .card {
-                position: fixed; bottom: 20px; right: 20px; width: 300px;
+                position: fixed; bottom: 16px; right: 16px; width: 320px;
                 pointer-events: auto;
-                background: #111113; border-radius: 12px;
+                background: rgba(12, 12, 14, 0.88);
+                backdrop-filter: blur(24px) saturate(1.3);
+                -webkit-backdrop-filter: blur(24px) saturate(1.3);
+                border-radius: var(--cx-radius-xl);
                 border: 1px solid rgba(255, 255, 255, 0.06);
-                box-shadow: 0 0 0 .5px rgba(0,0,0,.3), 0 4px 20px rgba(0,0,0,.4), 0 16px 40px rgba(0,0,0,.2);
-                font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'SF Pro Text', system-ui, sans-serif;
-                animation: panelIn 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-                color: #e4e4e7;
-                padding: 16px;
+                box-shadow: 0 8px 40px rgba(0,0,0,0.5);
+                font-family: var(--cx-font);
+                animation: panelIn 0.2s var(--cx-ease-enter);
+                color: var(--cx-text);
+                padding: 20px;
             }
-            .top-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
-            .platform { font-size: 11px; color: #71717a; letter-spacing: 0.3px; }
-            .close-btn {
-                width: 20px; height: 20px; border: none; background: rgba(255,255,255,.04);
-                border-radius: 5px; cursor: pointer; display: flex; align-items: center;
-                justify-content: center; transition: background .12s;
-            }
-            .close-btn:hover { background: rgba(255,255,255,.08); }
-            .close-btn svg { width: 8px; height: 8px; stroke: #71717a; stroke-width: 2; }
-            .title { font-size: 13px; font-weight: 600; letter-spacing: -0.2px; line-height: 1.4; margin-bottom: 2px; color: #e4e4e7; }
-            .chapter { font-size: 11px; color: #52525b; margin-bottom: 6px; }
-            .position { font-size: 12px; color: #a1a1aa; font-family: 'SF Mono', 'Fira Code', ui-monospace, monospace; margin: 8px 0 6px; }
-            .bar-bg { width: 100%; height: 3px; background: rgba(255,255,255,.06); border-radius: 2px; margin-bottom: 4px; }
-            .bar-fill { height: 100%; border-radius: 2px; background: #10b981; transition: width .3s; }
-            .pct { font-size: 10px; color: #52525b; text-align: right; margin-bottom: 12px; }
+            .pick-up { font-size: 15px; font-weight: 600; letter-spacing: -0.015em; margin-bottom: 12px; color: var(--cx-text); }
+            .title { font-size: 13px; color: var(--cx-text); line-height: 1.4; margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+            .chapter { font-size: 11px; color: var(--cx-text-tertiary); margin-bottom: 6px; }
+            .position { font-size: 12px; color: var(--cx-text-tertiary); font-family: var(--cx-mono); margin: 8px 0 6px; }
+            .bar-bg { width: 100%; height: 4px; background: rgba(255,255,255,0.06); border-radius: 2px; margin-bottom: 12px; }
+            .bar-fill { height: 100%; border-radius: 2px; background: var(--cx-accent); transition: width .3s; }
+            .actions { display: flex; justify-content: space-between; align-items: center; }
             .resume-btn {
-                display: block; width: 100%; padding: 8px; border: none; border-radius: 8px;
-                background: rgba(16, 185, 129, 0.12); color: #10b981; cursor: pointer;
-                font-size: 12px; font-weight: 600; font-family: inherit; letter-spacing: 0.2px;
-                transition: background .12s;
+                padding: 6px 16px; border: 1px solid var(--cx-accent); border-radius: var(--cx-radius-md);
+                background: transparent; color: var(--cx-accent); cursor: pointer;
+                font-size: 11px; font-weight: 500; font-family: inherit; letter-spacing: 0.04em;
+                text-transform: uppercase; transition: background var(--cx-duration-fast);
             }
-            .resume-btn:hover { background: rgba(16, 185, 129, 0.2); }
+            .resume-btn:hover { background: rgba(129, 140, 248, 0.08); }
+            .resume-btn:focus-visible { outline: 2px solid var(--cx-accent); outline-offset: 2px; }
             .dismiss-btn {
-                display: block; width: 100%; padding: 5px; margin-top: 4px;
-                border: none; background: none; color: #3f3f46; cursor: pointer;
-                font-size: 11px; font-family: inherit; transition: color .12s;
+                border: none; background: none; color: var(--cx-text-tertiary); cursor: pointer;
+                font-size: 10px; font-family: inherit; transition: color var(--cx-duration-fast);
             }
-            .dismiss-btn:hover { color: #71717a; }
+            .dismiss-btn:hover { color: var(--cx-text-secondary); }
         </style>
         <div class="card" id="resume-card">
-            <div class="top-row">
-                <span class="platform">${platformLabel} · ${timeAgo(lastVisited)}</span>
-                <button class="close-btn" id="resume-close">
-                    <svg viewBox="0 0 10 10" fill="none"><path d="M1 1l8 8M9 1l-8 8"/></svg>
-                </button>
-            </div>
+            <div class="pick-up">Pick up where you left off</div>
             <div class="title">${safeTitle}</div>
             ${chapterHtml}
             <div class="position">${escapeHtml(posLabel)}</div>
             <div class="bar-bg"><div class="bar-fill" style="width:${barWidth}%"></div></div>
-            <div class="pct">${Math.round(progressPct)}%</div>
-            <button class="resume-btn" id="resume-action">Resume ▸</button>
-            <button class="dismiss-btn" id="resume-dismiss">Dismiss</button>
+            <div class="actions">
+                <button class="resume-btn" id="resume-action">Resume</button>
+                <button class="dismiss-btn" id="resume-dismiss">Dismiss</button>
+            </div>
         </div>
     `;
 
     document.body.appendChild(host);
 
     // Wire up buttons
-    const closeBtn = shadow.getElementById("resume-close");
     const resumeBtn = shadow.getElementById("resume-action");
     const dismissBtn = shadow.getElementById("resume-dismiss");
-
-    closeBtn?.addEventListener("click", () => removeResumeCard());
 
     resumeBtn?.addEventListener("click", () => {
         executeResume(activity);
@@ -1020,19 +1051,16 @@ function executeResume(activity: Record<string, unknown>): void {
             const targetTime = pos.timestamp_s as number;
             const savedDuration = activity.content_duration_s as number;
 
-            // Wait for video element, then seek
             const trySeek = (video: HTMLVideoElement) => {
-                // Verify same content: duration within 5s tolerance
                 if (savedDuration > 0 && Math.abs(video.duration - savedDuration) > 5) {
                     showResumeToast("Different video detected", `Your saved position was ${fmtTime(targetTime)}`);
                     return;
                 }
                 video.currentTime = targetTime;
-                video.play().catch(() => {}); // Some browsers block autoplay
+                video.play().catch(() => {});
                 showResumeToast("Resumed", `Jumped to ${fmtTime(targetTime)}`);
             };
 
-            // Try to find video now; if not found, use MutationObserver
             const selectors = ["video.html5-main-video", ".bpx-player-video-wrap video", "video"];
             let found = false;
             for (const sel of selectors) {
@@ -1040,7 +1068,6 @@ function executeResume(activity: Record<string, unknown>): void {
                 if (v && v.readyState >= 1) { trySeek(v); found = true; break; }
             }
             if (!found) {
-                // Wait for video to appear
                 const observer = new MutationObserver(() => {
                     for (const sel of selectors) {
                         const v = document.querySelector<HTMLVideoElement>(sel);
@@ -1081,7 +1108,7 @@ function executeResume(activity: Record<string, unknown>): void {
                     }
                 }
             }
-            showResumeToast("Welcome back", `You were in ${pos.stage} stage · ${pos.wrong_answer_count} WA`);
+            showResumeToast("Welcome back", `You were in ${pos.stage} stage \u00B7 ${pos.wrong_answer_count} WA`);
             break;
         }
         case "notebook": {
@@ -1127,18 +1154,198 @@ function showResumeToast(title: string, body: string): void {
     const el = document.createElement("div");
     el.id = id;
     el.style.cssText =
-        "position:fixed;top:16px;right:16px;z-index:2147483647;max-width:280px;" +
-        "padding:10px 14px;border-radius:10px;font-family:-apple-system,BlinkMacSystemFont,'Inter',system-ui,sans-serif;" +
-        "background:#111113;color:#e4e4e7;border:1px solid rgba(255,255,255,.06);" +
-        "box-shadow:0 4px 20px rgba(0,0,0,.4);animation:cortexSlideIn .25s ease;font-size:12px;line-height:1.5;" +
-        "cursor:pointer;";
+        `position:fixed;top:16px;right:16px;z-index:2147483647;max-width:280px;` +
+        `padding:10px 14px;border-radius:${CX.radiusMd}px;font-family:${CX.font};` +
+        `background:${CX.surface};color:${CX.text};border:1px solid ${CX.borderDefault};` +
+        `box-shadow:0 8px 40px rgba(0,0,0,.5);animation:cortexSlideIn .2s cubic-bezier(0,0,0.2,1);font-size:13px;line-height:1.5;` +
+        `cursor:pointer;`;
     el.innerHTML =
-        `<style>@keyframes cortexSlideIn{from{transform:translateY(-12px);opacity:0}to{transform:translateY(0);opacity:1}}</style>` +
-        `<div style="font-weight:600;margin-bottom:2px;font-size:12px;color:#10b981">${escapeHtml(title)}</div>` +
-        `<div style="color:#71717a;font-size:11px">${escapeHtml(body)}</div>`;
+        `<style>@keyframes cortexSlideIn{from{transform:translateY(-8px);opacity:0}to{transform:translateY(0);opacity:1}}</style>` +
+        `<div style="font-weight:600;margin-bottom:2px;font-size:12px;color:${CX.accent}">${escapeHtml(title)}</div>` +
+        `<div style="color:${CX.textSecondary};font-size:11px">${escapeHtml(body)}</div>`;
     el.addEventListener("click", () => el.remove());
     document.body.appendChild(el);
-    setTimeout(() => el.remove(), 5000);
+    setTimeout(() => {
+        if (document.getElementById(id)) {
+            el.style.transition = "opacity 150ms";
+            el.style.opacity = "0";
+            setTimeout(() => el.remove(), 150);
+        }
+    }, 5000);
+}
+
+// --- Distraction Blocker ---
+
+const CORTEX_DISTRACTION_ID = "cortex-distraction-blocker";
+
+interface DistractionPayload {
+    focusMin: number;
+    streakMin: number;
+    distractionsBlocked: number;
+    domain: string;
+    goal?: string;
+}
+
+function removeDistractionBlocker(): void {
+    const el = document.getElementById(CORTEX_DISTRACTION_ID);
+    if (el) {
+        el.style.transition = "opacity 150ms cubic-bezier(0.4, 0, 1, 1)";
+        el.style.opacity = "0";
+        el.style.pointerEvents = "none";
+        setTimeout(() => el.remove(), 150);
+    }
+}
+
+function showDistractionBlocker(payload: DistractionPayload): void {
+    document.getElementById(CORTEX_DISTRACTION_ID)?.remove();
+
+    const host = document.createElement("div");
+    host.id = CORTEX_DISTRACTION_ID;
+    host.style.cssText = "position:fixed;inset:0;z-index:2147483647;";
+    const shadow = host.attachShadow({ mode: "closed" });
+
+    const goalText = payload.goal ? escapeHtml(payload.goal) : "your task";
+
+    shadow.innerHTML = `
+        <style>
+            ${cxBaseCSS()}
+            :host {
+                all: initial;
+                display: block;
+                position: fixed;
+                inset: 0;
+                z-index: 2147483647;
+            }
+            .backdrop {
+                position: fixed;
+                inset: 0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: var(--cx-bg);
+                font-family: var(--cx-font);
+                color: var(--cx-text);
+                animation: fadeIn 0.2s cubic-bezier(0, 0, 0.2, 1);
+            }
+            @keyframes fadeIn {
+                from { opacity: 0; }
+                to { opacity: 1; }
+            }
+            .panel {
+                text-align: center;
+                max-width: 400px;
+                padding: 48px 40px;
+            }
+            .focused-on {
+                font-size: 13px;
+                color: var(--cx-text-tertiary);
+                margin: 0 0 8px;
+                line-height: 1.5;
+            }
+            .goal {
+                font-size: 18px;
+                font-weight: 600;
+                letter-spacing: -0.015em;
+                color: var(--cx-text);
+                margin: 0 0 12px;
+                line-height: 1.3;
+            }
+            .stats {
+                font-size: 13px;
+                color: var(--cx-text-tertiary);
+                margin: 0 0 0;
+                line-height: 1.5;
+            }
+            .actions {
+                display: flex;
+                gap: 8px;
+                justify-content: center;
+                margin-top: 32px;
+            }
+            .btn-primary {
+                padding: 10px 28px;
+                border: none;
+                border-radius: var(--cx-radius-md);
+                background: var(--cx-accent);
+                color: var(--cx-text-inverse);
+                font-size: 11px;
+                font-weight: 500;
+                text-transform: uppercase;
+                letter-spacing: 0.04em;
+                cursor: pointer;
+                font-family: var(--cx-font);
+                transition: background var(--cx-duration-fast) var(--cx-ease-default);
+            }
+            .btn-primary:hover {
+                background: var(--cx-accent-hover);
+            }
+            .btn-primary:focus-visible {
+                outline: 2px solid var(--cx-accent);
+                outline-offset: 2px;
+            }
+            .btn-ghost {
+                padding: 10px 28px;
+                border: 1px solid var(--cx-border-default);
+                border-radius: var(--cx-radius-md);
+                background: transparent;
+                color: var(--cx-text-tertiary);
+                font-size: 12px;
+                cursor: pointer;
+                font-family: var(--cx-font);
+                transition: border-color var(--cx-duration-fast) var(--cx-ease-default),
+                            color var(--cx-duration-fast) var(--cx-ease-default);
+            }
+            .btn-ghost:hover {
+                border-color: var(--cx-border-emphasis);
+                color: var(--cx-text-secondary);
+            }
+            .btn-ghost:focus-visible {
+                outline: 2px solid var(--cx-accent);
+                outline-offset: 2px;
+            }
+            @media (prefers-reduced-motion: reduce) {
+                *, *::before, *::after {
+                    animation-duration: 0.001ms !important;
+                    transition-duration: 0.001ms !important;
+                }
+            }
+        </style>
+        <div class="backdrop" role="alertdialog" aria-modal="true" aria-label="Distraction blocked">
+            <div class="panel">
+                <p class="focused-on">You're focused on</p>
+                <h1 class="goal">${goalText}</h1>
+                <p class="stats">${payload.focusMin}m in \u00B7 ${payload.distractionsBlocked} blocked</p>
+                <div class="actions">
+                    <button class="btn-primary" id="go-back">Go back</button>
+                    <button class="btn-ghost" id="continue-btn">Continue</button>
+                </div>
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(host);
+
+    shadow.getElementById("go-back")?.addEventListener("click", () => {
+        try { chrome.runtime.sendMessage({ type: "DISTRACTION_BLOCKED" }); } catch {}
+        removeDistractionBlocker();
+        history.back();
+    });
+
+    shadow.getElementById("continue-btn")?.addEventListener("click", () => {
+        removeDistractionBlocker();
+    });
+
+    // Focus the "Go back" button for keyboard accessibility
+    shadow.getElementById("go-back")?.focus();
+
+    // Escape dismisses (continue)
+    const escHandler = (e: KeyboardEvent) => {
+        if (e.key === "Escape") {
+            removeDistractionBlocker();
+            document.removeEventListener("keydown", escHandler);
+        }
+    };
+    document.addEventListener("keydown", escHandler);
 }
 
 // --- Message Listener ---
@@ -1177,6 +1384,13 @@ chrome.runtime.onMessage.addListener(
             case "AMBIENT_STATE_UPDATE": {
                 const payload = message.payload as Record<string, unknown>;
                 updateAmbient(payload);
+                sendResponse({ ok: true });
+                break;
+            }
+
+            case "SHOW_DISTRACTION_BLOCKER": {
+                const dp = message.payload as DistractionPayload;
+                if (dp) showDistractionBlocker(dp);
                 sendResponse({ ok: true });
                 break;
             }
