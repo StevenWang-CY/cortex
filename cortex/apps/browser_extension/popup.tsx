@@ -1,12 +1,13 @@
 /**
  * Cortex Chrome Extension — Popup UI
  *
- * Design: dark, high-end tech aesthetic (Linear/Raycast-inspired).
- * Monospace numerals, tight spacing, subtle borders, no decoration.
+ * Design: Cortex Design System — dark, calm, Linear/Raycast-inspired.
+ * Inter + JetBrains Mono typography, indigo accent, 4px grid spacing.
  */
 
 import React, { useCallback, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { CX, STATE_COLORS, STATE_LABELS, CX_KEYFRAMES } from "./design-tokens";
 
 // --- Types ---
 
@@ -80,44 +81,29 @@ function synthesizeActions(
     ];
 }
 
-// --- Design Tokens ---
+// --- State dot animation helper ---
 
-const C = {
-    bg: "#09090b",
-    surface: "#111113",
-    surfaceHover: "#18181b",
-    border: "rgba(255,255,255,.06)",
-    borderLight: "rgba(255,255,255,.04)",
-    text: "#e4e4e7",
-    textSecondary: "#71717a",
-    textTertiary: "#3f3f46",
-    accent: "#10b981",       // emerald green
-    accentDim: "rgba(16,185,129,.12)",
-    danger: "#ef4444",
-    dangerDim: "rgba(239,68,68,.1)",
-    warn: "#f59e0b",
-    warnDim: "rgba(245,158,11,.1)",
-    blue: "#3b82f6",
-    blueDim: "rgba(59,130,246,.1)",
-    font: "-apple-system, BlinkMacSystemFont, 'Inter', 'SF Pro Text', system-ui, sans-serif",
-    mono: "'SF Mono', 'Fira Code', 'JetBrains Mono', ui-monospace, monospace",
-    radius: 10,
-    radiusSm: 8,
-};
+function getStateDotStyle(stateStr: string, stateColor: string): React.CSSProperties {
+    const base: React.CSSProperties = {
+        width: 6,
+        height: 6,
+        borderRadius: "50%",
+        background: stateColor,
+        flexShrink: 0,
+    };
 
-const STATE_COLORS: Record<string, string> = {
-    FLOW: C.accent,
-    HYPER: C.danger,
-    HYPO: C.blue,
-    RECOVERY: C.warn,
-};
-
-const STATE_LABELS: Record<string, string> = {
-    FLOW: "Focused",
-    HYPER: "Elevated",
-    HYPO: "Low",
-    RECOVERY: "Recovering",
-};
+    switch (stateStr) {
+        case "FLOW":
+            return { ...base, animation: "cxPulse 2s ease-in-out infinite" };
+        case "HYPO":
+            return { ...base, animation: "cxFadeSlow 4s ease-in-out infinite" };
+        case "HYPER":
+            // No animation, no glow — student is already overwhelmed
+            return base;
+        default:
+            return base;
+    }
+}
 
 // --- Main ---
 
@@ -138,6 +124,18 @@ function CortexPopup(): React.ReactElement {
     const [tabCloseDisabled, setTabCloseDisabled] = useState(false);
     const [launching, setLaunching] = useState(false);
     const [launchError, setLaunchError] = useState(false);
+    const [tabsExpanded, setTabsExpanded] = useState(false);
+
+    // Inject fonts + keyframes (single injection point)
+    useEffect(() => {
+        const id = "cortex-popup-styles";
+        if (document.getElementById(id)) return;
+        const style = document.createElement("style");
+        style.id = id;
+        style.textContent = CX_KEYFRAMES;
+        document.head.appendChild(style);
+        return () => { style.remove(); };
+    }, []);
 
     // Load tab-close toggle state on mount
     useEffect(() => {
@@ -269,7 +267,7 @@ function CortexPopup(): React.ReactElement {
 
     // Derived
     const stateStr = state?.state ?? "";
-    const stateColor = STATE_COLORS[stateStr] || C.textTertiary;
+    const stateColor = STATE_COLORS[stateStr] || CX.textTertiary;
     const stateLabel = STATE_LABELS[stateStr] || "Idle";
     const hr = state?.biometrics?.heart_rate;
     const hrv = state?.biometrics?.hrv_rmssd;
@@ -287,6 +285,10 @@ function CortexPopup(): React.ReactElement {
     const closeTabs = tabRecs?.tabs?.filter(t => t.action === "close" || t.action === "bookmark_and_close") || [];
     const keepTabs = tabRecs?.tabs?.filter(t => t.action === "keep") || [];
     const rec = activeActions.filter(a => a.category === "recommended");
+
+    // Cap visible tabs at 5, expandable on click
+    const visibleCloseTabs = tabsExpanded ? closeTabs : closeTabs.slice(0, 5);
+    const overflowCount = tabsExpanded ? 0 : closeTabs.length - visibleCloseTabs.length;
 
     // Filter out generic error_analysis that has no real content
     const genericErrPhrases = ["no specific errors", "no errors detected", "not applicable", "no error", "n/a"];
@@ -319,25 +321,33 @@ function CortexPopup(): React.ReactElement {
                 {!connected ? (
                     <button style={S.connectBtn} onClick={handleConnect}>Connect</button>
                 ) : (
-                    <div style={S.statusRow}>
-                        <div style={{ ...S.statusDot, background: stateColor, boxShadow: `0 0 6px ${stateColor}40` }} />
+                    <div style={S.statusRow} aria-live="polite">
+                        <div style={getStateDotStyle(stateStr, stateColor)} />
                         <span style={{ ...S.statusText, color: stateColor }}>{stateLabel}</span>
                     </div>
                 )}
             </div>
 
+            {/* Not connected banner */}
+            {!connected && (
+                <div style={S.disconnectedBanner}>
+                    <div style={S.disconnectedTitle}>Not connected</div>
+                    <div style={S.disconnectedBody}>Start the Cortex daemon to begin</div>
+                </div>
+            )}
+
             {/* Launch / Camera */}
             <button
                 style={{
                     ...S.primaryBtn,
-                    marginBottom: 10,
-                    background: launchError ? C.dangerDim
-                        : launching ? C.surfaceHover
-                        : connected ? C.surface : C.accent,
-                    color: launchError ? C.danger
-                        : launching ? C.textSecondary
-                        : connected ? C.text : "#fff",
-                    border: connected && !launchError ? `1px solid ${C.border}` : "none",
+                    marginBottom: 12,
+                    background: launchError ? CX.dangerDim
+                        : launching ? CX.tertiary
+                        : connected ? CX.surface : CX.accent,
+                    color: launchError ? CX.danger
+                        : launching ? CX.textSecondary
+                        : connected ? CX.text : CX.textInverse,
+                    border: connected && !launchError ? `1px solid ${CX.border}` : "none",
                     cursor: launching ? "default" : "pointer",
                     pointerEvents: launching ? "none" as const : "auto" as const,
                 }}
@@ -350,26 +360,26 @@ function CortexPopup(): React.ReactElement {
                         ? "Starting\u2026"
                         : connected
                             ? "Restart Camera"
-                            : "Launch Cortex"}
+                            : "Start Cortex daemon"}
             </button>
 
             {/* Morning Briefing */}
             {briefing && (
-                <div style={{ ...S.card, borderColor: "rgba(16,185,129,.15)" }}>
+                <div style={{ ...S.card, borderColor: "rgba(129, 140, 248, 0.15)" }}>
                     <div style={S.sectionHead}>Where you left off</div>
-                    <div style={{ fontSize: 12, color: C.text, lineHeight: 1.5, marginBottom: 8 }}>{briefing.summary}</div>
+                    <div style={{ fontSize: 13, color: CX.text, lineHeight: 1.5, marginBottom: 8 }}>{briefing.summary}</div>
                     {briefing.action_items.length > 0 && (
-                        <div style={{ marginBottom: 6 }}>
+                        <div style={{ marginBottom: 8 }}>
                             {briefing.action_items.map((item, i) => (
                                 <div key={i} style={{ ...S.tabRow, padding: "2px 0" }}>
-                                    <span style={{ ...S.tabXMark, color: C.accent }}>{i + 1}.</span>
-                                    <span style={{ fontSize: 11, color: C.textSecondary }}>{item}</span>
+                                    <span style={{ ...S.tabXMark, color: CX.accent }}>{i + 1}.</span>
+                                    <span style={{ fontSize: 11, color: CX.textSecondary }}>{item}</span>
                                 </div>
                             ))}
                         </div>
                     )}
                     <button
-                        style={{ ...S.primaryBtn, fontSize: 11, padding: "6px 0" }}
+                        style={{ ...S.primaryBtn, fontSize: 11, padding: "8px 0" }}
                         onClick={() => setBriefing(null)}
                     >Got it</button>
                 </div>
@@ -391,9 +401,9 @@ function CortexPopup(): React.ReactElement {
                 </div>
             )}
 
-            {/* Active Focus */}
+            {/* Active Focus — sticky so it stays visible when scrolling */}
             {focus && (
-                <div style={S.card}>
+                <div style={{ ...S.card, position: "sticky" as const, top: 0, zIndex: 10 }}>
                     <div style={S.focusHeader}>
                         <div>
                             <div style={S.focusGoal}>{focus.goal}</div>
@@ -403,7 +413,7 @@ function CortexPopup(): React.ReactElement {
                     </div>
 
                     <div style={S.bigRow}>
-                        <span style={S.bigNum}>{focusMin}</span>
+                        <span style={{ ...S.bigNum, color: stateColor }}>{focusMin}</span>
                         <div>
                             <div style={S.bigLabel}>min focused</div>
                             <div style={S.muted}>{focus.focusPct}%</div>
@@ -414,8 +424,7 @@ function CortexPopup(): React.ReactElement {
                         <div style={{
                             ...S.trackFill,
                             width: `${Math.min(focus.focusPct, 100)}%`,
-                            background: focus.focusPct >= 70 ? C.accent :
-                                focus.focusPct >= 40 ? C.warn : C.danger,
+                            background: stateColor,
                         }} />
                     </div>
 
@@ -433,22 +442,29 @@ function CortexPopup(): React.ReactElement {
             {connected && (
                 <div style={S.card}>
                     <div style={S.metricsRow}>
-                        <Metric label="bpm" value={hr ? String(Math.round(hr)) : "--"} />
+                        <Metric label="bpm" value={hr ? String(Math.round(hr)) : "--"} labelColor={CX.bioHr} ariaLabel={hr ? `${Math.round(hr)} beats per minute` : "no heart rate data"} />
                         <div style={S.metricDiv} />
-                        <Metric label="hrv" value={hrv ? String(Math.round(hrv)) : "--"} />
+                        <Metric label="hrv" value={hrv ? String(Math.round(hrv)) : "--"} labelColor={CX.bioHrv} ariaLabel={hrv ? `${Math.round(hrv)} milliseconds heart rate variability` : "no HRV data"} />
                         <div style={S.metricDiv} />
-                        <Metric label="blinks" value={blink ? String(Math.round(blink)) : "--"} />
+                        <Metric label="blinks" value={blink ? String(Math.round(blink)) : "--"} labelColor={CX.bioBlink} ariaLabel={blink ? `${Math.round(blink)} blinks per minute` : "no blink rate data"} />
                     </div>
                 </div>
             )}
 
             {/* Intervention */}
             {hasIntervention && (
-                <div style={{ ...S.card, borderColor: "rgba(255,255,255,.08)" }}>
-                    {closeTabs.length > 0 && (
+                <div style={{ ...S.card, borderColor: CX.borderMed }}>
+                    {/* Causal explanation */}
+                    {realCausal && (
+                        <div style={{ fontSize: 13, color: CX.textSecondary, lineHeight: 1.5, marginBottom: 12, fontStyle: "italic" }}>
+                            {realCausal}
+                        </div>
+                    )}
+
+                    {visibleCloseTabs.length > 0 && (
                         <div style={{ marginBottom: 12 }}>
                             <div style={S.sectionHead}>Closing {closeTabs.length} tab{closeTabs.length !== 1 ? "s" : ""}</div>
-                            {closeTabs.map((t, i) => {
+                            {visibleCloseTabs.map((t, i) => {
                                 const title = String(t.tab_title || "Untitled");
                                 const rawReason = String(t.reason || "");
                                 const reason = genericReasonPhrases.some(p => rawReason.toLowerCase().includes(p)) ? "" : rawReason;
@@ -459,13 +475,19 @@ function CortexPopup(): React.ReactElement {
                                             <span style={S.tabName}>{title}</span>
                                         </div>
                                         {reason && (
-                                            <div style={{ fontSize: 10, color: C.textTertiary, marginLeft: 22, lineHeight: 1.3 }}>{reason}</div>
+                                            <div style={{ fontSize: 10, color: CX.textTertiary, marginLeft: 22, lineHeight: 1.3 }}>{reason}</div>
                                         )}
                                     </div>
                                 );
                             })}
+                            {overflowCount > 0 && (
+                                <button
+                                    style={{ fontSize: 11, color: CX.accent, marginTop: 4, background: "none", border: "none", cursor: "pointer", padding: 0, fontFamily: CX.font }}
+                                    onClick={() => setTabsExpanded(true)}
+                                >+{overflowCount} more</button>
+                            )}
                             {keepTabs.length > 0 && (
-                                <div style={S.keepLine}>Keeping <span style={{ color: C.accent }}>{keepTabs.length}</span> you need</div>
+                                <div style={S.keepLine}>Keeping <span style={{ color: STATE_COLORS.FLOW }}>{keepTabs.length}</span> you need</div>
                             )}
                         </div>
                     )}
@@ -480,18 +502,12 @@ function CortexPopup(): React.ReactElement {
                         </div>
                     )}
 
-                    {realCausal && (
-                        <div style={{ fontSize: 11, color: C.textTertiary, lineHeight: 1.5, marginBottom: 10, fontStyle: "italic" }}>
-                            {realCausal}
-                        </div>
-                    )}
-
                     {!tabRecs && !realErrAnalysis && rec.length > 0 && (
-                        <div style={{ marginBottom: 10 }}>
+                        <div style={{ marginBottom: 12 }}>
                             {rec.map((a, i) => (
                                 <div key={i} style={S.tabRow}>
-                                    <span style={{ ...S.tabXMark, color: C.textSecondary }}>{"\u2022"}</span>
-                                    <span style={{ ...S.tabName, color: C.text }}>{String(a.label || "")}</span>
+                                    <span style={{ ...S.tabXMark, color: CX.textSecondary }}>{"\u2022"}</span>
+                                    <span style={{ ...S.tabName, color: CX.text }}>{String(a.label || "")}</span>
                                 </div>
                             ))}
                         </div>
@@ -510,7 +526,6 @@ function CortexPopup(): React.ReactElement {
                                     }, (results: Array<{ success: boolean }> | undefined) => {
                                         const succeeded = Array.isArray(results) && results.some(r => r.success);
                                         if (succeeded) {
-                                            // Show "Done" briefly, then clear the intervention card
                                             setApplied(true);
                                             setTimeout(() => {
                                                 setActiveActions([]);
@@ -563,7 +578,7 @@ function CortexPopup(): React.ReactElement {
                     <button
                         style={{
                             ...S.toggleTrack,
-                            background: tabCloseDisabled ? C.borderLight : C.accent,
+                            background: tabCloseDisabled ? "rgba(255, 255, 255, 0.04)" : CX.accent,
                         }}
                         onClick={handleTabCloseToggle}
                         aria-label={tabCloseDisabled ? "Enable tab closing" : "Disable tab closing"}
@@ -594,14 +609,20 @@ function CortexPopup(): React.ReactElement {
 
 // --- Metric Component ---
 
-function Metric({ label, value, unit }: { label: string; value: string; unit?: string }): React.ReactElement {
+function Metric({ label, value, unit, labelColor, ariaLabel }: {
+    label: string;
+    value: string;
+    unit?: string;
+    labelColor?: string;
+    ariaLabel?: string;
+}): React.ReactElement {
     return (
-        <div style={S.metric}>
+        <div style={S.metric} aria-label={ariaLabel}>
             <span style={S.metricVal}>
                 {value}
                 {unit && <span style={S.metricUnit}>{unit}</span>}
             </span>
-            <span style={S.metricLabel}>{label}</span>
+            <span style={{ ...S.metricLabel, color: labelColor ? `${labelColor}99` : CX.textTertiary }}>{label}</span>
         </div>
     );
 }
@@ -610,106 +631,125 @@ function Metric({ label, value, unit }: { label: string; value: string; unit?: s
 
 const S: Record<string, React.CSSProperties> = {
     root: {
-        width: 340,
-        padding: 14,
-        fontFamily: C.font,
+        width: 380,
+        maxHeight: 540,
+        overflowY: "auto",
+        padding: 16,
+        fontFamily: CX.font,
         fontSize: 13,
-        color: C.text,
-        background: C.bg,
+        color: CX.text,
+        background: CX.bg,
     },
 
     // Alert
     alertBox: {
-        padding: "10px 12px",
-        borderRadius: C.radiusSm,
-        background: C.surface,
-        border: `1px solid ${C.border}`,
-        marginBottom: 10,
+        padding: "12px 14px",
+        borderRadius: CX.radiusMd,
+        background: CX.surface,
+        border: `1px solid ${CX.border}`,
+        marginBottom: 12,
     },
-    alertTitle: { fontSize: 12, fontWeight: 600, marginBottom: 2, color: C.text },
-    alertBody: { fontSize: 11, color: C.textSecondary, lineHeight: 1.5 },
+    alertTitle: { fontSize: 13, fontWeight: 600, marginBottom: 2, color: CX.text },
+    alertBody: { fontSize: 11, color: CX.textSecondary, lineHeight: 1.5 },
 
     // Header
     header: {
         display: "flex",
         alignItems: "center",
         justifyContent: "space-between",
-        marginBottom: 14,
+        marginBottom: 16,
         paddingBottom: 12,
-        borderBottom: `1px solid ${C.borderLight}`,
+        borderBottom: `1px solid ${CX.border}`,
     },
-    logoRow: { display: "flex", alignItems: "center", gap: 7 },
+    logoRow: { display: "flex", alignItems: "center", gap: 8 },
     logoMark: {
         width: 8,
         height: 8,
         borderRadius: "50%",
-        background: `linear-gradient(135deg, ${C.accent}, #059669)`,
-        boxShadow: `0 0 8px ${C.accent}30`,
+        background: `linear-gradient(135deg, ${CX.accent}, ${CX.accentHover})`,
     },
     logoText: {
         fontSize: 13,
         fontWeight: 600,
         letterSpacing: -0.3,
-        color: C.text,
+        color: CX.text,
     },
     connectBtn: {
         padding: "4px 12px",
-        border: `1px solid ${C.border}`,
-        borderRadius: 6,
+        border: `1px solid ${CX.borderMed}`,
+        borderRadius: CX.radiusSm,
         background: "transparent",
-        color: C.textSecondary,
+        color: CX.textSecondary,
         cursor: "pointer",
         fontSize: 11,
         fontWeight: 500,
-        fontFamily: C.font,
+        fontFamily: CX.font,
     },
     statusRow: { display: "flex", alignItems: "center", gap: 6 },
-    statusDot: { width: 6, height: 6, borderRadius: "50%", transition: "all 1s" },
-    statusText: { fontSize: 11, fontWeight: 600, fontFamily: C.mono, letterSpacing: 0.5, transition: "color 1s" },
+    statusText: {
+        fontSize: 11,
+        fontWeight: 500,
+        fontFamily: CX.mono,
+        letterSpacing: 0.5,
+        transition: `color ${CX.durationSlow} ${CX.easeDefault}`,
+    },
+
+    // Disconnected banner
+    disconnectedBanner: {
+        padding: "12px 14px",
+        borderRadius: CX.radiusMd,
+        background: CX.tertiary,
+        border: `1px solid ${CX.border}`,
+        marginBottom: 12,
+        textAlign: "center" as const,
+    },
+    disconnectedTitle: { fontSize: 13, fontWeight: 600, color: CX.textSecondary, marginBottom: 2 },
+    disconnectedBody: { fontSize: 11, color: CX.textTertiary, lineHeight: 1.4 },
 
     // Sections
-    section: { marginBottom: 10 },
+    section: { marginBottom: 12 },
     input: {
         width: "100%",
-        padding: "9px 11px",
-        border: `1px solid ${C.border}`,
-        borderRadius: C.radiusSm,
-        background: C.surface,
-        color: C.text,
-        fontSize: 12,
+        padding: "10px 12px",
+        border: `1px solid ${CX.border}`,
+        borderRadius: CX.radiusMd,
+        background: CX.surface,
+        color: CX.text,
+        fontSize: 13,
         marginBottom: 8,
         outline: "none",
         boxSizing: "border-box" as const,
-        fontFamily: C.font,
+        fontFamily: CX.font,
     },
     primaryBtn: {
         width: "100%",
-        padding: "9px 0",
+        padding: "10px 20px",
         border: "none",
-        borderRadius: C.radiusSm,
-        background: C.text,
-        color: C.bg,
-        fontSize: 12,
-        fontWeight: 600,
+        borderRadius: CX.radiusMd,
+        background: CX.accent,
+        color: CX.textInverse,
+        fontSize: 11,
+        fontWeight: 500,
         cursor: "pointer",
-        letterSpacing: -0.1,
-        fontFamily: C.font,
-        transition: "opacity .15s",
+        letterSpacing: 0.5,
+        textTransform: "uppercase" as const,
+        fontFamily: CX.font,
+        transition: `background ${CX.durationFast} ${CX.easeDefault}`,
     },
     doneBtnStyle: {
-        background: C.accent,
-        color: "#fff",
+        background: STATE_COLORS.FLOW,
+        color: CX.textInverse,
         cursor: "default",
         pointerEvents: "none" as const,
     },
 
     // Card
     card: {
-        background: C.surface,
-        borderRadius: C.radius,
-        padding: 12,
+        background: CX.surface,
+        borderRadius: CX.radiusLg,
+        padding: 16,
         marginBottom: 8,
-        border: `1px solid ${C.borderLight}`,
+        border: `1px solid ${CX.border}`,
     },
 
     // Focus
@@ -717,93 +757,91 @@ const S: Record<string, React.CSSProperties> = {
         display: "flex",
         alignItems: "flex-start",
         justifyContent: "space-between",
-        marginBottom: 14,
+        marginBottom: 16,
     },
-    focusGoal: { fontSize: 12, fontWeight: 600, color: C.text },
-    muted: { fontSize: 10, color: C.textSecondary, marginTop: 2, fontFamily: C.mono },
+    focusGoal: { fontSize: 13, fontWeight: 600, color: CX.text, letterSpacing: -0.2 },
+    muted: { fontSize: 10, color: CX.textSecondary, marginTop: 2, fontFamily: CX.mono },
     endBtn: {
-        padding: "3px 10px",
-        border: `1px solid ${C.dangerDim}`,
-        borderRadius: 6,
-        background: C.dangerDim,
-        color: C.danger,
+        padding: "4px 12px",
+        border: `1px solid ${CX.dangerDim}`,
+        borderRadius: CX.radiusSm,
+        background: CX.dangerDim,
+        color: CX.danger,
         cursor: "pointer",
         fontSize: 10,
         fontWeight: 600,
-        fontFamily: C.font,
+        fontFamily: CX.font,
     },
-    bigRow: { display: "flex", alignItems: "baseline", gap: 8, marginBottom: 10 },
+    bigRow: { display: "flex", alignItems: "baseline", gap: 8, marginBottom: 12 },
     bigNum: {
-        fontSize: 36,
-        fontWeight: 200,
-        color: C.accent,
-        letterSpacing: -2,
-        lineHeight: 1,
-        fontFamily: C.mono,
+        fontSize: 28,
+        fontWeight: 600,
+        letterSpacing: -1,
+        lineHeight: 1.15,
+        fontFamily: CX.mono,
     },
-    bigLabel: { fontSize: 12, color: C.textSecondary },
+    bigLabel: { fontSize: 13, color: CX.textSecondary },
 
     // Progress track
     trackOuter: {
         height: 2,
         borderRadius: 1,
-        background: C.borderLight,
-        marginBottom: 14,
+        background: CX.border,
+        marginBottom: 16,
         overflow: "hidden",
     },
     trackFill: {
         height: "100%",
         borderRadius: 1,
-        transition: "width 1s ease, background 2s ease",
+        transition: `width 1s ease, background ${CX.durationSlow} ${CX.easeDefault}`,
     },
 
     // Metrics row
     metricsRow: { display: "flex", alignItems: "center", justifyContent: "space-around" },
     metric: { display: "flex", flexDirection: "column" as const, alignItems: "center", gap: 2 },
-    metricVal: { fontSize: 15, fontWeight: 400, color: C.text, fontFamily: C.mono },
-    metricUnit: { fontSize: 10, color: C.textSecondary, marginLeft: 1 },
-    metricLabel: { fontSize: 9, color: C.textTertiary, letterSpacing: 0.8, fontFamily: C.mono },
-    metricDiv: { width: 1, height: 16, background: C.borderLight },
+    metricVal: { fontSize: 15, fontWeight: 400, color: CX.text, fontFamily: CX.mono, transition: `all 0.3s ${CX.easeDefault}` },
+    metricUnit: { fontSize: 10, color: CX.textSecondary, marginLeft: 1 },
+    metricLabel: { fontSize: 9, color: CX.textTertiary, letterSpacing: 0.8, fontFamily: CX.mono, textTransform: "uppercase" as const },
+    metricDiv: { width: 1, height: 16, background: CX.border },
 
     // Intervention
-    sectionHead: { fontSize: 11, fontWeight: 500, color: C.textSecondary, marginBottom: 8 },
+    sectionHead: { fontSize: 11, fontWeight: 500, color: CX.textSecondary, marginBottom: 8, letterSpacing: 0.2 },
     tabRow: { display: "flex", alignItems: "center", gap: 8, padding: "3px 0" },
-    tabXMark: { color: C.danger, fontSize: 13, fontWeight: 500, width: 14, textAlign: "center" as const, flexShrink: 0, fontFamily: C.mono },
+    tabXMark: { color: CX.danger, fontSize: 13, fontWeight: 500, width: 14, textAlign: "center" as const, flexShrink: 0, fontFamily: CX.mono },
     tabName: {
-        fontSize: 12, color: C.textSecondary,
+        fontSize: 12, color: CX.textSecondary,
         whiteSpace: "nowrap" as const, overflow: "hidden", textOverflow: "ellipsis" as const,
     },
-    keepLine: { fontSize: 11, color: C.textTertiary, marginTop: 6 },
+    keepLine: { fontSize: 11, color: CX.textTertiary, marginTop: 6 },
 
     // Error
     errBox: {
-        padding: "10px 12px",
-        background: C.dangerDim,
-        borderRadius: C.radiusSm,
-        border: `1px solid rgba(239,68,68,.08)`,
+        padding: "12px 14px",
+        background: CX.dangerDim,
+        borderRadius: CX.radiusMd,
+        border: `1px solid rgba(239, 68, 68, 0.08)`,
         marginBottom: 12,
     },
-    errHead: { fontSize: 10, fontWeight: 600, color: C.danger, marginBottom: 4, fontFamily: C.mono, letterSpacing: 0.5 },
-    errBody: { fontSize: 12, color: C.text, lineHeight: 1.5 },
+    errHead: { fontSize: 10, fontWeight: 600, color: CX.danger, marginBottom: 4, fontFamily: CX.mono, letterSpacing: 0.5, textTransform: "uppercase" as const },
+    errBody: { fontSize: 13, color: CX.text, lineHeight: 1.5 },
     errCode: {
-        fontSize: 11, color: C.textSecondary, marginTop: 8, fontFamily: C.mono,
-        padding: "8px 10px", background: "rgba(0,0,0,.3)", borderRadius: 6, lineHeight: 1.5,
+        fontSize: 12, color: CX.textSecondary, marginTop: 8, fontFamily: CX.mono,
+        padding: "8px 10px", background: "rgba(0,0,0,.3)", borderRadius: CX.radiusSm, lineHeight: 1.5,
         whiteSpace: "pre-wrap" as const, border: "none", margin: 0,
     },
 
     // Undo
     undoRow: {
         display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
-        marginTop: 6, fontSize: 11, color: C.textTertiary,
+        marginTop: 8, fontSize: 11, color: CX.textTertiary,
     },
     undoLink: {
-        background: "none", border: "none", color: C.blue, fontSize: 11,
-        fontWeight: 500, cursor: "pointer", padding: 0, fontFamily: C.font,
+        background: "none", border: "none", color: CX.accent, fontSize: 11,
+        fontWeight: 500, cursor: "pointer", padding: 0, fontFamily: CX.font,
     },
 
     // Daily stats
     dailyGrid: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 4 },
-    dailyItem: { display: "flex", flexDirection: "column" as const, alignItems: "center", gap: 2 },
 
     // Toggle
     toggleRow: {
@@ -812,8 +850,8 @@ const S: Record<string, React.CSSProperties> = {
         justifyContent: "space-between",
         gap: 12,
     },
-    toggleLabel: { fontSize: 12, fontWeight: 500, color: C.text },
-    toggleDesc: { fontSize: 10, color: C.textTertiary, marginTop: 2 },
+    toggleLabel: { fontSize: 13, fontWeight: 500, color: CX.text },
+    toggleDesc: { fontSize: 10, color: CX.textTertiary, marginTop: 2 },
     toggleTrack: {
         position: "relative" as const,
         width: 36,
@@ -823,7 +861,7 @@ const S: Record<string, React.CSSProperties> = {
         cursor: "pointer",
         padding: 0,
         flexShrink: 0,
-        transition: "background .2s",
+        transition: `background ${CX.durationNormal} ${CX.easeDefault}`,
     },
     toggleThumb: {
         position: "absolute" as const,
@@ -833,7 +871,7 @@ const S: Record<string, React.CSSProperties> = {
         height: 16,
         borderRadius: "50%",
         background: "#fff",
-        transition: "transform .2s",
+        transition: `transform ${CX.durationNormal} ${CX.easeDefault}`,
     },
 };
 

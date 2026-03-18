@@ -105,11 +105,56 @@ const RECENTLY_ACTIVE_PROTECTION_MS = 5 * 60 * 1000; // 5 minutes
 
 chrome.tabs.onActivated.addListener((activeInfo) => {
     tabLastActivated.set(activeInfo.tabId, Date.now());
+    schedulePersist();
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
     tabLastActivated.delete(tabId);
+    schedulePersist();
 });
+
+// --- State Persistence (survives MV3 service worker restarts) ---
+
+let persistTimer: ReturnType<typeof setTimeout> | null = null;
+const PERSIST_KEYS = ["focusSession", "undoStack", "dismissedInterventions", "dismissedUrlPatterns", "quietMode", "tabLastActivated"] as const;
+
+function schedulePersist(): void {
+    if (persistTimer) clearTimeout(persistTimer);
+    persistTimer = setTimeout(async () => {
+        await chrome.storage.session.set({
+            focusSession,
+            undoStack,
+            dismissedInterventions: [...dismissedInterventions.entries()],
+            dismissedUrlPatterns: [...dismissedUrlPatterns.entries()],
+            quietMode,
+            tabLastActivated: [...tabLastActivated.entries()],
+        });
+    }, 500);
+}
+
+async function restoreState(): Promise<void> {
+    const data = await chrome.storage.session.get(PERSIST_KEYS as unknown as string[]);
+    if (data.focusSession) focusSession = data.focusSession;
+    if (data.undoStack) {
+        undoStack.splice(0, undoStack.length, ...data.undoStack);
+    }
+    if (data.dismissedInterventions) {
+        dismissedInterventions.clear();
+        for (const [k, v] of data.dismissedInterventions) dismissedInterventions.set(k, v);
+    }
+    if (data.dismissedUrlPatterns) {
+        dismissedUrlPatterns.clear();
+        for (const [k, v] of data.dismissedUrlPatterns) dismissedUrlPatterns.set(k, v);
+    }
+    if (data.quietMode !== undefined) quietMode = data.quietMode;
+    if (data.tabLastActivated) {
+        tabLastActivated.clear();
+        for (const [k, v] of data.tabLastActivated) tabLastActivated.set(k, v);
+    }
+}
+
+// Restore persisted state on service worker startup
+restoreState();
 
 // Health alert state
 let lastPostureAlert = 0;
@@ -504,6 +549,7 @@ async function handleMessage(raw: string): Promise<void> {
                     break;
                 }
                 dismissedInterventions.delete(iid);
+                schedulePersist();
             }
 
             // Check URL-based cooldown: don't re-trigger for same site within window
@@ -516,6 +562,7 @@ async function handleMessage(raw: string): Promise<void> {
                     break;
                 }
                 dismissedUrlPatterns.delete(urlKey);
+                schedulePersist();
             }
 
             // Minimum tab count gate: don't intervene with few tabs open
@@ -544,6 +591,7 @@ async function handleMessage(raw: string): Promise<void> {
 
         case "SETTINGS_SYNC":
             quietMode = Boolean(msg.payload.quiet_mode);
+            schedulePersist();
             broadcastToPopup({ type: "SETTINGS_SYNC", payload: msg.payload });
             break;
 
@@ -567,6 +615,23 @@ async function handleMessage(raw: string): Promise<void> {
                     type: "SHOW_ACTIVE_RECALL",
                     payload: { ...msg.payload, visible_text: visibleText },
                 });
+            }
+            break;
+        }
+
+        case "LEETCODE_SHOW_LOCKOUT": {
+            // Inject lockout overlay into the active tab
+            try {
+                const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+                if (tab?.id) {
+                    await chrome.scripting.executeScript({
+                        target: { tabId: tab.id },
+                        func: injectLockoutOverlay,
+                        args: [msg.payload],
+                    });
+                }
+            } catch (e) {
+                console.error("Cortex: failed to inject lockout overlay", e);
             }
             break;
         }
@@ -918,6 +983,97 @@ function injectOverlay(payload: Record<string, unknown>): void {
     setTimeout(dismiss, 5 * 60 * 1000);
 }
 
+
+/**
+ * Injected into the active tab to show a lockout countdown overlay.
+ * Uses the same Shadow DOM pattern as the intervention overlay.
+ *
+ * payload.duration_s  — lockout duration in seconds
+ * payload.reason      — brief message explaining why
+ */
+function injectLockoutOverlay(payload: Record<string, unknown>): void {
+    const OID = "cortex-lockout-overlay";
+    document.getElementById(OID)?.remove();
+
+    const durationS = Math.max(1, Math.round(Number(payload.duration_s) || 60));
+    const reason = String(
+        payload.reason || "Take a moment to step back and think before continuing.",
+    );
+    const esc = (s: string) =>
+        s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+    function formatCountdown(totalSeconds: number): string {
+        const m = Math.floor(totalSeconds / 60);
+        const s = totalSeconds % 60;
+        return `${m}:${String(s).padStart(2, "0")}`;
+    }
+
+    const host = document.createElement("div");
+    host.id = OID;
+    host.style.cssText =
+        "position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483647;pointer-events:none;";
+
+    const shadow = host.attachShadow({ mode: "open" });
+    shadow.innerHTML = `
+<style>
+@keyframes panelIn{from{transform:translateY(12px) scale(.99);opacity:0}to{transform:translateY(0) scale(1);opacity:1}}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+*{box-sizing:border-box;margin:0;padding:0}
+.bk{position:fixed;inset:0;background:rgba(0,0,0,.55);pointer-events:auto;animation:fadeIn .25s ease}
+.pn{
+  position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:360px;
+  pointer-events:auto;
+  background:#111113;
+  border-radius:14px;
+  border:1px solid rgba(255,255,255,.06);
+  box-shadow:0 0 0 .5px rgba(0,0,0,.3),0 4px 20px rgba(0,0,0,.4),0 16px 40px rgba(0,0,0,.2);
+  font-family:-apple-system,BlinkMacSystemFont,'Inter','SF Pro Text',system-ui,sans-serif;
+  color:#e4e4e7;padding:28px 24px 22px;text-align:center;
+  animation:panelIn .3s cubic-bezier(.16,1,.3,1);
+}
+.hd{font-size:15px;font-weight:600;color:#e4e4e7;margin-bottom:8px;letter-spacing:-.2px}
+.rs{font-size:12px;color:#71717a;line-height:1.5;margin-bottom:20px}
+.tm{font-size:40px;font-weight:700;color:#e4e4e7;font-variant-numeric:tabular-nums;margin-bottom:20px;font-family:'SF Mono','Fira Code',ui-monospace,monospace}
+.sk{display:inline-block;padding:7px 18px;border:1px solid rgba(255,255,255,.08);border-radius:8px;background:none;color:#71717a;font-size:11px;cursor:pointer;font-family:inherit;transition:all .12s}
+.sk:hover{color:#e4e4e7;border-color:rgba(255,255,255,.15)}
+</style>
+<div class="bk" id="bk"></div>
+<div class="pn">
+  <div class="hd">Lockout Active</div>
+  <div class="rs">\${esc(reason)}</div>
+  <div class="tm" id="countdown">\${formatCountdown(durationS)}</div>
+  <button class="sk" id="skip">I need to continue</button>
+</div>
+`;
+
+    document.body.appendChild(host);
+
+    let remaining = durationS;
+
+    function dismiss(): void {
+        host.remove();
+    }
+
+    const timer = setInterval(() => {
+        remaining--;
+        const el = shadow.getElementById("countdown");
+        if (el) el.textContent = formatCountdown(remaining);
+        if (remaining <= 0) {
+            clearInterval(timer);
+            dismiss();
+        }
+    }, 1000);
+
+    // Skip button — no penalty, just log and dismiss
+    shadow.getElementById("skip")?.addEventListener("click", () => {
+        clearInterval(timer);
+        console.log("Cortex: lockout skipped by user at", remaining, "s remaining");
+        dismiss();
+    });
+
+    // Clicking backdrop does NOT dismiss — lockout must be waited out or explicitly skipped
+}
+
 async function handleIntervention(
     payload: Record<string, unknown>,
 ): Promise<void> {
@@ -1188,6 +1344,7 @@ function startFocusSession(goal: string): void {
         currentStreakStart: 0,
         goal,
     };
+    schedulePersist();
     broadcastToPopup({ type: "FOCUS_SESSION_STARTED", goal });
 }
 
@@ -1197,6 +1354,7 @@ function stopFocusSession(): FocusSession | null {
     // Save to daily stats
     saveToDailyStats(session);
     focusSession = null;
+    schedulePersist();
     broadcastToPopup({ type: "FOCUS_SESSION_ENDED", session });
     return session;
 }
@@ -1222,6 +1380,7 @@ function updateFocusSession(payload: Record<string, unknown>): void {
     }
     focusSession.lastStateWasFocus = isFocused;
     focusSession.lastFocusCheck = now;
+    schedulePersist();
 }
 
 function getFocusSessionSnapshot() {
@@ -1530,6 +1689,7 @@ function pushUndo(entry: UndoEntry): void {
     if (undoStack.length > MAX_UNDO_ENTRIES) {
         undoStack.shift();
     }
+    schedulePersist();
 }
 
 async function executeAction(action: SuggestedAction): Promise<ActionExecuteResult> {
@@ -1835,6 +1995,7 @@ async function undoAction(actionId: string): Promise<boolean> {
     if (idx === -1) return false;
     const entry = undoStack[idx];
     undoStack.splice(idx, 1);
+    schedulePersist();
 
     try {
         switch (entry.action_type) {
@@ -2193,6 +2354,7 @@ chrome.runtime.onMessage.addListener(
                         if (tab?.url) {
                             try {
                                 dismissedUrlPatterns.set(new URL(tab.url).hostname, now);
+                                schedulePersist();
                             } catch {}
                         }
                     }).catch(() => {});
@@ -2203,6 +2365,7 @@ chrome.runtime.onMessage.addListener(
                     for (const [k, t] of dismissedUrlPatterns) {
                         if (now - t > URL_DISMISS_COOLDOWN) dismissedUrlPatterns.delete(k);
                     }
+                    schedulePersist();
 
                     activeIntervention = null;
                     try { chrome.storage.session.remove(["cortex_active_intervention", "cortex_tab_snapshot"]); } catch {}
@@ -2228,6 +2391,7 @@ chrome.runtime.onMessage.addListener(
                 // User clicked "Go back" on the distraction interceptor
                 if (focusSession) {
                     focusSession.distractionsBlocked++;
+                    schedulePersist();
                 }
                 sendResponse({ ok: true });
                 break;
@@ -2404,17 +2568,28 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, _tab) => {
         const url = changeInfo.url;
         if (isDistractionUrl(url, _tab.title)) {
             const snap = getFocusSessionSnapshot();
-            chrome.scripting.executeScript({
-                target: { tabId },
-                func: injectDistractionInterceptor,
-                args: [
-                    Math.round((snap?.focusMs ?? 0) / 60000),
-                    snap?.longestStreakMin ?? 0,
-                    snap?.distractionsBlocked ?? 0,
-                    url,
-                ],
+            const domain = new URL(url).hostname.replace("www.", "");
+            chrome.tabs.sendMessage(tabId, {
+                type: "SHOW_DISTRACTION_BLOCKER",
+                payload: {
+                    focusMin: Math.round((snap?.focusMs ?? 0) / 60000),
+                    streakMin: snap?.longestStreakMin ?? 0,
+                    distractionsBlocked: snap?.distractionsBlocked ?? 0,
+                    domain,
+                    goal: focusSession?.goal ?? "",
+                },
             }).catch(() => {
-                // Injection failed
+                // Content script not ready — fall back to executeScript
+                chrome.scripting.executeScript({
+                    target: { tabId },
+                    func: injectDistractionInterceptor,
+                    args: [
+                        Math.round((snap?.focusMs ?? 0) / 60000),
+                        snap?.longestStreakMin ?? 0,
+                        snap?.distractionsBlocked ?? 0,
+                        url,
+                    ],
+                }).catch(() => {});
             });
         }
     }
@@ -2507,9 +2682,13 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 // --- Auto-connect on install/startup ---
 
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener((details) => {
     chrome.alarms.create("cortex-keepalive", { periodInMinutes: 0.4 });
     connect();
+    // Open onboarding tab on first install
+    if (details.reason === "install") {
+        chrome.tabs.create({ url: chrome.runtime.getURL("tabs/onboarding.html") });
+    }
 });
 
 chrome.runtime.onStartup.addListener(() => {

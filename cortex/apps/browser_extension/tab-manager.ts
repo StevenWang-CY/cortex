@@ -192,6 +192,40 @@ export async function collectCurrentWindowTabs(): Promise<TabData[]> {
 /** Active snapshots for restoration. */
 const snapshots: Map<string, TabSnapshot> = new Map();
 
+// --- Snapshot Persistence (survives MV3 service worker restarts) ---
+
+let snapshotPersistTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleSnapshotPersist(): void {
+    if (snapshotPersistTimer) clearTimeout(snapshotPersistTimer);
+    snapshotPersistTimer = setTimeout(async () => {
+        try {
+            await chrome.storage.session.set({
+                cortex_tab_mgr_snapshots: [...snapshots.entries()],
+            });
+        } catch {
+            // storage.session may not be available
+        }
+    }, 500);
+}
+
+async function restoreSnapshots(): Promise<void> {
+    try {
+        const data = await chrome.storage.session.get("cortex_tab_mgr_snapshots");
+        if (data.cortex_tab_mgr_snapshots) {
+            snapshots.clear();
+            for (const [k, v] of data.cortex_tab_mgr_snapshots) {
+                snapshots.set(k, v);
+            }
+        }
+    } catch {
+        // storage.session not available
+    }
+}
+
+// Restore snapshots on module init
+restoreSnapshots();
+
 /**
  * Hide non-active tabs in the current window by grouping and collapsing them.
  * Excludes protected tabs (goal-relevant, AI assistants, recently-active, etc.)
@@ -249,6 +283,7 @@ export async function hideNonActiveTabs(
         };
 
         snapshots.set(interventionId, snapshot);
+        scheduleSnapshotPersist();
         return snapshot;
     } catch {
         return null;
@@ -278,9 +313,11 @@ export async function restoreHiddenTabs(
         }
 
         snapshots.delete(interventionId);
+        scheduleSnapshotPersist();
         return true;
     } catch {
         snapshots.delete(interventionId);
+        scheduleSnapshotPersist();
         return false;
     }
 }
