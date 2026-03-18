@@ -20,10 +20,12 @@ Detection conditions (all must be true simultaneously):
 from __future__ import annotations
 
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
 _HR_PROXIMITY_THRESHOLD = 0.05  # 5% of baseline
+_REBOUND_WINDOW_SECONDS = 300.0  # 5 min max after last acceptance
 
 
 class ParasympatheticReboundDetector:
@@ -54,6 +56,7 @@ class ParasympatheticReboundDetector:
         hr_baseline: float,
         hrv_current: float | None,
         hrv_prev: float | None,
+        last_submission_ts: float | None = None,
     ) -> bool:
         """
         Evaluate whether parasympathetic rebound conditions are met.
@@ -66,14 +69,23 @@ class ParasympatheticReboundDetector:
                          unavailable.
             hrv_prev: Previous HRV RMSSD sample in milliseconds.  ``None``
                       if unavailable.
+            last_submission_ts: Timestamp of the last accepted submission
+                (epoch seconds).  ``None`` to skip the temporal check.
 
         Returns:
-            ``True`` if all three rebound conditions are satisfied.
+            ``True`` if all rebound conditions are satisfied.
         """
         # Condition 1: problem accepted
         if not accepted:
             self._latest_rebound = False
             return False
+
+        # Temporal guard: only detect rebound within 5 min of last acceptance
+        if last_submission_ts is not None:
+            elapsed = time.time() - last_submission_ts
+            if elapsed > _REBOUND_WINDOW_SECONDS:
+                self._latest_rebound = False
+                return False
 
         # Condition 2: HR within 5% of baseline
         if hr is None or hr_baseline <= 0:

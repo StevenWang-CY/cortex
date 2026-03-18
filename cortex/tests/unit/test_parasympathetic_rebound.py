@@ -1,5 +1,7 @@
 """Unit tests for ParasympatheticReboundDetector."""
 
+import time
+
 import pytest
 
 from cortex.services.state_engine.parasympathetic_rebound import (
@@ -113,3 +115,46 @@ class TestParasympatheticReboundDetector:
             hrv_prev=None,
         )
         assert result is False
+
+    def test_rebound_rejected_20min_after_acceptance(self):
+        """Rebound 20 min after last acceptance must return False (outside 5-min window)."""
+        detector = ParasympatheticReboundDetector()
+        twenty_min_ago = time.time() - 20 * 60  # 20 min ago
+        result = detector.update(
+            accepted=True,
+            hr=71.0,
+            hr_baseline=70.0,
+            hrv_current=55.0,
+            hrv_prev=48.0,
+            last_submission_ts=twenty_min_ago,
+        )
+        assert result is False
+        assert detector.is_rebounding() is False
+
+    def test_rebound_accepted_within_5min_of_acceptance(self):
+        """Rebound 2 min after last acceptance must still pass."""
+        detector = ParasympatheticReboundDetector()
+        two_min_ago = time.time() - 2 * 60  # 2 min ago
+        result = detector.update(
+            accepted=True,
+            hr=71.0,
+            hr_baseline=70.0,
+            hrv_current=55.0,
+            hrv_prev=48.0,
+            last_submission_ts=two_min_ago,
+        )
+        assert result is True
+        assert detector.is_rebounding() is True
+
+    def test_rebound_without_timestamp_still_works(self):
+        """When last_submission_ts is None, temporal check is skipped (backwards compat)."""
+        detector = ParasympatheticReboundDetector()
+        result = detector.update(
+            accepted=True,
+            hr=71.0,
+            hr_baseline=70.0,
+            hrv_current=55.0,
+            hrv_prev=48.0,
+            last_submission_ts=None,
+        )
+        assert result is True

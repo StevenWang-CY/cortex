@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from cortex.libs.adapters.base import CortexAdapter
 from cortex.libs.adapters.leetcode_adapter import LeetCodeAdapter
 from cortex.libs.schemas.leetcode import LeetCodeContext
 
@@ -32,6 +33,13 @@ def _make_adapter_with_sender():
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+class TestLeetCodeAdapterProtocol:
+    def test_isinstance_cortex_adapter(self):
+        """LeetCodeAdapter must satisfy the CortexAdapter protocol."""
+        adapter = LeetCodeAdapter()
+        assert isinstance(adapter, CortexAdapter)
 
 
 class TestLeetCodeAdapterProperties:

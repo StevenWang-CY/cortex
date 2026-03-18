@@ -88,3 +88,16 @@ class TestZombieReadingDetector:
                 current_time=1000.0 + float(i),
             )
             assert result is False
+
+    def test_blink_rate_none_returns_false(self):
+        """blink_rate=None (no data) must return False conservatively, not fall through to True."""
+        detector = ZombieReadingDetector(min_duration=5.0, blink_baseline=17.0, cooldown=0.0)
+        for i in range(100):
+            result = detector.update(
+                state="HYPO",
+                mouse_velocity=10.0,
+                blink_rate=None,
+                active_app="Google Chrome",
+                current_time=1000.0 + float(i),
+            )
+            assert result is False

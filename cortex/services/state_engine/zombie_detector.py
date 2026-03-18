@@ -145,9 +145,12 @@ class ZombieReadingDetector:
             return False
 
         # Condition 4: Blink rate above baseline (glazed eyes)
-        if blink_rate is not None:
-            if blink_rate < self._blink_baseline * _BLINK_ELEVATION_RATIO:
-                return False
+        # When blink_rate is None (no data), return False conservatively
+        # rather than falling through to True.
+        if blink_rate is None:
+            return False
+        if blink_rate < self._blink_baseline * _BLINK_ELEVATION_RATIO:
+            return False
 
         return True
 

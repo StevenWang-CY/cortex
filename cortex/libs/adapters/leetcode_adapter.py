@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 WsSender = Callable[[dict[str, Any]], Coroutine[Any, Any, None]]
 
 
-class LeetCodeAdapter:
+class LeetCodeAdapter(CortexAdapter):
     """
     Adapter that communicates with a LeetCode browser extension over WebSocket.
 
