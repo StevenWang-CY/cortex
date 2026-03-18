@@ -29,9 +29,9 @@ from cortex.services.physio_engine.rppg import RPPGAlgorithm, extract_bvp
 
 logger = logging.getLogger(__name__)
 
-# Quality thresholds for algorithm switching
-_QUALITY_GOOD = 0.4  # Above this, current algorithm is fine
-_QUALITY_POOR = 0.40  # Below this, switch to fallback
+# Quality thresholds for algorithm switching (hysteresis band)
+_QUALITY_GOOD = 0.45  # Above this, switch back to preferred algorithm
+_QUALITY_POOR = 0.35  # Below this, switch to fallback algorithm
 _SWITCH_COOLDOWN_WINDOWS = 5  # Minimum windows before reconsidering
 
 

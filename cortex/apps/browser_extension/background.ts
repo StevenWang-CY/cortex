@@ -2372,6 +2372,7 @@ chrome.runtime.onMessage.addListener(
                     const now = Date.now();
                     if (interventionId) {
                         dismissedInterventions.set(interventionId, now);
+                        schedulePersist();
                     }
                     // Also record URL-based cooldown from the active tab
                     chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {

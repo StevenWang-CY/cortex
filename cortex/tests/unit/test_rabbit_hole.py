@@ -84,7 +84,7 @@ class TestRabbitHoleDetector:
     def test_keyword_extraction_filters_stop_words(self):
         detector = RabbitHoleDetector()
         detector.set_goal("implement the core A* search algorithm")
-        # "implement", "the", "core" are stop words
+        # "the" is a stop word; "implement" and "core" are preserved as goal-relevant
         assert "search" in detector._goal_keywords
         assert "the" not in detector._goal_keywords
 

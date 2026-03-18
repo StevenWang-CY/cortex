@@ -528,13 +528,7 @@ class CortexDaemon:
                                     ws_type="INTERVENTION_TRIGGER",
                                 )
 
-                        # v2.0: Check stress integral — warn at 80%, break at 100%
-                        if self._stress_tracker.should_warn():
-                            logger.info("Stress integral at 80%% — pre-break warning")
-                            await self._trigger_special_intervention(
-                                context, estimate, template_name="pre_break_warning",
-                                ws_type="PRE_BREAK_WARNING",
-                            )
+                        # v2.0: Check stress integral — break at 100% (priority), warn at 80%
                         if self._stress_tracker.should_break():
                             logger.info("Stress integral threshold — biological break")
                             await self._trigger_special_intervention(
@@ -542,6 +536,12 @@ class CortexDaemon:
                                 ws_type="BREATHING_OVERLAY",
                             )
                             self._stress_tracker.reset()
+                        elif self._stress_tracker.should_warn():
+                            logger.info("Stress integral at 80%% — pre-break warning")
+                            await self._trigger_special_intervention(
+                                context, estimate, template_name="pre_break_warning",
+                                ws_type="PRE_BREAK_WARNING",
+                            )
 
                         # v2.0: Check shutdown detection
                         if self._shutdown_detector.should_handover(
