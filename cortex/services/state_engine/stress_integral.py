@@ -59,6 +59,7 @@ class StressIntegralTracker:
         self._last_timestamp: float | None = None
         self._last_hrv: float | None = None
         self._break_emitted: bool = False
+        self._warning_emitted: bool = False
         self._history: deque[tuple[float, float]] = deque(maxlen=_MAX_HISTORY)
 
     @property
@@ -121,6 +122,24 @@ class StressIntegralTracker:
 
         return self._integral
 
+    def should_warn(self) -> bool:
+        """
+        Check if cumulative stress is approaching break threshold (80%).
+
+        Returns True once per threshold approach until reset().
+        Allows the intervention pipeline to surface a "getting tired" hint.
+        """
+        if self._warning_emitted:
+            return False
+        if self.load_ratio >= 0.8:
+            self._warning_emitted = True
+            logger.info(
+                "Stress integral %.1f at %.0f%% of threshold %.1f — pre-break warning",
+                self._integral, self.load_ratio * 100, self.threshold,
+            )
+            return True
+        return False
+
     def should_break(self) -> bool:
         """
         Check if cumulative stress warrants a break.
@@ -142,6 +161,7 @@ class StressIntegralTracker:
         """Reset the stress integral after a break is taken."""
         self._integral = 0.0
         self._break_emitted = False
+        self._warning_emitted = False
         self._last_timestamp = None
         self._last_hrv = None
         self._history.clear()

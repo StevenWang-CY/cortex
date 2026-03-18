@@ -59,6 +59,12 @@ class LongitudinalTracker:
         self._intervention_count: int = 0
         self._intervention_accepted: int = 0
 
+        # Per-topic tracking for subject-specific calibration
+        self._topic_stress: dict[str, list[float]] = defaultdict(list)
+        self._topic_flow: dict[str, float] = defaultdict(float)
+        self._topic_hyper: dict[str, float] = defaultdict(float)
+        self._current_topic: str | None = None
+
     def accumulate(
         self,
         hr: float | None = None,
@@ -98,6 +104,15 @@ class LongitudinalTracker:
             self._flow_seconds += dt_seconds
         elif state == "HYPER":
             self._hyper_seconds += dt_seconds
+
+        # Per-topic accumulation
+        if self._current_topic:
+            if state == "FLOW":
+                self._topic_flow[self._current_topic] += dt_seconds
+            elif state == "HYPER":
+                self._topic_hyper[self._current_topic] += dt_seconds
+            if hrv is not None:
+                self._topic_stress[self._current_topic].append(hrv)
 
     def record_intervention(self, accepted: bool) -> None:
         """Record an intervention event."""
@@ -222,6 +237,38 @@ class LongitudinalTracker:
             trend, slope, multiplier, len(baselines),
         )
         return result
+
+    def set_topic(self, topic: str | None) -> None:
+        """Set the current topic tag for per-subject tracking."""
+        self._current_topic = topic
+
+    def get_topic_difficulty(self, topic: str) -> float | None:
+        """Get the relative difficulty of a topic (0-1 scale).
+
+        Based on the ratio of HYPER time to total tracked time for this topic.
+        Returns None if insufficient data (<60s tracked).
+        """
+        flow = self._topic_flow.get(topic, 0.0)
+        hyper = self._topic_hyper.get(topic, 0.0)
+        total = flow + hyper
+        if total < 60.0:
+            return None
+        return hyper / total
+
+    def get_topic_stress_modifier(self, topic: str) -> float:
+        """Get stress integral sensitivity modifier for a topic.
+
+        Hard topics (high HYPER ratio) get a higher threshold (more patience).
+        Easy topics get a lower threshold (break sooner if struggling).
+
+        Returns a multiplier in [0.7, 1.3].
+        """
+        difficulty = self.get_topic_difficulty(topic)
+        if difficulty is None:
+            return 1.0
+        # Hard topic → higher multiplier → more patience (up to 1.3)
+        # Easy topic → lower multiplier → less patience (down to 0.7)
+        return 0.7 + difficulty * 0.6
 
     @property
     def sensitivity_multiplier(self) -> float:

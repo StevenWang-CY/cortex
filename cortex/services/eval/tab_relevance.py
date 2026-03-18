@@ -45,7 +45,11 @@ def _store_key(domain: str, goal: str) -> str:
 
 
 class TabRelevanceTracker:
-    """Learns per-domain relevance from user feedback on tab close recommendations."""
+    """Learns per-domain relevance from user feedback on tab close recommendations.
+
+    Also tracks modality preferences (video vs text vs interactive) per topic,
+    enabling proactive resource switching when zombie-reading is detected.
+    """
 
     def __init__(self, store: Any) -> None:
         self._store = store
@@ -111,6 +115,52 @@ class TabRelevanceTracker:
         )
         # Track known domains for get_overrides scanning
         await self._track_domain(domain)
+
+    async def record_modality_engagement(
+        self, topic: str, modality: str, engagement_s: float,
+    ) -> None:
+        """Record time spent in a learning modality for a topic.
+
+        When zombie-reading fires, the system can query preferred modalities
+        and suggest switching to a format the user engages with better.
+
+        Args:
+            topic: Topic tag (e.g., "algorithms", "calculus").
+            modality: One of "video", "text", "interactive", "code", "other".
+            engagement_s: Seconds of productive engagement in this modality.
+        """
+        if not topic or not modality:
+            return
+        key = f"modality_pref:{_goal_hash(topic)}:{modality}"
+        data = await self._store.get_json(key)
+        current = float(data.get("total_s", 0.0)) if data else 0.0
+        await self._store.set_json(
+            key,
+            {"total_s": current + engagement_s, "modality": modality, "topic": topic},
+            _TTL_SECONDS,
+        )
+
+    async def get_preferred_modality(self, topic: str) -> str | None:
+        """Get the user's preferred learning modality for a topic.
+
+        Returns the modality with the most engagement time, or None
+        if insufficient data.
+        """
+        if not topic:
+            return None
+        modalities = ["video", "text", "interactive", "code"]
+        best: str | None = None
+        best_time = 0.0
+        for mod in modalities:
+            key = f"modality_pref:{_goal_hash(topic)}:{mod}"
+            data = await self._store.get_json(key)
+            if data:
+                t = float(data.get("total_s", 0.0))
+                if t > best_time:
+                    best_time = t
+                    best = mod
+        # Need at least 5 minutes of data
+        return best if best_time >= 300.0 else None
 
     async def _track_domain(self, domain: str) -> None:
         """Keep a list of known domains for override scanning."""
