@@ -394,6 +394,29 @@ Complexity: {complexity:.2f}
 {constraints_text}
 """
 
+_PRE_BREAK_WARNING = """\
+The user's cumulative stress is approaching the break threshold (around 80%). \
+They are not yet at a full break point, but their HRV trend indicates growing fatigue.
+
+Generate a SUBTLE, ambient-style hint:
+- A brief "heads up" that they've been pushing hard — NOT a break command
+- Suggest they finish their current thought/task and then take a short break
+- Tone: supportive study partner, not a health monitor
+- Use a non-intrusive ambient overlay (auto-dismiss after 10 seconds)
+- Headline should be casual (e.g., "Might be time soon" or "Heads up")
+
+Do NOT mention biometric numbers, HRV, stress integral, or thresholds.
+Acknowledge what they're working on and frame the hint around their progress.
+
+Focus goal: {goal_hint}
+
+{context}
+
+State: {state} (confidence {confidence:.0%}, dwelling {dwell:.0f}s)
+Complexity: {complexity:.2f}
+{constraints_text}
+"""
+
 # ---------------------------------------------------------------------------
 # Template registry
 # ---------------------------------------------------------------------------
@@ -406,6 +429,7 @@ PROMPT_TEMPLATES: dict[str, str] = {
     "calm_overlay_writer": _CALM_OVERLAY_WRITER,
     # v2.0 templates
     "breathing_overlay": _BREATHING_OVERLAY,
+    "pre_break_warning": _PRE_BREAK_WARNING,
     "active_recall": _ACTIVE_RECALL,
     "rabbit_hole": _RABBIT_HOLE_PROMPT,
     "alignment_summary": _ALIGNMENT_SUMMARY,

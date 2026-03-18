@@ -317,7 +317,7 @@ class TestPromptSelection(unittest.TestCase):
         assert select_prompt_template(ctx) == "micro_step_planner"
 
     def test_all_templates_exist(self):
-        assert len(PROMPT_TEMPLATES) == 10
+        assert len(PROMPT_TEMPLATES) == 11
         for name in ["debug_error_summary", "code_focus_reduction", "browser_tab_reduction",
                       "micro_step_planner", "calm_overlay_writer",
                       "breathing_overlay", "active_recall", "rabbit_hole",
@@ -802,7 +802,7 @@ class TestImports(unittest.TestCase):
             select_prompt_template,
         )
 
-        assert len(PROMPT_TEMPLATES) == 10
+        assert len(PROMPT_TEMPLATES) == 11
         assert SYSTEM_PROMPT is not None
         assert callable(build_messages)
         assert callable(build_user_prompt)

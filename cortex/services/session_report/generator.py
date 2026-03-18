@@ -120,17 +120,37 @@ class SessionReportGenerator:
     def finish(
         self,
         comparison: ComparisonStats | None = None,
+        end_timestamp: float | None = None,
     ) -> SessionReport:
-        """Generate the final session report."""
-        end_time = datetime.now(timezone.utc)
+        """Generate the final session report.
+
+        Args:
+            comparison: Optional 7-day comparison stats.
+            end_timestamp: Optional epoch timestamp for the session end.
+                If None, uses time.time(). Pass explicitly in tests with
+                synthetic timestamps.
+        """
+        import time as _time
+
+        end_ts = end_timestamp if end_timestamp is not None else _time.time()
+        end_time = datetime.fromtimestamp(end_ts, tz=timezone.utc)
         start = self._start_time or end_time
 
         duration = (end_time - start).total_seconds()
 
-        # Finalize current state
+        # Finalize current state — close the last segment's duration
+        if self._current_state is not None:
+            dt = end_ts - self._current_state_start
+            if dt > 0:
+                self._state_durations[self._current_state] += dt
+                hour = datetime.fromtimestamp(self._current_state_start).hour
+                self._hourly_total[hour] += dt
+                if self._current_state == "FLOW":
+                    self._hourly_flow[hour] += dt
         if self._current_state == "FLOW" and self._current_flow_start is not None:
-            import time as _time
-            self._flow_streaks.append(_time.time() - self._current_flow_start)
+            streak = end_ts - self._current_flow_start
+            if streak > 0:
+                self._flow_streaks.append(streak)
 
         flow_s = self._state_durations.get("FLOW", 0.0)
         hyper_s = self._state_durations.get("HYPER", 0.0)

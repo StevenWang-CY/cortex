@@ -29,10 +29,11 @@ class TestSessionReportGenerator:
         gen.record_activity("Lecture 3", "educational", 300.0)
         gen.record_distraction("reddit.com")
 
-        report = gen.finish()
+        # End at now+150: 60s FLOW + 30s HYPER + 60s FLOW (final segment)
+        report = gen.finish(end_timestamp=now + 150)
 
         assert isinstance(report, SessionReport)
-        assert report.time_in_flow_seconds == pytest.approx(60.0, abs=1.0)
+        assert report.time_in_flow_seconds == pytest.approx(120.0, abs=1.0)
         assert report.time_in_hyper_seconds == pytest.approx(30.0, abs=1.0)
         assert report.peak_stress_integral == 250.0
         assert report.breaks_taken == 1
@@ -52,7 +53,8 @@ class TestSessionReportGenerator:
         gen.record_state("FLOW", now)
         gen.record_state("HYPER", now + 100)
 
-        report = gen.finish()
+        # End at now+200: 100s FLOW + 100s HYPER (final segment)
+        report = gen.finish(end_timestamp=now + 200)
         assert report.time_in_flow_seconds == pytest.approx(100.0, abs=1.0)
         assert report.flow_percentage > 0
 
@@ -79,8 +81,36 @@ class TestSessionReportGenerator:
         gen.record_state("FLOW", now + 40)
         gen.record_state("HYPO", now + 120)   # 80s flow
 
-        report = gen.finish()
+        report = gen.finish(end_timestamp=now + 150)
         assert report.longest_flow_streak_seconds == pytest.approx(80.0, abs=1.0)
+
+    def test_final_state_duration_included(self):
+        """The last state segment must be included in duration totals (bug fix)."""
+        gen = SessionReportGenerator()
+        gen.start()
+
+        now = time.time()
+        gen.record_state("FLOW", now)
+        # Session ends at now+120 with no further state transitions.
+        # The final 120s of FLOW must be counted.
+        report = gen.finish(end_timestamp=now + 120)
+
+        assert report.time_in_flow_seconds == pytest.approx(120.0, abs=1.0)
+        assert report.longest_flow_streak_seconds == pytest.approx(120.0, abs=1.0)
+
+    def test_final_hyper_segment_included(self):
+        """Final non-FLOW segment must also be counted."""
+        gen = SessionReportGenerator()
+        gen.start()
+
+        now = time.time()
+        gen.record_state("FLOW", now)
+        gen.record_state("HYPER", now + 60)
+        # Session ends at now+160: 60s FLOW then 100s HYPER (final segment)
+        report = gen.finish(end_timestamp=now + 160)
+
+        assert report.time_in_flow_seconds == pytest.approx(60.0, abs=1.0)
+        assert report.time_in_hyper_seconds == pytest.approx(100.0, abs=1.0)
 
 
 class TestStressIntegralWarning:
