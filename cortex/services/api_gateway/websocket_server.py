@@ -101,6 +101,7 @@ class WebSocketServer:
         # Callbacks for received messages
         self._user_action_callback: Any = None
         self._settings_callback: Any = None
+        self._shutdown_callback: Any = None
         self._activity_sync_callback: Any = None
         self._tab_relevance_feedback_callback: Any = None
 
@@ -127,6 +128,10 @@ class WebSocketServer:
     def set_settings_callback(self, callback: Any) -> None:
         """Set callback for SETTINGS_SYNC messages from clients."""
         self._settings_callback = callback
+
+    def set_shutdown_callback(self, callback: Any) -> None:
+        """Set callback for SHUTDOWN messages from clients."""
+        self._shutdown_callback = callback
 
     def set_activity_sync_callback(self, callback: Any) -> None:
         """Set callback for ACTIVITY_SYNC messages from browser extension."""
@@ -241,6 +246,16 @@ class WebSocketServer:
             await self._handle_activity_sync(client, msg)
         elif msg.type == "TAB_RELEVANCE_FEEDBACK":
             await self._handle_tab_relevance_feedback(client, msg)
+        elif msg.type == "SHUTDOWN":
+            logger.info("Shutdown requested via WebSocket from %s", client.client_id)
+            if self._shutdown_callback is not None:
+                try:
+                    if asyncio.iscoroutinefunction(self._shutdown_callback):
+                        await self._shutdown_callback()
+                    else:
+                        self._shutdown_callback()
+                except Exception as exc:
+                    logger.error("Shutdown callback error: %s", exc)
         else:
             logger.debug(f"Unknown message type from {client.client_id}: {msg.type}")
 

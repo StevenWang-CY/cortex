@@ -221,7 +221,7 @@ Built with Plasmo + React (Manifest V3). Lives in `apps/browser_extension/`.
 ### Popup Dashboard
 
 Dark, high-end interface (Linear/Raycast-inspired) showing:
-- **Launch Cortex / Restart Camera** button — connects to the daemon and enables webcam capture in one click. Shows "Launch Cortex" when disconnected, "Restart Camera" when connected (re-sends `webcam_enabled` to restart the capture pipeline). Displays inline error with `cortex-dev` instructions if the daemon isn't running.
+- **Start Cortex / Stop Cortex** button — starts or stops the entire daemon (backend + camera) with one click. When starting, tries three paths in order: (1) HTTP launcher agent on port 9471, (2) Chrome native messaging to spawn daemon via Terminal.app, (3) direct WebSocket if daemon is already running. When stopping, executes a multi-step kill chain: WebSocket SHUTDOWN → HTTP /shutdown → native messaging stop (PID-based SIGTERM/SIGKILL) → launcher agent stop. Displays actionable error if all paths fail.
 - Connection status with live cognitive state indicator (FLOW/HYPER/HYPO/RECOVERY)
 - Morning briefing card ("Where you left off" summary from yesterday's handover)
 - Focus session controls with goal input and Enter-to-start
@@ -431,14 +431,22 @@ python -m cortex.scripts.seed_config --root .
 # Calibrate personal baselines (2 min)
 cortex-calibrate
 
-# Start everything
-cortex-dev
-
-# Optional desktop shell
-python -m cortex.apps.desktop_shell.main
+# Start the daemon (from terminal)
+.venv/bin/python -m cortex.scripts.run_dev
 ```
 
 REST API runs at `http://127.0.0.1:9472`. WebSocket runs at `ws://127.0.0.1:9473`.
+
+### macOS Camera Access
+
+The daemon accesses your MacBook's built-in camera via OpenCV + AVFoundation. On first launch, macOS will prompt for camera permission — click **Allow**. The camera selection logic:
+
+- Enumerates cameras via AVFoundation and classifies each as built-in, external, or Continuity Camera (iPhone/iPad)
+- **Always prefers the MacBook's built-in camera** — Continuity Camera devices are explicitly skipped via keyword matching (`iphone`, `ipad`, `continuity`)
+- Post-open verification: after opening a camera, re-enumerates to confirm the opened device isn't a Continuity Camera (catches race conditions when iPhone appears/disappears)
+- Probe fallback: if enumeration fails, tries device indices 0–4 with live verification
+
+To force a specific device, set `CORTEX_CAPTURE__DEVICE_ID=N` in `.env` (leave unset for auto-selection).
 
 ### Chrome Extension
 
@@ -470,19 +478,48 @@ npx plasmo build --target=edge-mv3
 
 Dev/build/package scripts: `pnpm dev:edge`, `pnpm build:edge`, `pnpm package:edge`. Tab group APIs have graceful fallback for Edge quirks (collapse may silently fail). All other APIs (storage, tabs, scripting, webNavigation) work identically.
 
-### Native Messaging Host (Auto-Launch Daemon)
+### Native Messaging Host (Click-to-Start from Browser)
 
-Allows the Chrome extension to automatically start the Cortex daemon when it connects:
+Allows the Chrome extension to start and stop the Cortex daemon with a single click:
 
 ```bash
 # One-time setup: register native messaging host with Chrome
-python -m cortex.scripts.install_native_host
+python -m cortex.scripts.install_native_host --extension-id YOUR_EXTENSION_ID
 
-# Or specify extension ID manually
-python -m cortex.scripts.install_native_host --extension-id abcdef1234567890
+# IMPORTANT: Restart Chrome (Cmd+Q, reopen) after installing
 ```
 
-The host (`native_host.py`) uses Chrome's native messaging protocol (4-byte length-prefixed JSON over stdio). On "launch" command, it spawns the daemon as a detached process and waits up to 8 seconds for port 9473 readiness. On "status" command, it checks if the daemon is already running.
+The install script:
+- Patches `native_host.py` with the absolute path to the venv Python as its shebang
+- Writes the Chrome native messaging manifest to `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/`
+- Preserves existing `allowed_origins` when updating
+
+**How it works:**
+
+The host (`native_host.py`) uses Chrome's native messaging protocol (4-byte length-prefixed JSON over stdio). It supports three commands:
+
+| Command | What It Does |
+|---------|-------------|
+| `launch` | Starts the daemon via Terminal.app (for camera access), waits up to 12s for port 9473 |
+| `stop` | Comprehensive kill: HTTP shutdown → SIGTERM all PIDs (by port + process name) → SIGKILL stragglers |
+| `status` | Checks if the daemon is listening on port 9473 |
+
+**Why Terminal.app?** macOS TCC (Transparency, Consent, and Control) ties camera permission to the app that spawned the process. Processes spawned directly from Chrome's native messaging host inherit Chrome's camera *denial*. By launching via `osascript 'tell application "Terminal" to do script "..."'`, the daemon runs under Terminal's TCC context, which has its own camera permission grant. A Terminal window opens while the daemon runs.
+
+**First-time setup:** The first time Chrome triggers `osascript` to control Terminal, macOS will ask: *"Google Chrome wants to control Terminal. Allow?"* — click Allow once.
+
+### Launcher Agent (Alternative)
+
+An optional lightweight HTTP server on `127.0.0.1:9471` that can start/stop the daemon without native messaging:
+
+```bash
+# Start the launcher agent manually (runs in terminal with camera access)
+python -m cortex.scripts.launcher_agent
+
+# Then the extension can POST to http://localhost:9471/launch
+```
+
+The extension tries the launcher agent first (if running), then falls back to native messaging. Useful if native messaging isn't set up or Chrome hasn't been restarted.
 
 ### Testing Interventions
 
@@ -497,6 +534,8 @@ python -m cortex.scripts.test_intervention
 
 ## API Endpoints
 
+**Daemon API** (`http://127.0.0.1:9472`):
+
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/state` | Current cognitive state estimate |
@@ -504,7 +543,17 @@ python -m cortex.scripts.test_intervention
 | GET | `/api/helpfulness/summary` | Intervention helpfulness metrics |
 | GET | `/api/projects` | List configured project launch profiles |
 | POST | `/api/launch/{name}` | Launch a project workspace |
+| POST | `/shutdown` | Graceful daemon shutdown |
 | WS | `ws://127.0.0.1:9473` | Real-time state, interventions, briefings |
+
+**Launcher Agent** (`http://127.0.0.1:9471`, optional):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/launch` | Start the daemon if not running |
+| POST | `/stop` | Stop the daemon (SIGTERM → SIGKILL) |
+| GET | `/status` | Daemon status, PID, project root |
+| GET | `/health` | Launcher liveness check |
 
 ---
 
@@ -615,7 +664,9 @@ cortex/
 │   ├── logging/             # structlog JSON event logging
 │   └── utils/               # Platform detection, async helpers, secrets
 ├── services/
-│   ├── capture_service/     # Webcam capture, MediaPipe face tracking, quality gating
+│   ├── capture_service/     # Webcam capture (smart camera selection — prefers built-in Mac
+│   │                        #   camera, skips iPhone Continuity Camera), MediaPipe face tracking,
+│   │                        #   quality gating, explicit TCC permission request on first launch
 │   ├── physio_engine/       # POS/CHROM rPPG, BVP peak detection, HR/HRV, respiration
 │   ├── kinematics_engine/   # EAR blink detection, solvePnP head pose, shoulder posture
 │   ├── telemetry_engine/    # pynput input hooks, window tracker, focus graph, aggregation
@@ -640,19 +691,22 @@ cortex/
 │   ├── desktop_shell/       # PySide6: tray, dashboard, overlay, settings, onboarding
 │   ├── vscode_extension/    # TypeScript: WS client, context provider, fold controller,
 │   │                        #   morning briefing, copilot throttle
-│   └── browser_extension/   # Plasmo/React: background SW, content script, popup, newtab,
+│   └── browser_extension/   # Plasmo/React: background SW (3-path daemon launch, multi-step
+│                            #   stop kill chain), content script, popup, newtab (Pulse Room),
 │                            #   tab manager, ambient engine, action executor, undo stack,
 │                            #   breathing overlay, active recall overlay, LeetCode observer,
 │                            #   intervention dismissal cooldown, activity tracker, resume card,
-│                            #   tab-close toggle
+│                            #   tab-close toggle, design tokens
 ├── scripts/
-│   ├── run_dev.py           # Start all services
+│   ├── run_dev.py           # Start all services (daemon entry point)
 │   ├── calibrate.py         # Capture personal baselines
 │   ├── seed_config.py       # Initialize storage and config
 │   ├── test_intervention.py # Mock intervention test server
 │   ├── replay_harness.py    # Offline session replay and A/B evaluation
-│   ├── native_host.py       # Chrome native messaging host (daemon auto-launch)
-│   ├── install_native_host.py # Register native messaging host manifest
+│   ├── native_host.py       # Chrome native messaging host (launches daemon via Terminal.app)
+│   ├── install_native_host.py # Register native messaging host manifest with Chrome
+│   ├── launcher_agent.py    # HTTP launcher server on port 9471 (alternative to native messaging)
+│   ├── install_launcher.py  # Manual start/stop helper for the launcher agent
 │   └── build_macos_app.sh   # macOS app packaging
 ├── tests/
 │   ├── unit/                # Per-module unit tests (41 test files)

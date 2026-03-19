@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/Users/chuyuewang/Desktop/CS/Project/Ralph/.venv/bin/python
 """
 Cortex Native Messaging Host for Chrome Extension.
 
@@ -20,6 +20,18 @@ import subprocess
 import sys
 import os
 import time
+import traceback
+
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native_host_debug.log")
+
+
+def log(msg: str) -> None:
+    """Append a debug line to the log file."""
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
 
 
 def read_message() -> dict:
@@ -58,43 +70,157 @@ def launch_daemon() -> dict:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(os.path.dirname(script_dir))
 
-    # Launch daemon detached from this process
+    log(f"project_root={project_root}")
+    log(f"sys.executable={sys.executable}")
+
+    # Launch the daemon with camera access.
+    # Chrome's native messaging host inherits Chrome's TCC context, which
+    # denies camera access.  We use Terminal.app (which has its own TCC
+    # context) to launch the daemon so it gets proper camera permissions.
     try:
         log_path = os.path.join(project_root, "cortex_daemon.log")
-        log_file = open(log_path, "a")
+        python = os.path.abspath(sys.executable)
 
-        subprocess.Popen(
-            [sys.executable, "-m", "cortex.scripts.run_dev"],
-            cwd=project_root,
-            stdout=log_file,
-            stderr=log_file,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
+        # Launch via Terminal.app — Terminal has its own TCC context for
+        # camera and file access.  The daemon runs in the foreground of
+        # Terminal so it inherits Terminal's camera permission.
+        # The Terminal window stays open while the daemon runs.
+        cmd = (
+            f"cd {project_root} && "
+            f"{python} -m cortex.scripts.run_dev "
+            f"2>&1 | tee -a {log_path}"
         )
+        subprocess.run(
+            [
+                "osascript", "-e",
+                f'tell application "Terminal" to do script "{cmd}"',
+            ],
+            capture_output=True, timeout=5,
+        )
+        log("Launched daemon via Terminal.app")
     except Exception as e:
+        log(f"Popen failed: {e}")
         return {"status": "error", "error": str(e)}
 
-    # Wait for the daemon to start listening (up to 8 seconds)
-    for _ in range(16):
+    # Wait for the daemon to start listening (up to 12 seconds —
+    # camera warmup alone takes ~2s on Mac builtin camera)
+    for i in range(24):
         time.sleep(0.5)
         if is_daemon_running():
+            log(f"Daemon ready after {(i+1)*0.5}s")
             return {"status": "launched"}
 
+    log("Daemon did not become ready in 12s")
     return {"status": "timeout", "error": "Daemon started but port 9473 not yet ready"}
 
 
+def _find_all_daemon_pids() -> set[int]:
+    """Find ALL Cortex daemon PIDs — by port AND by process name.
+
+    The daemon can lose its port binding while the process (and camera)
+    keeps running, so we must also search by command name.
+    """
+    pids: set[int] = set()
+
+    # Method 1: lsof on known ports
+    for port in (9473, 9472):
+        try:
+            result = subprocess.run(
+                ["lsof", "-ti", f"tcp:{port}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in result.stdout.strip().split("\n"):
+                line = line.strip()
+                if line.isdigit():
+                    pids.add(int(line))
+        except Exception:
+            pass
+
+    # Method 2: pgrep by command — catches orphaned processes that lost
+    # their port binding but still hold the camera open
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "cortex.scripts.run_dev"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.strip().split("\n"):
+            line = line.strip()
+            if line.isdigit():
+                pids.add(int(line))
+    except Exception:
+        pass
+
+    return pids
+
+
+def stop_daemon() -> dict:
+    """Stop the Cortex daemon — guaranteed kill."""
+    import signal as _signal
+
+    # Step 1: Try HTTP shutdown (cleanest — triggers graceful stop chain)
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "http://127.0.0.1:9472/shutdown", method="POST", data=b"",
+        )
+        urllib.request.urlopen(req, timeout=2)
+    except Exception:
+        pass
+
+    # Step 2: Find ALL daemon PIDs and send SIGTERM
+    pids = _find_all_daemon_pids()
+    for pid in pids:
+        try:
+            os.kill(pid, _signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    if pids:
+        log(f"Sent SIGTERM to pids: {pids}")
+
+    # Step 3: Wait for graceful shutdown
+    for _ in range(6):
+        time.sleep(0.5)
+        remaining = _find_all_daemon_pids()
+        if not remaining:
+            return {"status": "stopped"}
+
+    # Step 4: SIGKILL anything still alive
+    remaining = _find_all_daemon_pids()
+    for pid in remaining:
+        try:
+            os.kill(pid, _signal.SIGKILL)
+            log(f"SIGKILL sent to {pid}")
+        except ProcessLookupError:
+            pass
+
+    return {"status": "stopped"}
+
+
 def main() -> None:
-    msg = read_message()
-    command = msg.get("command", "launch")
+    log("--- invoked ---")
+    try:
+        msg = read_message()
+        log(f"received: {msg}")
+        command = msg.get("command", "launch")
 
-    if command == "launch":
-        result = launch_daemon()
-    elif command == "status":
-        result = {"status": "running" if is_daemon_running() else "stopped"}
-    else:
-        result = {"status": "error", "error": f"Unknown command: {command}"}
+        if command == "launch":
+            result = launch_daemon()
+        elif command == "stop":
+            result = stop_daemon()
+        elif command == "status":
+            result = {"status": "running" if is_daemon_running() else "stopped"}
+        else:
+            result = {"status": "error", "error": f"Unknown command: {command}"}
 
-    send_message(result)
+        log(f"sending: {result}")
+        send_message(result)
+    except Exception as e:
+        log(f"CRASH: {traceback.format_exc()}")
+        # Always try to send a response even on crash
+        try:
+            send_message({"status": "error", "error": str(e)})
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

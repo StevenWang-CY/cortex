@@ -1,0 +1,7 @@
+/* Immediate dark background for all extension pages — prevents white flash */
+html, body, #__plasmo {
+    margin: 0;
+    padding: 0;
+    background: #0C0C0E;
+    min-height: 100vh;
+}

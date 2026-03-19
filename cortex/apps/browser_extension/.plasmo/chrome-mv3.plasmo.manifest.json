@@ -34,7 +34,8 @@
     "storage",
     "alarms",
     "bookmarks",
-    "webNavigation"
+    "webNavigation",
+    "nativeMessaging"
   ],
   "content_scripts": [
     {

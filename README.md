@@ -15,7 +15,7 @@
 - **Progressive consent** — 5-level trust ladder (OBSERVE → SUGGEST → PREVIEW → REVERSIBLE_ACT → AUTONOMOUS_ACT) per action type; Cortex earns autonomy through repeated approvals
 - **Learning loop** — contextual bandit (LinUCB) selects intervention type; helpfulness tracker computes reward from user engagement and explicit ratings; per-tab relevance tracker learns individual tab preferences from Keep button feedback
 - **Ambient somatic feedback** — sub-threshold color vignettes, weather particles, and flow shield that fades distraction elements during sustained focus
-- **Chrome + Edge** — Plasmo/React Manifest V3 extension with popup dashboard, one-click daemon launch and camera restart, intervention overlay, Pulse Room new tab, and focus sessions with distraction blocking
+- **Chrome + Edge** — Plasmo/React Manifest V3 extension with popup dashboard, one-click daemon launch (via native messaging + Terminal.app for camera access), camera restart, intervention overlay, Pulse Room new tab, and focus sessions with distraction blocking
 
 ---
 
@@ -43,7 +43,7 @@ L5: Intervention ────── Consent · Validate · Execute · Undo · Le
 Store (Redis / In-Memory)
 ```
 
-All layers communicate via FastAPI (port 9472) and WebSocket (port 9473). The desktop shell, VS Code extension, and Chrome/Edge extension are all clients.
+All layers communicate via FastAPI (port 9472) and WebSocket (port 9473). The desktop shell, VS Code extension, and Chrome/Edge extension are all clients. An optional launcher agent on port 9471 provides HTTP-based daemon start/stop.
 
 ---
 
@@ -51,10 +51,11 @@ All layers communicate via FastAPI (port 9472) and WebSocket (port 9473). The de
 
 | Directory | Description |
 |-----------|-------------|
-| [`cortex/`](cortex/) | Core engine — bio-extraction, state classification, LLM interventions, consent ladder, learning loop, v2.0 detectors, LeetCode mode, activity tracker |
-| [`cortex/apps/browser_extension/`](cortex/apps/browser_extension/) | Chrome + Edge extension (Plasmo/React) — intervention overlay, ambient feedback, focus sessions, LeetCode observer, activity tracker, resume cards, Pulse Room |
+| [`cortex/`](cortex/) | Core engine — bio-extraction, state classification, LLM interventions, consent ladder, learning loop, v2.0 detectors, LeetCode mode, activity tracker, smart camera selection |
+| [`cortex/apps/browser_extension/`](cortex/apps/browser_extension/) | Chrome + Edge extension (Plasmo/React) — one-click daemon launch/stop, intervention overlay, ambient feedback, focus sessions, LeetCode observer, activity tracker, resume cards, Pulse Room |
 | [`cortex/apps/vscode_extension/`](cortex/apps/vscode_extension/) | VS Code extension — context provider, code folding, morning briefing, copilot throttle |
 | [`cortex/apps/desktop_shell/`](cortex/apps/desktop_shell/) | PySide6 desktop app — system tray, dashboard, onboarding, settings |
+| [`cortex/scripts/`](cortex/scripts/) | Daemon entry point, native messaging host, launcher agent, calibration, install scripts |
 
 ---
 
@@ -74,20 +75,32 @@ All layers communicate via FastAPI (port 9472) and WebSocket (port 9473). The de
 ## Quick Start
 
 ```bash
-cd cortex
-pip install -e ".[dev]"
-cp .env.example .env   # Edit with your Azure OpenAI config
+# Backend
+cd /path/to/Ralph
+pip install -e "./cortex[dev]"
+cp cortex/.env.example .env   # Edit with your Azure OpenAI config
 python -m cortex.scripts.seed_config --root .
-cortex-calibrate        # 2-min baseline capture
-cortex-dev              # Start all services
 ```
 
 ```bash
 # Chrome extension
 cd cortex/apps/browser_extension
 pnpm install && npx plasmo build
-# Load build/chrome-mv3-prod/ as unpacked extension
+# Load build/chrome-mv3-prod/ as unpacked extension in chrome://extensions
 ```
+
+```bash
+# Register native messaging host (one-time, enables click-to-start from extension)
+python -m cortex.scripts.install_native_host --extension-id YOUR_EXTENSION_ID
+# Restart Chrome after installing
+```
+
+**Starting the daemon:**
+
+- **From browser** — click **Start Cortex** in the extension popup. The daemon launches via Terminal.app (which has camera permissions). A Terminal window opens briefly while the daemon runs.
+- **From terminal** — `cd /path/to/Ralph && .venv/bin/python -m cortex.scripts.run_dev`
+
+The first time you start the daemon, macOS will prompt for camera access — click **Allow**.
 
 See [`cortex/README.md`](cortex/README.md) for full documentation — setup, architecture, all features, API reference, and development guide.
 

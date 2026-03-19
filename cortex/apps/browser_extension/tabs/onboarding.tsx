@@ -9,6 +9,7 @@
 
 import React, { useState } from "react";
 import { createRoot } from "react-dom/client";
+import "../page-reset.css";
 import { CX, CX_KEYFRAMES } from "../design-tokens";
 
 const STEPS = [
@@ -47,7 +48,16 @@ function Onboarding(): React.ReactElement {
 
     return (
         <div style={S.page}>
-            <style>{CX_KEYFRAMES}</style>
+            <style>{`
+                html, body, #__plasmo {
+                    margin: 0;
+                    padding: 0;
+                    background: #0C0C0E;
+                    min-height: 100%;
+                }
+                * { box-sizing: border-box; }
+                ${CX_KEYFRAMES}
+            `}</style>
             <div style={S.container}>
                 {/* Progress */}
                 <div style={S.progressRow}>
@@ -144,9 +154,9 @@ const S: Record<string, React.CSSProperties> = {
         maxWidth: 520,
         width: "100%",
         background: CX.surface,
-        borderRadius: CX.radiusXl,
-        border: `1px solid ${CX.borderDefault}`,
-        padding: 40,
+        borderRadius: 24,
+        border: `1px solid ${CX.border}`,
+        padding: 48,
     },
     progressRow: {
         display: "flex",
@@ -183,8 +193,8 @@ const S: Record<string, React.CSSProperties> = {
     },
     codeBlock: {
         background: CX.bg,
-        border: `1px solid ${CX.borderDefault}`,
-        borderRadius: CX.radiusMd,
+        border: `1px solid ${CX.border}`,
+        borderRadius: CX.radiusLg,
         padding: "14px 18px",
         fontFamily: CX.mono,
         fontSize: 14,
@@ -243,8 +253,8 @@ const S: Record<string, React.CSSProperties> = {
     },
     backBtn: {
         padding: "10px 20px",
-        border: `1px solid ${CX.borderDefault}`,
-        borderRadius: CX.radiusMd,
+        border: `1px solid ${CX.border}`,
+        borderRadius: CX.radiusLg,
         background: "transparent",
         color: CX.textSecondary,
         fontSize: 13,
@@ -255,7 +265,7 @@ const S: Record<string, React.CSSProperties> = {
     nextBtn: {
         padding: "10px 28px",
         border: "none",
-        borderRadius: CX.radiusMd,
+        borderRadius: CX.radiusLg,
         background: CX.accent,
         color: CX.textInverse,
         fontSize: 13,

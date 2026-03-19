@@ -9,6 +9,7 @@
  */
 
 import React, { useEffect, useRef, useState } from "react";
+import "./page-reset.css";
 import { CX, STATE_COLORS_RGB, CX_KEYFRAMES } from "./design-tokens";
 
 interface Ring {
@@ -53,6 +54,10 @@ function PulseRoom(): React.ReactElement {
     const [displayHR, setDisplayHR] = useState(0);
     const [displayConnected, setDisplayConnected] = useState(false);
     const [reducedMotion, setReducedMotion] = useState(false);
+
+    // Launch controls
+    const [launching, setLaunching] = useState(false);
+    const [launchError, setLaunchError] = useState("");
 
     // Activity tracking — resume cards at bottom
     const [activities, setActivities] = useState<RecentActivity[]>([]);
@@ -168,6 +173,9 @@ function PulseRoom(): React.ReactElement {
             canvas.width = window.innerWidth * dpr;
             canvas.height = window.innerHeight * dpr;
             ctx!.scale(dpr, dpr);
+            // Fill immediately on resize to prevent white flash
+            ctx!.fillStyle = CX.bg;
+            ctx!.fillRect(0, 0, window.innerWidth, window.innerHeight);
         }
         resize();
         window.addEventListener("resize", resize);
@@ -317,6 +325,20 @@ function PulseRoom(): React.ReactElement {
         };
     }, [reducedMotion]);
 
+    function handleLaunch() {
+        setLaunching(true);
+        setLaunchError("");
+        chrome.runtime.sendMessage({ type: "LAUNCH_CORTEX" }, (resp) => {
+            setLaunching(false);
+            if (resp?.ok && resp.status === "camera_enabled") {
+                // Connected — state updates will flow via polling
+            } else {
+                setLaunchError(`${resp?.status || "no_response"}: ${resp?.error || "unknown"}`);
+                setTimeout(() => setLaunchError(""), 15000);
+            }
+        });
+    }
+
     const col = STATE_COLORS_RGB[displayConnected ? stateRef.current.state : ""] || STATE_COLORS_RGB.FLOW;
 
     return (
@@ -349,25 +371,74 @@ function PulseRoom(): React.ReactElement {
                 }} />
             )}
 
-            {/* BPM readout — 36px, mono, centered below orb (48px gap). No label. Just the number. */}
-            <div
-                style={{
+            {/* Start button — shown when daemon is not connected */}
+            {!displayConnected && !displayHR && (
+                <div style={{
                     position: "fixed",
                     top: "calc(50% + 60px)",
                     left: "50%",
                     transform: "translateX(-50%)",
-                    fontFamily: CX.mono,
-                    fontSize: 36,
-                    fontWeight: 600,
-                    color: CX.text,
-                    userSelect: "none",
-                    transition: "color 3s ease",
-                    lineHeight: 1.15,
-                }}
-                aria-label={displayHR > 0 ? `${displayHR} beats per minute` : "no heart rate data"}
-            >
-                {displayHR > 0 ? displayHR : "\u2014"}
-            </div>
+                    display: "flex",
+                    flexDirection: "column" as const,
+                    alignItems: "center",
+                    gap: 10,
+                }}>
+                    <button
+                        onClick={handleLaunch}
+                        disabled={launching}
+                        style={{
+                            padding: "10px 32px",
+                            border: `1px solid ${CX.border}`,
+                            borderRadius: CX.radiusLg,
+                            background: launching ? CX.surface : "transparent",
+                            color: CX.textSecondary,
+                            fontSize: 13,
+                            fontWeight: 500,
+                            fontFamily: CX.font,
+                            cursor: launching ? "default" : "pointer",
+                            opacity: launching ? 0.6 : 1,
+                            transition: `all ${CX.durationNormal} ${CX.easeDefault}`,
+                            letterSpacing: 0.3,
+                        }}
+                    >
+                        {launching ? "Starting\u2026" : "Start Cortex"}
+                    </button>
+                    {launchError && (
+                        <div style={{
+                            fontSize: 10,
+                            color: CX.textTertiary,
+                            fontFamily: CX.mono,
+                            textAlign: "center" as const,
+                            maxWidth: 300,
+                            lineHeight: 1.5,
+                        }}>
+                            {launchError}
+                        </div>
+                    )}
+                </div>
+            )}
+
+            {/* BPM readout — 36px, mono, centered below orb (48px gap). No label. Just the number. Hidden when no data. */}
+            {displayHR > 0 && (
+                <div
+                    style={{
+                        position: "fixed",
+                        top: "calc(50% + 60px)",
+                        left: "50%",
+                        transform: "translateX(-50%)",
+                        fontFamily: CX.mono,
+                        fontSize: 36,
+                        fontWeight: 600,
+                        color: CX.text,
+                        userSelect: "none",
+                        transition: "color 3s ease, opacity 1s ease",
+                        lineHeight: 1.15,
+                    }}
+                    aria-label={`${displayHR} beats per minute`}
+                >
+                    {displayHR}
+                </div>
+            )}
 
             {/* Resume cards — bottom, horizontal, max 3, each max 200px */}
             {showActivities && activities.length > 0 && (

@@ -142,6 +142,7 @@ class CortexDaemon:
         self._ws_server = WebSocketServer(self.config.api)
         self._ws_server.set_user_action_callback(self._handle_user_action)
         self._ws_server.set_settings_callback(self.apply_settings)
+        self._ws_server.set_shutdown_callback(self._request_shutdown)
 
         self._rgb_history: deque[np.ndarray] = deque(
             maxlen=max(1, self.config.signal.rppg.window_seconds * self.config.capture.fps)
@@ -270,6 +271,18 @@ class CortexDaemon:
         logger.info("Cortex daemon started (v2.0)")
         await self._shutdown.wait()
 
+    def _request_shutdown(self) -> None:
+        """Request process shutdown via SIGTERM (triggers full graceful stop chain)."""
+        import os, signal as _signal
+        logger.info("Shutdown requested via WebSocket")
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop — send SIGTERM directly
+            os.kill(os.getpid(), _signal.SIGTERM)
+            return
+        loop.call_later(0.3, os.kill, os.getpid(), _signal.SIGTERM)
+
     async def stop(self) -> None:
         """Gracefully stop all runtime services."""
         self._shutdown.set()
@@ -278,8 +291,12 @@ class CortexDaemon:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
-        if self._capture_available and self._capture_pipeline.is_running:
+        # Always stop the capture pipeline to release the camera — even if
+        # _capture_available is False (pipeline may have started then errored)
+        try:
             await self._capture_pipeline.stop()
+        except Exception:
+            pass
         self._input_hooks.stop()
         self._window_tracker.stop()
         await self._ws_server.stop()
@@ -497,12 +514,12 @@ class CortexDaemon:
                         active_app = self._current_app_name()
                         telemetry = registry.get("latest_telemetry")
                         kinematics = self._latest_kinematics
+                        self._zombie_detector.update_baseline(self._scorer.baselines.blink_rate_baseline)
                         if self._zombie_detector.update(
                             state=estimate.state,
                             active_app=active_app,
                             mouse_velocity=telemetry.mouse_velocity_mean if telemetry else 0.0,
                             blink_rate=kinematics.blink_rate,
-                            blink_baseline=self._scorer.baselines.blink_rate_baseline,
                         ):
                             logger.info("Zombie reading detected — triggering active recall")
                             await self._trigger_special_intervention(

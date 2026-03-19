@@ -2312,6 +2312,68 @@ chrome.runtime.onMessage.addListener(
                 sendResponse({ ok: true });
                 break;
 
+            case "STOP_CORTEX":
+                // End any active focus session
+                stopFocusSession();
+                // Clear state
+                currentState = null;
+                activeIntervention = null;
+                (async () => {
+                    // Step 1: Send SHUTDOWN over WebSocket (graceful — triggers daemon stop chain)
+                    if (ws && connected) {
+                        try {
+                            send({
+                                type: "SHUTDOWN",
+                                payload: {},
+                                timestamp: Date.now() / 1000,
+                                sequence: ++sequence,
+                            });
+                            await new Promise((r) => setTimeout(r, 500));
+                        } catch { /* ws may already be closing */ }
+                    }
+                    // Step 2: Disconnect our WebSocket
+                    disconnect();
+                    // Step 3: HTTP shutdown via daemon API (backup)
+                    try {
+                        await fetch("http://localhost:9472/shutdown", {
+                            method: "POST",
+                            signal: AbortSignal.timeout(3000),
+                        });
+                    } catch { /* daemon may already be dead */ }
+                    // Step 4: Wait briefly for graceful shutdown to complete
+                    await new Promise((r) => setTimeout(r, 1000));
+                    // Step 5: Nuclear kill via native messaging — sends SIGTERM to the
+                    // daemon process by PID. This is the most reliable kill mechanism
+                    // because it works even when HTTP/WebSocket are unresponsive.
+                    try {
+                        chrome.runtime.sendNativeMessage(
+                            "com.cortex.launcher",
+                            { command: "stop" },
+                            () => { /* ignore response */ }
+                        );
+                    } catch { /* native messaging may not be available */ }
+                    // Step 6: HTTP stop via launcher agent (port 9471) as final backup
+                    try {
+                        await fetch("http://localhost:9471/stop", {
+                            method: "POST",
+                            signal: AbortSignal.timeout(3000),
+                        });
+                    } catch { /* launcher may not be running */ }
+                    // Close any onboarding tabs
+                    try {
+                        const onboardingUrl = chrome.runtime.getURL("tabs/onboarding.html");
+                        chrome.tabs.query({}, (tabs) => {
+                            for (const tab of tabs) {
+                                if (tab.id && tab.url && tab.url.startsWith(onboardingUrl)) {
+                                    chrome.tabs.remove(tab.id);
+                                }
+                            }
+                        });
+                    } catch { /* ignore */ }
+                    sendResponse({ ok: true });
+                })();
+                return true; // async response
+
             case "TOGGLE_QUIET_MODE":
                 quietMode = Boolean(message.quiet);
                 schedulePersist();
@@ -2328,24 +2390,101 @@ chrome.runtime.onMessage.addListener(
                 break;
 
             case "LAUNCH_CORTEX":
-                // Connect if not connected, then enable webcam capture
-                if (!connected) {
-                    connect();
-                }
-                // Wait briefly for connection, then send webcam enable
-                setTimeout(() => {
-                    if (connected && ws) {
-                        send({
-                            type: "SETTINGS_SYNC",
-                            payload: { webcam_enabled: true },
-                            timestamp: Date.now() / 1000,
-                            sequence: ++sequence,
+                // Try three launch paths in order:
+                // 1. HTTP launcher agent (port 9471) — works if user started launcher manually
+                // 2. Native messaging — Chrome invokes native_host.py directly
+                // 3. Direct WebSocket — daemon may already be running
+                (async () => {
+                    let launched = false;
+                    let lastError = "";
+
+                    // Helper: wait for WebSocket connection and enable camera
+                    const waitAndEnableCamera = async (maxAttempts: number): Promise<boolean> => {
+                        if (!connected) connect();
+                        let attempts = 0;
+                        while (!connected && attempts < maxAttempts) {
+                            await new Promise((r) => setTimeout(r, 500));
+                            attempts++;
+                        }
+                        if (connected && ws) {
+                            send({
+                                type: "SETTINGS_SYNC",
+                                payload: { webcam_enabled: true },
+                                timestamp: Date.now() / 1000,
+                                sequence: ++sequence,
+                            });
+                            return true;
+                        }
+                        return false;
+                    };
+
+                    try {
+                        // Path 1: HTTP launcher agent on port 9471
+                        try {
+                            const resp = await fetch("http://localhost:9471/launch", {
+                                method: "POST",
+                                signal: AbortSignal.timeout(12000),
+                            });
+                            const data = await resp.json();
+                            if (data.status === "starting" || data.status === "already_running") {
+                                // Daemon spawned/running — wait for WebSocket
+                                if (await waitAndEnableCamera(16)) {
+                                    sendResponse({ ok: true, status: "camera_enabled" });
+                                    return;
+                                }
+                                lastError = "Daemon started via launcher but WebSocket not connected";
+                            }
+                        } catch {
+                            // Launcher not running — try next path
+                        }
+
+                        // Path 2: Native messaging
+                        if (!launched) {
+                            const nativeResult = await new Promise<Record<string, string>>((resolve) => {
+                                try {
+                                    chrome.runtime.sendNativeMessage(
+                                        "com.cortex.launcher",
+                                        { command: "launch" },
+                                        (response) => {
+                                            if (chrome.runtime.lastError) {
+                                                resolve({ status: "native_error", error: chrome.runtime.lastError.message || "Native messaging failed" });
+                                            } else {
+                                                resolve(response || { status: "no_response" });
+                                            }
+                                        }
+                                    );
+                                } catch {
+                                    resolve({ status: "native_unavailable", error: "Native messaging not available" });
+                                }
+                            });
+
+                            if (nativeResult.status === "launched" || nativeResult.status === "already_running") {
+                                if (await waitAndEnableCamera(10)) {
+                                    sendResponse({ ok: true, status: "camera_enabled" });
+                                    return;
+                                }
+                                lastError = "Daemon started via native messaging but WebSocket not connected";
+                            } else {
+                                lastError = nativeResult.error || "Native messaging failed";
+                            }
+                        }
+
+                        // Path 3: Direct WebSocket — daemon may already be running
+                        if (await waitAndEnableCamera(4)) {
+                            sendResponse({ ok: true, status: "camera_enabled" });
+                            return;
+                        }
+
+                        // All paths failed
+                        sendResponse({
+                            ok: false,
+                            status: "not_connected",
+                            error: lastError || "Could not start daemon. Run in terminal: python -m cortex.scripts.run_dev",
                         });
-                        sendResponse({ ok: true, status: "camera_enabled" });
-                    } else {
-                        sendResponse({ ok: false, status: "not_connected" });
+                    } catch (e) {
+                        sendResponse({ ok: false, status: "error", error: String(e) });
                     }
-                }, 1500);
+                })();
                 return true; // async
 
             case "USER_ACTION":
@@ -2710,9 +2849,14 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 chrome.runtime.onInstalled.addListener((details) => {
     chrome.alarms.create("cortex-keepalive", { periodInMinutes: 0.4 });
     connect();
-    // Open onboarding tab on first install
+    // Open onboarding tab only on first-ever install (not updates/reloads)
     if (details.reason === "install") {
-        chrome.tabs.create({ url: chrome.runtime.getURL("tabs/onboarding.html") });
+        chrome.storage.local.get("cortex_onboarded", (data) => {
+            if (!data.cortex_onboarded) {
+                chrome.storage.local.set({ cortex_onboarded: true });
+                chrome.tabs.create({ url: chrome.runtime.getURL("tabs/onboarding.html") });
+            }
+        });
     }
 });
 

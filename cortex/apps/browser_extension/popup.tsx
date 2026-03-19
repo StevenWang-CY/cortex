@@ -10,6 +10,19 @@ import React, { useCallback, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { CX, STATE_COLORS, STATE_LABELS, CX_KEYFRAMES } from "./design-tokens";
 
+const CortexLogo = () => (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ flexShrink: 0 }}>
+        <path d="M13 3C7.48 3 3 7.48 3 13s4.48 10 10 10" stroke="url(#cortex-gradient)" strokeWidth="2.5" strokeLinecap="round" />
+        <path d="M8 13l2.5-3.5L13 16l2-2h4" stroke="url(#cortex-gradient)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+        <defs>
+            <linearGradient id="cortex-gradient" x1="3" y1="3" x2="19" y2="23" gradientUnits="userSpaceOnUse">
+                <stop stopColor="#3b82f6" />
+                <stop offset="1" stopColor="#10b981" />
+            </linearGradient>
+        </defs>
+    </svg>
+);
+
 // --- Types ---
 
 interface Biometrics {
@@ -174,16 +187,22 @@ function CortexPopup(): React.ReactElement {
         chrome.runtime.sendMessage({ type: "TOGGLE_QUIET_MODE", quiet: newValue });
     }, [quietMode]);
 
+    const [launchStatus, setLaunchStatus] = useState("");
+
     const handleLaunchCortex = useCallback(() => {
         setLaunching(true);
         setLaunchError(false);
+        setLaunchStatus("Launching daemon\u2026");
         chrome.runtime.sendMessage({ type: "LAUNCH_CORTEX" }, (resp) => {
             if (resp?.ok && resp.status === "camera_enabled") {
                 setLaunching(false);
+                setLaunchStatus("");
             } else {
                 setLaunching(false);
                 setLaunchError(true);
-                setTimeout(() => setLaunchError(false), 5000);
+                const errorMsg = resp?.error || "Could not reach daemon";
+                setLaunchStatus(`Start failed: ${errorMsg}. Run in terminal: python -m cortex.scripts.run_dev`);
+                setTimeout(() => { setLaunchError(false); setLaunchStatus(""); }, 30000);
             }
         });
     }, []);
@@ -281,6 +300,19 @@ function CortexPopup(): React.ReactElement {
         chrome.runtime.sendMessage({ type: "CONNECT" });
     }, []);
 
+    const [stopping, setStopping] = useState(false);
+    const handleStopCortex = useCallback(async () => {
+        setStopping(true);
+        // Force local UI to disconnected immediately
+        setConnected(false);
+        setState(null);
+        setFocus(null);
+        // Tell background to disconnect WS, kill daemon via HTTP, close tabs
+        chrome.runtime.sendMessage({ type: "STOP_CORTEX" });
+        // Wait a moment for shutdown to propagate, then release button
+        setTimeout(() => setStopping(false), 2000);
+    }, []);
+
     const handleStartFocus = useCallback(() => {
         chrome.runtime.sendMessage({
             type: "START_FOCUS",
@@ -345,7 +377,10 @@ function CortexPopup(): React.ReactElement {
 
             {/* Header — 44px total, 20px horizontal, 12px vertical */}
             <div style={S.header}>
-                <span style={S.logoText}>Cortex</span>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <CortexLogo />
+                    <span style={S.logoText}>Cortex</span>
+                </div>
                 {!connected ? (
                     <button style={S.connectBtn} onClick={handleConnect}>CONNECT</button>
                 ) : (
@@ -380,28 +415,74 @@ function CortexPopup(): React.ReactElement {
                 </div>
             )}
 
-            {/* Disconnected state — centered, quiet notice */}
+            {/* Disconnected state — centered, quiet notice with one-click launch */}
             {!connected && (
                 <div style={S.disconnectedArea}>
-                    <div style={{ width: 12, height: 12, borderRadius: "50%", border: `1.5px solid ${CX.textTertiary}`, flexShrink: 0 }} />
-                    <div style={S.disconnectedTitle}>Not connected</div>
-                    <div style={S.disconnectedBody}>Start the Cortex daemon</div>
+                    <div style={{
+                        width: 40,
+                        height: 40,
+                        borderRadius: "50%",
+                        border: `1.5px solid ${launching ? CX.accent : CX.textTertiary}`,
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        transition: `border-color ${CX.durationSlow} ${CX.easeDefault}`,
+                        marginBottom: 12,
+                    }}>
+                        {launching ? (
+                            <div style={{
+                                width: 8,
+                                height: 8,
+                                borderRadius: "50%",
+                                background: CX.accent,
+                                animation: "cxPulse 1.5s ease-in-out infinite",
+                            }} />
+                        ) : (
+                            <div style={{
+                                width: 0,
+                                height: 0,
+                                borderLeft: `8px solid ${CX.textTertiary}`,
+                                borderTop: "5px solid transparent",
+                                borderBottom: "5px solid transparent",
+                                marginLeft: 2,
+                            }} />
+                        )}
+                    </div>
+                    <div style={S.disconnectedTitle}>{launching ? "Starting Cortex" : "Not connected"}</div>
+                    <div style={S.disconnectedBody}>
+                        {launchStatus || "Launch daemon with camera"}
+                    </div>
                     <button
                         style={{
-                            ...S.ghostBtn,
-                            marginTop: 12,
+                            ...S.primaryBtn,
+                            marginTop: 16,
                             opacity: launching ? 0.5 : 1,
                             pointerEvents: launching ? "none" as const : "auto" as const,
+                            maxWidth: 200,
                         }}
                         onClick={handleLaunchCortex}
                         disabled={launching}
                     >
                         {launchError
-                            ? "Daemon not running"
+                            ? "Retry"
                             : launching
                                 ? "Starting\u2026"
                                 : "Start Cortex"}
                     </button>
+                    {launchError && launchStatus && (
+                        <div style={{
+                            fontSize: 10,
+                            color: CX.textTertiary,
+                            fontFamily: CX.mono,
+                            marginTop: 8,
+                            textAlign: "center" as const,
+                            lineHeight: 1.5,
+                            maxWidth: 280,
+                            wordBreak: "break-word" as const,
+                        }}>
+                            {launchStatus}
+                        </div>
+                    )}
                 </div>
             )}
 
@@ -627,6 +708,28 @@ function CortexPopup(): React.ReactElement {
                         }} />
                     </button>
                 </div>
+
+                <button
+                    style={{
+                        width: "100%",
+                        marginTop: 16,
+                        padding: "10px 0",
+                        border: `1px solid ${CX.dangerDim}`,
+                        borderRadius: CX.radiusMd,
+                        background: CX.dangerDim,
+                        color: CX.danger,
+                        fontSize: 12,
+                        fontWeight: 500,
+                        fontFamily: CX.font,
+                        cursor: stopping ? "default" : "pointer",
+                        opacity: stopping ? 0.5 : 1,
+                        transition: `opacity ${CX.durationFast} ${CX.easeDefault}`,
+                    }}
+                    onClick={handleStopCortex}
+                    disabled={stopping}
+                >
+                    {stopping ? "Stopping\u2026" : "Stop Cortex"}
+                </button>
             </div>
 
             {/* Today footer — no card, lowest hierarchy */}

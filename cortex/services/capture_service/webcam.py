@@ -34,6 +34,9 @@ _BUILTIN_MAC_CAMERA_KEYWORDS = (
     "built-in",
     "macbook",
     "imac",
+    "mac studio",
+    "mac pro",
+    "mac mini",
 )
 
 _CONTINUITY_CAMERA_KEYWORDS = (
@@ -80,10 +83,30 @@ def _extract_objc_string(obj: object, attr: str) -> str:
 
 
 def _list_macos_video_device_names() -> list[str]:
-    """Enumerate macOS camera names in AVFoundation order."""
+    """Enumerate macOS camera names in AVFoundation order.
+
+    Retries once after a short delay if the initial enumeration returns empty,
+    as AVFoundation may not have discovered all devices yet during early startup.
+    """
     if not is_macos():
         return []
 
+    names = _list_macos_video_device_names_once()
+    if not names:
+        # AVFoundation device discovery can be slow at startup — retry after delay
+        import time as _time
+        _time.sleep(1.0)
+        names = _list_macos_video_device_names_once()
+
+    if names:
+        logger.info("Enumerated %d camera(s): %s", len(names), names)
+    else:
+        logger.warning("Could not enumerate macOS cameras via AVFoundation")
+    return names
+
+
+def _list_macos_video_device_names_once() -> list[str]:
+    """Single attempt to enumerate macOS camera names."""
     # Try the pyobjc AVFoundation wrapper first
     try:
         import AVFoundation
@@ -103,32 +126,72 @@ def _list_macos_video_device_names() -> list[str]:
     # Fallback: load AVFoundation via objc bridge (pyobjc-core only)
     try:
         import objc
-        bundle = objc.loadBundle(
+        objc.loadBundle(
             "AVFoundation",
             bundle_path="/System/Library/Frameworks/AVFoundation.framework",
             module_globals={},
         )
-        # After loading, AVCaptureDevice is in the module globals
-        ns = bundle.__dict__ if hasattr(bundle, "__dict__") else {}
         AVCaptureDevice = objc.lookUpClass("AVCaptureDevice")
         devices = AVCaptureDevice.devicesWithMediaType_("vide") or []
         return [_extract_objc_string(device, "localizedName") for device in devices]
     except Exception:
         logger.debug("Failed to enumerate macOS cameras via objc bridge", exc_info=True)
-        return []
+
+    return []
+
+
+def _llm_pick_builtin_camera(names: list[str]) -> int | None:
+    """Use a local LLM to identify which camera is the computer's built-in webcam.
+
+    Calls local Ollama with a tiny classification prompt.  Returns the 0-based
+    index of the chosen camera, or None if the LLM is unavailable.
+    """
+    if len(names) < 2:
+        return 0 if names else None
+
+    numbered = "\n".join(f"{i}: {n}" for i, n in enumerate(names))
+    prompt = (
+        "Which of these cameras is the computer's built-in webcam "
+        "(not a phone or external camera)? Reply with ONLY the number.\n\n"
+        f"{numbered}"
+    )
+
+    try:
+        import httpx
+        resp = httpx.post(
+            "http://localhost:11434/api/generate",
+            json={"model": "llama3.2", "prompt": prompt, "stream": False},
+            timeout=8.0,
+        )
+        if resp.status_code == 200:
+            text = resp.json().get("response", "").strip()
+            # Extract first digit from the response
+            for ch in text:
+                if ch.isdigit():
+                    idx = int(ch)
+                    if 0 <= idx < len(names):
+                        logger.info("LLM selected camera %d (%s) from %d candidates", idx, names[idx], len(names))
+                        return idx
+    except Exception:
+        logger.debug("LLM camera selection unavailable, using keyword fallback")
+    return None
 
 
 def _find_builtin_macos_camera() -> tuple[int | None, str | None]:
     """Return the first built-in Mac camera, skipping Continuity Camera devices.
 
-    AVFoundation may list an iPhone Continuity Camera before the built-in camera,
-    or macOS may reorder devices when the iPhone connects.  We walk the list in
-    order, skipping anything that looks like a Continuity Camera, and return the
-    first device whose name contains a built-in keyword.  If no built-in keyword
-    matches we fall back to the first non-Continuity device.
+    Uses a local LLM for classification when available, with keyword-based
+    fallback.  AVFoundation may list an iPhone Continuity Camera before the
+    built-in camera, or macOS may reorder devices when the iPhone connects.
     """
     names = _list_macos_video_device_names()
-    # First pass: find a device that matches built-in keywords and is NOT a Continuity Camera
+
+    # Try LLM-based selection first
+    llm_pick = _llm_pick_builtin_camera(names)
+    if llm_pick is not None:
+        return llm_pick, names[llm_pick]
+
+    # Keyword fallback — first pass: match built-in keywords, skip Continuity Camera
     for index, name in enumerate(names):
         normalized = name.casefold()
         is_continuity = any(kw in normalized for kw in _CONTINUITY_CAMERA_KEYWORDS)
@@ -166,6 +229,20 @@ def _iter_camera_candidates(config: CaptureConfig) -> Iterable[CameraSelection]:
     if config.device_id is None and is_macos():
         names = _list_macos_video_device_names()
         if names:
+            # Try LLM-based selection first — if it picks a non-Continuity camera, use it
+            llm_pick = _llm_pick_builtin_camera(names)
+            if llm_pick is not None:
+                pick_name = names[llm_pick].casefold()
+                if not any(kw in pick_name for kw in _CONTINUITY_CAMERA_KEYWORDS):
+                    candidates.append(
+                        CameraSelection(
+                            device_id=llm_pick,
+                            backend=cv2.CAP_AVFOUNDATION,
+                            source="llm_selected",
+                            device_name=names[llm_pick],
+                        )
+                    )
+
             # Partition into builtin, other, and continuity camera groups
             builtin: list[tuple[int, str]] = []
             other: list[tuple[int, str]] = []
@@ -212,23 +289,34 @@ def _iter_camera_candidates(config: CaptureConfig) -> Iterable[CameraSelection]:
                         )
                     )
 
-    # Fallback: try the configured/default device id
+    # Fallback: try device indices 0-4 as "probe" candidates.
+    # The post-open check in open_video_capture() will re-enumerate and
+    # reject any Continuity Camera, so these are safe to try.
     if is_macos():
+        for probe_idx in range(5):
+            candidates.append(
+                CameraSelection(
+                    device_id=probe_idx,
+                    backend=cv2.CAP_AVFOUNDATION,
+                    source="probe_device",
+                )
+            )
+        for probe_idx in range(5):
+            candidates.append(
+                CameraSelection(
+                    device_id=probe_idx,
+                    backend=None,
+                    source="probe_device",
+                )
+            )
+    else:
         candidates.append(
             CameraSelection(
                 device_id=requested_device_id,
-                backend=cv2.CAP_AVFOUNDATION,
+                backend=None,
                 source="configured_device",
             )
         )
-
-    candidates.append(
-        CameraSelection(
-            device_id=requested_device_id,
-            backend=None,
-            source="configured_device",
-        )
-    )
 
     seen: set[tuple[int, int | None]] = set()
     for candidate in candidates:
@@ -237,6 +325,54 @@ def _iter_camera_candidates(config: CaptureConfig) -> Iterable[CameraSelection]:
             continue
         seen.add(key)
         yield candidate
+
+
+def _request_macos_camera_permission() -> bool:
+    """Explicitly request camera permission from macOS TCC.
+
+    On first launch, this triggers the system "Allow camera?" dialog.
+    Returns True if authorized, False if denied or unavailable.
+    """
+    if not is_macos():
+        return True
+    try:
+        import objc
+        import threading
+
+        objc.loadBundle(
+            "AVFoundation",
+            bundle_path="/System/Library/Frameworks/AVFoundation.framework",
+            module_globals={},
+        )
+        AVCaptureDevice = objc.lookUpClass("AVCaptureDevice")
+
+        # 0=notDetermined, 1=restricted, 2=denied, 3=authorized
+        status = AVCaptureDevice.authorizationStatusForMediaType_("vide")
+        if status == 3:
+            return True
+        if status in (1, 2):
+            logger.warning("Camera access denied (TCC status=%d)", status)
+            return False
+
+        # Status is notDetermined — trigger the system permission dialog
+        logger.info("Requesting camera permission from macOS...")
+        result_event = threading.Event()
+        granted = [False]
+
+        def on_response(was_granted: bool) -> None:
+            granted[0] = was_granted
+            result_event.set()
+
+        AVCaptureDevice.requestAccessForMediaType_completionHandler_(
+            "vide", on_response,
+        )
+        # Wait up to 60s for user to click Allow/Deny
+        result_event.wait(timeout=60)
+        logger.info("Camera permission %s", "granted" if granted[0] else "denied")
+        return granted[0]
+    except Exception:
+        logger.debug("Could not request camera permission via AVFoundation", exc_info=True)
+        return True  # Can't check — proceed and let OpenCV try
 
 
 def open_video_capture(
@@ -250,24 +386,74 @@ def open_video_capture(
     """
     import time as _time
 
+    # Request camera permission before trying to open any device.
+    # On first run this triggers the macOS "Allow camera?" dialog.
+    if is_macos():
+        _request_macos_camera_permission()
+
     last_candidate: CameraSelection | None = None
 
     for candidate in _iter_camera_candidates(config):
         last_candidate = candidate
+        logger.info(
+            "Trying camera candidate: device_id=%d, source=%s, name=%s, backend=%s",
+            candidate.device_id,
+            candidate.source,
+            candidate.device_name or "unknown",
+            candidate.backend,
+        )
+
+        # Skip Continuity Camera candidates entirely — never open them
+        if candidate.source == "continuity_camera":
+            logger.info(
+                "Skipping device %d (%s) — Continuity Camera",
+                candidate.device_id,
+                candidate.device_name or "unknown",
+            )
+            continue
+
         capture = (
             cv2.VideoCapture(candidate.device_id, candidate.backend)
             if candidate.backend is not None
             else cv2.VideoCapture(candidate.device_id)
         )
         if capture.isOpened():
-            # Validate with a test frame read (give camera 0.5s to initialise)
-            _time.sleep(0.5)
-            ret, frame = capture.read()
+            # Validate with test frame reads — built-in Mac cameras can need
+            # up to ~1.5s to deliver the first frame after opening.
+            ret, frame = False, None
+            for _attempt in range(4):
+                _time.sleep(0.5)
+                ret, frame = capture.read()
+                if ret and frame is not None:
+                    break
             if ret and frame is not None:
+                # ALWAYS re-enumerate to verify the camera at this index.
+                # Camera order can change dynamically (iPhone Continuity Camera
+                # can appear/disappear between our initial enum and now).
+                live_names = _list_macos_video_device_names()
+                actual_name = None
+                if live_names and candidate.device_id < len(live_names):
+                    actual_name = live_names[candidate.device_id]
+                # Fall back to cached name only if live enum returned nothing
+                if actual_name is None:
+                    actual_name = candidate.device_name
+
+                if actual_name and any(
+                    kw in actual_name.casefold()
+                    for kw in _CONTINUITY_CAMERA_KEYWORDS
+                ):
+                    logger.info(
+                        "Skipping device %d (%s) — Continuity Camera detected post-open",
+                        candidate.device_id,
+                        actual_name,
+                    )
+                    capture.release()
+                    continue
+
                 logger.info(
                     "Opened camera device %d (%s) — %s",
                     candidate.device_id,
-                    candidate.device_name or candidate.source,
+                    actual_name or candidate.source,
                     f"{frame.shape[1]}x{frame.shape[0]}",
                 )
                 return capture, candidate
@@ -398,21 +584,25 @@ class WebcamCapture:
         )
 
     async def stop(self) -> None:
-        """Stop the webcam capture and release resources."""
-        if not self._running.is_set():
-            return
+        """Stop the webcam capture and release resources.
 
+        Always releases the camera device, even if the capture thread has
+        already exited on its own.
+        """
+        # Signal the capture thread to stop (idempotent)
         self._running.clear()
 
-        # Wait for thread to finish
+        # Wait for thread to finish if it's still alive
         if self._thread is not None:
-            # Give it up to 2 seconds to finish
             self._stopped.wait(timeout=2.0)
             self._thread = None
 
-        # Release camera
+        # ALWAYS release the camera — this is the critical cleanup
         if self._cap is not None:
-            self._cap.release()
+            try:
+                self._cap.release()
+            except Exception:
+                pass
             self._cap = None
 
         logger.info(
