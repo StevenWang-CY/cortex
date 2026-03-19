@@ -17,6 +17,9 @@ node_modules/
 .ralphrc
 .vscode/
 
+# Runtime artifacts
+.cortex_launch.sh
+
 # Cortex
 storage/sessions/*
 storage/cache/*
