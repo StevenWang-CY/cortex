@@ -7,10 +7,10 @@ session data. Can be run on the V100 GPU for large datasets.
 Usage:
     python -m cortex.services.eval.bandit_trainer --data storage/sessions/ --output storage/models/
 
-For V100 training:
-    scp storage/sessions/*.jsonl wangcy07@gwhiz2.cis.upenn.edu:~/cortex_data/
-    ssh wangcy07@gwhiz2.cis.upenn.edu "python -m cortex.services.eval.bandit_trainer --data ~/cortex_data/"
-    scp wangcy07@gwhiz2.cis.upenn.edu:~/cortex_models/bandit_weights.json storage/models/
+For GPU training on a remote server:
+    scp storage/sessions/*.jsonl user@gpu-server:~/cortex_data/
+    ssh user@gpu-server "python -m cortex.services.eval.bandit_trainer --data ~/cortex_data/"
+    scp user@gpu-server:~/cortex_models/bandit_weights.json storage/models/
 """
 
 from __future__ import annotations

@@ -1,1 +1,3 @@
-.plasmo/cache/
+.plasmo/
+build/
+node_modules/

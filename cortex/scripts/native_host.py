@@ -1,4 +1,4 @@
-#!/Users/chuyuewang/Desktop/CS/Project/Ralph/.venv/bin/python
+#!/usr/bin/env python3
 """
 Cortex Native Messaging Host for Chrome Extension.
 

@@ -1,7 +1,7 @@
 """
 LLM Engine — Remote Qwen-3-8B Client
 
-Connects to a vLLM / SGLang server on gwhiz1.cis.upenn.edu via an SSH tunnel,
+Connects to a vLLM / SGLang server via an SSH tunnel,
 using the OpenAI-compatible chat/completions API over httpx.
 
 Features:

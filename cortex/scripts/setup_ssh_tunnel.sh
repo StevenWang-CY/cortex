@@ -2,7 +2,7 @@
 # =============================================================================
 # Cortex SSH Tunnel Setup
 #
-# Establishes an SSH tunnel to gwhiz1.cis.upenn.edu for remote LLM inference.
+# Establishes an SSH tunnel to a remote LLM server for inference.
 # Supports health checking, auto-reconnect, and background mode.
 #
 # Usage:
@@ -15,9 +15,9 @@
 set -euo pipefail
 
 # Configuration (override via environment)
-REMOTE_HOST="${CORTEX_LLM_REMOTE_HOST:-gwhiz1.cis.upenn.edu}"
+REMOTE_HOST="${CORTEX_LLM_REMOTE_HOST:?Set CORTEX_LLM_REMOTE_HOST}"
 REMOTE_PORT="${CORTEX_LLM_REMOTE_PORT:-8800}"
-SSH_USER="${CORTEX_LLM_SSH_USER:-wangcy07}"
+SSH_USER="${CORTEX_LLM_SSH_USER:?Set CORTEX_LLM_SSH_USER}"
 LOCAL_PORT="${CORTEX_SSH_LOCAL_PORT:-8800}"
 HEALTH_ENDPOINT="http://localhost:${LOCAL_PORT}/v1/models"
 PID_FILE="/tmp/cortex-ssh-tunnel.pid"
@@ -231,9 +231,9 @@ case "${1:-}" in
         echo "  --help          Show this help"
         echo ""
         echo "Environment variables:"
-        echo "  CORTEX_LLM_REMOTE_HOST  Remote host (default: gwhiz1.cis.upenn.edu)"
+        echo "  CORTEX_LLM_REMOTE_HOST  Remote host (required)"
         echo "  CORTEX_LLM_REMOTE_PORT  Remote port (default: 8800)"
-        echo "  CORTEX_LLM_SSH_USER     SSH user (default: wangcy07)"
+        echo "  CORTEX_LLM_SSH_USER     SSH user (required)"
         echo "  CORTEX_SSH_LOCAL_PORT    Local port (default: 8800)"
         ;;
     *)

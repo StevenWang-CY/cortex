@@ -4,10 +4,10 @@
 llm:
   mode: azure
   remote:
-    host: gwhiz1.cis.upenn.edu
+    host: ""
     port: 8800
     ssh_tunnel: true
-    ssh_user: wangcy07
+    ssh_user: ""
   local:
     host: localhost
     port: 11434

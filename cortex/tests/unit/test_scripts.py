@@ -181,7 +181,7 @@ class TestRunLLMServer:
         from cortex.scripts.run_llm_server import _print_status
 
         info = {
-            "host": "gwhiz1.cis.upenn.edu",
+            "host": "gpu-server.example.com",
             "port": 8800,
             "reachable": True,
             "vllm_running": True,

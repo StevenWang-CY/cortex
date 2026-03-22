@@ -1,6 +1,34 @@
 # Changelog
 
-## [Unreleased] — Full Revision (2026-03-18)
+## [Unreleased] — Public Readiness (2026-03-21)
+
+### Housekeeping
+- Removed personal credentials and university-specific defaults from all config files
+- Fixed hardcoded absolute paths in `.cortex_launcher.c` — now derives project root from executable location
+- Removed tracked build artifacts from git: `.plasmo/`, `CortexDaemon.app/`, `.vsix`, IDE configs
+- Comprehensive `.gitignore` update for all artifact types
+- Fixed deterministic extension ID via manifest key — `install_native_host` no longer requires `--extension-id`
+- Auto-detects all Chromium browsers (Chrome, Edge, Brave, Arc, Vivaldi, Opera, Chromium) and installs native messaging for each
+- Fixed API endpoint documentation (`/api/state` → `/status/current`)
+- Updated test counts (47 test files)
+
+### Click-to-Start Daemon (2026-03-19)
+- One-click "Start Cortex" from browser extension — daemon launches via Terminal.app with camera access
+- Multi-layer stop flow: WebSocket SHUTDOWN → HTTP /shutdown → native messaging kill → SIGKILL escalation
+- Orphaned process detection via both port (`lsof`) and process name (`pgrep`)
+- Smart camera selection: probes indices 0-4, post-open re-verification rejects Continuity Camera
+- Camera permission request via AVFoundation before opening capture device
+- MacBook camera warmup retry loop (4 × 0.5s)
+
+### Visual Identity Refresh (2026-03-19)
+- Design token system with CSS custom properties
+- Ambient somatic engine: particles, aura, weather effects
+- Redesigned popup dashboard and Pulse Room new tab page
+- Onboarding flow with 3-step setup guide
+
+---
+
+## [0.1.0] — Full Revision (2026-03-18)
 
 Comprehensive audit-driven revision across signal processing, LLM pipeline, Chrome extension, LeetCode mode, and new features. 903 tests passing.
 

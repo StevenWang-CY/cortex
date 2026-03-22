@@ -413,29 +413,30 @@ Pluggable architecture for workspace integrations. Adapters implement the `Corte
 
 ## Setup
 
-**Requirements:** Python 3.11+, macOS (primary target), webcam, Azure OpenAI deployment, Node.js 18+, pnpm. Optional: Redis 7+ (falls back to in-memory).
+**Requirements:** macOS 13+, Python 3.11+, Node.js 18+, pnpm (`npm install -g pnpm`), webcam. Optional: Redis 7+ (falls back to in-memory).
+
+**LLM backend** (pick one): Azure OpenAI API key, local [Ollama](https://ollama.com), or `rule_based` mode (no LLM needed).
 
 ```bash
 cd /path/to/Ralph
 
-# Install
+# Create venv and install
+python3 -m venv .venv && source .venv/bin/activate
 pip install -e "./cortex[dev]"
-export PYTHONPATH="$PWD"
 
-# Copy and edit config
+# Copy config and edit .env (set CORTEX_LLM__MODE and credentials)
 cp cortex/.env.example .env
 
-# Initialize storage and default config
+# Initialize storage
 python -m cortex.scripts.seed_config --root .
 
-# Calibrate personal baselines (2 min)
-cortex-calibrate
-
-# Start the daemon (from terminal)
-.venv/bin/python -m cortex.scripts.run_dev
+# Start the daemon
+cortex-dev
 ```
 
 REST API runs at `http://127.0.0.1:9472`. WebSocket runs at `ws://127.0.0.1:9473`.
+
+See the [full setup guide](docs/setup.md) for step-by-step instructions, LLM configuration options, macOS permissions, and troubleshooting.
 
 ### macOS Camera Access
 
@@ -483,16 +484,17 @@ Dev/build/package scripts: `pnpm dev:edge`, `pnpm build:edge`, `pnpm package:edg
 Allows the Chrome extension to start and stop the Cortex daemon with a single click:
 
 ```bash
-# One-time setup: register native messaging host with Chrome
-python -m cortex.scripts.install_native_host --extension-id YOUR_EXTENSION_ID
+# One-time setup: register native messaging host for all browsers
+python -m cortex.scripts.install_native_host
 
-# IMPORTANT: Restart Chrome (Cmd+Q, reopen) after installing
+# IMPORTANT: Restart your browser (Cmd+Q, reopen) after installing
 ```
 
 The install script:
 - Patches `native_host.py` with the absolute path to the venv Python as its shebang
-- Writes the Chrome native messaging manifest to `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/`
-- Preserves existing `allowed_origins` when updating
+- Auto-detects all installed Chromium browsers (Chrome, Edge, Brave, Arc, etc.) and installs for each
+- Auto-detects existing Cortex extension IDs from browser profiles — no manual ID needed
+- The extension uses a fixed manifest key for a deterministic ID across all machines
 
 **How it works:**
 
@@ -538,7 +540,7 @@ python -m cortex.scripts.test_intervention
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/state` | Current cognitive state estimate |
+| GET | `/status/current` | Current cognitive state estimate |
 | GET | `/api/stress-integral` | Current stress load, threshold, and break recommendation |
 | GET | `/api/helpfulness/summary` | Intervention helpfulness metrics |
 | GET | `/api/projects` | List configured project launch profiles |
@@ -709,7 +711,7 @@ cortex/
 │   ├── install_launcher.py  # Manual start/stop helper for the launcher agent
 │   └── build_macos_app.sh   # macOS app packaging
 ├── tests/
-│   ├── unit/                # Per-module unit tests (41 test files)
+│   ├── unit/                # Per-module unit tests (43 test files)
 │   └── integration/         # Pipeline integration tests
 └── docs/
     ├── setup.md

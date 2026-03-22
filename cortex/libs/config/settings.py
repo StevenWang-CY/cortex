@@ -35,12 +35,12 @@ class RedisConfig(BaseModel):
 
 
 class LLMRemoteConfig(BaseModel):
-    """Remote LLM server configuration (gwhiz1)."""
+    """Remote LLM server configuration."""
 
-    host: str = "gwhiz1.cis.upenn.edu"
+    host: str = ""
     port: int = 8800
     ssh_tunnel: bool = True
-    ssh_user: str = "wangcy07"
+    ssh_user: str = ""
 
 
 class LLMLocalConfig(BaseModel):

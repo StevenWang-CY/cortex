@@ -2,12 +2,14 @@
 
 **Cortex** is a real-time biofeedback engine that watches you work through your webcam and input devices, detects cognitive overwhelm, and actively restructures your digital workspace so you can stay focused. Unlike timer-based productivity tools, Cortex uses your biology to decide when you need help, and uses LLMs to decide how to help.
 
+> **Platform:** macOS only (requires AVFoundation for camera, TCC for permissions, and macOS-specific frameworks). Linux and Windows are not supported.
+
 ---
 
 ## Key Features
 
 - **Bio-extraction at 30 FPS** — heart rate, HRV, and respiratory rate via rPPG from your face (no video stored); blink rate, head pose, and posture via MediaPipe; mouse/keyboard patterns via pynput. Gracefully degrades to telemetry-only mode in poor lighting
-- **Cognitive state classification** — captures at 30 FPS and fuses signals into state estimates every 500ms as FLOW, HYPER (overwhelmed), HYPO (disengaged), or RECOVERY using rule-based scoring with EMA smoothing and hysteresis
+- **Cognitive state classification** — fuses signals into state estimates every 500ms as FLOW, HYPER (overwhelmed), HYPO (disengaged), or RECOVERY using rule-based scoring with EMA smoothing and hysteresis
 - **LLM-powered interventions** — workspace context (never biometrics) is sent to the LLM, which returns executable actions: close distraction tabs, group related tabs, surface error fixes, decompose tasks into micro-steps. Smart tab algorithm protects recently-visited tabs, AI assistants, and goal-relevant content from being closed
 - **Activity tracking and resume** — tracks learning progress across YouTube, Bilibili, Coursera, LeetCode, PDFs, Jupyter, and more. On return, shows a one-click resume card that seeks video, scrolls to position, or pastes saved code
 - **LeetCode mode** — DOM observer, stage inference (READ/PLAN/IMPLEMENT/DEBUG/REFLECT), amygdala hijack lockout, pattern ladder hints, submission discipline guard
@@ -43,7 +45,7 @@ L5: Intervention ────── Consent · Validate · Execute · Undo · Le
 Store (Redis / In-Memory)
 ```
 
-All layers communicate via FastAPI (port 9472) and WebSocket (port 9473). The desktop shell, VS Code extension, and Chrome/Edge extension are all clients. An optional launcher agent on port 9471 provides HTTP-based daemon start/stop.
+All layers communicate via FastAPI (port 9472) and WebSocket (port 9473). The desktop shell, VS Code extension, and Chrome/Edge extension are all clients.
 
 ---
 
@@ -68,41 +70,123 @@ All layers communicate via FastAPI (port 9472) and WebSocket (port 9473). The de
 | **VS Code Extension** | TypeScript, VS Code Extension API |
 | **LLM** | Azure OpenAI, Qwen-3-8B (remote via SSH tunnel), Ollama (local) |
 | **Storage** | Redis 7+ with automatic in-memory fallback |
-| **Testing** | pytest (45 test files), mypy (strict), ruff |
+| **Testing** | pytest (47 test files), mypy (strict), ruff |
 
 ---
 
-## Quick Start
+## Setup
+
+### Prerequisites
+
+| Requirement | How to install |
+|-------------|----------------|
+| **macOS 13+** | Required (Ventura or later) |
+| **Python 3.11 or 3.12** | `brew install python@3.11` or [python.org](https://www.python.org/downloads/) |
+| **Node.js 18+** | `brew install node` or [nodejs.org](https://nodejs.org/) |
+| **pnpm** | `npm install -g pnpm` (after installing Node.js) |
+| **LLM backend** | One of: Azure OpenAI API key, local [Ollama](https://ollama.com), or `rule_based` mode (no LLM needed) |
+| **Redis** (optional) | `brew install redis && brew services start redis` — falls back to in-memory if not running |
+
+> **Apple Silicon note:** Use native ARM Python, not Rosetta. Verify with: `python3 -c "import platform; print(platform.machine())"` — should print `arm64`.
+
+### Step 1: Python Backend
 
 ```bash
-# Backend
-cd /path/to/Ralph
+git clone https://github.com/StevenWang-CY/cortex.git
+cd cortex   # this is the repo root (Ralph/)
+
+# Create virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install all dependencies
 pip install -e "./cortex[dev]"
-cp cortex/.env.example .env   # Edit with your Azure OpenAI config
+```
+
+### Step 2: Configuration
+
+```bash
+# Copy example config
+cp cortex/.env.example .env
+```
+
+Edit `.env` and set your LLM backend. Pick ONE:
+
+**Option A — Azure OpenAI** (recommended):
+```bash
+CORTEX_LLM__MODE=azure
+CORTEX_LLM__AZURE__ENDPOINT=https://your-resource.openai.azure.com/
+CORTEX_LLM__AZURE__API_KEY=your-key-here
+CORTEX_LLM__AZURE__DEPLOYMENT_NAME=gpt-4o-mini
+```
+
+**Option B — Local Ollama** (free, no API key):
+```bash
+# Install and start Ollama first:
+#   brew install ollama && ollama pull llama3.1:8b && ollama serve
+CORTEX_LLM__MODE=local
+```
+
+**Option C — Rule-based only** (no LLM, limited interventions):
+```bash
+CORTEX_LLM__MODE=rule_based
+```
+
+Then initialize storage directories:
+```bash
 python -m cortex.scripts.seed_config --root .
 ```
 
+### Step 3: macOS Permissions
+
+Cortex needs two macOS permissions. Both are prompted automatically on first use:
+
+1. **Camera** — macOS will ask when the daemon first opens the webcam. Click **Allow**.
+2. **Accessibility (Input Monitoring)** — required for keyboard/mouse telemetry. Go to: `System Settings → Privacy & Security → Input Monitoring → add your terminal app (Terminal.app or iTerm)`
+
+### Step 4: Browser Extension
+
 ```bash
-# Chrome extension
 cd cortex/apps/browser_extension
-pnpm install && npx plasmo build
-# Load build/chrome-mv3-prod/ as unpacked extension in chrome://extensions
+pnpm install
 ```
+
+Build for your browser:
+
+| Browser | Build command | Load from |
+|---------|--------------|-----------|
+| **Chrome** | `npx plasmo build` | `chrome://extensions` → Developer mode → Load unpacked → `build/chrome-mv3-prod/` |
+| **Edge** | `npx plasmo build --target=edge-mv3` | `edge://extensions` → Developer mode → Load unpacked → `build/edge-mv3-prod/` |
+
+### Step 5: Native Messaging (enables one-click Start/Stop from browser)
 
 ```bash
-# Register native messaging host (one-time, enables click-to-start from extension)
-python -m cortex.scripts.install_native_host --extension-id YOUR_EXTENSION_ID
-# Restart Chrome after installing
+cd /path/to/repo-root
+python -m cortex.scripts.install_native_host
 ```
 
-**Starting the daemon:**
+This automatically:
+- Detects all installed Chromium browsers (Chrome, Edge, Brave, Arc, Vivaldi, Opera)
+- Registers the native messaging host for each
+- No extension ID needed — the extension uses a fixed manifest key
 
-- **From browser** — click **Start Cortex** in the extension popup. The daemon launches via Terminal.app (which has camera permissions). A Terminal window opens briefly while the daemon runs.
-- **From terminal** — `cd /path/to/Ralph && .venv/bin/python -m cortex.scripts.run_dev`
+**Then fully restart your browser** (Cmd+Q, reopen). Native messaging only loads at browser startup.
 
-The first time you start the daemon, macOS will prompt for camera access — click **Allow**.
+The first time you click "Start Cortex" from the extension, macOS will ask: *"Google Chrome (or Edge) wants to control Terminal. Allow?"* — click **Allow** once.
 
-See [`cortex/README.md`](cortex/README.md) for full documentation — setup, architecture, all features, API reference, and development guide.
+### Step 6: Start Cortex
+
+**From browser** — click **Start Cortex** in the extension popup. A Terminal window opens and the daemon runs there (Terminal has camera permission).
+
+**From terminal** — `source .venv/bin/activate && cortex-dev`
+
+### Step 7: Calibrate (optional but recommended)
+
+Sit relaxed for 2 minutes while Cortex learns your resting heart rate, blink rate, and posture:
+
+```bash
+cortex-calibrate --duration 120
+```
 
 ---
 
@@ -115,6 +199,45 @@ What works well today: the state classification system is conservative and well-
 Cortex asks for your webcam (for pulse and posture — no video is saved or sent anywhere), broad browser permissions (to read tab titles and URLs for context — the AI model never sees your biometrics), and a 2-minute baseline calibration session where you sit still so it can learn your resting heart rate. It runs a local daemon on your machine that communicates with a Chrome extension and optionally a VS Code extension. The AI model (Azure OpenAI, Qwen, or a local Ollama instance) sees only workspace context: file paths, error messages, and tab titles. Your physiological data stays on your machine.
 
 Cortex is not a study planner, a to-do app, or a replacement for actually understanding the material. The heart rate signal from a webcam is noisier than a chest strap — in dim lighting or if you move a lot, the biological signals degrade and the system falls back to behavioral-only detection. The HRV measurement at 30 FPS is at the edge of what's physiologically meaningful and works best as a trend indicator over minutes, not a precise beat-by-beat measurement. The AI-generated interventions are sometimes generic or slightly off-target, especially early on before the learning system has calibrated to your preferences. And if you're the kind of student who studies past midnight, you'll want to adjust the wind-down hour from its default — it was set for an earlier bedtime than most college students keep.
+
+---
+
+## Troubleshooting
+
+### "Start Cortex" shows "Native host not found"
+- Run `python -m cortex.scripts.install_native_host` and **fully restart your browser** (Cmd+Q, reopen)
+- Native messaging manifests are only loaded at browser startup — reloading the extension is not enough
+
+### Camera opens iPhone instead of MacBook camera
+- Cortex auto-skips Continuity Camera devices (iPhone/iPad). If it still picks the wrong one, set `CORTEX_CAPTURE__DEVICE_ID=0` in `.env` (or try `1`, `2`, etc.)
+- Moving your iPhone away or locking it removes the Continuity Camera from the device list
+
+### Camera permission denied
+- If the daemon was launched from the browser extension, it runs via Terminal.app. Grant camera access to **Terminal.app** (not Chrome) in: `System Settings → Privacy & Security → Camera`
+- If running from terminal directly, grant camera to your terminal app (Terminal.app or iTerm)
+
+### Webcam not detected
+```bash
+python3 -c "import cv2; [print(f'Device {i}: {cv2.VideoCapture(i).isOpened()}') for i in range(5)]"
+```
+
+### "Stop Cortex" doesn't stop the camera
+- Click Stop again — the extension uses a multi-layer kill chain (WebSocket → HTTP → process kill)
+- If the camera light stays on: `pkill -f "cortex.scripts.run_dev"`
+
+### Azure LLM errors
+- Verify your `.env` has `CORTEX_LLM__AZURE__ENDPOINT`, `API_KEY`, and `DEPLOYMENT_NAME` set
+- Check API version is `2025-01-01-preview`
+- Use `CORTEX_LLM__MODE=rule_based` to run without any LLM
+
+### MediaPipe import errors on Apple Silicon
+```bash
+pip install --force-reinstall mediapipe
+```
+Ensure you're using native ARM Python (not Rosetta): `python3 -c "import platform; print(platform.machine())"` should print `arm64`.
+
+### Accessibility / pynput errors
+Add your terminal app to: `System Settings → Privacy & Security → Input Monitoring`
 
 ---
 
