@@ -356,9 +356,10 @@ function PulseRoom(): React.ReactElement {
                             transition: "transform 0.05s linear",
                         }}
                     >
-                        <svg width="100" height="100" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                            <path d="M 17 4 A 10 10 0 1 0 17 22" stroke="#1a1a1a" strokeWidth="2.5" strokeLinecap="round" />
-                            <path d="M8 13l2.5-3.5L13 16l2-2h4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                        <svg width="100" height="100" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <path d="M 51.8 12.2 A 28 28 0 1 0 51.8 51.8" fill="none" stroke="#1a1a1a" strokeWidth="6" strokeLinecap="round" />
+                            <path d="M 12 32 L 22 32 L 27 15 L 37 49 L 42 32 L 60 32" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+                            <circle cx="60" cy="32" r="3" fill="currentColor" />
                         </svg>
                     </div>
                 </div>

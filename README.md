@@ -219,8 +219,9 @@ Cortex is not a study planner, a to-do app, or a replacement for actually unders
 - Native messaging manifests are only loaded at browser startup — reloading the extension is not enough
 
 ### Camera opens iPhone instead of MacBook camera
-- Cortex auto-skips Continuity Camera devices (iPhone/iPad). If it still picks the wrong one, set `CORTEX_CAPTURE__DEVICE_ID=0` in `.env` (or try `1`, `2`, etc.)
-- Moving your iPhone away or locking it removes the Continuity Camera from the device list
+- Cortex auto-skips Continuity Camera devices (iPhone/iPad) and rejects any camera it cannot verify by name
+- **Restart the daemon** after turning off your iPhone — camera selection only runs at daemon startup
+- If it still picks wrong: set `CORTEX_CAPTURE__DEVICE_ID=0` in `.env` (or try `1`, `2`, etc.)
 
 ### Camera permission denied
 - If the daemon was launched from the browser extension, it runs via Terminal.app. Grant camera access to **Terminal.app** (not Chrome) in: `System Settings → Privacy & Security → Camera`

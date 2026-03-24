@@ -80,7 +80,10 @@ Leave `CORTEX_CAPTURE__DEVICE_ID` commented out (the default) for automatic came
 - Enumerate cameras via AVFoundation
 - Skip iPhone/iPad Continuity Camera devices
 - Prefer the MacBook's built-in camera
-- Probe indices 0–4 as fallback
+- Probe only non-Continuity indices as fallback (never probes iPhone/iPad indices)
+- Reject any camera it cannot verify by name (prevents accidentally opening a Continuity Camera that disappeared from AVFoundation mid-enumeration)
+
+Camera selection runs once at daemon startup. If you turn off your iPhone after the daemon is already running, restart the daemon to re-run selection.
 
 Only set it manually if auto-detection picks the wrong camera:
 ```bash
@@ -231,8 +234,9 @@ pytest -m "not requires_webcam and not requires_gpu"
 3. Chrome/Edge only reads native messaging manifests at startup
 
 ### Camera opens iPhone instead of MacBook camera
-- Cortex auto-skips Continuity Camera (iPhone/iPad). If it still picks wrong: set `CORTEX_CAPTURE__DEVICE_ID=0` in `.env`
-- Lock your iPhone or move it away to remove it from the device list
+- Cortex auto-skips Continuity Camera (iPhone/iPad) and rejects any camera it cannot verify by name
+- **Restart the daemon** after turning off or disconnecting your iPhone — camera selection only runs at startup
+- If it still picks wrong: set `CORTEX_CAPTURE__DEVICE_ID=0` in `.env` (or `1`, `2`, etc.) to hardcode the index
 
 ### Camera permission denied
 - If launched from browser: grant camera to **Terminal.app** in `System Settings → Privacy & Security → Camera`
