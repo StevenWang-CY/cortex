@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="cortex/assets/banner.svg" alt="Cortex Banner" width="450" />
+  <img src="cortex/assets/banner.svg?v=2" alt="Cortex Banner" width="450" />
 </p>
 <h1 align="center">The Biological Browser Engine</h1>
 <p align="center">
