@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 120" width="500" height="120">
+  <defs>
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@1,600&amp;display=swap');
+      .brand-text {
+        font-family: 'Cormorant Garamond', 'Georgia', serif;
+        font-style: italic;
+        font-weight: 600;
+        font-size: 80px;
+        fill: #1a1a1a;
+        letter-spacing: 0.02em;
+      }
+    </style>
+  </defs>
+  
+  <g transform="translate(40, 15) scale(1.4)">
+    <!-- 250-degree C sweep -->
+    <path d="M 46.1 14.5 A 24 24 0 1 0 46.1 49.5" fill="none" stroke="#1a1a1a" stroke-width="6" stroke-linecap="round" />
+    <!-- Heartbeat signal -->
+    <path d="M 8 32 L 18 32 L 24 16 L 36 50 L 44 32 L 56 32" fill="none" stroke="#D97757" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />
+    <!-- Terminating node -->
+    <circle cx="56" cy="32" r="3" fill="#D97757" />
+  </g>
+  
+  <text x="175" y="85" class="brand-text">Cortex.</text>
+</svg>

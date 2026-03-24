@@ -155,7 +155,10 @@ function PulseRoom(): React.ReactElement {
         return () => clearTimeout(timer);
     }, []);
 
-    // Canvas animation loop
+    // Canvas animation loop + Logo Interaction
+    const logoRef = useRef<HTMLDivElement>(null);
+    const auraRef = useRef<HTMLDivElement>(null);
+
     useEffect(() => {
         if (reducedMotion) return;
 
@@ -187,18 +190,19 @@ function PulseRoom(): React.ReactElement {
             const w = window.innerWidth;
             const h = window.innerHeight;
             const cx = w / 2;
-            const cy = h / 2 - 40;
+            const cy = h / 2 - 80; // Offset upwards to match the SVG layout
 
             const sr = stateRef.current;
             const anim = animRef.current;
             const col = STATE_COLORS_RGB[sr.state] || STATE_COLORS_RGB.FLOW;
             const isHyper = sr.state === "HYPER";
 
-            // Fade trail — use warm bg color
-            ctx.fillStyle = "rgba(12, 12, 14, 0.15)";
+            // --- Background Paint ---
+            ctx.clearRect(0, 0, w, h);
+            ctx.fillStyle = CX.bg;
             ctx.fillRect(0, 0, w, h);
 
-            // Beat timing
+            // Beat timing computing based on heartbeat
             if (sr.heartRate > 0) {
                 const timeSinceBeat = now - anim.lastBeatTime;
                 anim.pulsePhase = Math.min(timeSinceBeat / anim.beatInterval, 1);
@@ -206,114 +210,65 @@ function PulseRoom(): React.ReactElement {
                 if (timeSinceBeat >= anim.beatInterval) {
                     anim.lastBeatTime = now;
                     anim.pulsePhase = 0;
+                    // Spawn delicate ripple ring
                     if (!isHyper || anim.rings.length % 2 === 0) {
                         anim.rings.push({
                             born: now,
-                            radius: 0,
-                            maxRadius: 150 + Math.random() * 80,
-                            opacity: isHyper ? 0.15 : 0.3,
+                            radius: 30, // Start tightly behind logo
+                            maxRadius: 250 + Math.random() * 100,
+                            opacity: 1.0, 
                         });
                     }
                 }
+            } else {
+                // Idle breathing
+                anim.pulsePhase = (Math.sin(now / 1500) * 0.5 + 0.5);
             }
 
-            // Background breathing (disabled during HYPER)
-            if (!isHyper) {
-                anim.breathPhase += 0.002;
-            }
-            const breathVal = Math.sin(anim.breathPhase) * 0.5 + 0.5;
-            const bgGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(w, h) * 0.7);
-            bgGrad.addColorStop(0, `rgba(${col.r}, ${col.g}, ${col.b}, ${0.02 + breathVal * 0.01})`);
-            bgGrad.addColorStop(1, "rgba(12, 12, 14, 0)");
-            ctx.fillStyle = bgGrad;
-            ctx.fillRect(0, 0, w, h);
-
-            // Ripple rings — state color at 3% opacity, fade over 3 seconds
+            // Ripple rings — delicate water ripples expanding outward
             anim.rings = anim.rings.filter((ring) => {
                 const age = (now - ring.born) / 1000;
-                if (age > 3) return false;
+                if (age > 4) return false;
 
-                ring.radius = ring.maxRadius * (1 - Math.exp(-age * 1.5));
-                const fadeAlpha = Math.max(0, 0.03 * (1 - age / 3));
+                ring.radius = ring.maxRadius * (1 - Math.exp(-age * 1.2));
+                // Extremely faint, delicate lines
+                const fadeAlpha = Math.max(0, 0.4 * (1 - age / 4));
 
                 ctx.beginPath();
                 ctx.arc(cx, cy, ring.radius, 0, Math.PI * 2);
                 ctx.strokeStyle = `rgba(${col.r}, ${col.g}, ${col.b}, ${fadeAlpha})`;
-                ctx.lineWidth = 1.5 * (1 - age / 3);
+                ctx.lineWidth = 1;
                 ctx.stroke();
+                // Add second faint ring for detail
+                ctx.beginPath();
+                ctx.arc(cx, cy, ring.radius * 0.8, 0, Math.PI * 2);
+                ctx.strokeStyle = `rgba(${col.r}, ${col.g}, ${col.b}, ${fadeAlpha * 0.3})`;
+                ctx.lineWidth = 0.5;
+                ctx.stroke();
+                
                 return true;
             });
 
-            // Central pulse orb — 8-12% opacity glow
-            if (sr.heartRate > 0) {
-                const systole =
-                    anim.pulsePhase < 0.15
-                        ? Math.sin((anim.pulsePhase / 0.15) * (Math.PI / 2))
-                        : Math.exp(-(anim.pulsePhase - 0.15) * 4);
+            // --- Drive the SVG DOM Elements ---
+            const systole = sr.heartRate > 0
+                ? (anim.pulsePhase < 0.15
+                    ? Math.sin((anim.pulsePhase / 0.15) * (Math.PI / 2))
+                    : Math.exp(-(anim.pulsePhase - 0.15) * 5))
+                : anim.pulsePhase;
 
-                const dampened = isHyper ? systole * 0.5 : systole;
-                const orbRadius = 20 + dampened * 25;
-                const orbOpacity = 0.08 + dampened * 0.04; // 8-12% per guide
+            const dampened = isHyper ? systole * 0.6 : systole;
 
-                // Outer glow
-                const glowRadius = isHyper ? orbRadius * 2.5 : orbRadius * 4;
-                const glowGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, glowRadius);
-                glowGrad.addColorStop(0, `rgba(${col.r}, ${col.g}, ${col.b}, ${orbOpacity})`);
-                glowGrad.addColorStop(0.5, `rgba(${col.r}, ${col.g}, ${col.b}, ${orbOpacity * 0.4})`);
-                glowGrad.addColorStop(1, `rgba(${col.r}, ${col.g}, ${col.b}, 0)`);
-                ctx.fillStyle = glowGrad;
-                ctx.beginPath();
-                ctx.arc(cx, cy, glowRadius, 0, Math.PI * 2);
-                ctx.fill();
+            if (logoRef.current) {
+                // Core heartbeat scaling — delicate and elegant
+                const scale = 1 + dampened * 0.08;
+                logoRef.current.style.transform = `scale(${scale})`;
+            }
 
-                // Core
-                const coreGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, orbRadius);
-                coreGrad.addColorStop(0, `rgba(255, 255, 255, ${orbOpacity * 3})`);
-                coreGrad.addColorStop(0.3, `rgba(${col.r}, ${col.g}, ${col.b}, ${orbOpacity * 2})`);
-                coreGrad.addColorStop(1, `rgba(${col.r}, ${col.g}, ${col.b}, 0)`);
-                ctx.fillStyle = coreGrad;
-                ctx.beginPath();
-                ctx.arc(cx, cy, orbRadius, 0, Math.PI * 2);
-                ctx.fill();
-
-                // ECG trace — 1px, state color at 30% opacity
-                anim.traceHistory.push(systole);
-                if (anim.traceHistory.length > 200) anim.traceHistory.shift();
-
-                const traceY = cy + 70;
-                const traceW = Math.min(w * 0.6, 600);
-                const traceX = (w - traceW) / 2;
-
-                ctx.beginPath();
-                ctx.strokeStyle = `rgba(${col.r}, ${col.g}, ${col.b}, 0.3)`;
-                ctx.lineWidth = 1;
-                for (let i = 0; i < anim.traceHistory.length; i++) {
-                    const x = traceX + (i / 200) * traceW;
-                    const y = traceY - anim.traceHistory[i] * 30;
-                    if (i === 0) ctx.moveTo(x, y);
-                    else ctx.lineTo(x, y);
-                }
-                ctx.stroke();
-
-                // Scanning dot
-                if (anim.traceHistory.length > 0) {
-                    const dotX = traceX + ((anim.traceHistory.length - 1) / 200) * traceW;
-                    const dotY = traceY - anim.traceHistory[anim.traceHistory.length - 1] * 30;
-                    ctx.beginPath();
-                    ctx.arc(dotX, dotY, 3, 0, Math.PI * 2);
-                    ctx.fillStyle = `rgba(${col.r}, ${col.g}, ${col.b}, 0.3)`;
-                    ctx.fill();
-                }
-            } else {
-                // Idle breathing
-                const idleRadius = 15 + Math.sin(now / 2000) * 5;
-                const idleGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, idleRadius * 3);
-                idleGrad.addColorStop(0, "rgba(113, 113, 122, 0.12)");
-                idleGrad.addColorStop(1, "rgba(113, 113, 122, 0)");
-                ctx.fillStyle = idleGrad;
-                ctx.beginPath();
-                ctx.arc(cx, cy, idleRadius * 3, 0, Math.PI * 2);
-                ctx.fill();
+            if (auraRef.current) {
+                // Glowing drop-shadow "breath" around the logo
+                const glowSize = 20 + dampened * 60;
+                const glowAlpha = 0.05 + dampened * 0.15;
+                auraRef.current.style.filter = `drop-shadow(0px 0px ${glowSize}px rgba(${col.r}, ${col.g}, ${col.b}, ${glowAlpha}))`;
             }
         }
 
@@ -360,97 +315,136 @@ function PulseRoom(): React.ReactElement {
             {/* Static orb for reduced motion */}
             {reducedMotion && (
                 <div style={{
-                    position: "fixed",
-                    top: "50%",
-                    left: "50%",
-                    transform: "translate(-50%, -50%)",
-                    width: 40,
-                    height: 40,
-                    borderRadius: "50%",
-                    background: `radial-gradient(circle, rgba(${col.r},${col.g},${col.b},0.1), rgba(${col.r},${col.g},${col.b},0.02))`,
+                    position: "absolute", top: 0, left: 0, right: 0, bottom: 0,
+                    background: `radial-gradient(circle at 50% 50%, rgba(${col.r},${col.g},${col.b},0.08), ${CX.bg})`,
+                    zIndex: 0,
                 }} />
             )}
 
-            {/* Start button — shown when daemon is not connected */}
-            {!displayConnected && !displayHR && (
-                <div style={{
-                    position: "fixed",
-                    top: "calc(50% + 60px)",
+            {/* Premium Editorial Centerpiece & Breathing SVG Logo */}
+            <div
+                style={{
+                    position: "absolute",
+                    top: "50%",
                     left: "50%",
-                    transform: "translateX(-50%)",
+                    transform: "translate(-50%, -50%)",
+                    zIndex: 10,
+                }}
+            >
+                <div style={{
                     display: "flex",
-                    flexDirection: "column" as const,
+                    flexDirection: "column",
                     alignItems: "center",
-                    gap: 10,
+                    justifyContent: "center",
+                    textAlign: "center",
+                    animation: "activityFadeIn 2.5s cubic-bezier(0.16, 1, 0.3, 1) forwards",
                 }}>
-                    <button
-                        onClick={handleLaunch}
-                        disabled={launching}
+                {/* The Breathing Logo */}
+                <div 
+                    ref={auraRef}
+                    style={{
+                        marginBottom: 40,
+                        transition: "filter 0.05s linear", 
+                    }}
+                >
+                    <div 
+                        ref={logoRef}
                         style={{
-                            padding: "10px 32px",
-                            border: `1px solid ${CX.border}`,
-                            borderRadius: CX.radiusLg,
-                            background: launching ? CX.surface : "transparent",
-                            color: CX.textSecondary,
-                            fontSize: 13,
-                            fontWeight: 500,
-                            fontFamily: CX.font,
-                            cursor: launching ? "default" : "pointer",
-                            opacity: launching ? 0.6 : 1,
-                            transition: `all ${CX.durationNormal} ${CX.easeDefault}`,
-                            letterSpacing: 0.3,
+                            color: displayConnected ? `rgb(${col.r}, ${col.g}, ${col.b})` : CX.textSecondary,
+                            willChange: "transform",
+                            transformOrigin: "center center",
+                            transition: "transform 0.05s linear",
                         }}
                     >
-                        {launching ? "Starting\u2026" : "Start Cortex"}
-                    </button>
-                    {launchError && (
-                        <div style={{
-                            fontSize: 10,
-                            color: CX.textTertiary,
-                            fontFamily: CX.mono,
-                            textAlign: "center" as const,
-                            maxWidth: 300,
-                            lineHeight: 1.5,
-                        }}>
-                            {launchError}
-                        </div>
+                        <svg width="100" height="100" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <path d="M 17 4 A 10 10 0 1 0 17 22" stroke="#1a1a1a" strokeWidth="2.5" strokeLinecap="round" />
+                            <path d="M8 13l2.5-3.5L13 16l2-2h4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                        </svg>
+                    </div>
+                </div>
+
+                <h1 style={{
+                    fontFamily: CX.fontSerif,
+                    fontSize: 48,
+                    fontWeight: 400,
+                    color: CX.text,
+                    letterSpacing: "-0.02em",
+                    margin: "0 0 16px 0",
+                    userSelect: "none",
+                }}>
+                    {displayConnected ? (
+                        <>
+                            {stateRef.current.state === "FLOW" ? "Deep Work with " :
+                             stateRef.current.state === "HYPER" ? "Elevated with " :
+                             stateRef.current.state === "RECOVERY" ? "Recovery with " : "Resting with "}
+                            <span style={{ fontFamily: CX.fontBrand, fontStyle: "italic", fontWeight: 500, paddingLeft: 4, letterSpacing: "0.02em" }}>Cortex.</span>
+                        </>
+                    ) : (
+                        <span style={{ fontFamily: CX.fontBrand, fontStyle: "italic", fontWeight: 500, letterSpacing: "0.02em" }}>Cortex.</span>
                     )}
-                </div>
-            )}
-
-            {/* BPM readout — 36px, mono, centered below orb (48px gap). No label. Just the number. Hidden when no data. */}
-            {displayHR > 0 && (
-                <div
-                    style={{
-                        position: "fixed",
-                        top: "calc(50% + 60px)",
-                        left: "50%",
-                        transform: "translateX(-50%)",
+                </h1>
+                
+                {displayConnected ? (
+                    <div style={{
                         fontFamily: CX.mono,
-                        fontSize: 36,
-                        fontWeight: 600,
-                        color: CX.text,
+                        fontSize: 13,
+                        color: CX.textTertiary,
+                        textTransform: "uppercase",
+                        letterSpacing: "0.15em",
                         userSelect: "none",
-                        transition: "color 3s ease, opacity 1s ease",
-                        lineHeight: 1.15,
-                    }}
-                    aria-label={`${displayHR} beats per minute`}
-                >
-                    {displayHR}
+                    }}>
+                        {displayHR > 0 ? `${displayHR} BPM \u00b7 ${stateRef.current.state} STATE` : "CALIBRATING BIOFEEDBACK"}
+                    </div>
+                ) : (
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 16 }}>
+                        <div style={{ fontSize: 13, color: CX.textTertiary, fontFamily: CX.mono, letterSpacing: "0.15em", userSelect: "none" }}>
+                            VISUAL ENGINE OFFLINE
+                        </div>
+                        <button
+                            onClick={handleLaunch}
+                            disabled={launching}
+                            style={{
+                                padding: "12px 36px",
+                                border: `1px solid rgba(0,0,0,0.08)`,
+                                borderRadius: CX.radiusFull,
+                                background: "rgba(255, 255, 255, 0.6)",
+                                backdropFilter: "blur(20px)",
+                                WebkitBackdropFilter: "blur(20px)",
+                                color: CX.text,
+                                fontSize: 13,
+                                fontWeight: 500,
+                                fontFamily: CX.font,
+                                cursor: launching ? "default" : "pointer",
+                                opacity: launching ? 0.6 : 1,
+                                boxShadow: "0 4px 12px rgba(0,0,0,0.03)",
+                                transition: `all ${CX.durationNormal} ${CX.easeDefault}`,
+                                letterSpacing: 0.5,
+                            }}
+                        >
+                            {launching ? "Starting\u2026" : "Start Cortex"}
+                        </button>
+                        {launchError && (
+                            <div style={{ fontSize: 11, color: CX.textTertiary, fontFamily: CX.mono, maxWidth: 300, lineHeight: 1.5 }}>
+                                {launchError}
+                            </div>
+                        )}
+                    </div>
+                )}
                 </div>
-            )}
+            </div>
 
-            {/* Resume cards — bottom, horizontal, max 3, each max 200px */}
+            {/* Resume cards — Glassmorphic Artifacts */}
             {showActivities && activities.length > 0 && (
                 <div
                     style={{
-                        position: "fixed",
-                        bottom: 24,
-                        left: 24,
+                        position: "absolute",
+                        bottom: 32,
+                        left: 32,
                         display: "flex",
-                        gap: 12,
+                        gap: 16,
+                        zIndex: 10,
                         opacity: 0,
-                        animation: "activityFadeIn 2s ease forwards",
+                        animation: "activityFadeIn 2s cubic-bezier(0.16, 1, 0.3, 1) 0.5s forwards",
                     }}
                 >
                     {activities.slice(0, 3).map((a) => {
@@ -464,33 +458,44 @@ function PulseRoom(): React.ReactElement {
                                 style={{
                                     display: "block",
                                     textDecoration: "none",
-                                    maxWidth: 200,
-                                    padding: 12,
-                                    borderRadius: CX.radiusLg,
-                                    background: CX.surface,
+                                    width: 220,
+                                    padding: 16,
+                                    borderRadius: 20,
+                                    background: "rgba(255, 255, 255, 0.65)",
+                                    backdropFilter: "blur(24px)",
+                                    WebkitBackdropFilter: "blur(24px)",
+                                    boxShadow: "0 8px 32px rgba(0, 0, 0, 0.05), inset 0 0 0 1px rgba(255,255,255,0.6)",
                                     cursor: "pointer",
-                                    transition: `background ${CX.durationMicro} ${CX.easeDefault}`,
+                                    transition: `transform ${CX.durationNormal} ${CX.easeDefault}, box-shadow ${CX.durationNormal} ${CX.easeDefault}`,
                                 }}
-                                onMouseEnter={(e) => { e.currentTarget.style.background = CX.tertiary; }}
-                                onMouseLeave={(e) => { e.currentTarget.style.background = CX.surface; }}
+                                onMouseEnter={(e) => { 
+                                    e.currentTarget.style.transform = "translateY(-4px)";
+                                    e.currentTarget.style.boxShadow = "0 12px 40px rgba(0, 0, 0, 0.08), inset 0 0 0 1px rgba(255,255,255,0.8)";
+                                }}
+                                onMouseLeave={(e) => { 
+                                    e.currentTarget.style.transform = "translateY(0)";
+                                    e.currentTarget.style.boxShadow = "0 8px 32px rgba(0, 0, 0, 0.05), inset 0 0 0 1px rgba(255,255,255,0.6)";
+                                }}
                                 title={a.title}
                             >
                                 <div style={{
-                                    fontSize: 13,
+                                    fontSize: 14,
+                                    fontWeight: 500,
                                     color: CX.text,
-                                    whiteSpace: "nowrap" as const,
+                                    whiteSpace: "nowrap",
                                     overflow: "hidden",
                                     textOverflow: "ellipsis",
                                     fontFamily: CX.font,
-                                    marginBottom: 8,
+                                    marginBottom: 10,
+                                    letterSpacing: "-0.01em",
                                 }}>{a.title}</div>
-                                {/* Progress bar — 4px, accent fill */}
-                                <div style={{ height: 4, borderRadius: 2, background: CX.tertiary, marginBottom: 6, overflow: "hidden" }}>
-                                    <div style={{ height: "100%", borderRadius: 2, background: CX.accent, width: `${pct}%` }} />
+                                {/* Progress bar — 3px, sleek */}
+                                <div style={{ height: 3, borderRadius: 1.5, background: "rgba(0,0,0,0.06)", marginBottom: 10, overflow: "hidden" }}>
+                                    <div style={{ height: "100%", borderRadius: 1.5, background: CX.accent, width: `${pct}%` }} />
                                 </div>
                                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                                    <span style={{ fontSize: 10, color: CX.textTertiary, fontFamily: CX.mono }}>{posLabel}</span>
-                                    <span style={{ fontSize: 11, fontWeight: 500, color: CX.accent, letterSpacing: "0.04em", textTransform: "uppercase" as const }}>Resume</span>
+                                    <span style={{ fontSize: 10, color: CX.textTertiary, fontFamily: CX.mono, letterSpacing: "0.05em" }}>{posLabel}</span>
+                                    <span style={{ fontSize: 10, fontWeight: 600, color: CX.textSecondary, letterSpacing: "0.08em", textTransform: "uppercase" }}>Resume &rarr;</span>
                                 </div>
                             </a>
                         );
@@ -501,14 +506,16 @@ function PulseRoom(): React.ReactElement {
             {/* Brand watermark — bottom-right, whispered */}
             <div
                 style={{
-                    position: "fixed",
-                    bottom: 16,
-                    right: 16,
-                    fontSize: 10,
+                    position: "absolute",
+                    bottom: 24,
+                    right: 32,
+                    fontSize: 11,
                     color: CX.textTertiary,
-                    opacity: 0.5,
-                    fontFamily: CX.font,
+                    opacity: 0.4,
+                    fontFamily: CX.fontSerif,
+                    letterSpacing: "0.05em",
                     userSelect: "none",
+                    zIndex: 1,
                 }}
             >
                 Cortex

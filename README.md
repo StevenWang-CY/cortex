@@ -1,4 +1,14 @@
-# Cortex
+<p align="center">
+  <img src="cortex/assets/banner.svg" alt="Cortex Banner" width="450" />
+</p>
+<h1 align="center">The Biological Browser Engine</h1>
+<p align="center">
+  [ 30 FPS ] REAL-TIME COGNITIVE TRACKING
+</p>
+<hr />
+<p align="center">
+  <a href="cortex/apps/browser_extension">EXTENSION</a> &nbsp; <a href="cortex/apps/desktop_shell">DESKTOP</a> &nbsp; <a href="cortex/docs/setup.md">DOCS</a> &nbsp; <a href="https://github.com/StevenWang-CY/cortex">SOURCE</a> &nbsp;&nbsp;&nbsp; ⭐️ ACTIVE
+</p>
 
 **Cortex** is a real-time biofeedback engine that watches you work through your webcam and input devices, detects cognitive overwhelm, and actively restructures your digital workspace so you can stay focused. Unlike timer-based productivity tools, Cortex uses your biology to decide when you need help, and uses LLMs to decide how to help.
 

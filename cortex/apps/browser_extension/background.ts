@@ -644,6 +644,14 @@ async function handleMessage(raw: string): Promise<void> {
             }
             break;
         }
+
+        case "MORNING_BRIEFING": {
+            broadcastToPopup({
+                type: "MORNING_BRIEFING",
+                payload: msg.payload,
+            });
+            break;
+        }
     }
 }
 

@@ -289,11 +289,22 @@ def _iter_camera_candidates(config: CaptureConfig) -> Iterable[CameraSelection]:
                         )
                     )
 
-    # Fallback: try device indices 0-4 as "probe" candidates.
-    # The post-open check in open_video_capture() will re-enumerate and
-    # reject any Continuity Camera, so these are safe to try.
+    # Fallback: probe device indices to handle cases where AVFoundation and
+    # OpenCV disagree on index ordering.  When the enumeration returned a
+    # non-empty names list, restrict probing to indices that are NOT known
+    # Continuity Cameras — this prevents accidentally opening an iPhone camera
+    # whose cv2 index isn't covered by the named candidates above.
+    # When enumeration failed entirely, probe 0-4 as a last resort.
     if is_macos():
-        for probe_idx in range(5):
+        if names:
+            probe_indices = [
+                idx
+                for idx, name in enumerate(names)
+                if not any(kw in name.casefold() for kw in _CONTINUITY_CAMERA_KEYWORDS)
+            ]
+        else:
+            probe_indices = list(range(5))
+        for probe_idx in probe_indices:
             candidates.append(
                 CameraSelection(
                     device_id=probe_idx,
@@ -301,7 +312,7 @@ def _iter_camera_candidates(config: CaptureConfig) -> Iterable[CameraSelection]:
                     source="probe_device",
                 )
             )
-        for probe_idx in range(5):
+        for probe_idx in probe_indices:
             candidates.append(
                 CameraSelection(
                     device_id=probe_idx,
@@ -446,6 +457,21 @@ def open_video_capture(
                         "Skipping device %d (%s) — Continuity Camera detected post-open",
                         candidate.device_id,
                         actual_name,
+                    )
+                    capture.release()
+                    continue
+
+                # On macOS, reject cameras whose identity we cannot verify.
+                # A None actual_name means the index is beyond the live
+                # enumeration range — this often indicates a Continuity Camera
+                # (iPhone/iPad) that is accessible to cv2 but has disappeared
+                # from the AVFoundation device list.
+                if is_macos() and actual_name is None:
+                    logger.info(
+                        "Skipping device %d — cannot verify camera identity "
+                        "(index beyond live enumeration; likely Continuity Camera). "
+                        "Set CORTEX_CAPTURE__DEVICE_ID to override.",
+                        candidate.device_id,
                     )
                     capture.release()
                     continue

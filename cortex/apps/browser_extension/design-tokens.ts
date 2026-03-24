@@ -8,47 +8,52 @@
 // --- Core Tokens ---
 
 export const CX = {
-    // Canvas (warm-shifted from pure black per design guide)
-    bg: "#0C0C0E",
-    surface: "#131316",
-    tertiary: "#1A1A1E",
-    overlay: "rgba(12, 12, 14, 0.88)",
+    // Canvas (Claude-style warm, earthy off-white)
+    bg: "#F3EFEA",
+    surface: "#FFFFFF",
+    tertiary: "#EBE6E0",
+    overlay: "rgba(243, 239, 234, 0.88)",
 
-    // Borders (reduced — feel structure without seeing lines)
-    border: "rgba(255, 255, 255, 0.03)",       // subtle — card edges, barely there
-    borderDefault: "rgba(255, 255, 255, 0.07)", // section separators
-    borderEmphasis: "rgba(255, 255, 255, 0.12)", // active/focus states
+    // Borders
+    border: "rgba(0, 0, 0, 0.08)",       
+    borderDefault: "rgba(0, 0, 0, 0.12)", 
+    borderEmphasis: "rgba(0, 0, 0, 0.20)", 
 
-    // Text
-    text: "#EDEDEF",
-    textSecondary: "#A0A0A8",
-    textTertiary: "#5C5C66",
-    textInverse: "#0A0A0B",
+    // Shadows
+    shadowFloat: "0 8px 32px rgba(0, 0, 0, 0.08), 0 0 0 1px rgba(0,0,0,0.04)",
 
-    // Accent (indigo)
-    accent: "#818CF8",
-    accentHover: "#6366F1",
-    accentDim: "rgba(129, 140, 248, 0.12)",
+    // Text (High contrast darks)
+    text: "#1A1A1A",
+    textSecondary: "#66625D",
+    textTertiary: "#999590",
+    textInverse: "#FFFFFF",
+
+    // Accent (Terracotta/Bronze)
+    accent: "#D97757",
+    accentHover: "#C46547",
+    accentDim: "rgba(217, 119, 87, 0.12)",
 
     // Danger
-    danger: "#EF4444",
-    dangerDim: "rgba(239, 68, 68, 0.10)",
+    danger: "#D95757",
+    dangerDim: "rgba(217, 87, 87, 0.10)",
 
     // Biometric
-    bioHr: "#F87171",
-    bioHrv: "#38BDF8",
-    bioResp: "#34D399",
-    bioBlink: "#FBBF24",
+    bioHr: "#D97757",     // Terracotta
+    bioHrv: "#57A0D9",    // Calm blue
+    bioResp: "#57D99E",   // Soft green
+    bioBlink: "#D9B457",  // Warm yellow
 
     // Fonts
     font: "'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif",
+    fontSerif: "ui-serif, 'Georgia', 'Cambria', 'Times New Roman', serif",
+    fontBrand: "'Cormorant Garamond', ui-serif, 'Georgia', serif",
     mono: "'JetBrains Mono', 'SF Mono', 'Cascadia Code', monospace",
 
-    // Radius
-    radiusSm: 6,
-    radiusMd: 10,
-    radiusLg: 14,
-    radiusXl: 16,
+    // Radius (Much softer, more organic)
+    radiusSm: 8,
+    radiusMd: 16,
+    radiusLg: 24,
+    radiusXl: 32,
     radiusFull: 9999,
 
     // Spacing (4px grid)
@@ -66,38 +71,38 @@ export const CX = {
     easeExit: "cubic-bezier(0.4, 0, 1, 1)",
 
     // Durations
-    durationMicro: "100ms",   // hover, focus ring
-    durationFast: "150ms",    // overlay exit, button press
-    durationNormal: "200ms",  // overlay enter, card expand
-    durationSlow: "400ms",    // state color transitions
-    durationAmbient: "3000ms", // aura, somatic filter
+    durationMicro: "100ms",   
+    durationFast: "150ms",    
+    durationNormal: "200ms",  
+    durationSlow: "400ms",    
+    durationAmbient: "3000ms", 
 } as const;
 
 // --- State Colors (hex, for React inline styles) ---
 
 export const STATE_COLORS: Record<string, string> = {
-    FLOW: "#34D399",
-    HYPER: "#F97316",
-    HYPO: "#60A5FA",
-    RECOVERY: "#A78BFA",
+    FLOW: "#D97757",    // Focus state -> Terracotta 
+    HYPER: "#BD4932",   // Hyper state -> Darker rust
+    HYPO: "#66625D",    // Low state -> Warm grey
+    RECOVERY: "#57A0D9", // Recovering -> Soft blue
 };
 
 // --- State Colors (RGB, for canvas rendering) ---
 
 export const STATE_COLORS_RGB: Record<string, { r: number; g: number; b: number }> = {
-    FLOW: { r: 52, g: 211, b: 153 },
-    HYPER: { r: 249, g: 115, b: 22 },
-    HYPO: { r: 96, g: 165, b: 250 },
-    RECOVERY: { r: 167, g: 139, b: 250 },
+    FLOW: { r: 217, g: 119, b: 87 },
+    HYPER: { r: 189, g: 73, b: 50 },
+    HYPO: { r: 102, g: 98, b: 93 },
+    RECOVERY: { r: 87, g: 160, b: 217 },
 };
 
 // --- State Colors (muted, 12% opacity backgrounds) ---
 
 export const STATE_COLORS_MUTED: Record<string, string> = {
-    FLOW: "rgba(52, 211, 153, 0.12)",
-    HYPER: "rgba(249, 115, 22, 0.12)",
-    HYPO: "rgba(96, 165, 250, 0.12)",
-    RECOVERY: "rgba(167, 139, 250, 0.12)",
+    FLOW: "rgba(217, 119, 87, 0.12)",
+    HYPER: "rgba(189, 73, 50, 0.12)",
+    HYPO: "rgba(102, 98, 93, 0.12)",
+    RECOVERY: "rgba(87, 160, 217, 0.12)",
 };
 
 // --- State Labels ---
@@ -105,17 +110,17 @@ export const STATE_COLORS_MUTED: Record<string, string> = {
 export const STATE_LABELS: Record<string, string> = {
     FLOW: "Focused",
     HYPER: "Elevated",
-    HYPO: "Low",
+    HYPO: "Idle",
     RECOVERY: "Recovering",
 };
 
 // --- Somatic Temperatures (ambient color filter) ---
 
 export const SOMATIC_TEMPS: Record<string, { r: number; g: number; b: number; opacity: number }> = {
-    FLOW: { r: 100, g: 180, b: 220, opacity: 0.01 },     // cool blue tint, 1%
-    HYPER: { r: 249, g: 150, b: 80, opacity: 0.02 },      // warm amber, 2%
-    HYPO: { r: 140, g: 160, b: 210, opacity: 0 },         // neutral, 0%
-    RECOVERY: { r: 180, g: 160, b: 220, opacity: 0.015 },
+    FLOW: { r: 217, g: 119, b: 87, opacity: 0.015 },     
+    HYPER: { r: 189, g: 73, b: 50, opacity: 0.03 },      
+    HYPO: { r: 102, g: 98, b: 93, opacity: 0 },         
+    RECOVERY: { r: 87, g: 160, b: 217, opacity: 0.02 },
 };
 
 // --- Font Loading ---
@@ -213,6 +218,7 @@ export function cxVars(): string {
         "bio-resp": CX.bioResp,
         "bio-blink": CX.bioBlink,
         "font": CX.font,
+        "font-serif": CX.fontSerif,
         "mono": CX.mono,
         "radius-sm": `${CX.radiusSm}px`,
         "radius-md": `${CX.radiusMd}px`,
@@ -225,6 +231,7 @@ export function cxVars(): string {
         "duration-fast": CX.durationFast,
         "duration-normal": CX.durationNormal,
         "duration-slow": CX.durationSlow,
+        "shadow-float": CX.shadowFloat,
     };
     return Object.entries(map)
         .map(([k, v]) => `--cx-${k}: ${v};`)

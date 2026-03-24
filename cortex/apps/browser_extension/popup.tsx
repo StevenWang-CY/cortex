@@ -12,14 +12,8 @@ import { CX, STATE_COLORS, STATE_LABELS, CX_KEYFRAMES } from "./design-tokens";
 
 const CortexLogo = () => (
     <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ flexShrink: 0 }}>
-        <path d="M13 3C7.48 3 3 7.48 3 13s4.48 10 10 10" stroke="url(#cortex-gradient)" strokeWidth="2.5" strokeLinecap="round" />
-        <path d="M8 13l2.5-3.5L13 16l2-2h4" stroke="url(#cortex-gradient)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-        <defs>
-            <linearGradient id="cortex-gradient" x1="3" y1="3" x2="19" y2="23" gradientUnits="userSpaceOnUse">
-                <stop stopColor="#3b82f6" />
-                <stop offset="1" stopColor="#10b981" />
-            </linearGradient>
-        </defs>
+        <path d="M 17 4 A 10 10 0 1 0 17 22" stroke="#1a1a1a" strokeWidth="2.5" strokeLinecap="round" />
+        <path d="M8 13l2.5-3.5L13 16l2-2h4" stroke="#D97757" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
 );
 
@@ -379,7 +373,7 @@ function CortexPopup(): React.ReactElement {
             <div style={S.header}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                     <CortexLogo />
-                    <span style={S.logoText}>Cortex</span>
+                    <span style={{ ...S.logoText, fontFamily: CX.fontBrand, fontStyle: "italic", letterSpacing: "0.02em" }}>Cortex.</span>
                 </div>
                 {!connected ? (
                     <button style={S.connectBtn} onClick={handleConnect}>CONNECT</button>
@@ -762,155 +756,154 @@ function CortexPopup(): React.ReactElement {
 const S: Record<string, React.CSSProperties> = {
     root: {
         width: 380,
-        maxHeight: 540,
+        maxHeight: 560,
         overflowY: "auto",
-        padding: "0 20px 20px 20px",
+        padding: "20px",
         fontFamily: CX.font,
-        fontSize: 13,
+        fontSize: 14,
         color: CX.text,
-        background: CX.bg,
+        background: CX.surface,
+        display: "flex",
+        flexDirection: "column" as const,
     },
 
     // Alert toast
     alertBox: {
-        padding: "12px 14px",
+        padding: "16px",
         borderRadius: CX.radiusMd,
         background: CX.surface,
-        marginBottom: 12,
-        animation: "cxAlertIn 0.2s cubic-bezier(0, 0, 0.2, 1)",
+        border: `1px solid ${CX.borderDefault}`,
+        boxShadow: CX.shadowFloat,
+        marginBottom: 16,
+        animation: "cxAlertIn 0.3s cubic-bezier(0.16, 1, 0.3, 1)",
     },
-    alertTitle: { fontSize: 13, fontWeight: 500, marginBottom: 2, color: CX.text },
-    alertBody: { fontSize: 10, color: CX.textTertiary, lineHeight: 1.4 },
+    alertTitle: { fontSize: 14, fontWeight: 600, marginBottom: 4, color: CX.text, fontFamily: CX.fontSerif },
+    alertBody: { fontSize: 13, color: CX.textSecondary, lineHeight: 1.5 },
 
-    // Header — 44px total
+    // Header 
     header: {
         display: "flex",
         alignItems: "center",
         justifyContent: "space-between",
-        height: 44,
-        padding: "0",
-        marginBottom: 0,
-        borderBottom: `1px solid ${CX.borderDefault}`,
+        height: 48,
+        padding: "0 4px",
+        marginBottom: 16,
     },
     logoText: {
-        fontSize: 15,
+        fontSize: 20,
         fontWeight: 600,
         letterSpacing: "-0.02em",
         color: CX.text,
+        fontFamily: CX.fontSerif,
     },
     connectBtn: {
-        padding: "4px 12px",
-        border: `1px solid ${CX.borderDefault}`,
-        borderRadius: CX.radiusSm,
-        background: "transparent",
-        color: CX.textSecondary,
+        padding: "6px 14px",
+        border: "none",
+        borderRadius: CX.radiusFull,
+        background: CX.text,
+        color: CX.textInverse,
         cursor: "pointer",
-        fontSize: 11,
+        fontSize: 13,
         fontWeight: 500,
         fontFamily: CX.font,
-        letterSpacing: "0.04em",
-        textTransform: "uppercase" as const,
+        transition: "background 0.2s ease",
     },
-    statusRow: { display: "flex", alignItems: "center", gap: 6 },
+    statusRow: { display: "flex", alignItems: "center", gap: 8, paddingRight: 4 },
     statusLabel: {
-        fontSize: 11,
+        fontSize: 12,
         fontWeight: 500,
-        letterSpacing: "0.04em",
-        textTransform: "uppercase" as const,
         fontFamily: CX.font,
+        color: CX.textSecondary,
         transition: `color ${CX.durationSlow} ${CX.easeDefault}`,
     },
 
-    // Disconnected area — centered vertically
+    // Disconnected area
     disconnectedArea: {
         display: "flex",
         flexDirection: "column" as const,
         alignItems: "center",
         justifyContent: "center",
-        padding: "32px 0",
-        gap: 4,
+        padding: "40px 0",
+        gap: 8,
     },
-    disconnectedTitle: { fontSize: 15, fontWeight: 600, color: CX.textSecondary, letterSpacing: "-0.015em" },
-    disconnectedBody: { fontSize: 13, color: CX.textTertiary },
+    disconnectedTitle: { fontSize: 18, fontWeight: 600, color: CX.text, fontFamily: CX.fontSerif },
+    disconnectedBody: { fontSize: 14, color: CX.textSecondary },
 
     // Morning briefing
     briefingCard: {
-        background: CX.surface,
-        borderRadius: CX.radiusLg,
+        background: CX.tertiary,
+        borderRadius: CX.radiusMd,
         padding: 16,
-        marginTop: CX.space6,
-        borderLeft: `3px solid ${CX.accent}`,
+        marginBottom: 16,
     },
-    briefingTitle: { fontSize: 15, fontWeight: 600, letterSpacing: "-0.015em", color: CX.text },
-    briefingBody: { fontSize: 13, color: CX.textSecondary, lineHeight: 1.5, marginTop: 4 },
+    briefingTitle: { fontSize: 16, fontWeight: 600, color: CX.text, fontFamily: CX.fontSerif, marginBottom: 4 },
+    briefingBody: { fontSize: 14, color: CX.textSecondary, lineHeight: 1.5 },
 
     // Ghost button
     ghostBtn: {
-        padding: "6px 16px",
+        padding: "8px 16px",
         border: `1px solid ${CX.borderDefault}`,
-        borderRadius: CX.radiusMd,
+        borderRadius: CX.radiusFull,
         background: "transparent",
-        color: CX.textSecondary,
+        color: CX.text,
         cursor: "pointer",
-        fontSize: 11,
+        fontSize: 13,
         fontWeight: 500,
         fontFamily: CX.font,
-        letterSpacing: "0.04em",
-        textTransform: "uppercase" as const,
     },
 
-    // Goal input — tertiary bg, 40px height, enter icon
+    // Goal input
     goalInput: {
         width: "100%",
-        height: 40,
-        padding: "0 32px 0 12px",
-        border: "none",
-        borderRadius: CX.radiusMd,
-        background: CX.tertiary,
+        height: 44,
+        padding: "0 40px 0 16px",
+        border: `1px solid ${CX.borderDefault}`,
+        borderRadius: CX.radiusFull,
+        background: CX.surface,
         color: CX.text,
-        fontSize: 13,
-        letterSpacing: "-0.005em",
+        fontSize: 14,
         outline: "none",
         boxSizing: "border-box" as const,
         fontFamily: CX.font,
-        marginTop: CX.space6,
+        marginBottom: 16,
+        transition: "border-color 0.2s",
     },
     goalEnterIcon: {
         position: "absolute" as const,
-        right: 12,
-        top: CX.space6 + 10,
+        right: 16,
+        top: 13,
         color: CX.textTertiary,
-        fontSize: 14,
+        fontSize: 16,
         pointerEvents: "none" as const,
     },
 
-    // Session card — surface bg, no visible border
+    // Session card 
     sessionCard: {
         background: CX.surface,
-        borderRadius: CX.radiusLg,
-        padding: 16,
-        marginTop: CX.space6,
+        borderRadius: CX.radiusMd,
+        padding: "20px",
+        marginBottom: 16,
+        border: `1px solid ${CX.borderDefault}`,
+        boxShadow: CX.shadowFloat,
     },
     focusHeader: {
         display: "flex",
         alignItems: "center",
         justifyContent: "space-between",
-        marginBottom: 16,
+        marginBottom: 20,
     },
-    focusTitle: { fontSize: 15, fontWeight: 600, color: CX.text, letterSpacing: "-0.015em" },
-    focusDuration: { fontSize: 13, color: CX.textTertiary },
+    focusTitle: { fontSize: 18, fontWeight: 600, color: CX.text, fontFamily: CX.fontSerif },
+    focusDuration: { fontSize: 13, color: CX.textSecondary },
     endBtn: {
-        padding: "4px 12px",
+        padding: "6px 14px",
         border: `1px solid ${CX.borderDefault}`,
-        borderRadius: CX.radiusSm,
+        borderRadius: CX.radiusFull,
         background: "transparent",
-        color: CX.textSecondary,
+        color: CX.text,
         cursor: "pointer",
-        fontSize: 11,
+        fontSize: 12,
         fontWeight: 500,
         fontFamily: CX.font,
-        letterSpacing: "0.04em",
-        textTransform: "uppercase" as const,
     },
     bigRow: {
         display: "flex",
@@ -919,99 +912,94 @@ const S: Record<string, React.CSSProperties> = {
         marginBottom: 4,
     },
     bigNum: {
-        fontSize: 28,
-        fontWeight: 600,
-        letterSpacing: "-0.03em",
+        fontSize: 36,
+        fontWeight: 500,
         lineHeight: 1.15,
-        fontFamily: CX.mono,
+        fontFamily: CX.fontSerif,
     },
     bigPct: {
-        fontSize: 16,
+        fontSize: 15,
         fontWeight: 500,
-        fontFamily: CX.mono,
         color: CX.textTertiary,
     },
     bigLabel: {
         fontSize: 13,
         color: CX.textSecondary,
-        letterSpacing: "-0.005em",
-        marginBottom: 12,
+        marginBottom: 20,
     },
 
-    // Progress track — 6px tall
+    // Progress track
     trackOuter: {
-        height: 6,
-        borderRadius: CX.radiusSm,
+        height: 4,
+        borderRadius: CX.radiusFull,
         background: CX.tertiary,
-        marginBottom: 16,
+        marginBottom: 20,
         overflow: "hidden",
     },
     trackFill: {
         height: "100%",
-        borderRadius: CX.radiusSm,
-        transition: `width 1s ease, background ${CX.durationSlow} ${CX.easeDefault}`,
+        borderRadius: CX.radiusFull,
+        transition: `width 1s ease`,
     },
 
-    // Stats row — three columns
-    statsRow: { display: "flex", justifyContent: "space-around" },
-    statCol: { display: "flex", flexDirection: "column" as const, alignItems: "center", gap: 2 },
-    statVal: { fontSize: 16, fontWeight: 500, color: CX.text, fontFamily: CX.mono },
-    statLabel: { fontSize: 11, fontWeight: 400, color: CX.textTertiary, letterSpacing: "0.04em", textTransform: "uppercase" as const },
+    // Stats row
+    statsRow: { display: "flex", justifyContent: "space-between" },
+    statCol: { display: "flex", flexDirection: "column" as const, alignItems: "flex-start", gap: 4 },
+    statVal: { fontSize: 15, fontWeight: 600, color: CX.text },
+    statLabel: { fontSize: 11, fontWeight: 500, color: CX.textTertiary, textTransform: "uppercase" },
 
-    // Intervention preview — left border for HYPER
+    // Intervention preview
     interventionCard: {
         background: CX.surface,
-        borderRadius: CX.radiusLg,
-        padding: 16,
-        marginTop: CX.space6,
-        borderLeft: `3px solid ${STATE_COLORS.HYPER}`,
+        borderRadius: CX.radiusMd,
+        padding: 20,
+        marginBottom: 16,
+        border: `1px solid ${CX.borderDefault}`,
+        boxShadow: CX.shadowFloat,
     },
     causalText: {
-        fontSize: 13,
+        fontSize: 15,
         color: CX.textSecondary,
         lineHeight: 1.5,
-        marginBottom: 12,
+        marginBottom: 16,
+        fontFamily: CX.fontSerif,
         fontStyle: "italic",
-        letterSpacing: "-0.005em",
     },
-    tabRow: { display: "flex", alignItems: "center", gap: 8, height: 32 },
-    tabXMark: { color: `${CX.danger}99`, fontSize: 12, fontWeight: 400, width: 14, textAlign: "center" as const, flexShrink: 0, fontFamily: CX.mono },
+    tabRow: { display: "flex", alignItems: "center", gap: 12, height: 32 },
+    tabXMark: { color: CX.danger, fontSize: 16, fontWeight: 500, width: 16, textAlign: "center" as const, flexShrink: 0 },
     tabName: {
-        fontSize: 12, color: CX.text, fontFamily: CX.mono,
-        whiteSpace: "nowrap" as const, overflow: "hidden", textOverflow: "ellipsis" as const,
+        fontSize: 14, color: CX.text,
+        whiteSpace: "nowrap" as const, overflow: "hidden", textOverflow: "ellipsis",
     },
-    keepLine: { fontSize: 10, color: CX.textTertiary, marginTop: 6 },
+    keepLine: { fontSize: 13, color: CX.textTertiary, marginTop: 8 },
 
-    // Error — tertiary bg, not danger
+    // Error
     errBox: {
-        padding: 12,
+        padding: 16,
         background: CX.tertiary,
-        borderRadius: CX.radiusMd,
-        marginBottom: 12,
+        borderRadius: CX.radiusSm,
+        marginBottom: 16,
     },
-    errBody: { fontSize: 12, color: CX.text, lineHeight: 1.5, fontFamily: CX.mono },
+    errBody: { fontSize: 13, color: CX.text, lineHeight: 1.5 },
     errCode: {
-        fontSize: 12, color: CX.accent, marginTop: 8, fontFamily: CX.mono,
-        lineHeight: 1.5, whiteSpace: "pre-wrap" as const, border: "none", margin: 0,
-        padding: 0, background: "none",
+        fontSize: 13, color: CX.accent, marginTop: 12, fontFamily: CX.mono,
+        lineHeight: 1.5, whiteSpace: "pre-wrap" as const, margin: 0,
     },
 
-    // Primary CTA — full width, accent bg, 40px height
+    // Primary CTA
     primaryBtn: {
         width: "100%",
-        height: 40,
+        height: 44,
         padding: "0 20px",
         border: "none",
-        borderRadius: CX.radiusMd,
-        background: CX.accent,
+        borderRadius: CX.radiusFull,
+        background: CX.text,
         color: CX.textInverse,
-        fontSize: 11,
+        fontSize: 14,
         fontWeight: 500,
         cursor: "pointer",
-        letterSpacing: "0.04em",
-        textTransform: "uppercase" as const,
         fontFamily: CX.font,
-        transition: `background ${CX.durationFast} ${CX.easeDefault}`,
+        transition: "opacity 0.2s ease",
     },
     doneBtnStyle: {
         background: STATE_COLORS.FLOW,
@@ -1023,87 +1011,82 @@ const S: Record<string, React.CSSProperties> = {
     // Undo
     undoRow: {
         display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
-        marginTop: 8, fontSize: 10, color: CX.textTertiary,
+        marginTop: 12, fontSize: 13, color: CX.textTertiary,
     },
     undoLink: {
-        background: "none", border: "none", color: CX.accent, fontSize: 10,
+        background: "none", border: "none", color: CX.text, fontSize: 13,
         fontWeight: 500, cursor: "pointer", padding: 0, fontFamily: CX.font,
+        textDecoration: "underline",
     },
 
-    // Biometrics row — no card, 1px separators
+    // Biometrics row
     bioRow: {
         display: "flex",
-        justifyContent: "space-around",
-        padding: "12px 0",
-        marginTop: CX.space6,
+        justifyContent: "space-between",
+        padding: "16px 8px",
+        marginBottom: 16,
         borderTop: `1px solid ${CX.borderDefault}`,
         borderBottom: `1px solid ${CX.borderDefault}`,
     },
-    bioCol: { display: "flex", alignItems: "center", gap: 6 },
+    bioCol: { display: "flex", flexDirection: "column" as const, alignItems: "flex-start", gap: 4 },
     bioLabel: {
         fontSize: 11,
         fontWeight: 500,
-        letterSpacing: "0.04em",
+        color: CX.textTertiary,
         textTransform: "uppercase" as const,
     },
     bioVal: {
-        fontSize: 12,
-        fontFamily: CX.mono,
+        fontSize: 18,
+        fontWeight: 400,
+        fontFamily: CX.fontSerif,
         color: CX.text,
     },
 
-    // Settings — no card, separator above
+    // Settings
     settingsArea: {
-        padding: "16px 0",
-        borderTop: `1px solid ${CX.borderDefault}`,
-        marginTop: CX.space6,
+        padding: "8px 4px",
     },
     toggleRow: {
         display: "flex",
         alignItems: "center",
         justifyContent: "space-between",
+        padding: "8px 0",
     },
-    toggleLabel: { fontSize: 13, color: CX.textSecondary },
+    toggleLabel: { fontSize: 14, color: CX.text },
     toggleTrack: {
         position: "relative" as const,
-        width: 36,
-        height: 20,
-        borderRadius: 10,
+        width: 40,
+        height: 24,
+        borderRadius: 12,
         border: "none",
         cursor: "pointer",
         padding: 0,
         flexShrink: 0,
-        transition: `background ${CX.durationNormal} ${CX.easeDefault}`,
+        transition: `background 0.2s ease`,
     },
     toggleThumb: {
         position: "absolute" as const,
         top: 2,
         left: 2,
-        width: 16,
-        height: 16,
+        width: 20,
+        height: 20,
         borderRadius: "50%",
         background: "#fff",
-        transition: `transform ${CX.durationNormal} ${CX.easeDefault}`,
+        transition: `transform 0.2s ease`,
+        boxShadow: "0 2px 4px rgba(0,0,0,0.1)",
     },
 
-    // Today footer — no card, visual basement
+    // Today footer
     todayFooter: {
         display: "flex",
-        justifyContent: "space-around",
-        padding: "16px 0 0 0",
+        justifyContent: "space-between",
+        padding: "20px 8px 0 8px",
         borderTop: `1px solid ${CX.borderDefault}`,
-        marginTop: CX.space6,
+        marginTop: 16,
     },
-    todayCol: { display: "flex", flexDirection: "column" as const, alignItems: "center", gap: 2 },
-    todayVal: { fontSize: 12, fontFamily: CX.mono, color: CX.textSecondary },
-    todayLabel: { fontSize: 10, color: CX.textTertiary, letterSpacing: "0.02em", textTransform: "uppercase" as const },
+    todayCol: { display: "flex", flexDirection: "column" as const, alignItems: "flex-start", gap: 4 },
+    todayVal: { fontSize: 16, fontFamily: CX.fontSerif, color: CX.text },
+    todayLabel: { fontSize: 11, color: CX.textTertiary, textTransform: "uppercase" },
 };
-
-// --- Mount ---
-
-const root = document.getElementById("root");
-if (root) {
-    createRoot(root).render(<CortexPopup />);
-}
 
 export default CortexPopup;

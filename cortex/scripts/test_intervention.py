@@ -27,210 +27,18 @@ logger = logging.getLogger("test_intervention")
 # --- Mock Intervention Payload ---
 
 def make_mock_intervention() -> dict:
-    """Build a realistic intervention payload with all new features."""
     return {
-        "type": "INTERVENTION_TRIGGER",
+        "type": "MORNING_BRIEFING",
         "payload": {
-            "intervention_id": f"test-{uuid.uuid4().hex[:8]}",
-            "level": "simplified_workspace",
-            "headline": "Too many tabs — let's focus",
-            "situation_summary": (
-                "You have 12 tabs open across multiple topics. "
-                "Several are unrelated to your current task (PyTorch CUDA debugging). "
-                "Let's organize them so you can focus."
-            ),
-            "primary_focus": "PyTorch CUDA error in train.py",
-            "micro_steps": [
-                "Fix the CUDA device mismatch in train.py line 42",
-                "Check the PyTorch docs tab for .to(device) usage",
-                "Run the training script again with CUDA_LAUNCH_BLOCKING=1",
+            "summary": "You spent the last hour working on the Cortex Ethereal UI Overhaul, specifically dialing in the SVG geometric curvature of the central logo inside newtab.tsx. You were experimenting with the arc sweeps and scaling transformations to get the perfect elegant 'C' wrap. Looks like the geometric math checked out perfectly.",
+            "action_items": [
+                "Verify the extreme 250-degree C curvature in the popup UI",
+                "Reload the extension in Chrome to pick up the new icon cache",
+                "Push the completely rebuilt visual codebase to your version control",
+                "Start exploring the Activity Context grouping features next"
             ],
-            "hide_targets": [
-                "browser_tabs_except_active",
-                "terminal_lines_before_last_error_block",
-            ],
-            "ui_plan": {
-                "dim_background": True,
-                "show_overlay": True,
-                "fold_unrelated_code": True,
-                "intervention_type": "simplified_workspace",
-            },
-            "tone": "direct",
-            "suggested_actions": [
-                {
-                    "action_id": f"act-{uuid.uuid4().hex[:8]}",
-                    "action_type": "close_tab",
-                    "tab_index": 3,
-                    "target": None,
-                    "label": "Close Reddit tab",
-                    "reason": "Not related to your current task",
-                    "category": "recommended",
-                    "reversible": True,
-                    "group_id": None,
-                    "metadata": {"tab_title": "Reddit - r/funny"},
-                },
-                {
-                    "action_id": f"act-{uuid.uuid4().hex[:8]}",
-                    "action_type": "close_tab",
-                    "tab_index": 5,
-                    "target": None,
-                    "label": "Close YouTube tab",
-                    "reason": "Media distraction",
-                    "category": "recommended",
-                    "reversible": True,
-                    "group_id": None,
-                    "metadata": {"tab_title": "YouTube - Lo-fi beats"},
-                },
-                {
-                    "action_id": f"act-{uuid.uuid4().hex[:8]}",
-                    "action_type": "close_tab",
-                    "tab_index": 8,
-                    "target": None,
-                    "label": "Close Twitter tab",
-                    "reason": "Social media not relevant",
-                    "category": "recommended",
-                    "reversible": True,
-                    "group_id": None,
-                    "metadata": {"tab_title": "Twitter / X"},
-                },
-                {
-                    "action_id": f"act-{uuid.uuid4().hex[:8]}",
-                    "action_type": "close_tab",
-                    "tab_index": 9,
-                    "target": None,
-                    "label": "Close Gmail tab",
-                    "reason": "Email can wait",
-                    "category": "recommended",
-                    "reversible": True,
-                    "group_id": None,
-                    "metadata": {"tab_title": "Gmail"},
-                },
-                {
-                    "action_id": f"act-{uuid.uuid4().hex[:8]}",
-                    "action_type": "close_tab",
-                    "tab_index": 11,
-                    "target": None,
-                    "label": "Close arXiv paper tab",
-                    "reason": "Paper reading can wait",
-                    "category": "recommended",
-                    "reversible": True,
-                    "group_id": None,
-                    "metadata": {"tab_title": "arXiv — Attention Is All You Need"},
-                },
-            ],
-            "error_analysis": {
-                "error_type": "runtime",
-                "root_cause": (
-                    "Tensor device mismatch: model is on cuda:0 but input tensor "
-                    "is on cpu. The data loader is not moving batches to GPU before "
-                    "forward pass."
-                ),
-                "suggested_fix": (
-                    "Add `inputs = inputs.to(device)` and `labels = labels.to(device)` "
-                    "after unpacking the batch in the training loop (train.py:42)."
-                ),
-                "search_query": "RuntimeError expected all tensors to be on the same device pytorch",
-                "relevant_doc_url": "https://pytorch.org/docs/stable/tensor_attributes.html#torch.device",
-            },
-            "tab_recommendations": {
-                "tabs": [
-                    {
-                        "tab_index": 0,
-                        "tab_title": "VS Code — train.py",
-                        "action": "keep",
-                        "reason": "Active file with the error",
-                        "relevance_score": 1.0,
-                    },
-                    {
-                        "tab_index": 1,
-                        "tab_title": "PyTorch Docs — CUDA Semantics",
-                        "action": "keep",
-                        "reason": "Directly relevant to debugging CUDA device issues",
-                        "relevance_score": 0.95,
-                    },
-                    {
-                        "tab_index": 2,
-                        "tab_title": "GitHub — your-repo/ml-project",
-                        "action": "keep",
-                        "reason": "Your project repository",
-                        "relevance_score": 0.85,
-                    },
-                    {
-                        "tab_index": 3,
-                        "tab_title": "Reddit — r/funny",
-                        "action": "close",
-                        "reason": "Not relevant to debugging",
-                        "relevance_score": 0.05,
-                    },
-                    {
-                        "tab_index": 4,
-                        "tab_title": "Stack Overflow — CUDA out of memory",
-                        "action": "keep",
-                        "reason": "Relevant CUDA troubleshooting",
-                        "relevance_score": 0.8,
-                    },
-                    {
-                        "tab_index": 5,
-                        "tab_title": "YouTube — Lo-fi beats to study to",
-                        "action": "close",
-                        "reason": "Media distraction during debugging",
-                        "relevance_score": 0.1,
-                    },
-                    {
-                        "tab_index": 6,
-                        "tab_title": "Stack Overflow — tensor device mismatch",
-                        "action": "group",
-                        "reason": "Related to your current error",
-                        "relevance_score": 0.75,
-                        "group_name": "CUDA Error References",
-                    },
-                    {
-                        "tab_index": 7,
-                        "tab_title": "PyTorch Forums — DataLoader GPU",
-                        "action": "group",
-                        "reason": "Related to your current error",
-                        "relevance_score": 0.7,
-                        "group_name": "CUDA Error References",
-                    },
-                    {
-                        "tab_index": 8,
-                        "tab_title": "Twitter / X",
-                        "action": "close",
-                        "reason": "Social media not relevant",
-                        "relevance_score": 0.02,
-                    },
-                    {
-                        "tab_index": 9,
-                        "tab_title": "Gmail",
-                        "action": "close",
-                        "reason": "Email can wait while debugging",
-                        "relevance_score": 0.1,
-                    },
-                    {
-                        "tab_index": 10,
-                        "tab_title": "Google — pytorch cuda error",
-                        "action": "keep",
-                        "reason": "Active search for your error",
-                        "relevance_score": 0.6,
-                    },
-                    {
-                        "tab_index": 11,
-                        "tab_title": "arXiv — Attention Is All You Need",
-                        "action": "close",
-                        "reason": "Paper reading can wait",
-                        "relevance_score": 0.15,
-                    },
-                ],
-                "summary": (
-                    "Keeping 5 tabs directly related to your CUDA debugging task. "
-                    "Hiding 5 distraction/low-relevance tabs. "
-                    "Grouping 2 StackOverflow tabs about the same CUDA error."
-                ),
-            },
-        },
-        "timestamp": time.time(),
-        "sequence": 1,
-        "source_client_type": "daemon",
+            "left_off_at": "Refining the UI logomark"
+        }
     }
 
 
@@ -303,31 +111,20 @@ async def run_test_server() -> None:
 
     async def send_intervention_after_delay():
         """Wait for a client, then send the intervention after a short delay."""
-        nonlocal intervention_sent
         while True:
-            if clients and not intervention_sent:
-                await asyncio.sleep(2)  # Give the extension time to settle
+            if clients:
+                await asyncio.sleep(2)  # Broadcast every 2 seconds constantly!
                 if clients:
                     intervention = make_mock_intervention()
-                    msg_json = json.dumps(intervention)
+                    msg = json.dumps(intervention)
                     for ws in clients.copy():
                         try:
-                            await ws.send(msg_json)
-                            logger.info(
-                                "Sent INTERVENTION_TRIGGER to client (id=%s)",
-                                intervention["payload"]["intervention_id"],
-                            )
-                        except Exception:
-                            pass
-                    intervention_sent = True
-                    logger.info(
-                        "\n"
-                        "=" * 50 + "\n"
-                        "  INTERVENTION SENT!\n"
-                        "  Switch to Chrome to see the overlay.\n"
-                        "=" * 50
-                    )
-            await asyncio.sleep(1)
+                            await ws.send(msg)
+                            logger.info(f"Sent Mock Briefing to {ws.remote_address}")
+                        except Exception as e:
+                            logger.error(f"Failed to send: {e}")
+            else:
+                await asyncio.sleep(1)
 
     logger.info("Starting WebSocket server on ws://127.0.0.1:9473")
     logger.info("Waiting for Chrome extension to connect...")
