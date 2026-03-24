@@ -1,8 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
-  <!-- 250-degree C sweep -->
-  <path d="M 46.1 14.5 A 24 24 0 1 0 46.1 49.5" fill="none" stroke="#1a1a1a" stroke-width="6" stroke-linecap="round" />
-  <!-- Heartbeat signal -->
-  <path d="M 8 32 L 18 32 L 24 16 L 36 50 L 44 32 L 56 32" fill="none" stroke="#D97757" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />
-  <!-- Terminating node -->
-  <circle cx="56" cy="32" r="3" fill="#D97757" />
+  <path d="M 51.8 12.2 A 28 28 0 1 0 51.8 51.8" fill="none" stroke="#1a1a1a" stroke-width="6" stroke-linecap="round" />
+  <path d="M 12 32 L 22 32 L 27 15 L 37 49 L 42 32 L 60 32" fill="none" stroke="#D97757" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />
+  <circle cx="60" cy="32" r="3" fill="#D97757" />
 </svg>
