@@ -23,6 +23,11 @@ node_modules/
 .claude/
 .ralphrc
 .vscode/
+CLAUDE.md
+CHANGELOG.md
+
+# VS Code extension compiled output
+cortex/apps/vscode_extension/out/
 
 # Runtime artifacts
 .cortex_launch.sh
