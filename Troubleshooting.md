@@ -201,6 +201,29 @@ for i in range(4):
 
 ---
 
+## Desktop App (DMG)
+
+### App bounces then disappears
+
+macOS Gatekeeper is blocking the app because it was downloaded from the internet:
+```bash
+xattr -cr /Applications/Cortex.app
+```
+
+### Dashboard doesn't show
+
+The dashboard window may be hidden. Check the system tray for the Cortex icon and click it, or try relaunching the app.
+
+### Camera not working in .app
+
+Grant camera permission to Cortex.app: `System Settings -> Privacy & Security -> Camera -> Cortex` should be allowed. If it does not appear in the list, open the app once so macOS registers the permission request.
+
+### Cannot connect browser extension
+
+Click the **Connect Chrome/Edge** button in the desktop app. It copies the install command to your clipboard and opens a terminal window. Follow the clipboard instructions, then fully restart your browser (Cmd+Q, reopen).
+
+---
+
 ## Logs
 
 Daemon logs are written to stdout. To save them:

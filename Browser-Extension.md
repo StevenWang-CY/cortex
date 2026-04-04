@@ -32,10 +32,12 @@ pnpm dev
 
 ## Native Messaging Setup
 
+> **DMG users:** If you installed Cortex via the desktop app (DMG), native messaging is auto-installed when you click the **Connect Chrome/Edge** button in the app. No terminal command needed -- just restart your browser after connecting.
+
 Native messaging lets the extension start and stop the daemon without using the terminal.
 
 ```bash
-# From the repo root
+# From the repo root (developer setup only)
 python -m cortex.scripts.install_native_host
 ```
 

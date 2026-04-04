@@ -31,6 +31,17 @@
 
 ---
 
+## Download
+
+1. Download **Cortex.dmg** from the [latest release](https://github.com/StevenWang-CY/cortex/releases/latest)
+2. Drag **Cortex.app** to Applications
+3. Strip quarantine: `xattr -cr /Applications/Cortex.app`
+4. Open Cortex — follow the 4-step setup wizard (Camera, Accessibility, API key, Extensions)
+
+That's it — no terminal, no Python, no Node.js required.
+
+---
+
 ## How It Works
 
 ```
@@ -66,8 +77,8 @@ All layers communicate via FastAPI (port 9472) and WebSocket (port 9473). The de
 | [`cortex/`](cortex/) | Core engine — bio-extraction, state classification, LLM interventions, consent ladder, learning loop, v2.0 detectors, LeetCode mode, activity tracker, smart camera selection |
 | [`cortex/apps/browser_extension/`](cortex/apps/browser_extension/) | Chrome + Edge extension (Plasmo/React) — one-click daemon launch/stop, intervention overlay, ambient feedback, focus sessions, LeetCode observer, activity tracker, resume cards, Pulse Room |
 | [`cortex/apps/vscode_extension/`](cortex/apps/vscode_extension/) | VS Code extension — context provider, code folding, morning briefing, copilot throttle |
-| [`cortex/apps/desktop_shell/`](cortex/apps/desktop_shell/) | PySide6 desktop app — system tray, dashboard, onboarding, settings |
-| [`cortex/scripts/`](cortex/scripts/) | Daemon entry point, native messaging host, launcher agent, calibration, install scripts |
+| [`cortex/apps/desktop_shell/`](cortex/apps/desktop_shell/) | PySide6 desktop app — in-process daemon, two-tab dashboard (biometrics + advanced), system tray, onboarding wizard, one-click browser/editor connection |
+| [`cortex/scripts/`](cortex/scripts/) | Daemon entry point, native messaging host, launcher agent, calibration, install scripts, PyInstaller build pipeline |
 
 ---
 
@@ -84,7 +95,9 @@ All layers communicate via FastAPI (port 9472) and WebSocket (port 9473). The de
 
 ---
 
-## Setup
+## Developer Setup (from source)
+
+> Most users should use the **DMG installer** above. This section is for developers who want to modify Cortex.
 
 ### Prerequisites
 
@@ -246,6 +259,12 @@ python3 -c "import cv2; [print(f'Device {i}: {cv2.VideoCapture(i).isOpened()}') 
 pip install --force-reinstall mediapipe
 ```
 Ensure you're using native ARM Python (not Rosetta): `python3 -c "import platform; print(platform.machine())"` should print `arm64`.
+
+### Cortex.app bounces in dock then disappears
+- Run `xattr -cr /Applications/Cortex.app` in Terminal to strip quarantine
+
+### Dashboard doesn't appear
+- The app may be running in the background (check system tray). Try quitting and relaunching.
 
 ### Accessibility / pynput errors
 Add your terminal app to: `System Settings → Privacy & Security → Input Monitoring`

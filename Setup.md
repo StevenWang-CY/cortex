@@ -1,6 +1,24 @@
 # Setup
 
-## Prerequisites
+## DMG Install (Recommended)
+
+1. Download **Cortex.dmg** from [Releases](https://github.com/StevenWang-CY/cortex/releases/latest)
+2. Drag **Cortex.app** to `/Applications`
+3. Strip the quarantine attribute:
+   ```bash
+   xattr -cr /Applications/Cortex.app
+   ```
+4. Open Cortex from Applications
+5. Follow the setup wizard to configure your LLM backend and grant permissions
+6. Use the in-app **Connect Chrome/Edge** button to install the browser extension
+
+The desktop app bundles the daemon, dashboard, and system tray. No Python, Node.js, or terminal setup required.
+
+---
+
+## Developer Setup (from source)
+
+### Prerequisites
 
 | Requirement | Install |
 |-------------|---------|
@@ -15,7 +33,7 @@
 
 ---
 
-## 1. Clone & Virtual Environment
+### 1. Clone & Virtual Environment
 
 ```bash
 git clone https://github.com/StevenWang-CY/cortex.git
@@ -27,7 +45,7 @@ source .venv/bin/activate
 
 ---
 
-## 2. Configuration
+### 2. Configuration
 
 Copy the example config:
 
@@ -93,7 +111,7 @@ CORTEX_CAPTURE__DEVICE_ID=0   # or 1, 2, etc.
 
 ---
 
-## 3. Install Python Dependencies
+### 3. Install Python Dependencies
 
 ```bash
 pip install -e "./cortex[dev]"
@@ -106,7 +124,7 @@ python -c "from cortex.libs.config.settings import get_config; print(f'LLM mode:
 
 ---
 
-## 4. Initialize Storage
+### 4. Initialize Storage
 
 ```bash
 python -m cortex.scripts.seed_config --root .
@@ -116,7 +134,7 @@ Creates the `storage/` directory tree and a default baseline profile.
 
 ---
 
-## 5. macOS Permissions
+### 5. macOS Permissions
 
 Cortex needs two permissions, both prompted automatically on first use:
 
@@ -129,7 +147,7 @@ Cortex needs two permissions, both prompted automatically on first use:
 
 ---
 
-## 6. Start the Daemon
+### 6. Start the Daemon
 
 ### From terminal
 
@@ -153,7 +171,7 @@ Opens a window showing the webcam feed with face detection overlays and FPS coun
 
 ---
 
-## 7. Browser Extension
+### 7. Browser Extension
 
 ```bash
 cd cortex/apps/browser_extension
@@ -184,7 +202,7 @@ First-time dialogs:
 
 ---
 
-## 8. Calibration (recommended)
+### 8. Calibration (recommended)
 
 ```bash
 cortex-calibrate --duration 120
@@ -194,7 +212,7 @@ Sit relaxed for 2 minutes while Cortex learns your resting heart rate, HRV, blin
 
 ---
 
-## 9. VS Code Extension (optional)
+### 9. VS Code Extension (optional)
 
 ```bash
 cd cortex/apps/vscode_extension
@@ -206,7 +224,7 @@ Provides editor context (open file, diagnostics, cursor position) to the daemon 
 
 ---
 
-## 10. Running Tests
+### 10. Running Tests
 
 ```bash
 pytest                                      # all tests

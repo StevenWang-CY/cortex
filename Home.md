@@ -23,6 +23,17 @@
 
 ## Quick Start
 
+1. Download **Cortex.dmg** from [Releases](https://github.com/StevenWang-CY/cortex/releases/latest)
+2. Drag **Cortex.app** to `/Applications`, then strip quarantine:
+   ```bash
+   xattr -cr /Applications/Cortex.app
+   ```
+3. Open Cortex and follow the setup wizard
+
+The app includes the daemon, dashboard, and system tray. Use the in-app **Connect Chrome/Edge** button to set up the browser extension.
+
+### Alternative: Developer Setup
+
 ```bash
 # 1. Clone and install
 git clone https://github.com/StevenWang-CY/cortex.git

@@ -55,6 +55,11 @@ Load the browser extension from `chrome://extensions`.
 
 ### 4. Start Cortex
 
+**Option A -- Desktop App (recommended):**
+Open **Cortex.app** from `/Applications` (installed via DMG). The app starts the daemon and dashboard automatically.
+
+**Option B -- Terminal (developer setup):**
+
 Terminal 1:
 
 ```bash

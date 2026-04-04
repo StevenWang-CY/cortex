@@ -1,6 +1,30 @@
 # Setup Guide
 
-## Prerequisites
+## Quick Install (DMG)
+
+The fastest way to get Cortex running. No Python, Node.js, or terminal setup required.
+
+1. Download `Cortex.dmg` from [GitHub Releases](https://github.com/StevenWang-CY/cortex/releases/latest)
+2. Drag `Cortex.app` to Applications
+3. Strip quarantine:
+   ```bash
+   xattr -cr /Applications/Cortex.app
+   ```
+4. Open Cortex
+5. Follow the 4-step onboarding wizard:
+   - **Camera** -- Grant camera permission when prompted
+   - **Accessibility** -- Grant Accessibility permission (for keyboard/mouse telemetry)
+   - **LLM backend** -- Choose your LLM provider and enter your API key (stored securely in macOS Keychain)
+   - **Connect tools** -- Connect browser extension (Chrome/Edge) and editor (VS Code/Cursor)
+6. You're done. The DMG bundles everything -- no Python, Node.js, or terminal setup required.
+
+---
+
+## Developer Setup (from source)
+
+For developers who want to modify Cortex or contribute to the project.
+
+### Prerequisites
 
 - **macOS 13+ (Ventura or later)** — Linux and Windows are not supported
 - **Python 3.11 or 3.12** — `brew install python@3.11` or [python.org](https://www.python.org/downloads/)
@@ -15,7 +39,7 @@
 
 > **Apple Silicon:** Use native ARM Python, not Rosetta. Verify: `python3 -c "import platform; print(platform.machine())"` should print `arm64`.
 
-## 1. Clone & Create Virtual Environment
+### 1. Clone & Create Virtual Environment
 
 ```bash
 git clone https://github.com/StevenWang-CY/cortex.git
@@ -25,7 +49,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-## 2. Configuration (before installing)
+### 2. Configuration (before installing)
 
 Copy and edit the config file first, so the daemon has valid settings from the start:
 
@@ -35,7 +59,7 @@ cp cortex/.env.example .env
 
 Edit `.env` and set your LLM backend. Cortex uses nested environment variables with `__` as separator.
 
-### LLM Options
+#### LLM Options
 
 **Azure OpenAI** (recommended):
 
@@ -74,7 +98,7 @@ CORTEX_LLM__MODE=rule_based
 
 This mode uses built-in heuristics instead of LLM-generated interventions. Good for testing the biofeedback pipeline without any LLM setup.
 
-### Camera Configuration
+#### Camera Configuration
 
 Leave `CORTEX_CAPTURE__DEVICE_ID` commented out (the default) for automatic camera selection. Cortex will:
 - Enumerate cameras via AVFoundation
@@ -90,7 +114,7 @@ Only set it manually if auto-detection picks the wrong camera:
 CORTEX_CAPTURE__DEVICE_ID=0   # or 1, 2, etc.
 ```
 
-## 3. Install Python Dependencies
+### 3. Install Python Dependencies
 
 ```bash
 pip install -e "./cortex[dev]"
@@ -101,7 +125,7 @@ Verify:
 python -c "from cortex.libs.config.settings import get_config; print(f'LLM mode: {get_config().llm.mode}')"
 ```
 
-## 4. Initialize Storage
+### 4. Initialize Storage
 
 ```bash
 python -m cortex.scripts.seed_config --root .
@@ -109,7 +133,7 @@ python -m cortex.scripts.seed_config --root .
 
 This creates the `storage/` directory tree and a default baseline profile. Use `--dry-run` to preview.
 
-## 5. macOS Permissions
+### 5. macOS Permissions
 
 Cortex needs two macOS permissions. Both are prompted on first use:
 
@@ -121,9 +145,9 @@ To grant Input Monitoring:
 
 > **Which terminal app?** If you start the daemon from the browser extension, grant permission to **Terminal.app** (the daemon launches via Terminal.app for camera access). If you start from iTerm or another terminal, add that app instead.
 
-## 6. Start the Daemon
+### 6. Start the Daemon
 
-### From terminal (simplest)
+#### From terminal (simplest)
 
 ```bash
 source .venv/bin/activate
@@ -135,7 +159,7 @@ This starts:
 - WebSocket server on `ws://127.0.0.1:9473`
 - All capture, signal processing, state engine, and intervention services
 
-### Standalone webcam test
+#### Standalone webcam test
 
 Verify your webcam and face tracking work before running the full daemon:
 
@@ -145,9 +169,9 @@ cortex-capture
 
 Opens a window showing the webcam feed with face detection overlays, FPS counter, and quality metrics. Press `q` to quit.
 
-## 7. Browser Extension
+### 7. Browser Extension
 
-### Build & Load
+#### Build & Load
 
 ```bash
 cd cortex/apps/browser_extension
@@ -161,7 +185,7 @@ pnpm install
 
 For development with hot reload: `pnpm dev` (Chrome) or `pnpm dev:edge` (Edge).
 
-### Native Messaging (one-click Start/Stop from browser)
+#### Native Messaging (one-click Start/Stop from browser)
 
 This lets you start and stop the daemon by clicking a button in the extension popup, without touching the terminal.
 
@@ -181,7 +205,7 @@ The script automatically:
 1. macOS will ask: *"Chrome/Edge wants to control Terminal. Allow?"* — click **Allow** (one-time)
 2. A Terminal window opens when the daemon starts — this is normal (Terminal provides camera access)
 
-## 8. Calibration (recommended)
+### 8. Calibration (recommended)
 
 Sit relaxed for 2 minutes while Cortex learns your personal baselines:
 
@@ -196,7 +220,7 @@ For testing without a webcam:
 cortex-calibrate --simulate
 ```
 
-## 9. VS Code Extension (optional)
+### 9. VS Code Extension (optional)
 
 ```bash
 cd cortex/apps/vscode_extension
@@ -205,7 +229,7 @@ npm run compile
 code --install-extension cortex-somatic-0.1.0.vsix
 ```
 
-## 10. Running Tests
+### 10. Running Tests
 
 ```bash
 # All tests
@@ -258,3 +282,15 @@ Verify native ARM Python: `python3 -c "import platform; print(platform.machine()
 
 ### Accessibility / pynput errors
 Add your terminal to: `System Settings → Privacy & Security → Input Monitoring`
+
+---
+
+## Building the DMG
+
+```bash
+# Prerequisites: Python venv with cortex[dev] installed, pnpm, browser extensions built
+./cortex/scripts/build_macos_app.sh
+# Output: dist/Cortex.dmg
+```
+
+For production distribution, set `CORTEX_SIGN_IDENTITY` to your Developer ID and `CORTEX_NOTARIZE_PROFILE` to your notarytool keychain profile.

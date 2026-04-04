@@ -203,10 +203,12 @@ cortex/
 │   ├── api_gateway/         # FastAPI app, REST routes, WebSocket server
 │   └── runtime_daemon.py    # Main orchestrator
 ├── scripts/               # run_dev, calibrate, native_host, install_native_host, seed_config
+│   └── cortex.spec        # PyInstaller spec for macOS .app bundle
 ├── apps/
 │   ├── browser_extension/ # Chrome + Edge (Plasmo/React MV3)
 │   ├── vscode_extension/  # VS Code (TypeScript)
-│   └── desktop_shell/     # PySide6 tray, dashboard, overlay
+│   └── desktop_shell/     # PySide6 tray, two-tab dashboard, overlay, in-process daemon
+│       └── controller.py  # In-process daemon controller for bundled .app
 └── tests/
     ├── unit/              # 40+ per-module unit tests
     └── integration/       # Cross-service integration tests
