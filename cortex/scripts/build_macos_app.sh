@@ -137,10 +137,31 @@ fi
 SIGN_IDENTITY="${CORTEX_SIGN_IDENTITY:--}"  # Default to ad-hoc ("-")
 
 echo "→ Code signing with: ${SIGN_IDENTITY}"
-codesign --force --options runtime --deep \
-    --sign "${SIGN_IDENTITY}" \
-    --entitlements "${ENTITLEMENTS}" \
-    "${APP_PATH}"
+
+# For ad-hoc signing, we must NOT use --options runtime (hardened runtime).
+# Hardened runtime enforces library validation which rejects ad-hoc-signed
+# libraries with different (or no) Team IDs — breaking Python.framework loading.
+# For Developer ID signing, hardened runtime is required for notarization.
+if [ "${SIGN_IDENTITY}" = "-" ]; then
+    # Ad-hoc: sign all nested binaries first (same identity), no hardened runtime
+    echo "  (ad-hoc mode: signing nested binaries individually)"
+    find "${APP_PATH}" -type f \( -name "*.dylib" -o -name "*.so" \) -exec \
+        codesign --force --sign - {} \; 2>/dev/null
+    # Sign Python framework explicitly
+    PYTHON_FW=$(find "${APP_PATH}" -name "Python" -path "*/Python.framework/*" -type f 2>/dev/null | head -1)
+    if [ -n "${PYTHON_FW}" ]; then
+        codesign --force --sign - "${PYTHON_FW}"
+    fi
+    # Sign main executable and bundle
+    codesign --force --sign - --entitlements "${ENTITLEMENTS}" "${APP_PATH}/Contents/MacOS/Cortex"
+    codesign --force --sign - --entitlements "${ENTITLEMENTS}" "${APP_PATH}"
+else
+    # Developer ID: use --deep --options runtime for notarization
+    codesign --force --options runtime --deep \
+        --sign "${SIGN_IDENTITY}" \
+        --entitlements "${ENTITLEMENTS}" \
+        "${APP_PATH}"
+fi
 
 # ── Step 8: Create DMG ────────────────────────────────────────────────────
 DMG_PATH="${DIST_DIR}/Cortex.dmg"

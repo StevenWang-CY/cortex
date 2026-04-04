@@ -164,7 +164,7 @@ exe = EXE(
     console=False,
     target_arch=None,
     codesign_identity=None,
-    entitlements_file=str(CORTEX / "scripts" / "cortex_entitlements.plist"),
+    entitlements_file=None,  # Signing handled by build_macos_app.sh
 )
 
 coll = COLLECT(
