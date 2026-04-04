@@ -37,13 +37,13 @@ _HOLD_SECONDS = 7
 _EXHALE_SECONDS = 8
 _CYCLE_SECONDS = _INHALE_SECONDS + _HOLD_SECONDS + _EXHALE_SECONDS
 
-# Calming palette (per spec: soft blues/whites)
-_BG_COLOR = QColor(20, 30, 50, 220)       # Dark blue, mostly opaque
-_CARD_BG = QColor(35, 50, 75, 240)        # Slightly lighter card
-_ACCENT = QColor(100, 160, 255)            # Soft blue accent
-_TEXT_PRIMARY = QColor(230, 240, 255)      # Near-white
-_TEXT_SECONDARY = QColor(160, 180, 210)    # Soft grey-blue
-_DISMISS_COLOR = QColor(255, 255, 255, 60) # Subtle dismiss button
+# Warm palette (matching browser extension overlay design)
+_BG_COLOR = QColor(12, 12, 14, 224)        # Dark, translucent
+_CARD_BG = QColor(30, 30, 34, 240)         # Slightly lighter card
+_ACCENT = QColor(217, 119, 87)             # Terracotta #D97757
+_TEXT_PRIMARY = QColor(243, 239, 234)       # Warm off-white #F3EFEA
+_TEXT_SECONDARY = QColor(153, 149, 144)     # Warm grey #999590
+_DISMISS_COLOR = QColor(255, 255, 255, 60)  # Subtle dismiss button
 
 
 class BreathingPacer(QWidget):

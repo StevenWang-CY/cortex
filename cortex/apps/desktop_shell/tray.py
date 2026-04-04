@@ -17,12 +17,12 @@ from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 logger = logging.getLogger(__name__)
 
-# State → color mapping (soft blues/greens per spec)
+# State → color mapping (warm palette per design tokens)
 STATE_COLORS: dict[str, QColor] = {
-    "FLOW": QColor(76, 175, 80),       # Green
-    "HYPER": QColor(244, 67, 54),       # Red
-    "HYPO": QColor(100, 149, 237),      # Cornflower blue
-    "RECOVERY": QColor(255, 193, 7),    # Amber
+    "FLOW": QColor(217, 119, 87),       # Terracotta #D97757
+    "HYPER": QColor(189, 73, 50),       # Dark rust #BD4932
+    "HYPO": QColor(102, 98, 93),        # Warm grey #66625D
+    "RECOVERY": QColor(87, 160, 217),   # Calm blue #57A0D9
 }
 
 DISCONNECTED_COLOR = QColor(158, 158, 158)  # Grey
@@ -59,6 +59,7 @@ class CortexTrayIcon(QSystemTrayIcon):
     """
 
     show_dashboard_requested = Signal()
+    show_connections_requested = Signal()
     show_settings_requested = Signal()
     pause_requested = Signal()
     restore_requested = Signal()
@@ -101,6 +102,11 @@ class CortexTrayIcon(QSystemTrayIcon):
         dashboard_action = QAction("Dashboard", self._menu)
         dashboard_action.triggered.connect(self.show_dashboard_requested.emit)
         self._menu.addAction(dashboard_action)
+
+        # Connections
+        connections_action = QAction("Connect Extensions\u2026", self._menu)
+        connections_action.triggered.connect(self.show_connections_requested.emit)
+        self._menu.addAction(connections_action)
 
         # Pause/Resume
         self._pause_action = QAction("Pause", self._menu)

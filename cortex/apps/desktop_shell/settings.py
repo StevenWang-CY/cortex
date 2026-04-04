@@ -47,6 +47,30 @@ class SettingsDialog(QWidget):
         super().__init__(parent)
         self.setWindowTitle("Cortex — Settings")
         self.setMinimumSize(400, 500)
+        self.setStyleSheet("""
+            QWidget { background: #F3EFEA; }
+            QGroupBox {
+                background: #FFFFFF;
+                border: 1px solid rgba(0,0,0,0.12);
+                border-radius: 16px;
+                padding: 16px;
+                margin-top: 8px;
+                font-weight: 600;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                padding: 0 8px;
+                color: #1A1A1A;
+            }
+            QLabel { color: #66625D; }
+            QCheckBox { color: #1A1A1A; font-size: 13px; }
+            QPushButton {
+                padding: 8px 16px; border-radius: 9999px;
+                background: #1A1A1A; color: white;
+                font-size: 13px; font-weight: 500; border: none;
+            }
+            QPushButton:hover { background: #333; }
+        """)
 
         self._build_ui()
 

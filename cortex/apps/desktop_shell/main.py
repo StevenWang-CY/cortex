@@ -383,10 +383,24 @@ class CortexApp:
 
 
 def main() -> None:
-    """Entry point for the desktop shell."""
+    """Entry point for the desktop shell.
+
+    In bundled mode (``sys.frozen``), boots the daemon in-process via
+    :class:`CortexAppController`.  In dev mode, falls back to the
+    WebSocket-based :class:`CortexApp` unless ``--in-process`` is passed.
+    """
     logging.basicConfig(level=logging.INFO)
-    app = CortexApp()
-    sys.exit(app.run())
+
+    use_in_process = getattr(sys, "frozen", False) or "--in-process" in sys.argv
+
+    if use_in_process:
+        from cortex.apps.desktop_shell.controller import CortexAppController
+
+        controller = CortexAppController()
+        sys.exit(controller.run())
+    else:
+        app = CortexApp()
+        sys.exit(app.run())
 
 
 if __name__ == "__main__":

@@ -7,9 +7,10 @@ Environment variables override YAML values.
 
 from __future__ import annotations
 
+import sys
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
@@ -18,6 +19,30 @@ from pydantic_settings import (
     PydanticBaseSettingsSource,
     SettingsConfigDict,
 )
+
+
+def _is_bundled() -> bool:
+    """True when running inside a PyInstaller ``.app`` bundle."""
+    return getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
+
+
+def _bundled_env_files() -> tuple[str, ...]:
+    """Resolve .env search paths for bundled vs. dev mode."""
+    if _is_bundled():
+        app_support = Path.home() / "Library" / "Application Support" / "Cortex"
+        meipass = Path(sys._MEIPASS)  # type: ignore[attr-defined]
+        return (
+            str(app_support / ".env"),  # User overrides (highest priority)
+            str(meipass / ".env"),       # Bundled defaults
+        )
+    return (".env", ".env.local")
+
+
+def _bundled_storage_path() -> str:
+    """Default storage path: App Support in bundled mode, ./storage in dev."""
+    if _is_bundled():
+        return str(Path.home() / "Library" / "Application Support" / "Cortex" / "Data")
+    return "./storage"
 
 # =============================================================================
 # Sub-configuration Models
@@ -207,7 +232,7 @@ class LandmarksConfig(BaseModel):
 class StorageConfig(BaseModel):
     """Storage configuration."""
 
-    path: str = "./storage"
+    path: str = Field(default_factory=_bundled_storage_path)
     session_retention_days: int = 7
     feature_retention_days: int = 7
     error_retention_days: int = 90
@@ -250,7 +275,7 @@ class CortexConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="CORTEX_",
         env_nested_delimiter="__",
-        env_file=(".env", ".env.local"),
+        env_file=_bundled_env_files(),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -300,6 +325,12 @@ class _YamlDefaultsSource(PydanticBaseSettingsSource):
 
 def load_yaml_defaults() -> dict:
     """Load default configuration from YAML file."""
+    # In bundled mode, check _MEIPASS first
+    if _is_bundled():
+        bundled = Path(sys._MEIPASS) / "cortex" / "libs" / "config" / "defaults.yaml"  # type: ignore[attr-defined]
+        if bundled.exists():
+            with open(bundled) as f:
+                return yaml.safe_load(f) or {}
     defaults_path = Path(__file__).parent / "defaults.yaml"
     if defaults_path.exists():
         with open(defaults_path) as f:
@@ -313,12 +344,29 @@ def get_config() -> CortexConfig:
     Get the global Cortex configuration instance.
 
     Configuration is loaded once and cached. YAML defaults are loaded first,
-    then environment variables override any values.
+    then environment variables override any values.  In bundled mode the
+    Azure API key is loaded from the macOS Keychain if ``use_keychain`` is
+    enabled and no key is already set.
 
     Returns:
         CortexConfig: The global configuration instance.
     """
-    return CortexConfig()
+    config = CortexConfig()
+
+    # BYOK: load API key from macOS Keychain when running as .app
+    if config.llm.azure.use_keychain and not config.llm.azure.api_key:
+        try:
+            import keyring
+            key = keyring.get_password(
+                config.llm.azure.keychain_service,
+                config.llm.azure.keychain_account,
+            )
+            if key:
+                config.llm.azure.api_key = key
+        except Exception:
+            pass  # keyring not available or no entry — LLM will fall back
+
+    return config
 
 
 def reset_config() -> None:

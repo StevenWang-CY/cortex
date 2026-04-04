@@ -9,10 +9,12 @@ product instead of a collection of disconnected test surfaces.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import time
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -100,6 +102,11 @@ class CortexDaemon:
         self._shutdown = asyncio.Event()
         self._tasks: list[asyncio.Task[Any]] = []
         self._uvicorn_server: uvicorn.Server | None = None
+
+        # Desktop UI callback hooks (called from asyncio thread — recipients
+        # must handle thread-safety, e.g. via Qt signal emission).
+        self._state_callback: Callable[[dict], None] | None = None
+        self._intervention_callback: Callable[[dict], None] | None = None
 
         self._recorder = SessionRecorder(self.config.storage.path)
         self._input_hooks = InputHooks(self.config.telemetry)
@@ -242,6 +249,24 @@ class CortexDaemon:
 
         # Track previous state for copilot throttle transitions
         self._prev_state: str = "FLOW"
+
+    def set_state_callback(self, fn: Callable[[dict], None]) -> None:
+        """Register a callback invoked on every state update.
+
+        The callback receives a deep-copied dict with ``estimate`` and
+        ``biometrics`` keys.  It is called from the asyncio daemon thread;
+        the recipient is responsible for thread-safe dispatching (e.g.
+        emit a Qt signal).
+        """
+        self._state_callback = fn
+
+    def set_intervention_callback(self, fn: Callable[[dict], None]) -> None:
+        """Register a callback invoked when an intervention is sent.
+
+        The callback receives a deep-copied dict of the intervention plan
+        payload.  Same threading caveat as :meth:`set_state_callback`.
+        """
+        self._intervention_callback = fn
 
     async def start(self) -> None:
         """Start the runtime and block until shutdown."""
@@ -493,6 +518,17 @@ class CortexDaemon:
                     }
                     await self._ws_server.broadcast_state(estimate, biometrics)
 
+                    if self._state_callback is not None:
+                        self._state_callback(copy.deepcopy({
+                            "state": estimate.state,
+                            "confidence": estimate.confidence,
+                            "scores": estimate.scores.model_dump() if hasattr(estimate.scores, "model_dump") else {},
+                            "signal_quality": estimate.signal_quality.model_dump(),
+                            "dwell_seconds": estimate.dwell_seconds,
+                            "reasons": estimate.reasons,
+                            "biometrics": biometrics,
+                        }))
+
                     # v2.0: Copilot throttle on state transitions
                     if estimate.state != self._prev_state:
                         await self._copilot_throttle.on_state_change(
@@ -672,6 +708,11 @@ class CortexDaemon:
             registry.register(f"workspace_snapshot:{plan.intervention_id}", snapshot)
             self._recorder.append("intervention_plan", plan.model_dump(mode="json"))
             await self._ws_server.send_intervention(plan)
+
+            if self._intervention_callback is not None:
+                self._intervention_callback(copy.deepcopy(
+                    plan.model_dump(mode="json")
+                ))
 
             # v2.0: Start helpfulness tracking
             self._helpfulness.start_tracking(

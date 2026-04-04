@@ -120,14 +120,26 @@ def _scan_browser_for_cortex_ids(browser_root: str) -> set[str]:
     return ids
 
 
-def install() -> None:
-    """Install the native messaging host manifest for all detected browsers."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
+def install(*, project_root: str | None = None) -> None:
+    """Install the native messaging host manifest for all detected browsers.
+
+    Args:
+        project_root: Override the project root directory.  Used by the
+            desktop app's ConnectionsPanel to pass the canonical
+            ``/Applications/Cortex.app`` path instead of the running
+            (possibly translocated) path.
+    """
+    if project_root is not None:
+        script_dir = os.path.join(project_root, "Contents", "Resources", "cortex", "scripts")
+    else:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
     host_script = os.path.join(script_dir, "native_host.py")
 
     if not os.path.exists(host_script):
         print(f"Error: Native host script not found at {host_script}")
-        sys.exit(1)
+        if project_root is None:
+            sys.exit(1)
+        return
 
     # Patch shebang with absolute Python path
     python_path = _find_python()
