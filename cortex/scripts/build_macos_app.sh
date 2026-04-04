@@ -71,6 +71,15 @@ CORTEX_API__WS_PORT=9473
 ENVEOF
 fi
 
+# Rename .env.bundled → .env so PyInstaller bundles it with the right name
+# (saved back after build)
+_ORIG_ENV=""
+if [ -f "${ROOT_DIR}/.env" ]; then
+    mv "${ROOT_DIR}/.env" "${ROOT_DIR}/.env.original"
+    _ORIG_ENV="1"
+fi
+cp "${ROOT_DIR}/.env.bundled" "${ROOT_DIR}/.env"
+
 # ── Step 5: Convert SVG → .icns ───────────────────────────────────────────
 ICON_SVG="${CORTEX_DIR}/assets/logo.svg"
 ICON_ICNS="${CORTEX_DIR}/assets/cortex.icns"
@@ -204,5 +213,10 @@ echo "  DMG:  ${DMG_PATH}"
 echo ""
 echo "To test: open ${DMG_PATH}"
 
-# Clean up bundled env
+# Restore original .env
 rm -f "${ROOT_DIR}/.env.bundled"
+if [ -n "${_ORIG_ENV}" ] && [ -f "${ROOT_DIR}/.env.original" ]; then
+    mv "${ROOT_DIR}/.env.original" "${ROOT_DIR}/.env"
+else
+    rm -f "${ROOT_DIR}/.env"
+fi

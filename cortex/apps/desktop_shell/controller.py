@@ -163,10 +163,15 @@ class CortexAppController:
 
         # -- Show UI ----------------------------------------------------------
         self._tray.show()
+
+        # Always show the dashboard on launch — it's the main window
+        self._show_dashboard()
+
+        # Show onboarding on top if first launch
         if not onboarding_marker_path().exists():
             self._onboarding.show()
-        else:
-            self._show_dashboard()
+            self._onboarding.raise_()
+            self._onboarding.activateWindow()
 
         return self._app.exec()
 
