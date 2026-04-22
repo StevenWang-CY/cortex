@@ -61,6 +61,9 @@ class BlinkState:
     blink_rate_delta: float | None  # Change from baseline
     blink_suppression_score: float  # 0-1, higher = more suppression
     blink_count_60s: int  # Blinks in last 60s window
+    perclos_60s: float | None  # % frames eyes are closed in rolling window
+    mean_blink_duration_ms: float | None  # mean blink duration in milliseconds
+    ear_variance: float | None  # EAR variance over rolling window
 
 
 class BlinkDetector:
@@ -108,6 +111,8 @@ class BlinkDetector:
 
         # Blink event history (rolling window)
         self._blink_events: deque[BlinkEvent] = deque()
+        self._ear_history: deque[tuple[float, float]] = deque()
+        self._closed_frame_history: deque[tuple[float, int]] = deque()
 
         # Latest state
         self._latest_state: BlinkState | None = None
@@ -126,6 +131,21 @@ class BlinkDetector:
     def baseline_blink_rate(self, value: float) -> None:
         """Update the baseline blink rate (e.g., after calibration)."""
         self._baseline_blink_rate = max(1.0, value)
+
+    def personalize_threshold_from_ear_samples(
+        self,
+        ear_samples: list[float],
+        *,
+        percentile: float = 0.15,
+    ) -> None:
+        """Personalize EAR close threshold from calibration samples."""
+        if not ear_samples:
+            return
+        pct = float(np.clip(percentile, 0.05, 0.45))
+        thresh = float(np.percentile(np.asarray(ear_samples, dtype=np.float64), pct * 100.0))
+        # Keep recovery slightly above threshold.
+        self._config.ear_threshold = float(np.clip(thresh, 0.12, 0.30))
+        self._config.ear_recovery = max(self._config.ear_threshold + 0.03, self._config.ear_recovery)
 
     @staticmethod
     def compute_ear(eye_landmarks: NDArray[np.floating]) -> float:
@@ -186,9 +206,12 @@ class BlinkDetector:
         # Run blink state machine
         is_closed = ear_mean < self._config.ear_threshold
         self._update_blink_state_machine(ear_mean, is_closed, timestamp)
+        self._ear_history.append((timestamp, ear_mean))
+        self._closed_frame_history.append((timestamp, 1 if is_closed else 0))
 
         # Prune old events outside the history window
         self._prune_events(timestamp)
+        self._prune_histories(timestamp)
 
         # Compute blink rate and suppression
         blink_count = len(self._blink_events)
@@ -203,6 +226,10 @@ class BlinkDetector:
             blink_rate_delta = None
             suppression = 0.0
 
+        perclos = self._compute_perclos()
+        ear_variance = self._compute_ear_variance()
+        mean_blink_ms = self._compute_mean_blink_duration_ms()
+
         state = BlinkState(
             ear_left=ear_left,
             ear_right=ear_right,
@@ -212,6 +239,9 @@ class BlinkDetector:
             blink_rate_delta=blink_rate_delta,
             blink_suppression_score=suppression,
             blink_count_60s=blink_count,
+            perclos_60s=perclos,
+            mean_blink_duration_ms=mean_blink_ms,
+            ear_variance=ear_variance,
         )
 
         self._latest_state = state
@@ -265,6 +295,13 @@ class BlinkDetector:
         while self._blink_events and self._blink_events[0].timestamp < cutoff:
             self._blink_events.popleft()
 
+    def _prune_histories(self, current_time: float) -> None:
+        cutoff = current_time - self._history_window_s
+        while self._ear_history and self._ear_history[0][0] < cutoff:
+            self._ear_history.popleft()
+        while self._closed_frame_history and self._closed_frame_history[0][0] < cutoff:
+            self._closed_frame_history.popleft()
+
     def _get_tracking_duration(self, current_time: float) -> float:
         """
         Get the effective tracking duration for rate computation.
@@ -298,6 +335,28 @@ class BlinkDetector:
         score = 1.0 - (blink_rate / _BLINK_SUPPRESSION_THRESHOLD)
         return float(np.clip(score, 0.0, 1.0))
 
+    def _compute_perclos(self) -> float | None:
+        if not self._closed_frame_history:
+            return None
+        closed = sum(flag for _, flag in self._closed_frame_history)
+        total = len(self._closed_frame_history)
+        if total <= 0:
+            return None
+        return float(np.clip(closed / total, 0.0, 1.0))
+
+    def _compute_ear_variance(self) -> float | None:
+        if len(self._ear_history) < 3:
+            return None
+        vals = np.array([v for _, v in self._ear_history], dtype=np.float64)
+        return float(np.var(vals))
+
+    def _compute_mean_blink_duration_ms(self) -> float | None:
+        if not self._blink_events:
+            return None
+        frame_durations = np.array([evt.duration_frames for evt in self._blink_events], dtype=np.float64)
+        # Approximate detector frame rate at 30 FPS.
+        return float(np.mean(frame_durations) * (1000.0 / 30.0))
+
     def get_blink_features(self) -> dict[str, float | None]:
         """
         Get blink-related features for KinematicFeatures.
@@ -311,12 +370,18 @@ class BlinkDetector:
                 "blink_rate": None,
                 "blink_rate_delta": None,
                 "blink_suppression_score": None,
+                "perclos_60s": None,
+                "mean_blink_duration_ms": None,
+                "ear_variance": None,
             }
 
         return {
             "blink_rate": state.blink_rate,
             "blink_rate_delta": state.blink_rate_delta,
             "blink_suppression_score": state.blink_suppression_score,
+            "perclos_60s": state.perclos_60s,
+            "mean_blink_duration_ms": state.mean_blink_duration_ms,
+            "ear_variance": state.ear_variance,
         }
 
     def reset(self) -> None:
@@ -325,4 +390,6 @@ class BlinkDetector:
         self._min_ear_during_close = 1.0
         self._blink_in_progress = False
         self._blink_events.clear()
+        self._ear_history.clear()
+        self._closed_frame_history.clear()
         self._latest_state = None

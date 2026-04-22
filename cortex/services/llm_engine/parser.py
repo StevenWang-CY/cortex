@@ -21,7 +21,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from cortex.libs.schemas.context import TaskContext
-from cortex.libs.schemas.intervention import InterventionPlan, UIPlan
+from cortex.libs.schemas.intervention import InterventionPlan
 from cortex.services.context_engine.tab_classifier import classify_tab
 
 
@@ -206,7 +206,7 @@ def enrich_plan_with_context(
                         rec.reason = (
                             f"{tab_type.replace('_', ' ').title()} — not related to your current work"
                             if tab_type
-                            else f"Not related to your current work"
+                            else "Not related to your current work"
                         )
 
     # --- Enforce tab-type safety rules via classifier ---
@@ -263,7 +263,44 @@ def enrich_plan_with_context(
             plan.micro_steps = filtered
         # If all steps were generic, keep the originals (schema requires ≥1)
 
+    plan.causal_explanation = verify_causal_explanation(plan, context)
+
     return plan
+
+
+def verify_causal_explanation(plan: InterventionPlan, context: TaskContext) -> str:
+    """
+    Ensure causal explanation references at least one observable metric/value.
+    """
+    explanation = (plan.causal_explanation or "").strip()
+    tab_count = context.browser_context.tab_count if context.browser_context else 0
+    total_errors = context.total_errors
+    complexity = context.complexity_score
+    if explanation:
+        numeric_tokens = re.findall(r"\\d+(?:\\.\\d+)?", explanation)
+        for tok in numeric_tokens:
+            try:
+                val = float(tok)
+            except ValueError:
+                continue
+            if abs(val - float(tab_count)) < 1e-9:
+                return explanation
+            if abs(val - float(total_errors)) < 1e-9:
+                return explanation
+            if abs(val - float(complexity)) < 0.01:
+                return explanation
+
+    if tab_count > 0:
+        return (
+            f"Cortex detected high workspace load with {tab_count} open tabs "
+            f"at complexity {complexity:.2f}."
+        )
+    if total_errors > 0:
+        return (
+            f"Cortex detected sustained debugging friction with {total_errors} active errors "
+            f"at complexity {complexity:.2f}."
+        )
+    return f"Cortex detected sustained overload patterns at complexity {complexity:.2f}."
 
 
 # ---------------------------------------------------------------------------

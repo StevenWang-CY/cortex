@@ -28,16 +28,34 @@ from PySide6.QtWidgets import (
 )
 
 from cortex.apps.desktop_shell.tokens import (
+    BTN_ACCENT_QSS,
+    BTN_PRIMARY_QSS,
+    CARD_QSS,
     CX_ACCENT,
+    CX_ACCENT_DIM,
     CX_BG,
+    CX_BORDER,
     CX_BORDER_DEFAULT,
+    CX_FONT_BRAND,
+    CX_FONT_SANS,
+    CX_SUCCESS,
+    CX_SUCCESS_DIM,
     CX_SURFACE,
     CX_TEXT,
     CX_TEXT_SECONDARY,
     CX_TEXT_TERTIARY,
+    PAGE_TITLE_QSS,
+    RADIUS_LG,
     RADIUS_MD,
+    RADIUS_SM,
+    RADIUS_FULL,
+    SP2,
+    SP3,
     SP4,
     SP5,
+    SP6,
+    SP8,
+    SP10,
 )
 from cortex.libs.config.settings import get_config
 
@@ -105,19 +123,29 @@ class OnboardingWindow(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Cortex Setup")
-        self.setMinimumSize(520, 480)
+        self.setMinimumSize(520, 520)
         self.setStyleSheet(f"background: {CX_BG};")
         self._build_ui()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(SP5 * 2, SP5 * 2, SP5 * 2, SP5 * 2)
-        layout.setSpacing(SP4)
+        layout.setContentsMargins(SP10, SP8, SP10, SP8)
+        layout.setSpacing(SP5)
 
-        title = QLabel("Set Up Cortex")
+        # ── Welcome header ───────────────────────────────────────────
+        brand = QLabel("Cortex")
+        brand.setStyleSheet(
+            f"font-family: {CX_FONT_BRAND}; "
+            f"font-style: italic; font-size: 16px; font-weight: 400; "
+            f"color: {CX_ACCENT}; background: transparent;"
+        )
+        layout.addWidget(brand)
+        layout.addSpacing(SP2)
+
+        title = QLabel("Welcome to Cortex")
         title.setStyleSheet(
-            f"font-family: Georgia, serif; font-size: 28px; "
-            f"font-weight: 700; color: {CX_TEXT};"
+            f"font-family: {CX_FONT_SANS}; font-size: 24px; "
+            f"font-weight: 700; color: {CX_TEXT}; background: transparent;"
         )
         layout.addWidget(title)
 
@@ -126,106 +154,145 @@ class OnboardingWindow(QWidget):
             "your browser and editor. This only takes a minute."
         )
         subtitle.setWordWrap(True)
-        subtitle.setStyleSheet(f"color: {CX_TEXT_SECONDARY}; font-size: 13px;")
+        subtitle.setStyleSheet(
+            f"font-family: {CX_FONT_SANS}; font-size: 13px; "
+            f"color: {CX_TEXT_SECONDARY}; background: transparent; "
+            f"line-height: 1.5;"
+        )
         layout.addWidget(subtitle)
+        layout.addSpacing(SP3)
 
         # Step 1: Camera
         layout.addWidget(self._make_step(
-            "1. Camera",
+            "Camera Access",
+            "Required for biometric sensing via webcam.",
             "Granted" if check_camera_permission() else "Not granted",
             check_camera_permission(),
             "Grant Access",
             request_camera_permission,
+            "1",
         ))
 
         # Step 2: Accessibility
         layout.addWidget(self._make_step(
-            "2. Accessibility",
+            "Accessibility",
+            "Required for keyboard and mouse tracking.",
             "Granted" if check_accessibility_permission() else "Not granted",
             check_accessibility_permission(),
             "Grant Access",
             request_accessibility_permission,
+            "2",
         ))
 
         # Step 3: LLM backend
         layout.addWidget(self._make_llm_step())
 
         # Step 4: Extensions
-        ext_frame = self._make_section("4. Connect Extensions")
+        ext_frame = self._make_section("4", "Connect Extensions")
         ext_layout = ext_frame.layout()
         hint = QLabel(
             "You can connect your browser and editor now, or later "
-            "from the Connections panel in the tray menu."
+            "from the Connections panel."
         )
         hint.setWordWrap(True)
-        hint.setStyleSheet(f"font-size: 13px; color: {CX_TEXT_SECONDARY};")
+        hint.setStyleSheet(
+            f"font-family: {CX_FONT_SANS}; font-size: 12px; "
+            f"color: {CX_TEXT_SECONDARY}; border: none; line-height: 1.4;"
+        )
         ext_layout.addWidget(hint)
         layout.addWidget(ext_frame)
 
-        # Buttons
+        # ── Finish button ────────────────────────────────────────────
+        layout.addStretch()
+
         btn_row = QHBoxLayout()
         btn_row.addStretch()
 
-        finish_btn = QPushButton("Finish Setup")
-        finish_btn.setStyleSheet(f"""
-            QPushButton {{
-                padding: 10px 24px; border-radius: 9999px;
-                background: {CX_TEXT}; color: white;
-                font-size: 14px; font-weight: 500; border: none;
-            }}
-            QPushButton:hover {{ background: #333; }}
-        """)
+        finish_btn = QPushButton("Get Started")
+        finish_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        finish_btn.setFixedHeight(40)
+        finish_btn.setMinimumWidth(140)
+        finish_btn.setStyleSheet(BTN_PRIMARY_QSS)
         finish_btn.clicked.connect(self.completed.emit)
         btn_row.addWidget(finish_btn)
         layout.addLayout(btn_row)
-        layout.addStretch()
 
-    def _make_section(self, title: str) -> QFrame:
+    def _make_section(self, number: str, title: str) -> QFrame:
         frame = QFrame()
-        frame.setStyleSheet(f"""
-            QFrame {{
-                background: {CX_SURFACE};
-                border: 1px solid {CX_BORDER_DEFAULT};
-                border-radius: {RADIUS_MD}px;
-            }}
-        """)
+        frame.setStyleSheet(f"QFrame {{ {CARD_QSS} }}")
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(SP4, SP4, SP4, SP4)
+        layout.setSpacing(SP3)
+
+        header = QHBoxLayout()
+        header.setSpacing(SP3)
+
+        num_label = QLabel(number)
+        num_label.setFixedSize(24, 24)
+        num_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        num_label.setStyleSheet(
+            f"font-family: {CX_FONT_SANS}; font-size: 12px; font-weight: 600; "
+            f"color: {CX_ACCENT}; background: {CX_ACCENT_DIM}; "
+            f"border: none; border-radius: 12px;"
+        )
+        header.addWidget(num_label)
+
         heading = QLabel(title)
         heading.setStyleSheet(
-            f"font-size: 14px; font-weight: 600; color: {CX_TEXT}; border: none;"
+            f"font-family: {CX_FONT_SANS}; font-size: 14px; "
+            f"font-weight: 600; color: {CX_TEXT}; border: none;"
         )
-        layout.addWidget(heading)
+        header.addWidget(heading)
+        header.addStretch()
+        layout.addLayout(header)
+
         return frame
 
     def _make_step(
         self,
         title: str,
+        description: str,
         status_text: str,
         granted: bool,
         btn_text: str,
         action: object,
+        number: str,
     ) -> QFrame:
-        frame = self._make_section(title)
+        frame = self._make_section(number, title)
         layout = frame.layout()
 
+        desc = QLabel(description)
+        desc.setWordWrap(True)
+        desc.setStyleSheet(
+            f"font-family: {CX_FONT_SANS}; font-size: 12px; "
+            f"color: {CX_TEXT_SECONDARY}; border: none; line-height: 1.4;"
+        )
+        layout.addWidget(desc)
+
         row = QHBoxLayout()
+
+        if granted:
+            status_color = CX_SUCCESS
+            status_bg = CX_SUCCESS_DIM
+        else:
+            status_color = CX_TEXT_TERTIARY
+            status_bg = "rgba(0,0,0,0.04)"
+
         status = QLabel(status_text)
-        color = CX_ACCENT if granted else CX_TEXT_TERTIARY
-        status.setStyleSheet(f"font-size: 13px; color: {color}; border: none;")
+        status.setStyleSheet(
+            f"font-family: {CX_FONT_SANS}; font-size: 11px; font-weight: 500; "
+            f"color: {status_color}; background: {status_bg}; "
+            f"border: none; border-radius: {RADIUS_SM}px; "
+            f"padding: 3px 8px;"
+        )
         row.addWidget(status)
         row.addStretch()
 
         if not granted:
             btn = QPushButton(btn_text)
-            btn.setStyleSheet(f"""
-                QPushButton {{
-                    padding: 6px 14px; border-radius: 9999px;
-                    background: {CX_ACCENT}; color: white;
-                    font-size: 12px; font-weight: 500; border: none;
-                }}
-                QPushButton:hover {{ background: #C46547; }}
-            """)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFixedHeight(32)
+            btn.setStyleSheet(BTN_ACCENT_QSS)
             btn.clicked.connect(action)
             row.addWidget(btn)
 
@@ -233,8 +300,16 @@ class OnboardingWindow(QWidget):
         return frame
 
     def _make_llm_step(self) -> QFrame:
-        frame = self._make_section("3. LLM Backend")
+        frame = self._make_section("3", "LLM Backend")
         layout = frame.layout()
+
+        desc = QLabel("Choose how Cortex generates intervention content.")
+        desc.setWordWrap(True)
+        desc.setStyleSheet(
+            f"font-family: {CX_FONT_SANS}; font-size: 12px; "
+            f"color: {CX_TEXT_SECONDARY}; border: none; line-height: 1.4;"
+        )
+        layout.addWidget(desc)
 
         config = get_config()
         current_mode = config.llm.mode
@@ -244,34 +319,43 @@ class OnboardingWindow(QWidget):
         mode_combo.setCurrentText(current_mode)
         mode_combo.setStyleSheet(f"""
             QComboBox {{
-                padding: 6px 12px; border: 1px solid {CX_BORDER_DEFAULT};
-                border-radius: 8px; font-size: 13px; background: white;
+                font-family: {CX_FONT_SANS};
+                font-size: 13px;
+                color: {CX_TEXT};
+                background: {CX_SURFACE};
+                border: 1px solid {CX_BORDER_DEFAULT};
+                border-radius: {RADIUS_SM}px;
+                padding: 8px 12px;
             }}
         """)
         layout.addWidget(mode_combo)
 
         # API key input (shown for Azure)
         key_row = QHBoxLayout()
+        key_row.setSpacing(SP2)
         self._key_input = QLineEdit()
         self._key_input.setPlaceholderText("Azure OpenAI API key")
         self._key_input.setEchoMode(QLineEdit.EchoMode.Password)
         self._key_input.setStyleSheet(f"""
             QLineEdit {{
-                padding: 6px 12px; border: 1px solid {CX_BORDER_DEFAULT};
-                border-radius: 8px; font-size: 13px; background: white;
+                font-family: {CX_FONT_SANS};
+                font-size: 13px;
+                color: {CX_TEXT};
+                background: {CX_SURFACE};
+                border: 1px solid {CX_BORDER_DEFAULT};
+                border-radius: {RADIUS_SM}px;
+                padding: 8px 12px;
+            }}
+            QLineEdit:focus {{
+                border: 1.5px solid {CX_ACCENT};
             }}
         """)
         key_row.addWidget(self._key_input)
 
-        save_key_btn = QPushButton("Save to Keychain")
-        save_key_btn.setStyleSheet(f"""
-            QPushButton {{
-                padding: 6px 14px; border-radius: 9999px;
-                background: {CX_ACCENT}; color: white;
-                font-size: 12px; font-weight: 500; border: none;
-            }}
-            QPushButton:hover {{ background: #C46547; }}
-        """)
+        save_key_btn = QPushButton("Save")
+        save_key_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_key_btn.setFixedHeight(36)
+        save_key_btn.setStyleSheet(BTN_ACCENT_QSS)
         save_key_btn.clicked.connect(self._save_api_key)
         key_row.addWidget(save_key_btn)
 
@@ -293,16 +377,22 @@ class OnboardingWindow(QWidget):
 
         if has_key:
             saved_label = QLabel("API key found in Keychain")
-            saved_label.setStyleSheet(f"font-size: 12px; color: {CX_ACCENT}; border: none;")
+            saved_label.setStyleSheet(
+                f"font-family: {CX_FONT_SANS}; font-size: 12px; "
+                f"color: {CX_SUCCESS}; border: none;"
+            )
             layout.addWidget(saved_label)
 
         hint = QLabel(
-            "Azure: Enter your API key (stored in macOS Keychain).\n"
-            "Local: Requires Ollama running on localhost.\n"
-            "Rule-based: No API needed (offline mode)."
+            "Azure: API key stored in macOS Keychain  \u00b7  "
+            "Local: Requires Ollama  \u00b7  "
+            "Rule-based: Offline mode"
         )
         hint.setWordWrap(True)
-        hint.setStyleSheet(f"font-size: 12px; color: {CX_TEXT_TERTIARY}; border: none;")
+        hint.setStyleSheet(
+            f"font-family: {CX_FONT_SANS}; font-size: 11px; "
+            f"color: {CX_TEXT_TERTIARY}; border: none; line-height: 1.4;"
+        )
         layout.addWidget(hint)
 
         # Toggle key input visibility

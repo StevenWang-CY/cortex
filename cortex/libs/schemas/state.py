@@ -99,6 +99,16 @@ class StateEstimate(BaseModel):
     stress_integral: float | None = Field(
         None, ge=0.0, description="Cumulative stress load integral (ms*s)"
     )
+    calibrated_probabilities: StateScores | None = Field(
+        None,
+        description="Calibrated class probabilities (optional ML/rule ensemble output)",
+    )
+    classifier_source: Literal["rule", "ml", "ensemble"] | None = Field(
+        None, description="Classifier source used for this estimate"
+    )
+    classifier_alpha: float | None = Field(
+        None, ge=0.0, le=1.0, description="Ensemble weight on ML branch when used"
+    )
 
     @property
     def is_overwhelmed(self) -> bool:
@@ -157,6 +167,24 @@ class UserBaselines(BaseModel):
     )
     calibrated_at: datetime | None = Field(
         None, description="When calibration was performed"
+    )
+    metric_distributions: dict[str, dict[str, float]] = Field(
+        default_factory=dict,
+        description="Per-metric distribution stats (mu, sigma, p10, p90)",
+    )
+    circadian_hr_cosinor: dict[str, float] = Field(
+        default_factory=dict,
+        description="Optional circadian cosinor model params (mesor, amplitude, acrophase)",
+    )
+    rolling_rebaseline_seconds: float = Field(
+        60.0,
+        ge=0.0,
+        description="Default rolling morning re-baseline capture window in seconds",
+    )
+    ew_decay_half_life_days: float = Field(
+        7.0,
+        gt=0.0,
+        description="Exponential-decay half life for baseline updates",
     )
 
     @property

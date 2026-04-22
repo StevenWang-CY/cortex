@@ -89,22 +89,30 @@ class FeatureFusion:
         # Physio features (dimensions 1-3 + respiration)
         hr = None
         hrv_rmssd = None
+        hrv_sdnn = None
         hr_delta = None
+        physio_sqi = None
         respiration_rate = None
         if self._physio is not None and self._physio.valid:
             hr = self._physio.pulse_bpm
             hrv_rmssd = self._physio.pulse_variability_proxy
+            hrv_sdnn = self._physio.hrv_sdnn
             hr_delta = self._physio.hr_delta_5s
+            physio_sqi = self._physio.physio_sqi
             respiration_rate = self._physio.respiration_rate_bpm
 
         # Kinematic features (dimensions 4-7)
         blink_rate = None
         blink_rate_delta = None
+        perclos_60s = None
+        ear_variance = None
         shoulder_drop_ratio = None
         forward_lean_angle = None
         if self._kinematics is not None:
             blink_rate = self._kinematics.blink_rate
             blink_rate_delta = self._kinematics.blink_rate_delta
+            perclos_60s = self._kinematics.perclos_60s
+            ear_variance = self._kinematics.ear_variance
             shoulder_drop_ratio = self._kinematics.shoulder_drop_ratio
             if self._kinematics.forward_lean_score is not None:
                 # Convert 0-1 score to 0-45 degree range for FeatureVector
@@ -115,28 +123,38 @@ class FeatureFusion:
         mouse_velocity_variance = 0.0
         click_frequency = 0.0
         keystroke_interval_variance = 0.0
+        correction_rate_per_100_keys = None
         tab_switch_frequency = 0.0
+        scroll_back_rate_per_min = None
         if self._telemetry is not None:
             mouse_velocity_mean = self._telemetry.mouse_velocity_mean
             mouse_velocity_variance = self._telemetry.mouse_velocity_variance
             click_frequency = self._telemetry.click_frequency
             keystroke_interval_variance = self._telemetry.keystroke_interval_variance
+            correction_rate_per_100_keys = self._telemetry.correction_rate_per_100_keys
             tab_switch_frequency = self._telemetry.window_switch_rate
+            scroll_back_rate_per_min = self._telemetry.scroll_back_rate_per_min
 
         vector = FeatureVector(
             timestamp=now,
             hr=hr,
             hrv_rmssd=hrv_rmssd,
+            hrv_sdnn=hrv_sdnn,
             hr_delta=hr_delta,
+            physio_sqi=physio_sqi,
             blink_rate=blink_rate,
             blink_rate_delta=blink_rate_delta,
+            perclos_60s=perclos_60s,
+            ear_variance=ear_variance,
             shoulder_drop_ratio=shoulder_drop_ratio,
             forward_lean_angle=forward_lean_angle,
             mouse_velocity_mean=mouse_velocity_mean,
             mouse_velocity_variance=mouse_velocity_variance,
             click_frequency=click_frequency,
             keystroke_interval_variance=keystroke_interval_variance,
+            correction_rate_per_100_keys=correction_rate_per_100_keys,
             tab_switch_frequency=tab_switch_frequency,
+            scroll_back_rate_per_min=scroll_back_rate_per_min,
             respiration_rate=respiration_rate,
         )
 

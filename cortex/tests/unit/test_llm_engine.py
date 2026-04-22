@@ -567,6 +567,7 @@ async def test_remote_generate_plan_retries_when_state_changes():
 @pytest.mark.asyncio
 async def test_remote_generate_plan_opens_tunnel_automatically():
     config = LLMConfig(mode="remote", timeout_seconds=5.0)
+    config.remote.ssh_tunnel = True
     client = RemoteQwenClient(config=config)
     ctx = _make_context()
     state = _make_state()

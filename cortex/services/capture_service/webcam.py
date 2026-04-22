@@ -18,8 +18,8 @@ import asyncio
 import logging
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 import cv2
 import numpy as np
@@ -225,6 +225,7 @@ def _iter_camera_candidates(config: CaptureConfig) -> Iterable[CameraSelection]:
     )
 
     candidates: list[CameraSelection] = []
+    names: list[str] = []
 
     if config.device_id is None and is_macos():
         names = _list_macos_video_device_names()
@@ -347,8 +348,9 @@ def _request_macos_camera_permission() -> bool:
     if not is_macos():
         return True
     try:
-        import objc
         import threading
+
+        import objc
 
         objc.loadBundle(
             "AVFoundation",
@@ -653,7 +655,7 @@ class WebcamCapture:
             return None
         try:
             return await asyncio.wait_for(self._queue.get(), timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return None
 
     def get_frame_nowait(self) -> CapturedFrame | None:

@@ -68,6 +68,11 @@ class SuggestedAction(BaseModel):
         default_factory=dict,
         description="Action-specific metadata (tab_title, search_query, etc.)",
     )
+    catalog_id: str | None = Field(
+        None,
+        max_length=80,
+        description="Optional curated intervention catalog identifier",
+    )
 
 
 class ErrorAnalysis(BaseModel):
@@ -218,6 +223,10 @@ class InterventionPlan(BaseModel):
         "observe", "suggest", "preview", "reversible_act", "autonomous_act"
     ] = Field(
         "suggest", description="Consent ladder level for this intervention"
+    )
+    plan_warnings: list[str] = Field(
+        default_factory=list,
+        description="Non-fatal validation or grounding warnings to surface in debug UI",
     )
 
     @property

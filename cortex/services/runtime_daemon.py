@@ -52,8 +52,10 @@ from cortex.libs.store import RedisStore, InMemoryStore
 from cortex.services.consent.ladder import ConsentLadder
 from cortex.services.consent.policy import ConsentPolicy
 from cortex.services.eval.bandit import ContextualBandit
+from cortex.services.eval.amip import AMIPPolicy
 from cortex.services.eval.helpfulness import HelpfulnessTracker
 from cortex.services.eval.tab_relevance import TabRelevanceTracker
+from cortex.services.eval.causal_report import generate_daily_causal_report
 from cortex.services.handover.briefing import MorningBriefing
 from cortex.services.handover.detector import ShutdownDetector
 from cortex.services.handover.snapshot import HandoverSnapshot
@@ -123,11 +125,18 @@ class CortexDaemon:
 
         self._capture_pipeline = CapturePipeline(self.config.capture)
         self._roi_extractor = RoiExtractor(self.config.landmarks)
-        self._pulse_estimator = PulseEstimator(fs=float(self.config.capture.fps))
+        self._pulse_estimator = PulseEstimator(
+            fs=float(self.config.capture.fps),
+            nsqi_threshold=self.config.signal.rppg.nsqi_threshold,
+            min_cardiac_snr_db=self.config.signal.rppg.min_cardiac_snr_db,
+            hrv_min_window_seconds=float(self.config.signal.rppg.hrv_min_window_seconds),
+            hrv_min_valid_ibi=self.config.signal.rppg.hrv_min_valid_ibi,
+        )
         self._blink_detector = BlinkDetector(
             blink_config=self.config.signal.blink,
             landmarks_config=self.config.landmarks,
         )
+        self._blink_detector.baseline_blink_rate = self._load_baselines().blink_rate_baseline
         self._head_pose = HeadPoseEstimator(
             frame_width=self.config.capture.width,
             frame_height=self.config.capture.height,
@@ -165,6 +174,9 @@ class CortexDaemon:
             blink_rate=None,
             blink_rate_delta=None,
             blink_suppression_score=None,
+            perclos_60s=None,
+            mean_blink_duration_ms=None,
+            ear_variance=None,
             head_pitch=None,
             head_yaw=None,
             head_roll=None,
@@ -238,6 +250,18 @@ class CortexDaemon:
 
         # Contextual bandit
         self._bandit = ContextualBandit(store=self._store)
+        self._amip = AMIPPolicy(
+            storage_root=self.config.storage.path,
+            n_features=8,
+            tau0=self.config.eval.amip.tau0,
+            tau_min=self.config.eval.amip.tau_min,
+            epsilon_explore=self.config.eval.amip.epsilon_explore,
+            epsilon_explore_after_500=self.config.eval.amip.epsilon_explore_after_500,
+            stress_ratio_threshold=self.config.eval.amip.safety_floor_stress_ratio,
+        )
+        self._last_policy_decision_id: str | None = None
+        self._last_policy_arm: str | None = None
+        self._last_policy_propensity: dict[str, float] | None = None
 
         # Copilot throttle
         self._copilot_throttle = CopilotThrottle(ws_server=self._ws_server)
@@ -289,6 +313,10 @@ class CortexDaemon:
             asyncio.create_task(self._context_loop(), name="cortex-context-loop"),
             asyncio.create_task(self._longitudinal_loop(), name="cortex-longitudinal-loop"),
         ]
+        if self.config.eval.causal_report.enabled:
+            self._tasks.append(
+                asyncio.create_task(self._causal_report_loop(), name="cortex-causal-report-loop")
+            )
 
         # v2.0: Check for morning briefing on startup
         await self._check_morning_briefing()
@@ -358,6 +386,7 @@ class CortexDaemon:
             "consent_ladder": self._consent_ladder,
             "helpfulness_tracker": self._helpfulness,
             "contextual_bandit": self._bandit,
+            "amip_policy": self._amip,
             "copilot_throttle": self._copilot_throttle,
         }.items():
             registry.register(name, service)
@@ -387,7 +416,15 @@ class CortexDaemon:
         if not baseline_path.exists():
             return UserBaselines()
         try:
-            return UserBaselines.model_validate_json(baseline_path.read_text())
+            loaded = UserBaselines.model_validate_json(baseline_path.read_text())
+            if not loaded.metric_distributions:
+                # Backward-compatible migration for legacy baseline files.
+                loaded.metric_distributions = {
+                    "hr": {"mu": loaded.hr_baseline, "sigma": loaded.hr_std, "p10": loaded.hr_baseline, "p90": loaded.hr_baseline},
+                    "hrv_rmssd": {"mu": loaded.hrv_baseline, "sigma": max(6.0, loaded.hrv_baseline * 0.2), "p10": loaded.hrv_baseline, "p90": loaded.hrv_baseline},
+                    "blink_rate": {"mu": loaded.blink_rate_baseline, "sigma": max(3.0, loaded.blink_rate_baseline * 0.2), "p10": loaded.blink_rate_baseline, "p90": loaded.blink_rate_baseline},
+                }
+            return loaded
         except Exception:
             logger.exception("Failed to load baselines from %s", baseline_path)
             return UserBaselines()
@@ -422,8 +459,19 @@ class CortexDaemon:
             output.frame_meta.timestamp - self._last_physio_update
         ) >= stride_seconds:
             rgb_window = np.array(self._rgb_history, dtype=np.float64)
-            bvp = extract_bvp(rgb_window, fs=float(self.config.capture.fps))
-            self._pulse_estimator.process_window(bvp, timestamp=output.frame_meta.timestamp)
+            bvp = extract_bvp(
+                rgb_window,
+                algorithm=self.config.signal.rppg.backend,
+                fs=float(self.config.capture.fps),
+                model_path=self.config.signal.rppg.model_path,
+            )
+            head_jitter_deg = float(roi_frame.head_jitter_px) * (45.0 / max(1.0, float(self.config.capture.width)))
+            self._pulse_estimator.process_window(
+                bvp,
+                timestamp=output.frame_meta.timestamp,
+                head_jitter_deg=head_jitter_deg,
+                face_presence_ratio=1.0 if output.frame_meta.face_detected else 0.0,
+            )
             self._latest_physio = self._pulse_estimator.get_features(output.frame_meta.timestamp)
             registry.register("latest_physio", self._latest_physio)
             self._feature_fusion.update_physio(self._latest_physio, timestamp=output.frame_meta.timestamp)
@@ -436,6 +484,9 @@ class CortexDaemon:
             blink_rate=blink.blink_rate,
             blink_rate_delta=blink.blink_rate_delta,
             blink_suppression_score=blink.blink_suppression_score,
+            perclos_60s=blink.perclos_60s,
+            mean_blink_duration_ms=blink.mean_blink_duration_ms,
+            ear_variance=blink.ear_variance,
             head_pitch=pose.pitch,
             head_yaw=pose.yaw,
             head_roll=pose.roll,
@@ -474,6 +525,23 @@ class CortexDaemon:
                 except Exception:
                     logger.exception("Context loop error")
                 await asyncio.sleep(5.0)
+        except asyncio.CancelledError:
+            pass
+
+    async def _causal_report_loop(self) -> None:
+        """Generate nightly causal report from AMIP policy logs."""
+        try:
+            while True:
+                try:
+                    now = time.localtime()
+                    target_hour = self.config.eval.causal_report.nightly_hour_local
+                    if now.tm_hour == target_hour and now.tm_min < 5:
+                        generate_daily_causal_report(self.config.storage.path)
+                        await asyncio.sleep(300.0)
+                        continue
+                except Exception:
+                    logger.debug("Failed generating causal report", exc_info=True)
+                await asyncio.sleep(60.0)
         except asyncio.CancelledError:
             pass
 
@@ -538,9 +606,25 @@ class CortexDaemon:
 
                     context = self._latest_context
                     if context is not None:
+                        telemetry_for_trigger = registry.get("latest_telemetry")
+                        typing_burst_seconds = 0.0
+                        if telemetry_for_trigger is not None:
+                            kb_burst = float(getattr(telemetry_for_trigger, "keyboard_burst_score", 0.0))
+                            if kb_burst >= 0.8:
+                                typing_burst_seconds = self.config.intervention.receptivity_typing_burst_seconds
+                        hour_now = time.localtime().tm_hour
+                        within_work_hours = (
+                            self.config.intervention.receptivity_work_hours_start
+                            <= hour_now
+                            < self.config.intervention.receptivity_work_hours_end
+                        )
                         decision = self._trigger_policy.evaluate(
                             estimate,
                             context_complexity=context.complexity_score,
+                            mic_active=False,
+                            fullscreen_active=False,
+                            typing_burst_seconds=typing_burst_seconds,
+                            within_work_hours=within_work_hours,
                             current_time=timestamp,
                         )
                         registry.register("latest_trigger_decision", decision)
@@ -612,13 +696,46 @@ class CortexDaemon:
                             and self._active_intervention_id is None
                             and estimate.signal_quality.acceptable
                         ):
-                            # v2.0: Consult bandit for intervention type
                             bandit_features = np.array(
                                 self._build_bandit_features(estimate, context),
                                 dtype=np.float64,
                             )
-                            selected_arm = self._bandit.select_arm(bandit_features)
-                            template_name = self._arm_to_template(selected_arm)
+                            if self.config.eval.policy == "amip":
+                                amip_decision = self._amip.choose_action(
+                                    bandit_features,
+                                    confidence=decision.confidence,
+                                    receptive=not decision.receptivity_blocked,
+                                    stress_ratio=self._stress_tracker.load_ratio,
+                                )
+                                self._last_policy_decision_id = amip_decision.decision_id
+                                self._last_policy_arm = amip_decision.action
+                                self._last_policy_propensity = dict(amip_decision.probabilities)
+                                template_name = self._policy_arm_to_template(amip_decision.action)
+                                if amip_decision.action == "no_action":
+                                    await asyncio.sleep(0.5)
+                                    continue
+                            elif self.config.eval.policy == "uniform":
+                                arm_name = np.random.choice(
+                                    [
+                                        "workspace_simplify",
+                                        "task_decompose",
+                                        "breath_box",
+                                        "nature_break",
+                                        "flow_shield",
+                                        "defusion_prompt",
+                                        "circuit_breaker",
+                                    ]
+                                ).item()
+                                self._last_policy_decision_id = None
+                                self._last_policy_arm = arm_name
+                                self._last_policy_propensity = None
+                                template_name = self._policy_arm_to_template(arm_name)
+                            else:
+                                selected_arm = self._bandit.select_arm(bandit_features)
+                                template_name = self._arm_to_template(selected_arm)
+                                self._last_policy_decision_id = None
+                                self._last_policy_arm = self._bandit.get_arm_label(selected_arm)
+                                self._last_policy_propensity = None
 
                             # Run intervention in background so the state
                             # loop keeps updating while the LLM responds.
@@ -656,11 +773,14 @@ class CortexDaemon:
 
             plan = await asyncio.wait_for(
                 self._llm_client.generate_intervention_plan(
-                    context, estimate,
+                    context,
+                    estimate,
+                    template_name=template_name,
                 ),
                 timeout=self.config.llm.timeout_seconds + 5.0,
             )
             plan = enrich_plan_with_context(plan, context)
+            self._self_critique_plan(plan)
 
             # Staleness check: suppress if student genuinely recovered
             current_state = registry.get("latest_state_estimate")
@@ -682,10 +802,15 @@ class CortexDaemon:
                             self._active_intervention_id = None
                             return
 
-            validation, commands = prepare_plan(plan)
+            tab_count = None
+            if hasattr(context, "browser_context") and context.browser_context is not None:
+                tab_count = len(context.browser_context.all_tabs)
+            validation, commands = prepare_plan(plan, tab_count=tab_count)
             if not validation.is_valid:
                 logger.warning("Rejected intervention plan %s: %s", plan.intervention_id, validation.errors)
                 return
+            if validation.warnings:
+                plan.plan_warnings.extend(validation.warnings)
 
             # v2.0: Check consent ladder
             consent_level_map = {
@@ -720,6 +845,9 @@ class CortexDaemon:
                 intervention_type=plan.level,
                 state=estimate.state,
                 confidence=estimate.confidence,
+                decision_id=self._last_policy_decision_id,
+                propensity=self._last_policy_propensity,
+                policy_arm=self._last_policy_arm,
             )
         except asyncio.TimeoutError:
             logger.warning("Intervention LLM call timed out")
@@ -743,10 +871,15 @@ class CortexDaemon:
         """Trigger a special v2.0 intervention (breathing, active recall, rabbit hole)."""
         if self._active_intervention_id is not None:
             return  # Don't stack interventions
+        self._last_policy_decision_id = None
+        self._last_policy_arm = None
+        self._last_policy_propensity = None
 
         try:
             plan = await self._llm_client.generate_intervention_plan(
-                context, estimate,
+                context,
+                estimate,
+                template_name=template_name,
             )
             plan = enrich_plan_with_context(plan, context)
             self._active_intervention_id = plan.intervention_id
@@ -754,6 +887,27 @@ class CortexDaemon:
             await self._ws_server.send_message(ws_type, plan.model_dump(mode="json"))
         except Exception:
             logger.exception("Failed to trigger special intervention (%s)", template_name)
+
+    @staticmethod
+    def _self_critique_plan(plan: InterventionPlan) -> None:
+        """
+        Drop destructive-looking actions/language before execution.
+        """
+        blocked_tokens = ("discard", "delete file", "delete project", "wipe", "close application")
+        sanitized_actions = []
+        for action in plan.suggested_actions:
+            text = f"{action.label} {action.reason} {action.action_type}".lower()
+            if any(tok in text for tok in blocked_tokens):
+                plan.plan_warnings.append(
+                    f"dropped action {action.action_id}: destructive self-critique filter"
+                )
+                continue
+            sanitized_actions.append(action)
+        plan.suggested_actions = sanitized_actions
+        plan.micro_steps = [
+            step for step in plan.micro_steps
+            if not any(tok in step.lower() for tok in blocked_tokens)
+        ] or plan.micro_steps[:1]
 
     async def _handle_restore_updates(self, estimate: Any, timestamp: float) -> None:
         outcomes = await self._restore_manager.update(estimate, current_time=timestamp)
@@ -792,11 +946,17 @@ class CortexDaemon:
         action = str(payload.get("action", "dismissed"))
         if not intervention_id:
             return
+        context = self._latest_context
 
         if action == "engaged":
             outcome = await self._restore_manager.engage(intervention_id)
             # v2.0: Record consent approval (using intervention level as action_type)
             await self._consent_ladder.record_approval("intervention")
+            self._trigger_policy.record_outcome(
+                dismissed=False,
+                confidence=float(getattr(outcome, "recovery_confidence", 0.0) or 0.0),
+                context_complexity=float(context.complexity_score) if context and hasattr(context, "complexity_score") else 0.0,
+            )
         elif action == "snoozed":
             self._trigger_policy.activate_quiet_mode(duration_minutes=15)
             outcome = await self._restore_manager.snooze(intervention_id)
@@ -804,6 +964,11 @@ class CortexDaemon:
             outcome = await self._restore_manager.dismiss(intervention_id)
             if action == "dismissed":
                 self._trigger_policy.record_dismissal()
+                self._trigger_policy.record_outcome(
+                    dismissed=True,
+                    confidence=float(getattr(outcome, "recovery_confidence", 0.0) or 0.0),
+                    context_complexity=float(context.complexity_score) if context and hasattr(context, "complexity_score") else 0.0,
+                )
                 # v2.0: Record consent rejection
                 await self._consent_ladder.record_rejection("intervention")
 
@@ -833,8 +998,11 @@ class CortexDaemon:
                 if context:
                     features = self._build_bandit_features(state_estimate, context)
                     bandit_features = np.array(features, dtype=np.float64)
-                    # Find arm index from template — use 0 as default
-                    self._bandit.update(bandit_features, 0, reward)
+                    if self.config.eval.policy == "amip" and self._last_policy_decision_id:
+                        self._amip.update_reward(self._last_policy_decision_id, reward)
+                    elif self.config.eval.policy != "uniform":
+                        # Back-compat LinUCB update path.
+                        self._bandit.update(bandit_features, 0, reward)
 
         # Record tab relevance feedback (skip if per-tab feedback was already received)
         await self._record_tab_relevance_feedback(action, outcome, intervention_id)
@@ -960,6 +1128,21 @@ class CortexDaemon:
             6: None,  # no intervention
         }
         return arm_templates.get(arm_index)
+
+    @staticmethod
+    def _policy_arm_to_template(arm_name: str) -> str | None:
+        """Map AMIP policy arm names to template names."""
+        mapping = {
+            "no_action": None,
+            "workspace_simplify": "code_focus_reduction",
+            "task_decompose": "micro_step_planner",
+            "breath_box": "breathing_overlay",
+            "nature_break": "pre_break_warning",
+            "flow_shield": "calm_overlay_writer",
+            "defusion_prompt": "rabbit_hole",
+            "circuit_breaker": "breathing_overlay",
+        }
+        return mapping.get(arm_name)
 
     async def _check_morning_briefing(self) -> None:
         """Check for yesterday's handover and generate morning briefing."""

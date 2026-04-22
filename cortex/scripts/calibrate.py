@@ -23,6 +23,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
+
 from cortex.libs.config.settings import get_config
 from cortex.libs.schemas.state import UserBaselines
 
@@ -306,6 +308,17 @@ def compute_baselines(
     def _safe_stdev(data: list[float], default: float) -> float:
         return statistics.stdev(data) if len(data) >= 2 else default
 
+    def _distribution(data: list[float], default_mu: float, default_sigma: float) -> dict[str, float]:
+        if not data:
+            return {"mu": default_mu, "sigma": default_sigma, "p10": default_mu, "p90": default_mu}
+        arr = sorted(data)
+        return {
+            "mu": float(statistics.mean(arr)),
+            "sigma": float(statistics.stdev(arr)) if len(arr) >= 2 else float(default_sigma),
+            "p10": float(np.percentile(arr, 10)),
+            "p90": float(np.percentile(arr, 90)),
+        }
+
     hr_values = samples.get("hr", [])
     hrv_values = samples.get("hrv", [])
     blink_values = samples.get("blink_rate", [])
@@ -322,6 +335,17 @@ def compute_baselines(
         mouse_variance_baseline=_safe_mean(mouse_var, 10000.0),
         shoulder_neutral_y=_safe_mean(shoulder_values, 0.5),
         calibrated_at=datetime.now(timezone.utc),
+        metric_distributions={
+            "hr": _distribution(hr_values, 72.0, 5.0),
+            "hrv_rmssd": _distribution(hrv_values, 50.0, 10.0),
+            "blink_rate": _distribution(blink_values, 17.0, 4.0),
+            "mouse_velocity": _distribution(mouse_vel, 500.0, 120.0),
+            "mouse_variance": _distribution(mouse_var, 10000.0, 2500.0),
+            "resp_rate": _distribution(samples.get("resp", []), 15.0, 3.0),
+        },
+        circadian_hr_cosinor={},
+        rolling_rebaseline_seconds=60.0,
+        ew_decay_half_life_days=7.0,
     )
 
     return baselines

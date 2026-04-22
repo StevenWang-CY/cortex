@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 
 from cortex.libs.schemas.intervention import InterventionPlan
 
-
 # ---------------------------------------------------------------------------
 # Adapter command types
 # ---------------------------------------------------------------------------
@@ -89,9 +88,9 @@ def validate_plan(plan: InterventionPlan) -> ValidationResult:
     elif step_count > 3:
         errors.append(f"has {step_count} micro_steps (max 3)")
 
-    # Check for destructive actions
+    # Check for destructive actions (keep as warning; dropped during sanitization).
     if plan.is_destructive:
-        errors.append("plan contains destructive actions")
+        warnings.append("plan contains destructive actions (dropped)")
 
     # Check required fields are non-empty
     if not plan.situation_summary.strip():
@@ -131,6 +130,38 @@ def validate_plan(plan: InterventionPlan) -> ValidationResult:
         errors=errors,
         warnings=warnings,
     )
+
+
+def sanitize_plan_actions(
+    plan: InterventionPlan,
+    *,
+    tab_count: int | None = None,
+) -> list[str]:
+    """
+    Drop invalid suggested actions in-place and return non-fatal warnings.
+    """
+    warnings: list[str] = []
+    sanitized = []
+    for action in plan.suggested_actions:
+        if action.tab_index is not None and tab_count is not None:
+            if action.tab_index < 0 or action.tab_index >= tab_count:
+                warnings.append(
+                    f"dropped action {action.action_id}: tab_index {action.tab_index} out of range"
+                )
+                continue
+        if action.action_type in {"close_tab", "bookmark_and_close"} and not action.reversible:
+            warnings.append(
+                f"dropped action {action.action_id}: close action must be reversible"
+            )
+            continue
+        if any(tok in action.label.lower() for tok in ("discard", "delete project", "delete file")):
+            warnings.append(
+                f"dropped action {action.action_id}: destructive label content"
+            )
+            continue
+        sanitized.append(action)
+    plan.suggested_actions = sanitized
+    return warnings
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +220,8 @@ def map_hide_targets(plan: InterventionPlan) -> list[AdapterCommand]:
 
 def prepare_plan(
     plan: InterventionPlan,
+    *,
+    tab_count: int | None = None,
 ) -> tuple[ValidationResult, list[AdapterCommand]]:
     """
     Validate and map a plan in one call.
@@ -197,7 +230,10 @@ def prepare_plan(
         Tuple of (validation_result, adapter_commands).
         Commands are empty if validation fails.
     """
+    dropped_warnings = sanitize_plan_actions(plan, tab_count=tab_count)
     result = validate_plan(plan)
+    if dropped_warnings:
+        result.warnings.extend(dropped_warnings)
     if not result.is_valid:
         return result, []
     commands = map_hide_targets(plan)

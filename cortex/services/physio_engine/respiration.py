@@ -17,6 +17,7 @@ References:
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -67,6 +68,8 @@ class RespirationEstimator:
         filter_order: int = _RESP_FILTER_ORDER,
         apnea_resp_threshold: float = _APNEA_RESP_THRESHOLD,
         apnea_blink_threshold: float = _APNEA_BLINK_SUPPRESSION_THRESHOLD,
+        apnea_sustain_seconds: float = 30.0,
+        resp_baseline_bpm: float | None = None,
     ) -> None:
         self._fs = fs
         self._low_hz = low_hz
@@ -74,7 +77,10 @@ class RespirationEstimator:
         self._filter_order = filter_order
         self._apnea_resp_threshold = apnea_resp_threshold
         self._apnea_blink_threshold = apnea_blink_threshold
+        self._apnea_sustain_seconds = apnea_sustain_seconds
+        self._resp_baseline_bpm = resp_baseline_bpm
         self._latest: RespirationEstimate | None = None
+        self._low_resp_started_at: float | None = None
 
     @property
     def latest_estimate(self) -> RespirationEstimate | None:
@@ -85,6 +91,8 @@ class RespirationEstimator:
         self,
         bvp_window: NDArray[np.float64],
         blink_suppression: float = 0.0,
+        motion_proxy_signal: NDArray[np.float64] | None = None,
+        timestamp: float | None = None,
     ) -> RespirationEstimate:
         """
         Extract respiratory rate from a BVP signal window.
@@ -112,71 +120,48 @@ class RespirationEstimator:
             logger.debug("BVP window too short for respiratory filtering: %d samples", n_samples)
             return self._empty_estimate()
 
-        # Step 1: Bandpass filter for respiratory band
-        try:
-            resp_signal = bandpass_filter(
-                bvp_window,
-                low_hz=self._low_hz,
-                high_hz=self._high_hz,
-                fs=self._fs,
-                order=self._filter_order,
-            )
-        except ValueError:
-            logger.debug("Respiratory bandpass filter failed")
+        bvp_rate, bvp_conf, bvp_freq = self._estimate_rate_from_signal(bvp_window)
+        motion_rate, motion_conf, motion_freq = self._estimate_rate_from_signal(motion_proxy_signal)
+
+        if bvp_rate is None and motion_rate is None:
             return self._empty_estimate()
 
-        # Step 2: Welch PSD in respiratory band
-        # Use nperseg = min(256, n_samples) for good frequency resolution
-        nperseg = min(256, n_samples)
-        try:
-            freqs, psd = welch(
-                resp_signal,
-                fs=self._fs,
-                nperseg=nperseg,
-                noverlap=nperseg // 2,
-            )
-        except Exception:
-            logger.debug("Welch PSD failed for respiratory signal")
-            return self._empty_estimate()
+        if motion_rate is None or motion_conf <= 0.0:
+            resp_rate_bpm = bvp_rate
+            confidence = bvp_conf
+            dominant_freq = bvp_freq
+        elif bvp_rate is None or bvp_conf <= 0.0:
+            resp_rate_bpm = motion_rate
+            confidence = motion_conf
+            dominant_freq = motion_freq
+        else:
+            total_w = bvp_conf + motion_conf
+            if total_w <= 1e-9:
+                resp_rate_bpm = bvp_rate
+                confidence = bvp_conf
+                dominant_freq = bvp_freq
+            else:
+                resp_rate_bpm = (bvp_rate * bvp_conf + motion_rate * motion_conf) / total_w
+                confidence = float(np.clip(total_w / 2.0, 0.0, 1.0))
+                dominant_freq = (resp_rate_bpm or 0.0) / 60.0
 
-        # Step 3: Find peak in respiratory band
-        resp_mask = (freqs >= self._low_hz) & (freqs <= self._high_hz)
-        if not np.any(resp_mask):
-            return self._empty_estimate()
+        now = timestamp if timestamp is not None else time.monotonic()
+        personal_threshold = self._apnea_resp_threshold
+        if self._resp_baseline_bpm is not None and self._resp_baseline_bpm > 0:
+            personal_threshold = min(personal_threshold, 0.5 * self._resp_baseline_bpm)
 
-        resp_freqs = freqs[resp_mask]
-        resp_psd = psd[resp_mask]
-
-        peak_idx = np.argmax(resp_psd)
-        dominant_freq = float(resp_freqs[peak_idx])
-        peak_power = float(resp_psd[peak_idx])
-
-        # Convert frequency to breaths per minute
-        resp_rate_bpm = dominant_freq * 60.0
-
-        # Step 4: Confidence from spectral peak prominence
-        # Ratio of peak power to total power in respiratory band
-        total_power = float(np.sum(resp_psd))
-        if total_power < 1e-12:
-            return self._empty_estimate()
-
-        # Also consider ratio to full-band power for quality
-        full_total = float(np.sum(psd))
-        in_band_ratio = total_power / full_total if full_total > 1e-12 else 0.0
-        peak_prominence = peak_power / total_power
-
-        # Confidence combines peak prominence and in-band power ratio
-        confidence = float(np.clip(
-            0.6 * peak_prominence + 0.4 * in_band_ratio,
-            0.0, 1.0,
-        ))
-
-        # Step 5: Check apnea conditions
-        apnea_detected = (
-            resp_rate_bpm < self._apnea_resp_threshold
+        apnea_detected = False
+        if (
+            resp_rate_bpm is not None
+            and resp_rate_bpm < personal_threshold
             and blink_suppression >= self._apnea_blink_threshold
-            and confidence > 0.3  # Don't flag on noisy signals
-        )
+            and confidence > 0.3
+        ):
+            if self._low_resp_started_at is None:
+                self._low_resp_started_at = now
+            apnea_detected = (now - self._low_resp_started_at) >= self._apnea_sustain_seconds
+        else:
+            self._low_resp_started_at = None
 
         estimate = RespirationEstimate(
             resp_rate_bpm=resp_rate_bpm,
@@ -198,6 +183,54 @@ class RespirationEstimator:
         self._latest = estimate
         return estimate
 
+    def _estimate_rate_from_signal(
+        self,
+        signal: NDArray[np.float64] | None,
+    ) -> tuple[float | None, float, float | None]:
+        """Estimate respiration rate and confidence from one signal path."""
+        if signal is None or len(signal) < 4:
+            return None, 0.0, None
+        from scipy.signal import welch
+
+        try:
+            resp_signal = bandpass_filter(
+                signal,
+                low_hz=self._low_hz,
+                high_hz=self._high_hz,
+                fs=self._fs,
+                order=self._filter_order,
+            )
+        except ValueError:
+            return None, 0.0, None
+
+        nperseg = min(256, len(resp_signal))
+        try:
+            freqs, psd = welch(resp_signal, fs=self._fs, nperseg=nperseg, noverlap=nperseg // 2)
+        except Exception:
+            return None, 0.0, None
+
+        resp_mask = (freqs >= self._low_hz) & (freqs <= self._high_hz)
+        if not np.any(resp_mask):
+            return None, 0.0, None
+        resp_freqs = freqs[resp_mask]
+        resp_psd = psd[resp_mask]
+        peak_idx = int(np.argmax(resp_psd))
+        dominant_freq = float(resp_freqs[peak_idx])
+        peak_power = float(resp_psd[peak_idx])
+        total_power = float(np.sum(resp_psd))
+        if total_power <= 1e-12:
+            return None, 0.0, None
+        full_total = float(np.sum(psd))
+        in_band_ratio = total_power / full_total if full_total > 1e-12 else 0.0
+        peak_prominence = peak_power / total_power
+        confidence = float(np.clip(0.6 * peak_prominence + 0.4 * in_band_ratio, 0.0, 1.0))
+        return dominant_freq * 60.0, confidence, dominant_freq
+
+    def update_baseline(self, resp_baseline_bpm: float | None) -> None:
+        """Update personalized respiratory baseline."""
+        self._resp_baseline_bpm = resp_baseline_bpm
+
     def reset(self) -> None:
         """Reset estimator state."""
         self._latest = None
+        self._low_resp_started_at = None

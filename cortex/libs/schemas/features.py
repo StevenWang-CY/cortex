@@ -39,6 +39,31 @@ class PhysioFeatures(BaseModel):
     pulse_variability_proxy: float | None = Field(
         None, ge=0.0, description="RMSSD of inter-beat intervals in ms"
     )
+    hrv_sdnn: float | None = Field(
+        None, ge=0.0, description="SDNN of inter-beat intervals in ms"
+    )
+    hrv_pnn50: float | None = Field(
+        None, ge=0.0, le=1.0, description="Fraction of adjacent IBI deltas > 50ms"
+    )
+    hrv_sd1: float | None = Field(
+        None, ge=0.0, description="Poincare SD1 in ms"
+    )
+    hrv_sd2: float | None = Field(
+        None, ge=0.0, description="Poincare SD2 in ms"
+    )
+    hrv_lf_hf_ratio: float | None = Field(
+        None, ge=0.0, description="LF/HF ratio from Lomb-Scargle PSD"
+    )
+    hrv_sample_entropy: float | None = Field(
+        None, ge=0.0, description="Sample entropy of IBI sequence"
+    )
+    physio_sqi: float | None = Field(
+        None, ge=0.0, le=1.0, description="Composite physiological signal-quality index"
+    )
+    physio_sqi_components: dict[str, float] = Field(
+        default_factory=dict,
+        description="Named SQI components (nsqi, snr, motion, face_presence)",
+    )
     hr_delta_5s: float | None = Field(
         None, description="Heart rate change over last 5 seconds (BPM/5s)"
     )
@@ -59,6 +84,15 @@ class KinematicFeatures(BaseModel):
     )
     blink_suppression_score: float | None = Field(
         None, ge=0.0, le=1.0, description="Blink suppression indicator (0-1)"
+    )
+    perclos_60s: float | None = Field(
+        None, ge=0.0, le=1.0, description="PERCLOS over rolling 60 second window"
+    )
+    mean_blink_duration_ms: float | None = Field(
+        None, ge=0.0, description="Mean blink duration in milliseconds"
+    )
+    ear_variance: float | None = Field(
+        None, ge=0.0, description="Variance of eye aspect ratio over rolling window"
     )
     head_pitch: float | None = Field(None, description="Head pitch angle in degrees")
     head_yaw: float | None = Field(None, description="Head yaw angle in degrees")
@@ -102,6 +136,9 @@ class TelemetryFeatures(BaseModel):
     backspace_density: float = Field(
         ..., ge=0.0, le=1.0, description="Ratio of backspaces to total keystrokes"
     )
+    correction_rate_per_100_keys: float | None = Field(
+        None, ge=0.0, description="Backspace + undo corrections per 100 keypresses"
+    )
     inactivity_seconds: float = Field(
         ..., ge=0.0, description="Seconds since last input event"
     )
@@ -111,6 +148,9 @@ class TelemetryFeatures(BaseModel):
     tab_count: int | None = Field(None, ge=0, description="Number of open browser tabs")
     scroll_reversal_score: float | None = Field(
         None, ge=0.0, le=1.0, description="Scroll direction reversal score"
+    )
+    scroll_back_rate_per_min: float | None = Field(
+        None, ge=0.0, description="Upward reread scroll bursts per minute"
     )
 
 
@@ -131,8 +171,14 @@ class FeatureVector(BaseModel):
     hrv_rmssd: float | None = Field(
         None, ge=0.0, description="HRV proxy - RMSSD in ms"
     )
+    hrv_sdnn: float | None = Field(
+        None, ge=0.0, description="SDNN in ms"
+    )
     hr_delta: float | None = Field(
         None, description="Heart rate gradient over 5s"
+    )
+    physio_sqi: float | None = Field(
+        None, ge=0.0, le=1.0, description="Composite physiological SQI"
     )
 
     # Kinematic features (4-7)
@@ -141,6 +187,12 @@ class FeatureVector(BaseModel):
     )
     blink_rate_delta: float | None = Field(
         None, description="Blink rate change from baseline"
+    )
+    perclos_60s: float | None = Field(
+        None, ge=0.0, le=1.0, description="PERCLOS in rolling 60s window"
+    )
+    ear_variance: float | None = Field(
+        None, ge=0.0, description="EAR variance over rolling window"
     )
     shoulder_drop_ratio: float | None = Field(
         None, ge=0.0, le=1.0, description="Shoulder drop from baseline"
@@ -160,8 +212,14 @@ class FeatureVector(BaseModel):
     keystroke_interval_variance: float = Field(
         0.0, ge=0.0, description="Keystroke interval variance (ms^2)"
     )
+    correction_rate_per_100_keys: float | None = Field(
+        None, ge=0.0, description="Backspace + undo corrections per 100 keys"
+    )
     tab_switch_frequency: float = Field(
         0.0, ge=0.0, description="Tab/window switches per minute"
+    )
+    scroll_back_rate_per_min: float | None = Field(
+        None, ge=0.0, description="Upward reread scroll bursts per minute"
     )
     respiration_rate: float | None = Field(
         None, ge=0.0, le=60.0, description="Respiration rate (breaths/min)"

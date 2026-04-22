@@ -45,13 +45,22 @@ class AzureOpenAIClient:
         context: TaskContext,
         state: StateEstimate,
         constraints: SimplificationConstraints | None = None,
+        *,
+        template_name: str | None = None,
+        extra_context: str = "",
     ) -> InterventionPlan:
         """Generate an intervention plan via Azure OpenAI."""
         cached = self._cache.get(context, state, constraints)
         if cached is not None:
             return cached
 
-        messages = build_messages(context, state, constraints)
+        messages = build_messages(
+            context,
+            state,
+            constraints,
+            template_name=template_name,
+            extra_context=extra_context,
+        )
         last_error: Exception | None = None
 
         for attempt in range(1, self._max_retries + 1):
@@ -72,7 +81,13 @@ class AzureOpenAIClient:
 
         if self._config.fallback_mode == "local_ollama":
             try:
-                return await self._ollama.generate_intervention_plan(context, state, constraints)
+                return await self._ollama.generate_intervention_plan(
+                    context,
+                    state,
+                    constraints,
+                    template_name=template_name,
+                    extra_context=extra_context,
+                )
             except Exception as exc:  # pragma: no cover - defensive fallback
                 last_error = exc
                 logger.warning("Azure fallback to Ollama failed: %s", exc)
@@ -141,6 +156,8 @@ class AzureOpenAIClient:
                 self._config.azure.max_completion_tokens, 2048
             ),
             "stream": False,
+            # Keep broadly compatible JSON mode for Azure deployments; strict
+            # schema validation still runs in parse_and_validate().
             "response_format": {"type": "json_object"},
         }
 
@@ -178,4 +195,3 @@ class AzureOpenAIClient:
                 return "".join(parts)
 
         raise LLMError("Empty content in Azure response")
-

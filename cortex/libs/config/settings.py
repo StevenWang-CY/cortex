@@ -64,7 +64,7 @@ class LLMRemoteConfig(BaseModel):
 
     host: str = ""
     port: int = 8800
-    ssh_tunnel: bool = True
+    ssh_tunnel: bool = False
     ssh_user: str = ""
 
 
@@ -135,10 +135,14 @@ class StateConfig(BaseModel):
 
     entry_threshold: float = 0.85
     exit_threshold: float = 0.70
-    hyper_dwell_seconds: int = 8
-    hypo_dwell_seconds: int = 15
-    flow_dwell_seconds: int = 15
+    hyper_dwell_seconds: int = 30
+    hypo_dwell_seconds: int = 60
+    flow_dwell_seconds: int = 120
     ema_alpha: float = 0.3
+    ml_enabled: bool = False
+    ml_min_labeled_episodes: int = 30
+    ml_alpha_max: float = 0.7
+    ml_alpha_full_at_episodes: int = 150
     weights: StateWeights = Field(default_factory=StateWeights)
 
 
@@ -157,6 +161,17 @@ class InterventionConfig(BaseModel):
     timeout_minutes: int = 5
     dismissal_threshold_bump: float = 0.05
     dismissal_decay_hours: int = 1
+    receptivity_enforced: bool = True
+    receptivity_typing_burst_seconds: float = 10.0
+    receptivity_block_fullscreen: bool = True
+    receptivity_block_if_mic_active: bool = True
+    receptivity_work_hours_start: int = 7
+    receptivity_work_hours_end: int = 22
+    adaptive_threshold_enabled: bool = True
+    adaptive_threshold_min: float = 0.75
+    adaptive_threshold_max: float = 0.95
+    dismissal_model_enabled: bool = True
+    dismissal_model_threshold: float = 0.6
 
 
 class HandoverConfig(BaseModel):
@@ -189,10 +204,19 @@ class RPPGSignalConfig(BaseModel):
 
     window_seconds: int = 10
     stride_seconds: int = 1
+    backend: Literal["pos", "chrom", "green", "tscan"] = "pos"
+    model_path: str = "cortex/models/tscan.onnx"
     bandpass_low: float = 0.7
     bandpass_high: float = 3.5
     bandpass_order: int = 4
     welch_resolution: float = 0.1
+    nsqi_threshold: float = 0.293
+    min_cardiac_snr_db: float = 2.0
+    min_resp_snr_db: float = 1.5
+    max_face_loss_ratio: float = 0.20
+    max_head_jitter_deg: float = 7.5
+    hrv_min_window_seconds: int = 60
+    hrv_min_valid_ibi: int = 30
 
 
 class BlinkSignalConfig(BaseModel):
@@ -201,6 +225,8 @@ class BlinkSignalConfig(BaseModel):
     ear_threshold: float = 0.21
     ear_recovery: float = 0.25
     min_frames: int = 3
+    perclos_threshold: float = 0.2
+    personalize_ear_percentile: float = 0.15
 
 
 class PostureSignalConfig(BaseModel):
@@ -216,6 +242,34 @@ class SignalConfig(BaseModel):
     rppg: RPPGSignalConfig = Field(default_factory=RPPGSignalConfig)
     blink: BlinkSignalConfig = Field(default_factory=BlinkSignalConfig)
     posture: PostureSignalConfig = Field(default_factory=PostureSignalConfig)
+
+
+class AMIPConfig(BaseModel):
+    """Adaptive microrandomized intervention policy configuration."""
+
+    enabled: bool = True
+    tau0: float = 1.0
+    tau_min: float = 0.1
+    epsilon_explore: float = 0.05
+    epsilon_explore_after_500: float = 0.01
+    safety_floor_stress_ratio: float = 1.0
+    reward_window_seconds: int = 300
+
+
+class CausalReportConfig(BaseModel):
+    """Nightly causal reporting configuration."""
+
+    enabled: bool = True
+    bootstrap_samples: int = 300
+    nightly_hour_local: int = 2
+
+
+class EvalConfig(BaseModel):
+    """Evaluation and policy-learning configuration."""
+
+    policy: Literal["amip", "greedy", "uniform"] = "amip"
+    amip: AMIPConfig = Field(default_factory=AMIPConfig)
+    causal_report: CausalReportConfig = Field(default_factory=CausalReportConfig)
 
 
 class LandmarksConfig(BaseModel):
@@ -294,6 +348,7 @@ class CortexConfig(BaseSettings):
     debug: DebugConfig = Field(default_factory=DebugConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     redis: RedisConfig = Field(default_factory=RedisConfig)
+    eval: EvalConfig = Field(default_factory=EvalConfig)
 
     @classmethod
     def settings_customise_sources(

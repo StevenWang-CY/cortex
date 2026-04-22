@@ -133,6 +133,9 @@ class RemoteQwenClient:
         context: TaskContext,
         state: StateEstimate,
         constraints: SimplificationConstraints | None = None,
+        *,
+        template_name: str | None = None,
+        extra_context: str = "",
     ) -> InterventionPlan:
         """Generate an intervention plan via the remote Qwen model."""
         # Check cache first
@@ -140,7 +143,13 @@ class RemoteQwenClient:
         if cached is not None:
             return cached
 
-        messages = build_messages(context, state, constraints)
+        messages = build_messages(
+            context,
+            state,
+            constraints,
+            template_name=template_name,
+            extra_context=extra_context,
+        )
 
         # Retry loop
         last_error: Exception | None = None
@@ -203,6 +212,7 @@ class RemoteQwenClient:
             "max_tokens": self._config.max_tokens,
             "temperature": self._config.temperature,
             "stream": False,
+            "response_format": {"type": "json_object"},
         }
 
         timeout = httpx.Timeout(

@@ -6,7 +6,7 @@ llm:
   remote:
     host: ""
     port: 8800
-    ssh_tunnel: true
+    ssh_tunnel: false
     ssh_user: ""
   local:
     host: localhost
@@ -43,12 +43,16 @@ state:
   exit_threshold: 0.70
 
   # Dwell times (seconds before state transition)
-  hyper_dwell_seconds: 8
-  hypo_dwell_seconds: 15
-  flow_dwell_seconds: 15
+  hyper_dwell_seconds: 30
+  hypo_dwell_seconds: 60
+  flow_dwell_seconds: 120
 
   # Exponential moving average alpha for smoothing
   ema_alpha: 0.3
+  ml_enabled: false
+  ml_min_labeled_episodes: 30
+  ml_alpha_max: 0.7
+  ml_alpha_full_at_episodes: 150
 
   # Overwhelm score weights (should sum to 1.0)
   weights:
@@ -79,6 +83,17 @@ intervention:
   # Adaptive threshold adjustment on dismissal
   dismissal_threshold_bump: 0.05
   dismissal_decay_hours: 1
+  receptivity_enforced: true
+  receptivity_typing_burst_seconds: 10.0
+  receptivity_block_fullscreen: true
+  receptivity_block_if_mic_active: true
+  receptivity_work_hours_start: 7
+  receptivity_work_hours_end: 22
+  adaptive_threshold_enabled: true
+  adaptive_threshold_min: 0.75
+  adaptive_threshold_max: 0.95
+  dismissal_model_enabled: true
+  dismissal_model_threshold: 0.6
 
 handover:
   late_hour: 23
@@ -97,15 +112,26 @@ signal:
   rppg:
     window_seconds: 10
     stride_seconds: 1
+    backend: pos
+    model_path: cortex/models/tscan.onnx
     bandpass_low: 0.7
     bandpass_high: 3.5
     bandpass_order: 4
     welch_resolution: 0.1
+    nsqi_threshold: 0.293
+    min_cardiac_snr_db: 2.0
+    min_resp_snr_db: 1.5
+    max_face_loss_ratio: 0.20
+    max_head_jitter_deg: 7.5
+    hrv_min_window_seconds: 60
+    hrv_min_valid_ibi: 30
 
   blink:
     ear_threshold: 0.21
     ear_recovery: 0.25
     min_frames: 3
+    perclos_threshold: 0.2
+    personalize_ear_percentile: 0.15
 
   posture:
     shoulder_drop_threshold: 0.15
@@ -137,3 +163,18 @@ logging:
   level: INFO
   format: json
   include_timestamp: true
+
+eval:
+  policy: amip
+  amip:
+    enabled: true
+    tau0: 1.0
+    tau_min: 0.1
+    epsilon_explore: 0.05
+    epsilon_explore_after_500: 0.01
+    safety_floor_stress_ratio: 1.0
+    reward_window_seconds: 300
+  causal_report:
+    enabled: true
+    bootstrap_samples: 300
+    nightly_hour_local: 2

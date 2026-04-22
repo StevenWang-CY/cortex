@@ -53,6 +53,9 @@ class LocalOllamaClient:
         context: TaskContext,
         state: StateEstimate,
         constraints: SimplificationConstraints | None = None,
+        *,
+        template_name: str | None = None,
+        extra_context: str = "",
     ) -> InterventionPlan:
         """Generate an intervention plan via local Ollama."""
         # Check cache first
@@ -60,7 +63,13 @@ class LocalOllamaClient:
         if cached is not None:
             return cached
 
-        messages = build_messages(context, state, constraints)
+        messages = build_messages(
+            context,
+            state,
+            constraints,
+            template_name=template_name,
+            extra_context=extra_context,
+        )
 
         last_error: Exception | None = None
         for attempt in range(1, self._max_retries + 1):
@@ -113,6 +122,7 @@ class LocalOllamaClient:
             "model": self._model,
             "messages": messages,
             "stream": False,
+            "format": "json",
             "options": {
                 "num_predict": self._config.max_tokens,
                 "temperature": self._config.temperature,

@@ -132,11 +132,13 @@ class FeatureAggregator:
         kb_burst = self._compute_keyboard_burst_score(key_events)
         ks_variance = self._compute_keystroke_interval_variance(key_events)
         bs_density = self._compute_backspace_density(key_events)
+        correction_rate = self._compute_correction_rate_per_100_keys(key_events)
         inactivity = self._compute_inactivity(
             mouse_moves, mouse_clicks, mouse_scrolls, key_events, now
         )
         switch_rate = self._compute_window_switch_rate(window_events, window)
         scroll_rev = self._compute_scroll_reversal_score(mouse_scrolls)
+        scroll_back_rate = self._compute_scroll_back_rate_per_min(mouse_scrolls, window)
         thrashing = self._focus_graph.compute_thrashing_score(current_time=now)
 
         # Tab count from external provider
@@ -158,10 +160,12 @@ class FeatureAggregator:
             keyboard_burst_score=kb_burst,
             keystroke_interval_variance=ks_variance,
             backspace_density=bs_density,
+            correction_rate_per_100_keys=correction_rate,
             inactivity_seconds=inactivity,
             window_switch_rate=switch_rate,
             tab_count=tab_count,
             scroll_reversal_score=scroll_rev,
+            scroll_back_rate_per_min=scroll_back_rate,
         )
 
     @property
@@ -355,6 +359,18 @@ class FeatureAggregator:
         return float(np.clip(backspaces / len(typing_keys), 0.0, 1.0))
 
     @staticmethod
+    def _compute_correction_rate_per_100_keys(key_events: list[KeyEvent]) -> float:
+        """Compute correction events per 100 typed keys."""
+        presses = [k for k in key_events if k.pressed]
+        if not presses:
+            return 0.0
+        typing_keys = [k for k in presses if k.key_type in (KeyType.REGULAR, KeyType.BACKSPACE)]
+        if not typing_keys:
+            return 0.0
+        corrections = sum(1 for k in typing_keys if k.key_type == KeyType.BACKSPACE)
+        return float((corrections / len(typing_keys)) * 100.0)
+
+    @staticmethod
     def _compute_inactivity(
         moves: list[MouseMoveEvent],
         clicks: list[MouseClickEvent],
@@ -420,3 +436,14 @@ class FeatureAggregator:
 
         total_pairs = len(scrolls) - 1
         return float(np.clip(reversals / total_pairs, 0.0, 1.0))
+
+    @staticmethod
+    def _compute_scroll_back_rate_per_min(
+        scrolls: list[MouseScrollEvent],
+        window_seconds: float,
+    ) -> float:
+        """Compute upward scroll-back rate per minute."""
+        if window_seconds <= 1e-6 or not scrolls:
+            return 0.0
+        upward = sum(1 for s in scrolls if s.direction == ScrollDirection.UP)
+        return float((upward * 60.0) / window_seconds)

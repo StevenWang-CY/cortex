@@ -38,6 +38,8 @@ _LEVEL_NAMES = {
 
 # Default approvals needed to escalate to next level
 _DEFAULT_ESCALATION_THRESHOLD = 5
+_RECENCY_WINDOW_SECONDS = 30 * 24 * 3600
+_DECAY_HALF_LIFE_SECONDS = 10 * 24 * 3600
 
 
 class ConsentDecision:
@@ -127,6 +129,8 @@ class ConsentLadder:
                 "total_approvals": 0,
                 "last_approval": None,
                 "last_rejection": None,
+                "approval_timestamps": [],
+                "rejection_timestamps": [],
             }
         return self._action_states[action_type]
 
@@ -189,15 +193,24 @@ class ConsentLadder:
         state["approvals"] += 1
         state["total_approvals"] += 1
         state["last_approval"] = time.time()
+        state.setdefault("approval_timestamps", []).append(state["last_approval"])
+        self._prune_old_timestamps(state)
 
-        # Check for escalation
+        # Check for escalation (recency-weighted trust, no recent reversals).
+        now = time.time()
+        weighted_approvals = self._weighted_recent_approvals(state, now)
+        recent_rejections = len(state.get("rejection_timestamps", []))
+        recent_approvals = len(state.get("approval_timestamps", []))
         if (
-            state["approvals"] >= self._escalation_threshold
+            recent_approvals >= self._escalation_threshold
+            and weighted_approvals >= (self._escalation_threshold * 0.8)
+            and recent_rejections == 0
             and state["level"] < AUTONOMOUS_ACT
         ):
             old_level = state["level"]
             state["level"] = min(state["level"] + 1, AUTONOMOUS_ACT)
             state["approvals"] = 0  # Reset counter for next level
+            state["approval_timestamps"] = []  # Recency window resets per earned tier.
             logger.info(
                 "Consent escalated for '%s': %s → %s (after %d approvals)",
                 action_type,
@@ -218,6 +231,8 @@ class ConsentLadder:
         state = self._get_state(action_type)
         state["rejections"] += 1
         state["last_rejection"] = time.time()
+        state.setdefault("rejection_timestamps", []).append(state["last_rejection"])
+        self._prune_old_timestamps(state)
 
         # 3 rejections at current level → de-escalate
         if state["rejections"] >= 3 and state["level"] > SUGGEST:
@@ -233,6 +248,22 @@ class ConsentLadder:
             )
 
         await self._persist()
+
+    def _prune_old_timestamps(self, state: dict) -> None:
+        now = time.time()
+        cutoff = now - _RECENCY_WINDOW_SECONDS
+        approvals = [t for t in state.get("approval_timestamps", []) if t >= cutoff]
+        rejections = [t for t in state.get("rejection_timestamps", []) if t >= cutoff]
+        state["approval_timestamps"] = approvals
+        state["rejection_timestamps"] = rejections
+
+    def _weighted_recent_approvals(self, state: dict, now: float) -> float:
+        total = 0.0
+        for ts in state.get("approval_timestamps", []):
+            age = max(0.0, now - float(ts))
+            weight = 0.5 ** (age / _DECAY_HALF_LIFE_SECONDS)
+            total += weight
+        return total
 
     async def get_level(self, action_type: str) -> int:
         """Get current consent level for an action type."""

@@ -215,6 +215,16 @@ class TestAmygdalaLockout:
         action = intervention.build_action(mode_est, ctx)
         assert action["payload"]["duration_s"] == 180
 
+    def test_lockout_is_preview_level(self):
+        intervention = AmygdalaLockout()
+        mode_est = _make_mode_estimate(
+            stage=LeetCodeStage.DEBUG,
+            mode=LeetCodeMode.AMYGDALA_HIJACK,
+        )
+        ctx = _make_ctx(stage=LeetCodeStage.DEBUG, wrong_answer_count=4)
+        action = intervention.build_action(mode_est, ctx)
+        assert action["required_consent_level"] == "preview"
+
 
 # ---------------------------------------------------------------------------
 # SubmissionDisciplineGuard

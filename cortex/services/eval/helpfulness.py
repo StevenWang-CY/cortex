@@ -41,6 +41,9 @@ class _TrackedIntervention:
         pre_thrashing: float,
         pre_stress: float,
         started_at: float,
+        decision_id: str | None = None,
+        propensity: dict[str, float] | None = None,
+        policy_arm: str | None = None,
     ) -> None:
         self.intervention_id = intervention_id
         self.intervention_type = intervention_type
@@ -52,6 +55,9 @@ class _TrackedIntervention:
         self.pre_thrashing = pre_thrashing
         self.pre_stress = pre_stress
         self.started_at = started_at
+        self.decision_id = decision_id
+        self.propensity = propensity or {}
+        self.policy_arm = policy_arm
 
         # Post-intervention (filled later)
         self.post_state: str | None = None
@@ -100,6 +106,9 @@ class HelpfulnessTracker:
         error_count: int = 0,
         thrashing_score: float = 0.0,
         stress_integral: float = 0.0,
+        decision_id: str | None = None,
+        propensity: dict[str, float] | None = None,
+        policy_arm: str | None = None,
     ) -> None:
         """
         Start tracking an intervention.
@@ -117,6 +126,9 @@ class HelpfulnessTracker:
             pre_thrashing=thrashing_score,
             pre_stress=stress_integral,
             started_at=time.monotonic(),
+            decision_id=decision_id,
+            propensity=propensity,
+            policy_arm=policy_arm,
         )
 
     def record_user_action(
@@ -205,6 +217,9 @@ class HelpfulnessTracker:
             "user_rating": tracked.user_rating,
             "user_action": tracked.user_action,
             "reward_signal": reward,
+            "decision_id": tracked.decision_id,
+            "policy_arm": tracked.policy_arm,
+            "propensity": tracked.propensity,
             "duration_seconds": (tracked.ended_at - tracked.started_at) if tracked.ended_at else None,
         }
 

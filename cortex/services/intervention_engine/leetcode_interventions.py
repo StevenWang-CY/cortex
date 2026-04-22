@@ -76,6 +76,7 @@ class RestatementScratchpad:
         )
         return {
             "action": "show_scratchpad",
+            "required_consent_level": "preview",
             "payload": {
                 "problem_title": leetcode_ctx.title,
                 "problem_id": leetcode_ctx.problem_id,
@@ -134,6 +135,7 @@ class PatternLadder:
         )
         return {
             "action": "show_pattern_ladder",
+            "required_consent_level": "suggest",
             "payload": {
                 "problem_title": leetcode_ctx.title,
                 "difficulty": leetcode_ctx.difficulty,
@@ -209,6 +211,7 @@ class AmygdalaLockout:
         )
         return {
             "action": "show_lockout",
+            "required_consent_level": "preview",
             "payload": {
                 "duration_s": duration,
                 "last_submission_result": leetcode_ctx.last_submission_result,
@@ -264,6 +267,7 @@ class SubmissionDisciplineGuard:
         )
         return {
             "action": "show_submission_gate",
+            "required_consent_level": "preview",
             "payload": {
                 "wrong_answer_count": leetcode_ctx.wrong_answer_count,
                 "submission_count": leetcode_ctx.submission_count,
@@ -346,6 +350,7 @@ class SolutionEscapeFriction:
         )
         return {
             "action": "show_solution_friction",
+            "required_consent_level": "preview",
             "payload": {
                 "stage": leetcode_ctx.stage.value,
                 "time_elapsed_s": leetcode_ctx.time_elapsed_s,

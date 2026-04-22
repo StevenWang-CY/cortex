@@ -20,7 +20,7 @@ import logging
 
 import numpy as np
 
-from cortex.libs.config.settings import StateConfig, StateWeights
+from cortex.libs.config.settings import StateConfig
 from cortex.libs.schemas.features import FeatureVector
 from cortex.libs.schemas.state import StateScores, UserBaselines
 
@@ -50,6 +50,7 @@ class RuleScorer:
         self._weights = self._config.weights
         # Optional tab category context for same-category discount
         self._tab_categories: list[str] | None = None
+        self._apnea_low_since: float | None = None
 
     @property
     def baselines(self) -> UserBaselines:
@@ -195,7 +196,11 @@ class RuleScorer:
             scores.append(0.0)
 
         # Screen apnea indicator (low respiration + fixation)
-        apnea = self.score_screen_apnea(fv.respiration_rate, fv.blink_rate)
+        apnea = self.score_screen_apnea(
+            fv.respiration_rate,
+            fv.blink_rate,
+            timestamp=fv.timestamp,
+        )
         if apnea > 0.3:
             scores.append(apnea)
 
@@ -208,50 +213,66 @@ class RuleScorer:
         """
         Compute flow (optimal engagement) score.
 
-        Indicators: HR within 10% of baseline, HRV elevated (RMSSD > 40ms),
-        blink rate 12-20/min, steady typing, low mouse variance, upright posture.
+        Evidence-aligned signature:
+        - HR in a narrow band around baseline (moderate arousal)
+        - HRV near personal baseline (not stress-low and not boredom-high extremes)
+        - Slight blink suppression vs baseline
+        - Low correction and low mouse chaos
+        - Moderate tab switching (context engagement without thrashing)
         """
         scores = []
 
-        # HR within 10% of baseline
+        # HR near baseline (+/-8%).
         if fv.hr is not None:
-            hr_deviation = abs(fv.hr - self._baselines.hr_baseline) / self._baselines.hr_baseline
-            if hr_deviation < 0.10:
-                scores.append(1.0 - hr_deviation / 0.10)
+            hr_deviation = abs(fv.hr - self._baselines.hr_baseline) / max(1e-6, self._baselines.hr_baseline)
+            if hr_deviation <= 0.08:
+                scores.append(1.0 - (hr_deviation / 0.08))
             else:
                 scores.append(0.0)
 
-        # HRV elevated (RMSSD > 40ms)
+        # HRV around personal center (mu +/- 0.5 sigma).
         if fv.hrv_rmssd is not None:
-            if fv.hrv_rmssd >= 40.0:
-                scores.append(min(1.0, fv.hrv_rmssd / 80.0))
-            elif fv.hrv_rmssd >= 25.0:
-                scores.append((fv.hrv_rmssd - 25.0) / 15.0 * 0.5)
+            hrv_sigma = self._metric_sigma("hrv_rmssd", fallback=max(6.0, self._baselines.hrv_baseline * 0.2))
+            z = abs((fv.hrv_rmssd - self._baselines.hrv_baseline) / max(1e-6, hrv_sigma))
+            if z <= 0.5:
+                scores.append(1.0 - (z / 0.5))
+            elif z <= 1.5:
+                scores.append(max(0.0, 0.5 - ((z - 0.5) / 2.0)))
             else:
                 scores.append(0.0)
 
-        # Blink rate 12-20/min (normal range)
+        # Mild blink suppression relative to baseline.
         if fv.blink_rate is not None:
-            if 12.0 <= fv.blink_rate <= 20.0:
-                scores.append(1.0)
-            elif 8.0 <= fv.blink_rate < 12.0 or 20.0 < fv.blink_rate <= 25.0:
-                scores.append(0.5)
+            ratio = fv.blink_rate / max(1e-6, self._baselines.blink_rate_baseline)
+            if 0.55 <= ratio <= 0.95:
+                scores.append(1.0 - abs(ratio - 0.75) / 0.20)
+            elif 0.45 <= ratio <= 1.10:
+                scores.append(0.4)
             else:
                 scores.append(0.0)
 
         # Low mouse variance (focused, not erratic)
-        if fv.mouse_velocity_variance < self._baselines.mouse_variance_baseline:
+        if fv.mouse_velocity_variance < self._baselines.mouse_variance_baseline * 1.2:
             scores.append(0.8)
-        elif fv.mouse_velocity_variance < self._baselines.mouse_variance_baseline * 2:
+        elif fv.mouse_velocity_variance < self._baselines.mouse_variance_baseline * 1.8:
             scores.append(0.4)
         else:
             scores.append(0.0)
 
-        # Moderate window switching (focused)
-        if 2.0 <= fv.tab_switch_frequency <= 10.0:
-            scores.append(0.7)
-        elif fv.tab_switch_frequency < 2.0:
-            scores.append(0.4)  # Could be hypo or very focused
+        # Low correction rate (if available).
+        if fv.correction_rate_per_100_keys is not None:
+            if fv.correction_rate_per_100_keys <= 8.0:
+                scores.append(0.8)
+            elif fv.correction_rate_per_100_keys <= 15.0:
+                scores.append(0.4)
+            else:
+                scores.append(0.0)
+
+        # Moderate tab switching (focused, not thrashing).
+        if 0.5 <= fv.tab_switch_frequency <= 4.0:
+            scores.append(0.8)
+        elif 0.2 <= fv.tab_switch_frequency < 0.5 or 4.0 < fv.tab_switch_frequency <= 6.0:
+            scores.append(0.35)
         else:
             scores.append(0.0)
 
@@ -269,10 +290,11 @@ class RuleScorer:
         Recovery is the transition from HYPER/HYPO back toward FLOW.
         Characterized by mixed signals and declining overwhelm indicators.
         """
-        # Recovery happens when hyper/hypo are moderate and flow is rising
-        if hyper < 0.5 and hypo < 0.5 and flow > 0.3:
-            # In the recovery zone — moderate confidence
-            recovery = 0.5 + 0.5 * flow - 0.3 * hyper - 0.3 * hypo
+        # Recovery should not dominate during already-stable FLOW.
+        stress_signal = max(hyper, hypo)
+        if 0.15 <= stress_signal <= 0.65 and 0.25 <= flow <= 0.75:
+            # HEURISTIC: mixed profile with moderate stress + improving flow.
+            recovery = 0.15 + 0.35 * flow + 0.35 * stress_signal
             return float(np.clip(recovery, 0.0, 1.0))
 
         # Also recovery if hyper is declining
@@ -294,14 +316,12 @@ class RuleScorer:
         if hr is None:
             return 0.0
 
-        threshold = self._baselines.hr_baseline * 1.15
-        if hr <= threshold:
+        sigma = max(1.0, self._baselines.hr_std)
+        z = (hr - self._baselines.hr_baseline) / sigma
+        if z <= 1.5:
             return 0.0
-
-        # Linear ramp from threshold to baseline + 30%
-        max_hr = self._baselines.hr_baseline * 1.30
-        score = (hr - threshold) / (max_hr - threshold)
-        return float(np.clip(score, 0.0, 1.0))
+        # HEURISTIC: map z=[1.5, 4.0] to [0, 1].
+        return float(np.clip((z - 1.5) / 2.5, 0.0, 1.0))
 
     def score_hrv_drop(self, hrv_rmssd: float | None) -> float:
         """
@@ -312,15 +332,12 @@ class RuleScorer:
         if hrv_rmssd is None:
             return 0.0
 
-        if hrv_rmssd >= 40.0:
+        sigma = self._metric_sigma("hrv_rmssd", fallback=max(6.0, self._baselines.hrv_baseline * 0.2))
+        z = (self._baselines.hrv_baseline - hrv_rmssd) / max(1e-6, sigma)
+        if z <= 1.5:
             return 0.0
-
-        if hrv_rmssd <= 10.0:
-            return 1.0
-
-        # Linear from 40 → 10 maps to 0 → 1
-        score = (40.0 - hrv_rmssd) / 30.0
-        return float(np.clip(score, 0.0, 1.0))
+        # HEURISTIC: map z=[1.5, 3.5] to [0, 1].
+        return float(np.clip((z - 1.5) / 2.0, 0.0, 1.0))
 
     def score_blink_suppression(self, blink_rate: float | None, hr: float | None = None) -> float:
         """
@@ -345,7 +362,13 @@ class RuleScorer:
 
         return score
 
-    def score_screen_apnea(self, respiration_rate: float | None, blink_rate: float | None) -> float:
+    def score_screen_apnea(
+        self,
+        respiration_rate: float | None,
+        blink_rate: float | None,
+        *,
+        timestamp: float | None = None,
+    ) -> float:
         """
         Score screen apnea: respiration_rate < 8 AND blink suppression.
         Returns 0-1 indicating screen apnea severity.
@@ -364,7 +387,13 @@ class RuleScorer:
 
         # Both must be present for screen apnea
         if resp_score > 0.3 and blink_score > 0.3:
-            return float(np.clip(0.6 * resp_score + 0.4 * blink_score, 0.0, 1.0))
+            now = float(timestamp or 0.0)
+            if self._apnea_low_since is None:
+                self._apnea_low_since = now
+            elapsed = max(0.0, now - self._apnea_low_since)
+            sustain = min(1.0, elapsed / 30.0)  # HEURISTIC: sustained >=30s.
+            return float(np.clip((0.6 * resp_score + 0.4 * blink_score) * sustain, 0.0, 1.0))
+        self._apnea_low_since = None
         return 0.0
 
     def score_posture_collapse(
@@ -448,4 +477,21 @@ class RuleScorer:
                 and fv.mouse_velocity_variance > self._baselines.mouse_variance_baseline * 2):
             score += 0.3
 
+        if fv.correction_rate_per_100_keys is not None:
+            if fv.correction_rate_per_100_keys > 20.0:
+                score += 0.35
+            elif fv.correction_rate_per_100_keys > 12.0:
+                score += 0.2
+
+        if fv.scroll_back_rate_per_min is not None:
+            if fv.scroll_back_rate_per_min > 35.0:
+                score += 0.25
+            elif fv.scroll_back_rate_per_min > 20.0:
+                score += 0.12
+
         return float(np.clip(score, 0.0, 1.0))
+
+    def _metric_sigma(self, metric: str, *, fallback: float) -> float:
+        stats = self._baselines.metric_distributions.get(metric, {})
+        sigma = float(stats.get("sigma", fallback))
+        return max(1e-6, sigma)

@@ -145,6 +145,8 @@ class CortexAppController:
 
         self._overlay.dismissed.connect(self._on_overlay_dismissed)
         self._settings.settings_changed.connect(self._on_settings_changed)
+        self._settings.back_requested.connect(self._show_dashboard)
+        self._connections.back_requested.connect(self._show_dashboard)
         self._onboarding.open_settings_requested.connect(self._show_settings)
         self._onboarding.run_calibration_requested.connect(self._run_calibration)
         self._onboarding.completed.connect(self._complete_onboarding)
@@ -164,14 +166,34 @@ class CortexAppController:
         # -- Show UI ----------------------------------------------------------
         self._tray.show()
 
-        # Always show the dashboard on launch — it's the main window
-        self._show_dashboard()
+        # Force the app to activate as a foreground app on macOS.
+        # PyInstaller bundles don't always get proper activation, so the
+        # dashboard window can be created but hidden behind other windows.
+        try:
+            from AppKit import NSApp, NSApplicationActivationPolicyRegular  # type: ignore[import-untyped]
 
-        # Show onboarding on top if first launch
-        if not onboarding_marker_path().exists():
-            self._onboarding.show()
-            self._onboarding.raise_()
-            self._onboarding.activateWindow()
+            NSApp.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+            NSApp.activateIgnoringOtherApps_(True)
+        except ImportError:
+            pass  # Not on macOS or pyobjc not available
+
+        # Defer dashboard show to after the event loop starts so that
+        # NSApp activation actually takes effect.
+        def _initial_show() -> None:
+            logger.info("_initial_show: showing dashboard window")
+            try:
+                self._show_dashboard()
+                logger.info("_initial_show: dashboard shown successfully, visible=%s",
+                            self._dashboard.isVisible() if self._dashboard else "None")
+            except Exception:
+                logger.exception("_initial_show: failed to show dashboard")
+            # Show onboarding on top if first launch
+            if not onboarding_marker_path().exists():
+                self._onboarding.show()
+                self._onboarding.raise_()
+                self._onboarding.activateWindow()
+
+        QTimer.singleShot(200, _initial_show)
 
         return self._app.exec()
 
@@ -284,6 +306,18 @@ class CortexAppController:
             self._dashboard.show()
             self._dashboard.raise_()
             self._dashboard.activateWindow()
+            # Force macOS to bring the app + window to front
+            try:
+                from AppKit import NSApp, NSApplication  # type: ignore[import-untyped]
+
+                NSApp.activateIgnoringOtherApps_(True)
+                # Raise the key window directly
+                if NSApp.keyWindow():
+                    NSApp.keyWindow().makeKeyAndOrderFront_(None)
+                elif NSApp.mainWindow():
+                    NSApp.mainWindow().makeKeyAndOrderFront_(None)
+            except Exception:
+                pass
 
     def _show_connections(self) -> None:
         if self._connections is not None:

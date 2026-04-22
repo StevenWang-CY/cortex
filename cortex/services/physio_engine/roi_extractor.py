@@ -39,6 +39,9 @@ class RoiTrace:
     g: float
     b: float
     pixel_count: int  # number of pixels in the ROI (for weighting)
+    luma_mean: float = 0.0
+    luma_std: float = 0.0
+    chroma_std: float = 0.0
 
     def to_array(self) -> NDArray[np.float64]:
         """Return [R, G, B] as numpy array."""
@@ -53,6 +56,7 @@ class RoiTraceFrame:
     left_cheek: RoiTrace | None
     right_cheek: RoiTrace | None
     timestamp: float
+    head_jitter_px: float = 0.0
 
     @property
     def best_roi(self) -> RoiTrace | None:
@@ -75,7 +79,11 @@ class RoiTraceFrame:
 
     def combined_rgb(self) -> NDArray[np.float64] | None:
         """
-        Pixel-count-weighted average of all available ROIs.
+        Adaptive weighted average of all available ROIs.
+
+        Weights combine ROI area with luminance/chrominance quality and
+        apply a global head-jitter penalty. This is a robust replacement
+        for static equal/pixel-only fusion.
 
         Returns:
             Array of shape (3,) with [R, G, B] means, or None if no ROIs.
@@ -87,10 +95,27 @@ class RoiTraceFrame:
         if not rois:
             return None
 
-        total_pixels = sum(r.pixel_count for r in rois)
-        weighted_sum = np.zeros(3, dtype=np.float64)
+        raw_weights: list[float] = []
         for roi in rois:
-            weighted_sum += roi.to_array() * roi.pixel_count
+            # HEURISTIC: prefer well-lit but non-saturated, chroma-stable ROIs.
+            luma_gate = 1.0 if 35.0 <= roi.luma_mean <= 220.0 else 0.45
+            chroma_gate = 1.0 / (1.0 + roi.chroma_std / 60.0)
+            texture_gate = 1.0 / (1.0 + roi.luma_std / 50.0)
+            jitter_gate = 1.0 / (1.0 + self.head_jitter_px / 12.0)
+            raw_weights.append(
+                max(1.0, float(roi.pixel_count))
+                * luma_gate
+                * chroma_gate
+                * texture_gate
+                * jitter_gate
+            )
+
+        total_pixels = sum(raw_weights)
+        if total_pixels <= 1e-9:
+            return None
+        weighted_sum = np.zeros(3, dtype=np.float64)
+        for roi, weight in zip(rois, raw_weights):
+            weighted_sum += roi.to_array() * weight
         return weighted_sum / total_pixels
 
 
@@ -108,6 +133,8 @@ class RoiExtractor:
 
     def __init__(self, landmarks_config: LandmarksConfig | None = None) -> None:
         self._config = landmarks_config or get_config().landmarks
+        self._prev_face_center: NDArray[np.float64] | None = None
+        self._latest_head_jitter_px: float = 0.0
 
     def extract(
         self,
@@ -137,13 +164,26 @@ class RoiExtractor:
         right_cheek = self._extract_roi(
             frame, landmarks_px, self._config.right_cheek, h, w
         )
+        self._update_head_jitter(landmarks_px)
 
         return RoiTraceFrame(
             forehead=forehead,
             left_cheek=left_cheek,
             right_cheek=right_cheek,
             timestamp=timestamp,
+            head_jitter_px=self._latest_head_jitter_px,
         )
+
+    def _update_head_jitter(self, landmarks_px: NDArray[np.float32]) -> None:
+        if landmarks_px.size == 0:
+            self._latest_head_jitter_px = 0.0
+            return
+        center = np.mean(landmarks_px, axis=0, dtype=np.float64)
+        if self._prev_face_center is None:
+            self._latest_head_jitter_px = 0.0
+        else:
+            self._latest_head_jitter_px = float(np.linalg.norm(center - self._prev_face_center))
+        self._prev_face_center = center
 
     def _extract_roi(
         self,
@@ -204,12 +244,19 @@ class RoiExtractor:
         # Use mask to select only ROI pixels
         roi_pixels = frame[mask == 1]  # shape (pixel_count, 3) in BGR
         mean_bgr = np.mean(roi_pixels, axis=0)
+        luma = 0.114 * roi_pixels[:, 0] + 0.587 * roi_pixels[:, 1] + 0.299 * roi_pixels[:, 2]
+        rg = roi_pixels[:, 2].astype(np.float64) - roi_pixels[:, 1].astype(np.float64)
+        bg = roi_pixels[:, 0].astype(np.float64) - roi_pixels[:, 1].astype(np.float64)
+        chroma_std = float(np.std(np.concatenate([rg, bg]))) if pixel_count > 1 else 0.0
 
         return RoiTrace(
             r=float(mean_bgr[2]),  # BGR -> R
             g=float(mean_bgr[1]),  # BGR -> G
             b=float(mean_bgr[0]),  # BGR -> B
             pixel_count=pixel_count,
+            luma_mean=float(np.mean(luma)),
+            luma_std=float(np.std(luma)),
+            chroma_std=chroma_std,
         )
 
     def extract_single_roi(

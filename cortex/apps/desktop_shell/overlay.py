@@ -29,6 +29,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from cortex.apps.desktop_shell.tokens import (
+    CX_FONT_SANS,
+    CX_FONT_DISPLAY,
+    RADIUS_LG,
+    RADIUS_MD,
+    RADIUS_SM,
+    SP3,
+    SP4,
+    SP5,
+    SP6,
+    SP8,
+)
+
 logger = logging.getLogger(__name__)
 
 # 4-7-8 breathing pattern: inhale 4s, hold 7s, exhale 8s = 19s total cycle
@@ -39,11 +52,11 @@ _CYCLE_SECONDS = _INHALE_SECONDS + _HOLD_SECONDS + _EXHALE_SECONDS
 
 # Warm palette (matching browser extension overlay design)
 _BG_COLOR = QColor(12, 12, 14, 224)        # Dark, translucent
-_CARD_BG = QColor(30, 30, 34, 240)         # Slightly lighter card
+_CARD_BG = QColor(28, 32, 42, 245)         # Deep slate card
 _ACCENT = QColor(217, 119, 87)             # Terracotta #D97757
 _TEXT_PRIMARY = QColor(243, 239, 234)       # Warm off-white #F3EFEA
-_TEXT_SECONDARY = QColor(153, 149, 144)     # Warm grey #999590
-_DISMISS_COLOR = QColor(255, 255, 255, 60)  # Subtle dismiss button
+_TEXT_SECONDARY = QColor(160, 156, 150)     # Warm grey
+_DISMISS_COLOR = QColor(255, 255, 255, 50)  # Subtle dismiss button
 
 
 class BreathingPacer(QWidget):
@@ -121,6 +134,10 @@ class BreathingPacer(QWidget):
 
         if not self._active:
             painter.setPen(_TEXT_SECONDARY)
+            f = QFont()
+            f.setFamily("SF Pro Text")
+            f.setPointSize(12)
+            painter.setFont(f)
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Pacer")
             painter.end()
             return
@@ -136,7 +153,7 @@ class BreathingPacer(QWidget):
             r = radius - i * 3
             if r < 5:
                 break
-            alpha = 120 - i * 30
+            alpha = 100 - i * 25
             color = QColor(_ACCENT.red(), _ACCENT.green(), _ACCENT.blue(), alpha)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(color)
@@ -145,6 +162,7 @@ class BreathingPacer(QWidget):
         # Phase label
         painter.setPen(_TEXT_PRIMARY)
         font = QFont()
+        font.setFamily("SF Pro Text")
         font.setPointSize(14)
         font.setBold(True)
         painter.setFont(font)
@@ -206,30 +224,36 @@ class OverlayWindow(QWidget):
     def _build_ui(self) -> None:
         """Build the overlay UI."""
         self._main_layout = QVBoxLayout(self)
-        self._main_layout.setContentsMargins(20, 20, 20, 20)
+        self._main_layout.setContentsMargins(24, 24, 24, 24)
 
         # Card container
         self._card = QFrame()
         self._card.setStyleSheet(
-            f"QFrame {{ background-color: rgba(35, 50, 75, 240); "
-            f"border-radius: 16px; }}"
+            f"QFrame {{ background-color: rgba(28, 32, 42, 245); "
+            f"border-radius: {RADIUS_LG}px; "
+            f"border: 1px solid rgba(255, 255, 255, 0.06); }}"
         )
         card_layout = QVBoxLayout(self._card)
-        card_layout.setContentsMargins(24, 24, 24, 24)
-        card_layout.setSpacing(16)
+        card_layout.setContentsMargins(SP8, SP6, SP8, SP6)
+        card_layout.setSpacing(SP4)
 
         # Headline
-        self._headline = QLabel("—")
-        self._headline.setFont(QFont("Arial", 20, QFont.Weight.Bold))
-        self._headline.setStyleSheet(f"color: {_TEXT_PRIMARY.name()};")
+        self._headline = QLabel("\u2014")
+        self._headline.setStyleSheet(
+            f"font-family: {CX_FONT_DISPLAY}; font-size: 20px; "
+            f"font-weight: 600; color: {_TEXT_PRIMARY.name()}; "
+            f"line-height: 1.3;"
+        )
         self._headline.setWordWrap(True)
         self._headline.setAlignment(Qt.AlignmentFlag.AlignCenter)
         card_layout.addWidget(self._headline)
 
         # Situation summary
         self._summary = QLabel("")
-        self._summary.setFont(QFont("Arial", 13))
-        self._summary.setStyleSheet(f"color: {_TEXT_SECONDARY.name()};")
+        self._summary.setStyleSheet(
+            f"font-family: {CX_FONT_SANS}; font-size: 13px; "
+            f"color: {_TEXT_SECONDARY.name()}; line-height: 1.5;"
+        )
         self._summary.setWordWrap(True)
         card_layout.addWidget(self._summary)
 
@@ -237,20 +261,22 @@ class OverlayWindow(QWidget):
         divider = QFrame()
         divider.setFrameShape(QFrame.Shape.HLine)
         divider.setStyleSheet(
-            "background-color: rgba(100, 160, 255, 60); max-height: 1px;"
+            "background-color: rgba(255, 255, 255, 0.08); max-height: 1px;"
         )
         card_layout.addWidget(divider)
 
         # Primary focus
         self._focus_label = QLabel("Focus:")
-        self._focus_label.setFont(QFont("Arial", 14, QFont.Weight.Bold))
-        self._focus_label.setStyleSheet(f"color: {_ACCENT.name()};")
+        self._focus_label.setStyleSheet(
+            f"font-family: {CX_FONT_SANS}; font-size: 14px; "
+            f"font-weight: 600; color: {_ACCENT.name()};"
+        )
         self._focus_label.setWordWrap(True)
         card_layout.addWidget(self._focus_label)
 
         # Micro-steps checklist
         self._steps_container = QVBoxLayout()
-        self._steps_container.setSpacing(8)
+        self._steps_container.setSpacing(SP3)
         self._step_widgets: list[QCheckBox] = []
         card_layout.addLayout(self._steps_container)
 
@@ -264,18 +290,22 @@ class OverlayWindow(QWidget):
 
         # Dismiss button
         self._dismiss_btn = QPushButton("Dismiss (Esc)")
-        self._dismiss_btn.setFont(QFont("Arial", 12))
+        self._dismiss_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._dismiss_btn.setStyleSheet(
-            "QPushButton {"
-            "  background-color: rgba(255, 255, 255, 40);"
-            "  color: white;"
-            "  border: 1px solid rgba(255, 255, 255, 60);"
-            "  border-radius: 8px;"
-            "  padding: 8px 24px;"
-            "}"
-            "QPushButton:hover {"
-            "  background-color: rgba(255, 255, 255, 80);"
-            "}"
+            f"QPushButton {{"
+            f"  font-family: {CX_FONT_SANS};"
+            f"  font-size: 12px;"
+            f"  font-weight: 500;"
+            f"  background-color: rgba(255, 255, 255, 0.06);"
+            f"  color: rgba(255, 255, 255, 0.7);"
+            f"  border: 1px solid rgba(255, 255, 255, 0.10);"
+            f"  border-radius: {RADIUS_SM}px;"
+            f"  padding: 10px 28px;"
+            f"}}"
+            f"QPushButton:hover {{"
+            f"  background-color: rgba(255, 255, 255, 0.12);"
+            f"  color: white;"
+            f"}}"
         )
         self._dismiss_btn.clicked.connect(self._user_dismiss)
         card_layout.addWidget(
@@ -309,9 +339,11 @@ class OverlayWindow(QWidget):
         # Add micro-steps as checkboxes
         for step in payload.get("micro_steps", []):
             cb = QCheckBox(step)
-            cb.setFont(QFont("Arial", 12))
             cb.setStyleSheet(
-                f"QCheckBox {{ color: {_TEXT_PRIMARY.name()}; spacing: 8px; }}"
+                f"QCheckBox {{ "
+                f"  font-family: {CX_FONT_SANS}; font-size: 13px; "
+                f"  color: {_TEXT_PRIMARY.name()}; spacing: 10px; "
+                f"}}"
                 f"QCheckBox::indicator {{ width: 18px; height: 18px; }}"
             )
             self._steps_container.addWidget(cb)
@@ -359,7 +391,7 @@ class OverlayWindow(QWidget):
         """Paint semi-transparent backdrop."""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor(10, 15, 30, 180))
+        painter.fillRect(self.rect(), QColor(10, 12, 20, 180))
         painter.end()
 
     def _user_dismiss(self) -> None:

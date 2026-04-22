@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -79,6 +79,7 @@ class ScoreSmoother:
     def __init__(self, config: StateConfig | None = None) -> None:
         self._config = config or StateConfig()
         self._alpha = self._config.ema_alpha
+        self._probability_temperature = 1.0
 
         # Smoothed scores
         self._smoothed = SmoothedScores()
@@ -139,7 +140,9 @@ class ScoreSmoother:
         self._smoothed.hyper = self._ema(self._smoothed.hyper, raw_scores.hyper)
         self._smoothed.recovery = self._ema(self._smoothed.recovery, raw_scores.recovery)
 
-        # Determine dominant state from smoothed scores
+        # Determine dominant state from raw smoothed scores for hysteresis.
+        # Probabilities are used for confidence reporting, not entry gating.
+        probs = self._compute_probabilities()
         dominant_state, dominant_score = self._smoothed.dominant()
 
         # Apply hysteresis and dwell time
@@ -172,8 +175,16 @@ class ScoreSmoother:
         # Build estimate
         estimate = StateEstimate(
             state=self._current_state.value,
-            confidence=self._get_state_score(self._current_state),
+            confidence=probs[self._current_state],
             scores=self._smoothed.to_state_scores(),
+            calibrated_probabilities=StateScores(
+                flow=probs[UserState.FLOW],
+                hypo=probs[UserState.HYPO],
+                hyper=probs[UserState.HYPER],
+                recovery=probs[UserState.RECOVERY],
+            ),
+            classifier_source="rule",
+            classifier_alpha=0.0,
             reasons=self._generate_reasons(),
             signal_quality=signal_quality,
             timestamp=now,
@@ -250,6 +261,30 @@ class ScoreSmoother:
             UserState.RECOVERY: self._smoothed.recovery,
         }
         return scores[state]
+
+    def _compute_probabilities(self) -> dict[UserState, float]:
+        """Convert smoothed scores into calibrated probabilities via softmax."""
+        logits = np.array(
+            [
+                self._smoothed.flow,
+                self._smoothed.hypo,
+                self._smoothed.hyper,
+                self._smoothed.recovery,
+            ],
+            dtype=np.float64,
+        )
+        temp = max(1e-3, float(self._probability_temperature))
+        logits = logits / temp
+        logits = logits - np.max(logits)
+        exp = np.exp(logits)
+        denom = float(np.sum(exp)) if np.sum(exp) > 1e-12 else 1.0
+        probs = exp / denom
+        return {
+            UserState.FLOW: float(probs[0]),
+            UserState.HYPO: float(probs[1]),
+            UserState.HYPER: float(probs[2]),
+            UserState.RECOVERY: float(probs[3]),
+        }
 
     def _get_dwell_time(self, state: UserState) -> float:
         """Get required dwell time for a state transition."""

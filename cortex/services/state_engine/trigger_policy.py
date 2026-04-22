@@ -23,7 +23,9 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
+import numpy as np
 
 from cortex.libs.config.settings import InterventionConfig
 from cortex.libs.schemas.state import StateEstimate
@@ -49,6 +51,8 @@ class TriggerDecision:
     quiet_mode_active: bool
     effective_threshold: float  # Adjusted threshold after dismissals
     context_complexity: float | None = None
+    receptivity_blocked: bool = False
+    dismissal_probability: float | None = None
 
 
 class TriggerPolicy:
@@ -85,6 +89,10 @@ class TriggerPolicy:
 
         # Intervention counter
         self._intervention_count: int = 0
+        self._dismissals_total: int = 0
+        self._approvals_total: int = 0
+        self._dismissal_model_weights: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._dismissal_outcomes: int = 0
 
     @property
     def is_quiet_mode(self) -> bool:
@@ -100,6 +108,10 @@ class TriggerPolicy:
         estimate: StateEstimate,
         *,
         context_complexity: float | None = None,
+        mic_active: bool = False,
+        fullscreen_active: bool = False,
+        typing_burst_seconds: float = 0.0,
+        within_work_hours: bool = True,
         current_time: float | None = None,
     ) -> TriggerDecision:
         """
@@ -114,13 +126,60 @@ class TriggerPolicy:
         """
         now = current_time or time.monotonic()
 
-        # Compute effective threshold (base + dismissal bumps)
+        # Compute effective threshold (base + dismissal bumps + adaptive feedback).
         effective_threshold = self._compute_effective_threshold(now)
         confidence = estimate.confidence
         cooldown_remaining = max(
             0.0, self._last_intervention_time + self._config.cooldown_seconds - now
         )
         quiet_active = now < self._quiet_mode_until
+
+        # Receptivity gate (don't interrupt high-friction moments).
+        if self._config.receptivity_enforced:
+            if self._config.receptivity_block_if_mic_active and mic_active:
+                return TriggerDecision(
+                    should_trigger=False,
+                    reason="Receptivity gate: microphone/call active",
+                    confidence=confidence,
+                    cooldown_remaining=cooldown_remaining,
+                    quiet_mode_active=quiet_active,
+                    effective_threshold=effective_threshold,
+                    context_complexity=context_complexity,
+                    receptivity_blocked=True,
+                )
+            if self._config.receptivity_block_fullscreen and fullscreen_active:
+                return TriggerDecision(
+                    should_trigger=False,
+                    reason="Receptivity gate: fullscreen active",
+                    confidence=confidence,
+                    cooldown_remaining=cooldown_remaining,
+                    quiet_mode_active=quiet_active,
+                    effective_threshold=effective_threshold,
+                    context_complexity=context_complexity,
+                    receptivity_blocked=True,
+                )
+            if typing_burst_seconds >= self._config.receptivity_typing_burst_seconds:
+                return TriggerDecision(
+                    should_trigger=False,
+                    reason="Receptivity gate: active typing burst",
+                    confidence=confidence,
+                    cooldown_remaining=cooldown_remaining,
+                    quiet_mode_active=quiet_active,
+                    effective_threshold=effective_threshold,
+                    context_complexity=context_complexity,
+                    receptivity_blocked=True,
+                )
+            if not within_work_hours:
+                return TriggerDecision(
+                    should_trigger=False,
+                    reason="Receptivity gate: outside configured work hours",
+                    confidence=confidence,
+                    cooldown_remaining=cooldown_remaining,
+                    quiet_mode_active=quiet_active,
+                    effective_threshold=effective_threshold,
+                    context_complexity=context_complexity,
+                    receptivity_blocked=True,
+                )
 
         # Check quiet mode
         if quiet_active:
@@ -217,7 +276,28 @@ class TriggerPolicy:
                 cooldown_remaining=0.0,
                 quiet_mode_active=False,
                 effective_threshold=effective_threshold,
+                    context_complexity=context_complexity,
+                )
+
+        dismiss_prob = self._predict_dismiss_probability(
+            confidence=confidence,
+            context_complexity=context_complexity or 0.0,
+            typing_burst_seconds=typing_burst_seconds,
+        )
+        if (
+            self._config.dismissal_model_enabled
+            and self._dismissal_outcomes >= 10
+            and dismiss_prob > self._config.dismissal_model_threshold
+        ):
+            return TriggerDecision(
+                should_trigger=False,
+                reason=f"Predicted dismissal probability too high ({dismiss_prob:.2f})",
+                confidence=confidence,
+                cooldown_remaining=0.0,
+                quiet_mode_active=False,
+                effective_threshold=effective_threshold,
                 context_complexity=context_complexity,
+                dismissal_probability=dismiss_prob,
             )
 
         # All conditions met — trigger intervention
@@ -229,6 +309,7 @@ class TriggerPolicy:
             quiet_mode_active=False,
             effective_threshold=effective_threshold,
             context_complexity=context_complexity,
+            dismissal_probability=dismiss_prob,
         )
 
     def record_intervention(self, timestamp: float | None = None) -> None:
@@ -246,6 +327,7 @@ class TriggerPolicy:
         """
         now = timestamp or time.monotonic()
         self._dismissals.append(DismissalEvent(timestamp=now))
+        self._dismissals_total += 1
 
         # Add threshold bump (+0.05 for 1 hour)
         expiry = now + self._config.dismissal_decay_hours * 3600.0
@@ -279,6 +361,34 @@ class TriggerPolicy:
                 f"{recent_dismissals} dismissals in {self._config.dismissal_window_minutes} min)"
             )
 
+    def record_outcome(
+        self,
+        *,
+        dismissed: bool,
+        confidence: float = 0.0,
+        context_complexity: float = 0.0,
+        typing_burst_seconds: float = 0.0,
+    ) -> None:
+        """Update adaptive thresholding and dismissal model with user feedback."""
+        if dismissed:
+            self._dismissals_total += 1
+        else:
+            self._approvals_total += 1
+        self._dismissal_outcomes += 1
+
+        # Online logistic update (very small-step SGD).
+        y = 1.0 if dismissed else 0.0
+        x = np.array(
+            [float(confidence), float(context_complexity), min(1.0, float(typing_burst_seconds) / 10.0)],
+            dtype=np.float64,
+        )
+        w = np.array(self._dismissal_model_weights, dtype=np.float64)
+        z = float(w @ x)
+        p = 1.0 / (1.0 + np.exp(-np.clip(z, -20.0, 20.0)))
+        grad = (p - y) * x
+        w = w - 0.05 * grad
+        self._dismissal_model_weights = (float(w[0]), float(w[1]), float(w[2]))
+
     def activate_quiet_mode(
         self,
         *,
@@ -308,8 +418,36 @@ class TriggerPolicy:
             if expiry > now
         )
 
+        threshold = base + total_bump
+        if self._config.adaptive_threshold_enabled:
+            feedback_offset = (self._dismissals_total - self._approvals_total) * 0.01
+            threshold += float(np.clip(feedback_offset, -0.10, 0.10))
+            threshold = float(np.clip(
+                threshold,
+                self._config.adaptive_threshold_min,
+                self._config.adaptive_threshold_max,
+            ))
         # Cap at reasonable maximum
-        return min(0.99, base + total_bump)
+        return min(0.99, threshold)
+
+    def _predict_dismiss_probability(
+        self,
+        *,
+        confidence: float,
+        context_complexity: float,
+        typing_burst_seconds: float,
+    ) -> float:
+        """Predict dismissal probability from lightweight online model."""
+        w = np.array(self._dismissal_model_weights, dtype=np.float64)
+        if not np.any(np.abs(w) > 1e-6):
+            # Cold start: neutral prior until we have enough labeled outcomes.
+            return 0.5
+        x = np.array(
+            [float(confidence), float(context_complexity), min(1.0, float(typing_burst_seconds) / 10.0)],
+            dtype=np.float64,
+        )
+        z = float(w @ x)
+        return float(1.0 / (1.0 + np.exp(-np.clip(z, -20.0, 20.0))))
 
     def reset(self) -> None:
         """Reset all trigger policy state."""
@@ -320,3 +458,7 @@ class TriggerPolicy:
         self._quiet_mode_count = 0
         self._quiet_mode_count_reset_at = 0.0
         self._intervention_count = 0
+        self._dismissal_outcomes = 0
+        self._dismissals_total = 0
+        self._approvals_total = 0
+        self._dismissal_model_weights = (0.0, 0.0, 0.0)

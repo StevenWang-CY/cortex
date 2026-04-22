@@ -49,10 +49,12 @@ class StressIntegralTracker:
     def __init__(
         self,
         hrv_baseline: float = 50.0,
+        hrv_sigma: float = 1.0,
         threshold: float = _DEFAULT_THRESHOLD,
         sensitivity_multiplier: float = 1.0,
     ) -> None:
         self._hrv_baseline = hrv_baseline
+        self._hrv_sigma = max(1.0, hrv_sigma)
         self._base_threshold = threshold
         self._sensitivity_multiplier = sensitivity_multiplier
         self._integral: float = 0.0
@@ -84,6 +86,10 @@ class StressIntegralTracker:
         """Update the HRV baseline (e.g., from longitudinal tracker)."""
         self._hrv_baseline = hrv_baseline
 
+    def update_sigma(self, hrv_sigma: float) -> None:
+        """Update personalized HRV dispersion for standardized deficit."""
+        self._hrv_sigma = max(1.0, hrv_sigma)
+
     def update_sensitivity(self, multiplier: float) -> None:
         """Update the sensitivity multiplier from longitudinal tracker."""
         self._sensitivity_multiplier = max(0.5, min(2.0, multiplier))
@@ -111,8 +117,8 @@ class StressIntegralTracker:
             dt = timestamp - self._last_timestamp
             if dt > 0 and dt < 30.0:  # Ignore gaps > 30s (pauses, etc.)
                 # Trapezoidal integration of suppression
-                suppression_now = max(0.0, self._hrv_baseline - hrv_rmssd)
-                suppression_prev = max(0.0, self._hrv_baseline - self._last_hrv)
+                suppression_now = max(0.0, (self._hrv_baseline - hrv_rmssd) / self._hrv_sigma)
+                suppression_prev = max(0.0, (self._hrv_baseline - self._last_hrv) / self._hrv_sigma)
                 avg_suppression = (suppression_now + suppression_prev) / 2.0
                 self._integral += avg_suppression * dt
 
@@ -167,6 +173,15 @@ class StressIntegralTracker:
         self._history.clear()
         logger.info("Stress integral reset after break")
 
+    def apply_recovery_credit(self, seconds: float = 120.0) -> None:
+        """
+        Apply recovery credit after a confirmed restorative action.
+
+        HEURISTIC: subtract equivalent of sustained low-deficit time.
+        """
+        credit = max(0.0, seconds)
+        self._integral = max(0.0, self._integral - credit)
+
     def get_history(self, window_seconds: float = 3600.0) -> list[tuple[float, float]]:
         """
         Get stress integral history for visualization.
@@ -187,6 +202,7 @@ class StressIntegralTracker:
         return {
             "integral": self._integral,
             "hrv_baseline": self._hrv_baseline,
+            "hrv_sigma": self._hrv_sigma,
             "base_threshold": self._base_threshold,
             "sensitivity_multiplier": self._sensitivity_multiplier,
             "break_emitted": self._break_emitted,
@@ -199,6 +215,7 @@ class StressIntegralTracker:
         """Restore from serialized state."""
         tracker = cls(
             hrv_baseline=data.get("hrv_baseline", 50.0),
+            hrv_sigma=data.get("hrv_sigma", 10.0),
             threshold=data.get("base_threshold", _DEFAULT_THRESHOLD),
             sensitivity_multiplier=data.get("sensitivity_multiplier", 1.0),
         )

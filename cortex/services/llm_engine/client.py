@@ -31,6 +31,9 @@ class LLMClient(Protocol):
         context: TaskContext,
         state: StateEstimate,
         constraints: SimplificationConstraints | None = None,
+        *,
+        template_name: str | None = None,
+        extra_context: str = "",
     ) -> InterventionPlan:
         """
         Generate a structured intervention plan from workspace context and user state.
@@ -178,6 +181,9 @@ class RuleBasedLLMClient:
         context: TaskContext,
         state: StateEstimate,
         constraints: SimplificationConstraints | None = None,
+        *,
+        template_name: str | None = None,
+        extra_context: str = "",
     ) -> InterventionPlan:
         return build_fallback_plan(context)
 

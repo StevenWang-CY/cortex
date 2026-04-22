@@ -48,25 +48,54 @@ That's it — no terminal, no Python, no Node.js required.
 Webcam (30 FPS)
      │
      ▼
-L1: Bio-Extraction ─── rPPG · Respiration · Blink · Pose · Telemetry
+L1: Bio-Extraction ─── rPPG (POS/CHROM/TSCAN) · Respiration Fusion · Blink/PERCLOS · Pose · Telemetry
      │
-     ▼  FeatureVector (500ms)
-L2: State Engine ────── Fusion · Focus Graph · Scoring · Detectors
+     ▼  SQI Gate (NSQI + SNR + motion + face-loss) → FeatureVector (500ms)
+L2: State Engine ────── Personalized Scoring · Optional ML Ensemble · Calibrated Confidence
      │
      ▼  StateEstimate + stress_integral
-L3: Context Engine ──── VS Code · Chrome · Terminal · Adapter Registry
+L3: Trigger Policy ──── Receptivity Gate · Dwell/Hysteresis · Adaptive Threshold · AMIP
      │
      ▼  TaskContext
-L4: LLM Engine ──────── Azure OpenAI · Qwen-3 · Ollama · Bandit
+L4: LLM Engine ──────── Schema-Constrained Output · Grounded Explanations · Self-Critique
      │
      ▼  InterventionPlan
-L5: Intervention ────── Consent · Validate · Execute · Undo · Learn
+L5: Intervention ────── Recency-Weighted Consent · Single-CTA Execute · Undo Stack · Reward Logging
      │
      ▼
-Store (Redis / In-Memory)
+Store (Redis / In-Memory + policy WAL + nightly causal reports)
 ```
 
 All layers communicate via FastAPI (port 9472) and WebSocket (port 9473). The desktop shell, VS Code extension, and Chrome/Edge extension are all clients.
+
+---
+
+## Scientific Foundations
+
+- **rPPG + SQI:** POS/CHROM remain default, with optional ONNX TSCAN backend and explicit SQI veto (`NSQI`, SNR, motion, face-loss) before publishing physiology.
+- **HRV reliability:** 60-second rolling IBI gate for expanded HRV (`RMSSD`, `SDNN`, `pNN50`, `SD1/SD2`, LF/HF via Lomb-Scargle, sample entropy).
+- **Fatigue and vigilance:** Blink pipeline includes PERCLOS and blink-duration variability, not blink rate alone.
+- **Flow psychophysiology:** FLOW signature now targets near-baseline HR/HRV bands plus behavioral stability and sustained dwell (120s), rather than high-HRV-only heuristics.
+- **JITAI rigor:** Triggering adds receptivity gating and AMIP (contextual Thompson sampling with propensity logging and deterministic safety floor).
+- **Intervention ethics:** Consent escalation is recency-weighted and reversible; unsafe/destructive plans are degraded gracefully instead of silently executed.
+
+## How We Know It Works
+
+- Unit and integration regression suite plus new evaluation tests:
+  - AMIP regret smoke (`cortex/tests/eval/test_amip_regret.py`)
+  - IPS unbiasedness (`cortex/tests/eval/test_ips_unbiased.py`)
+  - Safety-floor invariants (`cortex/tests/eval/test_safety_floor.py`)
+  - Classifier calibration/Brier (`cortex/tests/state_engine/test_calibration.py`)
+  - LLM safety degrade-and-ground tests (`cortex/tests/unit/test_llm_safety_refinements.py`)
+- Policy decisions are written to `storage/policy_log/YYYY-MM-DD.jsonl` before posterior updates.
+- Nightly causal reports are written to `storage/reports/causal_YYYY-MM-DD.md` (IPS/SNIPS, excursion-style effect summary, calibration diagnostics).
+
+## Limitations
+
+- Webcam rPPG remains sensitive to lighting, motion, and camera quality; physiology is gated and may be unavailable in degraded conditions.
+- Webcam-derived HRV at 30 FPS should be treated as trend-level guidance, not clinical-grade beat-level measurement.
+- Dataset replay tests for UBFC/PURE are environment-gated and require locally provided preprocessed traces.
+- The optional per-user ML classifier improves with user labels; before sufficient labels, rule-based scoring dominates.
 
 ---
 

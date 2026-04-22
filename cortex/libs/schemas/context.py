@@ -7,6 +7,7 @@ and terminal adapters.
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -282,7 +283,7 @@ class TaskContext(BaseModel):
         # Inject learned tab relevance preferences
         if learned_relevance:
             prefs = [
-                f"User previously kept {domain} open during similar sessions (relevance: {score:.2f})"
+                f"User previously kept {self._sanitize_pref_key(domain)} open during similar sessions (relevance: {score:.2f})"
                 for domain, score in learned_relevance.items()
                 if score > 0.6
             ]
@@ -291,6 +292,14 @@ class TaskContext(BaseModel):
                 parts.extend(prefs[:5])
 
         return "\n".join(parts)
+
+    @staticmethod
+    def _sanitize_pref_key(value: str) -> str:
+        text = (value or "")[:120]
+        text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
+        text = text.encode("ascii", "ignore").decode("ascii")
+        text = text.replace("{", "(").replace("}", ")")
+        return text
 
 
 # Priority order for tab type selection (higher priority types kept first)

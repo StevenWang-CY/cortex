@@ -12,32 +12,100 @@ import collections
 import logging
 import time
 
-from PySide6.QtCore import Qt, QRectF
-from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
-from PySide6.QtWidgets import (
-    QFrame,
-    QGraphicsDropShadowEffect,
-    QGridLayout,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QProgressBar,
-    QPushButton,
-    QScrollArea,
-    QSizePolicy,
-    QTabWidget,
-    QVBoxLayout,
-    QWidget,
-)
+from PySide6.QtCore import Qt
+
+try:
+    from PySide6.QtCore import QRectF
+except ImportError:  # pragma: no cover - compatibility for lightweight test mocks
+    from PySide6.QtCore import QRect as QRectF
+try:
+    from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
+except ImportError:  # pragma: no cover - compatibility for lightweight test mocks
+    from PySide6.QtGui import QColor, QFont, QPainter, QPen
+
+    class QPainterPath:  # type: ignore[override]
+        def addRoundedRect(self, *_args: object, **_kwargs: object) -> None:
+            return
+
+        def moveTo(self, *_args: object, **_kwargs: object) -> None:
+            return
+
+        def lineTo(self, *_args: object, **_kwargs: object) -> None:
+            return
+try:
+    from PySide6.QtWidgets import (
+        QFrame,
+        QGraphicsDropShadowEffect,
+        QGridLayout,
+        QHBoxLayout,
+        QLabel,
+        QLineEdit,
+        QProgressBar,
+        QPushButton,
+        QScrollArea,
+        QSizePolicy,
+        QTabWidget,
+        QVBoxLayout,
+        QWidget,
+    )
+except ImportError:  # pragma: no cover - compatibility for lightweight test mocks
+    from PySide6.QtWidgets import (  # type: ignore[attr-defined]
+        QFrame,
+        QGridLayout,
+        QHBoxLayout,
+        QLabel,
+        QProgressBar,
+        QPushButton,
+        QVBoxLayout,
+        QWidget,
+    )
+
+    class QGraphicsDropShadowEffect:  # type: ignore[override]
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            return
+
+        def setBlurRadius(self, *_args: object, **_kwargs: object) -> None:
+            return
+
+        def setOffset(self, *_args: object, **_kwargs: object) -> None:
+            return
+
+        def setColor(self, *_args: object, **_kwargs: object) -> None:
+            return
+
+    class QLineEdit(QLabel):  # type: ignore[override]
+        def setPlaceholderText(self, *_args: object, **_kwargs: object) -> None:
+            return
+
+    class QScrollArea(QWidget):  # type: ignore[override]
+        def setWidgetResizable(self, *_args: object, **_kwargs: object) -> None:
+            return
+
+        def setWidget(self, *_args: object, **_kwargs: object) -> None:
+            return
+
+    class QSizePolicy:  # type: ignore[override]
+        class Policy:
+            Expanding = 0
+            Preferred = 0
+
+    class QTabWidget(QWidget):  # type: ignore[override]
+        def addTab(self, *_args: object, **_kwargs: object) -> None:
+            return
 
 from cortex.apps.desktop_shell.tokens import (
+    CARD_QSS,
     CX_ACCENT,
     CX_BG,
     CX_BIO_BLINK,
     CX_BIO_HR,
     CX_BIO_HRV,
+    CX_BORDER,
     CX_BORDER_DEFAULT,
     CX_DANGER,
+    CX_FONT_BRAND,
+    CX_FONT_MONO,
+    CX_FONT_SANS,
     CX_SURFACE,
     CX_TERTIARY,
     CX_TEXT,
@@ -45,12 +113,15 @@ from cortex.apps.desktop_shell.tokens import (
     CX_TEXT_TERTIARY,
     DASHBOARD_MAX_HEIGHT,
     DASHBOARD_WIDTH,
-    RADIUS_MD,
     RADIUS_FULL,
+    RADIUS_MD,
+    RADIUS_SM,
+    SECTION_HEADING_QSS,
     SP2,
     SP3,
     SP4,
     SP5,
+    SP6,
     STATE_COLORS,
     STATE_LABELS,
 )
@@ -68,9 +139,9 @@ _MAX_TIMELINE_EVENTS = 50
 def _card_shadow(widget: QWidget) -> None:
     """Apply a soft drop shadow to a widget."""
     shadow = QGraphicsDropShadowEffect(widget)
-    shadow.setBlurRadius(24)
-    shadow.setOffset(0, 4)
-    shadow.setColor(QColor(0, 0, 0, 20))
+    shadow.setBlurRadius(20)
+    shadow.setOffset(0, 2)
+    shadow.setColor(QColor(0, 0, 0, 16))
     widget.setGraphicsEffect(shadow)
 
 
@@ -93,19 +164,20 @@ QTabBar {{
 QTabBar::tab {{
     background: transparent;
     color: {CX_TEXT_TERTIARY};
-    font-family: -apple-system, 'SF Pro Text', sans-serif;
+    font-family: {CX_FONT_SANS};
     font-size: 13px;
     font-weight: 500;
-    padding: 10px 20px;
+    padding: 12px 24px 10px 24px;
     border: none;
     border-bottom: 2px solid transparent;
-    margin-bottom: 4px;
+    margin-bottom: 0px;
 }}
 QTabBar::tab:selected {{
     color: {CX_TEXT};
+    font-weight: 600;
     border-bottom: 2px solid {CX_ACCENT};
 }}
-QTabBar::tab:hover {{
+QTabBar::tab:hover:!selected {{
     color: {CX_TEXT_SECONDARY};
 }}
 """
@@ -123,72 +195,91 @@ class _ConsumerTab(QWidget):
         self.setStyleSheet(f"background: {CX_BG};")
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(20, 16, 20, 20)
+        root.setContentsMargins(SP6, SP5, SP6, SP6)
         root.setSpacing(0)
 
         # ── Header ────────────────────────────────────────────────────
         header = QHBoxLayout()
-        header.setContentsMargins(0, 0, 0, 16)
-        brand = QLabel("Cortex.")
+        header.setContentsMargins(0, 0, 0, SP5)
+        brand = QLabel("Cortex")
         brand.setStyleSheet(
-            f"font-family: Georgia, 'Times New Roman', serif; "
-            f"font-style: italic; font-size: 22px; font-weight: 400; "
+            f"font-family: {CX_FONT_BRAND}; "
+            f"font-style: italic; font-size: 20px; font-weight: 400; "
             f"color: {CX_TEXT}; background: transparent;"
         )
         header.addWidget(brand)
         header.addStretch()
 
+        # State pill badge
+        self._state_badge = QWidget()
+        badge_layout = QHBoxLayout(self._state_badge)
+        badge_layout.setContentsMargins(10, 4, 12, 4)
+        badge_layout.setSpacing(6)
+
         self._state_dot = QLabel()
-        self._state_dot.setFixedSize(8, 8)
+        self._state_dot.setFixedSize(7, 7)
         self._state_dot.setStyleSheet(
-            f"background: {CX_TEXT_TERTIARY}; border-radius: 4px;"
+            f"background: {CX_TEXT_TERTIARY}; border-radius: 3px;"
         )
-        header.addWidget(self._state_dot, alignment=Qt.AlignmentFlag.AlignVCenter)
+        badge_layout.addWidget(self._state_dot, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         self._state_label = QLabel("Disconnected")
         self._state_label.setStyleSheet(
-            f"font-size: 13px; color: {CX_TEXT_SECONDARY}; "
-            f"margin-left: 6px; background: transparent;"
+            f"font-family: {CX_FONT_SANS}; font-size: 12px; font-weight: 500; "
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
-        header.addWidget(self._state_label, alignment=Qt.AlignmentFlag.AlignVCenter)
+        badge_layout.addWidget(self._state_label, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        self._state_badge.setStyleSheet(
+            f"background: {CX_TERTIARY}; border-radius: {RADIUS_FULL}px;"
+        )
+        header.addWidget(self._state_badge, alignment=Qt.AlignmentFlag.AlignVCenter)
         root.addLayout(header)
 
         # ── Goal input ────────────────────────────────────────────────
         self._goal_input = QLineEdit()
         self._goal_input.setPlaceholderText("What are you working on?")
-        self._goal_input.setFixedHeight(44)
+        self._goal_input.setFixedHeight(42)
         self._goal_input.setStyleSheet(f"""
             QLineEdit {{
-                padding: 0 16px;
-                border: 1px solid rgba(0,0,0,0.08);
-                border-radius: 22px;
-                font-size: 14px;
+                padding: 0 {SP4}px;
+                border: 1px solid {CX_BORDER_DEFAULT};
+                border-radius: {RADIUS_SM}px;
+                font-family: {CX_FONT_SANS};
+                font-size: 13px;
                 color: {CX_TEXT};
                 background: {CX_SURFACE};
             }}
             QLineEdit:focus {{
-                border: 2px solid {CX_ACCENT};
+                border: 1.5px solid {CX_ACCENT};
             }}
             QLineEdit::placeholder {{
                 color: {CX_TEXT_TERTIARY};
             }}
         """)
         root.addWidget(self._goal_input)
-        root.addSpacing(20)
+        root.addSpacing(SP5)
 
         # ── Biometrics card ───────────────────────────────────────────
         bio_card = QFrame()
         bio_card.setStyleSheet(f"""
             QFrame {{
-                background: {CX_SURFACE};
-                border: 1px solid rgba(0,0,0,0.06);
-                border-radius: {RADIUS_MD}px;
+                {CARD_QSS}
             }}
         """)
         _card_shadow(bio_card)
-        bio_inner = QHBoxLayout(bio_card)
-        bio_inner.setContentsMargins(24, 20, 24, 20)
-        bio_inner.setSpacing(0)
+        bio_inner = QVBoxLayout(bio_card)
+        bio_inner.setContentsMargins(SP5, SP4, SP5, SP4)
+        bio_inner.setSpacing(SP3)
+
+        # Bio heading
+        bio_heading = QLabel("BIOMETRICS")
+        bio_heading.setStyleSheet(SECTION_HEADING_QSS)
+        bio_inner.addWidget(bio_heading)
+
+        # Bio values row
+        bio_row = QHBoxLayout()
+        bio_row.setSpacing(0)
 
         self._bpm_label = QLabel("--")
         self._hrv_label = QLabel("--")
@@ -200,32 +291,37 @@ class _ConsumerTab(QWidget):
             (self._blk_label, "BLK", CX_BIO_BLINK),
         ]:
             col = QVBoxLayout()
-            col.setSpacing(4)
+            col.setSpacing(2)
             col.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            heading = QLabel(title)
-            heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            heading.setStyleSheet(
-                f"font-size: 11px; font-weight: 600; letter-spacing: 1px; "
-                f"color: {color}; background: transparent; border: none;"
-            )
+
             val_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
             val_widget.setStyleSheet(
-                f"font-family: Georgia, serif; font-size: 28px; "
+                f"font-family: {CX_FONT_BRAND}; font-size: 32px; "
                 f"font-weight: 400; color: {CX_TEXT}; "
                 f"background: transparent; border: none;"
             )
-            col.addWidget(heading)
-            col.addWidget(val_widget)
-            bio_inner.addLayout(col, stretch=1)
 
+            heading = QLabel(title)
+            heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            heading.setStyleSheet(
+                f"font-family: {CX_FONT_SANS}; font-size: 10px; font-weight: 600; "
+                f"letter-spacing: 1px; color: {color}; "
+                f"background: transparent; border: none;"
+            )
+            col.addWidget(val_widget)
+            col.addWidget(heading)
+            bio_row.addLayout(col, stretch=1)
+
+        bio_inner.addLayout(bio_row)
         root.addWidget(bio_card)
-        root.addSpacing(16)
+        root.addSpacing(SP4)
 
         # ── Connections row ───────────────────────────────────────────
         conn_row = QHBoxLayout()
-        conn_row.setContentsMargins(4, 0, 4, 0)
-        conn_row.setSpacing(16)
+        conn_row.setContentsMargins(SP2, 0, SP2, 0)
+        conn_row.setSpacing(SP4)
 
+        self._conn_dots: dict[str, QLabel] = {}
         for name in ("Chrome", "Edge", "Editor"):
             dot = QLabel()
             dot.setFixedSize(6, 6)
@@ -234,10 +330,12 @@ class _ConsumerTab(QWidget):
             )
             lbl = QLabel(name)
             lbl.setStyleSheet(
-                f"font-size: 12px; color: {CX_TEXT_TERTIARY}; background: transparent;"
+                f"font-family: {CX_FONT_SANS}; font-size: 11px; "
+                f"color: {CX_TEXT_TERTIARY}; background: transparent;"
             )
             conn_row.addWidget(dot, alignment=Qt.AlignmentFlag.AlignVCenter)
             conn_row.addWidget(lbl, alignment=Qt.AlignmentFlag.AlignVCenter)
+            self._conn_dots[name] = dot
 
         conn_row.addStretch()
 
@@ -245,7 +343,8 @@ class _ConsumerTab(QWidget):
         self._connect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._connect_btn.setStyleSheet(f"""
             QPushButton {{
-                font-size: 12px; font-weight: 500;
+                font-family: {CX_FONT_SANS};
+                font-size: 12px; font-weight: 600;
                 color: {CX_ACCENT}; background: transparent;
                 border: none; padding: 4px 0;
             }}
@@ -253,24 +352,20 @@ class _ConsumerTab(QWidget):
         """)
         conn_row.addWidget(self._connect_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
         root.addLayout(conn_row)
-        root.addSpacing(20)
+        root.addSpacing(SP5)
 
         # ── Divider ───────────────────────────────────────────────────
         divider = QFrame()
         divider.setFixedHeight(1)
-        divider.setStyleSheet(f"background: rgba(0,0,0,0.06);")
+        divider.setStyleSheet(f"background: {CX_BORDER};")
         root.addWidget(divider)
-        root.addSpacing(16)
+        root.addSpacing(SP5)
 
         # ── Today stats ──────────────────────────────────────────────
-        today_label = QLabel("Today")
-        today_label.setStyleSheet(
-            f"font-size: 11px; font-weight: 600; letter-spacing: 1px; "
-            f"color: {CX_TEXT_TERTIARY}; background: transparent; "
-            f"text-transform: uppercase;"
-        )
+        today_label = QLabel("TODAY")
+        today_label.setStyleSheet(SECTION_HEADING_QSS)
         root.addWidget(today_label)
-        root.addSpacing(12)
+        root.addSpacing(SP3)
 
         today_row = QHBoxLayout()
         today_row.setSpacing(0)
@@ -281,50 +376,52 @@ class _ConsumerTab(QWidget):
         self._today_blocked = QLabel("--")
 
         for val_widget, title in [
-            (self._today_focus, "FOCUS"),
-            (self._today_sessions, "SESSIONS"),
-            (self._today_best, "BEST"),
-            (self._today_blocked, "BLOCKED"),
+            (self._today_focus, "Focus"),
+            (self._today_sessions, "Sessions"),
+            (self._today_best, "Best"),
+            (self._today_blocked, "Blocked"),
         ]:
             col = QVBoxLayout()
             col.setSpacing(2)
             col.setAlignment(Qt.AlignmentFlag.AlignCenter)
             val_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
             val_widget.setStyleSheet(
-                f"font-family: Georgia, serif; font-size: 18px; "
+                f"font-family: {CX_FONT_BRAND}; font-size: 20px; "
                 f"color: {CX_TEXT}; background: transparent;"
             )
             heading = QLabel(title)
             heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
             heading.setStyleSheet(
-                f"font-size: 10px; font-weight: 500; letter-spacing: 0.5px; "
-                f"color: {CX_TEXT_TERTIARY}; background: transparent;"
+                f"font-family: {CX_FONT_SANS}; font-size: 10px; font-weight: 500; "
+                f"letter-spacing: 0.5px; color: {CX_TEXT_TERTIARY}; "
+                f"background: transparent;"
             )
             col.addWidget(val_widget)
             col.addWidget(heading)
             today_row.addLayout(col, stretch=1)
 
         root.addLayout(today_row)
-        root.addSpacing(24)
+        root.addStretch()
 
         # ── Stop button ──────────────────────────────────────────────
+        root.addSpacing(SP4)
         self._stop_btn = QPushButton("Stop Cortex")
         self._stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._stop_btn.setFixedHeight(40)
+        self._stop_btn.setFixedHeight(38)
         self._stop_btn.setStyleSheet(f"""
             QPushButton {{
-                border: 1px solid rgba(217, 87, 87, 0.15);
-                background: rgba(217, 87, 87, 0.06);
+                border: 1px solid rgba(217, 87, 87, 0.12);
+                background: rgba(217, 87, 87, 0.04);
                 color: {CX_DANGER};
+                font-family: {CX_FONT_SANS};
                 font-size: 12px; font-weight: 500;
-                border-radius: {RADIUS_MD}px;
+                border-radius: {RADIUS_SM}px;
             }}
             QPushButton:hover {{
-                background: rgba(217, 87, 87, 0.12);
+                background: rgba(217, 87, 87, 0.10);
             }}
         """)
         root.addWidget(self._stop_btn)
-        root.addStretch()
 
     # -- Public update methods ------------------------------------------------
 
@@ -333,11 +430,12 @@ class _ConsumerTab(QWidget):
         color = STATE_COLORS.get(state, CX_TEXT_TERTIARY)
         label = STATE_LABELS.get(state, state)
         self._state_dot.setStyleSheet(
-            f"background: {color}; border-radius: 4px;"
+            f"background: {color}; border-radius: 3px;"
         )
         self._state_label.setText(label)
         self._state_label.setStyleSheet(
-            f"font-size: 13px; color: {color}; margin-left: 6px; background: transparent;"
+            f"font-family: {CX_FONT_SANS}; font-size: 12px; font-weight: 500; "
+            f"color: {color}; background: transparent;"
         )
 
         bio = payload.get("biometrics", {})
@@ -352,12 +450,12 @@ class _ConsumerTab(QWidget):
         if connected:
             self._state_label.setText("Connected")
             self._state_dot.setStyleSheet(
-                f"background: {CX_ACCENT}; border-radius: 4px;"
+                f"background: {CX_ACCENT}; border-radius: 3px;"
             )
         else:
             self._state_label.setText("Disconnected")
             self._state_dot.setStyleSheet(
-                f"background: {CX_TEXT_TERTIARY}; border-radius: 4px;"
+                f"background: {CX_TEXT_TERTIARY}; border-radius: 3px;"
             )
 
 
@@ -392,7 +490,7 @@ class HRTracePlot(QWidget):
         painter.drawPath(path)
 
         # Border
-        painter.setPen(QPen(QColor(0, 0, 0, 15), 1))
+        painter.setPen(QPen(QColor(0, 0, 0, 12), 1))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(path)
 
@@ -409,13 +507,13 @@ class HRTracePlot(QWidget):
         hr_range = max(max_hr - min_hr, 10.0)
 
         # Subtle grid lines
-        painter.setPen(QPen(QColor(0, 0, 0, 8), 1))
+        painter.setPen(QPen(QColor(0, 0, 0, 6), 1))
         for tick in range(int(min_hr), int(max_hr) + 1, 10):
             y = pad + (h - 2 * pad) - int((tick - min_hr) / hr_range * (h - 2 * pad))
             painter.drawLine(pad, y, w - pad, y)
 
         # Trace line — smooth, terracotta
-        pen = QPen(QColor(CX_BIO_HR), 2.5)
+        pen = QPen(QColor(CX_BIO_HR), 2)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         painter.setPen(pen)
@@ -430,7 +528,7 @@ class HRTracePlot(QWidget):
 
         # Current value — bottom right
         painter.setPen(QColor(CX_TEXT))
-        f = QFont("Georgia", 13)
+        f = QFont("Georgia", 12)
         f.setBold(True)
         painter.setFont(f)
         painter.drawText(w - 80, h - 12, f"{vals[-1]:.0f} BPM")
@@ -448,25 +546,26 @@ class _SignalQualityBar(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 2, 0, 2)
         self._label = QLabel(label)
-        self._label.setFixedWidth(80)
+        self._label.setFixedWidth(76)
         self._label.setStyleSheet(
-            f"font-size: 12px; color: {CX_TEXT_SECONDARY}; background: transparent;"
+            f"font-family: {CX_FONT_SANS}; font-size: 12px; "
+            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
         )
         layout.addWidget(self._label)
         self._bar = QProgressBar()
         self._bar.setRange(0, 100)
         self._bar.setValue(0)
         self._bar.setTextVisible(False)
-        self._bar.setFixedHeight(6)
+        self._bar.setFixedHeight(5)
         self._bar.setStyleSheet(f"""
             QProgressBar {{
                 background: {CX_TERTIARY};
                 border: none;
-                border-radius: 3px;
+                border-radius: 2px;
             }}
             QProgressBar::chunk {{
                 background: {CX_ACCENT};
-                border-radius: 3px;
+                border-radius: 2px;
             }}
         """)
         layout.addWidget(self._bar)
@@ -475,7 +574,8 @@ class _SignalQualityBar(QWidget):
         self._val_label.setFixedWidth(36)
         self._val_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._val_label.setStyleSheet(
-            f"font-size: 11px; color: {CX_TEXT_TERTIARY}; background: transparent;"
+            f"font-family: {CX_FONT_SANS}; font-size: 11px; "
+            f"color: {CX_TEXT_TERTIARY}; background: transparent;"
         )
         layout.addWidget(self._val_label)
 
@@ -484,7 +584,7 @@ class _SignalQualityBar(QWidget):
         self._bar.setValue(pct)
         self._val_label.setText(f"{pct}%")
         if quality >= 0.7:
-            color = "#57D99E"
+            color = "#4CAF7D"
         elif quality >= 0.4:
             color = "#D9B457"
         else:
@@ -492,11 +592,11 @@ class _SignalQualityBar(QWidget):
         self._bar.setStyleSheet(f"""
             QProgressBar {{
                 background: {CX_TERTIARY};
-                border: none; border-radius: 3px;
+                border: none; border-radius: 2px;
             }}
             QProgressBar::chunk {{
                 background: {color};
-                border-radius: 3px;
+                border-radius: 2px;
             }}
         """)
 
@@ -515,15 +615,12 @@ class _AdvancedTab(QWidget):
         self._session_start = time.monotonic()
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 16, 20, 20)
-        layout.setSpacing(16)
+        layout.setContentsMargins(SP6, SP5, SP6, SP6)
+        layout.setSpacing(SP4)
 
         # ── Signal quality ────────────────────────────────────────────
-        sq_label = QLabel("Signal Quality")
-        sq_label.setStyleSheet(
-            f"font-size: 11px; font-weight: 600; letter-spacing: 1px; "
-            f"color: {CX_TEXT_TERTIARY}; background: transparent;"
-        )
+        sq_label = QLabel("SIGNAL QUALITY")
+        sq_label.setStyleSheet(SECTION_HEADING_QSS)
         layout.addWidget(sq_label)
 
         self._physio_q = _SignalQualityBar("Physio")
@@ -532,24 +629,18 @@ class _AdvancedTab(QWidget):
         layout.addWidget(self._physio_q)
         layout.addWidget(self._kine_q)
         layout.addWidget(self._tele_q)
-        layout.addSpacing(4)
+        layout.addSpacing(SP2)
 
         # ── HR trace ──────────────────────────────────────────────────
-        hr_label = QLabel("Heart Rate")
-        hr_label.setStyleSheet(
-            f"font-size: 11px; font-weight: 600; letter-spacing: 1px; "
-            f"color: {CX_TEXT_TERTIARY}; background: transparent;"
-        )
+        hr_label = QLabel("HEART RATE")
+        hr_label.setStyleSheet(SECTION_HEADING_QSS)
         layout.addWidget(hr_label)
         self._hr_plot = HRTracePlot()
         layout.addWidget(self._hr_plot)
 
         # ── State scores ─────────────────────────────────────────────
-        scores_label = QLabel("State Scores")
-        scores_label.setStyleSheet(
-            f"font-size: 11px; font-weight: 600; letter-spacing: 1px; "
-            f"color: {CX_TEXT_TERTIARY}; background: transparent;"
-        )
+        scores_label = QLabel("STATE SCORES")
+        scores_label.setStyleSheet(SECTION_HEADING_QSS)
         layout.addWidget(scores_label)
 
         scores_grid = QGridLayout()
@@ -564,22 +655,28 @@ class _AdvancedTab(QWidget):
         ]):
             lbl = QLabel(name.capitalize())
             lbl.setFixedWidth(72)
-            lbl.setStyleSheet(f"font-size: 12px; color: {CX_TEXT_SECONDARY}; background: transparent;")
+            lbl.setStyleSheet(
+                f"font-family: {CX_FONT_SANS}; font-size: 12px; "
+                f"color: {CX_TEXT_SECONDARY}; background: transparent;"
+            )
             scores_grid.addWidget(lbl, i, 0)
             bar = QProgressBar()
             bar.setRange(0, 100)
             bar.setValue(0)
-            bar.setFixedHeight(6)
+            bar.setFixedHeight(5)
             bar.setTextVisible(False)
             bar.setStyleSheet(f"""
-                QProgressBar {{ background: {CX_TERTIARY}; border: none; border-radius: 3px; }}
-                QProgressBar::chunk {{ background: {color}; border-radius: 3px; }}
+                QProgressBar {{ background: {CX_TERTIARY}; border: none; border-radius: 2px; }}
+                QProgressBar::chunk {{ background: {color}; border-radius: 2px; }}
             """)
             scores_grid.addWidget(bar, i, 1)
             val_lbl = QLabel("0.00")
             val_lbl.setFixedWidth(36)
             val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            val_lbl.setStyleSheet(f"font-size: 11px; color: {CX_TEXT_TERTIARY}; background: transparent;")
+            val_lbl.setStyleSheet(
+                f"font-family: {CX_FONT_SANS}; font-size: 11px; "
+                f"color: {CX_TEXT_TERTIARY}; background: transparent;"
+            )
             scores_grid.addWidget(val_lbl, i, 2)
             self._score_bars[name] = bar
             self._score_labels[name] = val_lbl
@@ -589,11 +686,13 @@ class _AdvancedTab(QWidget):
         meta_row = QHBoxLayout()
         self._confidence_lbl = QLabel("Confidence: --")
         self._confidence_lbl.setStyleSheet(
-            f"font-size: 12px; color: {CX_TEXT_TERTIARY}; background: transparent;"
+            f"font-family: {CX_FONT_SANS}; font-size: 12px; "
+            f"color: {CX_TEXT_TERTIARY}; background: transparent;"
         )
         self._dwell_lbl = QLabel("Dwell: --")
         self._dwell_lbl.setStyleSheet(
-            f"font-size: 12px; color: {CX_TEXT_TERTIARY}; background: transparent;"
+            f"font-family: {CX_FONT_SANS}; font-size: 12px; "
+            f"color: {CX_TEXT_TERTIARY}; background: transparent;"
         )
         meta_row.addWidget(self._confidence_lbl)
         meta_row.addStretch()
@@ -601,16 +700,13 @@ class _AdvancedTab(QWidget):
         layout.addLayout(meta_row)
 
         # ── Timeline ──────────────────────────────────────────────────
-        tl_label = QLabel("Timeline")
-        tl_label.setStyleSheet(
-            f"font-size: 11px; font-weight: 600; letter-spacing: 1px; "
-            f"color: {CX_TEXT_TERTIARY}; background: transparent;"
-        )
+        tl_label = QLabel("TIMELINE")
+        tl_label.setStyleSheet(SECTION_HEADING_QSS)
         layout.addWidget(tl_label)
         self._timeline_text = QLabel("No events yet")
         self._timeline_text.setWordWrap(True)
         self._timeline_text.setStyleSheet(
-            f"font-family: 'SF Mono', 'JetBrains Mono', monospace; "
+            f"font-family: {CX_FONT_MONO}; "
             f"font-size: 11px; color: {CX_TEXT_SECONDARY}; "
             f"background: transparent; line-height: 1.6;"
         )
@@ -668,6 +764,8 @@ class DashboardWindow(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        # Backward-compatible test-facing fields.
+        self._connected = False
         self.setObjectName("CortexDashboard")
         self.setWindowTitle("Cortex")
         self.setFixedWidth(DASHBOARD_WIDTH)
@@ -681,6 +779,7 @@ class DashboardWindow(QWidget):
         self._tabs = QTabWidget()
         self._consumer = _ConsumerTab()
         self._advanced = _AdvancedTab()
+        self._timeline_events = self._advanced._timeline_events
         self._tabs.addTab(self._consumer, "Dashboard")
         self._tabs.addTab(self._advanced, "Advanced")
         layout.addWidget(self._tabs)
@@ -690,4 +789,5 @@ class DashboardWindow(QWidget):
         self._advanced.update_state(payload)
 
     def set_connected(self, connected: bool) -> None:
+        self._connected = connected
         self._consumer.set_connected(connected)

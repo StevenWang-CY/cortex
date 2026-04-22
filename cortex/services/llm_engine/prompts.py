@@ -16,6 +16,20 @@ from cortex.libs.schemas.state import StateEstimate
 
 logger = logging.getLogger(__name__)
 
+
+def sanitize_prompt_text(value: str, *, max_len: int = 4000) -> str:
+    """
+    Sanitize user/telemetry-derived strings before prompt interpolation.
+    """
+    text = value or ""
+    # Strip non-printable/control characters.
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", text)
+    # Normalize to ASCII (drop non-ASCII prompt-markers).
+    text = text.encode("ascii", "ignore").decode("ascii")
+    # Escape braces to avoid accidental format interpolation.
+    text = text.replace("{", "{{").replace("}", "}}")
+    return text[:max_len]
+
 # ---------------------------------------------------------------------------
 # System prompt (shared across all modes)
 # ---------------------------------------------------------------------------
@@ -41,7 +55,7 @@ do one thing, what would it be? Lead with that. The headline should name this ac
 - ALWAYS include a "causal_explanation" field: 1-2 sentences explaining WHY you are \
 intervening, referencing specific BEHAVIORAL signals the user can act on (e.g., \
 "You've been switching between 6 tabs every 30 seconds for the past 2 minutes"). \
-Do NOT cite raw biometric numbers (heart rate, HRV, blink rate) — students already \
+Do NOT cite raw biometric numbers (pulse, HRV, blink rate) — students already \
 know they're stressed. Focus on observable workspace behavior: tab count, switching \
 frequency, time stuck on an error, idle time, number of context switches.
 - Output ONLY valid JSON matching the schema below. No markdown, no preamble.
@@ -146,7 +160,7 @@ concrete file, tab, error, or action visible in the context. Never generate gene
 advice like "take a break", "breathe", "focus on your task", or "stay focused".
 - causal_explanation must reference SPECIFIC behavioral data: tab count, switching \
 frequency, time spent on current error, idle time, number of apps visited. \
-Never cite raw biometrics (heart rate, HRV, blink rate) — these feel clinical \
+Never cite raw biometrics (pulse, HRV, blink rate) — these feel clinical \
 and patronizing. Never say "you are feeling overwhelmed" without citing observable \
 workspace behavior from the state data provided.
 
@@ -520,14 +534,14 @@ def build_user_prompt(
         goal_hint = context.browser_context.focus_goal
 
     return template.format(
-        context=context.to_llm_context(),
+        context=sanitize_prompt_text(context.to_llm_context(), max_len=12000),
         state=state.state,
         confidence=state.confidence,
         dwell=state.dwell_seconds,
         complexity=context.complexity_score,
-        constraints_text=constraints_text,
-        goal_hint=goal_hint,
-        extra_context=extra_context,
+        constraints_text=sanitize_prompt_text(constraints_text, max_len=1000),
+        goal_hint=sanitize_prompt_text(goal_hint, max_len=400),
+        extra_context=sanitize_prompt_text(extra_context, max_len=5000),
     )
 
 

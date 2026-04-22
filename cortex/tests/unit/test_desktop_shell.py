@@ -54,12 +54,17 @@ def _setup_pyside6_mocks() -> bool:
         class AlignmentFlag:
             AlignCenter = 0x84
             AlignTop = 0x20
+            AlignVCenter = 0x80
+            AlignLeft = 0x01
+            AlignRight = 0x02
         class Orientation:
             Horizontal = 1
         class WindowType:
             FramelessWindowHint = 0x800
             WindowStaysOnTopHint = 0x40000
             Tool = 0x800
+        class CursorShape:
+            PointingHandCursor = 13
         class WidgetAttribute:
             WA_TranslucentBackground = 120
         class PenStyle:
@@ -92,6 +97,7 @@ def _setup_pyside6_mocks() -> bool:
     qtcore.QTimer = MockQTimer
     qtcore.QObject = MockQObject
     qtcore.QRect = MockQRect
+    qtcore.QRectF = MockQRect
     qtcore.QPropertyAnimation = MockQPropertyAnimation
     qtcore.QEvent = type("QEvent", (), {})
 
@@ -133,6 +139,12 @@ def _setup_pyside6_mocks() -> bool:
     class MockQPen:
         def __init__(self, *args): pass
 
+    class MockQPainterPath:
+        def __init__(self, *args): pass
+        def addRoundedRect(self, *args): pass
+        def moveTo(self, *args): pass
+        def lineTo(self, *args): pass
+
     class MockQPixmap:
         def __init__(self, *args): pass
         def fill(self, c): pass
@@ -152,6 +164,7 @@ def _setup_pyside6_mocks() -> bool:
     qtgui.QFont = MockQFont
     qtgui.QPainter = MockQPainter
     qtgui.QPen = MockQPen
+    qtgui.QPainterPath = MockQPainterPath
     qtgui.QPixmap = MockQPixmap
     qtgui.QIcon = MockQIcon
     qtgui.QAction = MockQAction
@@ -162,11 +175,14 @@ def _setup_pyside6_mocks() -> bool:
         def __init__(self, parent=None):
             self._visible = False
             self._size = (400, 300)
+            self._object_name = ""
         def setWindowFlags(self, f): pass
         def setAttribute(self, a): pass
         def setMinimumSize(self, w, h): self._size = (w, h)
         def setMinimumHeight(self, h): pass
         def setMinimumWidth(self, w): pass
+        def setMaximumHeight(self, h): pass
+        def setMaximumWidth(self, w): pass
         def setFixedSize(self, w, h): self._size = (w, h)
         def setFixedWidth(self, w): pass
         def setFixedHeight(self, h): pass
@@ -189,6 +205,10 @@ def _setup_pyside6_mocks() -> bool:
         def setStyleSheet(self, s): pass
         def setFont(self, f): pass
         def deleteLater(self): pass
+        def setObjectName(self, name): self._object_name = name
+        def objectName(self): return self._object_name
+        def setCursor(self, c): pass
+        def setGraphicsEffect(self, e): pass
 
     class MockQApplication:
         def __init__(self, *args): pass
@@ -207,6 +227,14 @@ def _setup_pyside6_mocks() -> bool:
         def setFont(self, f): pass
         def setWordWrap(self, w): pass
         def setAlignment(self, a): pass
+
+    class MockQLineEdit(MockQWidget):
+        def __init__(self, text="", parent=None):
+            super().__init__(parent)
+            self._text = text
+        def setText(self, t): self._text = t
+        def text(self): return self._text
+        def setPlaceholderText(self, t): pass
 
     class MockQProgressBar(MockQWidget):
         def __init__(self, parent=None):
@@ -296,15 +324,52 @@ def _setup_pyside6_mocks() -> bool:
             self._text = text
             self.clicked = MockSignal()
 
+    class MockQTabWidget(MockQWidget):
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self._tabs = []
+        def addTab(self, widget, title):
+            self._tabs.append((widget, title))
+
+    class MockQScrollArea(MockQWidget):
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self._widget = None
+        def setWidgetResizable(self, v): pass
+        def setWidget(self, w): self._widget = w
+
+    class MockQGraphicsDropShadowEffect:
+        def __init__(self, *args): pass
+        def setBlurRadius(self, v): pass
+        def setOffset(self, x, y): pass
+        def setColor(self, c): pass
+
+    class MockQSizePolicy:
+        class Policy:
+            Expanding = 0
+            Preferred = 0
+
+    class MockQMessageBox:
+        @staticmethod
+        def information(*args, **kwargs): return 0
+        @staticmethod
+        def warning(*args, **kwargs): return 0
+        @staticmethod
+        def critical(*args, **kwargs): return 0
+
     class MockLayout:
         def __init__(self, parent=None): pass
         def addWidget(self, w, *args, **kwargs): pass
-        def addLayout(self, layout): pass
-        def addStretch(self): pass
-        def addRow(self, *args): pass
+        def addLayout(self, layout, *args, **kwargs): pass
+        def addStretch(self, *args, **kwargs): pass
+        def addSpacing(self, s): pass
+        def addRow(self, *args, **kwargs): pass
         def removeWidget(self, w): pass
         def setContentsMargins(self, *args): pass
         def setSpacing(self, s): pass
+        def setAlignment(self, *args): pass
+        def setVerticalSpacing(self, s): pass
+        def setHorizontalSpacing(self, s): pass
 
     class MockDialogButtonBox(MockQWidget):
         class StandardButton:
@@ -321,6 +386,7 @@ def _setup_pyside6_mocks() -> bool:
     qtwidgets.QApplication = MockQApplication
     qtwidgets.QWidget = MockQWidget
     qtwidgets.QLabel = MockQLabel
+    qtwidgets.QLineEdit = MockQLineEdit
     qtwidgets.QProgressBar = MockQProgressBar
     qtwidgets.QCheckBox = MockQCheckBox
     qtwidgets.QSlider = MockQSlider
@@ -331,12 +397,17 @@ def _setup_pyside6_mocks() -> bool:
     qtwidgets.QMenu = MockQMenu
     qtwidgets.QSystemTrayIcon = MockQSystemTrayIcon
     qtwidgets.QPushButton = MockQPushButton
+    qtwidgets.QTabWidget = MockQTabWidget
+    qtwidgets.QScrollArea = MockQScrollArea
+    qtwidgets.QSizePolicy = MockQSizePolicy
+    qtwidgets.QMessageBox = MockQMessageBox
     qtwidgets.QDialogButtonBox = MockDialogButtonBox
     qtwidgets.QVBoxLayout = MockLayout
     qtwidgets.QHBoxLayout = MockLayout
     qtwidgets.QGridLayout = MockLayout
     qtwidgets.QFormLayout = MockLayout
     qtwidgets.QGraphicsOpacityEffect = type("QGraphicsOpacityEffect", (), {"__init__": lambda self, *a: None})
+    qtwidgets.QGraphicsDropShadowEffect = MockQGraphicsDropShadowEffect
 
     sys.modules["PySide6"] = pyside6
     sys.modules["PySide6.QtCore"] = qtcore

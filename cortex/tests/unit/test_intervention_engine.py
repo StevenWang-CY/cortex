@@ -385,8 +385,10 @@ class TestPlanValidation(unittest.TestCase):
     def test_destructive_plan_rejected(self):
         plan = _make_plan(destructive=True)
         result = validate_plan(plan)
-        assert result.is_valid is False
-        assert any("destructive" in e for e in result.errors)
+        # v0.2.0: destructive actions are downgraded to warnings so the
+        # remainder of the plan can still execute safely.
+        assert result.is_valid is True
+        assert any("destructive" in w for w in result.warnings)
 
     def test_unknown_hide_target_warning(self):
         plan = _make_plan(hide_targets=["unknown_target"])
@@ -445,8 +447,9 @@ class TestHideTargetMapping(unittest.TestCase):
     def test_prepare_plan_invalid(self):
         plan = _make_plan(destructive=True)
         result, commands = prepare_plan(plan)
-        assert result.is_valid is False
-        assert commands == []
+        assert result.is_valid is True
+        assert len(result.warnings) > 0
+        assert len(commands) > 0
 
 
 # ===========================================================================

@@ -15,7 +15,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -28,17 +28,35 @@ from PySide6.QtWidgets import (
 )
 
 from cortex.apps.desktop_shell.tokens import (
+    BTN_ACCENT_QSS,
+    BTN_PRIMARY_QSS,
+    CARD_QSS,
     CX_ACCENT,
+    CX_ACCENT_DIM,
     CX_BG,
+    CX_BORDER,
     CX_BORDER_DEFAULT,
     CX_DANGER,
+    CX_DANGER_DIM,
+    CX_FONT_SANS,
+    CX_SUCCESS,
+    CX_SUCCESS_DIM,
     CX_SURFACE,
     CX_TEXT,
     CX_TEXT_SECONDARY,
     CX_TEXT_TERTIARY,
+    PAGE_TITLE_QSS,
+    RADIUS_LG,
     RADIUS_MD,
+    RADIUS_SM,
+    RADIUS_FULL,
+    SECTION_HEADING_QSS,
+    SP2,
+    SP3,
     SP4,
     SP5,
+    SP6,
+    SP8,
 )
 
 logger = logging.getLogger(__name__)
@@ -115,35 +133,85 @@ _BROWSERS: list[tuple[str, str, str]] = [
 class ConnectionsPanel(QWidget):
     """Panel with one-click buttons for Chrome, Edge, and editor setup."""
 
+    back_requested = Signal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Cortex — Connect Extensions")
-        self.setFixedWidth(440)
+        self.setWindowTitle("Cortex — Connect")
+        self.setFixedWidth(460)
         self.setStyleSheet(f"background: {CX_BG};")
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(SP5, SP5, SP5, SP5)
-        layout.setSpacing(SP4)
+        layout.setContentsMargins(SP6, SP5, SP6, SP6)
+        layout.setSpacing(SP5)
 
+        # ── Header with back button ──────────────────────────────────
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+
+        back_btn = QPushButton("\u2190  Back")
+        back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        back_btn.setStyleSheet(f"""
+            QPushButton {{
+                font-family: {CX_FONT_SANS};
+                font-size: 13px; font-weight: 500;
+                color: {CX_TEXT_SECONDARY};
+                background: transparent; border: none;
+                padding: 4px 0;
+            }}
+            QPushButton:hover {{ color: {CX_TEXT}; }}
+        """)
+        back_btn.clicked.connect(self._on_back)
+        header.addWidget(back_btn)
+        header.addStretch()
+        layout.addLayout(header)
+
+        # ── Title ────────────────────────────────────────────────────
         title = QLabel("Connect Extensions")
-        title.setStyleSheet(
-            f"font-family: Georgia, serif; font-size: 20px; "
-            f"font-weight: 600; color: {CX_TEXT};"
-        )
+        title.setStyleSheet(PAGE_TITLE_QSS)
         layout.addWidget(title)
 
-        # Translocation warning (hidden by default)
-        self._transloc_warning = QLabel(
-            "Cortex is running in a temporary sandbox.\n"
-            "Move it to Applications, then run in Terminal:\n"
-            "  xattr -cr /Applications/Cortex.app\n"
-            "and relaunch."
+        subtitle = QLabel(
+            "Link your browser and editor to enable real-time "
+            "workspace restructuring."
         )
-        self._transloc_warning.setWordWrap(True)
-        self._transloc_warning.setStyleSheet(
-            f"background: {CX_DANGER}22; color: {CX_DANGER}; "
-            f"padding: 12px; border-radius: {RADIUS_MD}px; font-size: 13px;"
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet(
+            f"font-family: {CX_FONT_SANS}; font-size: 13px; "
+            f"color: {CX_TEXT_SECONDARY}; background: transparent; "
+            f"line-height: 1.5;"
         )
+        layout.addWidget(subtitle)
+        layout.addSpacing(SP2)
+
+        # ── Translocation warning (hidden by default) ────────────────
+        self._transloc_warning = QFrame()
+        self._transloc_warning.setStyleSheet(f"""
+            QFrame {{
+                background: {CX_DANGER_DIM};
+                border: 1px solid rgba(217, 87, 87, 0.15);
+                border-radius: {RADIUS_MD}px;
+            }}
+        """)
+        warn_layout = QVBoxLayout(self._transloc_warning)
+        warn_layout.setContentsMargins(SP4, SP3, SP4, SP3)
+        warn_title = QLabel("App Sandbox Detected")
+        warn_title.setStyleSheet(
+            f"font-family: {CX_FONT_SANS}; font-size: 13px; "
+            f"font-weight: 600; color: {CX_DANGER}; border: none;"
+        )
+        warn_layout.addWidget(warn_title)
+        warn_body = QLabel(
+            "Cortex is running in a temporary sandbox. "
+            "Move it to Applications, run xattr -cr /Applications/Cortex.app "
+            "in Terminal, then relaunch."
+        )
+        warn_body.setWordWrap(True)
+        warn_body.setStyleSheet(
+            f"font-family: {CX_FONT_SANS}; font-size: 12px; "
+            f"color: {CX_DANGER}; border: none; line-height: 1.4;"
+        )
+        warn_layout.addWidget(warn_body)
         self._transloc_warning.setVisible(False)
         layout.addWidget(self._transloc_warning)
 
@@ -151,17 +219,31 @@ class ConnectionsPanel(QWidget):
         if translocated:
             self._transloc_warning.setVisible(True)
 
-        # Browser cards
+        # ── Section: Browsers ────────────────────────────────────────
+        browser_label = QLabel("BROWSERS")
+        browser_label.setStyleSheet(SECTION_HEADING_QSS)
+        layout.addWidget(browser_label)
+
         for name, app_path, scheme in _BROWSERS:
             installed = os.path.exists(app_path)
             card = self._make_browser_card(name, app_path, scheme, installed, translocated)
             layout.addWidget(card)
 
-        # Editor card
+        # ── Section: Editor ──────────────────────────────────────────
+        editor_label = QLabel("EDITOR")
+        editor_label.setStyleSheet(SECTION_HEADING_QSS)
+        layout.addWidget(editor_label)
+
         editor = find_editor_cli()
         layout.addWidget(self._make_editor_card(editor, translocated))
 
         layout.addStretch()
+
+    # -- Navigation -----------------------------------------------------------
+
+    def _on_back(self) -> None:
+        self.hide()
+        self.back_requested.emit()
 
     # -- Card builders --------------------------------------------------------
 
@@ -174,55 +256,73 @@ class ConnectionsPanel(QWidget):
         translocated: bool,
     ) -> QFrame:
         card = QFrame()
-        card.setStyleSheet(f"""
-            QFrame {{
-                background: {CX_SURFACE};
-                border: 1px solid {CX_BORDER_DEFAULT};
-                border-radius: {RADIUS_MD}px;
-                padding: {SP4}px;
-            }}
-        """)
+        card.setStyleSheet(f"QFrame {{ {CARD_QSS} }}")
         layout = QVBoxLayout(card)
+        layout.setContentsMargins(SP4, SP4, SP4, SP4)
+        layout.setSpacing(SP3)
 
+        # Header row
         header = QHBoxLayout()
-        title = QLabel(f"{name} Extension")
-        title.setStyleSheet(f"font-size: 14px; font-weight: 600; color: {CX_TEXT}; border: none;")
+        header.setSpacing(SP3)
+
+        title = QLabel(f"{name}")
+        title.setStyleSheet(
+            f"font-family: {CX_FONT_SANS}; font-size: 14px; "
+            f"font-weight: 600; color: {CX_TEXT}; border: none;"
+        )
         header.addWidget(title)
         header.addStretch()
 
-        status = QLabel("Not installed" if not installed else "Ready")
+        # Status badge
+        if installed:
+            status_text = "Available"
+            status_color = CX_SUCCESS
+            status_bg = CX_SUCCESS_DIM
+        else:
+            status_text = "Not found"
+            status_color = CX_TEXT_TERTIARY
+            status_bg = "rgba(0,0,0,0.04)"
+
+        status = QLabel(status_text)
         status.setStyleSheet(
-            f"font-size: 12px; color: {CX_TEXT_TERTIARY if not installed else CX_ACCENT}; border: none;"
+            f"font-family: {CX_FONT_SANS}; font-size: 11px; font-weight: 500; "
+            f"color: {status_color}; background: {status_bg}; "
+            f"border: none; border-radius: {RADIUS_SM}px; "
+            f"padding: 3px 8px;"
         )
         header.addWidget(status)
         layout.addLayout(header)
 
+        # Description
+        desc = QLabel(
+            f"Install native messaging host and load the Cortex extension."
+            if installed else f"{name} is not installed on this Mac."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet(
+            f"font-family: {CX_FONT_SANS}; font-size: 12px; "
+            f"color: {CX_TEXT_SECONDARY}; border: none; line-height: 1.4;"
+        )
+        layout.addWidget(desc)
+
+        # Connect button
         btn = QPushButton(f"Connect {name}")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.setEnabled(installed and not translocated)
-        btn.setStyleSheet(f"""
-            QPushButton {{
-                padding: 8px 16px; border-radius: 9999px;
-                background: {CX_TEXT}; color: white;
-                font-size: 13px; font-weight: 500; border: none;
-            }}
-            QPushButton:hover {{ background: #333; }}
-            QPushButton:disabled {{ background: {CX_TEXT_TERTIARY}; }}
-        """)
+        btn.setFixedHeight(36)
+        btn.setStyleSheet(BTN_PRIMARY_QSS)
         btn.clicked.connect(lambda checked=False, n=name, s=scheme: self._connect_browser(n, s))
         layout.addWidget(btn)
 
+        # Instructions label (shown after clicking Connect)
         self._instructions_label = QLabel("")
         self._instructions_label.setWordWrap(True)
         self._instructions_label.setStyleSheet(
-            f"font-size: 12px; color: {CX_TEXT_SECONDARY}; border: none;"
+            f"font-family: {CX_FONT_SANS}; font-size: 12px; "
+            f"color: {CX_TEXT_SECONDARY}; border: none;"
         )
         self._instructions_label.setVisible(False)
         layout.addWidget(self._instructions_label)
-
-        if not installed:
-            hint = QLabel(f"{name} not found")
-            hint.setStyleSheet(f"font-size: 12px; color: {CX_TEXT_TERTIARY}; border: none;")
-            layout.addWidget(hint)
 
         return card
 
@@ -232,50 +332,68 @@ class ConnectionsPanel(QWidget):
         translocated: bool,
     ) -> QFrame:
         card = QFrame()
-        card.setStyleSheet(f"""
-            QFrame {{
-                background: {CX_SURFACE};
-                border: 1px solid {CX_BORDER_DEFAULT};
-                border-radius: {RADIUS_MD}px;
-                padding: {SP4}px;
-            }}
-        """)
+        card.setStyleSheet(f"QFrame {{ {CARD_QSS} }}")
         layout = QVBoxLayout(card)
+        layout.setContentsMargins(SP4, SP4, SP4, SP4)
+        layout.setSpacing(SP3)
 
         editor_name = editor[1] if editor else "Editor"
+
+        # Header row
         header = QHBoxLayout()
-        title = QLabel(f"{editor_name} Extension")
-        title.setStyleSheet(f"font-size: 14px; font-weight: 600; color: {CX_TEXT}; border: none;")
+        header.setSpacing(SP3)
+
+        title = QLabel(editor_name)
+        title.setStyleSheet(
+            f"font-family: {CX_FONT_SANS}; font-size: 14px; "
+            f"font-weight: 600; color: {CX_TEXT}; border: none;"
+        )
         header.addWidget(title)
         header.addStretch()
 
-        status = QLabel("Ready" if editor else "Not found")
+        if editor:
+            status_text = "Available"
+            status_color = CX_SUCCESS
+            status_bg = CX_SUCCESS_DIM
+        else:
+            status_text = "Not found"
+            status_color = CX_TEXT_TERTIARY
+            status_bg = "rgba(0,0,0,0.04)"
+
+        status = QLabel(status_text)
         status.setStyleSheet(
-            f"font-size: 12px; color: {CX_ACCENT if editor else CX_TEXT_TERTIARY}; border: none;"
+            f"font-family: {CX_FONT_SANS}; font-size: 11px; font-weight: 500; "
+            f"color: {status_color}; background: {status_bg}; "
+            f"border: none; border-radius: {RADIUS_SM}px; "
+            f"padding: 3px 8px;"
         )
         header.addWidget(status)
         layout.addLayout(header)
 
+        # Description
+        desc_text = (
+            f"Install the Cortex VS Code extension for editor integration."
+            if editor else
+            "No compatible editor found (VS Code, Cursor, VSCodium)."
+        )
+        desc = QLabel(desc_text)
+        desc.setWordWrap(True)
+        desc.setStyleSheet(
+            f"font-family: {CX_FONT_SANS}; font-size: 12px; "
+            f"color: {CX_TEXT_SECONDARY}; border: none; line-height: 1.4;"
+        )
+        layout.addWidget(desc)
+
+        # Connect button
         btn = QPushButton(f"Connect {editor_name}")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.setEnabled(editor is not None and not translocated)
-        btn.setStyleSheet(f"""
-            QPushButton {{
-                padding: 8px 16px; border-radius: 9999px;
-                background: {CX_TEXT}; color: white;
-                font-size: 13px; font-weight: 500; border: none;
-            }}
-            QPushButton:hover {{ background: #333; }}
-            QPushButton:disabled {{ background: {CX_TEXT_TERTIARY}; }}
-        """)
+        btn.setFixedHeight(36)
+        btn.setStyleSheet(BTN_PRIMARY_QSS)
         if editor:
             cli_path = editor[0]
             btn.clicked.connect(lambda: self._connect_editor(cli_path, editor_name))
         layout.addWidget(btn)
-
-        if not editor:
-            hint = QLabel("No compatible editor found (VS Code, Cursor, VSCodium)")
-            hint.setStyleSheet(f"font-size: 12px; color: {CX_TEXT_TERTIARY}; border: none;")
-            layout.addWidget(hint)
 
         return card
 
