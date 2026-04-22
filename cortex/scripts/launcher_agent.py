@@ -76,20 +76,38 @@ def _find_daemon_pid() -> int | None:
     return None
 
 
+CORTEX_APP_PATH = "/Applications/Cortex.app"
+
+
 def _launch_daemon() -> dict:
-    """Spawn the Cortex daemon as a detached background process."""
+    """Spawn the Cortex daemon as a detached background process.
+
+    Prefers ``open -a Cortex.app`` when the DMG install is present so end
+    users who don't have a dev checkout can still use the extension's
+    Start button. Falls back to ``python -m cortex.scripts.run_dev`` for
+    developers.
+    """
     if _is_daemon_running():
         pid = _find_daemon_pid()
         return {"status": "already_running", "pid": pid}
 
+    # DMG path: launch the installed .app (in-process daemon).
+    if os.path.isdir(CORTEX_APP_PATH):
+        try:
+            subprocess.run(
+                ["open", "-a", CORTEX_APP_PATH],
+                capture_output=True, timeout=5,
+            )
+            return {"status": "starting", "message": "Cortex.app launched"}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    # Dev path: run the cortex.scripts.run_dev module from the checkout.
     project_root = _project_root()
     python = _python_path()
-
     log_path = os.path.join(project_root, "cortex_daemon.log")
 
     try:
-        # Write a launcher script and spawn via Popen (launcher_agent
-        # already runs from terminal context with camera permissions).
         launcher_sh = os.path.join(project_root, ".cortex_launch.sh")
         with open(launcher_sh, "w") as f:
             f.write(f"#!/bin/bash\ncd {project_root}\nexec {python} -m cortex.scripts.run_dev\n")

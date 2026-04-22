@@ -18,6 +18,11 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.signal import find_peaks, lombscargle, welch
 
+# np.trapz was removed in NumPy 2.0 in favor of np.trapezoid.
+# This shim lets the module work on both NumPy 1.x (deployed in CI) and 2.x.
+if not hasattr(np, "trapezoid"):
+    np.trapezoid = np.trapz  # type: ignore[attr-defined]
+
 
 def estimate_hr_welch(
     bvp_signal: NDArray[np.float64],

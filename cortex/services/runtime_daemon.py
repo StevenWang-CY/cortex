@@ -980,6 +980,9 @@ class CortexDaemon:
         await self._ws_server.send_restore(intervention_id, user_action=action)
 
         # v2.0: End helpfulness tracking and update bandit
+        # Fold the user's action into the tracker first so the implicit-signal
+        # term (engaged/ignored/undone) contributes to the reward.
+        self._helpfulness.record_user_action(intervention_id, action)
         context = self._latest_context
         state_estimate = registry.get("latest_state_estimate")
         if state_estimate:

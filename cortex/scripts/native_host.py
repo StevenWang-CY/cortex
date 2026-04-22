@@ -1,4 +1,4 @@
-#!/Users/chuyuewang/Desktop/CS/Project/Ralph/.venv/bin/python
+#!/usr/bin/env python3
 """
 Cortex Native Messaging Host for Chrome Extension.
 
@@ -61,11 +61,52 @@ def is_daemon_running(port: int = 9473) -> bool:
         return False
 
 
+CORTEX_APP_PATH = "/Applications/Cortex.app"
+
+
+def _is_installed_app() -> bool:
+    """True when Cortex.app is installed in /Applications (DMG users)."""
+    return os.path.isdir(CORTEX_APP_PATH)
+
+
 def launch_daemon() -> dict:
-    """Launch the Cortex daemon as a detached background process."""
+    """Launch the Cortex daemon as a detached background process.
+
+    Two launch modes:
+
+    * **DMG mode** — Cortex.app is installed in /Applications. Use
+      ``open -a Cortex`` so the bundled Python and in-process daemon
+      start with the app's own TCC camera identity. This is the path
+      end users hit after installing the DMG.
+    * **Dev mode** — No installed .app. Fall back to running
+      ``python -m cortex.scripts.run_dev`` via Terminal.app so the
+      dev-checkout daemon inherits Terminal's camera permission.
+    """
     if is_daemon_running():
         return {"status": "already_running"}
 
+    # --- DMG path: open the installed .app ---------------------------------
+    if _is_installed_app():
+        try:
+            subprocess.run(
+                ["open", "-a", CORTEX_APP_PATH],
+                capture_output=True, timeout=5,
+            )
+            log("Launched daemon via open -a Cortex.app")
+        except Exception as e:
+            log(f"open -a failed: {e}")
+            return {"status": "error", "error": str(e)}
+
+        # The desktop shell starts its daemon lazily — allow up to 20s.
+        for i in range(40):
+            time.sleep(0.5)
+            if is_daemon_running():
+                log(f"Daemon ready after {(i+1)*0.5}s")
+                return {"status": "launched"}
+        log("Daemon did not become ready in 20s")
+        return {"status": "timeout", "error": "Daemon started but port 9473 not yet ready"}
+
+    # --- Dev path: python -m cortex.scripts.run_dev via Terminal.app -------
     # Find the project root (this script is at cortex/scripts/native_host.py)
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(os.path.dirname(script_dir))
@@ -73,10 +114,6 @@ def launch_daemon() -> dict:
     log(f"project_root={project_root}")
     log(f"sys.executable={sys.executable}")
 
-    # Launch the daemon with camera access.
-    # Chrome's native messaging host inherits Chrome's TCC context, which
-    # denies camera access.  We use Terminal.app (which has its own TCC
-    # context) to launch the daemon so it gets proper camera permissions.
     try:
         log_path = os.path.join(project_root, "cortex_daemon.log")
         python = os.path.abspath(sys.executable)
@@ -84,7 +121,6 @@ def launch_daemon() -> dict:
         # Launch via Terminal.app — Terminal has its own TCC context for
         # camera and file access.  The daemon runs in the foreground of
         # Terminal so it inherits Terminal's camera permission.
-        # The Terminal window stays open while the daemon runs.
         cmd = (
             f"cd {project_root} && "
             f"{python} -m cortex.scripts.run_dev "

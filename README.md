@@ -38,7 +38,7 @@
 3. Strip quarantine: `xattr -cr /Applications/Cortex.app`
 4. Open Cortex — follow the 4-step setup wizard (Camera, Accessibility, API key, Extensions)
 
-That's it — no terminal, no Python, no Node.js required.
+That's it — no terminal, no Python, no Node.js required. The daemon runs in-process inside Cortex.app; the browser extension's **Start Cortex** button launches the installed .app automatically (`open -a Cortex.app`) and reuses its in-process daemon.
 
 ---
 
@@ -120,7 +120,7 @@ All layers communicate via FastAPI (port 9472) and WebSocket (port 9473). The de
 | **VS Code Extension** | TypeScript, VS Code Extension API |
 | **LLM** | Azure OpenAI, Qwen-3-8B (remote via SSH tunnel), Ollama (local) |
 | **Storage** | Redis 7+ with automatic in-memory fallback |
-| **Testing** | pytest (47 test files), mypy (strict), ruff |
+| **Testing** | pytest (55 test files, 995+ tests), mypy (strict), ruff |
 
 ---
 
@@ -275,8 +275,10 @@ python3 -c "import cv2; [print(f'Device {i}: {cv2.VideoCapture(i).isOpened()}') 
 ```
 
 ### "Stop Cortex" doesn't stop the camera
-- Click Stop again — the extension uses a multi-layer kill chain (WebSocket → HTTP → process kill)
-- If the camera light stays on: `pkill -f "cortex.scripts.run_dev"`
+- Click Stop again — the extension uses a multi-layer kill chain (WebSocket → HTTP → native messaging SIGTERM → launcher SIGTERM)
+- If the camera light stays on:
+  - DMG install: `osascript -e 'tell application "Cortex" to quit'`
+  - Dev checkout: `pkill -f "cortex.scripts.run_dev"`
 
 ### Azure LLM errors
 - Verify your `.env` has `CORTEX_LLM__AZURE__ENDPOINT`, `API_KEY`, and `DEPLOYMENT_NAME` set

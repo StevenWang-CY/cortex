@@ -119,7 +119,8 @@ class TestStressIntegralWarning:
     def test_warning_at_80_percent(self):
         from cortex.services.state_engine.stress_integral import StressIntegralTracker
 
-        tracker = StressIntegralTracker(hrv_baseline=50.0, threshold=100.0)
+        # hrv_sigma=1.0 preserves raw-ms integration so 1ms*s/sample arithmetic holds.
+        tracker = StressIntegralTracker(hrv_baseline=50.0, hrv_sigma=1.0, threshold=100.0)
 
         # Push to 80% (suppression=1ms/s, need 81 samples for 80ms integral)
         for i in range(82):
@@ -131,7 +132,7 @@ class TestStressIntegralWarning:
     def test_no_warning_below_80(self):
         from cortex.services.state_engine.stress_integral import StressIntegralTracker
 
-        tracker = StressIntegralTracker(hrv_baseline=50.0, threshold=1000.0)
+        tracker = StressIntegralTracker(hrv_baseline=50.0, hrv_sigma=1.0, threshold=1000.0)
         tracker.update(hrv_rmssd=49.0, timestamp=0.0)
         tracker.update(hrv_rmssd=49.0, timestamp=1.0)
 
@@ -140,7 +141,7 @@ class TestStressIntegralWarning:
     def test_warning_fires_only_once(self):
         from cortex.services.state_engine.stress_integral import StressIntegralTracker
 
-        tracker = StressIntegralTracker(hrv_baseline=50.0, threshold=100.0)
+        tracker = StressIntegralTracker(hrv_baseline=50.0, hrv_sigma=1.0, threshold=100.0)
         for i in range(82):
             tracker.update(hrv_rmssd=49.0, timestamp=float(i))
 
@@ -150,7 +151,7 @@ class TestStressIntegralWarning:
     def test_reset_clears_warning(self):
         from cortex.services.state_engine.stress_integral import StressIntegralTracker
 
-        tracker = StressIntegralTracker(hrv_baseline=50.0, threshold=100.0)
+        tracker = StressIntegralTracker(hrv_baseline=50.0, hrv_sigma=1.0, threshold=100.0)
         for i in range(82):
             tracker.update(hrv_rmssd=49.0, timestamp=float(i))
         tracker.should_warn()
