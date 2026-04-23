@@ -1,7 +1,7 @@
 /**
  * Cortex VS Code Extension — WebSocket Client
  *
- * Connects to the Cortex daemon at ws://localhost:9473.
+ * Connects to the Cortex daemon at ws://127.0.0.1:9473.
  * Handles STATE_UPDATE and INTERVENTION_TRIGGER messages from daemon,
  * sends IDENTIFY and USER_ACTION messages to daemon.
  * Auto-reconnects on disconnect with exponential backoff.

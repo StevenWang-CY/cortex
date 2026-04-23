@@ -54,15 +54,18 @@ datas = [
     (str(CORTEX / "apps" / "vscode_extension" / "cortex-somatic-0.1.0.vsix"),
      "."),
 
-    # Native messaging host — Chrome invokes this script directly (outside the
-    # PyInstaller bundle), so ship it on disk rather than inside the PYZ archive.
-    # install_native_host.install(project_root=<app>) patches its shebang to the
-    # user's Python at registration time and expects it at
-    # Contents/Resources/cortex/scripts/native_host.py.
+    # Native messaging host — Chrome invokes a copied host script from the
+    # user's Application Support directory. The installer reads this bundled
+    # source script and writes the executable copy outside the signed app bundle.
     (str(CORTEX / "scripts" / "native_host.py"),
      "cortex/scripts"),
     (str(CORTEX / "scripts" / "install_native_host.py"),
      "cortex/scripts"),
+
+    # MediaPipe task model used by FaceTracker. Without this data file the
+    # frozen app falls back to telemetry-only mode even when camera access works.
+    (str(CORTEX / "models" / "face_landmarker.task"),
+     "cortex/models"),
 
     # Fonts
     (str(CORTEX / "apps" / "browser_extension" / "assets" / "fonts"),
@@ -96,8 +99,9 @@ hiddenimports = [
 
     # MediaPipe
     "mediapipe",
-    "mediapipe.python",
-    "mediapipe.python.solutions",
+    "mediapipe.tasks",
+    "mediapipe.tasks.python",
+    "mediapipe.tasks.python.vision",
 
     # PySide6
     "PySide6.QtCore",
@@ -215,6 +219,10 @@ app = BUNDLE(
         ),
         "NSAppleEventsUsageDescription": (
             "Cortex needs automation access to manage workspace windows."
+        ),
+        "NSInputMonitoringUsageDescription": (
+            "Cortex needs input monitoring access to estimate typing and mouse "
+            "patterns locally for focus-state detection."
         ),
         "LSUIElement": False,  # Show in Dock
         "NSHighResolutionCapable": True,

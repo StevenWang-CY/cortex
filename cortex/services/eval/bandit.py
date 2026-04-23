@@ -215,6 +215,16 @@ class ContextualBandit:
             return ARM_LABELS[arm_idx]
         return "unknown"
 
+    def get_arm_index(self, arm_label: str) -> int | None:
+        """Get arm index by label, or None when unknown."""
+        try:
+            idx = ARM_LABELS.index(arm_label)
+        except ValueError:
+            return None
+        if idx >= self._n_arms:
+            return None
+        return idx
+
     def get_arm_stats(self) -> list[dict]:
         """Get statistics for each arm."""
         stats = []

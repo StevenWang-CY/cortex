@@ -1,0 +1,6 @@
+.vscode/**
+src/**
+**/*.map
+tsconfig.json
+package-lock.json
+npm-debug.log

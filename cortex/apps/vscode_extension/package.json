@@ -85,7 +85,7 @@
       "properties": {
         "cortex.daemonUrl": {
           "type": "string",
-          "default": "ws://localhost:9473",
+          "default": "ws://127.0.0.1:9473",
           "description": "WebSocket URL of the Cortex daemon"
         },
         "cortex.autoConnect": {

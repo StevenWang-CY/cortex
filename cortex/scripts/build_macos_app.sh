@@ -23,6 +23,15 @@ if [ -f "${ROOT_DIR}/.venv/bin/activate" ]; then
     source "${ROOT_DIR}/.venv/bin/activate"
 fi
 
+# Non-interactive bash launched from GUI tools often lacks Homebrew/NVM paths.
+# Add the common macOS Node locations before building bundled extensions.
+export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
+if ! command -v npm &>/dev/null && [ -s "${HOME}/.nvm/nvm.sh" ]; then
+    # shellcheck disable=SC1090
+    source "${HOME}/.nvm/nvm.sh"
+    nvm use --silent default >/dev/null 2>&1 || true
+fi
+
 ENV_BACKUP_PATH=""
 BUNDLED_ENV_ACTIVE="0"
 DMG_STAGE_DIR=""
@@ -74,11 +83,30 @@ else
     )
 fi
 
-# ── Step 3: Verify VSIX ────────────────────────────────────────────────────
+# ── Step 2: Build VS Code extension ────────────────────────────────────────
 VSIX="${CORTEX_DIR}/apps/vscode_extension/cortex-somatic-0.1.0.vsix"
+VSCODE_EXT_DIR="${CORTEX_DIR}/apps/vscode_extension"
+if [ "${CORTEX_SKIP_VSCODE_EXT_BUILD:-0}" = "1" ]; then
+    echo "→ Skipping VS Code extension build (CORTEX_SKIP_VSCODE_EXT_BUILD=1)"
+else
+    echo "→ Building VS Code extension..."
+    (
+        cd "${VSCODE_EXT_DIR}"
+        if command -v npm &>/dev/null; then
+            npm install
+            npm run compile
+            npx --yes @vscode/vsce package --out "${VSIX}"
+        else
+            echo "ERROR: npm not installed; cannot build VS Code extension" >&2
+            exit 1
+        fi
+    )
+fi
+
+# ── Step 3: Verify VSIX ────────────────────────────────────────────────────
 if [ ! -f "${VSIX}" ]; then
     echo "ERROR: VSIX not found at ${VSIX}" >&2
-    echo "Build it with: cd cortex/apps/vscode_extension && vsce package" >&2
+    echo "Build it with: cd cortex/apps/vscode_extension && npx @vscode/vsce package --out cortex-somatic-0.1.0.vsix" >&2
     exit 1
 fi
 echo "→ VSIX found"

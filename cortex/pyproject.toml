@@ -47,6 +47,9 @@ dependencies = [
     # Desktop UI
     "PySide6>=6.6.0",
 
+    # macOS Keychain for BYOK storage
+    "keyring>=24.3.0",
+
     # HTTP Client
     "httpx>=0.26.0",
 

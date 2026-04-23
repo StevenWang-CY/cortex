@@ -161,6 +161,7 @@ class BrowserAdapter:
                 url=url,
                 tab_type=tab_type,
                 is_active=is_active,
+                topic_hint=t.get("topic_hint", ""),
             ))
 
             type_counts[tab_type] = type_counts.get(tab_type, 0) + 1
@@ -176,6 +177,7 @@ class BrowserAdapter:
             active_tab_content_excerpt=content,
             all_tabs=tabs,
             tab_type_classification=type_counts,
+            focus_goal=payload.get("focus_goal"),
         )
 
     def reset(self) -> None:

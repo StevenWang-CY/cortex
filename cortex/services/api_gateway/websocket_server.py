@@ -104,6 +104,7 @@ class WebSocketServer:
         self._shutdown_callback: Any = None
         self._activity_sync_callback: Any = None
         self._tab_relevance_feedback_callback: Any = None
+        self._leetcode_context_callback: Any = None
 
         # Latest state for new connections
         self._latest_state: StateEstimate | None = None
@@ -140,6 +141,10 @@ class WebSocketServer:
     def set_tab_relevance_feedback_callback(self, callback: Any) -> None:
         """Set callback for TAB_RELEVANCE_FEEDBACK messages from browser extension."""
         self._tab_relevance_feedback_callback = callback
+
+    def set_leetcode_context_callback(self, callback: Any) -> None:
+        """Set callback for LEETCODE_CONTEXT_UPDATE messages from browser extension."""
+        self._leetcode_context_callback = callback
 
     async def start(self) -> bool:
         """
@@ -232,6 +237,9 @@ class WebSocketServer:
             await self._handle_user_action(client, msg)
         elif msg.type == "ACTION_EXECUTE":
             await self._handle_user_action(client, msg)
+        elif msg.type == "USER_RATING":
+            # Route user ratings through the same callback used for user actions.
+            await self._handle_user_action(client, msg)
         elif msg.type == "IDENTIFY":
             # Client identifying its type
             client.client_type = msg.payload.get("client_type", "unknown")
@@ -246,6 +254,8 @@ class WebSocketServer:
             await self._handle_activity_sync(client, msg)
         elif msg.type == "TAB_RELEVANCE_FEEDBACK":
             await self._handle_tab_relevance_feedback(client, msg)
+        elif msg.type == "LEETCODE_CONTEXT_UPDATE":
+            await self._handle_leetcode_context_update(client, msg)
         elif msg.type == "SHUTDOWN":
             logger.info("Shutdown requested via WebSocket from %s", client.client_id)
             if self._shutdown_callback is not None:
@@ -327,6 +337,21 @@ class WebSocketServer:
         except Exception as exc:
             logger.error("Tab relevance feedback error from %s: %s", client.client_id, exc)
 
+    async def _handle_leetcode_context_update(
+        self, client: WebSocketClient, msg: WSMessage,
+    ) -> None:
+        """Forward LeetCode DOM/code telemetry snapshots to the daemon."""
+        callback = self._leetcode_context_callback
+        if callback is None:
+            return
+        try:
+            if asyncio.iscoroutinefunction(callback):
+                await callback(msg.payload)
+            else:
+                callback(msg.payload)
+        except Exception as exc:
+            logger.error("LeetCode context callback error from %s: %s", client.client_id, exc)
+
     async def broadcast_state(
         self,
         estimate: StateEstimate,
@@ -381,6 +406,27 @@ class WebSocketServer:
                 type="SETTINGS_SYNC",
                 payload=settings,
                 sequence=self._sequence,
+            )
+        )
+
+    async def send_message(
+        self,
+        message_type: str,
+        payload: dict[str, Any],
+        *,
+        target_client_types: list[str] | None = None,
+        correlation_id: str | None = None,
+    ) -> int:
+        """Broadcast an arbitrary typed message to connected clients."""
+        self._sequence += 1
+        return await self._broadcast(
+            WSMessage(
+                type=message_type,
+                payload=payload,
+                sequence=self._sequence,
+                correlation_id=correlation_id,
+                target_client_types=target_client_types,
+                source_client_type="daemon",
             )
         )
 

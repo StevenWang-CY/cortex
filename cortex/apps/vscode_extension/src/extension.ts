@@ -23,7 +23,7 @@ let statusBarItem: vscode.StatusBarItem | undefined;
  */
 export function activate(context: vscode.ExtensionContext): void {
     const config = vscode.workspace.getConfiguration("cortex");
-    const daemonUrl = config.get<string>("daemonUrl", "ws://localhost:9473");
+    const daemonUrl = config.get<string>("daemonUrl", "ws://127.0.0.1:9473");
 
     // --- Status bar ---
     if (config.get<boolean>("showStatusBar", true)) {

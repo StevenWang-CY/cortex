@@ -406,13 +406,30 @@ class ConnectionsPanel(QWidget):
             from cortex.scripts.install_native_host import install
 
             app_root = str(canonical_app_path())
-            install(project_root=app_root)
+            if not install(project_root=app_root):
+                QMessageBox.warning(
+                    self,
+                    f"Connect {name}",
+                    "Native messaging host installation did not find a Chromium "
+                    "browser profile. Open the browser once, then click Connect again.",
+                )
+                return
         except Exception:
             logger.exception("Failed to install native messaging host")
+            QMessageBox.warning(
+                self,
+                f"Connect {name}",
+                "Failed to install the native messaging host. Check the Cortex log "
+                "and try again.",
+            )
+            return
 
         # 2. Determine extension path
         ext_subdir = "browser_extension_chrome" if "chrome" in name.lower() else "browser_extension_edge"
         ext_path = canonical_app_path() / "Contents" / "Resources" / ext_subdir
+        if not ext_path.exists():
+            QMessageBox.warning(self, "Error", f"Extension bundle not found at:\n{ext_path}")
+            return
 
         # 3. Copy to clipboard
         clipboard = QApplication.clipboard()

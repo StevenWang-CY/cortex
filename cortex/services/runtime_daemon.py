@@ -21,15 +21,18 @@ from typing import Any
 import numpy as np
 import uvicorn
 
+from cortex.libs.adapters.leetcode_adapter import LeetCodeAdapter
 from cortex.libs.config.settings import CortexConfig, get_config
 from cortex.libs.schemas.features import KinematicFeatures, PhysioFeatures
 from cortex.libs.schemas.intervention import InterventionPlan
+from cortex.libs.schemas.leetcode import LeetCodeContext
 from cortex.libs.schemas.state import UserBaselines
 from cortex.services.api_gateway.app import create_app, registry
 from cortex.services.api_gateway.websocket_server import WebSocketServer
 from cortex.services.capture_service.pipeline import CapturePipeline, PipelineOutput
 from cortex.services.context_engine import BrowserAdapter, ContextAssembler, EditorAdapter, TerminalAdapter
 from cortex.services.intervention_engine.executor import InterventionExecutor
+from cortex.services.intervention_engine.leetcode_interventions import InterventionMatrix
 from cortex.services.intervention_engine.planner import prepare_plan
 from cortex.services.intervention_engine.restore import RestoreManager
 from cortex.services.intervention_engine.snapshot import capture_snapshot
@@ -38,10 +41,15 @@ from cortex.services.kinematics_engine.head_pose import HeadPoseEstimator
 from cortex.services.kinematics_engine.posture import PostureAnalyzer
 from cortex.services.llm_engine import create_llm_client
 from cortex.services.llm_engine.parser import enrich_plan_with_context
+from cortex.services.launcher.launcher import ProjectLauncher
 from cortex.services.physio_engine.pulse_estimator import PulseEstimator
 from cortex.services.physio_engine.roi_extractor import RoiExtractor
 from cortex.services.physio_engine.rppg import extract_bvp
 from cortex.services.state_engine import FeatureFusion, RuleScorer, ScoreSmoother
+from cortex.services.state_engine.amygdala_hijack import AmygdalaHijackDetector
+from cortex.services.state_engine.destructive_struggle import DestructiveStruggleDetector
+from cortex.services.state_engine.leetcode_mode_resolver import LeetCodeModeResolver
+from cortex.services.state_engine.parasympathetic_rebound import ParasympatheticReboundDetector
 from cortex.services.state_engine.trigger_policy import TriggerPolicy
 from cortex.services.telemetry_engine.feature_aggregator import FeatureAggregator
 from cortex.services.telemetry_engine.input_hooks import InputHooks
@@ -104,6 +112,7 @@ class CortexDaemon:
         self._shutdown = asyncio.Event()
         self._tasks: list[asyncio.Task[Any]] = []
         self._uvicorn_server: uvicorn.Server | None = None
+        self._api_task: asyncio.Task[Any] | None = None
 
         # Desktop UI callback hooks (called from asyncio thread — recipients
         # must handle thread-safety, e.g. via Qt signal emission).
@@ -148,6 +157,7 @@ class CortexDaemon:
         self._trigger_policy = TriggerPolicy(self.config.intervention)
         self._llm_client = create_llm_client(self.config.llm)
         self._executor = InterventionExecutor()
+        self._project_launcher = ProjectLauncher(storage_path=self.config.storage.path)
         self._restore_manager = RestoreManager(
             self._executor,
             timeout_seconds=float(self.config.intervention.timeout_minutes * 60),
@@ -159,6 +169,19 @@ class CortexDaemon:
         self._ws_server.set_user_action_callback(self._handle_user_action)
         self._ws_server.set_settings_callback(self.apply_settings)
         self._ws_server.set_shutdown_callback(self._request_shutdown)
+        self._ws_server.set_leetcode_context_callback(self._handle_leetcode_context_update)
+
+        self._leetcode_adapter = LeetCodeAdapter()
+        self._leetcode_adapter.set_ws_sender(self._send_leetcode_ws_message)
+        self._leetcode_mode_resolver = LeetCodeModeResolver()
+        self._leetcode_interventions = InterventionMatrix()
+        self._amygdala_detector = AmygdalaHijackDetector()
+        self._destructive_detector = DestructiveStruggleDetector()
+        self._rebound_detector = ParasympatheticReboundDetector()
+        self._last_leetcode_problem_id: str | None = None
+        self._last_leetcode_allostatic_load = 0.0
+        self._last_leetcode_hrv_rmssd: float | None = None
+        self._leetcode_action_signatures: dict[str, float] = {}
 
         self._rgb_history: deque[np.ndarray] = deque(
             maxlen=max(1, self.config.signal.rppg.window_seconds * self.config.capture.fps)
@@ -262,6 +285,8 @@ class CortexDaemon:
         self._last_policy_decision_id: str | None = None
         self._last_policy_arm: str | None = None
         self._last_policy_propensity: dict[str, float] | None = None
+        self._amip_decision_ids_by_intervention: dict[str, str] = {}
+        self._bandit_decisions_by_intervention: dict[str, tuple[list[float], int]] = {}
 
         # Copilot throttle
         self._copilot_throttle = CopilotThrottle(ws_server=self._ws_server)
@@ -303,7 +328,11 @@ class CortexDaemon:
         except Exception:
             logger.exception("Capture pipeline failed to start; continuing in telemetry-first mode")
             self._capture_available = False
-        await self._ws_server.start()
+        ws_started = await self._ws_server.start()
+        if not ws_started:
+            raise RuntimeError(
+                f"WebSocket server failed to bind {self.config.api.host}:{self.config.api.ws_port}"
+            )
         self._start_api_server()
 
         self._tasks = [
@@ -339,11 +368,23 @@ class CortexDaemon:
     async def stop(self) -> None:
         """Gracefully stop all runtime services."""
         self._shutdown.set()
+        if self._uvicorn_server is not None:
+            self._uvicorn_server.should_exit = True
         for task in self._tasks:
             task.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+        if self._api_task is not None:
+            try:
+                await asyncio.wait_for(self._api_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                self._api_task.cancel()
+                await asyncio.gather(self._api_task, return_exceptions=True)
+            except Exception:
+                logger.debug("API server task ended with an error", exc_info=True)
+            finally:
+                self._api_task = None
         # Always stop the capture pipeline to release the camera — even if
         # _capture_available is False (pipeline may have started then errored)
         try:
@@ -353,8 +394,7 @@ class CortexDaemon:
         self._input_hooks.stop()
         self._window_tracker.stop()
         await self._ws_server.stop()
-        if self._uvicorn_server is not None:
-            self._uvicorn_server.should_exit = True
+        self._uvicorn_server = None
         registry.reset()
         logger.info("Cortex daemon stopped")
 
@@ -376,6 +416,8 @@ class CortexDaemon:
             "restore_manager": self._restore_manager,
             "ws_server": self._ws_server,
             "trigger_policy": self._trigger_policy,
+            "project_launcher": self._project_launcher,
+            "leetcode_adapter": self._leetcode_adapter,
             # v2.0 services
             "store": self._store,
             "stress_integral_tracker": self._stress_tracker,
@@ -403,7 +445,7 @@ class CortexDaemon:
             loop="asyncio",
         )
         self._uvicorn_server = uvicorn.Server(config)
-        self._tasks.append(asyncio.create_task(self._uvicorn_server.serve(), name="cortex-api"))
+        self._api_task = asyncio.create_task(self._uvicorn_server.serve(), name="cortex-api")
 
     def _current_app_name(self) -> str:
         events = self._window_tracker.get_events_in_window(window_seconds=60.0)
@@ -604,6 +646,10 @@ class CortexDaemon:
                         )
                         self._prev_state = estimate.state
 
+                    await self._maybe_trigger_leetcode_interventions(
+                        estimate, vector, timestamp,
+                    )
+
                     context = self._latest_context
                     if context is not None:
                         telemetry_for_trigger = registry.get("latest_telemetry")
@@ -700,6 +746,7 @@ class CortexDaemon:
                                 self._build_bandit_features(estimate, context),
                                 dtype=np.float64,
                             )
+                            selected_bandit_arm: int | None = None
                             if self.config.eval.policy == "amip":
                                 amip_decision = self._amip.choose_action(
                                     bandit_features,
@@ -731,18 +778,31 @@ class CortexDaemon:
                                 self._last_policy_propensity = None
                                 template_name = self._policy_arm_to_template(arm_name)
                             else:
-                                selected_arm = self._bandit.select_arm(bandit_features)
+                                selected_arm = await self._bandit.select_arm_async(bandit_features)
                                 template_name = self._arm_to_template(selected_arm)
                                 self._last_policy_decision_id = None
                                 self._last_policy_arm = self._bandit.get_arm_label(selected_arm)
                                 self._last_policy_propensity = None
+                                selected_bandit_arm = selected_arm
 
                             # Run intervention in background so the state
                             # loop keeps updating while the LLM responds.
                             self._active_intervention_id = "__pending__"
                             asyncio.create_task(
                                 self._trigger_intervention(
-                                    context, estimate, template_name=template_name,
+                                    context,
+                                    estimate,
+                                    template_name=template_name,
+                                    bandit_features=(
+                                        bandit_features.tolist()
+                                        if self.config.eval.policy == "greedy"
+                                        else None
+                                    ),
+                                    bandit_arm_index=(
+                                        selected_bandit_arm
+                                        if self.config.eval.policy == "greedy"
+                                        else None
+                                    ),
                                 ),
                                 name="cortex-intervention",
                             )
@@ -756,7 +816,13 @@ class CortexDaemon:
             pass
 
     async def _trigger_intervention(
-        self, context: Any, estimate: Any, *, template_name: str | None = None,
+        self,
+        context: Any,
+        estimate: Any,
+        *,
+        template_name: str | None = None,
+        bandit_features: list[float] | None = None,
+        bandit_arm_index: int | None = None,
     ) -> None:
         try:
             # Inject learned tab relevance into context for LLM
@@ -832,12 +898,6 @@ class CortexDaemon:
             self._active_intervention_id = plan.intervention_id
             registry.register(f"workspace_snapshot:{plan.intervention_id}", snapshot)
             self._recorder.append("intervention_plan", plan.model_dump(mode="json"))
-            await self._ws_server.send_intervention(plan)
-
-            if self._intervention_callback is not None:
-                self._intervention_callback(copy.deepcopy(
-                    plan.model_dump(mode="json")
-                ))
 
             # v2.0: Start helpfulness tracking
             self._helpfulness.start_tracking(
@@ -845,10 +905,42 @@ class CortexDaemon:
                 intervention_type=plan.level,
                 state=estimate.state,
                 confidence=estimate.confidence,
+                complexity=(
+                    float(context.complexity_score)
+                    if hasattr(context, "complexity_score")
+                    else 0.0
+                ),
+                tab_count=(
+                    int(context.browser_context.tab_count)
+                    if hasattr(context, "browser_context") and context.browser_context
+                    else 0
+                ),
+                error_count=(
+                    int(context.total_errors)
+                    if hasattr(context, "total_errors")
+                    else 0
+                ),
+                thrashing_score=float(getattr(self._aggregator, "thrashing_score", 0.0)),
+                stress_integral=float(getattr(self._stress_tracker, "current_load", 0.0)),
                 decision_id=self._last_policy_decision_id,
                 propensity=self._last_policy_propensity,
                 policy_arm=self._last_policy_arm,
             )
+            # Bind the policy decision to this intervention ID so reward updates
+            # use the exact action/context that was chosen.
+            if self._last_policy_decision_id:
+                self._amip_decision_ids_by_intervention[plan.intervention_id] = self._last_policy_decision_id
+            if bandit_features is not None and bandit_arm_index is not None:
+                self._bandit_decisions_by_intervention[plan.intervention_id] = (
+                    list(bandit_features), int(bandit_arm_index)
+                )
+
+            await self._ws_server.send_intervention(plan)
+
+            if self._intervention_callback is not None:
+                self._intervention_callback(copy.deepcopy(
+                    plan.model_dump(mode="json")
+                ))
         except asyncio.TimeoutError:
             logger.warning("Intervention LLM call timed out")
         except asyncio.CancelledError:
@@ -931,7 +1023,7 @@ class CortexDaemon:
             return
 
         # v2.0: Handle user ratings
-        if payload.get("type") == "USER_RATING":
+        if "rating" in payload and "intervention_id" in payload:
             iid = str(payload.get("intervention_id", ""))
             rating = str(payload.get("rating", ""))
             if iid and rating:
@@ -973,6 +1065,8 @@ class CortexDaemon:
                 await self._consent_ladder.record_rejection("intervention")
 
         if outcome is None:
+            self._amip_decision_ids_by_intervention.pop(intervention_id, None)
+            self._bandit_decisions_by_intervention.pop(intervention_id, None)
             return
 
         self._active_intervention_id = None
@@ -986,26 +1080,57 @@ class CortexDaemon:
         context = self._latest_context
         state_estimate = registry.get("latest_state_estimate")
         if state_estimate:
-            reward = await self._helpfulness.end_tracking(
+            reward_record = await self._helpfulness.end_tracking(
                 intervention_id=intervention_id,
                 state=state_estimate.state,
                 confidence=state_estimate.confidence,
                 complexity=context.complexity_score if context and hasattr(context, 'complexity_score') else 0.0,
+                tab_count=(
+                    int(context.browser_context.tab_count)
+                    if context and hasattr(context, "browser_context") and context.browser_context
+                    else 0
+                ),
+                error_count=int(context.total_errors) if context and hasattr(context, "total_errors") else 0,
             )
-            if reward is not None:
+            if reward_record is not None:
+                reward = float(reward_record.get("reward_signal", 0.0))
                 self._recorder.append("helpfulness", {
                     "intervention_id": intervention_id,
                     "reward_signal": reward,
                 })
                 # Update bandit with reward
-                if context:
-                    features = self._build_bandit_features(state_estimate, context)
-                    bandit_features = np.array(features, dtype=np.float64)
-                    if self.config.eval.policy == "amip" and self._last_policy_decision_id:
-                        self._amip.update_reward(self._last_policy_decision_id, reward)
-                    elif self.config.eval.policy != "uniform":
-                        # Back-compat LinUCB update path.
-                        self._bandit.update(bandit_features, 0, reward)
+                if self.config.eval.policy == "amip":
+                    decision_id = self._amip_decision_ids_by_intervention.pop(
+                        intervention_id, self._last_policy_decision_id
+                    )
+                    if decision_id:
+                        self._amip.update_reward(decision_id, reward)
+                elif self.config.eval.policy != "uniform":
+                    decision = self._bandit_decisions_by_intervention.pop(intervention_id, None)
+                    if decision is not None:
+                        feature_vec, arm_index = decision
+                        await self._bandit.update_async(
+                            np.array(feature_vec, dtype=np.float64),
+                            arm_index,
+                            reward,
+                        )
+                    elif context:
+                        # Fallback path for older interventions lacking bound
+                        # decision metadata.
+                        features = self._build_bandit_features(state_estimate, context)
+                        bandit_features = np.array(features, dtype=np.float64)
+                        arm_index = 0
+                        if self._last_policy_arm:
+                            mapped = self._bandit.get_arm_index(self._last_policy_arm)
+                            if mapped is not None:
+                                arm_index = mapped
+                        await self._bandit.update_async(bandit_features, arm_index, reward)
+            else:
+                self._amip_decision_ids_by_intervention.pop(intervention_id, None)
+                self._bandit_decisions_by_intervention.pop(intervention_id, None)
+        else:
+            self._amip_decision_ids_by_intervention.pop(intervention_id, None)
+            self._bandit_decisions_by_intervention.pop(intervention_id, None)
 
         # Record tab relevance feedback (skip if per-tab feedback was already received)
         await self._record_tab_relevance_feedback(action, outcome, intervention_id)
@@ -1038,14 +1163,13 @@ class CortexDaemon:
 
         try:
             for tab in context.browser_context.all_tabs:
-                try:
-                    domain = tab.url.split("//", 1)[1].split("/", 1)[0]
-                except (IndexError, ValueError):
+                url = getattr(tab, "url", "")
+                if not url:
                     continue
                 if action == "dismissed":
-                    await self._tab_relevance.record_kept(domain, goal)
+                    await self._tab_relevance.record_kept(url, goal)
                 elif action == "engaged":
-                    await self._tab_relevance.record_closed(domain, goal)
+                    await self._tab_relevance.record_closed(url, goal)
         except Exception:
             logger.debug("Failed to record tab relevance feedback", exc_info=True)
 
@@ -1069,24 +1193,17 @@ class CortexDaemon:
             for tab in payload.get("kept_tabs", []):
                 url = tab.get("url", "")
                 if url:
-                    try:
-                        domain = url.split("//", 1)[1].split("/", 1)[0]
-                    except (IndexError, ValueError):
-                        continue
-                    await self._tab_relevance.record_kept(domain, goal)
+                    await self._tab_relevance.record_kept(url, goal)
 
             for tab in payload.get("closed_tabs", []):
                 url = tab.get("url", "")
                 if url:
-                    try:
-                        domain = url.split("//", 1)[1].split("/", 1)[0]
-                    except (IndexError, ValueError):
-                        continue
-                    await self._tab_relevance.record_closed(domain, goal)
+                    await self._tab_relevance.record_closed(url, goal)
 
             # Mark that per-tab feedback was received for this intervention
             # so the legacy all-or-nothing feedback is skipped
-            self._per_tab_feedback_ids.append(intervention_id)
+            if intervention_id:
+                self._per_tab_feedback_ids.append(intervention_id)
         except Exception:
             logger.debug("Failed to handle tab relevance feedback", exc_info=True)
 
@@ -1099,6 +1216,217 @@ class CortexDaemon:
                 logger.debug("Ingested %d activities from browser", len(activities))
             except Exception:
                 logger.debug("Activity sync ingestion failed", exc_info=True)
+
+    async def _send_leetcode_ws_message(self, message: dict[str, Any]) -> None:
+        """Send a LeetCode-specific command to browser clients only."""
+        message_type = str(message.get("type") or "")
+        payload = message.get("payload")
+        if not message_type:
+            return
+        await self._ws_server.send_message(
+            message_type,
+            payload if isinstance(payload, dict) else {},
+            target_client_types=["chrome"],
+        )
+
+    async def _handle_leetcode_context_update(self, payload: dict[str, Any]) -> None:
+        """Cache LeetCode DOM/code telemetry pushed by the browser extension."""
+        raw_context = payload.get("leetcode_context", payload)
+        if not isinstance(raw_context, dict):
+            return
+        try:
+            context = LeetCodeContext.model_validate(raw_context)
+        except Exception:
+            logger.debug("Invalid LeetCode context update", exc_info=True)
+            return
+
+        if context.problem_id != self._last_leetcode_problem_id:
+            self._last_leetcode_problem_id = context.problem_id
+            self._last_leetcode_allostatic_load = 0.0
+            self._last_leetcode_hrv_rmssd = None
+            self._leetcode_action_signatures.clear()
+            self._amygdala_detector.reset()
+            self._destructive_detector.reset()
+            self._rebound_detector.reset()
+
+        self._leetcode_adapter.update_context(context.model_dump(mode="json"))
+        registry.register("latest_leetcode_context", context)
+
+    async def _maybe_trigger_leetcode_interventions(
+        self,
+        estimate: Any,
+        vector: Any,
+        timestamp: float,
+    ) -> None:
+        """Run the LeetCode stage x biology matrix when fresh problem context exists."""
+        if not self._interventions_enabled:
+            return
+        try:
+            if not await self._leetcode_adapter.health_check():
+                return
+            context = self._leetcode_adapter.context
+            if not context.problem_id or estimate.confidence < 0.45:
+                return
+
+            baselines = self._scorer.baselines
+            telemetry = registry.get("latest_telemetry")
+            blink_delta = 0.0
+            if vector.blink_rate_delta is not None:
+                blink_delta = float(vector.blink_rate_delta)
+            elif vector.blink_rate is not None:
+                blink_delta = float(vector.blink_rate - baselines.blink_rate_baseline)
+
+            key_velocity = min(max(float(context.chars_per_min) / 240.0, 0.0), 1.0)
+            if telemetry is not None:
+                key_velocity = max(
+                    key_velocity,
+                    float(getattr(telemetry, "keyboard_burst_score", 0.0) or 0.0),
+                )
+
+            last_result = (
+                context.last_submission_result.value
+                if context.last_submission_result is not None
+                else ""
+            )
+            wa_timestamp = (
+                self._leetcode_submission_monotonic(context)
+                if last_result == "Wrong Answer"
+                else None
+            )
+            aai_score = self._amygdala_detector.update(
+                hr_delta=float(vector.hr_delta or 0.0),
+                blink_delta=blink_delta,
+                key_velocity=key_velocity,
+                wa_timestamp=wa_timestamp,
+                current_time=timestamp,
+            )
+
+            current_load = float(estimate.stress_integral or self._stress_tracker.current_load)
+            hrv_current = (
+                float(vector.hrv_rmssd)
+                if vector.hrv_rmssd is not None
+                else float(baselines.hrv_baseline)
+            )
+            wa_timestamps: list[float] = []
+            if wa_timestamp is not None and context.wrong_answer_count > 0:
+                wa_timestamps = [wa_timestamp] * int(context.wrong_answer_count)
+            destructive = self._destructive_detector.update(
+                reread_count=int(context.reread_count),
+                wrong_answer_count=int(context.wrong_answer_count),
+                code_delete_ratio=float(context.code_delete_ratio_60s),
+                stage_dwell_s=float(context.time_elapsed_s),
+                allostatic_load=current_load,
+                allostatic_load_prev=self._last_leetcode_allostatic_load,
+                hrv_rmssd=hrv_current,
+                hrv_baseline=float(baselines.hrv_baseline),
+                wa_timestamps=wa_timestamps,
+                current_time=timestamp,
+            )
+
+            submission_epoch = self._leetcode_submission_epoch_seconds(context)
+            accepted = bool(context.accepted or last_result == "Accepted")
+            rebound = self._rebound_detector.update(
+                accepted=accepted,
+                hr=vector.hr,
+                hr_baseline=float(baselines.hr_baseline),
+                hrv_current=vector.hrv_rmssd,
+                hrv_prev=self._last_leetcode_hrv_rmssd,
+                last_submission_ts=submission_epoch if accepted else None,
+            )
+
+            mode_estimate = self._leetcode_mode_resolver.resolve(
+                estimate,
+                context,
+                aai_score=aai_score,
+                destructive=destructive,
+                parasympathetic_rebound=rebound,
+            )
+            registry.register("latest_leetcode_mode_estimate", mode_estimate)
+
+            for action in self._leetcode_interventions.select(mode_estimate, context):
+                action_name = str(action.get("action") or "")
+                params = action.get("payload")
+                if not action_name or not isinstance(params, dict):
+                    continue
+
+                signature = ":".join([
+                    action_name,
+                    str(context.problem_id),
+                    context.stage.value,
+                    str(context.submission_count),
+                    str(context.wrong_answer_count),
+                    str(context.last_submission_ts or ""),
+                ])
+                last_sent = self._leetcode_action_signatures.get(signature)
+                if last_sent is not None and timestamp - last_sent < 30.0:
+                    continue
+
+                requested_level = {
+                    "observe": 0,
+                    "suggest": 1,
+                    "preview": 2,
+                    "reversible_act": 3,
+                    "autonomous_act": 4,
+                }.get(str(action.get("required_consent_level") or "preview"), 2)
+                consent = await self._consent_ladder.check(
+                    action_type=action_name,
+                    requested_level=requested_level,
+                )
+                if not consent.allowed:
+                    logger.debug(
+                        "LeetCode action %s blocked by consent ladder: %s",
+                        action_name,
+                        consent.reason,
+                    )
+                    continue
+
+                result = await self._leetcode_adapter.execute(action_name, params)
+                if result.success:
+                    self._leetcode_action_signatures[signature] = timestamp
+                    self._recorder.append("leetcode_intervention", {
+                        "action": action_name,
+                        "payload": params,
+                        "mode": mode_estimate.mode.value,
+                        "stage": mode_estimate.stage.value,
+                        "problem_id": context.problem_id,
+                    })
+                else:
+                    logger.debug("LeetCode action %s failed: %s", action_name, result.error)
+
+            self._last_leetcode_allostatic_load = current_load
+            if vector.hrv_rmssd is not None:
+                self._last_leetcode_hrv_rmssd = float(vector.hrv_rmssd)
+
+            stale_before = timestamp - 600.0
+            self._leetcode_action_signatures = {
+                key: sent_at
+                for key, sent_at in self._leetcode_action_signatures.items()
+                if sent_at >= stale_before
+            }
+        except Exception:
+            logger.debug("LeetCode intervention matrix failed", exc_info=True)
+
+    @staticmethod
+    def _leetcode_submission_epoch_seconds(context: LeetCodeContext) -> float | None:
+        """Normalize content-script submission timestamps to epoch seconds."""
+        value = context.last_submission_ts
+        if value is None:
+            return None
+        ts = float(value)
+        if ts > 10_000_000_000:
+            ts /= 1000.0
+        if ts <= 0:
+            return None
+        return ts
+
+    @classmethod
+    def _leetcode_submission_monotonic(cls, context: LeetCodeContext) -> float | None:
+        """Convert a LeetCode submission epoch timestamp to monotonic time."""
+        epoch_seconds = cls._leetcode_submission_epoch_seconds(context)
+        if epoch_seconds is None:
+            return None
+        age = max(0.0, time.time() - epoch_seconds)
+        return time.monotonic() - age
 
     # --- v2.0 helper methods ---
 

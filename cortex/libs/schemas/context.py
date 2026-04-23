@@ -109,6 +109,10 @@ class TabInfo(BaseModel):
         "learning_platform",
         "video_platform",
         "communication",
+        "goal_relevant",
+        "educational",
+        "video",
+        "entertainment",
         "distraction",
         "social",
         "other",
@@ -304,6 +308,7 @@ class TaskContext(BaseModel):
 
 # Priority order for tab type selection (higher priority types kept first)
 _TAB_TYPE_PRIORITY: dict[str, int] = {
+    "goal_relevant": 0,
     "documentation": 0,
     "ai_assistant": 1,
     "reference": 2,
@@ -312,12 +317,15 @@ _TAB_TYPE_PRIORITY: dict[str, int] = {
     "stackoverflow": 5,
     "code_host": 6,
     "learning_platform": 7,
+    "educational": 7,
     "search": 8,
     "video_platform": 9,
+    "video": 9,
     "communication": 10,
     "other": 11,
     "social": 12,
     "distraction": 13,
+    "entertainment": 13,
 }
 
 

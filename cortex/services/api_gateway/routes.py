@@ -564,7 +564,7 @@ async def get_helpfulness_summary(request: Request) -> HelpfulnessSummaryRespons
     reg = _get_registry(request)
     tracker = reg.get("helpfulness_tracker")
     if tracker is not None and hasattr(tracker, "get_summary"):
-        summary = tracker.get_summary()
+        summary = await tracker.get_summary()
         return HelpfulnessSummaryResponse(**summary)
     return HelpfulnessSummaryResponse()
 

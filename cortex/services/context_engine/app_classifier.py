@@ -206,7 +206,14 @@ def classify_tab_type(url: str) -> str:
     return "other"
 
 
-_AMBIGUOUS_TYPES = {"video_platform", "social", "communication", "distraction", "other"}
+_AMBIGUOUS_TYPES = {
+    "ai_assistant",
+    "video_platform",
+    "social",
+    "communication",
+    "distraction",
+    "other",
+}
 
 # Short technical terms that should be treated as valid goal keywords
 # despite being <= 2 characters. Mirrors TECH_SHORT_WORDS in background.ts.

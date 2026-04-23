@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 _SCROLL_VELOCITY_MAX = 50.0  # px/s — steady reading pace
 _MOUSE_VELOCITY_MAX = 30.0   # px/s — minimal mouse movement
 _MIN_DURATION_SECONDS = 90.0  # Must sustain for 90s before triggering
+_NO_BLINK_MIN_DURATION_SECONDS = 120.0  # Require stronger evidence without camera kinematics
 _BLINK_ELEVATION_RATIO = 1.15  # Blink rate 15% above baseline
 _COOLDOWN_SECONDS = 300.0  # 5 min cooldown between triggers
 
@@ -112,7 +113,10 @@ class ZombieReadingDetector:
                 self._consecutive_frames += 1
 
             duration = current_time - self._zombie_start
-            if duration >= self._min_duration:
+            required_duration = self._min_duration
+            if blink_rate is None:
+                required_duration = max(required_duration, _NO_BLINK_MIN_DURATION_SECONDS)
+            if duration >= required_duration:
                 self._last_trigger = current_time
                 self._reset()
                 logger.info(
@@ -145,11 +149,11 @@ class ZombieReadingDetector:
         if mouse_velocity > _MOUSE_VELOCITY_MAX:
             return False
 
-        # Condition 4: Blink rate above baseline (glazed eyes)
-        # When blink_rate is None (no data), return False conservatively
-        # rather than falling through to True.
+        # Condition 4: Blink rate above baseline (glazed eyes). If camera
+        # kinematics are unavailable, rely on the other sustained telemetry
+        # conditions rather than disabling the detector entirely.
         if blink_rate is None:
-            return False
+            return True
         if blink_rate < self._blink_baseline * _BLINK_ELEVATION_RATIO:
             return False
 

@@ -1,7 +1,7 @@
 /**
  * Cortex Chrome Extension — Background Service Worker
  *
- * Maintains a WebSocket connection to the Cortex daemon (ws://localhost:9473).
+ * Maintains a WebSocket connection to the Cortex daemon (ws://127.0.0.1:9473).
  * Receives STATE_UPDATE and INTERVENTION_TRIGGER messages.
  * Dispatches content script injection on intervention triggers.
  * Sends IDENTIFY and USER_ACTION messages to the daemon.
@@ -48,6 +48,9 @@ let reconnectDelay = 3000;
 const MAX_RECONNECT_DELAY = 30000;
 let intentionalDisconnect = false;
 let sequence = 0;
+const DAEMON_WS_URL = "ws://127.0.0.1:9473";
+const DAEMON_HTTP_URL = "http://127.0.0.1:9472";
+const LAUNCHER_HTTP_URL = "http://127.0.0.1:9471";
 
 let currentState: CortexState | null = null;
 let activeIntervention: Record<string, unknown> | null = null;
@@ -412,7 +415,7 @@ function connect(): void {
     intentionalDisconnect = false;
 
     try {
-        ws = new WebSocket("ws://localhost:9473");
+        ws = new WebSocket(DAEMON_WS_URL);
 
         ws.onopen = () => {
             connected = true;
@@ -567,15 +570,6 @@ async function handleMessage(raw: string): Promise<void> {
                 schedulePersist();
             }
 
-            // Minimum tab count gate: don't intervene with few tabs open
-            try {
-                const allTabs = await chrome.tabs.query({});
-                if (allTabs.length < 5) {
-                    console.log(`Cortex: skipping intervention — only ${allTabs.length} tabs open (minimum: 5)`);
-                    break;
-                }
-            } catch {}
-
             activeIntervention = msg.payload;
             // Persist so popup can load it after SW restart
             try { chrome.storage.session.set({ cortex_active_intervention: msg.payload }); } catch {}
@@ -628,6 +622,16 @@ async function handleMessage(raw: string): Promise<void> {
             break;
         }
 
+        case "PRE_BREAK_WARNING": {
+            const headline = String(msg.payload.headline || "Biological load rising");
+            const summary = String(
+                msg.payload.situation_summary || "Consider a short reset before stress load crosses the break threshold.",
+            );
+            injectToast(headline, summary);
+            broadcastToPopup({ type: "PRE_BREAK_WARNING", payload: msg.payload });
+            break;
+        }
+
         case "LEETCODE_SHOW_LOCKOUT": {
             // Inject lockout overlay into the active tab
             try {
@@ -641,6 +645,26 @@ async function handleMessage(raw: string): Promise<void> {
                 }
             } catch (e) {
                 console.error("Cortex: failed to inject lockout overlay", e);
+            }
+            break;
+        }
+
+        case "LEETCODE_SHOW_SCRATCHPAD":
+        case "LEETCODE_SHOW_PATTERN_LADDER":
+        case "LEETCODE_SHOW_SUBMISSION_GATE":
+        case "LEETCODE_SHOW_SOLUTION_FRICTION":
+        case "LEETCODE_SHOW_CONSOLIDATION": {
+            try {
+                const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+                if (tab?.id) {
+                    await chrome.scripting.executeScript({
+                        target: { tabId: tab.id },
+                        func: injectLeetCodeCoachOverlay,
+                        args: [msg.type, msg.payload],
+                    });
+                }
+            } catch (e) {
+                console.error("Cortex: failed to inject LeetCode coach overlay", e);
             }
             break;
         }
@@ -1091,6 +1115,70 @@ function injectLockoutOverlay(payload: Record<string, unknown>): void {
     // Clicking backdrop does NOT dismiss — lockout must be waited out or explicitly skipped
 }
 
+function injectLeetCodeCoachOverlay(kind: string, payload: Record<string, unknown>): void {
+    const OID = "cortex-leetcode-coach";
+    document.getElementById(OID)?.remove();
+
+    const esc = (s: string) =>
+        s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const tags = Array.isArray(payload.tags)
+        ? (payload.tags as unknown[]).map(String).slice(0, 5)
+        : [];
+
+    let title = "Cortex LeetCode Coach";
+    let body = "Pause briefly and make the next move explicit.";
+    let extra = "";
+
+    if (kind === "LEETCODE_SHOW_SCRATCHPAD") {
+        title = "Restate Before Solving";
+        body = `Write the input, output, and invariant for ${esc(String(payload.problem_title || "this problem"))}.`;
+        extra = `<textarea id="lc-note" placeholder="In my own words, the problem asks..." spellcheck="false"></textarea>`;
+    } else if (kind === "LEETCODE_SHOW_PATTERN_LADDER") {
+        title = "Pattern Ladder";
+        body = "Reveal only as much help as you need. Start with the category, not code.";
+        const tagHtml = tags.map((t) => `<span>${esc(t)}</span>`).join("");
+        extra = `<div class="tags">${tagHtml || "<span>unknown pattern</span>"}</div><button id="lc-reveal">Reveal next hint</button><div id="lc-hint" class="hint">Hint 1: classify the problem type before choosing data structures.</div>`;
+    } else if (kind === "LEETCODE_SHOW_SUBMISSION_GATE") {
+        title = "Submission Gate";
+        body = `${Number(payload.wrong_answer_count || 0)} wrong answers so far. Add one concrete failing test before the next submit.`;
+        extra = `<label><input id="lc-check" type="checkbox"> I traced one failing case by hand</label>`;
+    } else if (kind === "LEETCODE_SHOW_SOLUTION_FRICTION") {
+        title = "Before Opening Solutions";
+        body = "Write what you expect the editorial's key idea to be. This keeps the solution useful instead of replacing the learning step.";
+        extra = `<textarea id="lc-note" placeholder="My hypothesis is..." spellcheck="false"></textarea>`;
+    } else if (kind === "LEETCODE_SHOW_CONSOLIDATION") {
+        title = "Consolidate the Solve";
+        body = "Capture the reusable pattern while the successful path is still fresh.";
+        extra = `<textarea id="lc-note" placeholder="The transferable pattern was..." spellcheck="false"></textarea>`;
+    }
+
+    const host = document.createElement("div");
+    host.id = OID;
+    host.style.cssText = "position:fixed;inset:0;z-index:2147483647;pointer-events:none;";
+    const shadow = host.attachShadow({ mode: "open" });
+    shadow.innerHTML = `
+<style>
+*{box-sizing:border-box}
+.card{position:fixed;right:22px;bottom:22px;width:min(380px,calc(100vw - 28px));pointer-events:auto;background:#101112;color:#f3f0e8;border:1px solid rgba(243,240,232,.12);border-radius:18px;box-shadow:0 18px 60px rgba(0,0,0,.35);font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;padding:18px;animation:in .22s cubic-bezier(.16,1,.3,1)}
+@keyframes in{from{opacity:0;transform:translateY(10px) scale(.98)}to{opacity:1;transform:translateY(0) scale(1)}}
+.top{display:flex;align-items:center;gap:10px;margin-bottom:10px}.dot{width:9px;height:9px;border-radius:99px;background:#dfb15b;box-shadow:0 0 18px rgba(223,177,91,.55)}.ttl{font-size:14px;font-weight:700;letter-spacing:-.02em;flex:1}.x{border:0;background:transparent;color:#9b9488;font-size:18px;line-height:1;cursor:pointer}.body{font-size:13px;line-height:1.5;color:#cfc7b7;margin-bottom:13px}textarea{width:100%;height:92px;resize:vertical;background:#18191a;color:#f3f0e8;border:1px solid rgba(243,240,232,.14);border-radius:12px;padding:10px;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;outline:none}textarea:focus{border-color:#dfb15b}.tags{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}.tags span{font-size:11px;color:#dfb15b;border:1px solid rgba(223,177,91,.25);border-radius:99px;padding:4px 8px;background:rgba(223,177,91,.08)}button{border:1px solid rgba(243,240,232,.14);background:#dfb15b;color:#15110a;border-radius:10px;padding:8px 11px;font-size:12px;font-weight:700;cursor:pointer}.hint{margin-top:10px;font-size:12px;line-height:1.45;color:#cfc7b7;background:#18191a;border-radius:10px;padding:10px}label{display:flex;gap:8px;align-items:center;font-size:12px;color:#cfc7b7}
+</style>
+<div class="card">
+  <div class="top"><span class="dot"></span><div class="ttl">${esc(title)}</div><button class="x" id="lc-close">×</button></div>
+  <div class="body">${body}</div>
+  ${extra}
+</div>`;
+    document.body.appendChild(host);
+
+    shadow.getElementById("lc-close")?.addEventListener("click", () => host.remove());
+    shadow.getElementById("lc-reveal")?.addEventListener("click", () => {
+        const hint = shadow.getElementById("lc-hint");
+        if (hint) {
+            hint.textContent = "Hint 2: define the state transition and one invariant before writing more code.";
+        }
+    });
+}
+
 async function handleIntervention(
     payload: Record<string, unknown>,
 ): Promise<void> {
@@ -1240,7 +1328,7 @@ async function handleRestore(payload: Record<string, unknown>): Promise<void> {
         // Ignore overlay cleanup failures
     }
     activeIntervention = null;
-    try { chrome.storage.session.remove(["cortex_active_intervention", "cortex_tab_snapshot"]); } catch {}
+    try { chrome.storage.session.remove(["cortex_active_intervention", "cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]); } catch {}
     broadcastToPopup({ type: "INTERVENTION_RESTORE", payload });
 }
 
@@ -2072,7 +2160,7 @@ async function executeAllRecommended(
     const interventionId = activeIntervention?.intervention_id;
     activeIntervention = null;
     // Persist cleared state
-    try { await chrome.storage.session.remove(["cortex_active_intervention", "cortex_tab_snapshot"]); } catch {}
+    try { await chrome.storage.session.remove(["cortex_active_intervention", "cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]); } catch {}
 
     // Notify daemon that user engaged with the intervention
     if (hadIntervention && interventionId) {
@@ -2172,10 +2260,15 @@ async function injectToast(title: string, body: string): Promise<void> {
                         "background:#111113;color:#e4e4e7;border:1px solid rgba(255,255,255,.06);" +
                         "box-shadow:0 4px 20px rgba(0,0,0,.4);animation:cortexSlideIn .25s ease;font-size:12px;line-height:1.5;" +
                         "cursor:pointer;";
-                    el.innerHTML =
-                        `<style>@keyframes cortexSlideIn{from{transform:translateY(-12px);opacity:0}to{transform:translateY(0);opacity:1}}</style>` +
-                        `<div style="font-weight:600;margin-bottom:3px;font-size:12px;color:#e4e4e7">${t}</div>` +
-                        `<div style="color:#71717a;font-size:11px">${b}</div>`;
+                    const style = document.createElement("style");
+                    style.textContent = "@keyframes cortexSlideIn{from{transform:translateY(-12px);opacity:0}to{transform:translateY(0);opacity:1}}";
+                    const titleEl = document.createElement("div");
+                    titleEl.style.cssText = "font-weight:600;margin-bottom:3px;font-size:12px;color:#e4e4e7";
+                    titleEl.textContent = t;
+                    const bodyEl = document.createElement("div");
+                    bodyEl.style.cssText = "color:#71717a;font-size:11px";
+                    bodyEl.textContent = b;
+                    el.append(style, titleEl, bodyEl);
                     el.addEventListener("click", () => el.remove());
                     document.body.appendChild(el);
                     setTimeout(() => el.remove(), 8000);
@@ -2333,6 +2426,7 @@ chrome.runtime.onMessage.addListener(
                         await chrome.storage.session.remove([
                             "cortex_active_intervention",
                             "cortex_tab_snapshot",
+                            "cortex_tab_mgr_snapshots",
                         ]);
                     } catch { /* storage.session may be unavailable */ }
 
@@ -2352,7 +2446,7 @@ chrome.runtime.onMessage.addListener(
                     disconnect();
                     // Step 3: HTTP shutdown via daemon API (backup)
                     try {
-                        await fetch("http://localhost:9472/shutdown", {
+                        await fetch(`${DAEMON_HTTP_URL}/shutdown`, {
                             method: "POST",
                             signal: AbortSignal.timeout(3000),
                         });
@@ -2371,7 +2465,7 @@ chrome.runtime.onMessage.addListener(
                     } catch { /* native messaging may not be available */ }
                     // Step 6: HTTP stop via launcher agent (port 9471) as final backup
                     try {
-                        await fetch("http://localhost:9471/stop", {
+                        await fetch(`${LAUNCHER_HTTP_URL}/stop`, {
                             method: "POST",
                             signal: AbortSignal.timeout(3000),
                         });
@@ -2437,7 +2531,7 @@ chrome.runtime.onMessage.addListener(
                     try {
                         // Path 1: HTTP launcher agent on port 9471
                         try {
-                            const resp = await fetch("http://localhost:9471/launch", {
+                            const resp = await fetch(`${LAUNCHER_HTTP_URL}/launch`, {
                                 method: "POST",
                                 signal: AbortSignal.timeout(12000),
                             });
@@ -2546,7 +2640,7 @@ chrome.runtime.onMessage.addListener(
                     schedulePersist();
 
                     activeIntervention = null;
-                    try { chrome.storage.session.remove(["cortex_active_intervention", "cortex_tab_snapshot"]); } catch {}
+                    try { chrome.storage.session.remove(["cortex_active_intervention", "cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]); } catch {}
                     if (interventionId) {
                         restoreTabsForIntervention(interventionId);
                     } else {
@@ -2655,6 +2749,18 @@ chrome.runtime.onMessage.addListener(
                     sendResponse(data.cortex_sessions || []);
                 });
                 return true; // async
+
+            case "LEETCODE_CONTEXT_UPDATE": {
+                const payload = (message.payload || {}) as Record<string, unknown>;
+                send({
+                    type: "LEETCODE_CONTEXT_UPDATE",
+                    payload,
+                    timestamp: Date.now() / 1000,
+                    sequence: ++sequence,
+                });
+                sendResponse({ ok: true });
+                break;
+            }
 
             case "ACTIVITY_UPDATE": {
                 const record = message.record as ActivityRecord;

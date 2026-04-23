@@ -22,6 +22,9 @@ import shutil
 import sys
 
 HOST_NAME = "com.cortex.launcher"
+NATIVE_HOST_DIR = os.path.expanduser(
+    "~/Library/Application Support/Cortex/NativeMessaging"
+)
 
 # Deterministic extension ID derived from the fixed key in package.json.
 # This never changes regardless of where the extension is loaded from.
@@ -116,6 +119,33 @@ def _patch_shebang(script_path: str, python_path: str) -> None:
         f.writelines(lines)
 
 
+def _is_app_bundle(project_root: str | None) -> bool:
+    return bool(project_root and project_root.endswith(".app"))
+
+
+def _prepare_host_script(source_script: str, *, project_root: str | None = None) -> str:
+    """Prepare the executable host script path for the browser manifest.
+
+    In packaged mode this deliberately copies the script outside
+    ``/Applications/Cortex.app`` before patching its shebang. Mutating files
+    inside the app bundle can invalidate code signatures and can fail for
+    non-admin installs.
+    """
+    if _is_app_bundle(project_root):
+        os.makedirs(NATIVE_HOST_DIR, exist_ok=True)
+        host_script = os.path.join(NATIVE_HOST_DIR, "native_host.py")
+        shutil.copyfile(source_script, host_script)
+    else:
+        host_script = source_script
+
+    python_path = _find_python(project_root=project_root)
+    _patch_shebang(host_script, python_path)
+    os.chmod(host_script, 0o755)
+    print(f"Native host: {host_script}")
+    print(f"Python:      {python_path}")
+    return host_script
+
+
 def _scan_browser_for_cortex_ids(browser_root: str) -> set[str]:
     """Scan a browser's profiles for existing Cortex extension IDs.
 
@@ -148,7 +178,7 @@ def _scan_browser_for_cortex_ids(browser_root: str) -> set[str]:
     return ids
 
 
-def install(*, project_root: str | None = None) -> None:
+def install(*, project_root: str | None = None) -> bool:
     """Install the native messaging host manifest for all detected browsers.
 
     Args:
@@ -167,14 +197,9 @@ def install(*, project_root: str | None = None) -> None:
         print(f"Error: Native host script not found at {host_script}")
         if project_root is None:
             sys.exit(1)
-        return
+        return False
 
-    # Patch shebang with absolute Python path
-    python_path = _find_python(project_root=project_root)
-    _patch_shebang(host_script, python_path)
-    os.chmod(host_script, 0o755)
-    print(f"Native host: {host_script}")
-    print(f"Python:      {python_path}")
+    host_script = _prepare_host_script(host_script, project_root=project_root)
 
     # Collect all extension IDs: fixed + auto-detected from browser profiles
     all_ids: set[str] = {FIXED_EXTENSION_ID}
@@ -222,11 +247,13 @@ def install(*, project_root: str | None = None) -> None:
 
     if not installed_browsers:
         print("  Warning: No Chromium browsers detected!")
+        return False
     else:
         print()
         print(f"Installed for {len(installed_browsers)} browser(s). No manual configuration needed.")
         print()
         print("IMPORTANT: Restart your browser (Cmd+Q, reopen) for changes to take effect.")
+        return True
 
 
 def main() -> None:

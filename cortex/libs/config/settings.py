@@ -408,6 +408,12 @@ def get_config() -> CortexConfig:
     """
     config = CortexConfig()
 
+    if _is_bundled():
+        storage_path = Path(config.storage.path).expanduser()
+        if not storage_path.is_absolute():
+            config.storage.path = _bundled_storage_path()
+        Path(config.storage.path).mkdir(parents=True, exist_ok=True)
+
     # BYOK: load API key from macOS Keychain when running as .app
     if config.llm.azure.use_keychain and not config.llm.azure.api_key:
         try:

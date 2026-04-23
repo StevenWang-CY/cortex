@@ -135,7 +135,9 @@ export function classifyTabTypeWithGoal(
 
     const titleLower = title.toLowerCase();
     for (const kw of goalKeywords) {
-        if (titleLower.includes(kw)) {
+        const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const pattern = new RegExp(`(^|[^a-z0-9+#])${escaped}($|[^a-z0-9+#])`, "i");
+        if (pattern.test(titleLower)) {
             return "goal_relevant";
         }
     }
@@ -246,7 +248,7 @@ export async function hideNonActiveTabs(
         // Safe types that should never be hidden — they are tools the user is actively using
         const safeTypes = new Set([
             "ai_assistant", "learning_platform", "documentation",
-            "reference", "code_host", "stackoverflow",
+            "reference", "code_host", "stackoverflow", "goal_relevant",
         ]);
 
         const toHide = tabs

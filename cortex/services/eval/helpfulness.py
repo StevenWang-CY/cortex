@@ -94,6 +94,7 @@ class HelpfulnessTracker:
         self._store = store
         self._active: dict[str, _TrackedIntervention] = {}
         self._recent_rewards: list[float] = []
+        self._recent_engaged: list[bool] = []
 
     def start_tracking(
         self,
@@ -198,6 +199,9 @@ class HelpfulnessTracker:
         self._recent_rewards.append(reward)
         if len(self._recent_rewards) > 100:
             self._recent_rewards = self._recent_rewards[-100:]
+        self._recent_engaged.append(tracked.was_engaged)
+        if len(self._recent_engaged) > 100:
+            self._recent_engaged = self._recent_engaged[-100:]
 
         record = {
             "intervention_id": intervention_id,
@@ -302,11 +306,20 @@ class HelpfulnessTracker:
 
     async def get_summary(self) -> dict:
         """Get helpfulness summary statistics."""
+        total = len(self._recent_rewards)
+        engagement_rate = (
+            sum(1 for engaged in self._recent_engaged if engaged) / total
+            if total > 0 else 0.0
+        )
+        positive_rate = (
+            sum(1 for r in self._recent_rewards if r > 0) / total
+            if total > 0 else 0.0
+        )
         return {
-            "total_tracked": len(self._recent_rewards),
+            "total_interventions": total,
+            "total_tracked": total,  # backward compatibility
             "mean_reward": self.mean_reward,
-            "positive_rate": (
-                sum(1 for r in self._recent_rewards if r > 0) / len(self._recent_rewards)
-                if self._recent_rewards else 0.0
-            ),
+            "engagement_rate": engagement_rate,
+            "positive_rate": positive_rate,  # backward compatibility
+            "recent_rewards": list(self._recent_rewards[-20:]),
         }
