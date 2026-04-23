@@ -14,11 +14,12 @@ followed by JSON payload.
 from __future__ import annotations
 
 import json
+import os
+import shlex
 import socket
 import struct
 import subprocess
 import sys
-import os
 import time
 import traceback
 
@@ -40,6 +41,9 @@ def read_message() -> dict:
     if len(raw_length) < 4:
         return {}
     length = struct.unpack("<I", raw_length)[0]
+    # Guardrail against malformed length prefixes.
+    if length > 8 * 1024 * 1024:
+        return {}
     data = sys.stdin.buffer.read(length)
     return json.loads(data.decode("utf-8"))
 
@@ -88,10 +92,17 @@ def launch_daemon() -> dict:
     # --- DMG path: open the installed .app ---------------------------------
     if _is_installed_app():
         try:
-            subprocess.run(
-                ["open", "-a", CORTEX_APP_PATH],
-                capture_output=True, timeout=5,
+            result = subprocess.run(
+                ["open", CORTEX_APP_PATH],
+                capture_output=True, text=True, timeout=5,
             )
+            if result.returncode != 0:
+                stderr = (result.stderr or "").strip()
+                log(f"open failed rc={result.returncode} stderr={stderr}")
+                return {
+                    "status": "error",
+                    "error": stderr or "Failed to launch Cortex.app",
+                }
             log("Launched daemon via open -a Cortex.app")
         except Exception as e:
             log(f"open -a failed: {e}")
@@ -122,17 +133,21 @@ def launch_daemon() -> dict:
         # camera and file access.  The daemon runs in the foreground of
         # Terminal so it inherits Terminal's camera permission.
         cmd = (
-            f"cd {project_root} && "
-            f"{python} -m cortex.scripts.run_dev "
-            f"2>&1 | tee -a {log_path}"
+            f"cd {shlex.quote(project_root)} && "
+            f"{shlex.quote(python)} -m cortex.scripts.run_dev "
+            f"2>&1 | tee -a {shlex.quote(log_path)}"
         )
-        subprocess.run(
+        result = subprocess.run(
             [
                 "osascript", "-e",
                 f'tell application "Terminal" to do script "{cmd}"',
             ],
-            capture_output=True, timeout=5,
+            capture_output=True, text=True, timeout=5,
         )
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            log(f"osascript failed rc={result.returncode} stderr={stderr}")
+            return {"status": "error", "error": stderr or "Failed to launch via Terminal"}
         log("Launched daemon via Terminal.app")
     except Exception as e:
         log(f"Popen failed: {e}")
@@ -177,6 +192,18 @@ def _find_all_daemon_pids() -> set[int]:
     try:
         result = subprocess.run(
             ["pgrep", "-f", "cortex.scripts.run_dev"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.strip().split("\n"):
+            line = line.strip()
+            if line.isdigit():
+                pids.add(int(line))
+    except Exception:
+        pass
+    # Bundled app executable path for DMG installs.
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", f"{CORTEX_APP_PATH}/Contents/MacOS/Cortex"],
             capture_output=True, text=True, timeout=5,
         )
         for line in result.stdout.strip().split("\n"):

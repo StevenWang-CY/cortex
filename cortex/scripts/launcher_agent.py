@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import signal
 import socket
 import subprocess
@@ -94,10 +95,16 @@ def _launch_daemon() -> dict:
     # DMG path: launch the installed .app (in-process daemon).
     if os.path.isdir(CORTEX_APP_PATH):
         try:
-            subprocess.run(
-                ["open", "-a", CORTEX_APP_PATH],
-                capture_output=True, timeout=5,
+            result = subprocess.run(
+                ["open", CORTEX_APP_PATH],
+                capture_output=True, text=True, timeout=5,
             )
+            if result.returncode != 0:
+                stderr = (result.stderr or "").strip()
+                return {
+                    "status": "error",
+                    "error": stderr or "Failed to launch Cortex.app",
+                }
             return {"status": "starting", "message": "Cortex.app launched"}
         except Exception as e:
             return {"status": "error", "error": str(e)}
@@ -110,7 +117,11 @@ def _launch_daemon() -> dict:
     try:
         launcher_sh = os.path.join(project_root, ".cortex_launch.sh")
         with open(launcher_sh, "w") as f:
-            f.write(f"#!/bin/bash\ncd {project_root}\nexec {python} -m cortex.scripts.run_dev\n")
+            f.write(
+                "#!/bin/bash\n"
+                f"cd {shlex.quote(project_root)}\n"
+                f"exec {shlex.quote(python)} -m cortex.scripts.run_dev\n"
+            )
         os.chmod(launcher_sh, 0o755)
 
         log_file = open(log_path, "a")
@@ -145,6 +156,18 @@ def _find_all_daemon_pids() -> set[int]:
     try:
         result = subprocess.run(
             ["pgrep", "-f", "cortex.scripts.run_dev"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.strip().split("\n"):
+            line = line.strip()
+            if line.isdigit():
+                pids.add(int(line))
+    except Exception:
+        pass
+    # Bundled app process name/path for DMG installs.
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", f"{CORTEX_APP_PATH}/Contents/MacOS/Cortex"],
             capture_output=True, text=True, timeout=5,
         )
         for line in result.stdout.strip().split("\n"):

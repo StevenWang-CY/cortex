@@ -208,7 +208,7 @@ class RollingKeystrokeWindow {
 
 export class LeetCodeObserver {
   // --- Timing ---
-  private readonly startTime = Date.now();
+  private startTime = Date.now();
   private emitInterval: ReturnType<typeof setInterval> | null = null;
   private urlWatchInterval: ReturnType<typeof setInterval> | null = null;
   private observer: MutationObserver | null = null;
@@ -685,7 +685,7 @@ export class LeetCodeObserver {
     this.rereadCount = 0;
     this.solutionsTabAttempted = false;
     this.currentStage = "READ";
-    (this as { startTime: number }).startTime = Date.now();
+    this.startTime = Date.now();
 
     // Wait for hydration of the new problem
     this.attemptHydrationReady();
@@ -780,7 +780,8 @@ export class LeetCodeObserver {
 if (window.location.hostname.includes("leetcode.com") || window.location.hostname.includes("leetcode.cn")) {
   // Guard against duplicate injection (Plasmo may re-inject on HMR)
   const GUARD_KEY = "__cortex_leetcode_observer__";
-  if (!(window as Record<string, unknown>)[GUARD_KEY]) {
-    (window as Record<string, unknown>)[GUARD_KEY] = new LeetCodeObserver();
+  const guardedWindow = window as unknown as Record<string, unknown>;
+  if (!guardedWindow[GUARD_KEY]) {
+    guardedWindow[GUARD_KEY] = new LeetCodeObserver();
   }
 }

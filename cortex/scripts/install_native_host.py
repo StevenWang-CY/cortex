@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 
 HOST_NAME = "com.cortex.launcher"
@@ -55,14 +56,41 @@ BROWSER_PROFILES = {
 _CORTEX_KEYWORDS = ["cortex", "somatic", "biofeedback", "workspace engine"]
 
 
-def _find_python() -> str:
-    """Find the absolute venv Python path for the native host shebang."""
-    project_root = os.path.dirname(
+def _find_python(project_root: str | None = None) -> str:
+    """Find an absolute Python path for the native-host shebang.
+
+    Important: in bundled-app mode, ``sys.executable`` points to
+    ``.../Cortex.app/Contents/MacOS/Cortex`` (the app executable), not a
+    Python interpreter. Native messaging must point to a real Python binary.
+    """
+    # Explicit override for power users / debugging.
+    env_python = os.environ.get("CORTEX_NATIVE_HOST_PYTHON")
+    if env_python and os.path.isfile(env_python) and os.access(env_python, os.X_OK):
+        return os.path.abspath(env_python)
+
+    requested_app_bundle = bool(project_root and project_root.endswith(".app"))
+
+    # Frozen app OR explicit .app target: do not use sys.executable
+    # (bundled binary) and avoid dev-venv coupling.
+    if getattr(sys, "frozen", False) or requested_app_bundle:
+        for candidate in ("/usr/bin/python3", "/opt/homebrew/bin/python3", "/usr/local/bin/python3"):
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        found = shutil.which("python3")
+        if found:
+            return os.path.abspath(found)
+        # Last-resort fallback on macOS.
+        return "/usr/bin/python3"
+
+    # Dev checkout: prefer local venv.
+    dev_root = os.path.dirname(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     )
-    venv_python = os.path.join(project_root, ".venv", "bin", "python")
-    if os.path.isfile(venv_python):
+    venv_python = os.path.join(dev_root, ".venv", "bin", "python")
+    if os.path.isfile(venv_python) and os.access(venv_python, os.X_OK):
         return os.path.abspath(venv_python)
+
+    # Non-frozen fallback.
     return os.path.abspath(sys.executable)
 
 
@@ -72,7 +100,7 @@ def _patch_shebang(script_path: str, python_path: str) -> None:
     Chrome invokes native messaging hosts directly — /usr/bin/env won't
     resolve inside Chrome's restricted PATH.
     """
-    with open(script_path, "r") as f:
+    with open(script_path) as f:
         lines = f.readlines()
 
     if not lines:
@@ -142,7 +170,7 @@ def install(*, project_root: str | None = None) -> None:
         return
 
     # Patch shebang with absolute Python path
-    python_path = _find_python()
+    python_path = _find_python(project_root=project_root)
     _patch_shebang(host_script, python_path)
     os.chmod(host_script, 0o755)
     print(f"Native host: {host_script}")

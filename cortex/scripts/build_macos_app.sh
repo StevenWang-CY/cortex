@@ -23,21 +23,55 @@ if [ -f "${ROOT_DIR}/.venv/bin/activate" ]; then
     source "${ROOT_DIR}/.venv/bin/activate"
 fi
 
+ENV_BACKUP_PATH=""
+BUNDLED_ENV_ACTIVE="0"
+DMG_STAGE_DIR=""
+
+cleanup() {
+    # Always remove temporary bundled env.
+    rm -f "${ROOT_DIR}/.env.bundled"
+
+    # Restore developer .env if we temporarily replaced it.
+    if [ "${BUNDLED_ENV_ACTIVE}" = "1" ]; then
+        rm -f "${ROOT_DIR}/.env"
+    fi
+    if [ -n "${ENV_BACKUP_PATH}" ] && [ -f "${ENV_BACKUP_PATH}" ]; then
+        mv "${ENV_BACKUP_PATH}" "${ROOT_DIR}/.env"
+    fi
+
+    # Clean up temporary DMG staging directory.
+    if [ -n "${DMG_STAGE_DIR}" ] && [ -d "${DMG_STAGE_DIR}" ]; then
+        rm -rf "${DMG_STAGE_DIR}"
+    fi
+}
+
+trap cleanup EXIT
+
 # ── Step 1: Build Chrome extension ──────────────────────────────────────────
 EXT_DIR="${CORTEX_DIR}/apps/browser_extension"
-if [ ! -d "${EXT_DIR}/build/chrome-mv3-prod" ]; then
-    echo "→ Building Chrome extension..."
-    (cd "${EXT_DIR}" && pnpm install && npx plasmo build)
+if [ "${CORTEX_SKIP_EXT_BUILD:-0}" = "1" ]; then
+    echo "→ Skipping browser extension build (CORTEX_SKIP_EXT_BUILD=1)"
 else
-    echo "→ Chrome extension already built"
-fi
-
-# ── Step 2: Build Edge extension ────────────────────────────────────────────
-if [ ! -d "${EXT_DIR}/build/edge-mv3-prod" ]; then
-    echo "→ Building Edge extension..."
-    (cd "${EXT_DIR}" && npx plasmo build --target=edge-mv3)
-else
-    echo "→ Edge extension already built"
+    echo "→ Building Chrome and Edge extensions..."
+    (
+        cd "${EXT_DIR}"
+        if command -v pnpm &>/dev/null; then
+            pnpm install
+            pnpm exec plasmo build
+            pnpm exec plasmo build --target=edge-mv3
+        elif command -v corepack &>/dev/null; then
+            corepack pnpm install
+            corepack pnpm exec plasmo build
+            corepack pnpm exec plasmo build --target=edge-mv3
+        elif command -v npm &>/dev/null; then
+            npm install
+            npx plasmo build
+            npx plasmo build --target=edge-mv3
+        else
+            echo "ERROR: pnpm/corepack/npm not installed; cannot build browser extension" >&2
+            exit 1
+        fi
+    )
 fi
 
 # ── Step 3: Verify VSIX ────────────────────────────────────────────────────
@@ -73,12 +107,12 @@ fi
 
 # Rename .env.bundled → .env so PyInstaller bundles it with the right name
 # (saved back after build)
-_ORIG_ENV=""
 if [ -f "${ROOT_DIR}/.env" ]; then
-    mv "${ROOT_DIR}/.env" "${ROOT_DIR}/.env.original"
-    _ORIG_ENV="1"
+    ENV_BACKUP_PATH="$(mktemp "${ROOT_DIR}/.env.backup.XXXXXX")"
+    mv "${ROOT_DIR}/.env" "${ENV_BACKUP_PATH}"
 fi
 cp "${ROOT_DIR}/.env.bundled" "${ROOT_DIR}/.env"
+BUNDLED_ENV_ACTIVE="1"
 
 # ── Step 5: Convert SVG → .icns ───────────────────────────────────────────
 ICON_SVG="${CORTEX_DIR}/assets/logo.svg"
@@ -175,9 +209,12 @@ fi
 # ── Step 8: Create DMG ────────────────────────────────────────────────────
 DMG_PATH="${DIST_DIR}/Cortex.dmg"
 echo "→ Creating DMG..."
+DMG_STAGE_DIR="$(mktemp -d /tmp/cortex_dmg_stage.XXXXXX)"
+cp -R "${APP_PATH}" "${DMG_STAGE_DIR}/Cortex.app"
+rm -f "${DMG_PATH}"
 
 if command -v create-dmg &>/dev/null; then
-    create-dmg \
+    if ! create-dmg \
         --volname "Cortex" \
         --window-pos 200 120 \
         --window-size 600 400 \
@@ -185,11 +222,19 @@ if command -v create-dmg &>/dev/null; then
         --icon "Cortex.app" 175 190 \
         --app-drop-link 425 190 \
         "${DMG_PATH}" \
-        "${APP_PATH}" || true  # create-dmg returns non-zero on "already exists"
+        "${DMG_STAGE_DIR}"; then
+        echo "WARNING: create-dmg failed; falling back to hdiutil" >&2
+        rm -f "${DMG_PATH}"
+        hdiutil create -volname "Cortex" -srcfolder "${DMG_STAGE_DIR}" -ov -format UDZO "${DMG_PATH}"
+    fi
 else
     # Fallback to hdiutil
-    rm -f "${DMG_PATH}"
-    hdiutil create -volname "Cortex" -srcfolder "${APP_PATH}" -ov -format UDZO "${DMG_PATH}"
+    hdiutil create -volname "Cortex" -srcfolder "${DMG_STAGE_DIR}" -ov -format UDZO "${DMG_PATH}"
+fi
+
+if [ ! -f "${DMG_PATH}" ]; then
+    echo "ERROR: DMG was not generated at ${DMG_PATH}" >&2
+    exit 1
 fi
 
 # ── Step 9: Notarize (if credentials available) ───────────────────────────
@@ -212,11 +257,3 @@ echo "  App:  ${APP_PATH}"
 echo "  DMG:  ${DMG_PATH}"
 echo ""
 echo "To test: open ${DMG_PATH}"
-
-# Restore original .env
-rm -f "${ROOT_DIR}/.env.bundled"
-if [ -n "${_ORIG_ENV}" ] && [ -f "${ROOT_DIR}/.env.original" ]; then
-    mv "${ROOT_DIR}/.env.original" "${ROOT_DIR}/.env"
-else
-    rm -f "${ROOT_DIR}/.env"
-fi

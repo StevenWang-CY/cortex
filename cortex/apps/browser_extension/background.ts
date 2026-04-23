@@ -2327,6 +2327,15 @@ chrome.runtime.onMessage.addListener(
                 currentState = null;
                 activeIntervention = null;
                 (async () => {
+                    // Clear persisted intervention/snapshot state so popup does not
+                    // resurrect stale UI after service-worker restart.
+                    try {
+                        await chrome.storage.session.remove([
+                            "cortex_active_intervention",
+                            "cortex_tab_snapshot",
+                        ]);
+                    } catch { /* storage.session may be unavailable */ }
+
                     // Step 1: Send SHUTDOWN over WebSocket (graceful — triggers daemon stop chain)
                     if (ws && connected) {
                         try {
@@ -2403,7 +2412,6 @@ chrome.runtime.onMessage.addListener(
                 // 2. Native messaging — Chrome invokes native_host.py directly
                 // 3. Direct WebSocket — daemon may already be running
                 (async () => {
-                    let launched = false;
                     let lastError = "";
 
                     // Helper: wait for WebSocket connection and enable camera
@@ -2447,34 +2455,32 @@ chrome.runtime.onMessage.addListener(
                         }
 
                         // Path 2: Native messaging
-                        if (!launched) {
-                            const nativeResult = await new Promise<Record<string, string>>((resolve) => {
-                                try {
-                                    chrome.runtime.sendNativeMessage(
-                                        "com.cortex.launcher",
-                                        { command: "launch" },
-                                        (response) => {
-                                            if (chrome.runtime.lastError) {
-                                                resolve({ status: "native_error", error: chrome.runtime.lastError.message || "Native messaging failed" });
-                                            } else {
-                                                resolve(response || { status: "no_response" });
-                                            }
+                        const nativeResult = await new Promise<Record<string, string>>((resolve) => {
+                            try {
+                                chrome.runtime.sendNativeMessage(
+                                    "com.cortex.launcher",
+                                    { command: "launch" },
+                                    (response) => {
+                                        if (chrome.runtime.lastError) {
+                                            resolve({ status: "native_error", error: chrome.runtime.lastError.message || "Native messaging failed" });
+                                        } else {
+                                            resolve(response || { status: "no_response" });
                                         }
-                                    );
-                                } catch {
-                                    resolve({ status: "native_unavailable", error: "Native messaging not available" });
-                                }
-                            });
-
-                            if (nativeResult.status === "launched" || nativeResult.status === "already_running") {
-                                if (await waitAndEnableCamera(10)) {
-                                    sendResponse({ ok: true, status: "camera_enabled" });
-                                    return;
-                                }
-                                lastError = "Daemon started via native messaging but WebSocket not connected";
-                            } else {
-                                lastError = nativeResult.error || "Native messaging failed";
+                                    }
+                                );
+                            } catch {
+                                resolve({ status: "native_unavailable", error: "Native messaging not available" });
                             }
+                        });
+
+                        if (nativeResult.status === "launched" || nativeResult.status === "already_running") {
+                            if (await waitAndEnableCamera(10)) {
+                                sendResponse({ ok: true, status: "camera_enabled" });
+                                return;
+                            }
+                            lastError = "Daemon started via native messaging but WebSocket not connected";
+                        } else {
+                            lastError = nativeResult.error || "Native messaging failed";
                         }
 
                         // Path 3: Direct WebSocket — daemon may already be running
