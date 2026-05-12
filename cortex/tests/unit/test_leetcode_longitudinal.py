@@ -17,7 +17,6 @@ import pytest
 from cortex.libs.schemas.leetcode import LeetCodeContext, LeetCodeStage
 from cortex.services.state_engine.leetcode_longitudinal import LeetCodeLongitudinalTracker
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

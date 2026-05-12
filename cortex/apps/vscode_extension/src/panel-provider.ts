@@ -29,10 +29,16 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
         this._extensionUri = extensionUri;
         this._wsClient = wsClient;
 
-        // Listen for state updates to show in panel
+        // D.1: STATE_UPDATE fires every 500ms. A full HTML rebuild here
+        // resets the breathing-pacer canvas's animation start time on
+        // every tick, so the pacer never actually animates. Instead push
+        // a diff message into the existing webview script, which updates
+        // the state label + confidence in place. Full HTML re-render is
+        // reserved for showIntervention / clearIntervention where the
+        // structural content actually changes.
         wsClient.onStateUpdate((payload) => {
             this._currentState = payload;
-            this._updatePanel();
+            this._postStateToWebview();
         });
     }
 
@@ -127,6 +133,40 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
         }
 
         this._view.webview.html = this._getWebviewContent();
+    }
+
+    /**
+     * Push the current state into the existing webview without rebuilding
+     * the DOM. The webview script (see _getWebviewContent) listens for
+     * messages with type === 'state' and updates the state label, dot, and
+     * confidence in place.
+     *
+     * D.1 fix: keeps the breathing-pacer animation running across the
+     * 500ms STATE_UPDATE stream that previously reset it every tick.
+     */
+    private _postStateToWebview(): void {
+        if (!this._view) {
+            return;
+        }
+        const state = this._currentState;
+        const stateStr = (state.state as string) ?? "—";
+        const confidence = state.confidence as number | undefined;
+        const stateColors: Record<string, string> = {
+            FLOW: "#4CAF50",
+            HYPER: "#F44336",
+            HYPO: "#6495ED",
+            RECOVERY: "#FFC107",
+        };
+        try {
+            this._view.webview.postMessage({
+                type: "state",
+                state: stateStr,
+                color: stateColors[stateStr] ?? "#888",
+                confidence: confidence ?? 0,
+            });
+        } catch {
+            // postMessage can throw briefly during webview teardown
+        }
     }
 
     /**
@@ -347,15 +387,34 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
 </head>
 <body>
     <div class="state-bar">
-        <div class="state-dot" style="background: ${stateColor};"></div>
-        <span class="state-label">${stateStr}</span>
-        <span class="state-conf">${confPct}%</span>
+        <div class="state-dot" id="cx-state-dot" style="background: ${stateColor};"></div>
+        <span class="state-label" id="cx-state-label">${stateStr}</span>
+        <span class="state-conf" id="cx-state-conf">${confPct}%</span>
     </div>
 
     ${interventionHtml || '<div class="no-intervention">No active intervention</div>'}
 
     <script>
         const vscode = acquireVsCodeApi();
+
+        // D.1: receive STATE_UPDATE diffs from the host and patch the DOM
+        // in place. The host posts {type:'state',state,color,confidence}
+        // every ~500ms; full HTML rebuild only happens on intervention
+        // show/clear so the breathing pacer keeps its animation state.
+        window.addEventListener('message', (event) => {
+            const msg = event.data || {};
+            if (msg.type === 'state') {
+                const label = document.getElementById('cx-state-label');
+                const dot = document.getElementById('cx-state-dot');
+                const conf = document.getElementById('cx-state-conf');
+                if (label) label.textContent = msg.state;
+                if (dot) dot.style.background = msg.color;
+                if (conf) {
+                    const pct = Math.round((Number(msg.confidence) || 0) * 100);
+                    conf.textContent = pct + '%';
+                }
+            }
+        });
 
         // Dismiss button
         const dismissBtn = document.getElementById('dismiss-btn');

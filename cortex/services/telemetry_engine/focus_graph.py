@@ -19,8 +19,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +171,7 @@ class FocusGraphBuilder:
             return 0.0
 
         # Count unique nodes
-        unique_nodes = set(e.node_id for e in recent)
+        unique_nodes = {e.node_id for e in recent}
         n_unique = len(unique_nodes)
         n_switches = len(recent) - 1
 

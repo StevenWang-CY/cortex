@@ -8,14 +8,12 @@ import pytest
 
 from cortex.services.consent.ladder import (
     AUTONOMOUS_ACT,
-    OBSERVE,
     PREVIEW,
     REVERSIBLE_ACT,
     SUGGEST,
     ConsentLadder,
 )
-from cortex.services.consent.policy import ConsentPolicy, DEFAULT_ACTION_LEVELS
-
+from cortex.services.consent.policy import ConsentPolicy
 
 # ---------------------------------------------------------------------------
 # Helpers

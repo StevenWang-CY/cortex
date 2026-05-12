@@ -8,12 +8,12 @@ learning-preserving interventions.
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
 
-class LeetCodeStage(str, Enum):
+class LeetCodeStage(StrEnum):
     """Problem-solving stage derived from DOM observation."""
 
     READ = "READ"          # Reading/understanding the problem statement
@@ -23,7 +23,7 @@ class LeetCodeStage(str, Enum):
     REFLECT = "REFLECT"    # Post-submission with Accepted visible
 
 
-class LeetCodeMode(str, Enum):
+class LeetCodeMode(StrEnum):
     """Biological mode specific to competitive programming context."""
 
     FLOW = "FLOW"                          # Optimal engagement
@@ -34,7 +34,7 @@ class LeetCodeMode(str, Enum):
     AMYGDALA_HIJACK = "AMYGDALA_HIJACK"    # Acute emotional spike post-WA
 
 
-class SubmissionResult(str, Enum):
+class SubmissionResult(StrEnum):
     """LeetCode submission outcome types."""
 
     ACCEPTED = "Accepted"

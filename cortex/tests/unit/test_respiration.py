@@ -1,7 +1,7 @@
 """Tests for RespirationEstimator — rPPG respiratory rate extraction."""
 import numpy as np
-import pytest
-from cortex.services.physio_engine.respiration import RespirationEstimator, RespirationEstimate
+
+from cortex.services.physio_engine.respiration import RespirationEstimator
 
 
 class TestRespirationEstimator:

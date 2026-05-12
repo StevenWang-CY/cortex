@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import unittest
 from typing import Any
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -39,8 +38,7 @@ from cortex.services.intervention_engine.planner import (
 )
 from cortex.services.intervention_engine.restore import ActiveIntervention, RestoreManager
 from cortex.services.intervention_engine.snapshot import capture_snapshot
-from cortex.services.intervention_engine.trigger import InterventionTrigger, TriggerDecision
-
+from cortex.services.intervention_engine.trigger import InterventionTrigger
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -954,15 +952,17 @@ class TestImports(unittest.TestCase):
         assert callable(capture_snapshot)
 
     def test_import_planner(self):
-        from cortex.services.intervention_engine import validate_plan, map_hide_targets, prepare_plan
+        from cortex.services.intervention_engine import (
+            validate_plan,
+        )
         assert callable(validate_plan)
 
     def test_import_executor(self):
-        from cortex.services.intervention_engine import InterventionExecutor, Mutation
+        from cortex.services.intervention_engine import InterventionExecutor
         assert InterventionExecutor is not None
 
     def test_import_restore(self):
-        from cortex.services.intervention_engine import RestoreManager, ActiveIntervention
+        from cortex.services.intervention_engine import RestoreManager
         assert RestoreManager is not None
 
 

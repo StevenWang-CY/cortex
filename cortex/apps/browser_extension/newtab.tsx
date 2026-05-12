@@ -307,6 +307,22 @@ function PulseRoom(): React.ReactElement {
                 padding: 0,
             }}
         >
+            {/*
+              CLAUDE.md rule 19 / F.2: Plasmo's tabs/* pages have a
+              default white <body>. The imported page-reset.css fires
+              on first paint of the React tree but the user can still
+              see a white flash before the stylesheet attaches. Inject
+              an inline <style> tag as the first child so the rule is
+              applied during HTML parse, before React mounts.
+            */}
+            <style
+                dangerouslySetInnerHTML={{
+                    __html:
+                        "html,body,#__plasmo{background:" +
+                        CX.bg +
+                        ";margin:0;padding:0}",
+                }}
+            />
             <canvas
                 ref={canvasRef}
                 style={{ display: "block", width: "100%", height: "100%" }}

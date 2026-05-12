@@ -277,7 +277,7 @@ def verify_causal_explanation(plan: InterventionPlan, context: TaskContext) -> s
     total_errors = context.total_errors
     complexity = context.complexity_score
     if explanation:
-        numeric_tokens = re.findall(r"\\d+(?:\\.\\d+)?", explanation)
+        numeric_tokens = re.findall(r"\d+(?:\.\d+)?", explanation)
         for tok in numeric_tokens:
             try:
                 val = float(tok)

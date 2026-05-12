@@ -11,13 +11,11 @@ Tests use synthetic landmarks to verify:
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from cortex.libs.config.settings import BlinkSignalConfig, LandmarksConfig, PostureSignalConfig
 from cortex.services.kinematics_engine.blink_detector import BlinkDetector, BlinkState
-from cortex.services.kinematics_engine.head_pose import HeadPoseEstimator, HeadPoseResult
-from cortex.services.kinematics_engine.posture import PostureAnalyzer, PostureState
-
+from cortex.services.kinematics_engine.head_pose import HeadPoseEstimator
+from cortex.services.kinematics_engine.posture import PostureAnalyzer
 
 # =============================================================================
 # Helpers — Synthetic Landmark Generation
@@ -368,7 +366,7 @@ class TestBlinkRate:
 
     def test_blink_rate_delta(self):
         """Blink rate delta should reflect difference from baseline."""
-        detector = BlinkDetector(baseline_blink_rate=17.0)
+        BlinkDetector(baseline_blink_rate=17.0)
         _, state = self._make_detector_with_blinks(5, 60.0)
         # With ~5 blinks/min vs baseline 17, delta should be negative
         assert state.blink_rate_delta is not None

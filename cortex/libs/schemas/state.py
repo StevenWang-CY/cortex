@@ -7,13 +7,13 @@ Pydantic models for user state estimation, baselines, and state transitions.
 from __future__ import annotations
 
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
 
-class UserState(str, Enum):
+class UserState(StrEnum):
     """User cognitive state classification."""
 
     FLOW = "FLOW"  # Optimal engagement
@@ -41,7 +41,7 @@ class SignalQuality(BaseModel):
         """Compute overall signal quality as weighted average."""
         weights = [0.4, 0.3, 0.3]  # Physio weighted higher
         qualities = [self.physio, self.kinematics, self.telemetry]
-        return sum(w * q for w, q in zip(weights, qualities))
+        return sum(w * q for w, q in zip(weights, qualities, strict=False))
 
     @property
     def acceptable(self) -> bool:

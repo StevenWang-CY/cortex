@@ -91,6 +91,18 @@ def _setup_pyside6_mocks() -> bool:
     class MockQObject:
         def __init__(self, *args, **kwargs): pass
 
+    class MockQSettings:
+        # E.2 settings.py uses QSettings("Cortex", "Desktop") for persistence.
+        # In-process dict mimics the API surface the dialog touches.
+        def __init__(self, *args):
+            self._store: dict[str, object] = {}
+        def value(self, key, default=None, _type=None):
+            return self._store.get(key, default)
+        def setValue(self, key, value):
+            self._store[key] = value
+        def sync(self):
+            pass
+
     qtcore.Signal = MockSignal
     qtcore.Slot = MockSlot
     qtcore.Qt = MockQt
@@ -99,6 +111,7 @@ def _setup_pyside6_mocks() -> bool:
     qtcore.QRect = MockQRect
     qtcore.QRectF = MockQRect
     qtcore.QPropertyAnimation = MockQPropertyAnimation
+    qtcore.QSettings = MockQSettings
     qtcore.QEvent = type("QEvent", (), {})
 
     # --- QtGui mocks ---
@@ -232,9 +245,15 @@ def _setup_pyside6_mocks() -> bool:
         def __init__(self, text="", parent=None):
             super().__init__(parent)
             self._text = text
+            # E.1: dashboard wires returnPressed → goal_set
+            self.returnPressed = MockSignal()
+            self.editingFinished = MockSignal()
         def setText(self, t): self._text = t
         def text(self): return self._text
         def setPlaceholderText(self, t): pass
+        def setEchoMode(self, *_): pass
+        class EchoMode:
+            Password = 1
 
     class MockQProgressBar(MockQWidget):
         def __init__(self, parent=None):
@@ -676,7 +695,8 @@ class TestSettings:
         assert result["entry_threshold"] == pytest.approx(0.85, abs=0.01)
         assert result["cooldown_seconds"] == 60
         assert result["quiet_mode"] is False
-        assert result["llm_mode"] == "azure"
+        # v0.2.1: default LLM mode is Bedrock (Anthropic SDK).
+        assert result["llm_mode"] == "bedrock"
 
     def test_sensitivity_to_threshold(self):
         settings = SettingsDialog()
@@ -688,15 +708,16 @@ class TestSettings:
         assert settings.get_settings()["entry_threshold"] == pytest.approx(0.75, abs=0.01)
 
     def test_llm_mode_mapping(self):
+        # v0.2.1: combo box order is bedrock / vertex / direct / rule_based.
         settings = SettingsDialog()
         settings._llm_backend._index = 0
-        assert settings.get_settings()["llm_mode"] == "azure"
+        assert settings.get_settings()["llm_mode"] == "bedrock"
         settings._llm_backend._index = 1
-        assert settings.get_settings()["llm_mode"] == "local"
+        assert settings.get_settings()["llm_mode"] == "vertex"
         settings._llm_backend._index = 2
-        assert settings.get_settings()["llm_mode"] == "rule_based"
+        assert settings.get_settings()["llm_mode"] == "direct"
         settings._llm_backend._index = 3
-        assert settings.get_settings()["llm_mode"] == "remote"
+        assert settings.get_settings()["llm_mode"] == "rule_based"
 
     def test_apply_emits_signal(self):
         settings = SettingsDialog()

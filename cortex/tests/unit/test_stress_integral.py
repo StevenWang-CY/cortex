@@ -1,5 +1,4 @@
 """Tests for StressIntegralTracker — biological Pomodoro break detection."""
-import pytest
 from cortex.services.state_engine.stress_integral import StressIntegralTracker
 
 

@@ -1,5 +1,4 @@
 """Tests for FocusGraphBuilder — thrashing detection via focus transition graph."""
-import pytest
 from cortex.services.telemetry_engine.focus_graph import FocusGraphBuilder
 
 

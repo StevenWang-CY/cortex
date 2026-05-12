@@ -98,36 +98,33 @@ class CopilotThrottle:
         return False
 
     async def _disable_suggestions(self) -> None:
-        """Send command to VS Code to disable inline suggestions."""
-        if self._ws_server is None:
-            return
-        try:
-            await self._ws_server.send_to_client(
-                client_type="vscode",
-                message_type="COMMAND",
-                payload={
-                    "command": "cortex.disableInlineSuggestions",
-                    "args": {},
-                },
-            )
-        except Exception:
-            logger.debug("Failed to send disable suggestions command")
+        """Tell VS Code to disable inline suggestions (Copilot/Cursor/…)."""
+        await self._emit("disable")
 
     async def _enable_suggestions(self) -> None:
-        """Send command to VS Code to re-enable inline suggestions."""
+        """Tell VS Code to re-enable inline suggestions."""
+        await self._emit("enable")
+
+    async def _emit(self, action: str) -> None:
+        """Send a ``COPILOT_THROTTLE`` message targeted at the VS Code client.
+
+        Matches the handler at
+        ``cortex/apps/vscode_extension/src/extension.ts`` (case
+        ``COPILOT_THROTTLE``) which invokes
+        ``cortex.disableInlineSuggestions`` / ``cortex.enableInlineSuggestions``.
+        Previously this used a generic ``COMMAND`` message type with no
+        VS Code-side handler — the call site was an orphan emitter.
+        """
         if self._ws_server is None:
             return
         try:
-            await self._ws_server.send_to_client(
-                client_type="vscode",
-                message_type="COMMAND",
-                payload={
-                    "command": "cortex.enableInlineSuggestions",
-                    "args": {},
-                },
+            await self._ws_server.send_message(
+                "COPILOT_THROTTLE",
+                {"action": action},
+                target_client_types=["vscode"],
             )
         except Exception:
-            logger.debug("Failed to send enable suggestions command")
+            logger.debug("Failed to send COPILOT_THROTTLE message", exc_info=True)
 
     async def force_enable(self) -> None:
         """Force re-enable suggestions regardless of state."""

@@ -16,7 +16,6 @@ Algorithm: LinUCB (Disjoint) — O(d^2) per update, trivially fast on CPU.
 from __future__ import annotations
 
 import logging
-import time
 from typing import Any
 
 import numpy as np
@@ -150,7 +149,7 @@ class ContextualBandit:
         Returns:
             Index of the selected arm.
         """
-        x = context.reshape(-1, 1)  # Column vector
+        context.reshape(-1, 1)  # Column vector
         ucb_values = np.zeros(self._n_arms)
 
         for a in range(self._n_arms):

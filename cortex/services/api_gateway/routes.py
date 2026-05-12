@@ -56,7 +56,9 @@ router = APIRouter()
 @router.post("/shutdown")
 async def shutdown(request: Request):
     """Gracefully shut down the Cortex daemon."""
-    import asyncio, os, signal as _signal
+    import asyncio
+    import os
+    import signal as _signal
     logger.info("Shutdown requested via API")
     # Schedule shutdown after response is sent
     loop = asyncio.get_running_loop()

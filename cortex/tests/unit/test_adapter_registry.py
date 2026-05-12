@@ -6,9 +6,8 @@ from typing import Any
 
 import pytest
 
-from cortex.libs.adapters.base import AdapterResult, CortexAdapter
+from cortex.libs.adapters.base import AdapterResult
 from cortex.libs.adapters.registry import AdapterRegistry
-
 
 # ---------------------------------------------------------------------------
 # Stub adapter implementing the CortexAdapter protocol

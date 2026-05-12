@@ -7,13 +7,14 @@ Environment variables override YAML values.
 
 from __future__ import annotations
 
+import os
 import sys
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -59,51 +60,90 @@ class RedisConfig(BaseModel):
     key_prefix: str = "cortex"
 
 
-class LLMRemoteConfig(BaseModel):
-    """Remote LLM server configuration."""
+LogicalModelId = Literal[
+    "claude-opus-4-7",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5",
+]
+"""Cortex-canonical logical model IDs.
 
-    host: str = ""
-    port: int = 8800
-    ssh_tunnel: bool = False
-    ssh_user: str = ""
-
-
-class LLMLocalConfig(BaseModel):
-    """Local LLM configuration (Ollama)."""
-
-    host: str = "localhost"
-    port: int = 11434
-    model: str = "llama3.1:8b"
+Resolved to provider-specific identifiers (Bedrock inference profiles,
+Vertex revisions, or direct Anthropic API names) by
+``cortex.libs.llm.anthropic_client.resolve_anthropic_model_id``.
+"""
 
 
-class LLMAzureConfig(BaseModel):
-    """Azure OpenAI configuration."""
+class BedrockConfig(BaseModel):
+    """AWS Bedrock transport configuration."""
 
-    endpoint: str = ""
-    api_key: str = ""
-    api_version: str = "2025-01-01-preview"
-    deployment_name: str = ""
-    reasoning_deployment_name: str = ""
-    max_completion_tokens: int = 1024
-    use_keychain: bool = True
-    keychain_service: str = "cortex.azure_openai"
-    keychain_account: str = "default"
+    aws_region: str = "us-east-2"
+    keychain_service: str = "cortex.bedrock"
+    keychain_account: str = "bearer_token"
 
 
 class LLMConfig(BaseModel):
-    """LLM engine configuration."""
+    """LLM engine configuration — Anthropic SDK over Bedrock (primary).
 
-    model_config = ConfigDict(protected_namespaces=())
+    Direct ``AsyncAnthropic`` and ``AsyncAnthropicVertex`` remain as escape
+    hatches behind the same interface for capacity / residency failover.
+    All Azure/Qwen/Ollama branches were removed in v0.2.0.
 
-    mode: Literal["remote", "local", "azure", "rule_based", "openai_compat"] = "azure"
-    remote: LLMRemoteConfig = Field(default_factory=LLMRemoteConfig)
-    local: LLMLocalConfig = Field(default_factory=LLMLocalConfig)
-    azure: LLMAzureConfig = Field(default_factory=LLMAzureConfig)
-    model_name: str = "qwen3-8b"
+    Backwards compatibility: ``extra="ignore"`` drops legacy env vars
+    (``CORTEX_LLM__MODE``, ``CORTEX_LLM__AZURE__*``, ``CORTEX_LLM__REMOTE__*``,
+    ``CORTEX_LLM__LOCAL__*``, ``CORTEX_LLM__MODEL_NAME``) without raising.
+    Users still on a 0.1.x ``.env`` can rerun ``cortex-dev``/the desktop
+    BYOK step to migrate cleanly.
+    """
+
+    model_config = ConfigDict(protected_namespaces=(), extra="ignore")
+
+    provider: Literal["bedrock", "vertex", "direct"] = "bedrock"
+    bedrock: BedrockConfig = Field(default_factory=BedrockConfig)
+    use_keychain: bool = True
+
+    # Three logical tiers — actual model selection per template lives in
+    # ``cortex/services/llm_engine/anthropic_planner.py:_TEMPLATE_TIER``.
+    model_default: LogicalModelId = "claude-sonnet-4-6"
+    model_fast: LogicalModelId = "claude-haiku-4-5"
+    model_deep: LogicalModelId = "claude-opus-4-7"
+
     max_tokens: int = 1024
     temperature: float = 0.3
-    timeout_seconds: float = 10.0
-    fallback_mode: Literal["local_ollama", "rule_based"] = "rule_based"
+    # Bedrock cold starts can take 5-10s; Opus calls can exceed 20s.
+    timeout_seconds: float = 30.0
+    cache_ttl_seconds: int = 300
+    # Per-template overrides keyed by template_name (e.g. {"debug_error_summary": "deep"}).
+    template_tier_overrides: dict[str, Literal["fast", "default", "deep"]] = Field(
+        default_factory=dict,
+    )
+    # If Bedrock fails after retries, the only remaining option is the
+    # deterministic rule-based plan. Direct Anthropic API access is reserved
+    # for environments where ``ANTHROPIC_API_KEY`` is explicitly provisioned.
+    fallback_mode: Literal["direct_anthropic", "rule_based"] = "rule_based"
+    # Bound in-flight requests (Bedrock account-level concurrency limits apply).
+    max_concurrent_requests: int = 3
+
+    @field_validator("fallback_mode", mode="before")
+    @classmethod
+    def _coerce_legacy_fallback(cls, v: object) -> object:
+        # Legacy values from 0.1.x .env files (local_ollama / remote / azure)
+        # are silently mapped to ``rule_based`` so the daemon doesn't crash
+        # on first launch after upgrade.
+        if isinstance(v, str) and v not in {"direct_anthropic", "rule_based"}:
+            return "rule_based"
+        return v
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def _coerce_legacy_provider(cls, v: object) -> object:
+        if isinstance(v, str) and v not in {"bedrock", "vertex", "direct"}:
+            # Legacy values: azure, local, remote, openai_compat → bedrock
+            return "bedrock"
+        return v
+    # Circuit-breaker: open after this many consecutive failures, in this window.
+    circuit_failure_threshold: int = 5
+    circuit_window_seconds: float = 60.0
+    circuit_open_seconds: float = 30.0
 
 
 class CaptureConfig(BaseModel):
@@ -154,7 +194,9 @@ class InterventionConfig(BaseModel):
     guided_threshold: float = 0.95
     complexity_threshold: float = 0.6
     cooldown_seconds: int = 60
-    hyper_dwell_seconds: float = 15.0
+    # NOTE: `hyper_dwell_seconds` lives on StateConfig (default 30) — the
+    # duplicate field that lived here was removed in v0.2.0 (C.5). The
+    # trigger policy reads StateConfig.hyper_dwell_seconds directly.
     quiet_mode_minutes: int = 30
     max_dismissals: int = 3
     dismissal_window_minutes: int = 5
@@ -399,9 +441,12 @@ def get_config() -> CortexConfig:
     Get the global Cortex configuration instance.
 
     Configuration is loaded once and cached. YAML defaults are loaded first,
-    then environment variables override any values.  In bundled mode the
-    Azure API key is loaded from the macOS Keychain if ``use_keychain`` is
-    enabled and no key is already set.
+    then environment variables override any values. When ``use_keychain`` is
+    enabled the AWS Bedrock bearer token is sourced from the macOS Keychain
+    (service ``cortex.bedrock`` / account ``bearer_token``) at startup and
+    exported into ``AWS_BEARER_TOKEN_BEDROCK`` for the Anthropic SDK to pick
+    up. The token itself is never persisted into ``CortexConfig`` or any
+    file on disk.
 
     Returns:
         CortexConfig: The global configuration instance.
@@ -414,18 +459,30 @@ def get_config() -> CortexConfig:
             config.storage.path = _bundled_storage_path()
         Path(config.storage.path).mkdir(parents=True, exist_ok=True)
 
-    # BYOK: load API key from macOS Keychain when running as .app
-    if config.llm.azure.use_keychain and not config.llm.azure.api_key:
+    # BYOK: surface the Bedrock bearer token via env so the Anthropic SDK
+    # (AsyncAnthropicBedrock) and any boto3 fallbacks can find it. We never
+    # store the token on the config object — keychain is the source of truth.
+    if (
+        config.llm.provider == "bedrock"
+        and config.llm.use_keychain
+        and not os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
+    ):
         try:
             import keyring
-            key = keyring.get_password(
-                config.llm.azure.keychain_service,
-                config.llm.azure.keychain_account,
+            token = keyring.get_password(
+                config.llm.bedrock.keychain_service,
+                config.llm.bedrock.keychain_account,
             )
-            if key:
-                config.llm.azure.api_key = key
+            if token:
+                os.environ["AWS_BEARER_TOKEN_BEDROCK"] = token
         except Exception:
-            pass  # keyring not available or no entry — LLM will fall back
+            pass  # keyring not available — daemon will degrade to fallback
+
+    # Mirror provider + region into the env the SDK reads, so subprocess
+    # workers and the planner module see the same configuration.
+    os.environ.setdefault("ANTHROPIC_PROVIDER", config.llm.provider)
+    if config.llm.provider == "bedrock":
+        os.environ.setdefault("AWS_REGION", config.llm.bedrock.aws_region)
 
     return config
 

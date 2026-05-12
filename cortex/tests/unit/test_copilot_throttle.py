@@ -1,13 +1,19 @@
 """Tests for CopilotThrottle — AI assistant throttling on cognitive overload."""
-import pytest
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
 from cortex.services.throttle.copilot_throttle import CopilotThrottle
 
 
 class TestCopilotThrottle:
     def setup_method(self):
         self.ws_server = MagicMock()
-        self.ws_server.send_to_client = AsyncMock()
+        # D.5: throttle now emits a COPILOT_THROTTLE message via
+        # ``send_message(type, payload, target_client_types=...)`` so the
+        # VS Code extension's existing handler can pick it up. The legacy
+        # ``send_to_client`` shim has been removed.
+        self.ws_server.send_message = AsyncMock()
         self.throttle = CopilotThrottle(
             ws_server=self.ws_server,
             hyper_threshold=0.85,
@@ -20,7 +26,11 @@ class TestCopilotThrottle:
         changed = await self.throttle.on_state_change("HYPER", 0.9)
         assert changed is True
         assert self.throttle.is_throttled is True
-        self.ws_server.send_to_client.assert_called_once()
+        self.ws_server.send_message.assert_called_once()
+        args, kwargs = self.ws_server.send_message.call_args
+        assert args[0] == "COPILOT_THROTTLE"
+        assert args[1] == {"action": "disable"}
+        assert kwargs.get("target_client_types") == ["vscode"]
 
     @pytest.mark.asyncio
     async def test_unthrottle_on_flow(self):

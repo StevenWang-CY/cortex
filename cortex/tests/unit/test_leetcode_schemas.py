@@ -16,7 +16,6 @@ from cortex.libs.schemas.leetcode import (
     SubmissionResult,
 )
 
-
 # ---------------------------------------------------------------------------
 # LeetCodeStage and LeetCodeMode enums
 # ---------------------------------------------------------------------------

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import UTC
+
 import pytest
 
 from cortex.libs.schemas.activity import ActivitySummary, ActivityTimeline
 from cortex.libs.store.memory_store import InMemoryStore
 from cortex.services.activity_tracker.aggregator import ActivityAggregator
 from cortex.services.activity_tracker.summarizer import ActivitySummarizer
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -95,8 +96,8 @@ class TestActivityAggregator:
         activities = [_make_activity()]
         await aggregator.ingest(activities)
 
-        from datetime import datetime, timezone
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        from datetime import datetime
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
         timeline = await aggregator.get_timeline(today)
 
         assert timeline is not None
@@ -112,8 +113,8 @@ class TestActivityAggregator:
         await aggregator.ingest([act1])
         await aggregator.ingest([act2])
 
-        from datetime import datetime, timezone
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        from datetime import datetime
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
         timeline = await aggregator.get_timeline(today)
 
         assert timeline is not None
@@ -130,8 +131,8 @@ class TestActivityAggregator:
         ]
         await aggregator.ingest(activities)
 
-        from datetime import datetime, timezone
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        from datetime import datetime
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
         timeline = await aggregator.get_timeline(today)
 
         assert timeline is not None
@@ -146,8 +147,8 @@ class TestActivityAggregator:
         ]
         await aggregator.ingest(activities)
 
-        from datetime import datetime, timezone
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        from datetime import datetime
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
         timeline = await aggregator.get_timeline(today)
 
         assert "algorithm" in timeline.dominant_topics
@@ -181,8 +182,8 @@ class TestActivityAggregator:
         ]
         await aggregator.ingest(activities)
 
-        from datetime import datetime, timezone
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        from datetime import datetime
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
         timeline = await aggregator.get_timeline(today)
         assert len(timeline.activities) == 1
 

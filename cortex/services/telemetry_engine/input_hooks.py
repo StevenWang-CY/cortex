@@ -21,14 +21,14 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 
 from cortex.libs.config.settings import TelemetryConfig
 
 logger = logging.getLogger(__name__)
 
 
-class MouseButton(str, Enum):
+class MouseButton(StrEnum):
     """Mouse button types."""
 
     LEFT = "left"
@@ -37,14 +37,14 @@ class MouseButton(str, Enum):
     UNKNOWN = "unknown"
 
 
-class ScrollDirection(str, Enum):
+class ScrollDirection(StrEnum):
     """Scroll direction."""
 
     UP = "up"
     DOWN = "down"
 
 
-class KeyType(str, Enum):
+class KeyType(StrEnum):
     """Key event classification."""
 
     REGULAR = "regular"

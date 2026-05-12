@@ -1,7 +1,7 @@
 """Tests for trust surface — causal explanation in interventions."""
-import pytest
 from datetime import datetime
-from cortex.libs.schemas.intervention import InterventionPlan, InterventionOutcome, UIPlan
+
+from cortex.libs.schemas.intervention import InterventionOutcome, InterventionPlan, UIPlan
 
 
 class TestTrustSurface:

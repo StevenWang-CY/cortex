@@ -111,26 +111,30 @@ if [ ! -f "${VSIX}" ]; then
 fi
 echo "→ VSIX found"
 
-# ── Step 4: Generate key-free .env for bundling ────────────────────────────
-echo "→ Generating bundled .env (no secrets)..."
+# ── Step 4: Generate key-free .env for bundling (allowlist, not denylist) ──
+# Only non-secret pointers ship inside the DMG. Secrets live in macOS Keychain
+# (cortex.bedrock / bearer_token). Anything not matching ALLOWED_KEYS is dropped.
+echo "→ Generating bundled .env (allowlist scrub)..."
+ALLOWED_KEYS='^(CORTEX_API__HOST|CORTEX_API__PORT|CORTEX_API__WS_PORT|CORTEX_LLM__PROVIDER|CORTEX_LLM__BEDROCK__AWS_REGION|CORTEX_LLM__USE_KEYCHAIN|CORTEX_LLM__MODEL_DEFAULT|CORTEX_LLM__MODEL_FAST|CORTEX_LLM__MODEL_DEEP|CORTEX_STORAGE__BASE_DIR)='
 if [ -f "${ROOT_DIR}/.env" ]; then
-    # Strip api_key lines, force use_keychain=true
-    grep -v -i "api_key" "${ROOT_DIR}/.env" \
-        | grep -v "^#.*api_key" \
-        | sed 's/CORTEX_LLM__AZURE__USE_KEYCHAIN=.*/CORTEX_LLM__AZURE__USE_KEYCHAIN=true/' \
-        > "${ROOT_DIR}/.env.bundled"
-    # Ensure use_keychain is present
-    if ! grep -q "USE_KEYCHAIN" "${ROOT_DIR}/.env.bundled"; then
-        echo "CORTEX_LLM__AZURE__USE_KEYCHAIN=true" >> "${ROOT_DIR}/.env.bundled"
-    fi
+    grep -E "${ALLOWED_KEYS}" "${ROOT_DIR}/.env" > "${ROOT_DIR}/.env.bundled" || true
 else
-    cat > "${ROOT_DIR}/.env.bundled" << 'ENVEOF'
-CORTEX_LLM__MODE=azure
-CORTEX_LLM__AZURE__USE_KEYCHAIN=true
-CORTEX_API__HOST=127.0.0.1
-CORTEX_API__PORT=9472
-CORTEX_API__WS_PORT=9473
-ENVEOF
+    : > "${ROOT_DIR}/.env.bundled"
+fi
+# Always force these defaults in the bundled .env regardless of dev .env state.
+{
+    echo "CORTEX_LLM__PROVIDER=bedrock"
+    echo "CORTEX_LLM__USE_KEYCHAIN=true"
+    echo "CORTEX_LLM__BEDROCK__AWS_REGION=us-east-2"
+    echo "CORTEX_API__HOST=127.0.0.1"
+    echo "CORTEX_API__PORT=9472"
+    echo "CORTEX_API__WS_PORT=9473"
+} >> "${ROOT_DIR}/.env.bundled"
+# Defence-in-depth: blow up the build if a secret slipped through.
+if grep -qiE "AWS_BEARER_TOKEN_BEDROCK|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|api_key=|sk-ant-|openai\.com|franklink|gwhiz|cis\.upenn" "${ROOT_DIR}/.env.bundled"; then
+    echo "ERROR: bundled .env contains a forbidden pattern; aborting build." >&2
+    head -50 "${ROOT_DIR}/.env.bundled" >&2
+    exit 1
 fi
 
 # Rename .env.bundled → .env so PyInstaller bundles it with the right name

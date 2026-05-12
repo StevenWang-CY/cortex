@@ -112,7 +112,7 @@ class PerUserLogisticClassifier:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "PerUserLogisticClassifier":
+    def from_dict(cls, data: dict) -> PerUserLogisticClassifier:
         n_features = int(data.get("n_features", 0))
         model = cls(n_features=n_features, l2=float(data.get("l2", 1e-3)))
         model.weights = np.asarray(data.get("weights", [0.0] * n_features), dtype=np.float64)
@@ -128,6 +128,6 @@ class PerUserLogisticClassifier:
         Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     @classmethod
-    def load(cls, path: str | Path) -> "PerUserLogisticClassifier":
+    def load(cls, path: str | Path) -> PerUserLogisticClassifier:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         return cls.from_dict(data)

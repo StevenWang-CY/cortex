@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cortex"
-version = "0.1.0"
+version = "0.2.1"
 description = "Real-time biofeedback workspace engine for detecting cognitive overwhelm"
 readme = "README.md"
 license = "MIT"
@@ -53,6 +53,12 @@ dependencies = [
     # HTTP Client
     "httpx>=0.26.0",
 
+    # Anthropic SDK — production LLM path (AWS Bedrock primary,
+    # direct Anthropic / Vertex as escape hatches behind the same
+    # interface, per ADR-0004-style provider routing).
+    "anthropic[bedrock,vertex]>=0.39.0",
+    "boto3>=1.34.0",
+
     # ML Inference
     "onnxruntime>=1.17.0",
 
@@ -60,6 +66,7 @@ dependencies = [
     "pyobjc-framework-AVFoundation>=10.1; sys_platform == 'darwin'",
     "pyobjc-framework-Cocoa>=10.1; sys_platform == 'darwin'",
     "pyobjc-framework-Quartz>=10.1; sys_platform == 'darwin'",
+    "pyobjc-framework-CoreAudio>=10.1; sys_platform == 'darwin'",
 
     # Structured Logging
     "structlog>=24.1.0",
@@ -81,9 +88,6 @@ dev = [
 
     # Linting & Formatting
     "ruff>=0.2.0",
-
-    # Redis testing
-    "fakeredis>=2.21.0",
 
     # Development utilities
     "ipython>=8.20.0",
@@ -165,7 +169,16 @@ select = [
 ignore = [
     "E501",  # line too long (handled by formatter)
     "B008",  # do not perform function calls in argument defaults
+    "E741",  # ambiguous variable name (l, I, O) — accepted in tight list comps
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests use looser patterns: late imports after docstring/header banners,
+# unused loop vars in synthetic event generators, blind exception assertions
+# for schema validation, and StopAsyncIteration without `from None` is the
+# canonical async-generator-end pattern.
+# Patterns are relative to this pyproject.toml's location.
+"tests/**/*.py" = ["E402", "B007", "B011", "B017", "B904"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["cortex"]

@@ -13,7 +13,6 @@ from typing import Any
 
 import numpy as np
 
-
 ARMS = [
     "no_action",
     "workspace_simplify",
@@ -63,7 +62,7 @@ class AMIPPolicy:
 
         self._A = {arm: np.eye(n_features, dtype=np.float64) for arm in ARMS}
         self._b = {arm: np.zeros(n_features, dtype=np.float64) for arm in ARMS}
-        self._counts = {arm: 0 for arm in ARMS}
+        self._counts = dict.fromkeys(ARMS, 0)
         self._decisions: dict[str, AMIPDecision] = {}
 
         root = Path(storage_root)
@@ -176,7 +175,7 @@ class AMIPPolicy:
         exp = np.exp(vals)
         denom = float(np.sum(exp)) if np.sum(exp) > 1e-12 else 1.0
         probs = exp / denom
-        return {k: float(p) for k, p in zip(keys, probs)}
+        return {k: float(p) for k, p in zip(keys, probs, strict=False)}
 
     def _apply_safety_floor(
         self,
@@ -192,7 +191,7 @@ class AMIPPolicy:
             return {arm: (1.0 if arm == "no_action" else 0.0) for arm in ARMS}
 
         if stress_ratio >= self._stress_ratio_threshold:
-            p = {arm: 0.0 for arm in ARMS}
+            p = dict.fromkeys(ARMS, 0.0)
             # Deterministic safety floor: always prioritize active recovery.
             p["no_action"] = 0.0
             p["breath_box"] = 0.45

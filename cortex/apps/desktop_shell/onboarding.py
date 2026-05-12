@@ -11,7 +11,6 @@ Steps:
 from __future__ import annotations
 
 import subprocess
-import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
@@ -34,7 +33,6 @@ from cortex.apps.desktop_shell.tokens import (
     CX_ACCENT,
     CX_ACCENT_DIM,
     CX_BG,
-    CX_BORDER,
     CX_BORDER_DEFAULT,
     CX_FONT_BRAND,
     CX_FONT_SANS,
@@ -44,21 +42,15 @@ from cortex.apps.desktop_shell.tokens import (
     CX_TEXT,
     CX_TEXT_SECONDARY,
     CX_TEXT_TERTIARY,
-    PAGE_TITLE_QSS,
-    RADIUS_LG,
-    RADIUS_MD,
     RADIUS_SM,
-    RADIUS_FULL,
     SP2,
     SP3,
     SP4,
     SP5,
-    SP6,
     SP8,
     SP10,
 )
 from cortex.libs.config.settings import get_config
-
 
 # ---------------------------------------------------------------------------
 # Permission checks
@@ -83,10 +75,28 @@ def check_accessibility_permission() -> bool:
 
 
 def request_camera_permission() -> None:
-    """Open System Settings to the Camera privacy pane."""
+    """Trigger the macOS camera-permission prompt.
+
+    E.3: previously this just opened System Settings, leaving the user
+    to drill into Privacy → Camera themselves. Use the proper
+    AVFoundation request via
+    :func:`cortex.libs.utils.platform.request_camera_permission`, which
+    fires the native dialog. Fall back to System Settings only if the
+    AVFoundation framework is unavailable (CI / Linux test harnesses).
+    """
+    try:
+        from cortex.libs.utils.platform import (
+            request_camera_permission as _request_camera_permission,
+        )
+
+        _request_camera_permission()
+        return
+    except Exception:
+        pass
     try:
         subprocess.Popen([
-            "open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera",
+            "open",
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera",
         ])
     except Exception:
         pass
@@ -119,6 +129,7 @@ class OnboardingWindow(QWidget):
     completed = Signal()
     open_settings_requested = Signal()
     run_calibration_requested = Signal()
+    extensions_requested = Signal()  # E.5: from the new step-4 button
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -187,12 +198,14 @@ class OnboardingWindow(QWidget):
         # Step 3: LLM backend
         layout.addWidget(self._make_llm_step())
 
-        # Step 4: Extensions
+        # Step 4: Extensions (E.5: actionable button — previously the wizard
+        # only displayed a hint with no way to act on it).
         ext_frame = self._make_section("4", "Connect Extensions")
         ext_layout = ext_frame.layout()
         hint = QLabel(
-            "You can connect your browser and editor now, or later "
-            "from the Connections panel."
+            "Install the browser and editor extensions to give Cortex "
+            "context about your tabs and code. You can also do this later "
+            "from the tray menu → Connect Extensions."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet(
@@ -200,6 +213,14 @@ class OnboardingWindow(QWidget):
             f"color: {CX_TEXT_SECONDARY}; border: none; line-height: 1.4;"
         )
         ext_layout.addWidget(hint)
+
+        connect_btn = QPushButton("Open Connections")
+        connect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        connect_btn.setFixedHeight(36)
+        connect_btn.setStyleSheet(BTN_ACCENT_QSS)
+        connect_btn.clicked.connect(self.extensions_requested.emit)
+        ext_layout.addWidget(connect_btn)
+
         layout.addWidget(ext_frame)
 
         # ── Finish button ────────────────────────────────────────────
@@ -300,10 +321,14 @@ class OnboardingWindow(QWidget):
         return frame
 
     def _make_llm_step(self) -> QFrame:
-        frame = self._make_section("3", "LLM Backend")
+        frame = self._make_section("3", "AWS Bedrock Bearer Token")
         layout = frame.layout()
 
-        desc = QLabel("Choose how Cortex generates intervention content.")
+        desc = QLabel(
+            "Cortex uses Anthropic Claude via AWS Bedrock. Paste your "
+            "long-lived bearer token below \u2014 it's stored only in the "
+            "macOS Keychain and never written to disk."
+        )
         desc.setWordWrap(True)
         desc.setStyleSheet(
             f"font-family: {CX_FONT_SANS}; font-size: 12px; "
@@ -312,12 +337,12 @@ class OnboardingWindow(QWidget):
         layout.addWidget(desc)
 
         config = get_config()
-        current_mode = config.llm.mode
 
-        mode_combo = QComboBox()
-        mode_combo.addItems(["azure", "local", "rule_based"])
-        mode_combo.setCurrentText(current_mode)
-        mode_combo.setStyleSheet(f"""
+        # Region picker (defaults to the user's configured region).
+        region_combo = QComboBox()
+        region_combo.addItems(["us-east-2", "us-east-1", "us-west-2", "eu-west-1", "ap-southeast-2"])
+        region_combo.setCurrentText(config.llm.bedrock.aws_region)
+        region_combo.setStyleSheet(f"""
             QComboBox {{
                 font-family: {CX_FONT_SANS};
                 font-size: 13px;
@@ -328,13 +353,14 @@ class OnboardingWindow(QWidget):
                 padding: 8px 12px;
             }}
         """)
-        layout.addWidget(mode_combo)
+        self._region_combo = region_combo
+        layout.addWidget(region_combo)
 
-        # API key input (shown for Azure)
+        # Bearer token input
         key_row = QHBoxLayout()
         key_row.setSpacing(SP2)
         self._key_input = QLineEdit()
-        self._key_input.setPlaceholderText("Azure OpenAI API key")
+        self._key_input.setPlaceholderText("AWS Bedrock bearer token")
         self._key_input.setEchoMode(QLineEdit.EchoMode.Password)
         self._key_input.setStyleSheet(f"""
             QLineEdit {{
@@ -363,20 +389,20 @@ class OnboardingWindow(QWidget):
         self._key_widget.setLayout(key_row)
         layout.addWidget(self._key_widget)
 
-        # Check if key already in Keychain
+        # Check if token already in Keychain
         has_key = False
         try:
             import keyring
             existing = keyring.get_password(
-                config.llm.azure.keychain_service,
-                config.llm.azure.keychain_account,
+                config.llm.bedrock.keychain_service,
+                config.llm.bedrock.keychain_account,
             )
             has_key = bool(existing)
         except Exception:
             pass
 
         if has_key:
-            saved_label = QLabel("API key found in Keychain")
+            saved_label = QLabel("Bedrock bearer token found in Keychain")
             saved_label.setStyleSheet(
                 f"font-family: {CX_FONT_SANS}; font-size: 12px; "
                 f"color: {CX_SUCCESS}; border: none;"
@@ -384,9 +410,9 @@ class OnboardingWindow(QWidget):
             layout.addWidget(saved_label)
 
         hint = QLabel(
-            "Azure: API key stored in macOS Keychain  \u00b7  "
-            "Local: Requires Ollama  \u00b7  "
-            "Rule-based: Offline mode"
+            "Cortex calls Claude via AWS Bedrock inference profiles  \u00b7  "
+            "Token stored in macOS Keychain (service: cortex.bedrock)  \u00b7  "
+            "Without a token, the daemon falls back to rule-based plans."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet(
@@ -395,31 +421,36 @@ class OnboardingWindow(QWidget):
         )
         layout.addWidget(hint)
 
-        # Toggle key input visibility
-        def _on_mode_change(mode: str) -> None:
-            self._key_widget.setVisible(mode == "azure")
-        mode_combo.currentTextChanged.connect(_on_mode_change)
-        _on_mode_change(current_mode)
-
         return frame
 
     def _save_api_key(self) -> None:
         key = self._key_input.text().strip()
         if not key:
-            QMessageBox.warning(self, "Error", "Please enter an API key.")
+            QMessageBox.warning(self, "Error", "Please paste a Bedrock bearer token.")
             return
         try:
             import keyring
             config = get_config()
             keyring.set_password(
-                config.llm.azure.keychain_service,
-                config.llm.azure.keychain_account,
+                config.llm.bedrock.keychain_service,
+                config.llm.bedrock.keychain_account,
                 key,
             )
-            QMessageBox.information(self, "Saved", "API key saved to macOS Keychain.")
+            # Persist the chosen region back to config (env var override
+            # is recomputed on next get_config()).
+            try:
+                config.llm.bedrock.aws_region = self._region_combo.currentText()
+            except AttributeError:
+                pass
+            QMessageBox.information(
+                self,
+                "Saved",
+                "Bedrock bearer token saved to macOS Keychain. Restart "
+                "Cortex (or sign out and back in) to pick it up.",
+            )
             self._key_input.clear()
         except Exception as e:
-            QMessageBox.warning(self, "Error", f"Failed to save key:\n{e}")
+            QMessageBox.warning(self, "Error", f"Failed to save token:\n{e}")
 
 
 def onboarding_marker_path() -> Path:

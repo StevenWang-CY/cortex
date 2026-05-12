@@ -193,7 +193,10 @@ def main() -> None:
     print("=" * 60)
     print(f"  API:       http://{config.api.host}:{config.api.port}")
     print(f"  WebSocket: ws://{config.api.host}:{config.api.ws_port}")
-    print(f"  LLM Mode:  {config.llm.mode}")
+    print(
+        f"  LLM:       {config.llm.provider} "
+        f"(default model: {config.llm.model_default})"
+    )
     print(
         f"  Capture:   device {describe_requested_camera(config.capture)} @ "
         f"{config.capture.fps} FPS"

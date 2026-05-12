@@ -7,14 +7,13 @@ from datetime import datetime
 import pytest
 
 from cortex.libs.schemas.features import FeatureVector
-from cortex.libs.schemas.state import UserBaselines, UserState
 from cortex.libs.schemas.intervention import (
     ErrorAnalysis,
     InterventionOutcome,
     InterventionPlan,
     UIPlan,
 )
-
+from cortex.libs.schemas.state import UserBaselines, UserState
 
 # ---------------------------------------------------------------------------
 # FeatureVector

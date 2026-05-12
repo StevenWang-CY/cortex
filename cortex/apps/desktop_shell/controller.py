@@ -170,7 +170,10 @@ class CortexAppController:
         # PyInstaller bundles don't always get proper activation, so the
         # dashboard window can be created but hidden behind other windows.
         try:
-            from AppKit import NSApp, NSApplicationActivationPolicyRegular  # type: ignore[import-untyped]
+            from AppKit import (  # type: ignore[import-untyped]
+                NSApp,
+                NSApplicationActivationPolicyRegular,
+            )
 
             NSApp.setActivationPolicy_(NSApplicationActivationPolicyRegular)
             NSApp.activateIgnoringOtherApps_(True)
@@ -308,7 +311,7 @@ class CortexAppController:
             self._dashboard.activateWindow()
             # Force macOS to bring the app + window to front
             try:
-                from AppKit import NSApp, NSApplication  # type: ignore[import-untyped]
+                from AppKit import NSApp  # type: ignore[import-untyped]
 
                 NSApp.activateIgnoringOtherApps_(True)
                 # Raise the key window directly

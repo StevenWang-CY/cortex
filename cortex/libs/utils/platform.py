@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     pass
 
 
-class Platform(str, Enum):
+class Platform(StrEnum):
     """Supported platforms."""
 
     MACOS = "macos"

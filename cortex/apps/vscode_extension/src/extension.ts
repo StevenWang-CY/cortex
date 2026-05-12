@@ -265,21 +265,49 @@ function updateStatusBar(payload: Record<string, unknown>): void {
 function handleIntervention(payload: Record<string, unknown>): void {
     const uiPlan = payload.ui_plan as Record<string, unknown> | undefined;
 
+    // D.6: respect the LLM-supplied max_visible_lines constraint instead
+    // of hard-coding ±20. The daemon's SimplificationConstraints flow
+    // into UIPlan.max_visible_lines (default 40 = ±20 either side of
+    // cursor) — see libs/schemas/intervention.py.
+    const rawMaxVisible =
+        (uiPlan?.max_visible_lines as number | undefined) ??
+        ((payload.constraints as Record<string, unknown> | undefined)
+            ?.max_visible_lines as number | undefined);
+    const halfWindow = Math.max(
+        5,
+        Math.floor(((typeof rawMaxVisible === "number" ? rawMaxVisible : 40)) / 2),
+    );
+
     // Apply fold if requested
     if (uiPlan?.fold_unrelated_code && foldController) {
         const editor = vscode.window.activeTextEditor;
         if (editor) {
             const cursorLine = editor.selection.active.line;
-            // Fold everything except ±20 lines around cursor
             foldController.foldExcept(
-                Math.max(0, cursorLine - 20),
-                cursorLine + 20,
+                Math.max(0, cursorLine - halfWindow),
+                cursorLine + halfWindow,
             );
         }
     }
 
     // Show panel with intervention content
     panelProvider?.showIntervention(payload);
+
+    // D.4 / B.2: ack the apply so the daemon can replace optimistic
+    // mutation tracking with real client outcome. We don't have detailed
+    // success/failure per action here; report overall success and the
+    // current state of the fold controller.
+    try {
+        wsClient?.sendInterventionApplied(
+            payload.intervention_id as string,
+            "apply",
+            true,
+            uiPlan?.fold_unrelated_code ? ["foldExcept"] : [],
+            [],
+        );
+    } catch {
+        // wsClient may not be ready in tests — never crash the handler
+    }
 
     // Show notification for overlay_only
     const level = payload.level as string | undefined;

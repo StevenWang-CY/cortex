@@ -26,9 +26,6 @@ import sys
 import time
 from pathlib import Path
 
-from cortex.libs.schemas.features import FeatureVector
-from cortex.libs.schemas.state import StateEstimate, StateTransition
-
 logger = logging.getLogger(__name__)
 
 # State display colors (ANSI)

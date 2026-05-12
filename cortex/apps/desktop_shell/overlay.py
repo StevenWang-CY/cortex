@@ -14,14 +14,12 @@ intervention content. Features:
 from __future__ import annotations
 
 import logging
-import math
 
-from PySide6.QtCore import QPropertyAnimation, QRect, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtCore import QRect, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import (
     QCheckBox,
     QFrame,
-    QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -30,14 +28,12 @@ from PySide6.QtWidgets import (
 )
 
 from cortex.apps.desktop_shell.tokens import (
-    CX_FONT_SANS,
     CX_FONT_DISPLAY,
+    CX_FONT_SANS,
     RADIUS_LG,
-    RADIUS_MD,
     RADIUS_SM,
     SP3,
     SP4,
-    SP5,
     SP6,
     SP8,
 )
@@ -380,7 +376,6 @@ class OverlayWindow(QWidget):
 
     def keyPressEvent(self, event: object) -> None:
         """Handle Escape key to dismiss."""
-        from PySide6.QtCore import QEvent
 
         if hasattr(event, "key") and event.key() == Qt.Key.Key_Escape:
             self._user_dismiss()

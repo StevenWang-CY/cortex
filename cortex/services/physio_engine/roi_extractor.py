@@ -114,7 +114,7 @@ class RoiTraceFrame:
         if total_pixels <= 1e-9:
             return None
         weighted_sum = np.zeros(3, dtype=np.float64)
-        for roi, weight in zip(rois, raw_weights):
+        for roi, weight in zip(rois, raw_weights, strict=False):
             weighted_sum += roi.to_array() * weight
         return weighted_sum / total_pixels
 

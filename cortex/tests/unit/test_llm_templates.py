@@ -16,7 +16,6 @@ from cortex.libs.schemas.context import (
 from cortex.libs.schemas.state import SignalQuality, StateEstimate, StateScores
 from cortex.services.llm_engine.prompts import PROMPT_TEMPLATES, build_user_prompt
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -166,7 +165,6 @@ class TestTokenBudgetEnforcement:
     def test_large_context_is_truncated(self):
         """Context exceeding 80% of budget must be truncated under the limit."""
         from cortex.services.llm_engine.prompts import (
-            _estimate_tokens,
             _total_message_tokens,
             build_messages,
         )

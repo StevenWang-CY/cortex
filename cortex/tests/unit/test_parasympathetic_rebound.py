@@ -2,8 +2,6 @@
 
 import time
 
-import pytest
-
 from cortex.services.state_engine.parasympathetic_rebound import (
     ParasympatheticReboundDetector,
 )

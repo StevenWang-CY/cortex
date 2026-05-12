@@ -30,11 +30,58 @@ interface ActiveFileInfo {
 /**
  * Provides VS Code editor context to the Cortex daemon.
  */
+/** A short description of a recent edit. */
+interface RecentEdit {
+    file_path: string;
+    line: number;
+    length: number;
+    kind: "insert" | "delete" | "replace";
+}
+
 export class ContextProvider {
     private _terminalLines: string[] = [];
     private _commandHistory: string[] = [];
+    // D.7: maintain a small ring of recent edits so the LLM can see
+    // where the user is actively working without needing a full git diff.
+    private _recentEdits: RecentEdit[] = [];
+    private static readonly _RECENT_EDIT_CAPACITY = 25;
 
     constructor() {
+        // Watch text-document changes — describe each change in a small,
+        // privacy-preserving way (no content, only file/line/length).
+        try {
+            vscode.workspace.onDidChangeTextDocument((event) => {
+                if (event.document.uri.scheme !== "file") {
+                    return;
+                }
+                const filePath = event.document.uri.fsPath;
+                for (const change of event.contentChanges) {
+                    const insertedLength = change.text.length;
+                    const replacedLength =
+                        change.rangeOffset + change.rangeLength - change.rangeOffset;
+                    let kind: RecentEdit["kind"];
+                    if (insertedLength > 0 && change.rangeLength > 0) {
+                        kind = "replace";
+                    } else if (insertedLength > 0) {
+                        kind = "insert";
+                    } else {
+                        kind = "delete";
+                    }
+                    this._recentEdits.push({
+                        file_path: filePath,
+                        line: change.range.start.line + 1,
+                        length: Math.max(insertedLength, replacedLength),
+                        kind,
+                    });
+                    if (this._recentEdits.length > ContextProvider._RECENT_EDIT_CAPACITY) {
+                        this._recentEdits.shift();
+                    }
+                }
+            });
+        } catch {
+            // Subscription may fail in test harnesses with stubbed vscode API.
+        }
+
         const windowAny = vscode.window as typeof vscode.window & {
             onDidWriteTerminalData?: (
                 listener: (event: { data: string; terminal: vscode.Terminal }) => void,
@@ -207,7 +254,12 @@ export class ContextProvider {
                   visible_code: activeFile.visible_code,
                   symbol_at_cursor: symbolAtCursor,
                   diagnostics: diagnostics,
-                  recent_edits: [],
+                  // D.7: actual edits collected by onDidChangeTextDocument.
+                  // Format is privacy-preserving (file/line/length/kind only).
+                  recent_edits: this._recentEdits.slice(-10).map(
+                      (e) =>
+                          `${e.kind} at ${e.file_path}:${e.line} (${e.length} chars)`,
+                  ),
               }
             : {};
 

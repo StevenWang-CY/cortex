@@ -19,7 +19,7 @@ References:
 from __future__ import annotations
 
 import logging
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 
 import numpy as np
@@ -33,7 +33,7 @@ except Exception:  # pragma: no cover - optional runtime path
     ort = None  # type: ignore[assignment]
 
 
-class RPPGAlgorithm(str, Enum):
+class RPPGAlgorithm(StrEnum):
     """Available rPPG extraction algorithms."""
     POS = "pos"
     CHROM = "chrom"

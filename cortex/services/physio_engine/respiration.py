@@ -111,7 +111,6 @@ class RespirationEstimator:
         Returns:
             RespirationEstimate with rate, confidence, and apnea flag.
         """
-        from scipy.signal import welch
 
         n_samples = len(bvp_window)
         min_filter_samples = 3 * (2 * self._filter_order + 1)

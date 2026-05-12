@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import subprocess
 import sys
 from pathlib import Path
 
@@ -151,7 +150,7 @@ class ProjectLauncher:
     async def _run_terminal_command(self, command: str) -> bool:
         """Run a terminal command in the background."""
         try:
-            proc = await asyncio.create_subprocess_shell(
+            await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,

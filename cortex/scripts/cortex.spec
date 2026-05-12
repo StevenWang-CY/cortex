@@ -9,6 +9,11 @@ import os
 import sys
 from pathlib import Path
 
+try:
+    import tomllib  # py3.11+
+except ImportError:  # pragma: no cover
+    import tomli as tomllib  # type: ignore[import-not-found,no-redef]
+
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, copy_metadata
 
 # ---------------------------------------------------------------------------
@@ -17,6 +22,10 @@ from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, co
 
 ROOT = Path(os.environ.get("CORTEX_ROOT", os.getcwd()))
 CORTEX = ROOT / "cortex"
+
+# Single source of truth: read version from pyproject.toml.
+with (CORTEX / "pyproject.toml").open("rb") as _f:
+    CORTEX_VERSION = tomllib.load(_f)["project"]["version"]
 
 # ---------------------------------------------------------------------------
 # Data files
@@ -211,8 +220,8 @@ app = BUNDLE(
         "CFBundleName": "Cortex",
         "CFBundleDisplayName": "Cortex",
         "CFBundleIdentifier": "com.cortex.daemon",
-        "CFBundleVersion": "0.1.0",
-        "CFBundleShortVersionString": "0.1.0",
+        "CFBundleVersion": CORTEX_VERSION,
+        "CFBundleShortVersionString": CORTEX_VERSION,
         "NSCameraUsageDescription": (
             "Cortex needs camera access to monitor focus and attention "
             "via remote photoplethysmography."

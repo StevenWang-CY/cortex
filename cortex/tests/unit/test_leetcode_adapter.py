@@ -4,7 +4,6 @@ Unit tests for LeetCodeAdapter.
 
 from __future__ import annotations
 
-import time
 from typing import Any
 
 import pytest
@@ -12,7 +11,6 @@ import pytest
 from cortex.libs.adapters.base import CortexAdapter
 from cortex.libs.adapters.leetcode_adapter import LeetCodeAdapter
 from cortex.libs.schemas.leetcode import LeetCodeContext
-
 
 # ---------------------------------------------------------------------------
 # Helpers

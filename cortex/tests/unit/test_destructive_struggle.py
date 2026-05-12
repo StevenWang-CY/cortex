@@ -1,6 +1,5 @@
 """Unit tests for DestructiveStruggleDetector."""
 
-import pytest
 
 from cortex.services.state_engine.destructive_struggle import (
     DestructiveStruggleDetector,

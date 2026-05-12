@@ -56,6 +56,11 @@ class WebSocketBridge(QObject):
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ws: Any = None
+        # E.6: exponential reconnect backoff (3 → 6 → 12 → 24 → 30s cap),
+        # matching the browser and VS Code clients. Resets to 3s after a
+        # successful connect.
+        self._reconnect_delay = 3.0
+        self._reconnect_delay_max = 30.0
 
     def start(self) -> None:
         """Start the WebSocket listener in a background thread."""
@@ -123,6 +128,8 @@ class WebSocketBridge(QObject):
                     self._ws = ws
                     self.connection_changed.emit(True)
                     logger.info(f"Connected to Cortex daemon at {uri}")
+                    # E.6: successful connect → reset backoff.
+                    self._reconnect_delay = 3.0
 
                     # Identify as desktop client
                     identify_msg = json.dumps({
@@ -146,7 +153,10 @@ class WebSocketBridge(QObject):
                 self.connection_changed.emit(False)
                 logger.debug(f"WebSocket disconnected: {e}")
                 if self._running:
-                    await asyncio.sleep(3.0)  # Reconnect delay
+                    await asyncio.sleep(self._reconnect_delay)
+                    self._reconnect_delay = min(
+                        self._reconnect_delay * 2.0, self._reconnect_delay_max,
+                    )
 
     def _handle_message(self, raw: str) -> None:
         """Parse and dispatch a WebSocket message."""
@@ -209,11 +219,25 @@ class CortexApp:
         self._tray = CortexTrayIcon(self._app)
         self._tray.show_dashboard_requested.connect(self._show_dashboard)
         self._tray.show_settings_requested.connect(self._show_settings)
+        # E.4: wire the Connect Extensions menu entry in WS mode too —
+        # previously only the in-process CortexAppController hooked it,
+        # so the menu item silently did nothing under --ws mode.
+        if hasattr(self._tray, "show_connections_requested"):
+            self._tray.show_connections_requested.connect(
+                self._show_connections,
+            )
         self._tray.pause_requested.connect(self._toggle_pause)
         self._tray.restore_requested.connect(self._restore_workspace)
         self._tray.snooze_requested.connect(self._snooze_fifteen_minutes)
         self._tray.disable_session_requested.connect(self._disable_for_session)
         self._tray.quit_requested.connect(self._quit)
+
+        # E.1: route dashboard Stop / goal signals to the daemon. Stop
+        # tears down via WebSocket SHUTDOWN; goal_set posts a USER_ACTION
+        # that the daemon resolves to a current goal hint.
+        if self._dashboard is not None:
+            self._dashboard.stop_requested.connect(self._request_remote_shutdown)
+            self._dashboard.goal_set.connect(self._send_goal)
 
         # Create WebSocket bridge
         self._bridge = WebSocketBridge(
@@ -234,6 +258,9 @@ class CortexApp:
         self._onboarding.open_settings_requested.connect(self._show_settings)
         self._onboarding.run_calibration_requested.connect(self._run_calibration)
         self._onboarding.completed.connect(self._complete_onboarding)
+        # E.5: step-4 "Open Connections" button.
+        if hasattr(self._onboarding, "extensions_requested"):
+            self._onboarding.extensions_requested.connect(self._show_connections)
 
         # Start WebSocket connection
         self._bridge.start()
@@ -303,8 +330,19 @@ class CortexApp:
 
     @Slot(dict)
     def _on_settings_synced(self, payload: dict) -> None:
-        """Handle settings sync from the daemon."""
+        """Handle settings sync from the daemon.
+
+        E.2: round-trip daemon-side settings into the dialog widgets so
+        the dashboard always shows the authoritative state. Previously
+        the payload was logged and dropped, so any daemon-side mutation
+        (quiet mode, intervention disable, etc.) never reached the UI.
+        """
         logger.info(f"Settings synced: {payload}")
+        if self._settings is not None:
+            try:
+                self._settings.apply_payload(payload)
+            except Exception:
+                logger.debug("Failed to apply settings payload", exc_info=True)
 
     def _show_dashboard(self) -> None:
         """Show the dashboard window."""
@@ -319,6 +357,45 @@ class CortexApp:
             self._settings.show()
             self._settings.raise_()
             self._settings.activateWindow()
+
+    def _show_connections(self) -> None:
+        """Show the Connect Extensions panel (E.4).
+
+        Lazy-imports so non-macOS / test harnesses without PySide6 dialogs
+        don't pay the cost on startup.
+        """
+        try:
+            from cortex.apps.desktop_shell.connections import ConnectionsPanel
+
+            panel = getattr(self, "_connections_panel", None)
+            if panel is None:
+                panel = ConnectionsPanel()
+                self._connections_panel = panel
+            panel.show()
+            panel.raise_()
+            panel.activateWindow()
+        except Exception:
+            logger.warning("Connections panel unavailable", exc_info=True)
+
+    def _request_remote_shutdown(self) -> None:
+        """E.1 / E.4: tear down the daemon when the dashboard Stop button fires."""
+        if self._bridge is not None:
+            try:
+                self._bridge.send_user_action("shutdown", "")
+            except Exception:
+                pass
+        # Best-effort: also quit the desktop shell so the tray icon
+        # disappears alongside the daemon.
+        QTimer.singleShot(500, self._quit)
+
+    def _send_goal(self, goal: str) -> None:
+        """Forward the dashboard goal-input text to the daemon."""
+        if self._bridge is None or not goal:
+            return
+        try:
+            self._bridge.send_user_action(f"set_goal:{goal}", "")
+        except Exception:
+            pass
 
     def _run_calibration(self) -> None:
         """Kick off calibration in a detached subprocess."""

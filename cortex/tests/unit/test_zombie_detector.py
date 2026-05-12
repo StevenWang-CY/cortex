@@ -1,7 +1,5 @@
 """Tests for ZombieReadingDetector — passive reading interception."""
-import pytest
 from cortex.services.state_engine.zombie_detector import ZombieReadingDetector
-
 
 # All tests start at t=1000 to avoid the cooldown check (last_trigger=0.0, cooldown=300)
 
@@ -22,7 +20,7 @@ class TestZombieReadingDetector:
             if result:
                 assert (t - base_t) >= 90.0
                 return
-        assert False, "Zombie reading should have triggered after 90s"
+        raise AssertionError("Zombie reading should have triggered after 90s")
 
     def test_does_not_trigger_in_flow(self):
         detector = ZombieReadingDetector(min_duration=5.0, cooldown=0.0)

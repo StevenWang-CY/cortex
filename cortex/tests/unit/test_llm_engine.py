@@ -8,21 +8,17 @@ Covers:
 - Prompt building with context/state/constraints
 - LLM cache (hit, miss, expiration, eviction, stats)
 - Fallback plan generation
-- RemoteQwenClient (mocked HTTP)
-- LocalOllamaClient (mocked HTTP)
 - Module imports
+
+The transport-specific tests (AnthropicPlanner over Bedrock/Direct) live in
+``tests/unit/test_anthropic_planner.py``.
 """
 
 from __future__ import annotations
 
 import json
 import unittest
-from unittest.mock import AsyncMock, patch
 
-import httpx
-import pytest
-
-from cortex.libs.config.settings import LLMConfig
 from cortex.libs.schemas.context import (
     BrowserContext,
     Diagnostic,
@@ -34,9 +30,7 @@ from cortex.libs.schemas.context import (
 from cortex.libs.schemas.intervention import InterventionPlan, SimplificationConstraints, UIPlan
 from cortex.libs.schemas.state import SignalQuality, StateEstimate, StateScores
 from cortex.services.llm_engine.cache import LLMCache
-from cortex.services.llm_engine.client import LLMError, RuleBasedLLMClient, build_fallback_plan
-from cortex.services.llm_engine.azure_openai import AzureOpenAIClient
-from cortex.services.llm_engine.local_ollama import LocalOllamaClient
+from cortex.services.llm_engine.client import LLMError, build_fallback_plan
 from cortex.services.llm_engine.parser import (
     parse_and_validate,
     parse_llm_response,
@@ -49,7 +43,6 @@ from cortex.services.llm_engine.prompts import (
     build_user_prompt,
     select_prompt_template,
 )
-from cortex.services.llm_engine.remote_qwen import RemoteQwenClient
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -484,280 +477,9 @@ class TestFallbackPlan(unittest.TestCase):
         assert plan.headline == "Focus on the function you're in"
 
 
-# ===========================================================================
-# RemoteQwenClient Tests (mocked HTTP)
-# ===========================================================================
-
-
-def _make_remote_client():
-    config = LLMConfig(mode="remote", timeout_seconds=5.0)
-    return RemoteQwenClient(config=config)
-
-
-def _mock_response(status_code: int, json_data: dict) -> httpx.Response:
-    """Create a mock httpx.Response with a request attached (needed for raise_for_status)."""
-    request = httpx.Request("POST", "http://test")
-    return httpx.Response(status_code, json=json_data, request=request)
-
-
-@pytest.mark.asyncio
-async def test_remote_generate_plan_success():
-    """Successful API call returns parsed plan."""
-    client = _make_remote_client()
-    ctx = _make_context()
-    state = _make_state()
-    api_response = {
-        "choices": [{"message": {"content": VALID_PLAN_JSON}}]
-    }
-    mock_resp = _mock_response(200, api_response)
-    with patch("httpx.AsyncClient.post", new_callable=AsyncMock, return_value=mock_resp):
-        plan = await client.generate_intervention_plan(ctx, state)
-    assert isinstance(plan, InterventionPlan)
-    assert plan.level == "simplified_workspace"
-
-
-@pytest.mark.asyncio
-async def test_remote_generate_plan_fallback_on_http_error():
-    """HTTP errors should trigger fallback plan after retries."""
-    client = _make_remote_client()
-    ctx = _make_context()
-    state = _make_state()
-    with patch("httpx.AsyncClient.post", new_callable=AsyncMock, side_effect=httpx.ConnectError("refused")):
-        plan = await client.generate_intervention_plan(ctx, state)
-    assert isinstance(plan, InterventionPlan)
-    assert plan.level == "overlay_only"  # fallback
-
-
-@pytest.mark.asyncio
-async def test_remote_generate_plan_uses_cache():
-    """Second call should use cached result."""
-    client = _make_remote_client()
-    ctx = _make_context()
-    state = _make_state()
-    api_response = {
-        "choices": [{"message": {"content": VALID_PLAN_JSON}}]
-    }
-    mock_resp = _mock_response(200, api_response)
-    mock_post = AsyncMock(return_value=mock_resp)
-    with patch("httpx.AsyncClient.post", mock_post):
-        plan1 = await client.generate_intervention_plan(ctx, state)
-        plan2 = await client.generate_intervention_plan(ctx, state)
-    assert plan1.level == plan2.level
-    # post should only be called once (second call uses cache)
-    assert mock_post.call_count == 1
-
-
-@pytest.mark.asyncio
-async def test_remote_generate_plan_retries_when_state_changes():
-    client = _make_remote_client()
-    ctx = _make_context()
-    state1 = _make_state(confidence=0.82)
-    state2 = _make_state(confidence=0.97)
-    api_response = {
-        "choices": [{"message": {"content": VALID_PLAN_JSON}}]
-    }
-    mock_resp = _mock_response(200, api_response)
-    mock_post = AsyncMock(return_value=mock_resp)
-    with patch("httpx.AsyncClient.post", mock_post):
-        await client.generate_intervention_plan(ctx, state1)
-        await client.generate_intervention_plan(ctx, state2)
-    assert mock_post.call_count == 2
-
-
-@pytest.mark.asyncio
-async def test_remote_generate_plan_opens_tunnel_automatically():
-    config = LLMConfig(mode="remote", timeout_seconds=5.0)
-    config.remote.ssh_tunnel = True
-    client = RemoteQwenClient(config=config)
-    ctx = _make_context()
-    state = _make_state()
-    with patch.object(client, "open_tunnel", AsyncMock(return_value=True)) as open_tunnel:
-        with patch.object(client, "_call_api", AsyncMock(return_value=VALID_PLAN_JSON)):
-            plan = await client.generate_intervention_plan(ctx, state)
-    assert plan.level == "simplified_workspace"
-    open_tunnel.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_remote_generate_plan_handles_content_blocks():
-    config = LLMConfig(mode="remote", timeout_seconds=5.0)
-    config.remote.ssh_tunnel = False
-    client = RemoteQwenClient(config=config)
-    ctx = _make_context()
-    state = _make_state()
-    api_response = {
-        "choices": [{
-            "message": {
-                "content": [{"type": "text", "text": VALID_PLAN_JSON}],
-            }
-        }]
-    }
-    mock_resp = _mock_response(200, api_response)
-    with patch("httpx.AsyncClient.post", new_callable=AsyncMock, return_value=mock_resp):
-        plan = await client.generate_intervention_plan(ctx, state)
-    assert plan.level == "simplified_workspace"
-
-
-def test_remote_client_uses_remote_host_without_tunnel():
-    config = LLMConfig(mode="remote")
-    config.remote.host = "llm.example.org"
-    config.remote.port = 9911
-    config.remote.ssh_tunnel = False
-    client = RemoteQwenClient(config=config)
-    assert client._api_base_url == "http://llm.example.org:9911"
-
-
-@pytest.mark.asyncio
-async def test_remote_health_check_success():
-    client = _make_remote_client()
-    mock_response = httpx.Response(200, json={"data": []})
-    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=mock_response):
-        assert await client.health_check() is True
-
-
-@pytest.mark.asyncio
-async def test_remote_health_check_failure():
-    client = _make_remote_client()
-    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=httpx.ConnectError("refused")):
-        assert await client.health_check() is False
-
-
-# ===========================================================================
-# LocalOllamaClient Tests (mocked HTTP)
-# ===========================================================================
-
-
-def _make_ollama_client():
-    config = LLMConfig(mode="local", timeout_seconds=5.0)
-    return LocalOllamaClient(config=config)
-
-
-def _make_azure_client():
-    config = LLMConfig(mode="azure", timeout_seconds=5.0)
-    config.azure.endpoint = "https://example-resource.openai.azure.com/"
-    config.azure.api_key = "test-key"
-    config.azure.deployment_name = "gpt-5-mini"
-    config.azure.reasoning_deployment_name = "gpt-5-mini-reasoning"
-    config.azure.api_version = "2025-01-01-preview"
-    config.fallback_mode = "local_ollama"
-    return AzureOpenAIClient(config=config)
-
-
-@pytest.mark.asyncio
-async def test_ollama_generate_plan_success():
-    client = _make_ollama_client()
-    ctx = _make_context()
-    state = _make_state()
-    api_response = {"message": {"content": VALID_PLAN_JSON}}
-    mock_resp = _mock_response(200, api_response)
-    with patch("httpx.AsyncClient.post", new_callable=AsyncMock, return_value=mock_resp):
-        plan = await client.generate_intervention_plan(ctx, state)
-    assert isinstance(plan, InterventionPlan)
-    assert plan.level == "simplified_workspace"
-
-
-@pytest.mark.asyncio
-async def test_ollama_generate_plan_fallback_on_error():
-    client = _make_ollama_client()
-    ctx = _make_context()
-    state = _make_state()
-    with patch("httpx.AsyncClient.post", new_callable=AsyncMock, side_effect=httpx.ConnectError("refused")):
-        plan = await client.generate_intervention_plan(ctx, state)
-    assert isinstance(plan, InterventionPlan)
-    assert plan.level == "overlay_only"  # fallback
-
-
-@pytest.mark.asyncio
-async def test_ollama_health_check_success():
-    client = _make_ollama_client()
-    mock_response = httpx.Response(200, json={"models": []})
-    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=mock_response):
-        assert await client.health_check() is True
-
-
-@pytest.mark.asyncio
-async def test_ollama_health_check_failure():
-    client = _make_ollama_client()
-    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=httpx.ConnectError("refused")):
-        assert await client.health_check() is False
-
-
-# ===========================================================================
-# AzureOpenAIClient Tests (mocked HTTP)
-# ===========================================================================
-
-
-@pytest.mark.asyncio
-async def test_azure_generate_plan_success():
-    client = _make_azure_client()
-    ctx = _make_context()
-    state = _make_state()
-    api_response = {"choices": [{"message": {"content": VALID_PLAN_JSON}}]}
-    mock_resp = _mock_response(200, api_response)
-    with patch("httpx.AsyncClient.post", new_callable=AsyncMock, return_value=mock_resp) as post_mock:
-        plan = await client.generate_intervention_plan(ctx, state)
-    assert isinstance(plan, InterventionPlan)
-    assert plan.level == "simplified_workspace"
-    sent_payload = post_mock.await_args.kwargs["json"]
-    assert "max_completion_tokens" in sent_payload
-    assert "max_tokens" not in sent_payload
-
-
-@pytest.mark.asyncio
-async def test_azure_uses_reasoning_deployment_for_hyper_state():
-    client = _make_azure_client()
-    ctx = _make_context()
-    state = _make_state(state="HYPER", confidence=0.97)
-    api_response = {"choices": [{"message": {"content": VALID_PLAN_JSON}}]}
-    mock_resp = _mock_response(200, api_response)
-    with patch("httpx.AsyncClient.post", new_callable=AsyncMock, return_value=mock_resp) as post_mock:
-        await client.generate_intervention_plan(ctx, state)
-    called_url = post_mock.await_args.args[0]
-    assert "gpt-5-mini-reasoning" in called_url
-
-
-@pytest.mark.asyncio
-async def test_azure_falls_back_to_ollama_then_rule_based():
-    client = _make_azure_client()
-    ctx = _make_context()
-    state = _make_state()
-    with patch("httpx.AsyncClient.post", new_callable=AsyncMock, side_effect=httpx.ConnectError("refused")):
-        with patch.object(client._ollama, "generate_intervention_plan", AsyncMock(return_value=build_fallback_plan(ctx))) as ollama_mock:
-            plan = await client.generate_intervention_plan(ctx, state)
-    assert plan.level == "overlay_only"
-    ollama_mock.assert_awaited()
-
-
-@pytest.mark.asyncio
-async def test_azure_health_check_success():
-    client = _make_azure_client()
-    mock_response = httpx.Response(200, json={"data": []})
-    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=mock_response):
-        assert await client.health_check() is True
-
-
-@pytest.mark.asyncio
-async def test_azure_payload_includes_json_response_format():
-    """Azure API payload must include response_format for structured JSON output."""
-    client = _make_azure_client()
-    ctx = _make_context()
-    state = _make_state()
-    api_response = {"choices": [{"message": {"content": VALID_PLAN_JSON}}]}
-    mock_resp = _mock_response(200, api_response)
-    with patch("httpx.AsyncClient.post", new_callable=AsyncMock, return_value=mock_resp) as post_mock:
-        await client.generate_intervention_plan(ctx, state)
-    sent_payload = post_mock.await_args.kwargs["json"]
-    assert "response_format" in sent_payload
-    assert sent_payload["response_format"] == {"type": "json_object"}
-
-
-def test_azure_uses_keychain_when_api_key_missing():
-    config = LLMConfig(mode="azure")
-    config.azure.endpoint = "https://example-resource.openai.azure.com/"
-    config.azure.deployment_name = "gpt-5-mini"
-    with patch("cortex.services.llm_engine.azure_openai.get_keychain_password", return_value="from-keychain"):
-        client = AzureOpenAIClient(config=config)
-        assert client._api_key == "from-keychain"
+# Transport-specific tests for the Bedrock-backed AnthropicPlanner live in
+# ``tests/unit/test_anthropic_planner.py``. All Azure/Qwen/Ollama clients
+# were removed in v0.2.0 — see CHANGELOG and the LLM engine refactor.
 
 
 # ===========================================================================
@@ -787,7 +509,12 @@ class TestImports(unittest.TestCase):
     """Verify all public exports are importable."""
 
     def test_import_client(self):
-        from cortex.services.llm_engine import LLMClient, LLMError, RuleBasedLLMClient, build_fallback_plan
+        from cortex.services.llm_engine import (
+            LLMClient,
+            LLMError,
+            RuleBasedLLMClient,
+            build_fallback_plan,
+        )
 
         assert LLMClient is not None
         assert LLMError is not None
@@ -824,12 +551,11 @@ class TestImports(unittest.TestCase):
         from cortex.services.llm_engine import LLMCache
         assert LLMCache is not None
 
-    def test_import_clients(self):
-        from cortex.services.llm_engine import AzureOpenAIClient, LocalOllamaClient, RemoteQwenClient
+    def test_import_anthropic_planner(self):
+        from cortex.services.llm_engine import AnthropicPlanner, create_llm_client
 
-        assert RemoteQwenClient is not None
-        assert LocalOllamaClient is not None
-        assert AzureOpenAIClient is not None
+        assert AnthropicPlanner is not None
+        assert callable(create_llm_client)
 
 
 if __name__ == "__main__":

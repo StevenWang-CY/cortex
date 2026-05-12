@@ -185,6 +185,38 @@ export class CortexWSClient {
         });
     }
 
+    /**
+     * Notify the daemon that an intervention was applied (or restored).
+     *
+     * B.2: the daemon's in-process executor runs an
+     * ``_OptimisticInterventionAdapter`` that assumes success for every
+     * action; the real workspace effects happen here in the VS Code
+     * extension (folds) and in the browser extension (tabs, overlay).
+     * The ack lets the daemon overwrite ``Mutation.success`` with the
+     * actual client outcome, so ``InterventionOutcome.workspace_restored``
+     * is truthful instead of theatrical.
+     */
+    sendInterventionApplied(
+        interventionId: string,
+        phase: "apply" | "restore",
+        success: boolean,
+        appliedActions: string[],
+        errors: string[],
+    ): void {
+        this._send({
+            type: "INTERVENTION_APPLIED",
+            payload: {
+                intervention_id: interventionId,
+                phase,
+                success,
+                applied_actions: appliedActions,
+                errors,
+            },
+            timestamp: Date.now() / 1000,
+            sequence: ++this._sequence,
+        });
+    }
+
     // --- Internal ---
 
     private _send(msg: WSMessage): void {

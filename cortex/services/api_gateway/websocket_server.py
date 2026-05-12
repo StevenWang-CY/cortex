@@ -27,6 +27,22 @@ from cortex.libs.schemas.state import StateEstimate
 logger = logging.getLogger(__name__)
 
 
+def _serialize_timestamp(ts: Any) -> Any:
+    """``StateEstimate.timestamp`` is typed loosely (float monotonic or
+    datetime depending on producer). Return an ISO string for datetimes
+    and the raw value for everything else so JSON serialisation works
+    consistently across both shapes."""
+    if ts is None:
+        return None
+    iso = getattr(ts, "isoformat", None)
+    if callable(iso):
+        try:
+            return iso()
+        except Exception:
+            pass
+    return ts
+
+
 @dataclass
 class WebSocketClient:
     """Represents a connected WebSocket client."""
@@ -105,6 +121,7 @@ class WebSocketServer:
         self._activity_sync_callback: Any = None
         self._tab_relevance_feedback_callback: Any = None
         self._leetcode_context_callback: Any = None
+        self._intervention_applied_callback: Any = None
 
         # Latest state for new connections
         self._latest_state: StateEstimate | None = None
@@ -145,6 +162,18 @@ class WebSocketServer:
     def set_leetcode_context_callback(self, callback: Any) -> None:
         """Set callback for LEETCODE_CONTEXT_UPDATE messages from browser extension."""
         self._leetcode_context_callback = callback
+
+    def set_intervention_applied_callback(self, callback: Any) -> None:
+        """Set callback for ``INTERVENTION_APPLIED`` ack messages.
+
+        Clients send this after attempting to apply or restore an
+        intervention, with ``{intervention_id, success, applied_actions,
+        errors, phase: "apply"|"restore"}``. The daemon uses the ack to
+        replace its optimistic mutation tracking with extension-confirmed
+        state, so ``InterventionOutcome.workspace_restored`` reflects the
+        real world rather than the assumed default.
+        """
+        self._intervention_applied_callback = callback
 
     async def start(self) -> bool:
         """
@@ -256,6 +285,8 @@ class WebSocketServer:
             await self._handle_tab_relevance_feedback(client, msg)
         elif msg.type == "LEETCODE_CONTEXT_UPDATE":
             await self._handle_leetcode_context_update(client, msg)
+        elif msg.type == "INTERVENTION_APPLIED":
+            await self._handle_intervention_applied(client, msg)
         elif msg.type == "SHUTDOWN":
             logger.info("Shutdown requested via WebSocket from %s", client.client_id)
             if self._shutdown_callback is not None:
@@ -351,6 +382,42 @@ class WebSocketServer:
                 callback(msg.payload)
         except Exception as exc:
             logger.error("LeetCode context callback error from %s: %s", client.client_id, exc)
+
+    async def _handle_intervention_applied(
+        self, client: WebSocketClient, msg: WSMessage,
+    ) -> None:
+        """Forward an extension-side INTERVENTION_APPLIED ack to the daemon.
+
+        Payload shape::
+
+            {
+                "intervention_id": str,
+                "phase": "apply" | "restore",
+                "success": bool,
+                "applied_actions": list[str],
+                "errors": list[str],
+            }
+
+        The daemon uses this to overwrite the optimistic ``Mutation.success``
+        from ``_OptimisticInterventionAdapter`` with the actual extension
+        result, so ``InterventionOutcome.workspace_restored`` is truthful.
+        """
+        callback = self._intervention_applied_callback
+        if callback is None:
+            return
+        try:
+            payload = dict(msg.payload or {})
+            payload.setdefault("source_client_type", client.client_type)
+            if asyncio.iscoroutinefunction(callback):
+                await callback(payload)
+            else:
+                callback(payload)
+        except Exception as exc:
+            logger.error(
+                "intervention_applied callback error from %s: %s",
+                client.client_id,
+                exc,
+            )
 
     async def broadcast_state(
         self,
@@ -459,7 +526,7 @@ class WebSocketServer:
         try:
             await target.websocket.send(message.to_json())
             return await asyncio.wait_for(future, timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._pending_context_requests.pop(correlation_id, None)
             logger.debug("Context request to %s timed out", client_type)
             return {}
@@ -498,7 +565,14 @@ class WebSocketServer:
         estimate: StateEstimate,
         biometrics: dict[str, float | None] | None = None,
     ) -> WSMessage:
-        """Create a STATE_UPDATE message."""
+        """Create a STATE_UPDATE message.
+
+        Surfaces every v0.2.0 transparency field consumers may want to
+        display: ``stress_integral`` for break-readiness UI,
+        ``calibrated_probabilities`` for confidence bars,
+        ``classifier_source``/``classifier_alpha`` for debug overlays,
+        and ``timestamp`` so clients can detect stale broadcasts.
+        """
         self._sequence += 1
         payload: dict[str, Any] = {
             "state": estimate.state,
@@ -517,6 +591,11 @@ class WebSocketServer:
             },
             "dwell_seconds": estimate.dwell_seconds,
             "reasons": estimate.reasons,
+            "stress_integral": estimate.stress_integral,
+            "calibrated_probabilities": estimate.calibrated_probabilities,
+            "classifier_source": estimate.classifier_source,
+            "classifier_alpha": estimate.classifier_alpha,
+            "timestamp": _serialize_timestamp(estimate.timestamp),
         }
         if biometrics:
             payload["biometrics"] = biometrics
@@ -530,7 +609,13 @@ class WebSocketServer:
     def _make_intervention_trigger(
         self, plan: InterventionPlan,
     ) -> WSMessage:
-        """Create an INTERVENTION_TRIGGER message."""
+        """Create an INTERVENTION_TRIGGER message.
+
+        Surfaces ``causal_explanation`` (so the VS Code "Why this?" panel
+        and the popup transparency section can render the grounded
+        rationale), ``consent_level`` (the consent gate that produced this
+        plan), and ``plan_warnings`` (degradations the planner applied).
+        """
         self._sequence += 1
         payload: dict[str, Any] = {
             "intervention_id": plan.intervention_id,
@@ -543,6 +628,9 @@ class WebSocketServer:
             "ui_plan": plan.ui_plan.model_dump(),
             "tone": plan.tone,
             "suggested_actions": [a.model_dump() for a in plan.suggested_actions],
+            "causal_explanation": getattr(plan, "causal_explanation", None),
+            "consent_level": getattr(plan, "consent_level", None),
+            "plan_warnings": getattr(plan, "plan_warnings", None) or [],
         }
         if plan.error_analysis is not None:
             payload["error_analysis"] = plan.error_analysis.model_dump()

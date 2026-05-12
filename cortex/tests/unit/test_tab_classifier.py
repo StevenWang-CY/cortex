@@ -5,12 +5,9 @@ prompt template fix (2B-3), and blocklist additions (2B-4).
 
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from cortex.services.context_engine.tab_classifier import classify_tab
-
 
 # =========================================================================
 # 2B-1: Tab classifier — known domains classified correctly
@@ -107,8 +104,13 @@ class TestTabClassifier:
 # 2B-2: Parser enforcement — AI assistant and documentation tabs
 # =========================================================================
 
-from cortex.libs.schemas.context import BrowserContext, EditorContext, TabInfo, TaskContext
-from cortex.libs.schemas.intervention import InterventionPlan, TabRecommendation, TabRecommendations, UIPlan
+from cortex.libs.schemas.context import BrowserContext, TabInfo, TaskContext
+from cortex.libs.schemas.intervention import (
+    InterventionPlan,
+    TabRecommendation,
+    TabRecommendations,
+    UIPlan,
+)
 from cortex.services.llm_engine.parser import enrich_plan_with_context
 
 
@@ -225,6 +227,7 @@ class TestParserTabEnforcement:
         # This test verifies that the parser doesn't import or check for
         # specific ChatGPT URLs — it relies on the classifier
         import inspect
+
         from cortex.services.llm_engine import parser
         source = inspect.getsource(parser.enrich_plan_with_context)
         assert "chatgpt" not in source.lower()
@@ -306,9 +309,9 @@ class TestBlocklist:
 # 2B-5: Same-category tab switching discount in rule_scorer
 # =========================================================================
 
-from cortex.services.state_engine.rule_scorer import RuleScorer
-from cortex.libs.schemas.state import UserBaselines
 from cortex.libs.schemas.features import FeatureVector
+from cortex.libs.schemas.state import UserBaselines
+from cortex.services.state_engine.rule_scorer import RuleScorer
 
 
 class TestSameCategoryDiscount:

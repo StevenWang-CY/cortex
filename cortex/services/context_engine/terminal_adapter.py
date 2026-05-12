@@ -128,7 +128,7 @@ class TerminalAdapter:
         Returns condensed error messages (not full stack traces).
         """
         errors: list[str] = []
-        full_text = "\n".join(lines)
+        "\n".join(lines)
 
         # Detect multi-line error blocks (e.g., Python tracebacks)
         traceback_blocks = self._extract_python_tracebacks(lines)

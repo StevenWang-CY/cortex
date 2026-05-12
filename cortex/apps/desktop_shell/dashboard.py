@@ -12,7 +12,7 @@ import collections
 import logging
 import time
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 
 try:
     from PySide6.QtCore import QRectF
@@ -190,6 +190,14 @@ QTabBar::tab:hover:!selected {{
 class _ConsumerTab(QWidget):
     """Clean biometrics dashboard matching the browser extension popup."""
 
+    # E.1: surface user intent for the daemon orchestrator. The shell
+    # only owns the widgets; the parent dashboard re-emits these signals
+    # so the desktop app (in-process or WebSocket mode) can route them
+    # to ``RuntimeDaemon._handle_user_action`` (goal_set) and to
+    # ``_shutdown_daemon`` (stop_requested).
+    stop_requested = Signal()
+    goal_set = Signal(str)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setStyleSheet(f"background: {CX_BG};")
@@ -257,6 +265,11 @@ class _ConsumerTab(QWidget):
                 color: {CX_TEXT_TERTIARY};
             }}
         """)
+        # E.1: emit goal_set when the user hits return (the daemon
+        # forwards it through USER_ACTION{action: "set_goal"}).
+        self._goal_input.returnPressed.connect(
+            lambda: self.goal_set.emit(self._goal_input.text().strip())
+        )
         root.addWidget(self._goal_input)
         root.addSpacing(SP5)
 
@@ -421,6 +434,10 @@ class _ConsumerTab(QWidget):
                 background: rgba(217, 87, 87, 0.10);
             }}
         """)
+        # E.1: emit stop_requested so the parent dashboard can re-emit
+        # and the app-level handler can call _shutdown_daemon. Previously
+        # the button had no handler — clicking it did nothing.
+        self._stop_btn.clicked.connect(self.stop_requested.emit)
         root.addWidget(self._stop_btn)
 
     # -- Public update methods ------------------------------------------------
@@ -762,6 +779,12 @@ class _AdvancedTab(QWidget):
 class DashboardWindow(QWidget):
     """Two-tab dashboard: consumer view + advanced debug view."""
 
+    # E.1: re-emit user-intent signals from the consumer tab so the
+    # app-level orchestrator can wire them once at construction time
+    # without reaching into widget internals.
+    stop_requested = Signal()
+    goal_set = Signal(str)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         # Backward-compatible test-facing fields.
@@ -783,6 +806,10 @@ class DashboardWindow(QWidget):
         self._tabs.addTab(self._consumer, "Dashboard")
         self._tabs.addTab(self._advanced, "Advanced")
         layout.addWidget(self._tabs)
+
+        # E.1: forward consumer-tab signals to outer subscribers.
+        self._consumer.stop_requested.connect(self.stop_requested.emit)
+        self._consumer.goal_set.connect(self.goal_set.emit)
 
     def update_state(self, payload: dict) -> None:
         self._consumer.update_state(payload)

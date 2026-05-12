@@ -11,7 +11,7 @@ Default configuration: 10-second window at 30 FPS (300 frames) with
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray

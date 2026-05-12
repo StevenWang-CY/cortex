@@ -557,6 +557,9 @@ def build_messages(
     """
     Build the full message list for the OpenAI-compatible chat API.
 
+    Kept for backwards compatibility with parser tests; the Anthropic
+    production path uses :func:`build_anthropic_messages` below.
+
     Returns:
         List of {"role": ..., "content": ...} dicts.
     """
@@ -571,6 +574,71 @@ def build_messages(
 
     messages = _enforce_token_budget(messages, max_context_tokens=max_context_tokens)
     return messages
+
+
+def build_anthropic_messages(
+    context: TaskContext,
+    state: StateEstimate,
+    constraints: SimplificationConstraints | None = None,
+    *,
+    template_name: str | None = None,
+    extra_context: str = "",
+    max_context_tokens: int = 180_000,
+) -> tuple[list[dict], list[dict]]:
+    """Build (system_blocks, user_messages) for ``AsyncAnthropic.messages.create``.
+
+    The Anthropic Messages API takes the system prompt as a separate
+    parameter (a list of content blocks), not as a message. Cache control
+    is applied to the system prompt so subsequent calls within ~5 min
+    reuse it at 10% cost.
+
+    Args:
+        context, state, constraints, template_name, extra_context:
+            Same semantics as :func:`build_user_prompt`.
+        max_context_tokens: Effective context window (default 180k —
+            within the 200k headroom of Claude 4.x).
+
+    Returns:
+        ``(system_blocks, messages)`` where ``system_blocks`` is a list
+        suitable for the ``system=`` parameter and ``messages`` is the
+        list passed as ``messages=``.
+    """
+    user_prompt = build_user_prompt(
+        context,
+        state,
+        constraints,
+        template_name=template_name,
+        extra_context=extra_context,
+    )
+
+    # Re-use the OpenAI-style enforcement (it only touches the user
+    # message) to keep the truncation logic in a single place.
+    enforced = _enforce_token_budget(
+        [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        max_context_tokens=max_context_tokens,
+    )
+    enforced_user = enforced[1]["content"]
+
+    system_blocks: list[dict] = [
+        {
+            "type": "text",
+            "text": SYSTEM_PROMPT,
+            # Ephemeral cache: ~5 min reuse window in the Anthropic API.
+            # Saves ~90% on the 3-4k-token system prompt for back-to-back
+            # interventions.
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+    messages: list[dict] = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": enforced_user}],
+        }
+    ]
+    return system_blocks, messages
 
 
 # ---------------------------------------------------------------------------

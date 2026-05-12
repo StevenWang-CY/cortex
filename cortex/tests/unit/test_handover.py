@@ -1,13 +1,14 @@
 """Tests for Handover — ShutdownDetector, HandoverSnapshot, MorningBriefing."""
-import pytest
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
-from datetime import datetime
 
+import pytest
+
+from cortex.services.handover.briefing import BriefingContent, MorningBriefing
 from cortex.services.handover.detector import ShutdownDetector
 from cortex.services.handover.snapshot import HandoverSnapshot
-from cortex.services.handover.briefing import MorningBriefing, BriefingContent
 
 
 class TestShutdownDetector:
@@ -46,7 +47,6 @@ class TestShutdownDetector:
 
     def test_default_late_hour_from_config(self):
         """Default late_hour should be 23 from HandoverConfig."""
-        from cortex.libs.config.settings import HandoverConfig
         detector = ShutdownDetector()
         assert detector._late_hour == 23
 

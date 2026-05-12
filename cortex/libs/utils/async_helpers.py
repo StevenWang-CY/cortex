@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import signal
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Callable, Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 T = TypeVar("T")
 
@@ -63,7 +64,7 @@ class AsyncQueue(Generic[T]):
         """
         try:
             return await asyncio.wait_for(self._queue.get(), timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return None
 
     def qsize(self) -> int:
@@ -108,7 +109,7 @@ class AsyncQueue(Generic[T]):
             try:
                 item = await asyncio.wait_for(self._queue.get(), timeout=0.1)
                 yield item
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
             except asyncio.CancelledError:
                 break
@@ -132,7 +133,7 @@ async def with_timeout(
     """
     try:
         return await asyncio.wait_for(coro, timeout=timeout)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return default
 
 
@@ -230,7 +231,7 @@ class GracefulShutdown:
         """Handle shutdown signals."""
         self.request_exit()
 
-    async def __aenter__(self) -> "GracefulShutdown":
+    async def __aenter__(self) -> GracefulShutdown:
         """Set up signal handlers."""
         loop = asyncio.get_running_loop()
 

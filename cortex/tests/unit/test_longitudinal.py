@@ -1,6 +1,8 @@
 """Tests for LongitudinalTracker — multi-day baseline drift detection."""
-import pytest
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
 from cortex.services.state_engine.longitudinal import LongitudinalTracker
 
 

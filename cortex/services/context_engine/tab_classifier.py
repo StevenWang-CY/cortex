@@ -11,8 +11,6 @@ should import ``classify_tab`` rather than implementing their own URL logic.
 from __future__ import annotations
 
 import re
-from urllib.parse import urlparse
-
 
 # ---------------------------------------------------------------------------
 # Domain pattern registries  (order matters — first match wins)

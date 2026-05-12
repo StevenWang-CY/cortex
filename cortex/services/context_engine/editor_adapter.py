@@ -103,7 +103,7 @@ class EditorAdapter:
                 self._available = bool(ctx.file_path)
                 self._last_context = ctx if self._available else None
                 return self._last_context
-            except (asyncio.TimeoutError, ConnectionError, OSError) as e:
+            except (TimeoutError, ConnectionError, OSError) as e:
                 logger.debug(f"Editor adapter unavailable: {e}")
                 self._available = False
                 return None
@@ -139,7 +139,7 @@ class EditorAdapter:
             self._last_context = ctx
             return ctx
 
-        except (asyncio.TimeoutError, ConnectionError, OSError) as e:
+        except (TimeoutError, ConnectionError, OSError) as e:
             logger.debug(f"Editor adapter unavailable: {e}")
             self._available = False
             return None

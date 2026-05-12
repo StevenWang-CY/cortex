@@ -116,6 +116,9 @@ class ScoreSmoother:
         raw_scores: StateScores,
         signal_quality: SignalQuality,
         timestamp: float | None = None,
+        *,
+        ml_p_hyper: float | None = None,
+        ml_alpha: float = 0.0,
     ) -> StateEstimate:
         """
         Update smoothed scores and produce a StateEstimate.
@@ -124,6 +127,13 @@ class ScoreSmoother:
             raw_scores: Raw state scores from the rule scorer.
             signal_quality: Per-channel signal quality.
             timestamp: Current time. Defaults to now.
+            ml_p_hyper: Optional probability of HYPER from the per-user
+                logistic classifier (C.2). Blended into the smoothed
+                hyper score using ``ml_alpha``.
+            ml_alpha: Blend weight in ``[0, 1]``. ``0`` keeps the rule
+                output; ``1`` replaces it entirely. The daemon ramps this
+                with training-data volume (see ``StateConfig.ml_alpha_max``
+                and ``ml_alpha_full_at_episodes``).
 
         Returns:
             StateEstimate with smoothed state, confidence, and reasons.
@@ -139,6 +149,17 @@ class ScoreSmoother:
         self._smoothed.hypo = self._ema(self._smoothed.hypo, raw_scores.hypo)
         self._smoothed.hyper = self._ema(self._smoothed.hyper, raw_scores.hyper)
         self._smoothed.recovery = self._ema(self._smoothed.recovery, raw_scores.recovery)
+
+        # C.2: blend per-user ML classifier into the HYPER channel.
+        blended_classifier_source = "rule"
+        blended_alpha = 0.0
+        if ml_p_hyper is not None and 0.0 < ml_alpha <= 1.0:
+            blended_alpha = float(max(0.0, min(1.0, ml_alpha)))
+            self._smoothed.hyper = (
+                self._smoothed.hyper * (1.0 - blended_alpha)
+                + float(ml_p_hyper) * blended_alpha
+            )
+            blended_classifier_source = "ensemble"
 
         # Determine dominant state from raw smoothed scores for hysteresis.
         # Probabilities are used for confidence reporting, not entry gating.
@@ -172,19 +193,30 @@ class ScoreSmoother:
             self._state_entered_at = now
             self._dwell_seconds = 0.0
 
-        # Build estimate
+        # C.1: confidence is the raw smoothed dominant score, not a
+        # softmax probability. Softmax over 4 saturated [0,1] scores caps
+        # at ~0.475, making the spec's 0.85 gate mathematically unreachable
+        # and silently suppressing triggers.
+        #
+        # ``calibrated_probabilities`` is still populated so the dashboard
+        # transparency UI can render proportional bars — but the trigger
+        # policy and any UI threshold compare against the raw confidence.
+        smoothed_state_scores = self._smoothed.to_state_scores()
+        confidence_raw = float(
+            getattr(smoothed_state_scores, self._current_state.value.lower())
+        )
         estimate = StateEstimate(
             state=self._current_state.value,
-            confidence=probs[self._current_state],
-            scores=self._smoothed.to_state_scores(),
+            confidence=confidence_raw,
+            scores=smoothed_state_scores,
             calibrated_probabilities=StateScores(
                 flow=probs[UserState.FLOW],
                 hypo=probs[UserState.HYPO],
                 hyper=probs[UserState.HYPER],
                 recovery=probs[UserState.RECOVERY],
             ),
-            classifier_source="rule",
-            classifier_alpha=0.0,
+            classifier_source=blended_classifier_source,
+            classifier_alpha=blended_alpha,
             reasons=self._generate_reasons(),
             signal_quality=signal_quality,
             timestamp=now,

@@ -14,8 +14,6 @@ Covers mode resolution from generic StateEstimate + biological detector outputs:
 
 from __future__ import annotations
 
-import pytest
-
 from cortex.libs.schemas.leetcode import (
     DestructiveStruggleEstimate,
     LeetCodeContext,
@@ -24,7 +22,6 @@ from cortex.libs.schemas.leetcode import (
 )
 from cortex.libs.schemas.state import SignalQuality, StateEstimate, StateScores
 from cortex.services.state_engine.leetcode_mode_resolver import LeetCodeModeResolver
-
 
 # ---------------------------------------------------------------------------
 # Helpers

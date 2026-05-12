@@ -17,9 +17,9 @@ def replay_policy_log(storage_root: str, day: str) -> dict[str, Any]:
     """
     path = Path(storage_root) / "policy_log" / f"{day}.jsonl"
     if not path.exists():
-        return {"day": day, "decisions": 0, "rewards": 0, "by_arm": {arm: 0 for arm in ARMS}}
+        return {"day": day, "decisions": 0, "rewards": 0, "by_arm": dict.fromkeys(ARMS, 0)}
 
-    by_arm = {arm: 0 for arm in ARMS}
+    by_arm = dict.fromkeys(ARMS, 0)
     reward_total = 0.0
     reward_count = 0
     decisions = 0

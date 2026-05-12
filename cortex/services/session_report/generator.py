@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import uuid
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from cortex.services.session_report.models import (
     ActivitySummary,
@@ -53,7 +53,7 @@ class SessionReportGenerator:
 
     def start(self) -> None:
         """Mark session start."""
-        self._start_time = datetime.now(timezone.utc)
+        self._start_time = datetime.now(UTC)
 
     def record_state(self, state: str, timestamp: float) -> None:
         """Record a state transition."""
@@ -71,7 +71,7 @@ class SessionReportGenerator:
             self._state_transitions.append(StateTransition(
                 from_state=self._current_state,
                 to_state=state,
-                timestamp=datetime.fromtimestamp(now, tz=timezone.utc),
+                timestamp=datetime.fromtimestamp(now, tz=UTC),
             ))
 
         # Track flow streaks
@@ -133,7 +133,7 @@ class SessionReportGenerator:
         import time as _time
 
         end_ts = end_timestamp if end_timestamp is not None else _time.time()
-        end_time = datetime.fromtimestamp(end_ts, tz=timezone.utc)
+        end_time = datetime.fromtimestamp(end_ts, tz=UTC)
         start = self._start_time or end_time
 
         duration = (end_time - start).total_seconds()

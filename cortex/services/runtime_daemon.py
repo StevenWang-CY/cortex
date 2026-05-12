@@ -27,61 +27,86 @@ from cortex.libs.schemas.features import KinematicFeatures, PhysioFeatures
 from cortex.libs.schemas.intervention import InterventionPlan
 from cortex.libs.schemas.leetcode import LeetCodeContext
 from cortex.libs.schemas.state import UserBaselines
+
+# v2.0 imports
+from cortex.libs.store import InMemoryStore, RedisStore
+from cortex.libs.utils import receptivity
+from cortex.services.activity_tracker.aggregator import ActivityAggregator
 from cortex.services.api_gateway.app import create_app, registry
 from cortex.services.api_gateway.websocket_server import WebSocketServer
 from cortex.services.capture_service.pipeline import CapturePipeline, PipelineOutput
-from cortex.services.context_engine import BrowserAdapter, ContextAssembler, EditorAdapter, TerminalAdapter
+from cortex.services.consent.ladder import ConsentLadder
+from cortex.services.consent.policy import ConsentPolicy
+from cortex.services.context_engine import (
+    BrowserAdapter,
+    ContextAssembler,
+    EditorAdapter,
+    TerminalAdapter,
+)
+from cortex.services.eval.amip import AMIPPolicy
+from cortex.services.eval.bandit import ContextualBandit
+from cortex.services.eval.causal_report import generate_daily_causal_report
+from cortex.services.eval.helpfulness import HelpfulnessTracker
+from cortex.services.eval.tab_relevance import TabRelevanceTracker
+from cortex.services.handover.briefing import MorningBriefing
+from cortex.services.handover.detector import ShutdownDetector
+from cortex.services.handover.snapshot import HandoverSnapshot
 from cortex.services.intervention_engine.executor import InterventionExecutor
 from cortex.services.intervention_engine.leetcode_interventions import InterventionMatrix
 from cortex.services.intervention_engine.planner import prepare_plan
 from cortex.services.intervention_engine.restore import RestoreManager
 from cortex.services.intervention_engine.snapshot import capture_snapshot
+from cortex.services.janitor.retention import sweep_once as run_retention_sweep
 from cortex.services.kinematics_engine.blink_detector import BlinkDetector
 from cortex.services.kinematics_engine.head_pose import HeadPoseEstimator
 from cortex.services.kinematics_engine.posture import PostureAnalyzer
+from cortex.services.launcher.launcher import ProjectLauncher
 from cortex.services.llm_engine import create_llm_client
 from cortex.services.llm_engine.parser import enrich_plan_with_context
-from cortex.services.launcher.launcher import ProjectLauncher
 from cortex.services.physio_engine.pulse_estimator import PulseEstimator
 from cortex.services.physio_engine.roi_extractor import RoiExtractor
 from cortex.services.physio_engine.rppg import extract_bvp
+from cortex.services.session_report.generator import SessionReportGenerator
 from cortex.services.state_engine import FeatureFusion, RuleScorer, ScoreSmoother
 from cortex.services.state_engine.amygdala_hijack import AmygdalaHijackDetector
 from cortex.services.state_engine.destructive_struggle import DestructiveStruggleDetector
 from cortex.services.state_engine.leetcode_mode_resolver import LeetCodeModeResolver
+from cortex.services.state_engine.longitudinal import LongitudinalTracker
+from cortex.services.state_engine.ml_classifier import PerUserLogisticClassifier
 from cortex.services.state_engine.parasympathetic_rebound import ParasympatheticReboundDetector
+from cortex.services.state_engine.rabbit_hole import RabbitHoleDetector
+from cortex.services.state_engine.stress_integral import StressIntegralTracker
 from cortex.services.state_engine.trigger_policy import TriggerPolicy
+from cortex.services.state_engine.zombie_detector import ZombieReadingDetector
 from cortex.services.telemetry_engine.feature_aggregator import FeatureAggregator
 from cortex.services.telemetry_engine.input_hooks import InputHooks
 from cortex.services.telemetry_engine.window_tracker import WindowTracker
-
-# v2.0 imports
-from cortex.libs.store import RedisStore, InMemoryStore
-from cortex.services.consent.ladder import ConsentLadder
-from cortex.services.consent.policy import ConsentPolicy
-from cortex.services.eval.bandit import ContextualBandit
-from cortex.services.eval.amip import AMIPPolicy
-from cortex.services.eval.helpfulness import HelpfulnessTracker
-from cortex.services.eval.tab_relevance import TabRelevanceTracker
-from cortex.services.eval.causal_report import generate_daily_causal_report
-from cortex.services.handover.briefing import MorningBriefing
-from cortex.services.handover.detector import ShutdownDetector
-from cortex.services.handover.snapshot import HandoverSnapshot
-from cortex.services.activity_tracker.aggregator import ActivityAggregator
-from cortex.services.state_engine.longitudinal import LongitudinalTracker
-from cortex.services.state_engine.rabbit_hole import RabbitHoleDetector
-from cortex.services.state_engine.stress_integral import StressIntegralTracker
-from cortex.services.state_engine.zombie_detector import ZombieReadingDetector
 from cortex.services.throttle.copilot_throttle import CopilotThrottle
 
 logger = logging.getLogger(__name__)
 
 
-class _PassiveWorkspaceAdapter:
-    """Non-destructive adapter used for mutation tracking and API compatibility."""
+class _OptimisticInterventionAdapter:
+    """Optimistic in-process adapter.
+
+    Real workspace effects (DOM, fold ranges, overlay) are performed by the
+    Chrome / VS Code / desktop-shell clients in response to the
+    ``INTERVENTION_TRIGGER`` WebSocket broadcast. The daemon does not own
+    a direct path to those surfaces, so its in-process executor records
+    every dispatched mutation optimistically (success = True) and waits
+    for an ``INTERVENTION_APPLIED`` ack from the client to overwrite
+    ``Mutation.success`` and ``Mutation.error`` with the real outcome.
+
+    See ``_handle_intervention_applied`` for the ack handler.
+    """
 
     async def execute(self, action: str, params: dict[str, Any]) -> bool:
         return True
+
+
+# Backwards-compatible alias for older tests/imports that referenced the
+# previous adapter name.
+_PassiveWorkspaceAdapter = _OptimisticInterventionAdapter
 
 
 class SessionRecorder:
@@ -154,7 +179,37 @@ class CortexDaemon:
         self._feature_fusion = FeatureFusion()
         self._scorer = RuleScorer(config=self.config.state, baselines=self._load_baselines())
         self._smoother = ScoreSmoother(self.config.state)
-        self._trigger_policy = TriggerPolicy(self.config.intervention)
+
+        # C.2: optional per-user ML classifier. If a previously-trained
+        # model file exists in storage/baselines/classifier.json AND
+        # ml_enabled is set, load it and blend its HYPER probability into
+        # the smoothed score (see ScoreSmoother.update + state_loop below).
+        self._ml_classifier: PerUserLogisticClassifier | None = None
+        if self.config.state.ml_enabled:
+            classifier_path = (
+                Path(self.config.storage.path).expanduser()
+                / "baselines"
+                / "classifier.json"
+            )
+            try:
+                if classifier_path.exists():
+                    self._ml_classifier = PerUserLogisticClassifier.load(classifier_path)
+                    logger.info(
+                        "Loaded per-user ML classifier from %s (fitted=%s)",
+                        classifier_path,
+                        self._ml_classifier.is_fitted,
+                    )
+            except Exception:
+                logger.warning(
+                    "Failed to load ML classifier; falling back to rule-only",
+                    exc_info=True,
+                )
+                self._ml_classifier = None
+        self._ml_labeled_episodes: int = 0  # incremented by feedback ingest
+        self._trigger_policy = TriggerPolicy(
+            self.config.intervention,
+            state_config=self.config.state,
+        )
         self._llm_client = create_llm_client(self.config.llm)
         self._executor = InterventionExecutor()
         self._project_launcher = ProjectLauncher(storage_path=self.config.storage.path)
@@ -170,6 +225,7 @@ class CortexDaemon:
         self._ws_server.set_settings_callback(self.apply_settings)
         self._ws_server.set_shutdown_callback(self._request_shutdown)
         self._ws_server.set_leetcode_context_callback(self._handle_leetcode_context_update)
+        self._ws_server.set_intervention_applied_callback(self._handle_intervention_applied)
 
         self._leetcode_adapter = LeetCodeAdapter()
         self._leetcode_adapter.set_ws_sender(self._send_leetcode_ws_message)
@@ -243,10 +299,32 @@ class CortexDaemon:
         else:
             self._store = InMemoryStore()
 
-        # Stress integral tracker (biological pomodoros)
+        # Stress integral tracker (biological pomodoros). The standardized
+        # deficit math requires the user-specific HRV sigma so the integral
+        # is in z-score units, not raw ms·s. Without sigma the AMIP safety
+        # floor (keyed off stress_ratio ≥ 1.0) effectively never tripped.
+        _baselines_for_stress = self._load_baselines()
+        _hrv_sigma = 1.0
+        try:
+            _hrv_sigma = float(
+                _baselines_for_stress.metric_distributions.get(
+                    "hrv_rmssd", {}
+                ).get("std", 1.0)
+            )
+        except Exception:
+            _hrv_sigma = 1.0
         self._stress_tracker = StressIntegralTracker(
-            hrv_baseline=self._load_baselines().hrv_baseline,
+            hrv_baseline=_baselines_for_stress.hrv_baseline,
+            hrv_sigma=max(1.0, _hrv_sigma),
         )
+
+        # Cache the most recent state estimate + biometric payload for the
+        # dedicated 500ms broadcast loop. The pipeline loop writes; the
+        # broadcast loop reads — single-producer/single-consumer dict, no
+        # lock required (Python GIL guarantees pointer-replacement atomicity).
+        self._latest_estimate: Any = None
+        self._latest_biometrics: dict[str, Any] | None = None
+        self._broadcast_interval_seconds: float = 0.5
 
         # Longitudinal tracker (baseline drift)
         self._longitudinal = LongitudinalTracker(store=self._store)
@@ -299,6 +377,13 @@ class CortexDaemon:
         # Track previous state for copilot throttle transitions
         self._prev_state: str = "FLOW"
 
+        # G.1: live session debrief generator. start() initialises the
+        # session; record_state / record_hr / record_hrv are called from
+        # _state_loop; finish() runs in stop() and the report is written
+        # to storage/sessions/session_<id>.json (+ markdown if enabled).
+        self._session_report = SessionReportGenerator()
+        self._session_report_started = False
+
     def set_state_callback(self, fn: Callable[[dict], None]) -> None:
         """Register a callback invoked on every state update.
 
@@ -339,6 +424,7 @@ class CortexDaemon:
             asyncio.create_task(self._capture_loop(), name="cortex-capture-loop"),
             asyncio.create_task(self._telemetry_loop(), name="cortex-telemetry-loop"),
             asyncio.create_task(self._state_loop(), name="cortex-state-loop"),
+            asyncio.create_task(self._broadcast_loop(), name="cortex-broadcast-loop"),
             asyncio.create_task(self._context_loop(), name="cortex-context-loop"),
             asyncio.create_task(self._longitudinal_loop(), name="cortex-longitudinal-loop"),
         ]
@@ -346,6 +432,10 @@ class CortexDaemon:
             self._tasks.append(
                 asyncio.create_task(self._causal_report_loop(), name="cortex-causal-report-loop")
             )
+        # G.2: daily retention sweep so storage doesn't grow forever.
+        self._tasks.append(
+            asyncio.create_task(self._retention_sweep_loop(), name="cortex-retention-loop")
+        )
 
         # v2.0: Check for morning briefing on startup
         await self._check_morning_briefing()
@@ -355,7 +445,8 @@ class CortexDaemon:
 
     def _request_shutdown(self) -> None:
         """Request process shutdown via SIGTERM (triggers full graceful stop chain)."""
-        import os, signal as _signal
+        import os
+        import signal as _signal
         logger.info("Shutdown requested via WebSocket")
         try:
             loop = asyncio.get_running_loop()
@@ -378,7 +469,7 @@ class CortexDaemon:
         if self._api_task is not None:
             try:
                 await asyncio.wait_for(self._api_task, timeout=5.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 self._api_task.cancel()
                 await asyncio.gather(self._api_task, return_exceptions=True)
             except Exception:
@@ -393,6 +484,24 @@ class CortexDaemon:
             pass
         self._input_hooks.stop()
         self._window_tracker.stop()
+        # G.1: write the session debrief BEFORE shutting down the WS
+        # server so a future "view last report" endpoint can serve it
+        # immediately on next launch.
+        try:
+            if self._session_report_started:
+                report = self._session_report.finish()
+                sessions_dir = (
+                    Path(self.config.storage.path).expanduser() / "sessions"
+                )
+                sessions_dir.mkdir(parents=True, exist_ok=True)
+                session_path = sessions_dir / f"session_{report.session_id}.json"
+                session_path.write_text(
+                    json.dumps(report.model_dump(mode="json"), indent=2),
+                    encoding="utf-8",
+                )
+                logger.info("Wrote session report to %s", session_path)
+        except Exception:
+            logger.warning("Failed to finalise session report", exc_info=True)
         await self._ws_server.stop()
         self._uvicorn_server = None
         registry.reset()
@@ -553,6 +662,36 @@ class CortexDaemon:
         except asyncio.CancelledError:
             pass
 
+    async def _broadcast_loop(self) -> None:
+        """Broadcast STATE_UPDATE at a steady 500ms cadence (B.3).
+
+        The state pipeline (``_state_loop``) can take 1-3s per iteration when
+        an intervention path runs — feature fusion + classification + LLM
+        trigger evaluation, plus the per-iteration ``await asyncio.sleep(0.5)``.
+        That dragged the visible STATE_UPDATE cadence out of spec; UI bars
+        froze for seconds whenever the daemon was actively working.
+
+        This dedicated task wakes every 500ms regardless, reads the latest
+        cached estimate + biometrics that ``_state_loop`` produced, and
+        broadcasts. Clients see a stable cadence; the pipeline is free to
+        run as fast (or slow) as it needs.
+        """
+        try:
+            interval = self._broadcast_interval_seconds
+            while True:
+                await asyncio.sleep(interval)
+                estimate = self._latest_estimate
+                if estimate is None:
+                    continue
+                try:
+                    await self._ws_server.broadcast_state(
+                        estimate, self._latest_biometrics
+                    )
+                except Exception:
+                    logger.debug("broadcast_state failed", exc_info=True)
+        except asyncio.CancelledError:
+            pass
+
     async def _context_loop(self) -> None:
         """Build context every 5s — separate from fast state loop to avoid blocking."""
         try:
@@ -567,6 +706,36 @@ class CortexDaemon:
                 except Exception:
                     logger.exception("Context loop error")
                 await asyncio.sleep(5.0)
+        except asyncio.CancelledError:
+            pass
+
+    async def _retention_sweep_loop(self) -> None:
+        """Run the daily retention sweep (G.2).
+
+        Storage-related fields on :class:`StorageConfig`
+        (``session_retention_days``, ``feature_retention_days``,
+        ``error_retention_days``) were declarative-only — no code read
+        them and old files accumulated indefinitely. This loop runs
+        :func:`cortex.services.janitor.retention.sweep_once` every 24
+        hours so retention is enforced in practice.
+
+        We sleep ~60 seconds initially so the first sweep happens after
+        the daemon has fully booted, and then sleep 24h between sweeps.
+        Sweeps are blocking I/O — run them in the asyncio thread pool.
+        """
+        try:
+            await asyncio.sleep(60.0)
+            while True:
+                try:
+                    storage_root = Path(self.config.storage.path).expanduser()
+                    await asyncio.to_thread(
+                        run_retention_sweep,
+                        self.config.storage,
+                        storage_root=storage_root,
+                    )
+                except Exception:
+                    logger.debug("Retention sweep failed", exc_info=True)
+                await asyncio.sleep(24 * 60 * 60)
         except asyncio.CancelledError:
             pass
 
@@ -599,7 +768,33 @@ class CortexDaemon:
                         vector.thrashing_score = self._aggregator.thrashing_score
 
                     scores = self._scorer.compute_scores(vector)
-                    estimate = self._smoother.update(scores, quality, timestamp=timestamp)
+                    # C.2: blend ML classifier into smoother HYPER score
+                    # once we have enough labeled episodes for a useful ramp.
+                    ml_p_hyper: float | None = None
+                    ml_alpha = 0.0
+                    if (
+                        self._ml_classifier is not None
+                        and self._ml_classifier.is_fitted
+                        and self._ml_labeled_episodes
+                        >= self.config.state.ml_min_labeled_episodes
+                    ):
+                        try:
+                            x = np.asarray(vector.to_array(), dtype=np.float64).reshape(1, -1)
+                            ml_p_hyper = float(self._ml_classifier.predict(x)[0])
+                            full_at = max(1, self.config.state.ml_alpha_full_at_episodes)
+                            ramp = min(1.0, self._ml_labeled_episodes / full_at)
+                            ml_alpha = self.config.state.ml_alpha_max * ramp
+                        except Exception:
+                            logger.debug("ML classifier predict failed", exc_info=True)
+                            ml_p_hyper = None
+                            ml_alpha = 0.0
+                    estimate = self._smoother.update(
+                        scores,
+                        quality,
+                        timestamp=timestamp,
+                        ml_p_hyper=ml_p_hyper,
+                        ml_alpha=ml_alpha,
+                    )
 
                     # v2.0: Update stress integral
                     if vector.hrv_rmssd is not None:
@@ -616,6 +811,24 @@ class CortexDaemon:
 
                     registry.register("latest_state_estimate", estimate)
                     self._recorder.append("state_estimate", estimate.model_dump(mode="json"))
+                    # G.1: feed the session-debrief generator.
+                    try:
+                        if not self._session_report_started:
+                            self._session_report.start()
+                            self._session_report_started = True
+                        self._session_report.record_state(
+                            estimate.state, time.time(),
+                        )
+                        if vector.hr:
+                            self._session_report.record_hr(float(vector.hr))
+                        if vector.hrv_rmssd:
+                            self._session_report.record_hrv(float(vector.hrv_rmssd))
+                        if estimate.stress_integral is not None:
+                            self._session_report.record_stress(
+                                float(estimate.stress_integral)
+                            )
+                    except Exception:
+                        logger.debug("session_report record failed", exc_info=True)
                     biometrics = {
                         "heart_rate": vector.hr,
                         "hrv_rmssd": vector.hrv_rmssd,
@@ -626,7 +839,12 @@ class CortexDaemon:
                         "thrashing_score": vector.thrashing_score,
                         "stress_integral": self._stress_tracker.current_load,
                     }
-                    await self._ws_server.broadcast_state(estimate, biometrics)
+                    # B.3: cache for the dedicated broadcast loop instead of
+                    # broadcasting inline. Inline broadcasts let LLM/trigger
+                    # work stretch the cadence to multi-second; the broadcast
+                    # loop reads this cache at a steady 500ms tick.
+                    self._latest_estimate = estimate
+                    self._latest_biometrics = biometrics
 
                     if self._state_callback is not None:
                         self._state_callback(copy.deepcopy({
@@ -664,11 +882,17 @@ class CortexDaemon:
                             <= hour_now
                             < self.config.intervention.receptivity_work_hours_end
                         )
+                        # C.4: source mic + fullscreen from macOS via
+                        # cortex.libs.utils.receptivity. Returns None on
+                        # non-macOS or pyobjc-missing — degrade to False so
+                        # the policy still functions, matching legacy semantics.
+                        mic_state = receptivity.is_microphone_in_use()
+                        fs_state = receptivity.is_app_fullscreen()
                         decision = self._trigger_policy.evaluate(
                             estimate,
                             context_complexity=context.complexity_score,
-                            mic_active=False,
-                            fullscreen_active=False,
+                            mic_active=bool(mic_state) if mic_state is not None else False,
+                            fullscreen_active=bool(fs_state) if fs_state is not None else False,
                             typing_burst_seconds=typing_burst_seconds,
                             within_work_hours=within_work_hours,
                             current_time=timestamp,
@@ -941,7 +1165,7 @@ class CortexDaemon:
                 self._intervention_callback(copy.deepcopy(
                     plan.model_dump(mode="json")
                 ))
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("Intervention LLM call timed out")
         except asyncio.CancelledError:
             raise
@@ -1006,6 +1230,16 @@ class CortexDaemon:
         for outcome in outcomes:
             self._active_intervention_id = None
             self._recorder.append("intervention_outcome", outcome.model_dump(mode="json"))
+            # C.3: credit the stress integral when FLOW recovery confirms
+            # the intervention was restorative. apply_recovery_credit
+            # subtracts a window of sustained-low-deficit equivalent from
+            # the running integral so the AMIP safety floor doesn't keep
+            # firing across recovered sessions.
+            if getattr(outcome, "recovery_detected", False):
+                try:
+                    self._stress_tracker.apply_recovery_credit(seconds=120.0)
+                except Exception:
+                    logger.debug("apply_recovery_credit failed", exc_info=True)
             await self._ws_server.send_restore(
                 outcome.intervention_id,
                 user_action=outcome.user_action,
@@ -1251,6 +1485,57 @@ class CortexDaemon:
 
         self._leetcode_adapter.update_context(context.model_dump(mode="json"))
         registry.register("latest_leetcode_context", context)
+
+    async def _handle_intervention_applied(self, payload: dict[str, Any]) -> None:
+        """Reconcile optimistic mutation tracking with the client's ack.
+
+        See ``_OptimisticInterventionAdapter`` for the rationale. The client
+        sends ``{intervention_id, phase, success, applied_actions, errors}``
+        after executing the plan or the restore — we use ``success`` to
+        overwrite every mutation's ``success`` flag, and accumulate
+        ``errors`` into ``Mutation.error`` so downstream
+        ``InterventionOutcome.workspace_restored`` reflects reality.
+        """
+        intervention_id = payload.get("intervention_id")
+        if not isinstance(intervention_id, str):
+            return
+        phase = str(payload.get("phase", "apply"))
+        success = bool(payload.get("success", False))
+        errors = payload.get("errors") or []
+        error_text = "; ".join(str(e) for e in errors) if errors else None
+
+        mutations = self._executor.get_active_mutations(intervention_id)
+        if not mutations:
+            # The restore may have already drained mutations — record an
+            # outcome note on the recorder so we can audit silent failures.
+            self._recorder.append(
+                "intervention_applied_late",
+                {
+                    "intervention_id": intervention_id,
+                    "phase": phase,
+                    "success": success,
+                    "errors": errors,
+                    "source": payload.get("source_client_type"),
+                },
+            )
+            return
+
+        for mutation in mutations:
+            mutation.success = success
+            if not success and error_text:
+                mutation.error = error_text
+
+        self._recorder.append(
+            "intervention_applied",
+            {
+                "intervention_id": intervention_id,
+                "phase": phase,
+                "success": success,
+                "applied_actions": payload.get("applied_actions", []),
+                "errors": errors,
+                "source": payload.get("source_client_type"),
+            },
+        )
 
     async def _maybe_trigger_leetcode_interventions(
         self,
@@ -1539,11 +1824,17 @@ class CortexDaemon:
             threshold = float(settings["entry_threshold"])
             self.config.state.entry_threshold = threshold
             self.config.intervention.overlay_threshold = threshold
-            self._trigger_policy = TriggerPolicy(self.config.intervention)
+            self._trigger_policy = TriggerPolicy(
+                self.config.intervention,
+                state_config=self.config.state,
+            )
             registry.register("trigger_policy", self._trigger_policy)
         if "cooldown_seconds" in settings:
             self.config.intervention.cooldown_seconds = int(settings["cooldown_seconds"])
-            self._trigger_policy = TriggerPolicy(self.config.intervention)
+            self._trigger_policy = TriggerPolicy(
+                self.config.intervention,
+                state_config=self.config.state,
+            )
             registry.register("trigger_policy", self._trigger_policy)
         if "webcam_enabled" in settings:
             desired_capture = bool(settings["webcam_enabled"])
@@ -1583,9 +1874,23 @@ class CortexDaemon:
                 )
             else:
                 self._trigger_policy.clear_quiet_mode()
-        if "llm_mode" in settings:
-            mode = str(settings["llm_mode"])
-            self.config.llm.mode = "rule_based" if mode == "rule_based" else mode
+        if "llm_provider" in settings:
+            provider = str(settings["llm_provider"])
+            if provider in {"bedrock", "vertex", "direct"}:
+                self.config.llm.provider = provider  # type: ignore[assignment]
+            elif provider == "rule_based":
+                self.config.llm.fallback_mode = "rule_based"
             self._llm_client = create_llm_client(self.config.llm)
             registry.register("llm_client", self._llm_client)
-        await self._ws_server.broadcast_settings(settings)
+        # Re-broadcast settings with the values the daemon actually applied,
+        # plus any keys clients need to mirror (W-16 cooldown sync).
+        applied = dict(settings)
+        applied.setdefault(
+            "intervention_dismiss_cooldown_ms",
+            int(self.config.intervention.cooldown_seconds * 1000),
+        )
+        applied.setdefault(
+            "url_dismiss_cooldown_ms",
+            int(self.config.intervention.cooldown_seconds * 1000),
+        )
+        await self._ws_server.broadcast_settings(applied)

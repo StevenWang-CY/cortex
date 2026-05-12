@@ -11,9 +11,6 @@ Tests verify:
 
 from __future__ import annotations
 
-import numpy as np
-import pytest
-
 from cortex.libs.config.settings import InterventionConfig, StateConfig
 from cortex.libs.schemas.features import (
     FeatureVector,
@@ -32,7 +29,6 @@ from cortex.services.state_engine.feature_fusion import FeatureFusion
 from cortex.services.state_engine.rule_scorer import RuleScorer
 from cortex.services.state_engine.smoother import ScoreSmoother
 from cortex.services.state_engine.trigger_policy import TriggerPolicy
-
 
 # =============================================================================
 # Helpers
@@ -340,7 +336,7 @@ class TestSubScores:
     def test_s6_weighted_blend(self):
         """thrashing_score=0.2, switch_rate=25 → s6 weighted blend result."""
         scorer = self._make_scorer()
-        fv = FeatureVector(
+        FeatureVector(
             timestamp=1.0,
             hr=72.0,
             hrv_rmssd=50.0,
@@ -436,7 +432,7 @@ class TestScoreSmoother:
 
         # Brief hyper spike
         hyper_scores = StateScores(flow=0.2, hypo=0.0, hyper=0.7, recovery=0.0)
-        est = smoother.update(hyper_scores, quality, timestamp=10.0)
+        smoother.update(hyper_scores, quality, timestamp=10.0)
 
         # Should still be FLOW (hysteresis prevents immediate switch)
         assert smoother.current_state == UserState.FLOW
@@ -457,7 +453,7 @@ class TestScoreSmoother:
 
         # Feed many frames to overcome EMA and dwell
         for i in range(50):
-            est = smoother.update(hyper_scores, quality, timestamp=float(i) * 0.5)
+            smoother.update(hyper_scores, quality, timestamp=float(i) * 0.5)
 
         # After sustained hyper input, should eventually transition
         assert smoother.current_state == UserState.HYPER
@@ -503,7 +499,7 @@ class TestTriggerPolicy:
         return TriggerPolicy(config=config)
 
     def _make_hyper_estimate(
-        self, confidence: float = 0.9, dwell: float = 20.0,
+        self, confidence: float = 0.9, dwell: float = 35.0,
     ) -> StateEstimate:
         return StateEstimate(
             state="HYPER",
@@ -529,7 +525,8 @@ class TestTriggerPolicy:
     def test_trigger_on_hyper_with_confidence(self):
         """Should trigger when HYPER with high confidence and sufficient dwell."""
         policy = self._make_policy()
-        est = self._make_hyper_estimate(confidence=0.92, dwell=20.0)
+        # Dwell must clear StateConfig.hyper_dwell_seconds (default 30s).
+        est = self._make_hyper_estimate(confidence=0.92, dwell=35.0)
         decision = policy.evaluate(est, current_time=200.0)
         assert decision.should_trigger is True
 
@@ -544,7 +541,7 @@ class TestTriggerPolicy:
     def test_no_trigger_low_confidence(self):
         """Should not trigger when confidence below threshold."""
         policy = self._make_policy()
-        est = self._make_hyper_estimate(confidence=0.65, dwell=20.0)
+        est = self._make_hyper_estimate(confidence=0.65, dwell=35.0)
         decision = policy.evaluate(est, current_time=200.0)
         assert decision.should_trigger is False
         assert "below threshold" in decision.reason
@@ -554,7 +551,7 @@ class TestTriggerPolicy:
         policy = self._make_policy(cooldown_seconds=60)
         policy.record_intervention(timestamp=150.0)
 
-        est = self._make_hyper_estimate(confidence=0.92, dwell=20.0)
+        est = self._make_hyper_estimate(confidence=0.92, dwell=35.0)
         decision = policy.evaluate(est, current_time=180.0)  # 30s into 60s cooldown
         assert decision.should_trigger is False
         assert "Cooldown" in decision.reason
@@ -565,7 +562,7 @@ class TestTriggerPolicy:
         policy = self._make_policy(cooldown_seconds=60)
         policy.record_intervention(timestamp=100.0)
 
-        est = self._make_hyper_estimate(confidence=0.92, dwell=20.0)
+        est = self._make_hyper_estimate(confidence=0.92, dwell=35.0)
         decision = policy.evaluate(est, current_time=200.0)  # 100s after, cooldown expired
         assert decision.should_trigger is True
 
@@ -579,7 +576,7 @@ class TestTriggerPolicy:
             reasons=["Test"],
             signal_quality=make_poor_quality(),
             timestamp=100.0,
-            dwell_seconds=20.0,
+            dwell_seconds=35.0,
         )
         decision = policy.evaluate(est, current_time=200.0)
         assert decision.should_trigger is False
@@ -625,7 +622,8 @@ class TestTriggerPolicy:
     def test_no_trigger_insufficient_dwell(self):
         """Should not trigger with insufficient dwell time."""
         policy = self._make_policy()
-        est = self._make_hyper_estimate(confidence=0.92, dwell=3.0)  # < 8s
+        # StateConfig.hyper_dwell_seconds default is 30s; 3s is well below.
+        est = self._make_hyper_estimate(confidence=0.92, dwell=3.0)
         decision = policy.evaluate(est, current_time=200.0)
         assert decision.should_trigger is False
         assert "Dwell" in decision.reason

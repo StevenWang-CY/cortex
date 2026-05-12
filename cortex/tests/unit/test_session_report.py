@@ -179,9 +179,9 @@ class TestTopicCalibration:
         tracker.set_topic("algorithms")
 
         # Simulate 100s of study: 70s HYPER, 30s FLOW
-        for i in range(140):
+        for _i in range(140):
             tracker.accumulate(hr=80.0, hrv=30.0, state="HYPER", dt_seconds=0.5)
-        for i in range(60):
+        for _i in range(60):
             tracker.accumulate(hr=70.0, hrv=50.0, state="FLOW", dt_seconds=0.5)
 
         difficulty = tracker.get_topic_difficulty("algorithms")

@@ -86,8 +86,7 @@ class TabRelevanceTracker:
         if not goal:
             return {}
         # Scan known domains from recent interactions
-        key_prefix = f"tab_relevance:"
-        key_suffix = f":{_goal_hash(goal)}"
+        f":{_goal_hash(goal)}"
         overrides: dict[str, float] = {}
 
         # Use store's scan if available, otherwise check cached domains

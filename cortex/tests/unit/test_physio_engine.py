@@ -27,7 +27,6 @@ from cortex.services.physio_engine.rppg import (
     extract_bvp_pos,
 )
 
-
 # =============================================================================
 # Helpers
 # =============================================================================
@@ -526,8 +525,8 @@ class TestParabolicInterpolation:
 
     def test_parabolic_interpolation_reduces_ibi_std(self) -> None:
         """Parabolic interpolation should reduce IBI std on a synthetic 70 BPM signal."""
-        from cortex.libs.signal.peak_detection import compute_ibi_series, detect_bvp_peaks
         from cortex.libs.signal.filters import bandpass_filter
+        from cortex.libs.signal.peak_detection import compute_ibi_series, detect_bvp_peaks
 
         fs = 30.0
         duration_s = 10.0

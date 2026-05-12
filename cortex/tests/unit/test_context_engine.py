@@ -15,8 +15,6 @@ Tests verify:
 
 from __future__ import annotations
 
-import pytest
-
 from cortex.libs.schemas.context import (
     BrowserContext,
     Diagnostic,
@@ -36,7 +34,6 @@ from cortex.services.context_engine.assembler import (
 from cortex.services.context_engine.browser_adapter import BrowserAdapter
 from cortex.services.context_engine.editor_adapter import EditorAdapter
 from cortex.services.context_engine.terminal_adapter import TerminalAdapter
-
 
 # =============================================================================
 # App Classifier Tests

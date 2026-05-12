@@ -9,14 +9,14 @@ from __future__ import annotations
 import logging
 import sys
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 import structlog
 from pydantic import BaseModel
 
 
-class EventType(str, Enum):
+class EventType(StrEnum):
     """Cortex log event types."""
 
     # State events

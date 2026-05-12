@@ -142,72 +142,10 @@ class TestRunCapture:
 
 
 # ============================================================================
-# run_llm_server tests
+# (run_llm_server tests removed in v0.2.1 — the script was deleted as
+# part of the Anthropic SDK / Bedrock migration; transport-specific tests
+# now live in tests/unit/test_anthropic_planner.py.)
 # ============================================================================
-
-
-class TestRunLLMServer:
-    """Tests for LLM server management script."""
-
-    def test_parse_args_defaults(self):
-        from cortex.scripts.run_llm_server import _parse_args
-
-        with patch("sys.argv", ["run_llm_server"]):
-            args = _parse_args()
-        assert args.local is False
-
-    def test_parse_args_start(self):
-        from cortex.scripts.run_llm_server import _parse_args
-
-        with patch("sys.argv", ["run_llm_server", "--start"]):
-            args = _parse_args()
-        assert args.start is True
-
-    def test_parse_args_test(self):
-        from cortex.scripts.run_llm_server import _parse_args
-
-        with patch("sys.argv", ["run_llm_server", "--test"]):
-            args = _parse_args()
-        assert args.test is True
-
-    def test_parse_args_local(self):
-        from cortex.scripts.run_llm_server import _parse_args
-
-        with patch("sys.argv", ["run_llm_server", "--local"]):
-            args = _parse_args()
-        assert args.local is True
-
-    def test_print_status(self):
-        from cortex.scripts.run_llm_server import _print_status
-
-        info = {
-            "host": "gpu-server.example.com",
-            "port": 8800,
-            "reachable": True,
-            "vllm_running": True,
-            "models": ["qwen3-8b"],
-        }
-        # Should not raise
-        _print_status(info)
-
-    def test_print_status_local(self):
-        from cortex.scripts.run_llm_server import _print_status
-
-        info = {
-            "host": "localhost",
-            "port": 11434,
-            "reachable": False,
-            "models": [],
-        }
-        _print_status(info, local=True)
-
-    @pytest.mark.asyncio
-    async def test_check_local_status_unreachable(self):
-        from cortex.scripts.run_llm_server import check_local_status
-
-        # Should not raise, just report unreachable
-        info = await check_local_status("localhost", 99999)
-        assert info["reachable"] is False
 
 
 # ============================================================================
@@ -597,17 +535,17 @@ class TestSettingsLoading:
             (root / ".env").write_text(
                 "\n".join(
                     [
-                        "CORTEX_LLM__MODE=azure",
-                        "CORTEX_LLM__AZURE__ENDPOINT=https://dotenv.example/",
-                        "CORTEX_LLM__AZURE__DEPLOYMENT_NAME=gpt-5-mini",
+                        "CORTEX_LLM__PROVIDER=bedrock",
+                        "CORTEX_LLM__BEDROCK__AWS_REGION=us-west-2",
+                        "CORTEX_LLM__MODEL_DEFAULT=claude-sonnet-4-6",
                     ]
                 )
             )
             reset_config()
             config = get_config()
-            assert config.llm.mode == "azure"
-            assert config.llm.azure.endpoint == "https://dotenv.example/"
-            assert config.llm.azure.deployment_name == "gpt-5-mini"
+            assert config.llm.provider == "bedrock"
+            assert config.llm.bedrock.aws_region == "us-west-2"
+            assert config.llm.model_default == "claude-sonnet-4-6"
             reset_config()
 
     def test_environment_overrides_dotenv(self, monkeypatch: pytest.MonkeyPatch):
@@ -616,11 +554,11 @@ class TestSettingsLoading:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             monkeypatch.chdir(root)
-            (root / ".env").write_text("CORTEX_LLM__MODE=local\n")
-            monkeypatch.setenv("CORTEX_LLM__MODE", "rule_based")
+            (root / ".env").write_text("CORTEX_LLM__PROVIDER=vertex\n")
+            monkeypatch.setenv("CORTEX_LLM__PROVIDER", "direct")
             reset_config()
             config = get_config()
-            assert config.llm.mode == "rule_based"
+            assert config.llm.provider == "direct"
             reset_config()
 
 
@@ -641,11 +579,6 @@ class TestScriptImports:
         import cortex.scripts.run_capture as run_capture
 
         assert run_capture is not None
-
-    def test_import_run_llm_server(self):
-        import cortex.scripts.run_llm_server as run_llm_server
-
-        assert run_llm_server is not None
 
     def test_import_calibrate(self):
         import cortex.scripts.calibrate as calibrate

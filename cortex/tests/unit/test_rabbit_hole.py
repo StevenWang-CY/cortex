@@ -1,7 +1,5 @@
 """Tests for RabbitHoleDetector — anti-rabbit hole circuit breaker."""
-import pytest
-from cortex.services.state_engine.rabbit_hole import RabbitHoleDetector, RabbitHoleAlert
-
+from cortex.services.state_engine.rabbit_hole import RabbitHoleAlert, RabbitHoleDetector
 
 # Use base_t > default cooldown (600s) so initial _last_trigger=0.0 doesn't block
 _BASE_T = 1000.0
@@ -87,6 +85,16 @@ class TestRabbitHoleDetector:
         # "the" is a stop word; "implement" and "core" are preserved as goal-relevant
         assert "search" in detector._goal_keywords
         assert "the" not in detector._goal_keywords
+
+    def test_goal_relevant_verbs_preserved(self):
+        # W-06 regression guard: build/create/implement/make/write must NOT be stripped
+        # from goal keywords — they carry intent signal for alignment scoring.
+        for verb in ("build", "create", "implement", "make", "write"):
+            detector = RabbitHoleDetector()
+            detector.set_goal(f"{verb} the redis caching layer")
+            assert verb in detector._goal_keywords, (
+                f"{verb!r} was filtered out of goal keywords — W-06 regression"
+            )
 
     def test_suggested_file_from_on_task_history(self):
         detector = RabbitHoleDetector(min_drift_minutes=0.1, cooldown_seconds=0.0)

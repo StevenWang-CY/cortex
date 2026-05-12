@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Callable, Coroutine
+from collections.abc import Callable, Coroutine
+from typing import Any
 
 from cortex.libs.adapters.base import AdapterResult, CortexAdapter
 from cortex.libs.schemas.leetcode import LeetCodeContext

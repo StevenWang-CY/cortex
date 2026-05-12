@@ -84,7 +84,7 @@ class BrowserAdapter:
                 self._available = bool(ctx.active_tab_title or ctx.active_tab_url or ctx.all_tabs)
                 self._last_context = ctx if self._available else None
                 return self._last_context
-            except (asyncio.TimeoutError, ConnectionError, OSError) as e:
+            except (TimeoutError, ConnectionError, OSError) as e:
                 logger.debug(f"Browser adapter unavailable: {e}")
                 self._available = False
                 return None
@@ -115,7 +115,7 @@ class BrowserAdapter:
             self._last_context = ctx
             return ctx
 
-        except (asyncio.TimeoutError, ConnectionError, OSError) as e:
+        except (TimeoutError, ConnectionError, OSError) as e:
             logger.debug(f"Browser adapter unavailable: {e}")
             self._available = False
             return None

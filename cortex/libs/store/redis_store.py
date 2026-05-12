@@ -94,6 +94,21 @@ class RedisStore:
             self._fallback = InMemoryStore(key_prefix=self._prefix)
             return None
 
+    def _fallback_store(self) -> InMemoryStore:
+        """Return the in-memory fallback once the Redis client has been
+        determined unavailable. Raises if called when no fallback exists
+        (which would indicate a programming error — callers always reach this
+        only after ``_get_client`` returned ``None``).
+
+        Replaces previous ``assert self._fallback is not None`` so the check
+        survives ``python -O``.
+        """
+        if self._fallback is None:
+            raise RuntimeError(
+                "RedisStore fallback was not initialised before use"
+            )
+        return self._fallback
+
     # ------------------------------------------------------------------
     # Timeseries  (sorted sets with timestamp as score)
     # ------------------------------------------------------------------
@@ -109,8 +124,7 @@ class RedisStore:
         """
         client = await self._get_client()
         if client is None:
-            assert self._fallback is not None
-            return await self._fallback.append_timeseries(key, timestamp, value)
+            return await self._fallback_store().append_timeseries(key, timestamp, value)
 
         ik = self._key(key)
         member = f"{timestamp}:{value}"
@@ -128,8 +142,7 @@ class RedisStore:
         """
         client = await self._get_client()
         if client is None:
-            assert self._fallback is not None
-            return await self._fallback.get_timeseries(key, window_seconds)
+            return await self._fallback_store().get_timeseries(key, window_seconds)
 
         ik = self._key(key)
         min_score = time.time() - window_seconds
@@ -158,8 +171,7 @@ class RedisStore:
         """
         client = await self._get_client()
         if client is None:
-            assert self._fallback is not None
-            return await self._fallback.get_json(key)
+            return await self._fallback_store().get_json(key)
 
         raw = await client.get(self._key(key))
         if raw is None:
@@ -176,8 +188,7 @@ class RedisStore:
         """
         client = await self._get_client()
         if client is None:
-            assert self._fallback is not None
-            return await self._fallback.set_json(key, value, ttl_seconds)
+            return await self._fallback_store().set_json(key, value, ttl_seconds)
 
         ik = self._key(key)
         payload = json.dumps(value)
@@ -201,8 +212,7 @@ class RedisStore:
         """
         client = await self._get_client()
         if client is None:
-            assert self._fallback is not None
-            return await self._fallback.increment(key)
+            return await self._fallback_store().increment(key)
 
         return await client.incr(self._key(key))
 
@@ -217,8 +227,7 @@ class RedisStore:
         """
         client = await self._get_client()
         if client is None:
-            assert self._fallback is not None
-            return await self._fallback.get_float(key)
+            return await self._fallback_store().get_float(key)
 
         raw = await client.get(self._key(key))
         return float(raw) if raw is not None else None
@@ -232,8 +241,7 @@ class RedisStore:
         """
         client = await self._get_client()
         if client is None:
-            assert self._fallback is not None
-            return await self._fallback.set_float(key, value)
+            return await self._fallback_store().set_float(key, value)
 
         await client.set(self._key(key), str(value))
 
@@ -250,8 +258,7 @@ class RedisStore:
         """
         client = await self._get_client()
         if client is None:
-            assert self._fallback is not None
-            return await self._fallback.health_check()
+            return await self._fallback_store().health_check()
 
         try:
             return await client.ping()

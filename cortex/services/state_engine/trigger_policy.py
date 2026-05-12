@@ -27,7 +27,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from cortex.libs.config.settings import InterventionConfig
+from cortex.libs.config.settings import InterventionConfig, StateConfig
 from cortex.libs.schemas.state import StateEstimate
 
 logger = logging.getLogger(__name__)
@@ -72,8 +72,22 @@ class TriggerPolicy:
         policy.record_dismissal()
     """
 
-    def __init__(self, config: InterventionConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: InterventionConfig | None = None,
+        state_config: StateConfig | None = None,
+        *,
+        hyper_dwell_seconds: float | None = None,
+    ) -> None:
         self._config = config or InterventionConfig()
+        # Single source of truth for HYPER dwell is StateConfig (v0.2.0 C.5).
+        # Tests may inject ``hyper_dwell_seconds`` directly for short cycles.
+        if hyper_dwell_seconds is not None:
+            self._hyper_dwell_seconds = float(hyper_dwell_seconds)
+        else:
+            self._hyper_dwell_seconds = float(
+                (state_config or StateConfig()).hyper_dwell_seconds
+            )
 
         # Cooldown tracking
         self._last_intervention_time: float = 0.0
@@ -267,7 +281,7 @@ class TriggerPolicy:
                 )
 
         # Check dwell time (must be in HYPER for >= hyper_dwell_seconds)
-        dwell_required = self._config.hyper_dwell_seconds
+        dwell_required = self._hyper_dwell_seconds
         if estimate.dwell_seconds < dwell_required:
             return TriggerDecision(
                 should_trigger=False,

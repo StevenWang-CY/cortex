@@ -13,10 +13,6 @@ Covers:
 
 from __future__ import annotations
 
-from unittest.mock import patch
-
-import pytest
-
 from cortex.libs.schemas.leetcode import (
     DestructiveStruggleEstimate,
     LeetCodeContext,
@@ -32,7 +28,6 @@ from cortex.services.intervention_engine.leetcode_interventions import (
     SolutionEscapeFriction,
     SubmissionDisciplineGuard,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers

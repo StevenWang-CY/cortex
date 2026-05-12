@@ -28,6 +28,7 @@ import numpy as np
 
 from cortex.libs.config.settings import TelemetryConfig
 from cortex.libs.schemas.features import TelemetryFeatures
+from cortex.services.telemetry_engine.focus_graph import FocusGraphBuilder
 from cortex.services.telemetry_engine.input_hooks import (
     InputHooks,
     KeyEvent,
@@ -37,7 +38,6 @@ from cortex.services.telemetry_engine.input_hooks import (
     MouseScrollEvent,
     ScrollDirection,
 )
-from cortex.services.telemetry_engine.focus_graph import FocusGraphBuilder
 from cortex.services.telemetry_engine.window_tracker import WindowFocusEvent, WindowTracker
 
 logger = logging.getLogger(__name__)

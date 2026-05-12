@@ -15,8 +15,7 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QSettings, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -45,17 +44,13 @@ from cortex.apps.desktop_shell.tokens import (
     CX_TEXT_SECONDARY,
     CX_TEXT_TERTIARY,
     PAGE_TITLE_QSS,
-    RADIUS_LG,
-    RADIUS_MD,
     RADIUS_SM,
-    RADIUS_FULL,
     SECTION_HEADING_QSS,
     SP2,
     SP3,
     SP4,
     SP5,
     SP6,
-    SP8,
 )
 
 logger = logging.getLogger(__name__)
@@ -143,7 +138,12 @@ class SettingsDialog(QWidget):
         self.setWindowTitle("Cortex — Settings")
         self.setMinimumSize(420, 540)
         self.setStyleSheet(f"background: {CX_BG};")
+        # E.2: QSettings persistence — Cortex/Desktop. Default values come
+        # from the widget initializers in _build_ui; we restore over the
+        # top once the UI is built.
+        self._qs = QSettings("Cortex", "Desktop")
         self._build_ui()
+        self._load_persisted_settings()
 
     def _build_ui(self) -> None:
         """Build the settings UI."""
@@ -305,11 +305,14 @@ class SettingsDialog(QWidget):
         llm_inner.setSpacing(SP3)
 
         self._llm_backend = QComboBox()
+        # v0.2.0: Anthropic SDK transports. Direct API is gated by an
+        # ANTHROPIC_API_KEY; Vertex requires GCP credentials; rule_based
+        # is the offline deterministic fallback.
         self._llm_backend.addItems([
-            "Azure OpenAI",
-            "Local (Ollama)",
-            "Rule-based (no LLM)",
-            "Remote (dev only)",
+            "AWS Bedrock (Anthropic)",
+            "Google Vertex (Anthropic)",
+            "Anthropic API (direct)",
+            "Rule-based (offline)",
         ])
         self._llm_backend.setStyleSheet(_COMBO_QSS)
         llm_inner.addWidget(self._llm_backend)
@@ -376,8 +379,10 @@ class SettingsDialog(QWidget):
         # Sensitivity 1 = threshold 0.95, 3 = 0.85, 5 = 0.75
         threshold_offset = (3 - sensitivity) * 0.05
 
-        # Map LLM backend combo to mode string
-        llm_modes = ["azure", "local", "rule_based", "remote"]
+        # Map LLM backend combo to mode string. Order must match the
+        # addItems(...) call in _build_ui — Bedrock, Vertex, direct,
+        # rule_based — and the LLMConfig.provider Literal in settings.py.
+        llm_modes = ["bedrock", "vertex", "direct", "rule_based"]
         llm_mode = llm_modes[self._llm_backend.currentIndex()]
 
         return {
@@ -399,6 +404,96 @@ class SettingsDialog(QWidget):
     def _apply_settings(self) -> None:
         """Apply and emit current settings."""
         settings = self.get_settings()
+        # E.2: persist before emitting so a crash mid-roundtrip doesn't
+        # lose the user's choices.
+        self._persist_settings(settings)
         self.settings_changed.emit(settings)
         logger.info(f"Settings applied: sensitivity={settings['sensitivity']}, "
                      f"llm={settings['llm_mode']}")
+
+    # ------------------------------------------------------------------
+    # E.2: persistence (QSettings) + remote SETTINGS_SYNC reconciliation
+    # ------------------------------------------------------------------
+
+    def _persist_settings(self, settings: dict) -> None:
+        for key, value in settings.items():
+            try:
+                self._qs.setValue(key, value)
+            except Exception:
+                pass
+        try:
+            self._qs.sync()
+        except Exception:
+            pass
+
+    def _load_persisted_settings(self) -> None:
+        """Restore widget values from QSettings on construction."""
+
+        def _get_bool(key: str, default: bool) -> bool:
+            v = self._qs.value(key, default)
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, str):
+                return v.lower() in {"true", "1", "yes"}
+            return bool(v)
+
+        def _get_int(key: str, default: int) -> int:
+            v = self._qs.value(key, default)
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return default
+
+        try:
+            self._webcam_enabled.setChecked(_get_bool("webcam_enabled", True))
+            self._input_telemetry_enabled.setChecked(
+                _get_bool("input_telemetry_enabled", True)
+            )
+            self._interventions_enabled.setChecked(
+                _get_bool("interventions_enabled", True)
+            )
+            self._sensitivity_slider.setValue(_get_int("sensitivity", 3))
+            self._cooldown_spin.setValue(_get_int("cooldown_seconds", 60))
+            self._quiet_mode.setChecked(_get_bool("quiet_mode", False))
+            self._quiet_duration.setValue(_get_int("quiet_duration_minutes", 30))
+            llm_mode = str(self._qs.value("llm_mode", "bedrock"))
+            llm_modes = ["bedrock", "vertex", "direct", "rule_based"]
+            if llm_mode in llm_modes:
+                self._llm_backend.setCurrentIndex(llm_modes.index(llm_mode))
+            self._debug_capture.setChecked(_get_bool("debug_capture", False))
+            self._debug_rppg.setChecked(_get_bool("debug_rppg", False))
+            self._debug_state.setChecked(_get_bool("debug_state", False))
+            self._debug_llm.setChecked(_get_bool("debug_llm", False))
+        except Exception:
+            logger.debug("Failed to restore persisted settings", exc_info=True)
+
+    def apply_payload(self, payload: dict) -> None:
+        """Apply a ``SETTINGS_SYNC`` payload arriving from the daemon.
+
+        Called by the main app's _on_settings_synced handler. Previously
+        the payload was logged and dropped; now it round-trips to the
+        widgets so the dashboard reflects the daemon's authoritative
+        state (and is then re-persisted via QSettings).
+        """
+        if not isinstance(payload, dict):
+            return
+        try:
+            if "quiet_mode" in payload:
+                self._quiet_mode.setChecked(bool(payload["quiet_mode"]))
+            if "quiet_duration_minutes" in payload:
+                try:
+                    self._quiet_duration.setValue(int(payload["quiet_duration_minutes"]))
+                except (TypeError, ValueError):
+                    pass
+            if "sensitivity" in payload:
+                try:
+                    self._sensitivity_slider.setValue(int(payload["sensitivity"]))
+                except (TypeError, ValueError):
+                    pass
+            if "interventions_enabled" in payload:
+                self._interventions_enabled.setChecked(bool(payload["interventions_enabled"]))
+            if "webcam_enabled" in payload:
+                self._webcam_enabled.setChecked(bool(payload["webcam_enabled"]))
+        except Exception:
+            logger.debug("Failed to apply SETTINGS_SYNC payload", exc_info=True)
+        self._persist_settings(self.get_settings())

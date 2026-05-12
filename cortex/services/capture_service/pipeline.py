@@ -227,7 +227,7 @@ class CapturePipeline:
         """
         try:
             return await asyncio.wait_for(self._output_queue.get(), timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return None
 
     async def __aiter__(self):

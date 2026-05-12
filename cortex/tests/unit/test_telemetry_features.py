@@ -13,7 +13,6 @@ Tests use synthetic event sequences to verify:
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from cortex.libs.config.settings import TelemetryConfig
 from cortex.services.telemetry_engine.feature_aggregator import FeatureAggregator
@@ -31,7 +30,6 @@ from cortex.services.telemetry_engine.window_tracker import (
     WindowFocusEvent,
     WindowTracker,
 )
-
 
 # =============================================================================
 # Helpers — Synthetic Event Generation
@@ -646,13 +644,7 @@ class TestTelemetryEngineImports:
     def test_import_input_hooks(self):
         from cortex.services.telemetry_engine import (
             InputHooks,
-            KeyEvent,
-            KeyType,
-            MouseButton,
-            MouseClickEvent,
             MouseMoveEvent,
-            MouseScrollEvent,
-            ScrollDirection,
         )
 
         assert InputHooks is not None

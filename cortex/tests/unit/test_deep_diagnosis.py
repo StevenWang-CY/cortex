@@ -1,5 +1,4 @@
 """Tests for deep bottleneck diagnosis — extended ErrorAnalysis schema."""
-import pytest
 from cortex.libs.schemas.intervention import ErrorAnalysis, InterventionPlan, UIPlan
 
 

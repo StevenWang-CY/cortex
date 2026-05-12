@@ -30,6 +30,10 @@ interface FoldSnapshot {
 export class FoldController {
     private _snapshot: FoldSnapshot | null = null;
     private _hasPendingFolds = false;
+    // D.3: ranges that *we* explicitly folded during the most recent
+    // foldExcept invocation. Source of truth for restore — we know what
+    // we folded, so we know what to unfold (and what to leave alone).
+    private _appliedFolds: Array<[number, number]> = [];
 
     /** Whether there are active Cortex-applied folds. */
     get hasPendingFolds(): boolean {
@@ -89,6 +93,7 @@ export class FoldController {
             }
 
             // Apply folds by selecting ranges and folding
+            this._appliedFolds = [];
             if (foldRanges.length > 0) {
                 for (const range of foldRanges) {
                     editor.selection = range;
@@ -99,6 +104,10 @@ export class FoldController {
                             levels: 999, // Fold as deeply as possible
                         },
                     );
+                    // Track exactly what we folded so restore can be
+                    // precise instead of guessing from the foldable
+                    // structure of the whole file.
+                    this._appliedFolds.push([range.start.line, range.end.line]);
                 }
 
                 // Restore cursor to the kept range
@@ -164,20 +173,29 @@ export class FoldController {
         }
 
         try {
-            // Unfold everything first
-            await vscode.commands.executeCommand("editor.unfoldAll");
-
-            // Re-fold saved ranges
-            for (const [start] of this._snapshot.foldedRanges) {
-                await vscode.commands.executeCommand("editor.fold", {
-                    selectionLines: [start],
-                    levels: 1,
-                });
-                // Verify range is roughly correct (file may have changed)
+            // D.3: unfold only the ranges we explicitly folded during the
+            // intervention. The previous implementation re-folded *every*
+            // foldable range in the file on restore, which left the editor
+            // MORE folded than the user's pre-intervention state.
+            //
+            // Unfolding only our applied ranges leaves any folds the user
+            // had pre-existing untouched (we never knew about them; VS
+            // Code's API doesn't expose currently-folded ranges).
+            for (const [start] of this._appliedFolds) {
                 if (start >= editor.document.lineCount) {
-                    break;
+                    continue;
                 }
+                const safeStart = Math.max(
+                    0,
+                    Math.min(start, editor.document.lineCount - 1),
+                );
+                const pos = new vscode.Position(safeStart, 0);
+                editor.selection = new vscode.Selection(pos, pos);
+                await vscode.commands.executeCommand("editor.unfold", {
+                    selectionLines: [safeStart],
+                });
             }
+            this._appliedFolds = [];
 
             // Restore cursor position
             const [line, char] = this._snapshot.cursorPosition;

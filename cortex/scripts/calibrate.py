@@ -20,7 +20,7 @@ import logging
 import statistics
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
@@ -334,7 +334,7 @@ def compute_baselines(
         mouse_velocity_baseline=_safe_mean(mouse_vel, 500.0),
         mouse_variance_baseline=_safe_mean(mouse_var, 10000.0),
         shoulder_neutral_y=_safe_mean(shoulder_values, 0.5),
-        calibrated_at=datetime.now(timezone.utc),
+        calibrated_at=datetime.now(UTC),
         metric_distributions={
             "hr": _distribution(hr_values, 72.0, 5.0),
             "hrv_rmssd": _distribution(hrv_values, 50.0, 10.0),

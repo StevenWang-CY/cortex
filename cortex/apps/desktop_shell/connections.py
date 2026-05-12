@@ -28,35 +28,26 @@ from PySide6.QtWidgets import (
 )
 
 from cortex.apps.desktop_shell.tokens import (
-    BTN_ACCENT_QSS,
     BTN_PRIMARY_QSS,
     CARD_QSS,
-    CX_ACCENT,
-    CX_ACCENT_DIM,
     CX_BG,
-    CX_BORDER,
-    CX_BORDER_DEFAULT,
     CX_DANGER,
     CX_DANGER_DIM,
     CX_FONT_SANS,
     CX_SUCCESS,
     CX_SUCCESS_DIM,
-    CX_SURFACE,
     CX_TEXT,
     CX_TEXT_SECONDARY,
     CX_TEXT_TERTIARY,
     PAGE_TITLE_QSS,
-    RADIUS_LG,
     RADIUS_MD,
     RADIUS_SM,
-    RADIUS_FULL,
     SECTION_HEADING_QSS,
     SP2,
     SP3,
     SP4,
     SP5,
     SP6,
-    SP8,
 )
 
 logger = logging.getLogger(__name__)
@@ -295,7 +286,7 @@ class ConnectionsPanel(QWidget):
 
         # Description
         desc = QLabel(
-            f"Install native messaging host and load the Cortex extension."
+            "Install native messaging host and load the Cortex extension."
             if installed else f"{name} is not installed on this Mac."
         )
         desc.setWordWrap(True)
@@ -372,7 +363,7 @@ class ConnectionsPanel(QWidget):
 
         # Description
         desc_text = (
-            f"Install the Cortex VS Code extension for editor integration."
+            "Install the Cortex VS Code extension for editor integration."
             if editor else
             "No compatible editor found (VS Code, Cursor, VSCodium)."
         )
@@ -447,11 +438,11 @@ class ConnectionsPanel(QWidget):
         QMessageBox.information(
             self,
             f"Connect {name}",
-            f"Extension path copied to clipboard!\n\n"
-            f"1. Enable Developer Mode (top-right toggle)\n"
-            f"2. Click 'Load unpacked'\n"
-            f"3. Paste the path (Cmd+V)\n"
-            f"4. Click the reload icon on the Cortex card",
+            "Extension path copied to clipboard!\n\n"
+            "1. Enable Developer Mode (top-right toggle)\n"
+            "2. Click 'Load unpacked'\n"
+            "3. Paste the path (Cmd+V)\n"
+            "4. Click the reload icon on the Cortex card",
         )
 
     def _connect_editor(self, cli_path: str, editor_name: str) -> None:

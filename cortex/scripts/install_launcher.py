@@ -72,7 +72,7 @@ def start_foreground() -> None:
     print(f"Starting Cortex Launcher Agent on port {LAUNCHER_PORT}...")
     print(f"  Project root: {project_root}")
     print(f"  Python: {python}")
-    print(f"  Press Ctrl+C to stop\n")
+    print("  Press Ctrl+C to stop\n")
     os.execv(python, [python, "-m", "cortex.scripts.launcher_agent"])
 
 
@@ -97,7 +97,7 @@ def start_background() -> None:
     )
     print(f"Launcher agent started in background (pid {proc.pid})")
     print(f"  Log: {log_path}")
-    print(f"  Stop: python -m cortex.scripts.install_launcher --stop")
+    print("  Stop: python -m cortex.scripts.install_launcher --stop")
 
 
 def stop() -> None:

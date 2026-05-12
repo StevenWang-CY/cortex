@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from cortex.libs.schemas.activity import ActivitySummary, ActivityTimeline
 
@@ -39,7 +39,7 @@ class ActivityAggregator:
         if not activities:
             return
 
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
         key = f"activity:timeline:{today}"
 
         existing = await self._store.get_json(key)
@@ -83,7 +83,7 @@ class ActivityAggregator:
         Searches today and yesterday's timelines, returns up to `limit` items
         sorted by last_visited descending.
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         activities: list[ActivitySummary] = []
 
         for days_ago in range(3):

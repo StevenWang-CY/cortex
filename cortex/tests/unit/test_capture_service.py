@@ -25,12 +25,10 @@ from cortex.libs.config.settings import CaptureConfig
 from cortex.services.capture_service.face_tracker import (
     BoundingBox,
     FaceTracker,
-    FaceTrackingResult,
 )
 from cortex.services.capture_service.pipeline import AdaptiveFrameSkipper
-from cortex.services.capture_service.quality import FrameQuality, FrameQualityScorer
+from cortex.services.capture_service.quality import FrameQualityScorer
 from cortex.services.capture_service.webcam import CapturedFrame, WebcamCapture
-
 
 # =============================================================================
 # Helpers
@@ -362,7 +360,6 @@ class TestAdaptiveFrameSkipper:
     def test_skip_increases_with_high_latency(self) -> None:
         """Skip rate should increase when processing is too slow."""
         skipper = AdaptiveFrameSkipper(target_fps=30)
-        target_interval = 1.0 / 30  # ~33ms
 
         # Simulate consistently high processing latency (100ms > 33ms)
         for _ in range(20):

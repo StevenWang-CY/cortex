@@ -20,18 +20,15 @@ import asyncio
 import json
 import time
 
-import pytest
-
 from cortex.libs.schemas.intervention import (
     FoldState,
     InterventionPlan,
     UIPlan,
     WorkspaceSnapshot,
 )
-from cortex.services.api_gateway.websocket_server import WSMessage, WebSocketServer
+from cortex.services.api_gateway.websocket_server import WebSocketServer, WSMessage
 from cortex.services.intervention_engine.restore import RestoreManager
 from cortex.services.intervention_engine.snapshot import capture_snapshot
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -61,7 +58,7 @@ class MockWebSocket:
     async def __anext__(self) -> str:
         try:
             return await asyncio.wait_for(self._incoming.get(), timeout=1.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             raise StopAsyncIteration
 
 
@@ -247,7 +244,7 @@ class TestRestoreManagerIntegration:
             editor_visible_range=(10, 30),
         )
 
-        active = manager.start_intervention(
+        manager.start_intervention(
             "int_mgr_test", snapshot, started_at=time.monotonic(),
         )
 

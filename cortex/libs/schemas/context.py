@@ -119,6 +119,13 @@ class TabInfo(BaseModel):
     ] = Field("other", description="Classified tab type")
     is_active: bool = Field(False, description="Whether this is the active tab")
     topic_hint: str = Field("", description="Extracted topic/query from tab title")
+    # F.1: the browser extension supplies this for recently-active reasoning
+    # in the LLM prompt. Was previously dropped silently because the schema
+    # didn't declare it; now it's retained and forwarded to the planner.
+    last_activated_ago_seconds: int | None = Field(
+        None,
+        description="Seconds since this tab was last the active tab (None if unknown).",
+    )
 
 
 class BrowserContext(BaseModel):

@@ -1,10 +1,11 @@
 """Tests for ProjectLauncher and ProjectConfig."""
-import pytest
 import tempfile
 from pathlib import Path
 
-from cortex.services.launcher.project_config import ProjectConfig
+import pytest
+
 from cortex.services.launcher.launcher import ProjectLauncher
+from cortex.services.launcher.project_config import ProjectConfig
 
 
 class TestProjectConfig:

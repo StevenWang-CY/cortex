@@ -19,8 +19,6 @@ from __future__ import annotations
 import json
 import time
 
-import pytest
-
 from cortex.libs.schemas.context import BrowserContext, TabInfo
 from cortex.libs.schemas.intervention import (
     InterventionPlan,
@@ -28,12 +26,11 @@ from cortex.libs.schemas.intervention import (
     UIPlan,
     WorkspaceSnapshot,
 )
-from cortex.services.api_gateway.websocket_server import WSMessage, WebSocketServer
+from cortex.services.api_gateway.websocket_server import WebSocketServer, WSMessage
 from cortex.services.context_engine.app_classifier import classify_tab_type
 from cortex.services.context_engine.browser_adapter import BrowserAdapter
 from cortex.services.intervention_engine.restore import RestoreManager
 from cortex.services.intervention_engine.snapshot import capture_snapshot
-
 
 # ---------------------------------------------------------------------------
 # Tests

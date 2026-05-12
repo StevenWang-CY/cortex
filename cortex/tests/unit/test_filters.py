@@ -20,7 +20,6 @@ from cortex.libs.signal.filters import (
     design_bandpass,
 )
 
-
 # =============================================================================
 # Helper: generate a clean sinusoidal signal
 # =============================================================================

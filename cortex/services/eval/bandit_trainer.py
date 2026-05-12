@@ -22,7 +22,7 @@ from pathlib import Path
 
 import numpy as np
 
-from cortex.services.eval.bandit import ARM_LABELS, N_ARMS, N_FEATURES, ContextualBandit
+from cortex.services.eval.bandit import N_ARMS, N_FEATURES, ContextualBandit
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +106,7 @@ def evaluate_bandit(bandit: ContextualBandit, records: list[dict]) -> dict:
             continue
 
         context = np.array(features, dtype=np.float64)
-        selected = bandit.select_arm(context)
+        bandit.select_arm(context)
 
         # Check if bandit would have selected a positive-reward arm
         if reward > 0:

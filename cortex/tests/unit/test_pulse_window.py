@@ -29,7 +29,6 @@ from cortex.libs.signal.windowing import (
     WindowConfig,
 )
 
-
 # =============================================================================
 # Helper: generate synthetic PPG-like signals
 # =============================================================================

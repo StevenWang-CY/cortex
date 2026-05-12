@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -204,7 +203,7 @@ class ReplayHarness:
         print(f"Intervention events: {results.intervention_events}")
         print(f"Outcome events:      {results.outcome_events}")
         print(f"Helpfulness events:  {results.helpfulness_events}")
-        print(f"")
+        print("")
         print(f"Interventions:       {results.intervention_count}")
         print(f"  Engaged:           {results.engaged_count}")
         print(f"  Dismissed:         {results.dismissed_count}")

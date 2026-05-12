@@ -359,37 +359,33 @@ Valid `user_action` values: `dismissed`, `engaged`, `snoozed`, `timed_out`, `nat
 
 #### `GET /api/stress-integral`
 
-Current cumulative HRV suppression integral.
+Current cumulative standardized HRV-deficit integral (the "biological
+pomodoro"). When ``current_value / threshold ≥ 1`` the daemon recommends
+a break.
 
 **Response:**
 ```json
 {
-  "stress_integral": 12.5,
+  "current_value": 12.5,
   "threshold": 30.0,
-  "percentage": 41.7,
+  "should_break": false,
+  "sensitivity_multiplier": 1.0,
   "timestamp": 1000.5
 }
 ```
 
 #### `GET /api/helpfulness/summary`
 
-Summary of intervention helpfulness and bandit state.
+Summary of intervention helpfulness from the contextual-bandit feedback
+loop.
 
 **Response:**
 ```json
 {
   "total_interventions": 15,
   "mean_reward": 0.62,
-  "best_arm": "simplified_workspace",
-  "arm_counts": {
-    "overlay_only": 3,
-    "simplified_workspace": 5,
-    "guided_mode": 2,
-    "breathing": 2,
-    "active_recall": 1,
-    "circuit_breaker": 1,
-    "none": 1
-  },
+  "engagement_rate": 0.74,
+  "recent_rewards": [0.6, 0.8, 0.55],
   "timestamp": 1000.5
 }
 ```

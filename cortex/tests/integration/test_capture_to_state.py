@@ -13,22 +13,15 @@ Verifies:
 
 from __future__ import annotations
 
-import time
-
-import pytest
-
 from cortex.libs.config.settings import StateConfig
 from cortex.libs.schemas.features import (
-    FeatureVector,
     KinematicFeatures,
     PhysioFeatures,
     TelemetryFeatures,
 )
-from cortex.libs.schemas.state import SignalQuality, StateScores, UserBaselines, UserState
 from cortex.services.state_engine.feature_fusion import FeatureFusion
 from cortex.services.state_engine.rule_scorer import RuleScorer
 from cortex.services.state_engine.smoother import ScoreSmoother
-
 
 # ============================================================================
 # Helpers — create feature sets for different states

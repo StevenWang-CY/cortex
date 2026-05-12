@@ -21,8 +21,6 @@ from __future__ import annotations
 import json
 import time
 
-import pytest
-
 from cortex.libs.schemas.context import (
     BrowserContext,
     Diagnostic,
@@ -31,11 +29,15 @@ from cortex.libs.schemas.context import (
     TaskContext,
     TerminalContext,
 )
-from cortex.libs.schemas.features import FeatureVector, KinematicFeatures, PhysioFeatures, TelemetryFeatures
-from cortex.libs.schemas.intervention import InterventionPlan, UIPlan
+from cortex.libs.schemas.features import (
+    FeatureVector,
+    KinematicFeatures,
+    PhysioFeatures,
+    TelemetryFeatures,
+)
 from cortex.libs.schemas.state import SignalQuality, StateEstimate, StateScores
 from cortex.services.context_engine.app_classifier import classify_app, classify_mode
-from cortex.services.llm_engine.parser import parse_and_validate, parse_llm_response
+from cortex.services.llm_engine.parser import parse_and_validate
 from cortex.services.llm_engine.prompts import (
     build_messages,
     build_user_prompt,
@@ -44,7 +46,6 @@ from cortex.services.llm_engine.prompts import (
 from cortex.services.state_engine.feature_fusion import FeatureFusion
 from cortex.services.state_engine.rule_scorer import RuleScorer
 from cortex.services.state_engine.smoother import ScoreSmoother
-
 
 # ============================================================================
 # Helpers
@@ -438,10 +439,10 @@ class TestEndToEnd:
         assert intervention is not None
 
         # --- Step 8: Simulate recovery (FLOW state) ---
-        flow_estimate = _make_state_estimate(
+        _make_state_estimate(
             state="FLOW", confidence=0.80, dwell=20.0
         )
-        flow_estimate = StateEstimate(
+        StateEstimate(
             state="FLOW",
             confidence=0.80,
             scores=StateScores(flow=0.85, hypo=0.05, hyper=0.1, recovery=0.2),
@@ -479,15 +480,15 @@ class TestEndToEnd:
         fusion.update_kinematics(_flow_kinematics(), ts)
         fusion.update_telemetry(_flow_telemetry(), ts)
         vector, quality = fusion.fuse(ts)
-        scores = scorer.compute_scores(vector)
+        scorer.compute_scores(vector)
 
         # Context and prompts
         ctx = _make_coding_context()
         state = _make_state_estimate()
-        messages = build_messages(ctx, state)
+        build_messages(ctx, state)
 
         # Parse plan
-        plan = parse_and_validate(_valid_llm_json())
+        parse_and_validate(_valid_llm_json())
 
         elapsed = time.monotonic() - start
         assert elapsed < 1.0, f"Pipeline took {elapsed:.3f}s (budget: < 1.0s)"
@@ -625,7 +626,6 @@ class TestPerformance:
         """
         from cortex.services.state_engine.feature_fusion import FeatureFusion
         from cortex.services.state_engine.rule_scorer import RuleScorer
-        from cortex.services.state_engine.smoother import ScoreSmoother
 
         start = time.monotonic()
 
@@ -645,8 +645,8 @@ class TestPerformance:
 
         # Context + prompt + parse
         ctx = _make_coding_context()
-        messages = build_messages(ctx, estimate)
-        plan = parse_and_validate(_valid_llm_json())
+        build_messages(ctx, estimate)
+        parse_and_validate(_valid_llm_json())
 
         elapsed = time.monotonic() - start
         assert elapsed < 0.200, f"Full pipeline: {elapsed*1000:.1f}ms (budget: 200ms)"

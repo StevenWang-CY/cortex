@@ -54,18 +54,34 @@ const DISTRACTION_PATTERNS =
 
 /**
  * Classify a tab by its URL into one of the known categories.
+ *
+ * F.1: the output strings are the *single source of truth* for tab
+ * categorisation across the daemon and the extension. They MUST match
+ * the values returned by ``cortex/services/context_engine/tab_classifier.py``
+ * — otherwise the daemon-side parser silently drops the values when the
+ * extension surfaces them in BrowserContext.
+ *
+ * The Python classifier currently emits 9 types:
+ *   educational, documentation, reference, code_host, ai_assistant,
+ *   social, entertainment, video, other
+ *
+ * The TS classifier here exposes the finer-grained URL fingerprinting
+ * (stackoverflow / paper / pdf / search / video_platform / distraction /
+ * communication / learning_platform) but collapses them onto the Python
+ * vocabulary before returning, so cross-process consumers all see the
+ * same set.
  */
 export function classifyTabType(url: string): string {
     const u = url.toLowerCase();
 
     if (u.includes("stackoverflow.com") || u.includes("stackexchange.com")) {
-        return "stackoverflow";
+        return "educational";                 // Python: educational
     }
     if (PDF_PATTERNS.test(u)) {
-        return "pdf";
+        return "documentation";               // Python: documentation
     }
     if (PAPER_PATTERNS.test(u)) {
-        return "paper";
+        return "educational";                 // Python: educational
     }
     if (REFERENCE_PATTERNS.test(u)) {
         return "reference";
@@ -78,7 +94,7 @@ export function classifyTabType(url: string): string {
         u.includes("bing.com/search") ||
         u.includes("duckduckgo.com")
     ) {
-        return "search";
+        return "reference";                   // Python: reference
     }
     if (
         u.includes("github.com") ||
@@ -89,22 +105,22 @@ export function classifyTabType(url: string): string {
         return "code_host";
     }
     if (LEARNING_PLATFORM_PATTERNS.test(u)) {
-        return "learning_platform";
+        return "educational";                 // Python: educational
     }
     if (AI_ASSISTANT_PATTERNS.test(u)) {
         return "ai_assistant";
     }
     if (VIDEO_PLATFORM_PATTERNS.test(u)) {
-        return "video_platform";
+        return "video";                       // Python: video
     }
     if (COMMUNICATION_PATTERNS.test(u)) {
-        return "communication";
+        return "social";                      // Python: social
     }
     if (SOCIAL_PATTERNS.test(u)) {
         return "social";
     }
     if (DISTRACTION_PATTERNS.test(u)) {
-        return "distraction";
+        return "entertainment";               // Python: entertainment
     }
     return "other";
 }

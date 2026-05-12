@@ -218,12 +218,12 @@ class PostureAnalyzer:
         # Extract key landmarks
         left_ear = face_landmarks_px[_FACEMESH_LEFT_EAR]
         right_ear = face_landmarks_px[_FACEMESH_RIGHT_EAR]
-        nose = face_landmarks_px[_FACEMESH_NOSE_TIP]
+        face_landmarks_px[_FACEMESH_NOSE_TIP]
         chin = face_landmarks_px[_FACEMESH_CHIN]
         forehead = face_landmarks_px[_FACEMESH_FOREHEAD]
 
         # Ear midpoint
-        ear_mid = (left_ear + right_ear) / 2.0
+        (left_ear + right_ear) / 2.0
 
         # Forward lean: angle between vertical and ear-midpoint → chin vector
         # In upright posture, chin is roughly below ear midpoint

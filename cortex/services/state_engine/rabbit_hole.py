@@ -92,7 +92,6 @@ class RabbitHoleDetector:
             "my", "your", "our", "their", "its", "i", "me", "we", "you",
             "it", "they", "them", "this", "that", "these", "those",
             "not", "no", "nor", "so", "too", "very",
-            "build", "create", "implement", "make", "write",
             "core", "main", "basic", "simple",
         }
         # Short technical terms that should be kept as keywords
