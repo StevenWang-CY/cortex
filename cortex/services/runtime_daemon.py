@@ -1874,23 +1874,35 @@ class CortexDaemon:
                 )
             else:
                 self._trigger_policy.clear_quiet_mode()
+        # B.4 fix: accept both "llm_provider" (canonical, new clients) and
+        # "llm_mode" (legacy from the SettingsDialog) so the dropdown in
+        # the desktop settings actually rebuilds the client.
+        provider_value: str | None = None
         if "llm_provider" in settings:
-            provider = str(settings["llm_provider"])
-            if provider in {"bedrock", "vertex", "direct"}:
-                self.config.llm.provider = provider  # type: ignore[assignment]
-            elif provider == "rule_based":
+            provider_value = str(settings["llm_provider"])
+        elif "llm_mode" in settings:
+            provider_value = str(settings["llm_mode"])
+        if provider_value is not None:
+            if provider_value in {"bedrock", "vertex", "direct"}:
+                self.config.llm.provider = provider_value  # type: ignore[assignment]
+            elif provider_value == "rule_based":
                 self.config.llm.fallback_mode = "rule_based"
             self._llm_client = create_llm_client(self.config.llm)
             registry.register("llm_client", self._llm_client)
         # Re-broadcast settings with the values the daemon actually applied,
         # plus any keys clients need to mirror (W-16 cooldown sync).
+        # NOTE: dismiss-cooldowns are SEPARATE from the trigger-spacing
+        # ``cooldown_seconds`` knob. The previous implementation reused
+        # ``cooldown_seconds * 1000`` for both, which produced a 30×
+        # shrink of the extension's 30-min/10-min defaults the moment
+        # the daemon connected. Use the dedicated config fields instead.
         applied = dict(settings)
         applied.setdefault(
             "intervention_dismiss_cooldown_ms",
-            int(self.config.intervention.cooldown_seconds * 1000),
+            int(self.config.intervention.intervention_dismiss_cooldown_ms),
         )
         applied.setdefault(
             "url_dismiss_cooldown_ms",
-            int(self.config.intervention.cooldown_seconds * 1000),
+            int(self.config.intervention.url_dismiss_cooldown_ms),
         )
         await self._ws_server.broadcast_settings(applied)

@@ -2,31 +2,27 @@
 # These values can be overridden by environment variables or .env file
 
 llm:
-  mode: azure
-  remote:
-    host: ""
-    port: 8800
-    ssh_tunnel: false
-    ssh_user: ""
-  local:
-    host: localhost
-    port: 11434
-    model: llama3.1:8b
-  azure:
-    endpoint: ""
-    api_key: ""
-    api_version: 2025-01-01-preview
-    deployment_name: ""
-    reasoning_deployment_name: ""
-    max_completion_tokens: 1024
-    use_keychain: true
-    keychain_service: cortex.azure_openai
-    keychain_account: default
-  model_name: qwen3-8b
+  # v0.2.1: Anthropic SDK transport. AWS Bedrock is the production path;
+  # AsyncAnthropic (direct) and AsyncAnthropicVertex are escape hatches
+  # selected by ANTHROPIC_PROVIDER / config.llm.provider.
+  provider: bedrock
+  bedrock:
+    aws_region: us-east-2
+    keychain_service: cortex.bedrock
+    keychain_account: bearer_token
+  use_keychain: true
+  model_default: claude-sonnet-4-6
+  model_fast: claude-haiku-4-5
+  model_deep: claude-opus-4-7
   max_tokens: 1024
   temperature: 0.3
-  timeout_seconds: 10.0
-  fallback_mode: local_ollama
+  timeout_seconds: 30.0
+  cache_ttl_seconds: 300
+  fallback_mode: rule_based
+  max_concurrent_requests: 3
+  circuit_failure_threshold: 5
+  circuit_window_seconds: 60.0
+  circuit_open_seconds: 30.0
 
 capture:
   device_id: null

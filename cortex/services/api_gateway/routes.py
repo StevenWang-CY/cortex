@@ -418,7 +418,11 @@ async def request_llm_plan(
             )
             return LLMPlanResponse(plan=plan)
 
-    llm_client = _get_first_service(reg, "llm_client", "remote_qwen_client", "local_ollama_client")
+    # v0.2.1: only "llm_client" is registered — the legacy remote_qwen /
+    # local_ollama service keys were removed as part of the Anthropic SDK
+    # migration. Keep the call as a single-key lookup for symmetry with
+    # the helper signature.
+    llm_client = _get_first_service(reg, "llm_client")
     if llm_client is not None and hasattr(llm_client, "generate_intervention_plan"):
         plan = await llm_client.generate_intervention_plan(
             body.task_context,

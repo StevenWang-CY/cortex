@@ -70,14 +70,39 @@ export function activate(context: vscode.ExtensionContext): void {
     });
 
     wsClient.onRestore((payload) => {
+        const applied: string[] = [];
+        const errors: string[] = [];
+        let restoreOk = true;
         if (foldController?.hasPendingFolds) {
-            void foldController.restoreFoldState();
+            try {
+                void foldController.restoreFoldState();
+                applied.push("restoreFoldState");
+            } catch (e) {
+                restoreOk = false;
+                errors.push(`restoreFoldState: ${(e as Error)?.message ?? String(e)}`);
+            }
         }
         panelProvider?.showPanel();
         vscode.window.setStatusBarMessage(
             `Cortex restored workspace (${String(payload.user_action ?? "done")})`,
             3000,
         );
+        // B.2 (restore-side ack): tell the daemon the unfold completed so
+        // InterventionOutcome.workspace_restored reflects reality.
+        const interventionId = payload?.intervention_id;
+        if (typeof interventionId === "string") {
+            try {
+                wsClient.sendInterventionApplied(
+                    interventionId,
+                    "restore",
+                    restoreOk,
+                    applied,
+                    errors,
+                );
+            } catch {
+                // ws may be closing — never crash the handler
+            }
+        }
     });
 
     wsClient.onSettingsSync((payload) => {

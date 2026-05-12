@@ -194,6 +194,15 @@ class InterventionConfig(BaseModel):
     guided_threshold: float = 0.95
     complexity_threshold: float = 0.6
     cooldown_seconds: int = 60
+    # B.4 fix: these are *separate* semantic quantities from the trigger
+    # cooldown. ``cooldown_seconds`` (60s) is the minimum spacing between
+    # successive trigger evaluations; the dismiss-cooldowns below are the
+    # grace windows during which a freshly-dismissed intervention or URL
+    # must not re-fire. Conflating them (W-16's original implementation
+    # broadcast ``cooldown_seconds * 1000`` for both) produced a 30×
+    # shrink relative to the browser-extension defaults (30 min / 10 min).
+    intervention_dismiss_cooldown_ms: int = 30 * 60 * 1000
+    url_dismiss_cooldown_ms: int = 10 * 60 * 1000
     # NOTE: `hyper_dwell_seconds` lives on StateConfig (default 30) — the
     # duplicate field that lived here was removed in v0.2.0 (C.5). The
     # trigger policy reads StateConfig.hyper_dwell_seconds directly.

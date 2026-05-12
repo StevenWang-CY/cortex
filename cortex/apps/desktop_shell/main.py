@@ -91,6 +91,24 @@ class WebSocketBridge(QObject):
         })
         asyncio.run_coroutine_threadsafe(self._send(msg), self._loop)
 
+    def send_shutdown(self) -> None:
+        """E.1 (WS-mode Stop button): send a top-level SHUTDOWN message.
+
+        The WS server handles ``type=SHUTDOWN`` directly (it routes to
+        ``_request_shutdown`` → SIGTERM). The previous implementation went
+        through USER_ACTION, which the daemon dropped because no
+        ``intervention_id`` was attached.
+        """
+        if self._loop is None or self._ws is None:
+            return
+        msg = json.dumps({
+            "type": "SHUTDOWN",
+            "payload": {},
+            "timestamp": 0,
+            "sequence": 0,
+        })
+        asyncio.run_coroutine_threadsafe(self._send(msg), self._loop)
+
     def send_settings(self, settings: dict[str, Any]) -> None:
         """Send SETTINGS_SYNC to the daemon."""
         if self._loop is None or self._ws is None:
@@ -378,15 +396,23 @@ class CortexApp:
             logger.warning("Connections panel unavailable", exc_info=True)
 
     def _request_remote_shutdown(self) -> None:
-        """E.1 / E.4: tear down the daemon when the dashboard Stop button fires."""
+        """E.1 / E.4: tear down the daemon when the dashboard Stop button fires.
+
+        Sends a top-level ``SHUTDOWN`` WS message (which the daemon's
+        websocket_server handles via ``_request_shutdown`` → SIGTERM) and
+        then quits the shell after the daemon has time to release the
+        camera + WebSocket. The previous implementation used
+        ``send_user_action("shutdown", "")`` which the daemon silently
+        dropped because the action handler requires an intervention_id.
+        """
         if self._bridge is not None:
             try:
-                self._bridge.send_user_action("shutdown", "")
+                self._bridge.send_shutdown()
             except Exception:
                 pass
-        # Best-effort: also quit the desktop shell so the tray icon
-        # disappears alongside the daemon.
-        QTimer.singleShot(500, self._quit)
+        # Give the daemon ~1s to receive and act on SHUTDOWN before the
+        # shell exits (WS close races with the daemon's flush logic).
+        QTimer.singleShot(1000, self._quit)
 
     def _send_goal(self, goal: str) -> None:
         """Forward the dashboard goal-input text to the daemon."""

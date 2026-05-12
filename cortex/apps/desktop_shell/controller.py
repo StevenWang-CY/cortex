@@ -150,6 +150,19 @@ class CortexAppController:
         self._onboarding.open_settings_requested.connect(self._show_settings)
         self._onboarding.run_calibration_requested.connect(self._run_calibration)
         self._onboarding.completed.connect(self._complete_onboarding)
+        # E.5 (DMG-path completion): step-4 "Open Connections" button.
+        # Previously only the WS-mode CortexApp wired this signal, so the
+        # DMG-shipping in-process controller left the button dead.
+        if hasattr(self._onboarding, "extensions_requested"):
+            self._onboarding.extensions_requested.connect(self._show_connections)
+        # E.1 (DMG-path completion): dashboard Stop button and goal input.
+        # The bundled controller never owns a WebSocket — its `stop` path is
+        # to schedule the in-process daemon's `stop()` coroutine on the
+        # daemon thread loop, then quit the Qt app.
+        if hasattr(self._dashboard, "stop_requested"):
+            self._dashboard.stop_requested.connect(self._stop_daemon_and_quit)
+        if hasattr(self._dashboard, "goal_set"):
+            self._dashboard.goal_set.connect(self._on_goal_set)
 
         # -- Start daemon in background thread --------------------------------
         self._start_daemon()
@@ -396,3 +409,45 @@ class CortexAppController:
             self._dashboard.close()
         if self._app is not None:
             self._app.quit()
+
+    def _stop_daemon_and_quit(self) -> None:
+        """E.1 (DMG path): tear down the in-process daemon then quit Qt.
+
+        The dashboard Stop button used to do nothing in DMG mode. Now it
+        schedules ``daemon.stop()`` on the daemon thread's event loop —
+        which releases the camera, finalises the SessionReport, and closes
+        the WebSocket — before quitting the Qt app via ``_quit`` (which
+        also triggers ``aboutToQuit → _shutdown_daemon`` as a safety net).
+        """
+        logger.info("Dashboard Stop button — stopping daemon and quitting")
+        if self._daemon is not None and self._daemon_loop is not None and self._daemon_loop.is_running():
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._daemon.stop(), self._daemon_loop,
+                )
+                # Wait a short time so the camera is released before Qt exits.
+                future.result(timeout=5.0)
+            except Exception:
+                logger.warning("Daemon stop timed out from dashboard Stop", exc_info=True)
+        self._quit()
+
+    def _on_goal_set(self, goal: str) -> None:
+        """E.1 (DMG path): forward dashboard goal input to the daemon.
+
+        The in-process controller can mutate the daemon directly — no
+        round-trip through WebSocket needed. ``set_current_goal`` updates
+        the context engine's goal hint so the next planner call sees it.
+        """
+        cleaned = (goal or "").strip()
+        if not cleaned or self._daemon is None or self._daemon_loop is None:
+            return
+        try:
+            # Most rabbit-hole/goal logic lives behind the daemon's APIs;
+            # forward by mutating the focus session if exposed.
+            if hasattr(self._daemon, "set_current_goal"):
+                asyncio.run_coroutine_threadsafe(
+                    self._daemon.set_current_goal(cleaned),
+                    self._daemon_loop,
+                )
+        except Exception:
+            logger.debug("Failed to forward goal to daemon", exc_info=True)

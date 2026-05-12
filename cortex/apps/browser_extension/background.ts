@@ -475,6 +475,37 @@ function send(msg: WSMessage): void {
     }
 }
 
+/**
+ * B.2: ack an intervention apply / restore phase back to the daemon.
+ *
+ * The daemon's executor uses an _OptimisticInterventionAdapter that
+ * defaults every Mutation.success to True. Without this ack, the
+ * browser side (where >80% of mutations live — tab hides, overlay
+ * injections, distraction blocks) silently reports success regardless
+ * of actual outcome. See cortex/services/runtime_daemon.py
+ * `_handle_intervention_applied`.
+ */
+function sendInterventionApplied(
+    interventionId: string,
+    phase: "apply" | "restore",
+    success: boolean,
+    appliedActions: string[],
+    errors: string[],
+): void {
+    send({
+        type: "INTERVENTION_APPLIED",
+        payload: {
+            intervention_id: interventionId,
+            phase,
+            success,
+            applied_actions: appliedActions,
+            errors,
+        },
+        timestamp: Date.now() / 1000,
+        sequence: ++sequence,
+    });
+}
+
 function handleDisconnect(): void {
     ws = null;
     if (connected) {
@@ -1182,6 +1213,12 @@ function injectLeetCodeCoachOverlay(kind: string, payload: Record<string, unknow
 async function handleIntervention(
     payload: Record<string, unknown>,
 ): Promise<void> {
+    // B.2: track what we actually applied so the ack at the bottom is
+    // truthful instead of theatrical. Each successful effect appends
+    // a descriptor; failures push to ``errors``.
+    const appliedActions: string[] = [];
+    const errors: string[] = [];
+
     // Snapshot tabs so action executor can resolve tab_index → chrome tab ID
     await snapshotTabsForIntervention();
 
@@ -1201,9 +1238,11 @@ async function handleIntervention(
                     func: injectOverlay,
                     args: [payload],
                 });
+                appliedActions.push("inject_overlay");
             }
         } catch (e) {
             console.error("Cortex: failed to inject overlay", e);
+            errors.push(`inject_overlay: ${(e as Error)?.message ?? String(e)}`);
         }
     }
 
@@ -1239,7 +1278,12 @@ async function handleIntervention(
                     } catch {}
                 }
             }
-            await hideTabsForIntervention(interventionId, protectedIds);
+            try {
+                await hideTabsForIntervention(interventionId, protectedIds);
+                appliedActions.push("hide_tabs_except_active");
+            } catch (e) {
+                errors.push(`hide_tabs: ${(e as Error)?.message ?? String(e)}`);
+            }
         }
     }
 
@@ -1247,6 +1291,21 @@ async function handleIntervention(
         type: "INTERVENTION_TRIGGER",
         payload,
     });
+
+    // B.2: ack the apply so the daemon can replace the optimistic
+    // _OptimisticInterventionAdapter mutation tracking with real
+    // browser-side outcomes. Without this, InterventionOutcome.workspace_restored
+    // is theatrical for tab/overlay mutations (which are the majority).
+    const interventionId = payload.intervention_id;
+    if (typeof interventionId === "string") {
+        sendInterventionApplied(
+            interventionId,
+            "apply",
+            errors.length === 0,
+            appliedActions,
+            errors,
+        );
+    }
 }
 
 async function handleContextRequest(msg: WSMessage): Promise<void> {
@@ -1307,11 +1366,24 @@ async function handleContextRequest(msg: WSMessage): Promise<void> {
 }
 
 async function handleRestore(payload: Record<string, unknown>): Promise<void> {
+    // B.2: track real restore outcome so the daemon's
+    // InterventionOutcome.workspace_restored reflects truth, not
+    // optimistic defaults. Each effect either appends an applied descriptor
+    // or pushes an error.
+    const appliedActions: string[] = [];
+    const errors: string[] = [];
+
     const interventionId = payload.intervention_id;
-    if (typeof interventionId === "string") {
-        await restoreTabsForIntervention(interventionId);
-    } else {
-        await restoreAllTabs();
+    try {
+        if (typeof interventionId === "string") {
+            await restoreTabsForIntervention(interventionId);
+            appliedActions.push("restore_tabs_for_intervention");
+        } else {
+            await restoreAllTabs();
+            appliedActions.push("restore_all_tabs");
+        }
+    } catch (e) {
+        errors.push(`restore_tabs: ${(e as Error)?.message ?? String(e)}`);
     }
     try {
         const tabs = await chrome.tabs.query({});
@@ -1324,12 +1396,23 @@ async function handleRestore(payload: Record<string, unknown>): Promise<void> {
                     }).catch(() => undefined),
                 ),
         );
+        appliedActions.push("remove_overlay");
     } catch {
-        // Ignore overlay cleanup failures
+        errors.push("remove_overlay");
     }
     activeIntervention = null;
     try { chrome.storage.session.remove(["cortex_active_intervention", "cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]); } catch {}
     broadcastToPopup({ type: "INTERVENTION_RESTORE", payload });
+
+    if (typeof interventionId === "string") {
+        sendInterventionApplied(
+            interventionId,
+            "restore",
+            errors.length === 0,
+            appliedActions,
+            errors,
+        );
+    }
 }
 
 // --- Tab Management ---

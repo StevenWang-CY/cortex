@@ -363,6 +363,15 @@ class AnthropicPlanner:
             )
 
             enriched = enrich_plan_with_context(plan, context)
+            # D.6: surface the simplification constraint window into the
+            # UIPlan so VS Code can size its fold window per-plan instead
+            # of using the hard-coded ±20 line default.
+            if constraints is not None and enriched.ui_plan is not None:
+                try:
+                    half = max(5, int(constraints.max_visible_lines) // 2)
+                    enriched.ui_plan.max_visible_lines = half
+                except Exception:
+                    pass
             self._cache.put(context, enriched, state, constraints)
             return enriched
 

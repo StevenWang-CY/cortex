@@ -151,6 +151,16 @@ class UIPlan(BaseModel):
     intervention_type: Literal[
         "overlay_only", "simplified_workspace", "guided_mode"
     ] = Field("overlay_only", description="Type of intervention")
+    # D.6: surfaced here so the VS Code extension can size its fold window
+    # without round-tripping the full SimplificationConstraints object.
+    # Mirrors SimplificationConstraints.max_visible_lines; the planner
+    # populates this from the constraints applied at plan time.
+    max_visible_lines: int = Field(
+        40,
+        ge=10,
+        le=400,
+        description="Half-window of source lines to keep visible around cursor",
+    )
 
 
 class SimplificationConstraints(BaseModel):

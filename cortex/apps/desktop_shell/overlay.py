@@ -276,6 +276,19 @@ class OverlayWindow(QWidget):
         self._step_widgets: list[QCheckBox] = []
         card_layout.addLayout(self._steps_container)
 
+        # B.1: "Why this?" causal-explanation row — surfaces the
+        # transparency string the planner attaches to InterventionPlan.
+        # Renders only when the daemon supplies a non-trivial value
+        # (so the overlay doesn't show empty 'Why' rows).
+        self._causal_label = QLabel("")
+        self._causal_label.setStyleSheet(
+            f"font-family: {CX_FONT_SANS}; font-size: 11px; "
+            f"font-style: italic; color: {_TEXT_SECONDARY.name()};"
+        )
+        self._causal_label.setWordWrap(True)
+        self._causal_label.hide()
+        card_layout.addWidget(self._causal_label)
+
         # Breathing pacer
         pacer_layout = QHBoxLayout()
         pacer_layout.addStretch()
@@ -331,6 +344,15 @@ class OverlayWindow(QWidget):
             self._steps_container.removeWidget(cb)
             cb.deleteLater()
         self._step_widgets.clear()
+
+        # B.1: surface causal_explanation when the daemon supplies it.
+        causal = str(payload.get("causal_explanation") or "").strip()
+        if causal and len(causal) > 20:
+            self._causal_label.setText(f"Why this? {causal}")
+            self._causal_label.show()
+        else:
+            self._causal_label.setText("")
+            self._causal_label.hide()
 
         # Add micro-steps as checkboxes
         for step in payload.get("micro_steps", []):

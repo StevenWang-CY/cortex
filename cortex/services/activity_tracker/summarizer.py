@@ -64,26 +64,23 @@ class ActivitySummarizer:
         return self._template_recap(activity)
 
     async def _call_llm(self, activity: ActivitySummary) -> str:
-        """Call Azure OpenAI to generate a recap."""
-        import httpx
+        """Generate a recap via the Anthropic SDK (Haiku tier).
 
+        v0.2.1: rewritten from the Azure OpenAI fetch above to call Bedrock
+        through the shared ``cortex.libs.llm.anthropic_client`` factory.
+        We don't go through ``AnthropicPlanner`` because that path forces
+        a typed ``InterventionPlan`` tool-use output; for a 1-3 sentence
+        recap we just want raw text.
+        """
         from cortex.libs.config.settings import LLMConfig
-        from cortex.libs.utils import get_keychain_password
+        from cortex.libs.llm.anthropic_client import (
+            build_anthropic_sdk_client,
+            resolve_anthropic_model_id,
+        )
 
         config = self._llm_config
         if not isinstance(config, LLMConfig):
             raise ValueError("LLM config not available")
-
-        endpoint = config.azure.endpoint.rstrip("/")
-        api_key = config.azure.api_key
-        if not api_key and config.azure.use_keychain:
-            api_key = get_keychain_password(
-                config.azure.keychain_service,
-                config.azure.keychain_account,
-            ) or ""
-
-        if not endpoint or not api_key or not config.azure.deployment_name:
-            raise ValueError("Azure OpenAI not configured")
 
         prompt = _RECAP_PROMPT.format(
             title=activity.title,
@@ -92,27 +89,33 @@ class ActivitySummarizer:
             context=activity.context_snapshot[:200] if activity.context_snapshot else "N/A",
         )
 
-        url = (
-            f"{endpoint}/openai/deployments/{config.azure.deployment_name}"
-            f"/chat/completions?api-version={config.azure.api_version}"
-        )
-
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(
-                url,
-                headers={"api-key": api_key, "Content-Type": "application/json"},
-                json={
-                    "messages": [
-                        {"role": "system", "content": "You are a concise study assistant."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "temperature": 0.3,
-                    "max_tokens": 150,
-                },
+        try:
+            sdk = build_anthropic_sdk_client(
+                provider=config.provider,
+                bedrock_region=config.bedrock.aws_region,
             )
-            resp.raise_for_status()
-            data = resp.json()
-            return data["choices"][0]["message"]["content"].strip()
+        except RuntimeError as exc:
+            # No credentials available → fall through to template recap.
+            raise ValueError(str(exc)) from exc
+
+        model_id = resolve_anthropic_model_id(
+            config.model_fast, provider=config.provider,
+        )
+        response = await sdk.messages.create(
+            model=model_id,
+            max_tokens=200,
+            temperature=0.3,
+            system=[{"type": "text", "text": "You are a concise study assistant."}],
+            messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+            timeout=15.0,
+        )
+        # Concatenate any text blocks the model returns.
+        parts: list[str] = []
+        for block in getattr(response, "content", []) or []:
+            text = getattr(block, "text", None)
+            if isinstance(text, str):
+                parts.append(text)
+        return "".join(parts).strip()
 
     @staticmethod
     def _template_recap(activity: ActivitySummary) -> str:
