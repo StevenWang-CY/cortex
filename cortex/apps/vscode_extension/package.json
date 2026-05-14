@@ -2,7 +2,7 @@
   "name": "cortex-somatic",
   "displayName": "Cortex — Somatic Workspace Engine",
   "description": "Real-time biofeedback workspace engine that detects cognitive overwhelm and restructures your VS Code environment.",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "publisher": "cortex",
   "engines": {
     "vscode": "^1.85.0"

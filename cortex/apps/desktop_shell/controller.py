@@ -24,6 +24,7 @@ from typing import Any
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
 from PySide6.QtWidgets import QApplication
 
+from cortex.apps.desktop_shell import mac_native
 from cortex.apps.desktop_shell.connections import ConnectionsPanel
 from cortex.apps.desktop_shell.dashboard import DashboardWindow
 from cortex.apps.desktop_shell.onboarding import OnboardingWindow, onboarding_marker_path
@@ -178,6 +179,13 @@ class CortexAppController:
 
         # -- Show UI ----------------------------------------------------------
         self._tray.show()
+        # Best-effort NSStatusItem upgrade: replaces the Qt-rendered tray
+        # icon with a templated SF Symbol heart that follows menu-bar
+        # appearance (light/dark) automatically. No-op on non-mac.
+        try:
+            self._tray.install_native_status_item()
+        except Exception:
+            logger.debug("native status item install failed", exc_info=True)
 
         # Force the app to activate as a foreground app on macOS.
         # PyInstaller bundles don't always get proper activation, so the
@@ -199,6 +207,15 @@ class CortexAppController:
             logger.info("_initial_show: showing dashboard window")
             try:
                 self._show_dashboard()
+                # Each window's ``showEvent`` now applies vibrancy + unified
+                # titlebar internally via mac_native; this hook is the
+                # belt-and-suspenders re-application for the dashboard,
+                # which can be reshown without going through __init__.
+                if self._dashboard is not None:
+                    mac_native.apply_unified_titlebar(self._dashboard)
+                    mac_native.apply_vibrancy(
+                        self._dashboard, material="window_background",
+                    )
                 logger.info("_initial_show: dashboard shown successfully, visible=%s",
                             self._dashboard.isVisible() if self._dashboard else "None")
             except Exception:

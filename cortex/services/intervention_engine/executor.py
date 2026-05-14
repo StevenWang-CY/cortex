@@ -102,6 +102,10 @@ class InterventionExecutor:
         if self._registry is not None:
             adapter = self._registry.get(name)
             if adapter is not None:
+                # AdapterRegistry.get returns Any; we rely on the runtime
+                # protocol structural-check (WorkspaceAdapter.execute) rather
+                # than a static cast — adapters are registered by name and
+                # mypy cannot prove the type without a runtime isinstance.
                 return adapter  # type: ignore[return-value]
         return self._adapters.get(name)
 
@@ -189,6 +193,10 @@ class InterventionExecutor:
 
             reversal = Mutation(
                 adapter=m.adapter,
+                # m.reverse_action is typed as str | None; the guard
+                # `if not m.is_reversible: continue` above (line ~183)
+                # ensures it is non-None here. mypy cannot follow the
+                # property-based narrowing across the attribute access.
                 action=m.reverse_action,  # type: ignore[arg-type]
                 timestamp=time.monotonic(),
             )

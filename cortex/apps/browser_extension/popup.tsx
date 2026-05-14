@@ -309,9 +309,13 @@ function CortexPopup(): React.ReactElement {
     }, []);
 
     const handleStartFocus = useCallback(() => {
+        const goal = goalInput.trim();
+        if (goal === "") {
+            return;
+        }
         chrome.runtime.sendMessage({
             type: "START_FOCUS",
-            goal: goalInput || "Study session",
+            goal,
         });
         setGoalInput("");
     }, [goalInput]);
@@ -401,8 +405,9 @@ function CortexPopup(): React.ReactElement {
                     </div>
                     <div style={{ marginTop: 8 }}>
                         <button style={S.ghostBtn} onClick={() => {
-                            if (briefing.left_off_at) {
-                                chrome.runtime.sendMessage({ type: "START_FOCUS", goal: briefing.left_off_at });
+                            const leftOff = (briefing.left_off_at ?? "").trim();
+                            if (leftOff !== "") {
+                                chrome.runtime.sendMessage({ type: "START_FOCUS", goal: leftOff });
                             }
                             setBriefing(null);
                         }}>Resume</button>
@@ -489,6 +494,7 @@ function CortexPopup(): React.ReactElement {
                         style={S.goalInput}
                         placeholder="What are you working on?"
                         value={goalInput}
+                        maxLength={120}
                         onChange={(e) => setGoalInput(e.target.value)}
                         onKeyDown={(e) => e.key === "Enter" && handleStartFocus()}
                     />

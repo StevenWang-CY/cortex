@@ -92,7 +92,7 @@ export function activate(context: vscode.ExtensionContext): void {
         const interventionId = payload?.intervention_id;
         if (typeof interventionId === "string") {
             try {
-                wsClient.sendInterventionApplied(
+                wsClient?.sendInterventionApplied(
                     interventionId,
                     "restore",
                     restoreOk,

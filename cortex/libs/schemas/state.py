@@ -10,7 +10,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 class UserState(StrEnum):
@@ -20,7 +20,6 @@ class UserState(StrEnum):
     HYPO = "HYPO"  # Under-arousal, disengagement
     HYPER = "HYPER"  # Over-arousal, overwhelm
     RECOVERY = "RECOVERY"  # Transitioning back to flow
-    HYPO_APNEA = "HYPO_APNEA"
 
 
 class SignalQuality(BaseModel):
@@ -36,6 +35,7 @@ class SignalQuality(BaseModel):
         0.0, ge=0.0, le=1.0, description="Telemetry signal quality"
     )
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def overall(self) -> float:
         """Compute overall signal quality as weighted average."""
@@ -43,6 +43,7 @@ class SignalQuality(BaseModel):
         qualities = [self.physio, self.kinematics, self.telemetry]
         return sum(w * q for w, q in zip(weights, qualities, strict=False))
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def acceptable(self) -> bool:
         """Check if signal quality is acceptable for intervention."""

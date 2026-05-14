@@ -266,6 +266,12 @@ class CortexDaemon:
         )
         self._last_physio_update = 0.0
         self._active_intervention_id: str | None = None
+        # Dedup set for INTERVENTION_APPLIED acks. Clients can send the
+        # same (intervention_id, phase) twice (e.g. retries, multiple
+        # browser tabs echoing the ack); the second one would otherwise
+        # overwrite Mutation.success / re-append to the recorder. Keys
+        # are tuples of (intervention_id, phase).
+        self._intervention_applied_seen: set[tuple[str, str]] = set()
         self._aggregator = FeatureAggregator(
             self._input_hooks,
             self._window_tracker,
@@ -1500,6 +1506,20 @@ class CortexDaemon:
         if not isinstance(intervention_id, str):
             return
         phase = str(payload.get("phase", "apply"))
+
+        # Dedup: a second ack for the same (intervention_id, phase) would
+        # otherwise overwrite Mutation.success and re-append the recorder
+        # event. Drop duplicates silently after the first one.
+        dedup_key = (intervention_id, phase)
+        if dedup_key in self._intervention_applied_seen:
+            logger.debug(
+                "Duplicate INTERVENTION_APPLIED ack for %s (phase=%s); ignoring",
+                intervention_id,
+                phase,
+            )
+            return
+        self._intervention_applied_seen.add(dedup_key)
+
         success = bool(payload.get("success", False))
         errors = payload.get("errors") or []
         error_text = "; ".join(str(e) for e in errors) if errors else None

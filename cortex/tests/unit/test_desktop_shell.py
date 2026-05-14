@@ -110,6 +110,16 @@ def _setup_pyside6_mocks() -> bool:
     qtcore.QObject = MockQObject
     qtcore.QRect = MockQRect
     qtcore.QRectF = MockQRect
+    # mac_native bridge (and the new heart-shape tray icon) use QPointF.
+    class MockQPointF:
+        def __init__(self, x: float = 0, y: float = 0) -> None:
+            self._x = x
+            self._y = y
+        def x(self) -> float:
+            return self._x
+        def y(self) -> float:
+            return self._y
+    qtcore.QPointF = MockQPointF
     qtcore.QPropertyAnimation = MockQPropertyAnimation
     qtcore.QSettings = MockQSettings
     qtcore.QEvent = type("QEvent", (), {})
@@ -146,6 +156,7 @@ def _setup_pyside6_mocks() -> bool:
         def drawEllipse(self, *args): pass
         def drawLine(self, *args): pass
         def drawText(self, *args): pass
+        def drawPath(self, *args): pass
         def setFont(self, f): pass
         def end(self): pass
 
@@ -157,6 +168,8 @@ def _setup_pyside6_mocks() -> bool:
         def addRoundedRect(self, *args): pass
         def moveTo(self, *args): pass
         def lineTo(self, *args): pass
+        def cubicTo(self, *args): pass
+        def closeSubpath(self): pass
 
     class MockQPixmap:
         def __init__(self, *args): pass
@@ -172,6 +185,7 @@ def _setup_pyside6_mocks() -> bool:
             self._enabled = True
         def setEnabled(self, e): self._enabled = e
         def setText(self, t): self._text = t
+        def setShortcut(self, *_args): pass
 
     qtgui.QColor = MockQColor
     qtgui.QFont = MockQFont
@@ -341,7 +355,13 @@ def _setup_pyside6_mocks() -> bool:
         def __init__(self, text="", parent=None):
             super().__init__(parent)
             self._text = text
+            self._checked = False
             self.clicked = MockSignal()
+        def setCheckable(self, v): pass
+        def setChecked(self, v): self._checked = v
+        def isChecked(self): return self._checked
+        def setShortcut(self, *_args): pass
+        def setAccessibleName(self, *_args): pass
 
     class MockQTabWidget(MockQWidget):
         def __init__(self, parent=None):
@@ -349,6 +369,24 @@ def _setup_pyside6_mocks() -> bool:
             self._tabs = []
         def addTab(self, widget, title):
             self._tabs.append((widget, title))
+
+    class MockQButtonGroup:
+        def __init__(self, *args, **kwargs):
+            self._buttons = []
+        def addButton(self, *_args, **_kwargs):
+            return None
+        def setExclusive(self, *_args):
+            return None
+
+    class MockQStackedWidget(MockQWidget):
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self._children = []
+            self._index = 0
+        def addWidget(self, w):
+            self._children.append(w)
+        def setCurrentIndex(self, i):
+            self._index = i
 
     class MockQScrollArea(MockQWidget):
         def __init__(self, parent=None):
@@ -417,6 +455,8 @@ def _setup_pyside6_mocks() -> bool:
     qtwidgets.QSystemTrayIcon = MockQSystemTrayIcon
     qtwidgets.QPushButton = MockQPushButton
     qtwidgets.QTabWidget = MockQTabWidget
+    qtwidgets.QButtonGroup = MockQButtonGroup
+    qtwidgets.QStackedWidget = MockQStackedWidget
     qtwidgets.QScrollArea = MockQScrollArea
     qtwidgets.QSizePolicy = MockQSizePolicy
     qtwidgets.QMessageBox = MockQMessageBox
@@ -457,7 +497,7 @@ from cortex.apps.desktop_shell.settings import SettingsDialog
 from cortex.apps.desktop_shell.tray import (
     STATE_COLORS,
     CortexTrayIcon,
-    _make_circle_icon,
+    _make_heart_icon,
 )
 from cortex.apps.desktop_shell.dashboard import (
     DashboardWindow,
@@ -478,9 +518,9 @@ class TestTrayIcon:
         assert "HYPO" in STATE_COLORS
         assert "RECOVERY" in STATE_COLORS
 
-    def test_make_circle_icon(self):
+    def test_make_heart_icon(self):
         from PySide6.QtGui import QColor
-        icon = _make_circle_icon(QColor(255, 0, 0))
+        icon = _make_heart_icon(QColor(255, 0, 0))
         assert icon is not None
 
     def test_tray_init(self):

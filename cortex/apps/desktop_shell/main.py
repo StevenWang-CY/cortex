@@ -25,6 +25,7 @@ from typing import Any
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
 from PySide6.QtWidgets import QApplication
 
+from cortex.apps.desktop_shell import mac_native
 from cortex.apps.desktop_shell.dashboard import DashboardWindow
 from cortex.apps.desktop_shell.onboarding import OnboardingWindow, onboarding_marker_path
 from cortex.apps.desktop_shell.overlay import OverlayWindow
@@ -136,7 +137,14 @@ class WebSocketBridge(QObject):
         self._loop.run_until_complete(self._connect_loop())
 
     async def _connect_loop(self) -> None:
-        """Connect to WebSocket with auto-reconnect."""
+        """Connect to WebSocket with auto-reconnect.
+
+        swift-concurrency-pro gap fix: previously a bare ``except Exception``
+        swallowed :class:`asyncio.CancelledError`, so :meth:`stop` could not
+        unwind the loop cleanly. We now re-raise ``CancelledError`` (the
+        Swift-concurrency "let cancellation propagate" rule in Python idiom)
+        and only catch the network-shaped exceptions for the reconnect path.
+        """
         while self._running:
             try:
                 import websockets
@@ -166,7 +174,25 @@ class WebSocketBridge(QObject):
             except ImportError:
                 logger.error("websockets package not installed")
                 break
+            except asyncio.CancelledError:
+                # Propagate cleanly so the event loop can shut down.
+                self._ws = None
+                self.connection_changed.emit(False)
+                raise
+            except (OSError, ConnectionError) as e:
+                self._ws = None
+                self.connection_changed.emit(False)
+                logger.debug(f"WebSocket disconnected: {e}")
+                if self._running:
+                    await asyncio.sleep(self._reconnect_delay)
+                    self._reconnect_delay = min(
+                        self._reconnect_delay * 2.0, self._reconnect_delay_max,
+                    )
             except Exception as e:
+                # ``websockets.ConnectionClosed`` and similar transient
+                # protocol errors don't subclass OSError. Keep them in
+                # the reconnect path but distinguish them from
+                # cancellation, which is handled above.
                 self._ws = None
                 self.connection_changed.emit(False)
                 logger.debug(f"WebSocket disconnected: {e}")
@@ -292,6 +318,22 @@ class CortexApp:
 
         # Show tray icon
         self._tray.show()
+        try:
+            self._tray.install_native_status_item()
+        except Exception:
+            logger.debug("native status item install failed", exc_info=True)
+
+        # Apply native window chrome to top-level windows. Each window's
+        # ``showEvent`` also calls these to keep things robust on re-show.
+        try:
+            for window in (self._dashboard, self._settings, self._overlay,
+                           self._onboarding):
+                if window is None:
+                    continue
+                mac_native.apply_unified_titlebar(window)
+        except Exception:
+            logger.debug("native chrome init failed", exc_info=True)
+
         if not onboarding_marker_path().exists():
             self._onboarding.show()
 

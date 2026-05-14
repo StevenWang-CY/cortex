@@ -278,18 +278,26 @@ class AnthropicPlanner:
             t0 = time.perf_counter()
             try:
                 async with self._semaphore:
-                    response = await self._sdk.messages.create(
-                        model=model_id,
-                        max_tokens=self._config.max_tokens,
-                        temperature=self._config.temperature,
-                        system=system_blocks,
-                        messages=messages,
-                        tools=[self._plan_tool],
-                        tool_choice={
-                            "type": "tool",
-                            "name": _PLAN_TOOL_NAME,
-                        },
-                        timeout=self._config.timeout_seconds,
+                    # swift-concurrency-pro rule (transferred to asyncio):
+                    # shield the Bedrock call from cooperative cancellation.
+                    # If the caller cancels mid-flight (state pipeline
+                    # tear-down, daemon SIGTERM), we still let the SDK
+                    # finish its current HTTP transaction cleanly so the
+                    # Bedrock connection isn't left in a half-open state.
+                    response = await asyncio.shield(
+                        self._sdk.messages.create(
+                            model=model_id,
+                            max_tokens=self._config.max_tokens,
+                            temperature=self._config.temperature,
+                            system=system_blocks,
+                            messages=messages,
+                            tools=[self._plan_tool],
+                            tool_choice={
+                                "type": "tool",
+                                "name": _PLAN_TOOL_NAME,
+                            },
+                            timeout=self._config.timeout_seconds,
+                        )
                     )
             except (RateLimitError, APITimeoutError, APIStatusError) as exc:
                 latency_ms = (time.perf_counter() - t0) * 1000.0

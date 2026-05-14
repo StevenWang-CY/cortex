@@ -1,0 +1,159 @@
+# Cortex — Cross-Surface Design Token Source of Truth
+#
+# Read by `cortex/scripts/sync_design_tokens.py` which emits:
+#   - cortex/apps/desktop_shell/tokens.py
+#   - cortex/apps/browser_extension/design-tokens.ts
+#   - cortex/apps/vscode_extension/src/design-tokens.ts
+#
+# Edit this file, run `python -m cortex.scripts.sync_design_tokens`, then commit
+# all three emitted artifacts together. The sync script is deterministic, so the
+# emitted files round-trip cleanly.
+#
+# Palette is expressed in OKLCH primary (perceptually uniform per
+# frontend-design/color-and-contrast.md), with hex fallback for legacy callers.
+# Brand identity stays terracotta + Cormorant Garamond — see "Out of scope".
+
+version: 2
+
+brand:
+  # Identity preserved across the macOS-native refactor. These exist on every
+  # surface, light AND dark mode, with only a small luma adjustment.
+  accent:
+    oklch: "oklch(63% 0.13 35)"
+    hex:   "#D97757"
+  accent_hover:
+    oklch: "oklch(56% 0.13 32)"
+    hex:   "#C46547"
+  accent_dark:
+    # Boosted for legibility on dark window backgrounds (the macOS approach —
+    # System Accent under dark appearance uses a slightly higher L).
+    oklch: "oklch(70% 0.16 35)"
+    hex:   "#E08E6F"
+  accent_dim:
+    rgba: "rgba(217, 119, 87, 0.12)"
+  accent_subtle:
+    rgba: "rgba(217, 119, 87, 0.06)"
+
+  display_font: "Cormorant Garamond"   # wordmark + hero numerics only
+  wordmark: "Cortex"
+  wordmark_italic: true
+
+# macOS semantic palette. The Python token emitter maps these to NSColor
+# equivalents at runtime via cortex/apps/desktop_shell/mac_native.py; here we
+# pre-bake hex fallbacks so the dev-mode (no pyobjc) and non-mac harnesses
+# don't crash.
+semantic:
+  light:
+    window_bg:        { hex: "#ECECEC" }   # ~NSColor.windowBackgroundColor
+    control_bg:       { hex: "#FFFFFF" }   # ~NSColor.controlBackgroundColor
+    grouped_bg:       { hex: "#F2F2F7" }   # ~NSColor.systemGroupedBackground
+    sidebar_bg:       { hex: "#E5E5EA" }
+    label_primary:    { hex: "#1A1A1A" }   # ~NSColor.labelColor
+    label_secondary:  { hex: "#3C3C434C" } # 30% alpha black (NSColor.secondaryLabelColor)
+    label_tertiary:   { hex: "#3C3C432E" } # 18%
+    label_quaternary: { hex: "#3C3C4318" } # 9%
+    separator:        { hex: "#3C3C4326" } # 15% — hairline
+    danger:           { hex: "#D70015" }   # systemRed
+    success:          { hex: "#30B257" }   # systemGreen
+    warning:          { hex: "#D9A100" }   # systemYellow
+    info:             { hex: "#0A84FF" }   # systemBlue
+  dark:
+    window_bg:        { hex: "#1E1E1E" }
+    control_bg:       { hex: "#2C2C2E" }
+    grouped_bg:       { hex: "#1C1C1E" }
+    sidebar_bg:       { hex: "#232326" }
+    label_primary:    { hex: "#FFFFFF" }
+    label_secondary:  { hex: "#EBEBF599" } # 60% alpha white
+    label_tertiary:   { hex: "#EBEBF54D" }
+    label_quaternary: { hex: "#EBEBF528" }
+    separator:        { hex: "#5454584C" }
+    danger:           { hex: "#FF453A" }
+    success:          { hex: "#32D74B" }
+    warning:          { hex: "#FFD60A" }
+    info:             { hex: "#0A84FF" }
+
+# Cortex-specific state palette — derived from brand accent + system semantic
+# colors. Used on the state badge (capsule), tray icon tint, panel-provider
+# state pill, browser ext popup header.
+state:
+  FLOW:     { label: "Focused",    accent_role: "brand" }
+  HYPER:    { label: "Elevated",   accent_role: "danger" }
+  HYPO:     { label: "Idle",       accent_role: "label_tertiary" }
+  RECOVERY: { label: "Recovering", accent_role: "info" }
+
+# Biometric channel tints. Used in the biometrics card + HR trace plot + browser
+# popup biometrics row. Kept as fixed hues (not semantic) because they encode
+# data identity, not chrome.
+bio:
+  hr:    { hex: "#D97757" }
+  hrv:   { hex: "#57A0D9" }
+  resp:  { hex: "#57D99E" }
+  blink: { hex: "#D9B457" }
+
+typography:
+  # System font stack — guaranteed to resolve to SF Pro Text/Display on macOS,
+  # Segoe UI on Windows, Roboto on Android. Drops Inter (frontend-design rule:
+  # invisible default). On the desktop app the token emitter additionally
+  # produces a QFont via cortex/apps/desktop_shell/mac_native.system_font().
+  system_stack: "-apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"SF Pro Display\", system-ui, sans-serif"
+  display_stack: "\"Cormorant Garamond\", ui-serif, Georgia, serif"
+  mono_stack: "\"SF Mono\", ui-monospace, \"JetBrains Mono\", Menlo, monospace"
+
+  # 5-step modular scale (collapsed from previous 9-step muddle).
+  # Apple HIG nominal sizes: caption 11, footnote 13, body 15, title 22, large title 34.
+  scale:
+    caption:     11
+    footnote:    13
+    body:        15
+    title:       22
+    large_title: 34
+    # Cortex-specific hero number size (Cormorant in dashboard biometrics card).
+    hero_numeric: 32
+
+  # Weights — only the ones we actually use. swiftui-pro / HIG guidance:
+  # default regular, use semibold for control labels + section titles only.
+  weights:
+    regular: 400
+    medium: 500
+    semibold: 600
+    bold: 700
+
+spacing:
+  # 4pt grid (Apple HIG). All UI spacing must be a multiple of these.
+  sp1: 4
+  sp2: 8
+  sp3: 12
+  sp4: 16
+  sp5: 20
+  sp6: 24
+  sp7: 28
+  sp8: 32
+  sp10: 40
+
+radius:
+  # macOS HIG: 10pt for windows, 8pt for cards, 6pt for buttons. Pill = 9999.
+  window: 10
+  card: 8
+  button: 6
+  control: 6
+  pill: 9999
+
+motion:
+  # ms. swiftui-pro / Reduce-Motion guidance: nothing over 400ms unless explicit
+  # opt-in; the browser-ext ambient breathing canvas already gates on
+  # prefers-reduced-motion.
+  micro: 100
+  fast: 150
+  normal: 200
+  slow: 400
+  ambient: 3000
+
+dimensions:
+  dashboard:
+    width: 380          # macOS sidebar utility (was 400)
+    max_height: 720
+  popup:
+    width: 380
+    max_height: 560
+  panel:
+    breathing_pacer_size: 140

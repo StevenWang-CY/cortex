@@ -53,19 +53,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-@router.post("/shutdown")
-async def shutdown(request: Request):
-    """Gracefully shut down the Cortex daemon."""
-    import asyncio
-    import os
-    import signal as _signal
-    logger.info("Shutdown requested via API")
-    # Schedule shutdown after response is sent
-    loop = asyncio.get_running_loop()
-    loop.call_later(0.5, os.kill, os.getpid(), _signal.SIGTERM)
-    return {"status": "shutting_down"}
-
-
 # =============================================================================
 # Response models
 # =============================================================================
@@ -76,6 +63,26 @@ class AckResponse(BaseModel):
 
     status: str = "ok"
     timestamp: float = Field(default_factory=time.monotonic)
+
+
+class ShutdownResponse(BaseModel):
+    """Response for the /shutdown endpoint."""
+
+    status: str = "shutting_down"
+    timestamp: float = Field(default_factory=time.monotonic)
+
+
+@router.post("/shutdown", response_model=ShutdownResponse)
+async def shutdown(request: Request) -> ShutdownResponse:
+    """Gracefully shut down the Cortex daemon."""
+    import asyncio
+    import os
+    import signal as _signal
+    logger.info("Shutdown requested via API")
+    # Schedule shutdown after response is sent
+    loop = asyncio.get_running_loop()
+    loop.call_later(0.5, os.kill, os.getpid(), _signal.SIGTERM)
+    return ShutdownResponse(status="shutting_down")
 
 
 class HealthResponse(BaseModel):

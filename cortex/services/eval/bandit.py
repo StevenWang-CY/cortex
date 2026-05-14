@@ -41,7 +41,6 @@ STATE_CODES = {
     "HYPO": 0.25,
     "RECOVERY": 0.5,
     "HYPER": 1.0,
-    "HYPO_APNEA": 0.3,
 }
 
 

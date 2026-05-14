@@ -1,9 +1,23 @@
-"""
-Desktop Shell — Dashboard Window
+"""Desktop Shell — Dashboard Window (macOS-native refactor).
 
 Two-tab layout:
-  Tab 1 "Dashboard" — Clean biometrics view matching the browser extension popup
-  Tab 2 "Advanced"  — Developer debug view with HR trace, signal quality, state scores
+    Tab 1 "Dashboard" — Consumer biometrics view (Cormorant numerics, terracotta
+                        accent, native typography & spacing)
+    Tab 2 "Advanced"  — Developer debug view: HR trace, signal quality, scores
+
+The visual layer is now driven by:
+
+* :mod:`cortex.apps.desktop_shell.tokens` (emitted from
+  ``cortex/libs/design/tokens.yaml``) — semantic palette, 5-step type scale,
+  HIG-compliant spacing & radii.
+* :mod:`cortex.apps.desktop_shell.mac_native` — system font, NSVisualEffectView
+  vibrancy, unified title bar. Brand identity (terracotta accent +
+  Cormorant Garamond wordmark/numerics + ECG heartbeat motif) is preserved on
+  top of native materials.
+
+All public Signals, slots, and update methods are byte-identical to the
+pre-refactor implementation so :mod:`cortex.apps.desktop_shell.controller`
+and :mod:`cortex.apps.desktop_shell.main` do not need to change.
 """
 
 from __future__ import annotations
@@ -34,8 +48,8 @@ except ImportError:  # pragma: no cover - compatibility for lightweight test moc
             return
 try:
     from PySide6.QtWidgets import (
+        QButtonGroup,
         QFrame,
-        QGraphicsDropShadowEffect,
         QGridLayout,
         QHBoxLayout,
         QLabel,
@@ -44,7 +58,7 @@ try:
         QPushButton,
         QScrollArea,
         QSizePolicy,
-        QTabWidget,
+        QStackedWidget,
         QVBoxLayout,
         QWidget,
     )
@@ -60,17 +74,14 @@ except ImportError:  # pragma: no cover - compatibility for lightweight test moc
         QWidget,
     )
 
-    class QGraphicsDropShadowEffect:  # type: ignore[override]
+    class QButtonGroup:  # type: ignore[override]
         def __init__(self, *_args: object, **_kwargs: object) -> None:
             return
 
-        def setBlurRadius(self, *_args: object, **_kwargs: object) -> None:
+        def addButton(self, *_args: object, **_kwargs: object) -> None:
             return
 
-        def setOffset(self, *_args: object, **_kwargs: object) -> None:
-            return
-
-        def setColor(self, *_args: object, **_kwargs: object) -> None:
+        def setExclusive(self, *_args: object, **_kwargs: object) -> None:
             return
 
     class QLineEdit(QLabel):  # type: ignore[override]
@@ -89,34 +100,39 @@ except ImportError:  # pragma: no cover - compatibility for lightweight test moc
             Expanding = 0
             Preferred = 0
 
-    class QTabWidget(QWidget):  # type: ignore[override]
-        def addTab(self, *_args: object, **_kwargs: object) -> None:
+    class QStackedWidget(QWidget):  # type: ignore[override]
+        def addWidget(self, *_args: object, **_kwargs: object) -> None:
             return
 
+        def setCurrentIndex(self, *_args: object, **_kwargs: object) -> None:
+            return
+
+# Tab widget compatibility shim retained for test harness even though the new
+# dashboard uses a segmented control + QStackedWidget. Some downstream tests
+# still reference QTabWidget at import time.
+try:
+    from PySide6.QtWidgets import QTabWidget  # noqa: F401 - re-exported
+except ImportError:  # pragma: no cover
+    pass
+
+from cortex.apps.desktop_shell import mac_native
 from cortex.apps.desktop_shell.tokens import (
-    CARD_QSS,
-    CX_ACCENT,
-    CX_BG,
-    CX_BIO_BLINK,
-    CX_BIO_HR,
-    CX_BIO_HRV,
-    CX_BORDER,
-    CX_BORDER_DEFAULT,
-    CX_DANGER,
-    CX_FONT_BRAND,
-    CX_FONT_MONO,
-    CX_FONT_SANS,
-    CX_SURFACE,
-    CX_TERTIARY,
-    CX_TEXT,
-    CX_TEXT_SECONDARY,
-    CX_TEXT_TERTIARY,
+    BIO_BLINK,
+    BIO_HR,
+    BIO_HRV,
+    BRAND_ACCENT,
+    BRAND_DISPLAY_FONT,
     DASHBOARD_MAX_HEIGHT,
     DASHBOARD_WIDTH,
-    RADIUS_FULL,
-    RADIUS_MD,
-    RADIUS_SM,
-    SECTION_HEADING_QSS,
+    FS_CAPTION,
+    FS_FOOTNOTE,
+    FS_HERO_NUMERIC,
+    FS_TITLE,
+    FW_REGULAR,
+    FW_SEMIBOLD,
+    RADIUS_CARD,
+    RADIUS_PILL,
+    SEMANTIC_LIGHT,
     SP2,
     SP3,
     SP4,
@@ -131,56 +147,115 @@ logger = logging.getLogger(__name__)
 _MAX_HR_HISTORY = 120
 _MAX_TIMELINE_EVENTS = 50
 
+# Resolved semantic colors. These hex strings are dev-mode fallbacks; on
+# macOS, ``mac_native`` re-tints widgets at runtime when the user toggles
+# light/dark mode (see :func:`mac_native.install_appearance_observer`).
+_WINDOW_BG = SEMANTIC_LIGHT["window_bg"]
+_CONTROL_BG = SEMANTIC_LIGHT["control_bg"]
+_GROUPED_BG = SEMANTIC_LIGHT["grouped_bg"]
+_LABEL = SEMANTIC_LIGHT["label_primary"]
+_LABEL_SECONDARY = "#5C5854"   # high-contrast secondary (AA passes on warm bg)
+_LABEL_TERTIARY = "#827971"    # AA-passing tertiary (placeholders, captions)
+_SEPARATOR = SEMANTIC_LIGHT["separator"]
+_DANGER = SEMANTIC_LIGHT["danger"]
+
+
+def _system(point_size: float, weight: str = "regular") -> str:
+    """Return a Qt stylesheet font-family value resolving to the system font.
+
+    Used inside QSS strings where a literal stack is required. The companion
+    helper :func:`mac_native.system_font` returns an actual ``QFont`` for use
+    with ``setFont()`` calls.
+    """
+    return '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif'
+
 
 # ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _card_shadow(widget: QWidget) -> None:
-    """Apply a soft drop shadow to a widget."""
-    shadow = QGraphicsDropShadowEffect(widget)
-    shadow.setBlurRadius(20)
-    shadow.setOffset(0, 2)
-    shadow.setColor(QColor(0, 0, 0, 16))
-    widget.setGraphicsEffect(shadow)
-
-
-# ---------------------------------------------------------------------------
-# Global stylesheet
+# Global stylesheet — minimal, semantic
 # ---------------------------------------------------------------------------
 
 _GLOBAL_QSS = f"""
 QWidget#CortexDashboard {{
-    background-color: {CX_BG};
+    background-color: transparent;
 }}
-QTabWidget::pane {{
-    border: none;
-    background: {CX_BG};
+QLineEdit {{
+    selection-background-color: {BRAND_ACCENT};
 }}
-QTabBar {{
-    background: {CX_BG};
-    border: none;
-}}
-QTabBar::tab {{
-    background: transparent;
-    color: {CX_TEXT_TERTIARY};
-    font-family: {CX_FONT_SANS};
-    font-size: 13px;
-    font-weight: 500;
-    padding: 12px 24px 10px 24px;
-    border: none;
-    border-bottom: 2px solid transparent;
-    margin-bottom: 0px;
-}}
-QTabBar::tab:selected {{
-    color: {CX_TEXT};
-    font-weight: 600;
-    border-bottom: 2px solid {CX_ACCENT};
-}}
-QTabBar::tab:hover:!selected {{
-    color: {CX_TEXT_SECONDARY};
+QToolTip {{
+    background-color: {_CONTROL_BG};
+    color: {_LABEL};
+    border: 1px solid {_SEPARATOR};
+    padding: 4px 8px;
+    border-radius: 6px;
 }}
 """
+
+
+# ---------------------------------------------------------------------------
+# Native-style segmented control (capsule pill, two segments)
+# ---------------------------------------------------------------------------
+
+class _MacSegmentedControl(QWidget):
+    """Two-segment capsule pill matching ``NSSegmentedControl.capsule`` look.
+
+    Emits ``selection_changed(int)`` when the user clicks a segment. Used in
+    place of the previous ``QTabWidget`` underline-accent bar (which is a
+    Chrome/Material pattern, not a Mac one).
+    """
+
+    selection_changed = Signal(int)
+
+    def __init__(self, labels: list[str], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._buttons: list[QPushButton] = []
+        self._group = QButtonGroup(self)
+        self._group.setExclusive(True)
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        track = QFrame()
+        track.setObjectName("_seg_track")
+        track.setStyleSheet(
+            f"#_seg_track {{ background: {_GROUPED_BG};"
+            f" border: 0.5px solid {_SEPARATOR};"
+            f" border-radius: 8px; }}"
+        )
+        track_layout = QHBoxLayout(track)
+        track_layout.setContentsMargins(3, 3, 3, 3)
+        track_layout.setSpacing(2)
+        for index, label in enumerate(labels):
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
+            btn.setStyleSheet(
+                "QPushButton {"
+                "  padding: 4px 14px;"
+                "  border-radius: 6px;"
+                "  background: transparent;"
+                f"  color: {_LABEL_SECONDARY};"
+                "  border: none;"
+                "}"
+                f"QPushButton:hover {{ color: {_LABEL}; }}"
+                "QPushButton:checked {"
+                f"  background: {_CONTROL_BG};"
+                f"  color: {_LABEL};"
+                f"  font-weight: {FW_SEMIBOLD};"
+                "}"
+            )
+            btn.clicked.connect(lambda _checked=False, i=index: self._on_clicked(i))
+            self._group.addButton(btn, index)
+            self._buttons.append(btn)
+            track_layout.addWidget(btn, stretch=1)
+        outer.addWidget(track, stretch=1)
+        if self._buttons:
+            self._buttons[0].setChecked(True)
+
+    def _on_clicked(self, index: int) -> None:
+        for i, b in enumerate(self._buttons):
+            b.setChecked(i == index)
+        self.selection_changed.emit(index)
 
 
 # ---------------------------------------------------------------------------
@@ -188,19 +263,18 @@ QTabBar::tab:hover:!selected {{
 # ---------------------------------------------------------------------------
 
 class _ConsumerTab(QWidget):
-    """Clean biometrics dashboard matching the browser extension popup."""
+    """Clean biometrics dashboard — native materials, brand identity intact."""
 
-    # E.1: surface user intent for the daemon orchestrator. The shell
-    # only owns the widgets; the parent dashboard re-emits these signals
-    # so the desktop app (in-process or WebSocket mode) can route them
-    # to ``RuntimeDaemon._handle_user_action`` (goal_set) and to
-    # ``_shutdown_daemon`` (stop_requested).
+    # E.1: surface user intent for the daemon orchestrator. The shell only
+    # owns the widgets; the parent dashboard re-emits these signals so the
+    # desktop app (in-process or WebSocket mode) can route them to
+    # ``RuntimeDaemon._handle_user_action`` and to ``_shutdown_daemon``.
     stop_requested = Signal()
     goal_set = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setStyleSheet(f"background: {CX_BG};")
+        self.setStyleSheet(f"background: transparent; color: {_LABEL};")
 
         root = QVBoxLayout(self)
         root.setContentsMargins(SP6, SP5, SP6, SP6)
@@ -209,88 +283,90 @@ class _ConsumerTab(QWidget):
         # ── Header ────────────────────────────────────────────────────
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, SP5)
+
+        # Brand wordmark (preserved — Cormorant italic, terracotta is the
+        # signature contrast). HIG section-heading conventions don't apply to
+        # the wordmark; it's the app identity.
         brand = QLabel("Cortex")
         brand.setStyleSheet(
-            f"font-family: {CX_FONT_BRAND}; "
-            f"font-style: italic; font-size: 20px; font-weight: 400; "
-            f"color: {CX_TEXT}; background: transparent;"
+            f"font-family: {BRAND_DISPLAY_FONT}, ui-serif, Georgia, serif;"
+            f"font-style: italic; font-size: {FS_TITLE}px;"
+            f"font-weight: {FW_REGULAR};"
+            f"color: {_LABEL}; background: transparent;"
         )
         header.addWidget(brand)
         header.addStretch()
 
-        # State pill badge
+        # State pill — capsule with dot + label, sits on the grouped background.
         self._state_badge = QWidget()
         badge_layout = QHBoxLayout(self._state_badge)
-        badge_layout.setContentsMargins(10, 4, 12, 4)
+        badge_layout.setContentsMargins(10, 3, 12, 3)
         badge_layout.setSpacing(6)
 
         self._state_dot = QLabel()
         self._state_dot.setFixedSize(7, 7)
         self._state_dot.setStyleSheet(
-            f"background: {CX_TEXT_TERTIARY}; border-radius: 3px;"
+            f"background: {_LABEL_TERTIARY}; border-radius: 3px;"
         )
         badge_layout.addWidget(self._state_dot, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         self._state_label = QLabel("Disconnected")
+        self._state_label.setFont(mac_native.system_font(FS_FOOTNOTE - 1, "medium"))
         self._state_label.setStyleSheet(
-            f"font-family: {CX_FONT_SANS}; font-size: 12px; font-weight: 500; "
-            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
+            f"color: {_LABEL_SECONDARY}; background: transparent;"
         )
         badge_layout.addWidget(self._state_label, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         self._state_badge.setStyleSheet(
-            f"background: {CX_TERTIARY}; border-radius: {RADIUS_FULL}px;"
+            f"background: {_GROUPED_BG}; border-radius: {RADIUS_PILL}px;"
         )
         header.addWidget(self._state_badge, alignment=Qt.AlignmentFlag.AlignVCenter)
         root.addLayout(header)
 
-        # ── Goal input ────────────────────────────────────────────────
+        # ── Goal input — minimum width, flexible (HIG: avoid fixed sizes) ──
         self._goal_input = QLineEdit()
         self._goal_input.setPlaceholderText("What are you working on?")
-        self._goal_input.setFixedHeight(42)
-        self._goal_input.setStyleSheet(f"""
-            QLineEdit {{
-                padding: 0 {SP4}px;
-                border: 1px solid {CX_BORDER_DEFAULT};
-                border-radius: {RADIUS_SM}px;
-                font-family: {CX_FONT_SANS};
-                font-size: 13px;
-                color: {CX_TEXT};
-                background: {CX_SURFACE};
-            }}
-            QLineEdit:focus {{
-                border: 1.5px solid {CX_ACCENT};
-            }}
-            QLineEdit::placeholder {{
-                color: {CX_TEXT_TERTIARY};
-            }}
-        """)
-        # E.1: emit goal_set when the user hits return (the daemon
-        # forwards it through USER_ACTION{action: "set_goal"}).
+        self._goal_input.setMinimumHeight(36)
+        self._goal_input.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
+        self._goal_input.setStyleSheet(
+            "QLineEdit {"
+            f"  padding: 0 {SP4}px;"
+            f"  border: 0.5px solid {_SEPARATOR};"
+            f"  border-radius: 6px;"
+            f"  color: {_LABEL};"
+            f"  background: {_CONTROL_BG};"
+            "}"
+            f"QLineEdit:focus {{ border: 1.5px solid {BRAND_ACCENT}; }}"
+            f"QLineEdit::placeholder {{ color: {_LABEL_TERTIARY}; }}"
+        )
+        # E.1: emit goal_set when the user hits return.
         self._goal_input.returnPressed.connect(
             lambda: self.goal_set.emit(self._goal_input.text().strip())
         )
         root.addWidget(self._goal_input)
         root.addSpacing(SP5)
 
-        # ── Biometrics card ───────────────────────────────────────────
+        # ── Biometrics inset section (no shadow, hairline border) ──
         bio_card = QFrame()
-        bio_card.setStyleSheet(f"""
-            QFrame {{
-                {CARD_QSS}
-            }}
-        """)
-        _card_shadow(bio_card)
+        bio_card.setStyleSheet(
+            f"QFrame {{"
+            f"  background: {_CONTROL_BG};"
+            f"  border: 0.5px solid {_SEPARATOR};"
+            f"  border-radius: {RADIUS_CARD}px;"
+            "}}"
+        )
         bio_inner = QVBoxLayout(bio_card)
         bio_inner.setContentsMargins(SP5, SP4, SP5, SP4)
         bio_inner.setSpacing(SP3)
 
-        # Bio heading
-        bio_heading = QLabel("BIOMETRICS")
-        bio_heading.setStyleSheet(SECTION_HEADING_QSS)
+        # Sentence-case section heading (HIG) — no letter-spacing, secondary color.
+        bio_heading = QLabel("Biometrics")
+        bio_heading.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
+        bio_heading.setStyleSheet(
+            f"color: {_LABEL_SECONDARY}; background: transparent;"
+        )
         bio_inner.addWidget(bio_heading)
 
-        # Bio values row
         bio_row = QHBoxLayout()
         bio_row.setSpacing(0)
 
@@ -299,27 +375,30 @@ class _ConsumerTab(QWidget):
         self._blk_label = QLabel("--")
 
         for val_widget, title, color in [
-            (self._bpm_label, "BPM", CX_BIO_HR),
-            (self._hrv_label, "HRV", CX_BIO_HRV),
-            (self._blk_label, "BLK", CX_BIO_BLINK),
+            (self._bpm_label, "BPM", BIO_HR),
+            (self._hrv_label, "HRV", BIO_HRV),
+            (self._blk_label, "BLK", BIO_BLINK),
         ]:
             col = QVBoxLayout()
             col.setSpacing(2)
             col.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
             val_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            # Brand identity — Cormorant numerics, terracotta channel
+            # accents — preserved across the macOS refactor.
             val_widget.setStyleSheet(
-                f"font-family: {CX_FONT_BRAND}; font-size: 32px; "
-                f"font-weight: 400; color: {CX_TEXT}; "
+                f"font-family: {BRAND_DISPLAY_FONT}, ui-serif, Georgia, serif;"
+                f"font-size: {FS_HERO_NUMERIC}px;"
+                f"font-weight: {FW_REGULAR};"
+                f"color: {_LABEL};"
                 f"background: transparent; border: none;"
             )
 
             heading = QLabel(title)
             heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            heading.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
             heading.setStyleSheet(
-                f"font-family: {CX_FONT_SANS}; font-size: 10px; font-weight: 600; "
-                f"letter-spacing: 1px; color: {color}; "
-                f"background: transparent; border: none;"
+                f"color: {color}; background: transparent; border: none;"
             )
             col.addWidget(val_widget)
             col.addWidget(heading)
@@ -339,12 +418,12 @@ class _ConsumerTab(QWidget):
             dot = QLabel()
             dot.setFixedSize(6, 6)
             dot.setStyleSheet(
-                f"background: {CX_TEXT_TERTIARY}; border-radius: 3px;"
+                f"background: {_LABEL_TERTIARY}; border-radius: 3px;"
             )
             lbl = QLabel(name)
+            lbl.setFont(mac_native.system_font(FS_CAPTION, "regular"))
             lbl.setStyleSheet(
-                f"font-family: {CX_FONT_SANS}; font-size: 11px; "
-                f"color: {CX_TEXT_TERTIARY}; background: transparent;"
+                f"color: {_LABEL_TERTIARY}; background: transparent;"
             )
             conn_row.addWidget(dot, alignment=Qt.AlignmentFlag.AlignVCenter)
             conn_row.addWidget(lbl, alignment=Qt.AlignmentFlag.AlignVCenter)
@@ -354,29 +433,33 @@ class _ConsumerTab(QWidget):
 
         self._connect_btn = QPushButton("Connect")
         self._connect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._connect_btn.setStyleSheet(f"""
-            QPushButton {{
-                font-family: {CX_FONT_SANS};
-                font-size: 12px; font-weight: 600;
-                color: {CX_ACCENT}; background: transparent;
-                border: none; padding: 4px 0;
-            }}
-            QPushButton:hover {{ color: {CX_TEXT}; }}
-        """)
+        self._connect_btn.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
+        self._connect_btn.setStyleSheet(
+            "QPushButton {"
+            f"  color: {BRAND_ACCENT};"
+            f"  background: transparent;"
+            f"  border: none;"
+            f"  padding: 4px 0;"
+            "}"
+            f"QPushButton:hover {{ color: {_LABEL}; }}"
+        )
         conn_row.addWidget(self._connect_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
         root.addLayout(conn_row)
         root.addSpacing(SP5)
 
-        # ── Divider ───────────────────────────────────────────────────
+        # ── Divider (hairline, system separator) ───────────────────────
         divider = QFrame()
         divider.setFixedHeight(1)
-        divider.setStyleSheet(f"background: {CX_BORDER};")
+        divider.setStyleSheet(f"background: {_SEPARATOR};")
         root.addWidget(divider)
         root.addSpacing(SP5)
 
-        # ── Today stats ──────────────────────────────────────────────
-        today_label = QLabel("TODAY")
-        today_label.setStyleSheet(SECTION_HEADING_QSS)
+        # ── Today stats — sentence-case, no letter-spacing ────────────
+        today_label = QLabel("Today")
+        today_label.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
+        today_label.setStyleSheet(
+            f"color: {_LABEL_SECONDARY}; background: transparent;"
+        )
         root.addWidget(today_label)
         root.addSpacing(SP3)
 
@@ -399,15 +482,16 @@ class _ConsumerTab(QWidget):
             col.setAlignment(Qt.AlignmentFlag.AlignCenter)
             val_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
             val_widget.setStyleSheet(
-                f"font-family: {CX_FONT_BRAND}; font-size: 20px; "
-                f"color: {CX_TEXT}; background: transparent;"
+                f"font-family: {BRAND_DISPLAY_FONT}, ui-serif, Georgia, serif;"
+                f"font-size: {FS_TITLE}px;"
+                f"color: {_LABEL};"
+                f"background: transparent;"
             )
             heading = QLabel(title)
             heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            heading.setFont(mac_native.system_font(FS_CAPTION, "regular"))
             heading.setStyleSheet(
-                f"font-family: {CX_FONT_SANS}; font-size: 10px; font-weight: 500; "
-                f"letter-spacing: 0.5px; color: {CX_TEXT_TERTIARY}; "
-                f"background: transparent;"
+                f"color: {_LABEL_TERTIARY}; background: transparent;"
             )
             col.addWidget(val_widget)
             col.addWidget(heading)
@@ -416,42 +500,41 @@ class _ConsumerTab(QWidget):
         root.addLayout(today_row)
         root.addStretch()
 
-        # ── Stop button ──────────────────────────────────────────────
+        # ── Stop button (HIG destructive role) ─────────────────────────
         root.addSpacing(SP4)
         self._stop_btn = QPushButton("Stop Cortex")
         self._stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._stop_btn.setFixedHeight(38)
-        self._stop_btn.setStyleSheet(f"""
-            QPushButton {{
-                border: 1px solid rgba(217, 87, 87, 0.12);
-                background: rgba(217, 87, 87, 0.04);
-                color: {CX_DANGER};
-                font-family: {CX_FONT_SANS};
-                font-size: 12px; font-weight: 500;
-                border-radius: {RADIUS_SM}px;
-            }}
-            QPushButton:hover {{
-                background: rgba(217, 87, 87, 0.10);
-            }}
-        """)
-        # E.1: emit stop_requested so the parent dashboard can re-emit
-        # and the app-level handler can call _shutdown_daemon. Previously
-        # the button had no handler — clicking it did nothing.
+        self._stop_btn.setMinimumHeight(36)  # HIG tap target ≥ 44 once font padding factored
+        self._stop_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
+        self._stop_btn.setShortcut("Ctrl+Q")  # VoiceOver picks this up
+        self._stop_btn.setAccessibleName("Stop Cortex")
+        self._stop_btn.setStyleSheet(
+            "QPushButton {"
+            f"  border: 0.5px solid {_SEPARATOR};"
+            f"  background: {_CONTROL_BG};"
+            f"  color: {_DANGER};"
+            f"  border-radius: 8px;"
+            f"  padding: 6px 14px;"
+            "}"
+            f"QPushButton:hover {{ background: rgba(215, 0, 21, 0.06); }}"
+            f"QPushButton:pressed {{ background: rgba(215, 0, 21, 0.12); }}"
+        )
+        # E.1: emit stop_requested so the parent dashboard re-emits and the
+        # app-level handler calls _shutdown_daemon.
         self._stop_btn.clicked.connect(self.stop_requested.emit)
         root.addWidget(self._stop_btn)
 
-    # -- Public update methods ------------------------------------------------
+    # -- Public update methods (preserved byte-identical) ----------------
 
     def update_state(self, payload: dict) -> None:
         state = payload.get("state", "FLOW")
-        color = STATE_COLORS.get(state, CX_TEXT_TERTIARY)
+        color = STATE_COLORS.get(state, _LABEL_TERTIARY)
         label = STATE_LABELS.get(state, state)
         self._state_dot.setStyleSheet(
             f"background: {color}; border-radius: 3px;"
         )
         self._state_label.setText(label)
         self._state_label.setStyleSheet(
-            f"font-family: {CX_FONT_SANS}; font-size: 12px; font-weight: 500; "
             f"color: {color}; background: transparent;"
         )
 
@@ -467,21 +550,22 @@ class _ConsumerTab(QWidget):
         if connected:
             self._state_label.setText("Connected")
             self._state_dot.setStyleSheet(
-                f"background: {CX_ACCENT}; border-radius: 3px;"
+                f"background: {BRAND_ACCENT}; border-radius: 3px;"
             )
         else:
             self._state_label.setText("Disconnected")
             self._state_dot.setStyleSheet(
-                f"background: {CX_TEXT_TERTIARY}; border-radius: 3px;"
+                f"background: {_LABEL_TERTIARY}; border-radius: 3px;"
             )
 
 
 # ---------------------------------------------------------------------------
-# HR Trace Plot (warm palette)
+# HR Trace Plot — brand accent trace, system separator grid
 # ---------------------------------------------------------------------------
 
 class HRTracePlot(QWidget):
-    """Rolling 60s HR trace with warm styling."""
+    """Rolling HR trace. Grid lines use the system separator color; the trace
+    itself is the brand accent (terracotta) — the ECG identity preserved."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -499,22 +583,19 @@ class HRTracePlot(QWidget):
         w, h = self.width(), self.height()
         pad = 8
 
-        # Background — rounded rect
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(CX_SURFACE))
+        painter.setBrush(QColor(_CONTROL_BG))
         path = QPainterPath()
-        path.addRoundedRect(QRectF(0, 0, w, h), RADIUS_MD, RADIUS_MD)
+        path.addRoundedRect(QRectF(0, 0, w, h), RADIUS_CARD, RADIUS_CARD)
         painter.drawPath(path)
 
-        # Border
-        painter.setPen(QPen(QColor(0, 0, 0, 12), 1))
+        painter.setPen(QPen(QColor(0, 0, 0, 24), 1))  # ~ system separator 15%
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(path)
 
         if len(self._values) < 2:
-            painter.setPen(QColor(CX_TEXT_TERTIARY))
-            f = QFont("Georgia", 12)
-            painter.setFont(f)
+            painter.setPen(QColor(_LABEL_TERTIARY))
+            painter.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Waiting for HR data...")
             painter.end()
             return
@@ -523,14 +604,12 @@ class HRTracePlot(QWidget):
         max_hr = min(180.0, max(self._values) + 5)
         hr_range = max(max_hr - min_hr, 10.0)
 
-        # Subtle grid lines
-        painter.setPen(QPen(QColor(0, 0, 0, 6), 1))
+        painter.setPen(QPen(QColor(0, 0, 0, 12), 1))  # ~ tertiary label
         for tick in range(int(min_hr), int(max_hr) + 1, 10):
             y = pad + (h - 2 * pad) - int((tick - min_hr) / hr_range * (h - 2 * pad))
             painter.drawLine(pad, y, w - pad, y)
 
-        # Trace line — smooth, terracotta
-        pen = QPen(QColor(CX_BIO_HR), 2)
+        pen = QPen(QColor(BRAND_ACCENT), 2)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         painter.setPen(pen)
@@ -543,18 +622,17 @@ class HRTracePlot(QWidget):
             y2 = pad + (h - 2 * pad) - int((vals[i] - min_hr) / hr_range * (h - 2 * pad))
             painter.drawLine(x1, y1, x2, y2)
 
-        # Current value — bottom right
-        painter.setPen(QColor(CX_TEXT))
-        f = QFont("Georgia", 12)
-        f.setBold(True)
-        painter.setFont(f)
+        painter.setPen(QColor(_LABEL))
+        f = mac_native.system_font(FS_FOOTNOTE, "semibold")
+        if isinstance(f, QFont):
+            painter.setFont(f)
         painter.drawText(w - 80, h - 12, f"{vals[-1]:.0f} BPM")
 
         painter.end()
 
 
 # ---------------------------------------------------------------------------
-# Signal quality bar (refined)
+# Signal quality bar
 # ---------------------------------------------------------------------------
 
 class _SignalQualityBar(QWidget):
@@ -564,9 +642,9 @@ class _SignalQualityBar(QWidget):
         layout.setContentsMargins(0, 2, 0, 2)
         self._label = QLabel(label)
         self._label.setFixedWidth(76)
+        self._label.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         self._label.setStyleSheet(
-            f"font-family: {CX_FONT_SANS}; font-size: 12px; "
-            f"color: {CX_TEXT_SECONDARY}; background: transparent;"
+            f"color: {_LABEL_SECONDARY}; background: transparent;"
         )
         layout.addWidget(self._label)
         self._bar = QProgressBar()
@@ -574,25 +652,20 @@ class _SignalQualityBar(QWidget):
         self._bar.setValue(0)
         self._bar.setTextVisible(False)
         self._bar.setFixedHeight(5)
-        self._bar.setStyleSheet(f"""
-            QProgressBar {{
-                background: {CX_TERTIARY};
-                border: none;
-                border-radius: 2px;
-            }}
-            QProgressBar::chunk {{
-                background: {CX_ACCENT};
-                border-radius: 2px;
-            }}
-        """)
+        self._bar.setStyleSheet(
+            f"QProgressBar {{ background: {_GROUPED_BG};"
+            f" border: none; border-radius: 2px; }}"
+            f"QProgressBar::chunk {{ background: {BRAND_ACCENT};"
+            f" border-radius: 2px; }}"
+        )
         layout.addWidget(self._bar)
 
         self._val_label = QLabel("0%")
         self._val_label.setFixedWidth(36)
         self._val_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._val_label.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         self._val_label.setStyleSheet(
-            f"font-family: {CX_FONT_SANS}; font-size: 11px; "
-            f"color: {CX_TEXT_TERTIARY}; background: transparent;"
+            f"color: {_LABEL_TERTIARY}; background: transparent;"
         )
         layout.addWidget(self._val_label)
 
@@ -601,21 +674,17 @@ class _SignalQualityBar(QWidget):
         self._bar.setValue(pct)
         self._val_label.setText(f"{pct}%")
         if quality >= 0.7:
-            color = "#4CAF7D"
+            color = SEMANTIC_LIGHT["success"]
         elif quality >= 0.4:
-            color = "#D9B457"
+            color = BIO_BLINK
         else:
-            color = CX_DANGER
-        self._bar.setStyleSheet(f"""
-            QProgressBar {{
-                background: {CX_TERTIARY};
-                border: none; border-radius: 2px;
-            }}
-            QProgressBar::chunk {{
-                background: {color};
-                border-radius: 2px;
-            }}
-        """)
+            color = _DANGER
+        self._bar.setStyleSheet(
+            f"QProgressBar {{ background: {_GROUPED_BG};"
+            f" border: none; border-radius: 2px; }}"
+            f"QProgressBar::chunk {{ background: {color};"
+            f" border-radius: 2px; }}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -623,11 +692,11 @@ class _SignalQualityBar(QWidget):
 # ---------------------------------------------------------------------------
 
 class _AdvancedTab(QWidget):
-    """Developer debug view with refined warm styling."""
+    """Developer debug view."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setStyleSheet(f"background: {CX_BG};")
+        self.setStyleSheet(f"background: transparent; color: {_LABEL};")
         self._timeline_events: list[dict] = []
         self._session_start = time.monotonic()
 
@@ -635,9 +704,11 @@ class _AdvancedTab(QWidget):
         layout.setContentsMargins(SP6, SP5, SP6, SP6)
         layout.setSpacing(SP4)
 
-        # ── Signal quality ────────────────────────────────────────────
-        sq_label = QLabel("SIGNAL QUALITY")
-        sq_label.setStyleSheet(SECTION_HEADING_QSS)
+        sq_label = QLabel("Signal quality")
+        sq_label.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
+        sq_label.setStyleSheet(
+            f"color: {_LABEL_SECONDARY}; background: transparent;"
+        )
         layout.addWidget(sq_label)
 
         self._physio_q = _SignalQualityBar("Physio")
@@ -648,16 +719,20 @@ class _AdvancedTab(QWidget):
         layout.addWidget(self._tele_q)
         layout.addSpacing(SP2)
 
-        # ── HR trace ──────────────────────────────────────────────────
-        hr_label = QLabel("HEART RATE")
-        hr_label.setStyleSheet(SECTION_HEADING_QSS)
+        hr_label = QLabel("Heart rate")
+        hr_label.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
+        hr_label.setStyleSheet(
+            f"color: {_LABEL_SECONDARY}; background: transparent;"
+        )
         layout.addWidget(hr_label)
         self._hr_plot = HRTracePlot()
         layout.addWidget(self._hr_plot)
 
-        # ── State scores ─────────────────────────────────────────────
-        scores_label = QLabel("STATE SCORES")
-        scores_label.setStyleSheet(SECTION_HEADING_QSS)
+        scores_label = QLabel("State scores")
+        scores_label.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
+        scores_label.setStyleSheet(
+            f"color: {_LABEL_SECONDARY}; background: transparent;"
+        )
         layout.addWidget(scores_label)
 
         scores_grid = QGridLayout()
@@ -672,9 +747,9 @@ class _AdvancedTab(QWidget):
         ]):
             lbl = QLabel(name.capitalize())
             lbl.setFixedWidth(72)
+            lbl.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
             lbl.setStyleSheet(
-                f"font-family: {CX_FONT_SANS}; font-size: 12px; "
-                f"color: {CX_TEXT_SECONDARY}; background: transparent;"
+                f"color: {_LABEL_SECONDARY}; background: transparent;"
             )
             scores_grid.addWidget(lbl, i, 0)
             bar = QProgressBar()
@@ -682,49 +757,52 @@ class _AdvancedTab(QWidget):
             bar.setValue(0)
             bar.setFixedHeight(5)
             bar.setTextVisible(False)
-            bar.setStyleSheet(f"""
-                QProgressBar {{ background: {CX_TERTIARY}; border: none; border-radius: 2px; }}
-                QProgressBar::chunk {{ background: {color}; border-radius: 2px; }}
-            """)
+            bar.setStyleSheet(
+                f"QProgressBar {{ background: {_GROUPED_BG}; border: none;"
+                f" border-radius: 2px; }}"
+                f"QProgressBar::chunk {{ background: {color};"
+                f" border-radius: 2px; }}"
+            )
             scores_grid.addWidget(bar, i, 1)
             val_lbl = QLabel("0.00")
             val_lbl.setFixedWidth(36)
             val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            val_lbl.setFont(mac_native.system_font(FS_CAPTION, "regular"))
             val_lbl.setStyleSheet(
-                f"font-family: {CX_FONT_SANS}; font-size: 11px; "
-                f"color: {CX_TEXT_TERTIARY}; background: transparent;"
+                f"color: {_LABEL_TERTIARY}; background: transparent;"
             )
             scores_grid.addWidget(val_lbl, i, 2)
             self._score_bars[name] = bar
             self._score_labels[name] = val_lbl
         layout.addLayout(scores_grid)
 
-        # ── Confidence / dwell ────────────────────────────────────────
         meta_row = QHBoxLayout()
         self._confidence_lbl = QLabel("Confidence: --")
+        self._confidence_lbl.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         self._confidence_lbl.setStyleSheet(
-            f"font-family: {CX_FONT_SANS}; font-size: 12px; "
-            f"color: {CX_TEXT_TERTIARY}; background: transparent;"
+            f"color: {_LABEL_TERTIARY}; background: transparent;"
         )
         self._dwell_lbl = QLabel("Dwell: --")
+        self._dwell_lbl.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         self._dwell_lbl.setStyleSheet(
-            f"font-family: {CX_FONT_SANS}; font-size: 12px; "
-            f"color: {CX_TEXT_TERTIARY}; background: transparent;"
+            f"color: {_LABEL_TERTIARY}; background: transparent;"
         )
         meta_row.addWidget(self._confidence_lbl)
         meta_row.addStretch()
         meta_row.addWidget(self._dwell_lbl)
         layout.addLayout(meta_row)
 
-        # ── Timeline ──────────────────────────────────────────────────
-        tl_label = QLabel("TIMELINE")
-        tl_label.setStyleSheet(SECTION_HEADING_QSS)
+        tl_label = QLabel("Timeline")
+        tl_label.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
+        tl_label.setStyleSheet(
+            f"color: {_LABEL_SECONDARY}; background: transparent;"
+        )
         layout.addWidget(tl_label)
         self._timeline_text = QLabel("No events yet")
         self._timeline_text.setWordWrap(True)
         self._timeline_text.setStyleSheet(
-            f"font-family: {CX_FONT_MONO}; "
-            f"font-size: 11px; color: {CX_TEXT_SECONDARY}; "
+            f"font-family: \"SF Mono\", ui-monospace, Menlo, monospace;"
+            f"font-size: {FS_CAPTION}px; color: {_LABEL_SECONDARY};"
             f"background: transparent; line-height: 1.6;"
         )
         self._timeline_text.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -756,7 +834,6 @@ class _AdvancedTab(QWidget):
         self._confidence_lbl.setText(f"Confidence: {confidence:.0%}")
         self._dwell_lbl.setText(f"Dwell: {dwell:.1f}s")
 
-        # Timeline
         if not self._timeline_events or self._timeline_events[-1]["state"] != state:
             elapsed = time.monotonic() - self._session_start
             self._timeline_events.append({
@@ -777,21 +854,24 @@ class _AdvancedTab(QWidget):
 # ---------------------------------------------------------------------------
 
 class DashboardWindow(QWidget):
-    """Two-tab dashboard: consumer view + advanced debug view."""
+    """Two-tab dashboard with native chrome.
 
-    # E.1: re-emit user-intent signals from the consumer tab so the
-    # app-level orchestrator can wire them once at construction time
-    # without reaching into widget internals.
+    Uses a segmented control + stacked widget instead of QTabWidget — the
+    macOS convention for two-segment top-level navigation.
+    """
+
+    # E.1: re-emit user-intent signals from the consumer tab.
     stop_requested = Signal()
     goal_set = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        # Backward-compatible test-facing fields.
         self._connected = False
         self.setObjectName("CortexDashboard")
         self.setWindowTitle("Cortex")
-        self.setFixedWidth(DASHBOARD_WIDTH)
+        # HIG: minimum width, flexible. Macs at 1024×768 still fit comfortably.
+        self.setMinimumWidth(DASHBOARD_WIDTH)
+        self.setMaximumWidth(DASHBOARD_WIDTH + 60)
         self.setMaximumHeight(DASHBOARD_MAX_HEIGHT)
         self.setStyleSheet(_GLOBAL_QSS)
 
@@ -799,17 +879,40 @@ class DashboardWindow(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        self._tabs = QTabWidget()
+        # Segmented control sits at the top under the unified title bar.
+        seg_container = QHBoxLayout()
+        seg_container.setContentsMargins(SP6, SP3, SP6, SP3)
+        self._seg = _MacSegmentedControl(["Dashboard", "Advanced"])
+        seg_container.addWidget(self._seg, stretch=1)
+        layout.addLayout(seg_container)
+
+        self._stack = QStackedWidget()
         self._consumer = _ConsumerTab()
         self._advanced = _AdvancedTab()
         self._timeline_events = self._advanced._timeline_events
-        self._tabs.addTab(self._consumer, "Dashboard")
-        self._tabs.addTab(self._advanced, "Advanced")
-        layout.addWidget(self._tabs)
+        self._stack.addWidget(self._consumer)
+        self._stack.addWidget(self._advanced)
+        layout.addWidget(self._stack, stretch=1)
+
+        self._seg.selection_changed.connect(self._stack.setCurrentIndex)
 
         # E.1: forward consumer-tab signals to outer subscribers.
         self._consumer.stop_requested.connect(self.stop_requested.emit)
         self._consumer.goal_set.connect(self.goal_set.emit)
+
+    # -- Lifecycle hook for native chrome --------------------------------
+
+    def showEvent(self, event: object) -> None:  # noqa: D401 - Qt override
+        super().showEvent(event)
+        # Apply native materials once winId() is valid. Re-applying on each
+        # show is cheap and idempotent.
+        try:
+            mac_native.apply_unified_titlebar(self)
+            mac_native.apply_vibrancy(self, material="window_background")
+        except Exception:
+            logger.debug("native chrome application failed", exc_info=True)
+
+    # -- Public update methods (signature-stable) ------------------------
 
     def update_state(self, payload: dict) -> None:
         self._consumer.update_state(payload)

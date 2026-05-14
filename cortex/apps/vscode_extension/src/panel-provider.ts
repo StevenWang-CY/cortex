@@ -11,6 +11,7 @@
 
 import * as vscode from "vscode";
 import { CortexWSClient } from "./ws-client";
+import { PANEL_STATE_HEX_LIGHT } from "./design-tokens";
 
 /**
  * Webview provider for the Cortex intervention side panel.
@@ -151,17 +152,11 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
         const state = this._currentState;
         const stateStr = (state.state as string) ?? "—";
         const confidence = state.confidence as number | undefined;
-        const stateColors: Record<string, string> = {
-            FLOW: "#4CAF50",
-            HYPER: "#F44336",
-            HYPO: "#6495ED",
-            RECOVERY: "#FFC107",
-        };
         try {
             this._view.webview.postMessage({
                 type: "state",
                 state: stateStr,
-                color: stateColors[stateStr] ?? "#888",
+                color: PANEL_STATE_HEX_LIGHT[stateStr] ?? "#888",
                 confidence: confidence ?? 0,
             });
         } catch {
@@ -184,14 +179,9 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
         const confPct =
             confidence !== undefined ? Math.round(confidence * 100) : 0;
 
-        // State color
-        const stateColors: Record<string, string> = {
-            FLOW: "#4CAF50",
-            HYPER: "#F44336",
-            HYPO: "#6495ED",
-            RECOVERY: "#FFC107",
-        };
-        const stateColor = stateColors[stateStr] ?? "#888";
+        // State color — sourced from emitted design tokens so palette edits in
+        // libs/design/tokens.yaml flow through after a sync_design_tokens.py run.
+        const stateColor = PANEL_STATE_HEX_LIGHT[stateStr] ?? "#888";
 
         // Build intervention section
         let interventionHtml = "";
@@ -205,11 +195,16 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             const focus = this._escapeHtml(
                 (payload.primary_focus as string) ?? "",
             );
-            const microSteps = (payload.micro_steps as string[]) ?? [];
+            // Guard against malformed payloads (non-array, mixed types):
+            // an unchecked cast would let a stray number/object reach _escapeHtml
+            // and stringify into the rendered HTML.
+            const steps = Array.isArray(payload.micro_steps)
+                ? payload.micro_steps.filter((s): s is string => typeof s === "string")
+                : [];
 
             let stepsHtml = "";
-            for (let i = 0; i < microSteps.length; i++) {
-                const step = this._escapeHtml(microSteps[i]);
+            for (let i = 0; i < steps.length; i++) {
+                const step = this._escapeHtml(steps[i]);
                 stepsHtml += `
                     <label class="step">
                         <input type="checkbox" id="step-${i}" />
@@ -250,22 +245,43 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <style>
+        /* VS Code theme variables provide the editor-matched chrome; only
+         * the Cortex brand accent (terracotta) is fixed across all themes.
+         * The terracotta lives on the intervention card's left border, the
+         * focus headline, and the breathing-pacer rings — the same brand
+         * mark as the desktop shell + browser extension. */
         :root {
-            --bg: #0e1525;
-            --card: #1a2540;
-            --accent: #64a0ff;
-            --text: #e6f0ff;
-            --text-secondary: #a0b4d2;
-            --dismiss-bg: rgba(255, 255, 255, 0.08);
+            --cx-bg: var(--vscode-editor-background, #1e1e1e);
+            --cx-card: var(--vscode-editorWidget-background,
+                        var(--vscode-sideBar-background, #252526));
+            --cx-text: var(--vscode-editor-foreground, #e6e6e6);
+            --cx-text-secondary: var(--vscode-descriptionForeground,
+                                  rgba(204, 204, 204, 0.7));
+            --cx-text-tertiary: var(--vscode-disabledForeground,
+                                 rgba(204, 204, 204, 0.45));
+            --cx-separator: var(--vscode-widget-border, rgba(128, 128, 128, 0.18));
+            --cx-focus-ring: var(--vscode-focusBorder, #007fd4);
+            --cx-accent: #D97757;          /* brand — preserved */
+            --cx-accent-strong: #E08E6F;
+            --cx-dismiss-bg: var(--vscode-button-secondaryBackground,
+                              rgba(255, 255, 255, 0.06));
+            --cx-dismiss-bg-hover: var(--vscode-button-secondaryHoverBackground,
+                                    rgba(255, 255, 255, 0.12));
+            /* 5-step modular scale matching cortex/libs/design/tokens.yaml */
+            --fs-caption: 11px;
+            --fs-footnote: 13px;
+            --fs-body: 15px;
+            --fs-title: 22px;
         }
 
         body {
             margin: 0;
             padding: 12px;
-            font-family: var(--vscode-font-family, 'Segoe UI', sans-serif);
-            font-size: 13px;
-            color: var(--text);
-            background: var(--bg);
+            font-family: var(--vscode-font-family,
+                -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif);
+            font-size: var(--fs-footnote);
+            color: var(--cx-text);
+            background: var(--cx-bg);
         }
 
         .state-bar {
@@ -273,7 +289,8 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             align-items: center;
             gap: 8px;
             padding: 8px 12px;
-            background: var(--card);
+            background: var(--cx-card);
+            border: 0.5px solid var(--cx-separator);
             border-radius: 8px;
             margin-bottom: 12px;
         }
@@ -290,34 +307,43 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
         }
 
         .state-conf {
-            color: var(--text-secondary);
-            font-size: 12px;
+            color: var(--cx-text-secondary);
+            font-size: var(--fs-caption);
         }
 
         .intervention {
-            background: var(--card);
-            border-radius: 12px;
+            background: var(--cx-card);
+            border-radius: 10px;
             padding: 16px;
-            border-left: 3px solid var(--accent);
+            border-left: 3px solid var(--cx-accent);
+            border-top: 0.5px solid var(--cx-separator);
+            border-right: 0.5px solid var(--cx-separator);
+            border-bottom: 0.5px solid var(--cx-separator);
         }
 
         .headline {
-            font-size: 16px;
-            font-weight: 700;
+            font-size: var(--fs-body);
+            font-weight: 600;
             margin: 0 0 8px;
-            color: var(--text);
+            color: var(--cx-text);
         }
 
         .summary {
-            color: var(--text-secondary);
+            color: var(--cx-text-secondary);
             margin: 0 0 12px;
-            line-height: 1.4;
+            line-height: 1.45;
         }
 
         .focus {
-            color: var(--accent);
+            color: var(--cx-accent);
             margin-bottom: 12px;
-            font-size: 13px;
+            font-size: var(--fs-footnote);
+            font-weight: 600;
+        }
+
+        .causal {
+            font-size: var(--fs-caption) !important;
+            color: var(--cx-text-tertiary) !important;
         }
 
         .steps {
@@ -334,11 +360,11 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
 
         .step input[type="checkbox"] {
             margin-top: 2px;
-            accent-color: var(--accent);
+            accent-color: var(--cx-accent);
         }
 
         .step span {
-            line-height: 1.4;
+            line-height: 1.45;
         }
 
         .pacer {
@@ -352,36 +378,42 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
         }
 
         #pacer-label {
-            font-size: 14px;
+            font-size: var(--fs-body);
             font-weight: 600;
-            color: var(--text);
+            color: var(--cx-text);
         }
 
         #pacer-timer {
-            font-size: 12px;
-            color: var(--text-secondary);
+            font-size: var(--fs-caption);
+            color: var(--cx-text-secondary);
         }
 
         .dismiss-btn {
             display: block;
             width: 100%;
             padding: 8px;
-            border: 1px solid rgba(255, 255, 255, 0.15);
+            border: 0.5px solid var(--cx-separator);
             border-radius: 6px;
-            background: var(--dismiss-bg);
-            color: var(--text);
+            background: var(--cx-dismiss-bg);
+            color: var(--cx-text);
             cursor: pointer;
-            font-size: 13px;
+            font-size: var(--fs-footnote);
+            font-weight: 500;
         }
 
         .dismiss-btn:hover {
-            background: rgba(255, 255, 255, 0.15);
+            background: var(--cx-dismiss-bg-hover);
+        }
+
+        .dismiss-btn:focus-visible {
+            outline: 2px solid var(--cx-focus-ring);
+            outline-offset: 1px;
         }
 
         .no-intervention {
             text-align: center;
             padding: 24px 12px;
-            color: var(--text-secondary);
+            color: var(--cx-text-secondary);
         }
     </style>
 </head>
@@ -469,14 +501,15 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
 
                 ctx.clearRect(0, 0, w, h);
 
-                // Draw circles (gradient effect)
+                // Brand accent (terracotta) — RGB matches CX.accent so the
+                // pacer reads as Cortex on any VS Code theme.
                 for (let i = 0; i < 3; i++) {
                     const ri = r - i * 3;
                     if (ri < 5) break;
                     const alpha = 0.5 - i * 0.12;
                     ctx.beginPath();
                     ctx.arc(cx, cy, ri, 0, Math.PI * 2);
-                    ctx.fillStyle = 'rgba(100, 160, 255, ' + alpha + ')';
+                    ctx.fillStyle = 'rgba(217, 119, 87, ' + alpha + ')';
                     ctx.fill();
                 }
 

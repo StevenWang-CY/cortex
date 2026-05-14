@@ -84,7 +84,7 @@ else
 fi
 
 # ── Step 2: Build VS Code extension ────────────────────────────────────────
-VSIX="${CORTEX_DIR}/apps/vscode_extension/cortex-somatic-0.1.0.vsix"
+VSIX="${CORTEX_DIR}/apps/vscode_extension/cortex-somatic-0.2.1.vsix"
 VSCODE_EXT_DIR="${CORTEX_DIR}/apps/vscode_extension"
 if [ "${CORTEX_SKIP_VSCODE_EXT_BUILD:-0}" = "1" ]; then
     echo "→ Skipping VS Code extension build (CORTEX_SKIP_VSCODE_EXT_BUILD=1)"
@@ -106,7 +106,7 @@ fi
 # ── Step 3: Verify VSIX ────────────────────────────────────────────────────
 if [ ! -f "${VSIX}" ]; then
     echo "ERROR: VSIX not found at ${VSIX}" >&2
-    echo "Build it with: cd cortex/apps/vscode_extension && npx @vscode/vsce package --out cortex-somatic-0.1.0.vsix" >&2
+    echo "Build it with: cd cortex/apps/vscode_extension && npx @vscode/vsce package --out cortex-somatic-0.2.1.vsix" >&2
     exit 1
 fi
 echo "→ VSIX found"

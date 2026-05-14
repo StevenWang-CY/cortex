@@ -39,6 +39,12 @@ interface CortexState {
     reasons: string[];
 }
 
+// --- Debug ---
+// Flip to true while debugging to surface intervention/overlay/tab-context noise.
+// Production builds should keep this false to avoid leaking internals to the
+// devtools console of any inspected service worker.
+const DEBUG = false;
+
 // --- State ---
 
 let ws: WebSocket | null = null;
@@ -526,6 +532,28 @@ function scheduleReconnect(): void {
     reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
 }
 
+// swift-concurrency-pro rule (transferred to JS): tear down all in-flight
+// timers when the service worker is suspended so they don't fire against a
+// torn-down WS instance and cause spurious reconnect attempts. Chrome
+// emits ``runtime.onSuspend`` ~30s before evicting the worker.
+if (typeof chrome !== "undefined" && chrome.runtime?.onSuspend) {
+    chrome.runtime.onSuspend.addListener(() => {
+        if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+        }
+        if (persistTimer) {
+            clearTimeout(persistTimer);
+            persistTimer = null;
+        }
+        try {
+            disconnect();
+        } catch {
+            /* worker is going away anyway */
+        }
+    });
+}
+
 // --- Text Scraping ---
 
 async function scrapeVisibleText(tabId?: number): Promise<string> {
@@ -570,7 +598,7 @@ async function handleMessage(raw: string): Promise<void> {
         case "INTERVENTION_TRIGGER": {
             // Skip if an intervention is already being shown
             if (activeIntervention) {
-                console.log("Cortex: skipping intervention — one is already active");
+                if (DEBUG) console.log("Cortex: skipping intervention — one is already active");
                 break;
             }
 
@@ -581,7 +609,7 @@ async function handleMessage(raw: string): Promise<void> {
             if (iid && dismissedInterventions.has(iid)) {
                 const dismissedAt = dismissedInterventions.get(iid)!;
                 if (now - dismissedAt < interventionDismissCooldown) {
-                    console.log(`Cortex: skipping intervention ${iid} — dismissed ${Math.round((now - dismissedAt) / 1000)}s ago`);
+                    if (DEBUG) console.log(`Cortex: skipping intervention ${iid} — dismissed ${Math.round((now - dismissedAt) / 1000)}s ago`);
                     break;
                 }
                 dismissedInterventions.delete(iid);
@@ -594,7 +622,7 @@ async function handleMessage(raw: string): Promise<void> {
             if (urlKey && dismissedUrlPatterns.has(urlKey)) {
                 const dismissedAt = dismissedUrlPatterns.get(urlKey)!;
                 if (now - dismissedAt < urlDismissCooldown) {
-                    console.log(`Cortex: skipping intervention for ${urlKey} — dismissed ${Math.round((now - dismissedAt) / 1000)}s ago`);
+                    if (DEBUG) console.log(`Cortex: skipping intervention for ${urlKey} — dismissed ${Math.round((now - dismissedAt) / 1000)}s ago`);
                     break;
                 }
                 dismissedUrlPatterns.delete(urlKey);
@@ -675,7 +703,7 @@ async function handleMessage(raw: string): Promise<void> {
                     });
                 }
             } catch (e) {
-                console.error("Cortex: failed to inject lockout overlay", e);
+                if (DEBUG) console.error("Cortex: failed to inject lockout overlay", e);
             }
             break;
         }
@@ -695,7 +723,7 @@ async function handleMessage(raw: string): Promise<void> {
                     });
                 }
             } catch (e) {
-                console.error("Cortex: failed to inject LeetCode coach overlay", e);
+                if (DEBUG) console.error("Cortex: failed to inject LeetCode coach overlay", e);
             }
             break;
         }
@@ -1136,10 +1164,10 @@ function injectLockoutOverlay(payload: Record<string, unknown>): void {
         }
     }, 1000);
 
-    // Skip button — no penalty, just log and dismiss
+    // Skip button — no penalty, just dismiss. Lives in injected page-context
+    // (executeScript), so the service-worker DEBUG flag is out of scope here.
     shadow.getElementById("skip")?.addEventListener("click", () => {
         clearInterval(timer);
-        console.log("Cortex: lockout skipped by user at", remaining, "s remaining");
         dismiss();
     });
 
@@ -1241,7 +1269,7 @@ async function handleIntervention(
                 appliedActions.push("inject_overlay");
             }
         } catch (e) {
-            console.error("Cortex: failed to inject overlay", e);
+            if (DEBUG) console.error("Cortex: failed to inject overlay", e);
             errors.push(`inject_overlay: ${(e as Error)?.message ?? String(e)}`);
         }
     }
@@ -1762,7 +1790,7 @@ async function snapshotTabsForIntervention(): Promise<void> {
     interventionTabSnapshot = new Map();
     // LAYER 3: Discard stale context (>30s old) to prevent wrong-tab targeting
     if (lastContextTabs && Date.now() - lastContextTabsTimestamp > CONTEXT_STALENESS_LIMIT) {
-        console.log("Cortex: discarding stale tab context (>30s old), refreshing");
+        if (DEBUG) console.log("Cortex: discarding stale tab context (>30s old), refreshing");
         lastContextTabs = null;
     }
     const tabs = lastContextTabs ?? await collectTabs();

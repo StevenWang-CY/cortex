@@ -43,6 +43,10 @@ export class CortexWSClient {
     private _maxReconnectDelay = 30000;
     private _intentionalDisconnect = false;
     private _sequence = 0;
+    // swift-concurrency-pro rule (transferred to TS): the reconnect timer
+    // should be propagation-aware. ``disconnect()`` aborts this controller
+    // so the queued reconnect doesn't fire after teardown.
+    private _reconnectAbort: AbortController | undefined;
 
     // Event handlers
     private _stateUpdateHandlers: StateUpdateHandler[] = [];
@@ -149,6 +153,10 @@ export class CortexWSClient {
     disconnect(): void {
         this._intentionalDisconnect = true;
 
+        // Cancel any pending reconnect attempt — both the legacy
+        // ``setTimeout`` cleanup and the AbortController signal listener.
+        this._reconnectAbort?.abort();
+        this._reconnectAbort = undefined;
         if (this._reconnectTimer) {
             clearTimeout(this._reconnectTimer);
             this._reconnectTimer = undefined;
@@ -346,12 +354,30 @@ export class CortexWSClient {
             return;
         }
 
+        // Re-arm the abort controller for this attempt. If ``disconnect()``
+        // fires after the timer is set but before it runs, the abort handler
+        // clears the pending callback so we don't reconnect against a
+        // torn-down client.
+        this._reconnectAbort?.abort();
+        const controller = new AbortController();
+        this._reconnectAbort = controller;
+
         this._reconnectTimer = setTimeout(() => {
             this._reconnectTimer = undefined;
+            if (controller.signal.aborted) {
+                return;
+            }
             this.connect();
         }, this._reconnectDelay);
 
-        // Exponential backoff (3s, 6s, 12s, 24s, 30s max)
+        controller.signal.addEventListener("abort", () => {
+            if (this._reconnectTimer) {
+                clearTimeout(this._reconnectTimer);
+                this._reconnectTimer = undefined;
+            }
+        });
+
+        // Exponential backoff (3s, 6s, 12s, 24s, 30s max).
         this._reconnectDelay = Math.min(
             this._reconnectDelay * 2,
             this._maxReconnectDelay,

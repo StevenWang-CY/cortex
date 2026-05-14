@@ -59,8 +59,8 @@ datas = [
      "browser_extension_edge"),
 
     # VS Code extension — installed via `code --install-extension <vsix>`
-    # from ConnectionsPanel.
-    (str(CORTEX / "apps" / "vscode_extension" / "cortex-somatic-0.1.0.vsix"),
+    # from ConnectionsPanel. Version tracks pyproject.toml.
+    (str(CORTEX / "apps" / "vscode_extension" / f"cortex-somatic-{CORTEX_VERSION}.vsix"),
      "."),
 
     # Native messaging host — Chrome invokes a copied host script from the

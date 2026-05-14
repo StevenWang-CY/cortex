@@ -1,7 +1,70 @@
-/* Immediate dark background for all extension pages — prevents white flash */
+/* Page reset — applies semantic surface tokens and respects the user's
+ * macOS appearance via prefers-color-scheme. Cortex's terracotta brand
+ * accent (#D97757) is preserved on both light + dark backgrounds via the
+ * CSS custom properties below; React inline styles can opt in via
+ * var(--cx-accent) when they need to flip with system appearance.
+ *
+ * Light palette mirrors cortex/libs/design/tokens.yaml `semantic.light`;
+ * dark palette mirrors `semantic.dark`. Keep in lock-step with the YAML
+ * and re-run cortex/scripts/sync_design_tokens.py.
+ */
+
+:root {
+    color-scheme: light dark;
+
+    --cx-window-bg: #ECECEC;
+    --cx-control-bg: #FFFFFF;
+    --cx-grouped-bg: #F2F2F7;
+    --cx-label-primary: #1A1A1A;
+    --cx-label-secondary: #5C5854;
+    --cx-label-tertiary: #827971;
+    --cx-separator: rgba(60, 60, 67, 0.15);
+    --cx-accent: #D97757;
+    --cx-accent-hover: #C46547;
+    --cx-danger: #D70015;
+    --cx-success: #30B257;
+    --cx-warning: #D9A100;
+    --cx-info: #0A84FF;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --cx-window-bg: #1E1E1E;
+        --cx-control-bg: #2C2C2E;
+        --cx-grouped-bg: #1C1C1E;
+        --cx-label-primary: #FFFFFF;
+        --cx-label-secondary: rgba(235, 235, 245, 0.60);
+        --cx-label-tertiary: rgba(235, 235, 245, 0.30);
+        --cx-separator: rgba(84, 84, 88, 0.30);
+        --cx-accent: #E08E6F;          /* boosted L for legibility on dark */
+        --cx-accent-hover: #D97757;
+        --cx-danger: #FF453A;
+        --cx-success: #32D74B;
+        --cx-warning: #FFD60A;
+        --cx-info: #0A84FF;
+    }
+}
+
 html, body, #__plasmo {
     margin: 0;
     padding: 0;
-    background: #0C0C0E;
+    background: var(--cx-window-bg);
+    color: var(--cx-label-primary);
     min-height: 100vh;
+    /* SF system stack — drops Inter (frontend-design rule: invisible
+     * default). Resolves to SF Pro Text/Display on macOS. */
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+                 "SF Pro Display", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }
 }

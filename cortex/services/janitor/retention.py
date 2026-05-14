@@ -57,6 +57,12 @@ def _sweep_directory(
     freed = 0
     errors = 0
 
+    # swiftdata-pro rule (transferred): tombstone partial-write ``*.tmp``
+    # files older than 24h, regardless of the directory's overall retention
+    # window. These are SQLite/JSON write-ahead artifacts that should never
+    # outlive a normal session; if they survive a day, the writer crashed.
+    _TMP_TOMBSTONE_SECONDS = 24 * 3600
+
     for path in directory.rglob("*"):
         if path.is_dir():
             continue
@@ -66,7 +72,11 @@ def _sweep_directory(
         except OSError:
             errors += 1
             continue
-        if now - mtime <= retention_seconds:
+        is_tmp = path.suffix == ".tmp"
+        threshold = (
+            _TMP_TOMBSTONE_SECONDS if is_tmp else retention_seconds
+        )
+        if now - mtime <= threshold:
             continue
         try:
             size = path.stat().st_size

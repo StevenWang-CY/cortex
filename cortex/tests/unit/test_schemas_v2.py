@@ -72,13 +72,13 @@ class TestFeatureVector:
 # ---------------------------------------------------------------------------
 
 class TestStateSchemas:
-    def test_hypo_apnea_exists(self):
-        """UserState.HYPO_APNEA must be a valid enum member."""
-        assert UserState.HYPO_APNEA == "HYPO_APNEA"
-        assert UserState.HYPO_APNEA.value == "HYPO_APNEA"
-
     def test_all_states(self):
-        expected = {"FLOW", "HYPO", "HYPER", "RECOVERY", "HYPO_APNEA"}
+        """UserState exposes exactly the four states consumed by the
+        StateEstimate/StateTransition Literals. HYPO_APNEA was removed as
+        dead enum drift — it was never produced by the scorer and was
+        excluded from every Literal in the schema.
+        """
+        expected = {"FLOW", "HYPO", "HYPER", "RECOVERY"}
         actual = {s.value for s in UserState}
         assert expected == actual
 
