@@ -35,17 +35,33 @@ def log(msg: str) -> None:
         pass
 
 
-def read_message() -> dict:
-    """Read a native messaging request from stdin."""
+def read_message_bytes() -> bytes | None:
+    """Read a native messaging request from stdin as raw bytes.
+
+    Returns ``None`` when stdin is closed before a full length prefix
+    arrives. Length-prefix-only validation lives here so callers can
+    defer schema parsing to :func:`parse_native_message` (audit F14).
+    The legacy ``read_message()`` returned a parsed ``dict`` and used an
+    8 MB cap; the new contract is 64 KB and a bytes return so the
+    schema layer can reject oversized payloads alongside malformed
+    JSON in one place.
+    """
     raw_length = sys.stdin.buffer.read(4)
     if len(raw_length) < 4:
-        return {}
+        return None
     length = struct.unpack("<I", raw_length)[0]
-    # Guardrail against malformed length prefixes.
-    if length > 8 * 1024 * 1024:
-        return {}
-    data = sys.stdin.buffer.read(length)
-    return json.loads(data.decode("utf-8"))
+    # Tight cap (64 KB) lives in the schema module; reject earlier here
+    # so we never allocate megabytes for an obviously-bogus prefix.
+    # The schema layer rejects again — defense in depth.
+    if length > 64 * 1024:
+        # Drain whatever bytes are available so we don't desync the
+        # protocol for the next message; cap at 1 MB to bound work.
+        try:
+            sys.stdin.buffer.read(min(length, 1024 * 1024))
+        except Exception:
+            pass
+        return b""
+    return sys.stdin.buffer.read(length)
 
 
 def send_message(msg: dict) -> None:
@@ -278,17 +294,43 @@ def _get_auth_token_response() -> dict:
 def main() -> None:
     log("--- invoked ---")
     try:
-        msg = read_message()
-        log(f"received: {msg}")
-        command = msg.get("command", "launch")
+        # Audit F14 + F37: schema-validate the inbound payload before
+        # dispatching. Out-of-band failures (oversized, unparseable,
+        # unknown command, project_root outside the allowlist) return a
+        # structured ``error`` envelope rather than crashing the host
+        # or — worse — invoking ``launch_daemon`` with attacker-shaped
+        # arguments.
+        from cortex.libs.schemas.native_messaging import parse_native_message
 
-        if command == "launch":
+        raw = read_message_bytes()
+        if raw is None:
+            # stdin closed without a full prefix; nothing we can usefully
+            # reply to. The Chrome native-messaging protocol expects no
+            # further output in this case.
+            log("stdin closed before payload arrived")
+            return
+
+        parsed = parse_native_message(raw)
+        if parsed.error is not None:
+            log(f"rejected: error={parsed.error} detail={parsed.detail}")
+            send_message({
+                "status": "error",
+                "error": parsed.error,
+                "detail": parsed.detail,
+            })
+            return
+
+        msg = parsed.message
+        assert msg is not None  # narrow for type-checkers
+        log(f"received: command={msg.command}")
+
+        if msg.command == "launch":
             result = launch_daemon()
-        elif command == "stop":
+        elif msg.command == "stop":
             result = stop_daemon()
-        elif command == "status":
+        elif msg.command == "status":
             result = {"status": "running" if is_daemon_running() else "stopped"}
-        elif command == "get_auth_token":
+        elif msg.command == "get_auth_token":
             # F07b/F08: extension cannot read mode-0600 files directly;
             # the native host runs as the user and CAN. The browser↔host
             # boundary is already OS-authenticated (chrome.runtime.host
@@ -297,7 +339,13 @@ def main() -> None:
             # capability gates we added on WS SHUTDOWN and launcher /stop.
             result = _get_auth_token_response()
         else:
-            result = {"status": "error", "error": f"Unknown command: {command}"}
+            # Unreachable: the schema's discriminated union exhausts the
+            # legitimate command set. Surfaced for defence in depth.
+            result = {
+                "status": "error",
+                "error": "unknown_command",
+                "detail": str(msg.command),
+            }
 
         log(f"sending: {result}")
         send_message(result)
