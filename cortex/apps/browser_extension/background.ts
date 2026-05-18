@@ -51,7 +51,10 @@ const DEBUG = false;
 let ws: WebSocket | null = null;
 let connected = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-let reconnectDelay = 3000;
+// F32: keep the initial delay symbolic so the reset on `open` is
+// obviously paired with the doubling in `scheduleReconnect`.
+const INITIAL_RECONNECT_DELAY = 3000;
+let reconnectDelay = INITIAL_RECONNECT_DELAY;
 const MAX_RECONNECT_DELAY = 30000;
 let intentionalDisconnect = false;
 let sequence = 0;
@@ -442,7 +445,10 @@ function connect(): void {
 
         ws.onopen = () => {
             connected = true;
-            reconnectDelay = 3000;
+            // F32: reset the reconnect backoff on every successful open so a
+            // long-running disconnect cycle that finally succeeds doesn't
+            // keep waiting 30s on the next transient drop.
+            reconnectDelay = INITIAL_RECONNECT_DELAY;
 
             // Identify as Chrome extension
             send({
@@ -602,6 +608,16 @@ export function _resetWsParseErrorCounter(): void {
 
 export function _getWsParseErrorCount(): number {
     return wsParseErrorTimestamps.length;
+}
+
+/** Test-only: expose the F32 reconnect delay so tests can verify it
+ * resets on every successful WS open. */
+export function _getReconnectDelay(): number {
+    return reconnectDelay;
+}
+
+export function _getInitialReconnectDelay(): number {
+    return INITIAL_RECONNECT_DELAY;
 }
 
 function recordWsParseError(err: unknown, msg: Partial<WSMessage> | null): void {
