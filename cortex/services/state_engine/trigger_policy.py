@@ -50,6 +50,9 @@ DISMISSAL_MODEL_VERSION: int = 1
 _DISMISSAL_FLUSH_EVERY_N_UPDATES: int = 10
 _DISMISSAL_FLUSH_EVERY_SECONDS: float = 30.0
 
+# F26: persisted quiet-mode-history record version.
+QUIET_MODE_HISTORY_VERSION: int = 1
+
 
 def _default_dismissal_model_path() -> Path:
     """Where the persisted dismissal-model record lives (F21).
@@ -58,6 +61,11 @@ def _default_dismissal_model_path() -> Path:
     constructor kwarg instead of monkeypatching globals.
     """
     return get_config_dir() / "dismissal_model.json"
+
+
+def _default_quiet_mode_history_path() -> Path:
+    """Where the persisted quiet-mode-escalation record lives (F26)."""
+    return get_config_dir() / "quiet_mode_history.json"
 
 
 @dataclass(frozen=True)
@@ -106,6 +114,7 @@ class TriggerPolicy:
         *,
         hyper_dwell_seconds: float | None = None,
         dismissal_model_path: Path | None = None,
+        quiet_mode_history_path: Path | None = None,
     ) -> None:
         self._config = config or InterventionConfig()
         # Single source of truth for HYPER dwell is StateConfig (v0.2.0 C.5).
@@ -151,6 +160,20 @@ class TriggerPolicy:
         self._dismissal_updates_since_flush: int = 0
         self._dismissal_last_flush_at: float = time.monotonic()
         self._load_dismissal_model()
+
+        # F26: quiet-mode escalation persistence.
+        # The pre-fix code reset the counter back to 0 whenever 2 hours
+        # passed between dismissal bursts, so a user dismissing every
+        # ~2h forever stayed at level-1 quiet (15 min) and never escalated.
+        # We now persist the counter + the last-escalation timestamp and
+        # only zero them on an explicit reset_quiet_mode() call.
+        self._quiet_mode_history_path: Path = (
+            quiet_mode_history_path
+            if quiet_mode_history_path is not None
+            else _default_quiet_mode_history_path()
+        )
+        self._quiet_mode_history_lock: threading.Lock = threading.Lock()
+        self._load_quiet_mode_history()
 
     @property
     def is_quiet_mode(self) -> bool:
@@ -399,12 +422,15 @@ class TriggerPolicy:
         )
 
         if recent_dismissals >= self._config.max_dismissals:
-            # Reset escalation counter if >2 hours since last quiet mode
-            if now > self._quiet_mode_count_reset_at:
-                self._quiet_mode_count = 0
-
+            # F26: do NOT reset the escalation counter purely because
+            # ``now > self._quiet_mode_count_reset_at``. A user dismissing
+            # every >2h forever stayed at level-1 quiet (15 min) and never
+            # graduated to longer cool-downs. Counter only zeroes on an
+            # explicit ``reset_quiet_mode()`` invocation (e.g. dashboard
+            # "Reset suggestions"). We still track the timestamp of the
+            # last escalation for observability.
             self._quiet_mode_count += 1
-            # Progressive escalation: 15min → 30min → 60min
+            # Progressive escalation: 15min -> 30min -> 60min
             durations = [
                 self._config.quiet_mode_minutes,       # 15 min (base)
                 self._config.quiet_mode_minutes * 2,    # 30 min
@@ -412,12 +438,15 @@ class TriggerPolicy:
             ]
             minutes = durations[min(self._quiet_mode_count - 1, len(durations) - 1)]
             self._quiet_mode_until = now + minutes * 60.0
-            self._quiet_mode_count_reset_at = now + 2 * 3600.0  # Reset after 2 hours
+            # Track the last-escalation timestamp for diagnostics; we no
+            # longer use it as a reset trigger.
+            self._quiet_mode_count_reset_at = now
 
             logger.info(
                 f"Quiet mode activated for {minutes} minutes (level {self._quiet_mode_count}, "
                 f"{recent_dismissals} dismissals in {self._config.dismissal_window_minutes} min)"
             )
+            self._persist_quiet_mode_history()
 
     def record_outcome(
         self,
@@ -574,6 +603,112 @@ class TriggerPolicy:
         """Disable quiet mode immediately."""
         self._quiet_mode_until = 0.0
 
+    def reset_quiet_mode(self) -> None:
+        """User-driven quiet-mode reset (F26).
+
+        Clears the active quiet window AND the persisted escalation
+        counter. Wired (by dashboard / API in a follow-up commit) to a
+        "Reset suggestions" affordance. The 2-hour idle reset that used
+        to fire silently inside ``record_dismissal`` is gone: only this
+        explicit call zeroes the escalation memory.
+        """
+        self._quiet_mode_until = 0.0
+        self._quiet_mode_count = 0
+        self._quiet_mode_count_reset_at = 0.0
+        try:
+            if self._quiet_mode_history_path.exists():
+                self._quiet_mode_history_path.unlink()
+        except OSError:
+            logger.debug(
+                "Could not remove quiet mode history file at %s",
+                self._quiet_mode_history_path,
+            )
+
+    def _persist_quiet_mode_history(self) -> None:
+        """Write the current quiet-mode escalation record (F26).
+
+        Crash-safe via ``atomic_write_json``. Lock-guarded so a snapshot
+        read inside ``reset_quiet_mode`` cannot interleave with the
+        record_dismissal writer.
+        """
+        with self._quiet_mode_history_lock:
+            record = {
+                "version": QUIET_MODE_HISTORY_VERSION,
+                "quiet_mode_count": int(self._quiet_mode_count),
+                "quiet_mode_until_monotonic_delta": max(
+                    0.0,
+                    self._quiet_mode_until - time.monotonic(),
+                ),
+                "last_escalation_at_monotonic_delta": max(
+                    0.0,
+                    self._quiet_mode_count_reset_at - time.monotonic(),
+                ),
+                "saved_at": time.time(),
+            }
+        try:
+            atomic_write_json(self._quiet_mode_history_path, record)
+        except OSError as exc:
+            logger.warning(
+                "Failed to persist quiet mode history to %s: %s",
+                self._quiet_mode_history_path,
+                exc,
+            )
+
+    def _load_quiet_mode_history(self) -> None:
+        """Rehydrate the quiet-mode escalation counter on construction (F26).
+
+        Missing file / wrong version / malformed JSON => cold start.
+        Wall-clock-relative remainders are converted back to monotonic
+        time so a paused-and-resumed restart still honours any quiet
+        window that should still be active. If clock skew or a long
+        downtime makes the remainder non-sensible, the loader falls back
+        to a fresh ``_quiet_mode_until = 0`` while preserving the
+        escalation counter — the user's escalation memory is the bit
+        we care about most.
+        """
+        path = self._quiet_mode_history_path
+        if not path.exists():
+            logger.debug("No quiet mode history at %s; cold-starting.", path)
+            return
+        try:
+            raw = path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "Could not read quiet mode history at %s (%s); cold-starting.",
+                path,
+                exc,
+            )
+            return
+        if not isinstance(data, dict):
+            logger.warning(
+                "Quiet mode history at %s is not a JSON object; cold-starting.",
+                path,
+            )
+            return
+        if data.get("version") != QUIET_MODE_HISTORY_VERSION:
+            logger.info(
+                "Quiet mode history version mismatch (have=%r, want=%r); cold-starting.",
+                data.get("version"),
+                QUIET_MODE_HISTORY_VERSION,
+            )
+            return
+        count = data.get("quiet_mode_count", 0)
+        if isinstance(count, int) and count >= 0:
+            self._quiet_mode_count = count
+        # Restore the active quiet window if a remainder is still set.
+        remaining = data.get("quiet_mode_until_monotonic_delta", 0.0)
+        if isinstance(remaining, (int, float)) and remaining > 0.0:
+            self._quiet_mode_until = time.monotonic() + float(remaining)
+        last_delta = data.get("last_escalation_at_monotonic_delta", 0.0)
+        if isinstance(last_delta, (int, float)) and last_delta >= 0.0:
+            self._quiet_mode_count_reset_at = time.monotonic() + float(last_delta)
+        logger.info(
+            "Rehydrated quiet-mode history from %s (level=%d)",
+            path,
+            self._quiet_mode_count,
+        )
+
     def _compute_effective_threshold(self, now: float) -> float:
         """
         Compute the effective trigger threshold.
@@ -641,4 +776,13 @@ class TriggerPolicy:
             logger.debug(
                 "Could not remove dismissal model file at %s",
                 self._dismissal_model_path,
+            )
+        # F26: also clear the persisted quiet-mode escalation memory.
+        try:
+            if self._quiet_mode_history_path.exists():
+                self._quiet_mode_history_path.unlink()
+        except OSError:
+            logger.debug(
+                "Could not remove quiet mode history file at %s",
+                self._quiet_mode_history_path,
             )
