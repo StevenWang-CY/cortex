@@ -413,6 +413,28 @@ class AnthropicPlanner:
 
         attempts = 3
         for attempt in range(attempts):
+            # audit-w2: re-consult the daily cost ceiling on every retry,
+            # not just on the first attempt. A successful but token-heavy
+            # response on attempt 1 (or a partial response billed via the
+            # cancellation path in F30) can push the day's spend over
+            # ``BUDGET_KILL`` mid-call. Without this re-check the retry
+            # loop happily burns another two attempts past the ceiling.
+            if (
+                attempt > 0
+                and self._cost_tracker is not None
+                and self._cost_tracker.check_budget() == "KILL"
+            ):
+                logger.error(
+                    "LLM daily budget exceeded mid-retry; serving "
+                    "deterministic fallback (cid=%s, attempt=%d)",
+                    get_correlation_id() or "-",
+                    attempt + 1,
+                )
+                killed = build_fallback_plan(context)
+                killed.metadata["fallback_reason"] = "budget_killed"
+                killed.metadata["budget_killed"] = True
+                killed.metadata["budget_killed_on_retry"] = attempt + 1
+                return killed
             t0 = time.perf_counter()
             response: Any = None
             try:
