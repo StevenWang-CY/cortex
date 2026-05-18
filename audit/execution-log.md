@@ -125,6 +125,24 @@ Entries appended in commit order. Each entry: finding ID, fix summary, files tou
 
 ---
 
+### F01 — Capture pipeline stop() bounded by timeout
+
+**Fix.** `runtime_daemon.stop()` awaited `self._capture_pipeline.stop()` with no upper bound. A disconnected USB webcam or stuck mediapipe worker hangs the close indefinitely; only SIGKILL unblocks the daemon, and SIGKILL leaves the AVFoundation camera handle owned by a dead PID for minutes — next launch fails with a permission-loop. The fix wraps the call in `asyncio.wait_for(..., timeout=5.0)`. On timeout the daemon logs an explicit error and proceeds with the rest of the shutdown chain; the kernel reclaims the camera handle on actual process exit. Non-timeout exceptions are now logged (previously they were silently swallowed by `except: pass`).
+
+**Files touched** (2):
+- `cortex/services/runtime_daemon.py`
+- `cortex/tests/unit/test_capture_stop_timeout.py` (new)
+
+**Test.** 3 cases. A `_NeverFinishingPipeline` proves the timeout fires within bounds; a fast pipeline is not interrupted; non-timeout errors propagate (the wrapper does not swallow `RuntimeError`). On `main` the production code uses `await` with no `wait_for`, so a hung pipeline would block forever — adapter tests cannot match against that since they would themselves hang; the wrapper-pattern tests prove the new contract.
+
+**Verification.** F01 suite: 3 passed (0.28s).
+
+**Compatibility.** Behavioural change at shutdown: previously infinite wait, now 5 s. Legitimate camera close paths complete in well under 1 s; the 5 s budget is generous. No wire/schema change.
+
+**Rollback.** `git revert` is clean. Single hunk in `runtime_daemon.py`; the prior `try/except: pass` is straight-line restored.
+
+---
+
 ## New Findings (surfaced during Phase 2)
 
 ### F07b — Native-host mediated auth-token fetch for extension

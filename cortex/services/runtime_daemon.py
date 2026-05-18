@@ -524,10 +524,27 @@ class CortexDaemon:
                 self._api_task = None
         # Always stop the capture pipeline to release the camera — even if
         # _capture_available is False (pipeline may have started then errored)
+        #
+        # F01: bound the stop() with a hard timeout. A disconnected USB
+        # webcam or a stuck mediapipe worker can block forever inside the
+        # capture loop; without a timeout the daemon hangs in stop(),
+        # only SIGKILL unblocks, and SIGKILL leaves the AVFoundation
+        # camera handle owned by a dead process — next launch fails. By
+        # forcing a CancelledError after 5 s we surrender the graceful
+        # close window in exchange for a deterministic shutdown; the
+        # AVFoundation handle is reclaimed by the kernel on process exit
+        # regardless, but only if we actually exit.
         try:
-            await self._capture_pipeline.stop()
+            await asyncio.wait_for(
+                self._capture_pipeline.stop(), timeout=5.0
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Capture pipeline stop() exceeded 5s; abandoning graceful "
+                "close — relying on process exit to release the camera",
+            )
         except Exception:
-            pass
+            logger.exception("Capture pipeline stop() raised; continuing shutdown")
         self._input_hooks.stop()
         self._window_tracker.stop()
         # G.1: write the session debrief BEFORE shutting down the WS

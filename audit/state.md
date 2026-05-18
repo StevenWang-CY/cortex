@@ -1,9 +1,9 @@
 # Audit State Pointer
 
 **Phase:** 2 (remediation in progress)
-**Next finding to address:** F01 (capture pipeline stop timeout)
-**Last finding closed:** F03 (background task tracking)
-**Last commit:** `audit F03: track and drain background asyncio tasks on shutdown`
+**Next finding to address:** F11 (Bedrock token leak via os.environ)
+**Last finding closed:** F01 (capture pipeline stop timeout)
+**Last commit:** `audit F01: bound capture pipeline stop() with timeout`
 **Resume protocol on fresh invocation:**
 
 1. Read `audit/findings.md` — authoritative Ledger.
