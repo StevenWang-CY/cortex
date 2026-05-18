@@ -9,6 +9,30 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { CX, STATE_COLORS, STATE_LABELS, CX_KEYFRAMES } from "./design-tokens";
+import { newCorrelationId } from "./lib/correlation";
+
+/**
+ * F19b: every popup-initiated request mints a correlation id at the click
+ * boundary. The background script logs the id on receive and stamps it
+ * on the outbound WS frame so a single click can be traced through
+ * `popup → bg → native_host → daemon`.
+ */
+function sendWithCid(
+    msg: Record<string, unknown>,
+    cb?: (resp: unknown) => void,
+): string {
+    const correlation_id = newCorrelationId();
+    const enriched = { ...msg, correlation_id };
+    console.debug(
+        `cortex.popup.send cid=${correlation_id} type=${String(msg.type)}`,
+    );
+    if (cb) {
+        chrome.runtime.sendMessage(enriched, cb);
+    } else {
+        chrome.runtime.sendMessage(enriched);
+    }
+    return correlation_id;
+}
 
 const CortexLogo = () => (
     <svg width="22" height="22" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ flexShrink: 0 }}>
@@ -179,7 +203,7 @@ function CortexPopup(): React.ReactElement {
     const handleQuietModeToggle = useCallback(() => {
         const newValue = !quietMode;
         setQuietMode(newValue);
-        chrome.runtime.sendMessage({ type: "TOGGLE_QUIET_MODE", quiet: newValue });
+        sendWithCid({ type: "TOGGLE_QUIET_MODE", quiet: newValue });
     }, [quietMode]);
 
     const [launchStatus, setLaunchStatus] = useState("");
@@ -188,7 +212,8 @@ function CortexPopup(): React.ReactElement {
         setLaunching(true);
         setLaunchError(false);
         setLaunchStatus("Launching daemon\u2026");
-        chrome.runtime.sendMessage({ type: "LAUNCH_CORTEX" }, (resp) => {
+        sendWithCid({ type: "LAUNCH_CORTEX" }, (raw: unknown) => {
+            const resp = raw as { ok?: boolean; status?: string; error?: string } | undefined;
             if (resp?.ok && resp.status === "camera_enabled") {
                 setLaunching(false);
                 setLaunchStatus("");
@@ -292,7 +317,7 @@ function CortexPopup(): React.ReactElement {
     }, []);
 
     const handleConnect = useCallback(() => {
-        chrome.runtime.sendMessage({ type: "CONNECT" });
+        sendWithCid({ type: "CONNECT" });
     }, []);
 
     const [stopping, setStopping] = useState(false);
@@ -303,7 +328,7 @@ function CortexPopup(): React.ReactElement {
         setState(null);
         setFocus(null);
         // Tell background to disconnect WS, kill daemon via HTTP, close tabs
-        chrome.runtime.sendMessage({ type: "STOP_CORTEX" });
+        sendWithCid({ type: "STOP_CORTEX" });
         // Wait a moment for shutdown to propagate, then release button
         setTimeout(() => setStopping(false), 2000);
     }, []);
@@ -313,15 +338,12 @@ function CortexPopup(): React.ReactElement {
         if (goal === "") {
             return;
         }
-        chrome.runtime.sendMessage({
-            type: "START_FOCUS",
-            goal,
-        });
+        sendWithCid({ type: "START_FOCUS", goal });
         setGoalInput("");
     }, [goalInput]);
 
     const handleStopFocus = useCallback(() => {
-        chrome.runtime.sendMessage({ type: "STOP_FOCUS" });
+        sendWithCid({ type: "STOP_FOCUS" });
     }, []);
 
     // Derived
@@ -407,7 +429,7 @@ function CortexPopup(): React.ReactElement {
                         <button style={S.ghostBtn} onClick={() => {
                             const leftOff = (briefing.left_off_at ?? "").trim();
                             if (leftOff !== "") {
-                                chrome.runtime.sendMessage({ type: "START_FOCUS", goal: leftOff });
+                                sendWithCid({ type: "START_FOCUS", goal: leftOff });
                             }
                             setBriefing(null);
                         }}>Resume</button>
@@ -609,24 +631,28 @@ function CortexPopup(): React.ReactElement {
                                 style={applied ? { ...S.primaryBtn, ...S.doneBtnStyle } : S.primaryBtn}
                                 disabled={applied}
                                 onClick={() => {
-                                    chrome.runtime.sendMessage({
-                                        type: "EXECUTE_ALL_RECOMMENDED",
-                                        actions: rec,
-                                        intervention_id: interventionId,
-                                    }, (results: Array<{ success: boolean }> | undefined) => {
-                                        const succeeded = Array.isArray(results) && results.some(r => r.success);
-                                        if (succeeded) {
-                                            setApplied(true);
-                                            setTimeout(() => {
-                                                setActiveActions([]);
-                                                setTabRecs(null);
-                                                setErrAnalysis(null);
-                                                setApplied(false);
-                                            }, 10000);
-                                        } else {
-                                            setApplied(true);
-                                        }
-                                    });
+                                    sendWithCid(
+                                        {
+                                            type: "EXECUTE_ALL_RECOMMENDED",
+                                            actions: rec,
+                                            intervention_id: interventionId,
+                                        },
+                                        (raw: unknown) => {
+                                            const results = raw as Array<{ success: boolean }> | undefined;
+                                            const succeeded = Array.isArray(results) && results.some(r => r.success);
+                                            if (succeeded) {
+                                                setApplied(true);
+                                                setTimeout(() => {
+                                                    setActiveActions([]);
+                                                    setTabRecs(null);
+                                                    setErrAnalysis(null);
+                                                    setApplied(false);
+                                                }, 10000);
+                                            } else {
+                                                setApplied(true);
+                                            }
+                                        },
+                                    );
                                 }}
                             >
                                 {applied
@@ -643,7 +669,7 @@ function CortexPopup(): React.ReactElement {
                                     <button
                                         style={S.undoLink}
                                         onClick={() => {
-                                            chrome.runtime.sendMessage(
+                                            sendWithCid(
                                                 { type: "UNDO_ALL_RECENT", intervention_id: interventionId },
                                                 () => setApplied(false),
                                             );

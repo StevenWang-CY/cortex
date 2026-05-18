@@ -2572,6 +2572,13 @@ chrome.runtime.onMessage.addListener(
         _sender: chrome.runtime.MessageSender,
         sendResponse: (response: unknown) => void,
     ) => {
+        // F19b: every popup/newtab message can carry a correlation_id minted
+        // by `sendWithCid`. Log it on receive so the chain
+        // `popup → bg → daemon` is greppable end-to-end.
+        const __cid = typeof message.correlation_id === "string" ? message.correlation_id : null;
+        if (__cid) {
+            console.debug(`cortex.bg.recv cid=${__cid} type=${String(message.type)}`);
+        }
         switch (message.type) {
             case "GET_STATE":
                 // If activeIntervention was lost (SW restart), load from session storage
@@ -2665,6 +2672,10 @@ chrome.runtime.onMessage.addListener(
                                 payload: {},
                                 timestamp: Date.now() / 1000,
                                 sequence: ++sequence,
+                                // F19b: carry the popup's cid through so the
+                                // daemon can correlate the SHUTDOWN with the
+                                // upstream user click.
+                                correlation_id: __cid ?? undefined,
                             });
                             await new Promise((r) => setTimeout(r, 500));
                         } catch { /* ws may already be closing */ }
