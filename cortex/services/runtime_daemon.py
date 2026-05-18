@@ -56,7 +56,10 @@ from cortex.services.intervention_engine.leetcode_interventions import Intervent
 from cortex.services.intervention_engine.planner import prepare_plan
 from cortex.services.intervention_engine.restore import RestoreManager
 from cortex.services.intervention_engine.snapshot import capture_snapshot
-from cortex.services.janitor.retention import sweep_once as run_retention_sweep
+from cortex.services.janitor.retention import (
+    sweep_once as run_retention_sweep,
+    sweep_once_async as run_retention_sweep_async,
+)
 from cortex.services.kinematics_engine.blink_detector import BlinkDetector
 from cortex.services.kinematics_engine.head_pose import HeadPoseEstimator
 from cortex.services.kinematics_engine.posture import PostureAnalyzer
@@ -734,8 +737,10 @@ class CortexDaemon:
             while True:
                 try:
                     storage_root = Path(self.config.storage.path).expanduser()
-                    await asyncio.to_thread(
-                        run_retention_sweep,
+                    # F35: use the chunked async variant so a sweep over
+                    # a large storage root does not starve the state /
+                    # telemetry / broadcast coroutines.
+                    await run_retention_sweep_async(
                         self.config.storage,
                         storage_root=storage_root,
                     )
