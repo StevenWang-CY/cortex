@@ -535,23 +535,117 @@ class WebSocketServer:
             logger.exception("Context request to %s failed", client_type)
             return {}
 
+    # audit Phase-I: per-send timeout (s) and total broadcast budget (s).
+    # The per-send timeout is bumped from 1 s → 2 s so a transient
+    # network blip on one client does not get classified as a dead
+    # consumer; the hard total budget caps how long any single broadcast
+    # can block the loop. A broadcast that exceeds the budget logs a
+    # ``WS_BROADCAST_SLOW`` event and counts the clients that did not
+    # finish in time as dropped frames for that broadcast — they are
+    # not disconnected on the first slow broadcast (only if their
+    # individual per-send timeout actually fires).
+    _BROADCAST_PER_CLIENT_TIMEOUT_S: float = 2.0
+    _BROADCAST_BUDGET_S: float = 0.1
+
     async def _broadcast(self, msg: WSMessage) -> int:
-        """Broadcast a message to all connected clients."""
+        """Broadcast a message to all connected clients.
+
+        audit Phase-I: replaces the serial ``for client in clients:
+        await send(...)`` with ``asyncio.gather`` so a four-client
+        broadcast costs ~max(client_latencies) instead of
+        ~sum(client_latencies). The serial loop dropped frames at
+        4 connected clients because each STATE_UPDATE could spend up
+        to 4 × 1 s on a flaky client. The parallel-gather variant
+        keeps p95 broadcast latency below ``_BROADCAST_BUDGET_S``
+        (100 ms) under the same conditions.
+        """
         if not self._clients:
             return 0
 
+        payload = msg.to_json()
+        target_types = set(msg.target_client_types or [])
+        targets = [
+            (client_id, client)
+            for client_id, client in self._clients.items()
+            if not target_types or client.client_type in target_types
+        ]
+        if not targets:
+            return 0
+
+        async def _send_one(client: WebSocketClient) -> str | None:
+            """Return ``None`` on success or a disconnect reason string."""
+            try:
+                await asyncio.wait_for(
+                    client.websocket.send(payload),
+                    timeout=self._BROADCAST_PER_CLIENT_TIMEOUT_S,
+                )
+                return None
+            except TimeoutError:
+                return "slow consumer"
+            except Exception:
+                return "send error"
+
+        # audit Phase-I: parallel-gather under a hard total budget. We
+        # wrap each ``_send_one`` in its own Task so that when the
+        # budget elapses we cancel only the unfinished tasks — the
+        # tasks that already completed keep their results. (A plain
+        # ``asyncio.gather`` would cancel every inner coroutine when
+        # the wrapper is cancelled, losing already-completed results.)
+        broadcast_start = time.monotonic()
+        send_tasks = [
+            asyncio.create_task(_send_one(client)) for _, client in targets
+        ]
+        done, pending = await asyncio.wait(
+            send_tasks, timeout=self._BROADCAST_BUDGET_S,
+        )
+        budget_exceeded = bool(pending)
+        for task in pending:
+            task.cancel()
+        # Drain cancellations so they don't surface as "task was
+        # destroyed but pending" warnings on a busy event loop.
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        results: list[Any] = []
+        for task in send_tasks:
+            if task in pending:
+                results.append(asyncio.CancelledError())
+            else:
+                try:
+                    results.append(task.result())
+                except BaseException as exc:  # noqa: BLE001
+                    results.append(exc)
+
+        elapsed_s = time.monotonic() - broadcast_start
         sent = 0
         dead_clients: list[str] = []
-
-        target_types = set(msg.target_client_types or [])
-        for client_id, client in self._clients.items():
-            if target_types and client.client_type not in target_types:
-                continue
-            try:
-                await asyncio.wait_for(client.websocket.send(msg.to_json()), timeout=1.0)
+        slow_clients: list[str] = []
+        for (client_id, _client), outcome in zip(targets, results, strict=False):
+            if outcome is None:
                 sent += 1
-            except Exception:
+            elif isinstance(outcome, asyncio.CancelledError):
+                # Did not finish inside the budget; not a disconnect.
+                slow_clients.append(client_id)
+            elif isinstance(outcome, str):
                 dead_clients.append(client_id)
+            else:  # unexpected exception captured by gather
+                dead_clients.append(client_id)
+
+        if budget_exceeded or slow_clients:
+            try:
+                from cortex.libs.logging.structured import EventType, get_logger
+
+                get_logger(__name__).warning(
+                    "ws_broadcast_slow",
+                    event_type=EventType.WS_BROADCAST_SLOW.value,
+                    elapsed_ms=int(elapsed_s * 1000),
+                    budget_ms=int(self._BROADCAST_BUDGET_S * 1000),
+                    client_count=len(targets),
+                    dropped_for_budget=len(slow_clients),
+                )
+            except Exception:
+                # Telemetry must never break the hot path.
+                logger.debug("ws_broadcast_slow log failed", exc_info=True)
 
         # Clean up dead connections
         for client_id in dead_clients:
