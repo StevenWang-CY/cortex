@@ -161,8 +161,14 @@ def emit_python(data: dict[str, Any]) -> str:
     out.append('CX_SURFACE: Final[str] = SEMANTIC_LIGHT["control_bg"]\n')
     out.append('CX_TERTIARY: Final[str] = SEMANTIC_LIGHT["grouped_bg"]\n')
     out.append('CX_TEXT: Final[str] = SEMANTIC_LIGHT["label_primary"]\n')
+    # Warm-greyscale labels paired with the cream window background.
+    # F55 raised tertiary from "#827971" (3.98:1 against #FFFFFF — under WCAG
+    # AA's 4.5:1 threshold) to "#6B6661" (4.86:1, AA-compliant). Audit Wave 2
+    # promotes the literal to the token registry so the connections panel,
+    # settings dialog, and onboarding wizard pick up the same AA-passing
+    # value instead of carrying private hex copies.
     out.append('CX_TEXT_SECONDARY: Final[str] = "#5C5854"\n')
-    out.append('CX_TEXT_TERTIARY: Final[str] = "#827971"\n')
+    out.append('CX_TEXT_TERTIARY: Final[str] = "#6B6661"\n')
     out.append('CX_TEXT_INVERSE: Final[str] = "#FFFFFF"\n')
     out.append("CX_ACCENT: Final[str] = BRAND_ACCENT\n")
     out.append("CX_ACCENT_HOVER: Final[str] = BRAND_ACCENT_HOVER\n")
@@ -235,7 +241,7 @@ def emit_python(data: dict[str, Any]) -> str:
     out.append('    "}"\n')
     out.append('    "QPushButton:hover { background: #333; }"\n')
     out.append('    "QPushButton:pressed { background: #555; }"\n')
-    out.append('    f"QPushButton:disabled {{ background: {SEMANTIC_LIGHT[\'grouped_bg\']}; color: #827971; }}"\n')
+    out.append('    f"QPushButton:disabled {{ background: {SEMANTIC_LIGHT[\'grouped_bg\']}; color: #6B6661; }}"\n')
     out.append(")\n\n")
 
     out.append("BTN_ACCENT_QSS: Final[str] = (\n")
@@ -329,7 +335,7 @@ def emit_browser_ts(data: dict[str, Any]) -> str:
     out.append('    shadowFloat: "0 8px 32px rgba(0, 0, 0, 0.08), 0 0 0 1px rgba(0,0,0,0.04)",\n')
     out.append(f'    text: "{light["label_primary"]["hex"]}",\n')
     out.append('    textSecondary: "#5C5854",\n')
-    out.append('    textTertiary: "#827971",\n')
+    out.append('    textTertiary: "#6B6661",\n')
     out.append('    textInverse: "#FFFFFF",\n')
     out.append(f'    accent: "{brand["accent"]["hex"]}",\n')
     out.append(f'    accentHover: "{brand["accent_hover"]["hex"]}",\n')

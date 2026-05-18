@@ -150,7 +150,7 @@ CX_SURFACE: Final[str] = SEMANTIC_LIGHT["control_bg"]
 CX_TERTIARY: Final[str] = SEMANTIC_LIGHT["grouped_bg"]
 CX_TEXT: Final[str] = SEMANTIC_LIGHT["label_primary"]
 CX_TEXT_SECONDARY: Final[str] = "#5C5854"
-CX_TEXT_TERTIARY: Final[str] = "#827971"
+CX_TEXT_TERTIARY: Final[str] = "#6B6661"
 CX_TEXT_INVERSE: Final[str] = "#FFFFFF"
 CX_ACCENT: Final[str] = BRAND_ACCENT
 CX_ACCENT_HOVER: Final[str] = BRAND_ACCENT_HOVER
@@ -219,7 +219,7 @@ BTN_PRIMARY_QSS: Final[str] = (
     "}"
     "QPushButton:hover { background: #333; }"
     "QPushButton:pressed { background: #555; }"
-    f"QPushButton:disabled {{ background: {SEMANTIC_LIGHT['grouped_bg']}; color: #827971; }}"
+    f"QPushButton:disabled {{ background: {SEMANTIC_LIGHT['grouped_bg']}; color: #6B6661; }}"
 )
 
 BTN_ACCENT_QSS: Final[str] = (

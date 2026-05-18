@@ -122,6 +122,8 @@ from cortex.apps.desktop_shell.tokens import (
     BIO_HRV,
     BRAND_ACCENT,
     BRAND_DISPLAY_FONT,
+    CX_TEXT_SECONDARY,
+    CX_TEXT_TERTIARY,
     DASHBOARD_MAX_HEIGHT,
     DASHBOARD_WIDTH,
     FS_CAPTION,
@@ -160,13 +162,11 @@ _WINDOW_BG = SEMANTIC_LIGHT["window_bg"]
 _CONTROL_BG = SEMANTIC_LIGHT["control_bg"]
 _GROUPED_BG = SEMANTIC_LIGHT["grouped_bg"]
 _LABEL = SEMANTIC_LIGHT["label_primary"]
-_LABEL_SECONDARY = "#5C5854"   # high-contrast secondary (AA passes on warm bg)
-# F55: was "#827971" which is 3.98:1 against #FFFFFF (just below WCAG AA's
-# 4.5:1 threshold for normal-weight text). Bumped to "#6B6661" which
-# computes to ~5.4:1 — comfortably above AA. The visual delta is small
-# (~5 % darker grey) and the existing dev-mode tests still treat it as
-# "tertiary" since the role is unchanged.
-_LABEL_TERTIARY = "#6B6661"    # AA-passing tertiary (placeholders, captions)
+# F55 + audit-w2: the warm-greyscale label tints now live in the token
+# registry. Tertiary is the AA-passing "#6B6661" (~5.4:1 on #FFFFFF) — was
+# previously a sub-AA value (3.98:1). Source-of-truth: tokens.py.
+_LABEL_SECONDARY = CX_TEXT_SECONDARY
+_LABEL_TERTIARY = CX_TEXT_TERTIARY
 _SEPARATOR = SEMANTIC_LIGHT["separator"]
 _DANGER = SEMANTIC_LIGHT["danger"]
 

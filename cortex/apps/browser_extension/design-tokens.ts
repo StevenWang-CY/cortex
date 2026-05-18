@@ -18,7 +18,7 @@ export const CX = {
     shadowFloat: "0 8px 32px rgba(0, 0, 0, 0.08), 0 0 0 1px rgba(0,0,0,0.04)",
     text: "#1A1A1A",
     textSecondary: "#5C5854",
-    textTertiary: "#827971",
+    textTertiary: "#6B6661",
     textInverse: "#FFFFFF",
     accent: "#D97757",
     accentHover: "#C46547",

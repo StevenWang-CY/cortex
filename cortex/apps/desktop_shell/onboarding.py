@@ -47,6 +47,8 @@ from cortex.apps.desktop_shell.tokens import (
     BRAND_ACCENT_DIM,
     BRAND_ACCENT_HOVER,
     BRAND_DISPLAY_FONT,
+    CX_TEXT_SECONDARY,
+    CX_TEXT_TERTIARY,
     FS_BODY,
     FS_CAPTION,
     FS_FOOTNOTE,
@@ -152,8 +154,10 @@ _WINDOW_BG = SEMANTIC_LIGHT["window_bg"]
 _CONTROL_BG = SEMANTIC_LIGHT["control_bg"]
 _GROUPED_BG = SEMANTIC_LIGHT["grouped_bg"]
 _LABEL = SEMANTIC_LIGHT["label_primary"]
-_LABEL_SECONDARY = "#5C5854"
-_LABEL_TERTIARY = "#827971"
+# WCAG-AA-passing label tints from the token registry — was carrying a
+# private sub-AA copy that drifted from the dashboard's audit-F55 fix.
+_LABEL_SECONDARY = CX_TEXT_SECONDARY
+_LABEL_TERTIARY = CX_TEXT_TERTIARY
 _SEPARATOR = SEMANTIC_LIGHT["separator"]
 _SUCCESS = SEMANTIC_LIGHT["success"]
 _SUCCESS_DIM = "rgba(48, 178, 87, 0.10)"

@@ -33,6 +33,8 @@ from cortex.apps.desktop_shell.tokens import (
     BRAND_ACCENT,
     BRAND_ACCENT_HOVER,
     BRAND_DISPLAY_FONT,
+    CX_TEXT_SECONDARY,
+    CX_TEXT_TERTIARY,
     FS_BODY,
     FS_CAPTION,
     FS_FOOTNOTE,
@@ -53,8 +55,11 @@ logger = logging.getLogger(__name__)
 _WINDOW_BG = SEMANTIC_LIGHT["window_bg"]
 _CONTROL_BG = SEMANTIC_LIGHT["control_bg"]
 _LABEL = SEMANTIC_LIGHT["label_primary"]
-_LABEL_SECONDARY = "#5C5854"
-_LABEL_TERTIARY = "#827971"
+# Warm-greyscale label tints from the token registry. Tertiary is the
+# WCAG-AA-passing value the dashboard adopted in F55; audit Wave 2
+# promoted it so every surface picks it up.
+_LABEL_SECONDARY = CX_TEXT_SECONDARY
+_LABEL_TERTIARY = CX_TEXT_TERTIARY
 _SEPARATOR = SEMANTIC_LIGHT["separator"]
 _DANGER = SEMANTIC_LIGHT["danger"]
 _DANGER_DIM = "rgba(215, 0, 21, 0.10)"
