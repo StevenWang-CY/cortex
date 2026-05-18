@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -301,6 +302,10 @@ class OverlayWindow(QWidget):
         card_layout.addLayout(self._steps_container)
 
         # "Why this?" causal explanation — surfaces only when supplied.
+        # F51: long explanations are truncated to a one-line preview with
+        # a trailing ellipsis; a "Show more" QToolButton (checkable) toggles
+        # to the full text. The full text is stashed on the label so the
+        # toggle handler can swap without re-parsing the payload.
         self._causal_label = QLabel("")
         self._causal_label.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         self._causal_label.setStyleSheet(
@@ -311,6 +316,26 @@ class OverlayWindow(QWidget):
         self._causal_label.setWordWrap(True)
         self._causal_label.hide()
         card_layout.addWidget(self._causal_label)
+
+        self._causal_full_text: str = ""
+        self._causal_preview_text: str = ""
+        self._causal_toggle = QToolButton()
+        self._causal_toggle.setCheckable(True)
+        self._causal_toggle.setText("Show more")
+        self._causal_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._causal_toggle.setStyleSheet(
+            "QToolButton {"
+            f"  color: {_TEXT_SECONDARY.name()};"
+            "  background: transparent;"
+            "  border: none;"
+            "  padding: 2px 0;"
+            f"  font-size: {FS_CAPTION}px;"
+            "}"
+            "QToolButton:hover { color: white; }"
+        )
+        self._causal_toggle.toggled.connect(self._on_causal_toggled)
+        self._causal_toggle.hide()
+        card_layout.addWidget(self._causal_toggle, alignment=Qt.AlignmentFlag.AlignLeft)
 
         # Breathing pacer.
         pacer_layout = QHBoxLayout()
@@ -363,12 +388,12 @@ class OverlayWindow(QWidget):
         self._step_widgets.clear()
 
         causal = str(payload.get("causal_explanation") or "").strip()
+        # F51: only surface causal explanations with substantive content;
+        # the prior 20-char filter is preserved for the show/hide gate.
         if causal and len(causal) > 20:
-            self._causal_label.setText(f"Why this? {causal}")
-            self._causal_label.show()
+            self._show_causal_explanation(causal)
         else:
-            self._causal_label.setText("")
-            self._causal_label.hide()
+            self._hide_causal_explanation()
 
         for step in payload.get("micro_steps", []):
             cb = QCheckBox(step)
@@ -409,6 +434,54 @@ class OverlayWindow(QWidget):
         self.activateWindow()
 
         logger.info(f"Overlay shown for intervention {self._intervention_id}")
+
+    # ------------------------------------------------------------------
+    # F51: causal-explanation truncation + Show more toggle
+    # ------------------------------------------------------------------
+
+    # Characters above which the explanation gets the truncate + toggle
+    # treatment. ~180 chars is roughly one rendered line at the FS_CAPTION
+    # size inside the 460-pt-wide HUD card — picked empirically rather
+    # than measured because the actual visible area depends on font
+    # metrics that change between dev mode and the bundled .app.
+    _CAUSAL_TRUNCATE_THRESHOLD: int = 180
+
+    def _show_causal_explanation(self, causal: str) -> None:
+        """Set the causal explanation label. If the text exceeds the
+        truncation threshold, show a preview with a trailing ellipsis
+        plus a "Show more" toggle button. F51."""
+        full_text = f"Why this? {causal}"
+        self._causal_full_text = full_text
+        if len(causal) > self._CAUSAL_TRUNCATE_THRESHOLD:
+            preview = causal[: self._CAUSAL_TRUNCATE_THRESHOLD].rstrip()
+            self._causal_preview_text = f"Why this? {preview}…"
+            self._causal_toggle.setChecked(False)
+            self._causal_toggle.setText("Show more")
+            self._causal_toggle.show()
+            self._causal_label.setText(self._causal_preview_text)
+        else:
+            self._causal_preview_text = full_text
+            self._causal_toggle.hide()
+            self._causal_label.setText(full_text)
+        self._causal_label.show()
+
+    def _hide_causal_explanation(self) -> None:
+        """Reset the causal slot back to its empty / hidden state. F51."""
+        self._causal_full_text = ""
+        self._causal_preview_text = ""
+        self._causal_label.setText("")
+        self._causal_label.hide()
+        self._causal_toggle.hide()
+        self._causal_toggle.setChecked(False)
+
+    def _on_causal_toggled(self, checked: bool) -> None:
+        """Handler for the Show more / Show less QToolButton. F51."""
+        if checked:
+            self._causal_label.setText(self._causal_full_text)
+            self._causal_toggle.setText("Show less")
+        else:
+            self._causal_label.setText(self._causal_preview_text)
+            self._causal_toggle.setText("Show more")
 
     def keyPressEvent(self, event: object) -> None:
         if hasattr(event, "key") and event.key() == Qt.Key.Key_Escape:
