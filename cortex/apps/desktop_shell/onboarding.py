@@ -233,7 +233,8 @@ class _ProgressStrip(QWidget):
         self._dots: list[QLabel] = []
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        # SP2 = 8 — matches the 4pt grid for inter-dot spacing.
+        layout.setSpacing(SP2)
         for i in range(count):
             dot = QLabel(str(i + 1))
             dot.setFixedSize(22, 22)

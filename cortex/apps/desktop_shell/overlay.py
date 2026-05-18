@@ -279,7 +279,8 @@ class OverlayWindow(QWidget):
 
     def _build_ui(self) -> None:
         self._main_layout = QVBoxLayout(self)
-        self._main_layout.setContentsMargins(24, 24, 24, 24)
+        # 24px outer margin — matches SP6 (4pt grid).
+        self._main_layout.setContentsMargins(SP6, SP6, SP6, SP6)
 
         # Card — translucent dark surface that layers on top of the HUD
         # vibrancy material below. The 6% white border picks out the card
