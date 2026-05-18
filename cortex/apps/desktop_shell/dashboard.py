@@ -276,6 +276,12 @@ class _ConsumerTab(QWidget):
         super().__init__(parent)
         self.setStyleSheet(f"background: transparent; color: {_LABEL};")
 
+        # F31: per-widget cache of last applied text + stylesheet so the
+        # 2 Hz state broadcast loop does not push identical values through
+        # Qt's restyle / paint chain when the user's state is unchanged.
+        # Keyed by id(widget) because QWidget is not hashable on every Qt build.
+        self._render_cache: dict[int, dict[str, str]] = {}
+
         root = QVBoxLayout(self)
         root.setContentsMargins(SP6, SP5, SP6, SP6)
         root.setSpacing(0)
@@ -526,36 +532,64 @@ class _ConsumerTab(QWidget):
 
     # -- Public update methods (preserved byte-identical) ----------------
 
+    def _set_text_if_changed(self, widget: QLabel, text: str) -> bool:
+        """Call ``widget.setText`` only when the value differs from the
+        last applied text. Returns True if a write occurred. F31."""
+        slot = self._render_cache.setdefault(id(widget), {})
+        if slot.get("text") == text:
+            return False
+        slot["text"] = text
+        widget.setText(text)
+        return True
+
+    def _set_style_if_changed(self, widget: QWidget, qss: str) -> bool:
+        """Call ``widget.setStyleSheet`` only when the QSS differs from
+        the last applied stylesheet. Returns True if a write occurred. F31."""
+        slot = self._render_cache.setdefault(id(widget), {})
+        if slot.get("style") == qss:
+            return False
+        slot["style"] = qss
+        widget.setStyleSheet(qss)
+        return True
+
     def update_state(self, payload: dict) -> None:
         state = payload.get("state", "FLOW")
         color = STATE_COLORS.get(state, _LABEL_TERTIARY)
         label = STATE_LABELS.get(state, state)
-        self._state_dot.setStyleSheet(
-            f"background: {color}; border-radius: 3px;"
+        self._set_style_if_changed(
+            self._state_dot, f"background: {color}; border-radius: 3px;"
         )
-        self._state_label.setText(label)
-        self._state_label.setStyleSheet(
-            f"color: {color}; background: transparent;"
+        self._set_text_if_changed(self._state_label, label)
+        self._set_style_if_changed(
+            self._state_label, f"color: {color}; background: transparent;"
         )
 
         bio = payload.get("biometrics", {})
         hr = bio.get("heart_rate")
         hrv = bio.get("hrv_rmssd")
         blink = bio.get("blink_rate")
-        self._bpm_label.setText(f"{hr:.0f}" if hr is not None else "--")
-        self._hrv_label.setText(f"{hrv:.0f}" if hrv is not None else "--")
-        self._blk_label.setText(f"{blink:.1f}" if blink is not None else "--")
+        self._set_text_if_changed(
+            self._bpm_label, f"{hr:.0f}" if hr is not None else "--"
+        )
+        self._set_text_if_changed(
+            self._hrv_label, f"{hrv:.0f}" if hrv is not None else "--"
+        )
+        self._set_text_if_changed(
+            self._blk_label, f"{blink:.1f}" if blink is not None else "--"
+        )
 
     def set_connected(self, connected: bool) -> None:
         if connected:
-            self._state_label.setText("Connected")
-            self._state_dot.setStyleSheet(
-                f"background: {BRAND_ACCENT}; border-radius: 3px;"
+            self._set_text_if_changed(self._state_label, "Connected")
+            self._set_style_if_changed(
+                self._state_dot,
+                f"background: {BRAND_ACCENT}; border-radius: 3px;",
             )
         else:
-            self._state_label.setText("Disconnected")
-            self._state_dot.setStyleSheet(
-                f"background: {_LABEL_TERTIARY}; border-radius: 3px;"
+            self._set_text_if_changed(self._state_label, "Disconnected")
+            self._set_style_if_changed(
+                self._state_dot,
+                f"background: {_LABEL_TERTIARY}; border-radius: 3px;",
             )
 
 
@@ -699,6 +733,9 @@ class _AdvancedTab(QWidget):
         self.setStyleSheet(f"background: transparent; color: {_LABEL};")
         self._timeline_events: list[dict] = []
         self._session_start = time.monotonic()
+        # F31: render-cache per widget; only setText / setValue when the
+        # value differs from the last applied write.
+        self._render_cache: dict[int, dict[str, object]] = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(SP6, SP5, SP6, SP6)
@@ -809,6 +846,22 @@ class _AdvancedTab(QWidget):
         layout.addWidget(self._timeline_text)
         layout.addStretch()
 
+    def _set_text_if_changed(self, widget: QLabel, text: str) -> bool:
+        slot = self._render_cache.setdefault(id(widget), {})
+        if slot.get("text") == text:
+            return False
+        slot["text"] = text
+        widget.setText(text)
+        return True
+
+    def _set_value_if_changed(self, widget: QProgressBar, value: int) -> bool:
+        slot = self._render_cache.setdefault(id(widget), {})
+        if slot.get("value") == value:
+            return False
+        slot["value"] = value
+        widget.setValue(value)
+        return True
+
     def update_state(self, payload: dict) -> None:
         scores = payload.get("scores", {})
         sig_q = payload.get("signal_quality", {})
@@ -828,11 +881,13 @@ class _AdvancedTab(QWidget):
         for name in ("flow", "hyper", "hypo", "recovery"):
             val = scores.get(name, 0.0)
             if name in self._score_bars:
-                self._score_bars[name].setValue(int(val * 100))
-                self._score_labels[name].setText(f"{val:.2f}")
+                # F31: avoid pushing identical values through Qt's
+                # progress-bar / label paint chain on every 2 Hz tick.
+                self._set_value_if_changed(self._score_bars[name], int(val * 100))
+                self._set_text_if_changed(self._score_labels[name], f"{val:.2f}")
 
-        self._confidence_lbl.setText(f"Confidence: {confidence:.0%}")
-        self._dwell_lbl.setText(f"Dwell: {dwell:.1f}s")
+        self._set_text_if_changed(self._confidence_lbl, f"Confidence: {confidence:.0%}")
+        self._set_text_if_changed(self._dwell_lbl, f"Dwell: {dwell:.1f}s")
 
         if not self._timeline_events or self._timeline_events[-1]["state"] != state:
             elapsed = time.monotonic() - self._session_start
