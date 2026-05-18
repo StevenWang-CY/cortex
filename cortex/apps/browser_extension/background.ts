@@ -41,10 +41,54 @@ interface CortexState {
 }
 
 // --- Debug ---
-// Flip to true while debugging to surface intervention/overlay/tab-context noise.
-// Production builds should keep this false to avoid leaking internals to the
-// devtools console of any inspected service worker.
-const DEBUG = false;
+// F46: DEBUG is now a *variable* with two layered sources:
+//   1. Build-time env (`import.meta.env.CORTEX_DEBUG === "true"`).
+//      Plasmo exposes process.env.PLASMO_PUBLIC_*; for our purposes we
+//      read CORTEX_DEBUG via both `import.meta.env` (vite/vitest) and
+//      `process.env` (node) so tests can flip it.
+//   2. Runtime override via `chrome.storage.local.cortex_debug`. A
+//      change to that key flips `DEBUG` immediately, no reload required.
+function readBuildDebug(): boolean {
+    try {
+        const ime = (import.meta as unknown as { env?: Record<string, unknown> }).env;
+        if (ime && typeof ime.CORTEX_DEBUG === "string" && ime.CORTEX_DEBUG === "true") {
+            return true;
+        }
+    } catch {
+        // import.meta may not be available in all execution contexts.
+    }
+    try {
+        if (typeof process !== "undefined" && process.env && process.env.CORTEX_DEBUG === "true") {
+            return true;
+        }
+    } catch {
+        // process is not defined in plain browser builds.
+    }
+    return false;
+}
+
+let DEBUG = readBuildDebug();
+
+// Hydrate runtime override on startup, then keep listening for changes.
+try {
+    chrome.storage.local.get("cortex_debug", (data) => {
+        if (data && data.cortex_debug === true) DEBUG = true;
+        if (data && data.cortex_debug === false) DEBUG = readBuildDebug();
+    });
+    chrome.storage.onChanged.addListener((changes, area) => {
+        if (area !== "local" || !changes.cortex_debug) return;
+        const next = changes.cortex_debug.newValue;
+        if (next === true) DEBUG = true;
+        else if (next === false) DEBUG = readBuildDebug();
+    });
+} catch {
+    // chrome.storage may not be present in some test harness branches.
+}
+
+/** Test-only: read the current resolved DEBUG value. */
+export function _getDebugFlag(): boolean {
+    return DEBUG;
+}
 
 // --- State ---
 
