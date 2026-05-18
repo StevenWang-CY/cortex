@@ -41,6 +41,7 @@ from cortex.libs.schemas.features import (
     TelemetryFeatures,
 )
 from cortex.libs.schemas.intervention import (
+    InterventionApplyResult,
     InterventionOutcome,
     InterventionPlan,
     WorkspaceSnapshot,
@@ -155,10 +156,19 @@ class InterventionApplyRequest(BaseModel):
 
 
 class InterventionApplyResponse(BaseModel):
-    """Intervention apply result."""
+    """Intervention apply result.
+
+    F05: ``applied`` mirrors the optimistic adapter's pre-F05 contract
+    (mutations dispatched successfully). ``confirmation`` is the real
+    ack-driven outcome surfaced when ``await_confirmation`` is honoured;
+    callers that pass ``await_confirmation=False`` receive a 202-style
+    response with ``correlation_id`` populated so they can poll later.
+    """
 
     applied: bool = False
     snapshot: WorkspaceSnapshot | None = None
+    correlation_id: str | None = None
+    confirmation: InterventionApplyResult | None = None
     timestamp: float = Field(default_factory=time.monotonic)
 
 
@@ -447,15 +457,37 @@ async def request_llm_plan(
 
 @router.post("/intervention/apply", response_model=InterventionApplyResponse)
 async def apply_intervention(
-    body: InterventionApplyRequest, request: Request,
+    body: InterventionApplyRequest,
+    request: Request,
+    await_confirmation: bool = True,
+    confirmation_timeout_seconds: float = 30.0,
 ) -> InterventionApplyResponse:
-    """Apply intervention to workspace."""
+    """Apply intervention to workspace.
+
+    F05: when ``await_confirmation`` is True (the default), the call
+    blocks until the extension's WS ``INTERVENTION_APPLIED`` ack lands
+    or ``confirmation_timeout_seconds`` elapses. The response then
+    surfaces the real per-action outcome via ``confirmation`` rather
+    than the legacy always-optimistic ``applied=True``. Callers that
+    want non-blocking semantics (the 202-style pattern in the audit
+    plan) can pass ``await_confirmation=False`` and poll later using
+    ``correlation_id``.
+    """
     reg = _get_registry(request)
+    correlation_id = (
+        request.headers.get("X-Cortex-Request-ID")
+        if request is not None
+        else None
+    )
 
     intervention_engine = reg.get("intervention_engine")
     if intervention_engine is not None and hasattr(intervention_engine, "apply"):
         snapshot = await intervention_engine.apply(body.plan)
-        return InterventionApplyResponse(applied=True, snapshot=snapshot)
+        return InterventionApplyResponse(
+            applied=True,
+            snapshot=snapshot,
+            correlation_id=correlation_id,
+        )
 
     executor = _get_first_service(reg, "intervention_executor", "executor")
     if executor is not None and hasattr(executor, "apply"):
@@ -466,7 +498,9 @@ async def apply_intervention(
                 body.plan.intervention_id,
                 validation.errors,
             )
-            return InterventionApplyResponse(applied=False)
+            return InterventionApplyResponse(
+                applied=False, correlation_id=correlation_id,
+            )
 
         snapshot = await _build_snapshot_for_plan(reg, body.plan)
         mutations = await executor.apply(body.plan, commands)
@@ -483,15 +517,72 @@ async def apply_intervention(
         if ws_server is not None and hasattr(ws_server, "send_intervention"):
             await ws_server.send_intervention(body.plan)
 
-        return InterventionApplyResponse(applied=applied, snapshot=snapshot)
+        confirmation = await _maybe_await_confirmation(
+            reg,
+            body.plan.intervention_id,
+            correlation_id=correlation_id,
+            await_confirmation=await_confirmation,
+            timeout_seconds=confirmation_timeout_seconds,
+        )
+        return InterventionApplyResponse(
+            applied=applied,
+            snapshot=snapshot,
+            correlation_id=correlation_id,
+            confirmation=confirmation,
+        )
 
     # No executor available — still broadcast to WS clients (Chrome overlay)
     ws_server = reg.get("ws_server")
     if ws_server is not None and hasattr(ws_server, "send_intervention"):
         await ws_server.send_intervention(body.plan)
-        return InterventionApplyResponse(applied=True)
+        confirmation = await _maybe_await_confirmation(
+            reg,
+            body.plan.intervention_id,
+            correlation_id=correlation_id,
+            await_confirmation=await_confirmation,
+            timeout_seconds=confirmation_timeout_seconds,
+        )
+        return InterventionApplyResponse(
+            applied=True,
+            correlation_id=correlation_id,
+            confirmation=confirmation,
+        )
 
-    return InterventionApplyResponse(applied=False)
+    return InterventionApplyResponse(
+        applied=False, correlation_id=correlation_id,
+    )
+
+
+async def _maybe_await_confirmation(
+    reg: Any,
+    intervention_id: str,
+    *,
+    correlation_id: str | None,
+    await_confirmation: bool,
+    timeout_seconds: float,
+) -> InterventionApplyResult | None:
+    """F05 helper: bridge the route to the daemon's
+    ``await_apply_confirmation`` future. Returns ``None`` if the daemon is
+    not registered (legacy test rigs that mock the registry without a
+    daemon) or when ``await_confirmation`` is False — in the latter case
+    the caller polls separately using ``correlation_id``."""
+    if not await_confirmation:
+        return None
+    daemon = reg.get("daemon") if hasattr(reg, "get") else None
+    if daemon is None or not hasattr(daemon, "await_apply_confirmation"):
+        return None
+    try:
+        return await daemon.await_apply_confirmation(
+            intervention_id,
+            timeout_seconds=timeout_seconds,
+            correlation_id=correlation_id,
+        )
+    except Exception:
+        logger.debug(
+            "await_apply_confirmation failed for %s", intervention_id,
+            exc_info=True,
+        )
+        return None
 
 
 @router.post("/intervention/restore", response_model=InterventionRestoreResponse)
