@@ -223,6 +223,11 @@ class InterventionConfig(BaseModel):
     adaptive_threshold_max: float = 0.95
     dismissal_model_enabled: bool = True
     dismissal_model_threshold: float = 0.6
+    # F48: breathing pacer cadence (inhale, hold, exhale) in seconds.
+    # Default 4-7-8 (Dr. Andrew Weil's relaxation pattern); the overlay's
+    # ``BreathingPacer`` reads this so users with different rhythm
+    # preferences can override without patching the source.
+    breathing_pattern: tuple[int, int, int] = (4, 7, 8)
 
 
 class HandoverConfig(BaseModel):

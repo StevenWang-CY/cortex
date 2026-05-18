@@ -51,9 +51,12 @@ from cortex.apps.desktop_shell.tokens import (
 logger = logging.getLogger(__name__)
 
 # 4-7-8 breathing pattern: inhale 4s, hold 7s, exhale 8s = 19s total cycle.
-_INHALE_SECONDS = 4
-_HOLD_SECONDS = 7
-_EXHALE_SECONDS = 8
+# These remain as module-level fallbacks so callers without a config
+# (test stubs, ad-hoc previews) keep their prior behaviour. F48 moves the
+# spec to ``InterventionConfig.breathing_pattern`` and BreathingPacer
+# reads from there at construction time.
+_DEFAULT_BREATHING_PATTERN: tuple[int, int, int] = (4, 7, 8)
+_INHALE_SECONDS, _HOLD_SECONDS, _EXHALE_SECONDS = _DEFAULT_BREATHING_PATTERN
 _CYCLE_SECONDS = _INHALE_SECONDS + _HOLD_SECONDS + _EXHALE_SECONDS
 
 # HUD palette — resolved from :mod:`cortex.apps.desktop_shell.tokens` (F47).
@@ -68,13 +71,38 @@ _TEXT_TERTIARY = QColor(*TEXT_HUD_TERTIARY)
 
 
 class BreathingPacer(QWidget):
-    """4-7-8 breathing pacer animation widget. Geometry unchanged from prior
-    revision; only label fonts swap to the SF system stack."""
+    """Breathing pacer animation widget. F48: cadence is read from
+    :class:`cortex.libs.config.settings.InterventionConfig.breathing_pattern`
+    at construction time and falls back to the 4-7-8 default if no config
+    is supplied (test stubs, ad-hoc previews).
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    Geometry unchanged from prior revision; only label fonts swap to the
+    SF system stack."""
+
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        pattern: tuple[int, int, int] | None = None,
+    ) -> None:
         super().__init__(parent)
         self._active = False
         self._elapsed_ms = 0
+        # F48: resolve the breathing pattern. Explicit ``pattern`` arg
+        # wins (used by tests + future user-supplied profiles); otherwise
+        # we read ``InterventionConfig.breathing_pattern`` from the
+        # global config. If neither is available, fall back to 4-7-8.
+        if pattern is None:
+            try:
+                from cortex.libs.config.settings import get_config
+
+                pattern = tuple(  # type: ignore[assignment]
+                    get_config().intervention.breathing_pattern
+                )
+            except Exception:
+                pattern = _DEFAULT_BREATHING_PATTERN
+        self._inhale, self._hold, self._exhale = pattern
+        self._cycle = self._inhale + self._hold + self._exhale
         self._timer = QTimer(self)
         self._timer.setInterval(33)
         self._timer.timeout.connect(self._tick)
@@ -99,19 +127,19 @@ class BreathingPacer(QWidget):
         self.update()
 
     def _get_phase(self) -> tuple[str, float, float]:
-        cycle_pos = (self._elapsed_ms / 1000.0) % _CYCLE_SECONDS
-        if cycle_pos < _INHALE_SECONDS:
-            progress = cycle_pos / _INHALE_SECONDS
-            remaining = _INHALE_SECONDS - cycle_pos
+        cycle_pos = (self._elapsed_ms / 1000.0) % self._cycle
+        if cycle_pos < self._inhale:
+            progress = cycle_pos / self._inhale
+            remaining = self._inhale - cycle_pos
             scale = 0.3 + 0.7 * progress
             return "Inhale", remaining, scale
-        cycle_pos -= _INHALE_SECONDS
-        if cycle_pos < _HOLD_SECONDS:
-            remaining = _HOLD_SECONDS - cycle_pos
+        cycle_pos -= self._inhale
+        if cycle_pos < self._hold:
+            remaining = self._hold - cycle_pos
             return "Hold", remaining, 1.0
-        cycle_pos -= _HOLD_SECONDS
-        progress = cycle_pos / _EXHALE_SECONDS
-        remaining = _EXHALE_SECONDS - cycle_pos
+        cycle_pos -= self._hold
+        progress = cycle_pos / self._exhale
+        remaining = self._exhale - cycle_pos
         scale = 1.0 - 0.7 * progress
         return "Exhale", remaining, scale
 
