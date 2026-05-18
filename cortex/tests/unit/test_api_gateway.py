@@ -45,10 +45,28 @@ def _reset_registry():
 
 
 @pytest.fixture()
-def client() -> TestClient:
-    """Create a test client for the FastAPI app."""
+def client(tmp_path, monkeypatch) -> TestClient:
+    """Create an authenticated test client for the FastAPI app.
+
+    Debt-2 (audit): every mutating route now requires a capability
+    token. We redirect ``auth_token_path`` into ``tmp_path`` so the
+    test does not collide with the developer's real token file, mint
+    a token, and inject it as a default ``Authorization: Bearer``
+    header on the ``TestClient`` so every existing test continues to
+    exercise the route's business logic without each call having to
+    pass the header explicitly. Tests that want to assert the unauth
+    path live in ``test_systemic_auth_http.py``.
+    """
+    from cortex.libs.auth.local_token import load_or_create_token
+
+    token_file = tmp_path / "auth.token"
+    monkeypatch.setattr(
+        "cortex.libs.auth.local_token.auth_token_path", lambda: token_file
+    )
+    token = load_or_create_token(token_file)
     app = create_app()
     with TestClient(app) as c:
+        c.headers.update({"Authorization": f"Bearer {token}"})
         yield c
 
 

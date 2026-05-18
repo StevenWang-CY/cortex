@@ -108,15 +108,24 @@ def _make_feature_vector() -> dict:
 # ---------------------------------------------------------------------------
 
 
-def test_classifier_path_marks_source_classifier() -> None:
+def test_classifier_path_marks_source_classifier(
+    tmp_path, monkeypatch,
+) -> None:
+    from cortex.libs.auth.local_token import load_or_create_token
     from cortex.services.state_engine.rule_scorer import RuleScorer
     from cortex.services.state_engine.smoother import ScoreSmoother
 
+    token_file = tmp_path / "auth.token"
+    monkeypatch.setattr(
+        "cortex.libs.auth.local_token.auth_token_path", lambda: token_file
+    )
+    token = load_or_create_token(token_file)
     registry.register("rule_scorer", RuleScorer())
     registry.register("score_smoother", ScoreSmoother())
 
     app = create_app()
     with TestClient(app) as client:
+        client.headers["Authorization"] = f"Bearer {token}"
         resp = client.post(
             "/state/infer",
             json={
@@ -137,12 +146,22 @@ def test_classifier_path_marks_source_classifier() -> None:
 
 def test_fallback_path_marks_source_fallback_and_emits_event(
     caplog: pytest.LogCaptureFixture,
+    tmp_path,
+    monkeypatch,
 ) -> None:
     """No scorer / smoother registered → envelope flags degradation and
     a structured STATE_INFER_DEGRADED line is emitted with the cid.
     """
+    from cortex.libs.auth.local_token import load_or_create_token
+
+    token_file = tmp_path / "auth.token"
+    monkeypatch.setattr(
+        "cortex.libs.auth.local_token.auth_token_path", lambda: token_file
+    )
+    token = load_or_create_token(token_file)
     app = create_app()
     with TestClient(app) as client:
+        client.headers["Authorization"] = f"Bearer {token}"
         with caplog.at_level(logging.WARNING):
             resp = client.post(
                 "/state/infer",
