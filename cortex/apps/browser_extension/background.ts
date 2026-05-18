@@ -59,7 +59,23 @@ const DAEMON_HTTP_URL = "http://127.0.0.1:9472";
 const LAUNCHER_HTTP_URL = "http://127.0.0.1:9471";
 
 let currentState: CortexState | null = null;
-let activeIntervention: Record<string, unknown> | null = null;
+
+/**
+ * F16: active intervention is now an atomic swap by correlation_id.
+ *
+ * A burst of overlapping INTERVENTION_TRIGGER frames must not overwrite
+ * each other in arbitrary order. We mount the latest one and stamp it
+ * with the daemon's correlation_id; outgoing USER_ACTION carries the
+ * same cid so the daemon can ignore stale ACKs from a now-superseded
+ * plan. `mountedAt` is the local mount timestamp (ms since epoch).
+ */
+interface ActiveInterventionRecord {
+    plan: Record<string, unknown>;
+    correlation_id: string;
+    mountedAt: number;
+}
+
+let activeIntervention: ActiveInterventionRecord | null = null;
 let quietMode = false;
 
 // Dismissal cooldown: maps intervention_id → timestamp when dismissed
@@ -596,12 +612,6 @@ async function handleMessage(raw: string): Promise<void> {
             break;
 
         case "INTERVENTION_TRIGGER": {
-            // Skip if an intervention is already being shown
-            if (activeIntervention) {
-                if (DEBUG) console.log("Cortex: skipping intervention — one is already active");
-                break;
-            }
-
             const iid = typeof msg.payload.intervention_id === "string" ? msg.payload.intervention_id : null;
             const now = Date.now();
 
@@ -629,9 +639,37 @@ async function handleMessage(raw: string): Promise<void> {
                 schedulePersist();
             }
 
-            activeIntervention = msg.payload;
+            // F16: atomic swap by correlation_id. The latest INTERVENTION_TRIGGER
+            // always wins; any in-flight USER_ACTION ACK for a superseded plan
+            // is ignored by the daemon (F16-srv). The local cid falls back to
+            // a synthetic value so the swap still works when the daemon omits
+            // a correlation_id (e.g. legacy frames).
+            const inboundCid = typeof msg.correlation_id === "string" && msg.correlation_id.length > 0
+                ? msg.correlation_id
+                : `local_${now.toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+
+            if (activeIntervention) {
+                if (DEBUG) {
+                    console.log(
+                        `Cortex: superseding intervention cid=${activeIntervention.correlation_id} ` +
+                        `→ cid=${inboundCid}`,
+                    );
+                }
+            }
+
+            activeIntervention = {
+                plan: msg.payload,
+                correlation_id: inboundCid,
+                mountedAt: now,
+            };
             // Persist so popup can load it after SW restart
-            try { chrome.storage.session.set({ cortex_active_intervention: msg.payload }); } catch {}
+            try {
+                chrome.storage.session.set({
+                    cortex_active_intervention: msg.payload,
+                    cortex_active_intervention_cid: inboundCid,
+                    cortex_active_intervention_mounted_at: now,
+                });
+            } catch {}
             handleIntervention(msg.payload);
             break;
         }
@@ -1429,7 +1467,7 @@ async function handleRestore(payload: Record<string, unknown>): Promise<void> {
         errors.push("remove_overlay");
     }
     activeIntervention = null;
-    try { chrome.storage.session.remove(["cortex_active_intervention", "cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]); } catch {}
+    try { chrome.storage.session.remove(["cortex_active_intervention", "cortex_active_intervention_cid", "cortex_active_intervention_mounted_at", "cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]); } catch {}
     broadcastToPopup({ type: "INTERVENTION_RESTORE", payload });
 
     if (typeof interventionId === "string") {
@@ -2268,10 +2306,16 @@ async function executeAllRecommended(
 
     // Clear the intervention after execution so popup doesn't show stale data
     const hadIntervention = activeIntervention !== null;
-    const interventionId = activeIntervention?.intervention_id;
+    const interventionId =
+        typeof activeIntervention?.plan.intervention_id === "string"
+            ? (activeIntervention.plan.intervention_id as string)
+            : undefined;
+    // F16: outbound USER_ACTION carries the same cid the daemon stamped on
+    // the plan, so a superseded ACK is ignored by `_handle_user_action`.
+    const interventionCid = activeIntervention?.correlation_id;
     activeIntervention = null;
     // Persist cleared state
-    try { await chrome.storage.session.remove(["cortex_active_intervention", "cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]); } catch {}
+    try { await chrome.storage.session.remove(["cortex_active_intervention", "cortex_active_intervention_cid", "cortex_active_intervention_mounted_at", "cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]); } catch {}
 
     // Notify daemon that user engaged with the intervention
     if (hadIntervention && interventionId) {
@@ -2284,6 +2328,7 @@ async function executeAllRecommended(
             },
             timestamp: Date.now() / 1000,
             sequence: ++sequence,
+            correlation_id: interventionCid,
         });
     }
 
@@ -2477,22 +2522,39 @@ chrome.runtime.onMessage.addListener(
             case "GET_STATE":
                 // If activeIntervention was lost (SW restart), load from session storage
                 if (!activeIntervention) {
-                    chrome.storage.session.get("cortex_active_intervention", (data) => {
-                        const stored = data?.cortex_active_intervention || null;
-                        if (stored) activeIntervention = stored;
-                        sendResponse({
-                            connected,
-                            state: currentState,
-                            intervention: activeIntervention,
-                            focusSession: focusSession ? getFocusSessionSnapshot() : null,
-                        });
-                    });
+                    chrome.storage.session.get(
+                        [
+                            "cortex_active_intervention",
+                            "cortex_active_intervention_cid",
+                            "cortex_active_intervention_mounted_at",
+                        ],
+                        (data) => {
+                            const stored = data?.cortex_active_intervention || null;
+                            if (stored) {
+                                activeIntervention = {
+                                    plan: stored as Record<string, unknown>,
+                                    correlation_id:
+                                        (data?.cortex_active_intervention_cid as string) ||
+                                        `restore_${Date.now().toString(36)}`,
+                                    mountedAt:
+                                        (data?.cortex_active_intervention_mounted_at as number) ||
+                                        Date.now(),
+                                };
+                            }
+                            sendResponse({
+                                connected,
+                                state: currentState,
+                                intervention: activeIntervention?.plan ?? null,
+                                focusSession: focusSession ? getFocusSessionSnapshot() : null,
+                            });
+                        },
+                    );
                     return true; // async
                 }
                 sendResponse({
                     connected,
                     state: currentState,
-                    intervention: activeIntervention,
+                    intervention: activeIntervention.plan,
                     focusSession: focusSession ? getFocusSessionSnapshot() : null,
                 });
                 break;
@@ -2706,7 +2768,14 @@ chrome.runtime.onMessage.addListener(
                 })();
                 return true; // async
 
-            case "USER_ACTION":
+            case "USER_ACTION": {
+                // F16: stamp every outbound USER_ACTION with the cid of the
+                // currently mounted plan so the daemon can ignore a stale ACK
+                // when an intervention has been superseded.
+                const outboundCid =
+                    typeof message.correlation_id === "string" && message.correlation_id.length > 0
+                        ? (message.correlation_id as string)
+                        : activeIntervention?.correlation_id;
                 send({
                     type: "USER_ACTION",
                     payload: {
@@ -2716,15 +2785,17 @@ chrome.runtime.onMessage.addListener(
                     },
                     timestamp: Date.now() / 1000,
                     sequence: ++sequence,
+                    correlation_id: outboundCid,
                 });
                 if (message.action === "dismissed") {
+                    const activePlanId =
+                        typeof activeIntervention?.plan.intervention_id === "string"
+                            ? (activeIntervention.plan.intervention_id as string)
+                            : null;
                     const interventionId =
                         typeof message.intervention_id === "string"
-                            ? message.intervention_id
-                            : typeof activeIntervention?.intervention_id ===
-                                "string"
-                              ? (activeIntervention.intervention_id as string)
-                              : null;
+                            ? (message.intervention_id as string)
+                            : activePlanId;
 
                     // Record dismissal for cooldown
                     const now = Date.now();
@@ -2751,7 +2822,7 @@ chrome.runtime.onMessage.addListener(
                     schedulePersist();
 
                     activeIntervention = null;
-                    try { chrome.storage.session.remove(["cortex_active_intervention", "cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]); } catch {}
+                    try { chrome.storage.session.remove(["cortex_active_intervention", "cortex_active_intervention_cid", "cortex_active_intervention_mounted_at", "cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]); } catch {}
                     if (interventionId) {
                         restoreTabsForIntervention(interventionId);
                     } else {
@@ -2760,6 +2831,7 @@ chrome.runtime.onMessage.addListener(
                 }
                 sendResponse({ ok: true });
                 break;
+            }
 
             case "RESTORE_TABS":
                 restoreAllTabs().then(() => sendResponse({ ok: true }));
