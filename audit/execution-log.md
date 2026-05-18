@@ -143,6 +143,24 @@ Entries appended in commit order. Each entry: finding ID, fix summary, files tou
 
 ---
 
+### F11 — Bedrock token no longer leaks into process environment
+
+**Fix.** Previously `AnthropicPlanner.__init__` for `provider="bedrock"` fetched the bearer token from Keychain and wrote it permanently to `os.environ["AWS_BEARER_TOKEN_BEDROCK"]`. The Cortex daemon spawns many subprocesses (capture worker, native-host re-launches, project-launcher terminals); every one inherited the env, and any debugger / crash-dump tool attached to any descendant could read the token. The Anthropic SDK reads the bearer only inside its constructor, so we now scope the env mutation to that single call and restore the prior state on exit. Keychain is consulted only when env is initially empty (preserves the documented "env wins" precedence); the user's own env value, if present at startup, survives untouched.
+
+**Files touched** (2):
+- `cortex/services/llm_engine/anthropic_planner.py`
+- `cortex/tests/unit/test_bedrock_token_containment.py` (new)
+
+**Test.** 3 cases: (a) the scoped-mutation pattern in isolation produces a clean env, (b) full `AnthropicPlanner` construction sees the keychain token during SDK build (captured via stub) but the env is clean afterwards, (c) a pre-existing user-supplied env value is preserved (keychain skipped). The third case fails on `main` only by coincidence (no behavioural assertion before the fix); cases (a) and (b) fail on `main` because the env mutation was unbounded — the post-construction assertion `"AWS_BEARER_TOKEN_BEDROCK" not in os.environ` was false.
+
+**Verification.** F11 suite: 3 passed (0.90s). Regression check: `test_anthropic_planner.py` — 15 passed.
+
+**Compatibility.** Subtle but additive. Code that relied on the daemon polluting its own env after construction (none in this repo, grep verified) would break; the SDK's runtime requests do not re-read the env, so the post-construction emptiness has no functional effect on legitimate calls.
+
+**Rollback.** `git revert` is clean. Single hunk in `anthropic_planner.py`; the old "set env permanently" path is straight-line restored.
+
+---
+
 ## New Findings (surfaced during Phase 2)
 
 ### F07b — Native-host mediated auth-token fetch for extension

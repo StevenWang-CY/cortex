@@ -1,9 +1,9 @@
 # Audit State Pointer
 
 **Phase:** 2 (remediation in progress)
-**Next finding to address:** F11 (Bedrock token leak via os.environ)
-**Last finding closed:** F01 (capture pipeline stop timeout)
-**Last commit:** `audit F01: bound capture pipeline stop() with timeout`
+**Next finding to address:** F38+F39 (strip dead provider config / fix docs) — Cheap Win cohort
+**Last finding closed:** F11 (Bedrock token containment)
+**Last commit:** `audit F11: scope Bedrock token mutation to SDK construction only`
 **Resume protocol on fresh invocation:**
 
 1. Read `audit/findings.md` — authoritative Ledger.
