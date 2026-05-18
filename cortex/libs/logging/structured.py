@@ -78,6 +78,13 @@ class EventType(StrEnum):
     # detect the degradation without polling the response.
     STATE_INFER_DEGRADED = "state_infer_degraded"
 
+    # F29: prompt assembly trimmed at least one section to fit the token
+    # budget. Carries original vs truncated token counts and the names of
+    # the sections that lost content so the overlay can offer the user a
+    # "Show more context" affordance instead of silently shipping a
+    # partial traceback to the LLM.
+    CONTEXT_TRUNCATED = "context_truncated"
+
 
 class StateTransitionEvent(BaseModel):
     """State transition event data."""

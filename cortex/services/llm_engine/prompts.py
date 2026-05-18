@@ -9,12 +9,89 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
+from dataclasses import dataclass, field
 
+from cortex.libs.logging.correlation import get_correlation_id
+from cortex.libs.logging.structured import EventType
 from cortex.libs.schemas.context import TaskContext
 from cortex.libs.schemas.intervention import SimplificationConstraints
 from cortex.libs.schemas.state import StateEstimate
 
 logger = logging.getLogger(__name__)
+
+
+# F29 (audit): per-section truncation accounting. Pre-fix,
+# ``_truncate_section`` silently dropped content — the model saw only the
+# first N lines of a traceback and the user had no way to know the rest
+# had been hidden. The new code path returns ``(text, dropped_chars)`` per
+# pass, and ``_enforce_token_budget`` aggregates the losses into a
+# :class:`TruncationReport` that the planner stashes on the resulting
+# :class:`InterventionPlan.metadata` so the overlay can offer a "Show
+# more context" affordance.
+
+
+@dataclass
+class TruncationReport:
+    """Summary of how much content the token-budget enforcer dropped.
+
+    ``sections_trimmed`` carries the canonical section names (e.g.
+    ``"terminal_errors"``, ``"code"``, ``"tab_titles"``,
+    ``"final_overflow"``) so the UI can quote them back to the user
+    without having to reverse-engineer the prompt structure.
+    """
+
+    original_tokens: int = 0
+    truncated_tokens: int = 0
+    sections_trimmed: list[str] = field(default_factory=list)
+    dropped_chars: int = 0
+
+    @property
+    def truncated(self) -> bool:
+        return bool(self.sections_trimmed)
+
+
+# Thread-local report buffer. ``_enforce_token_budget`` writes into the
+# active buffer when one is set; the planner calls
+# :func:`capture_truncation_report` to scope a buffer for a single
+# request and read it out after assembly completes.
+_REPORT_BUFFER: threading.local = threading.local()
+
+
+def _active_report() -> TruncationReport | None:
+    return getattr(_REPORT_BUFFER, "report", None)
+
+
+def capture_truncation_report() -> "_TruncationCapture":
+    """Context manager that captures a :class:`TruncationReport`.
+
+    Usage from the planner::
+
+        with capture_truncation_report() as report:
+            system_blocks, messages = build_anthropic_messages(...)
+        if report.truncated:
+            plan.metadata["context_truncated_sections"] = report.sections_trimmed
+    """
+    return _TruncationCapture()
+
+
+class _TruncationCapture:
+    """Internal context manager — public surface is the ``with`` block."""
+
+    def __enter__(self) -> TruncationReport:
+        self._previous = getattr(_REPORT_BUFFER, "report", None)
+        self._report = TruncationReport()
+        _REPORT_BUFFER.report = self._report
+        return self._report
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._previous is None:
+            try:
+                del _REPORT_BUFFER.report
+            except AttributeError:
+                pass
+        else:
+            _REPORT_BUFFER.report = self._previous
 
 
 def sanitize_prompt_text(value: str, *, max_len: int = 4000) -> str:
@@ -745,61 +822,94 @@ def _enforce_token_budget(
     2. Tab titles (truncated to 50 chars each)
     3. File/code content
 
-    Logs a warning with pre/post sizes when truncation occurs.
+    F29 (audit): each truncation pass now records the bytes dropped and
+    the section name into the active :class:`TruncationReport` (if any).
+    The aggregate report is logged via :data:`EventType.CONTEXT_TRUNCATED`
+    once truncation actually occurred — log volume stays zero on the
+    happy path. The caller can scope a report with
+    :func:`capture_truncation_report` to surface ``sections_trimmed`` on
+    ``InterventionPlan.metadata``.
     """
     budget = int(max_context_tokens * 0.80)
     pre_tokens = _total_message_tokens(messages)
+    report = _active_report()
+    if report is not None:
+        # Record once; multiple ``_enforce_token_budget`` calls inside a
+        # single ``capture_truncation_report`` scope keep the largest
+        # original count (i.e. the biggest single-call demand).
+        if pre_tokens > report.original_tokens:
+            report.original_tokens = pre_tokens
 
     if pre_tokens <= budget:
+        if report is not None:
+            report.truncated_tokens = max(report.truncated_tokens, pre_tokens)
         return messages
 
     # Work on the user message (index 1); leave system prompt untouched
     user_content = messages[1]["content"]
 
     # --- Pass 1: Truncate terminal output ---
-    user_content = _truncate_section(
+    user_content, dropped = _truncate_section(
         user_content,
         start_marker="--- Terminal Errors ---",
         max_lines=10,
     )
+    _record_drop("terminal_errors", dropped, report)
 
     if _estimate_tokens(messages[0]["content"]) + _estimate_tokens(user_content) <= budget:
         messages = [messages[0], {"role": "user", "content": user_content}]
+        post_tokens = _total_message_tokens(messages)
         logger.warning(
             "Token budget: truncated terminal output (%d -> %d tokens)",
             pre_tokens,
-            _total_message_tokens(messages),
+            post_tokens,
         )
+        _finalise_report(report, post_tokens)
         return messages
 
     # --- Pass 2: Truncate tab titles to 50 chars each ---
+    before_tabs = user_content
     user_content = re.sub(
         r"(Tab \d+: \[[^\]]*\] )(.{50,}?)( — https?://)",
         lambda m: m.group(1) + m.group(2)[:50] + "..." + m.group(3),
         user_content,
     )
+    tabs_dropped = max(0, len(before_tabs) - len(user_content))
+    _record_drop("tab_titles", tabs_dropped, report)
 
     if _estimate_tokens(messages[0]["content"]) + _estimate_tokens(user_content) <= budget:
         messages = [messages[0], {"role": "user", "content": user_content}]
+        post_tokens = _total_message_tokens(messages)
         logger.warning(
             "Token budget: truncated tab titles (%d -> %d tokens)",
             pre_tokens,
-            _total_message_tokens(messages),
+            post_tokens,
         )
+        _finalise_report(report, post_tokens)
         return messages
 
     # --- Pass 3: Truncate file/code content ---
-    user_content = _truncate_section(
+    user_content, dropped = _truncate_section(
         user_content,
         start_marker="Code:",
         max_lines=30,
     )
+    _record_drop("code", dropped, report)
 
     # Final hard truncation if still over budget
     system_tokens = _estimate_tokens(messages[0]["content"])
     remaining_budget = budget - system_tokens
     if _estimate_tokens(user_content) > remaining_budget:
+        # Final hard cap — record the residual byte loss under a
+        # synthetic section name so the UI can still surface "Cortex
+        # had to cut more context than expected" if it wants to.
+        before_hard = user_content
         user_content = user_content[: remaining_budget * 4]
+        _record_drop(
+            "final_overflow",
+            max(0, len(before_hard) - len(user_content)),
+            report,
+        )
 
     messages = [messages[0], {"role": "user", "content": user_content}]
     post_tokens = _total_message_tokens(messages)
@@ -808,14 +918,62 @@ def _enforce_token_budget(
         pre_tokens,
         post_tokens,
     )
+    _finalise_report(report, post_tokens)
     return messages
 
 
-def _truncate_section(text: str, *, start_marker: str, max_lines: int) -> str:
-    """Truncate a section of text starting at *start_marker* to *max_lines* lines."""
+def _record_drop(
+    section: str,
+    dropped_chars: int,
+    report: TruncationReport | None,
+) -> None:
+    """Append ``section`` to the active report if any bytes were dropped."""
+    if dropped_chars <= 0:
+        return
+    if report is None:
+        return
+    report.dropped_chars += dropped_chars
+    if section not in report.sections_trimmed:
+        report.sections_trimmed.append(section)
+
+
+def _finalise_report(
+    report: TruncationReport | None,
+    post_tokens: int,
+) -> None:
+    """Emit :data:`EventType.CONTEXT_TRUNCATED` and stamp final counters."""
+    if report is None:
+        return
+    report.truncated_tokens = post_tokens
+    if not report.sections_trimmed:
+        return
+    logger.warning(
+        "%s original_tokens=%d truncated_tokens=%d sections_trimmed=%s cid=%s",
+        EventType.CONTEXT_TRUNCATED.value,
+        report.original_tokens,
+        report.truncated_tokens,
+        ",".join(report.sections_trimmed),
+        get_correlation_id() or "-",
+    )
+
+
+def _truncate_section(
+    text: str,
+    *,
+    start_marker: str,
+    max_lines: int,
+) -> tuple[str, int]:
+    """Truncate a section of text to *max_lines* lines.
+
+    Returns ``(truncated_text, dropped_chars)``. Pre-F29 this returned
+    only the truncated text and silently dropped content; the callers
+    now consume the byte loss and feed it into a per-request
+    :class:`TruncationReport` so the UI can surface a "Show more
+    context" affordance.
+    """
     idx = text.find(start_marker)
     if idx == -1:
-        return text
+        return text, 0
 
     before = text[:idx]
     after_marker = text[idx:]
@@ -836,9 +994,21 @@ def _truncate_section(text: str, *, start_marker: str, max_lines: int) -> str:
         else:
             rest_lines.append(line)
 
+    dropped_chars = 0
     if len(section_lines) > max_lines:
-        truncated_count = len(section_lines) - max_lines
+        dropped_lines = section_lines[max_lines:]
+        # ``+ 1`` per dropped line to account for the newline separator
+        # that joins them; the byte-cost of the marker line we append
+        # below ("... N lines truncated") is intentionally NOT subtracted
+        # because the affordance text is informational, not user data.
+        dropped_chars = sum(len(line) + 1 for line in dropped_lines)
+        truncated_count = len(dropped_lines)
         section_lines = section_lines[:max_lines]
         section_lines.append(f"  ... ({truncated_count} lines truncated)")
 
-    return before + "\n".join(section_lines) + ("\n" + "\n".join(rest_lines) if rest_lines else "")
+    result = (
+        before
+        + "\n".join(section_lines)
+        + ("\n" + "\n".join(rest_lines) if rest_lines else "")
+    )
+    return result, dropped_chars

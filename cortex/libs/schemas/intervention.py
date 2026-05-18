@@ -318,6 +318,19 @@ class InterventionPlan(BaseModel):
         default_factory=list,
         description="Non-fatal validation or grounding warnings to surface in debug UI",
     )
+    metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Side-channel metadata the LLM did not produce but the daemon "
+            "wants to surface to the UI. F29 (audit) writes "
+            "``context_truncated_sections: list[str]`` here when the "
+            "prompt assembler trimmed any section to fit the token "
+            "budget, so the overlay can offer a 'Show more context' "
+            "affordance. Free-form on purpose — future findings can "
+            "stash additional non-LLM-controlled hints without bumping "
+            "the wire schema each time."
+        ),
+    )
 
     @property
     def is_valid(self) -> bool:

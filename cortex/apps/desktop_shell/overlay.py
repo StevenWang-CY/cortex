@@ -279,6 +279,31 @@ class OverlayWindow(QWidget):
         self._causal_label.hide()
         card_layout.addWidget(self._causal_label)
 
+        # F29 (audit): "Show more context" affordance. Surfaces only when
+        # the daemon stamped ``context_truncated_sections`` onto the
+        # plan's metadata, i.e. when the prompt assembler had to trim
+        # one or more sections to fit the token budget. The label is a
+        # static affordance (not a real click handler — context retrieval
+        # belongs to a future plumbing PR); the user-visible affordance
+        # itself is what F29 promises.
+        self._context_truncation_label = QLabel("")
+        self._context_truncation_label.setObjectName(
+            "CortexContextTruncationAffordance"
+        )
+        self._context_truncation_label.setFont(
+            mac_native.system_font(FS_CAPTION, "medium")
+        )
+        self._context_truncation_label.setStyleSheet(
+            "QLabel#CortexContextTruncationAffordance {"
+            "  color: rgba(217, 119, 87, 0.95);"  # terracotta accent
+            "  background: transparent;"
+            "  text-decoration: underline;"
+            "}"
+        )
+        self._context_truncation_label.setWordWrap(True)
+        self._context_truncation_label.hide()
+        card_layout.addWidget(self._context_truncation_label)
+
         # Breathing pacer.
         pacer_layout = QHBoxLayout()
         pacer_layout.addStretch()
@@ -336,6 +361,24 @@ class OverlayWindow(QWidget):
         else:
             self._causal_label.setText("")
             self._causal_label.hide()
+
+        # F29 (audit): surface a "Show more context" affordance only when
+        # the daemon trimmed sections to fit the token budget. The
+        # affordance copy names the dominant section so the user knows
+        # which slice of context they could expand. ``metadata`` is
+        # free-form on the wire; we guard against non-list values.
+        meta = payload.get("metadata") or {}
+        truncated_sections = meta.get("context_truncated_sections") if isinstance(meta, dict) else None
+        if isinstance(truncated_sections, list) and truncated_sections:
+            primary = str(truncated_sections[0]).replace("_", " ")
+            self._context_truncation_label.setText(
+                f"Cortex saw only the first portion of your {primary}. "
+                "Show more context →"
+            )
+            self._context_truncation_label.show()
+        else:
+            self._context_truncation_label.setText("")
+            self._context_truncation_label.hide()
 
         for step in payload.get("micro_steps", []):
             cb = QCheckBox(step)
