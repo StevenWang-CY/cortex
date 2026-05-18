@@ -67,6 +67,15 @@ class _AlreadyDeadSocket:
 @pytest.mark.asyncio
 async def test_slow_client_receives_close_frame_and_is_removed(monkeypatch):
     server = WebSocketServer()
+    # F22 + Phase-I coordination: the F22 close-on-slow-consumer path
+    # only fires when the PER-SEND timeout elapses (a truly dead
+    # client). Phase I added a tighter total-broadcast BUDGET which
+    # otherwise cancels the slow task first and reroutes it to the
+    # "slow but alive" branch. For the F22 disconnect contract we
+    # widen the budget here so per-send fires first; the tighter
+    # 100 ms budget is exercised by ``test_broadcast_throughput.py``.
+    server._BROADCAST_PER_CLIENT_TIMEOUT_S = 0.2
+    server._BROADCAST_BUDGET_S = 5.0
     slow_ws = _SlowSocket()
     client = WebSocketClient(
         client_id="c-slow", websocket=slow_ws, client_type="chrome"
@@ -112,6 +121,8 @@ async def test_slow_client_receives_close_frame_and_is_removed(monkeypatch):
 @pytest.mark.asyncio
 async def test_healthy_client_unaffected_by_slow_peer():
     server = WebSocketServer()
+    server._BROADCAST_PER_CLIENT_TIMEOUT_S = 0.2
+    server._BROADCAST_BUDGET_S = 5.0
     slow_ws = _SlowSocket()
     healthy_ws = _HealthySocket()
     server._clients["c-slow"] = WebSocketClient(
@@ -137,6 +148,8 @@ async def test_reconnection_cycle_after_slow_close():
     with the same client_id (after reconnect) must be allowed. The
     original socket must have received the explicit close frame."""
     server = WebSocketServer()
+    server._BROADCAST_PER_CLIENT_TIMEOUT_S = 0.2
+    server._BROADCAST_BUDGET_S = 5.0
     slow_ws = _SlowSocket()
     server._clients["c1"] = WebSocketClient(
         client_id="c1", websocket=slow_ws, client_type="chrome"
@@ -164,6 +177,8 @@ async def test_close_on_already_dead_socket_does_not_raise():
     accidentally tolerated; the new code calls close() explicitly and
     must handle the raised exception."""
     server = WebSocketServer()
+    server._BROADCAST_PER_CLIENT_TIMEOUT_S = 0.2
+    server._BROADCAST_BUDGET_S = 5.0
     dead_ws = _AlreadyDeadSocket()
     server._clients["c-dead"] = WebSocketClient(
         client_id="c-dead", websocket=dead_ws, client_type="chrome"

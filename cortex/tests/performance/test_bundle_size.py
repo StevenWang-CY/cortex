@@ -100,17 +100,28 @@ def test_no_unexpected_top_level_sources(extension_files: list[Path]) -> None:
     ``_SOURCE_BUDGETS`` if it ships as an entry. The test prevents the
     common regression of dropping a 200 KB file at the top level and
     not noticing it bloated the popup bundle."""
+    # Dev-time configuration files do not ship in the runtime bundle and
+    # are exempt from the per-file budget. Tests (``__tests__/*``), mocks
+    # (``test/*``), and generated types live in their own subtrees and
+    # are excluded by ``extension_files``.
+    _DEV_CONFIG_EXEMPT: frozenset[str] = frozenset({
+        "vitest.config.ts",
+        "plasmo.config.ts",
+        "tsconfig.json",
+    })
+
     known = set(_SOURCE_BUDGETS.keys())
     unknown: list[str] = []
     for f in extension_files:
         rel = f.relative_to(_EXTENSION_ROOT).as_posix()
-        if rel not in known:
-            # Permit utility / lib files that are not entry points and
-            # show up only when imported. Plasmo entry-point files are
-            # all at the top level, under contents/, or under tabs/.
-            top = rel.split("/", 1)[0]
-            if top in {"contents", "tabs"} or "/" not in rel:
-                unknown.append(rel)
+        if rel in known or rel in _DEV_CONFIG_EXEMPT:
+            continue
+        # Permit utility / lib files that are not entry points and
+        # show up only when imported. Plasmo entry-point files are
+        # all at the top level, under contents/, or under tabs/.
+        top = rel.split("/", 1)[0]
+        if top in {"contents", "tabs"} or "/" not in rel:
+            unknown.append(rel)
     assert not unknown, (
         f"new extension entry points without a size budget: {unknown}. "
         "Either add a budget in _SOURCE_BUDGETS or move the file under "
