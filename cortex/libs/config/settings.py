@@ -361,6 +361,26 @@ class LoggingConfig(BaseModel):
     include_timestamp: bool = True
 
 
+class LauncherConfig(BaseModel):
+    """Project-launcher configuration.
+
+    Cortex's ProjectLauncher runs ``terminal_commands`` lifted from
+    user-importable YAML files. The allowlist in
+    :mod:`cortex.libs.utils.shell_allowlist` covers the common editor /
+    terminal launchers. Power users with bespoke tooling extend the
+    allowlist via ``user_command_allowlist`` rather than disabling the
+    check entirely (audit F12).
+    """
+
+    user_command_allowlist: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Extra binary basenames the project launcher will accept in "
+            "addition to the built-in editor/terminal allowlist."
+        ),
+    )
+
+
 # =============================================================================
 # Main Configuration
 # =============================================================================
@@ -400,6 +420,7 @@ class CortexConfig(BaseSettings):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     redis: RedisConfig = Field(default_factory=RedisConfig)
     eval: EvalConfig = Field(default_factory=EvalConfig)
+    launcher: LauncherConfig = Field(default_factory=LauncherConfig)
 
     @classmethod
     def settings_customise_sources(

