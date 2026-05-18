@@ -711,6 +711,29 @@ class _AdvancedTab(QWidget):
         layout.setContentsMargins(SP6, SP5, SP6, SP6)
         layout.setSpacing(SP4)
 
+        # F18 (audit): a small badge that surfaces when the daemon falls
+        # back to synthetic state inference. Hidden by default so the
+        # happy path remains visually unchanged.
+        self._degraded_badge = QLabel(
+            "Cortex degraded — classifier unavailable"
+        )
+        self._degraded_badge.setObjectName("CortexDegradedBadge")
+        self._degraded_badge.setFont(
+            mac_native.system_font(FS_FOOTNOTE, "semibold")
+        )
+        # Warm terracotta hint without recoloring the whole tab.
+        self._degraded_badge.setStyleSheet(
+            "QLabel#CortexDegradedBadge {"
+            "  color: #B25430;"  # deep terracotta, WCAG-AA on grouped bg
+            "  background-color: rgba(217, 119, 87, 0.10);"
+            "  border: 0.5px solid rgba(217, 119, 87, 0.35);"
+            "  border-radius: 6px;"
+            "  padding: 4px 10px;"
+            "}"
+        )
+        self._degraded_badge.setVisible(False)
+        layout.addWidget(self._degraded_badge)
+
         sq_label = QLabel("Signal quality")
         sq_label.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
         sq_label.setStyleSheet(
@@ -823,6 +846,16 @@ class _AdvancedTab(QWidget):
         dwell = payload.get("dwell_seconds", 0.0)
         state = payload.get("state", "FLOW")
         bio = payload.get("biometrics", {})
+
+        # F18 (audit): surface the daemon's degraded state. The
+        # ``degraded`` flag piggybacks the same payload dict that the
+        # controller already forwards from /state/infer responses and WS
+        # state-update frames. Falling back to ``source != "classifier"``
+        # keeps the badge correct on payloads that only carry ``source``.
+        is_degraded = bool(payload.get("degraded", False)) or (
+            payload.get("source") not in (None, "classifier")
+        )
+        self._degraded_badge.setVisible(is_degraded)
 
         self._physio_q.set_value(sig_q.get("physio", 0.0))
         self._kine_q.set_value(sig_q.get("kinematics", 0.0))

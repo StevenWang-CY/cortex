@@ -70,6 +70,14 @@ class EventType(StrEnum):
     # client behaviour that provoked it.
     RATE_LIMITED = "rate_limited"
 
+    # F18: ``/state/infer`` fell back to synthetic confidence because the
+    # rule scorer / smoother were not registered (cold daemon, partial
+    # boot, or scorer exception). The response envelope already exposes
+    # ``source="fallback"`` and ``degraded=True``; this event surfaces the
+    # same fact at log-stream granularity so a dashboard or alarm rule can
+    # detect the degradation without polling the response.
+    STATE_INFER_DEGRADED = "state_infer_degraded"
+
 
 class StateTransitionEvent(BaseModel):
     """State transition event data."""
