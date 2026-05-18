@@ -79,6 +79,30 @@ Entries appended in commit order. Each entry: finding ID, fix summary, files tou
 
 ---
 
+### F02 — Atomic session report write at shutdown
+
+**Fix.** The previous shutdown path wrapped `self._session_report.finish()` and `session_path.write_text(...)` in a single `try/except Exception: logger.warning(...)`. Any failure — disk-full, permission denied, a Pydantic model error inside `finish()`, a SIGKILL after the file was opened in write-truncate mode but before bytes were flushed — silently dropped the entire session debrief and left no recoverable artefact.
+- New helper `cortex/libs/utils/atomic_write.py`: `atomic_write_text` / `atomic_write_json` write to `<path>.tmp`, fsync, and `os.replace` into place. `os.replace` is atomic on POSIX and NTFS; failure before the rename leaves the prior on-disk file intact.
+- `runtime_daemon.stop()` now splits compute-vs-disk error handling: `finish()` errors log "nothing to persist" and skip the write; disk-write errors log "prior file preserved" and the previous report (if any) survives.
+- Both branches use `logger.error` instead of `warning` so the failure is observable at the daemon's default log level.
+
+**Files touched** (3):
+- `cortex/libs/utils/atomic_write.py` (new)
+- `cortex/services/runtime_daemon.py`
+- `cortex/tests/unit/test_atomic_write.py` (new test)
+
+**Test.** 5 cases in `test_atomic_write.py`. Round-trip JSON, no leftover `.tmp` on success, prior file survives `os.replace` failure (simulated `PermissionError`), tmp file cleaned up on write failure (simulated mid-write `OSError`). All fail on `main` (helper does not exist).
+
+**Verification.**
+- F02 suite: 5 passed (0.03s).
+- Regression check: full unit suite `pytest cortex/tests/unit/` → 931 passed, 1 skipped.
+
+**Compatibility.** Additive. The on-disk session report format is unchanged. Stale readers continue to see `session_<id>.json`. No migration.
+
+**Rollback.** `git revert` is clean. The atomic-write helper has no callers other than `runtime_daemon.stop()`; the previous `write_text` path is straight-line restored.
+
+---
+
 ## New Findings (surfaced during Phase 2)
 
 ### F07b — Native-host mediated auth-token fetch for extension

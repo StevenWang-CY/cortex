@@ -501,21 +501,49 @@ class CortexDaemon:
         # G.1: write the session debrief BEFORE shutting down the WS
         # server so a future "view last report" endpoint can serve it
         # immediately on next launch.
-        try:
-            if self._session_report_started:
+        #
+        # F02: split compute-vs-write error handling and use an atomic
+        # write so disk-full / SIGKILL mid-write does not silently lose
+        # the session. Previously a single ``try/except Exception`` wrapped
+        # both ``finish()`` and ``write_text``; either path's failure was
+        # logged once and the report was gone forever. Now compute errors
+        # log the report's last-known state, and disk-write errors retain
+        # the previous on-disk file (if any) because ``os.replace`` is
+        # atomic.
+        if self._session_report_started:
+            try:
                 report = self._session_report.finish()
-                sessions_dir = (
-                    Path(self.config.storage.path).expanduser() / "sessions"
+            except Exception:
+                logger.error(
+                    "Failed to compute session report; nothing to persist",
+                    exc_info=True,
                 )
-                sessions_dir.mkdir(parents=True, exist_ok=True)
-                session_path = sessions_dir / f"session_{report.session_id}.json"
-                session_path.write_text(
-                    json.dumps(report.model_dump(mode="json"), indent=2),
-                    encoding="utf-8",
-                )
-                logger.info("Wrote session report to %s", session_path)
-        except Exception:
-            logger.warning("Failed to finalise session report", exc_info=True)
+                report = None
+            if report is not None:
+                try:
+                    from cortex.libs.utils.atomic_write import atomic_write_json
+
+                    sessions_dir = (
+                        Path(self.config.storage.path).expanduser() / "sessions"
+                    )
+                    session_path = sessions_dir / f"session_{report.session_id}.json"
+                    atomic_write_json(session_path, report.model_dump(mode="json"))
+                    logger.info("Wrote session report to %s", session_path)
+                except OSError as exc:
+                    # Disk-full, permission denied, etc. The previous
+                    # on-disk version (if any) survives because the
+                    # atomic write never crossed the rename point.
+                    logger.error(
+                        "Failed to persist session report at shutdown "
+                        "(session_id=%s err=%s); prior file preserved",
+                        getattr(report, "session_id", "?"),
+                        exc,
+                    )
+                except Exception:
+                    logger.error(
+                        "Unexpected failure persisting session report",
+                        exc_info=True,
+                    )
         await self._ws_server.stop()
         self._uvicorn_server = None
         registry.reset()

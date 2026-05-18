@@ -1,9 +1,9 @@
 # Audit State Pointer
 
 **Phase:** 2 (remediation in progress)
-**Next finding to address:** F02 (atomic session report write)
-**Last finding closed:** F08 + F07b (launcher /stop capability token, native-host get_auth_token)
-**Last commit:** `audit F08+F07b: capability token on launcher /stop + native-host token fetch`
+**Next finding to address:** F03 (track all asyncio.create_task in state loop)
+**Last finding closed:** F02 (atomic session report write)
+**Last commit:** `audit F02: atomic session report write at shutdown`
 **Resume protocol on fresh invocation:**
 
 1. Read `audit/findings.md` — authoritative Ledger.
