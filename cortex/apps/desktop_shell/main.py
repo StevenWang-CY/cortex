@@ -62,6 +62,13 @@ class WebSocketBridge(QObject):
         # matching the browser and VS Code clients. Resets to 3s after a
         # successful connect.
         self._reconnect_delay = 3.0
+        # F17 (audit): per-message-type last-applied envelope sequence.
+        # The daemon's WS server increments ``WSMessage.sequence`` once
+        # per outbound message; receivers drop any frame whose sequence
+        # is not strictly greater than the last applied value for its
+        # type. Reset to {} on every fresh connect so a daemon restart
+        # always wins.
+        self._last_seq_by_type: dict[str, int] = {}
         self._reconnect_delay_max = 30.0
         # Debt-2 (audit): cache the capability token at startup so we can
         # AUTH on every (re)connect without re-reading the file. The
@@ -192,6 +199,13 @@ class WebSocketBridge(QObject):
                     logger.info(f"Connected to Cortex daemon at {uri}")
                     # E.6: successful connect → reset backoff.
                     self._reconnect_delay = 3.0
+                    # F17 (audit): clear the per-type drop-stale tracker
+                    # on every connect. A daemon restart resets its
+                    # WSMessage.sequence counter to 0; without clearing
+                    # here the receiver would reject every post-restart
+                    # frame as "stale" until the new daemon's counter
+                    # caught up with the pre-restart value.
+                    self._last_seq_by_type.clear()
 
                     # Debt-2 (audit): AUTH is the contractual first
                     # frame. The daemon refuses every other type until
@@ -267,6 +281,24 @@ class WebSocketBridge(QObject):
 
         msg_type = msg.get("type", "")
         payload = msg.get("payload", {})
+
+        # F17 (audit): per-type drop-stale on the WSMessage envelope
+        # ``sequence`` field. The daemon increments this once per
+        # outbound message; receivers maintain a per-type last-applied
+        # value and ignore any frame whose sequence isn't strictly
+        # greater. ``sequence=0`` from older daemons or test fixtures
+        # bypasses the check (the default goes through on the first
+        # frame only, which is the safe behaviour at connect time).
+        seq = msg.get("sequence", 0)
+        if isinstance(seq, int) and seq > 0 and msg_type:
+            last = self._last_seq_by_type.get(msg_type, 0)
+            if seq <= last:
+                logger.debug(
+                    "F17: dropping stale %s frame seq=%d last=%d",
+                    msg_type, seq, last,
+                )
+                return
+            self._last_seq_by_type[msg_type] = seq
 
         if msg_type == "STATE_UPDATE":
             self.state_updated.emit(payload)

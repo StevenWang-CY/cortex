@@ -77,14 +77,66 @@ class DaemonBridge(QObject):
     error_occurred = Signal(str, str, str)
 
     # -- callbacks invoked from daemon thread ---------------------------------
+    #
+    # F17 (audit): per-type monotonic ``_seq`` drop. The daemon stamps a
+    # ``_seq`` field on every payload it hands these callbacks; we
+    # remember the last applied value per channel and silently drop
+    # anything that is not strictly greater. This protects the UI from
+    # reordered or duplicated frames on the daemon→bridge edge (in-
+    # process there is no real reorder risk, but the same drop-stale
+    # invariant lets the bridge be safely shared with future
+    # cross-process callbacks).
+    _LAST_STATE_SEQ_DEFAULT: int = 0
+    _LAST_INTERVENTION_SEQ_DEFAULT: int = 0
+
+    def __init__(self) -> None:  # type: ignore[override]
+        super().__init__()
+        self._last_state_seq: int = self._LAST_STATE_SEQ_DEFAULT
+        self._last_intervention_seq: int = self._LAST_INTERVENTION_SEQ_DEFAULT
 
     def on_state(self, payload: dict) -> None:
-        """State callback — payload is already deep-copied by the daemon."""
+        """State callback — payload is already deep-copied by the daemon.
+
+        F17: drops the frame if ``payload['_seq']`` is not strictly
+        greater than the last applied value. Frames without ``_seq``
+        (older daemon builds, test fixtures) bypass the check.
+        """
+        seq = payload.get("_seq")
+        if isinstance(seq, int):
+            if seq <= self._last_state_seq:
+                logger.debug(
+                    "F17: dropping stale STATE frame seq=%s last=%s",
+                    seq, self._last_state_seq,
+                )
+                return
+            self._last_state_seq = seq
         self.state_updated.emit(payload)
 
     def on_intervention(self, payload: dict) -> None:
-        """Intervention callback — payload is already deep-copied."""
+        """Intervention callback — payload is already deep-copied.
+
+        F17: same drop-stale guard as ``on_state``. The intervention
+        channel benefits even more from sequencing: a reordered trigger
+        could overwrite an active intervention with a stale plan.
+        """
+        seq = payload.get("_seq")
+        if isinstance(seq, int):
+            if seq <= self._last_intervention_seq:
+                logger.debug(
+                    "F17: dropping stale INTERVENTION frame seq=%s last=%s",
+                    seq, self._last_intervention_seq,
+                )
+                return
+            self._last_intervention_seq = seq
         self.intervention_triggered.emit(payload)
+
+    def reset_sequence_counters(self) -> None:
+        """F17: reset both sequence counters. Called when the underlying
+        daemon restarts (in-process re-init, daemon stop+start) so the
+        next first-frame from the fresh daemon is not rejected as
+        stale against the previous-incarnation counter."""
+        self._last_state_seq = self._LAST_STATE_SEQ_DEFAULT
+        self._last_intervention_seq = self._LAST_INTERVENTION_SEQ_DEFAULT
 
     def on_daemon_stopped(self) -> None:
         """Called when the in-process daemon's ``stop()`` future resolves."""

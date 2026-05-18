@@ -232,6 +232,14 @@ class CortexDaemon:
         # must handle thread-safety, e.g. via Qt signal emission).
         self._state_callback: Callable[[dict], None] | None = None
         self._intervention_callback: Callable[[dict], None] | None = None
+        # F17 (audit): per-callback monotonic sequence numbers. The
+        # in-process bridge (``DaemonBridge``) reads ``_seq`` from the
+        # payload and drops frames whose ``_seq`` is not strictly
+        # greater than the last applied value. Reset on daemon restart
+        # is implicit — the bridge starts with ``last_seq = 0`` per
+        # restart, so the first frame from a fresh daemon always wins.
+        self._state_callback_seq: int = 0
+        self._intervention_callback_seq: int = 0
 
         self._recorder = SessionRecorder(self.config.storage.path)
         self._input_hooks = InputHooks(self.config.telemetry)
@@ -1213,7 +1221,13 @@ class CortexDaemon:
                     self._latest_biometrics = biometrics
 
                     if self._state_callback is not None:
+                        # F17: stamp a monotonic sequence into the payload so
+                        # the in-process bridge can drop reordered frames.
+                        # ``_seq`` underscore-prefix marks this as a wire
+                        # implementation detail, not a domain field.
+                        self._state_callback_seq += 1
                         self._state_callback(copy.deepcopy({
+                            "_seq": self._state_callback_seq,
                             "state": estimate.state,
                             "confidence": estimate.confidence,
                             "scores": estimate.scores.model_dump() if hasattr(estimate.scores, "model_dump") else {},
@@ -1528,9 +1542,14 @@ class CortexDaemon:
             await self._ws_server.send_intervention(plan)
 
             if self._intervention_callback is not None:
-                self._intervention_callback(copy.deepcopy(
-                    plan.model_dump(mode="json")
-                ))
+                # F17: stamp a monotonic sequence so the in-process bridge
+                # can drop reordered intervention triggers. The plan dict
+                # is augmented with ``_seq`` after deep-copying so we
+                # never mutate the model the daemon retains.
+                self._intervention_callback_seq += 1
+                _payload = copy.deepcopy(plan.model_dump(mode="json"))
+                _payload["_seq"] = self._intervention_callback_seq
+                self._intervention_callback(_payload)
         except TimeoutError:
             logger.warning("Intervention LLM call timed out")
         except asyncio.CancelledError:

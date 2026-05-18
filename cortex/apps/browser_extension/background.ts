@@ -526,6 +526,12 @@ function connect(): void {
             // long-running disconnect cycle that finally succeeds doesn't
             // keep waiting 30s on the next transient drop.
             reconnectDelay = INITIAL_RECONNECT_DELAY;
+            // F17 (audit): clear the per-type sequence tracker. The
+            // daemon restarts its WSMessage.sequence counter from 0
+            // each boot; keeping the pre-restart values would reject
+            // every post-restart frame as stale until the new daemon's
+            // counter caught up.
+            _resetLastSeqByType();
 
             // Debt-2 (audit): AUTH is the contractual first frame on
             // every WebSocket connection. The daemon refuses every other
@@ -729,6 +735,57 @@ export function _getInitialReconnectDelay(): number {
     return INITIAL_RECONNECT_DELAY;
 }
 
+/**
+ * F17 (audit): per-message-type last-applied envelope ``sequence``.
+ *
+ * The daemon's WS server increments ``WSMessage.sequence`` once per
+ * outbound message; we drop any frame whose sequence is not strictly
+ * greater than the last applied value for its type. This protects
+ * INTERVENTION_TRIGGER (where a reordered frame could clobber the
+ * active intervention plan) and STATE_UPDATE (where stale frames
+ * could overwrite the user-visible biometric state).
+ *
+ * Frames with ``sequence === 0`` (older daemons, broadcast types that
+ * the server never bumps) bypass the check — the default behaviour
+ * is to apply the frame, preserving backwards compatibility with the
+ * pre-F17 contract.
+ *
+ * Reset to ``{}`` on every successful WS open: the daemon's counter
+ * starts at 0 each restart, so retaining the pre-restart values would
+ * reject every post-restart frame as "stale".
+ */
+const lastSeqByType: Record<string, number> = {};
+
+export function _resetLastSeqByType(): void {
+    for (const key of Object.keys(lastSeqByType)) delete lastSeqByType[key];
+}
+
+export function _getLastSeq(msgType: string): number {
+    return lastSeqByType[msgType] ?? 0;
+}
+
+/**
+ * Returns true iff the frame should be APPLIED (i.e. its sequence
+ * advances the per-type counter). The function updates the counter
+ * as a side effect when it accepts the frame; callers that decide to
+ * accept-then-discard for a different reason are still safe because
+ * the counter only moves forward.
+ */
+function acceptSequencedFrame(msg: WSMessage): boolean {
+    const seq = typeof msg.sequence === "number" ? msg.sequence : 0;
+    if (seq <= 0 || !msg.type) return true; // unsequenced — bypass
+    const last = lastSeqByType[msg.type] ?? 0;
+    if (seq <= last) return false; // stale
+    lastSeqByType[msg.type] = seq;
+    return true;
+}
+
+/** Test-only: expose the sequence-drop predicate so vitest can exercise
+ * the F17 logic without spinning a real WebSocket / handleMessage. */
+export function _acceptSequencedFrame(msg: WSMessage): boolean {
+    return acceptSequencedFrame(msg);
+}
+
 function recordWsParseError(err: unknown, msg: Partial<WSMessage> | null): void {
     const cid =
         msg && typeof (msg as { correlation_id?: unknown }).correlation_id === "string"
@@ -771,6 +828,21 @@ async function handleMessage(raw: string): Promise<void> {
     // not stay armed forever.
     if (wsParseErrorTimestamps.length > 0) {
         wsParseErrorTimestamps = [];
+    }
+
+    // F17 (audit): drop reordered or duplicated frames before they reach
+    // the per-type handlers. AUTH_OK is excluded from the check by the
+    // ``seq <= 0`` early-return inside acceptSequencedFrame (the daemon
+    // emits AUTH_OK without bumping the sequence counter; see
+    // websocket_server.py::_auth_ok_frame).
+    if (!acceptSequencedFrame(msg)) {
+        if (DEBUG) {
+            console.warn(
+                `[cortex.bg] F17: dropping stale ${msg.type} seq=${msg.sequence} ` +
+                `last=${lastSeqByType[msg.type] ?? 0}`,
+            );
+        }
+        return;
     }
 
     switch (msg.type) {
