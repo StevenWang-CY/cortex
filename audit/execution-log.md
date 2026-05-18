@@ -256,3 +256,196 @@ The eight commits in this session close the data-loss tier (F01, F02, F03), the 
 ## Phase 2 Session 1 — Least-Confident Fix
 
 **F03** (background task tracking). The fix itself is straightforward — a tracked set + `_spawn_background_task` helper + cancellation in `stop()`. What I am least confident about is whether the test coverage is sufficient. The test runs against a `_StubDaemon` that mirrors the helper because booting the full `CortexDaemon` requires a real camera, real store backends, and other dependencies. The stub exercises the contract precisely, but it cannot catch the case where a future call site in the daemon adds another bare `asyncio.create_task(...)` instead of using `_spawn_background_task`. A `pytest --collect-only` style lint or a one-line grep CI check (`! grep -rn "asyncio.create_task" cortex/services/runtime_daemon.py | grep -v "_spawn_background_task"`) would close that gap. Filing as **F03b** but not opening a Ledger row this session because the existing failure mode (orphan tasks) is closed at the call site that was flagged; the residual risk is regression-only, not active.
+
+---
+
+## Audit Wave 2 — UI Consistency Reconciliation Report
+
+**Date.** 2026-05-19. **Posture.** Senior UI/UX engineer auditing Wave 1's
+desktop_shell + browser_extension changes for visual consistency and
+macOS-native feel. One fix per commit; tests where feasible.
+
+**Commits shipped.**
+
+| SHA | Subject |
+|-----|---------|
+| `9c7c32b` | promote warm label tints to tokens, lift sub-AA tertiary |
+| `d661a38` | route timeline font-family through FONT_MONO token |
+| `84a58f4` | regression-guard for native window chrome coverage |
+| `c90d382` | route remaining raw-int spacing through tokens |
+| `bdff047` | accessible names + tab order on settings, connections, onboarding |
+| `4bd1687` | route popup toggle radius + transitions through tokens |
+
+### Per-dimension verdict
+
+**1. Token source-of-truth.** GAP FOUND + CLOSED.
+`connections.py`, `settings.py`, `onboarding.py` each carried private
+`_LABEL_SECONDARY = "#5C5854"` and `_LABEL_TERTIARY = "#827971"` copies.
+The tertiary value fails WCAG AA on the cream background (3.98:1 against
+#FFFFFF) — F55 fixed this in `dashboard.py` (raised to `#6B6661`,
+~5.4:1) but the other three surfaces silently drifted. Wave-2 commit
+`9c7c32b` promotes both tints into the token registry (`tokens.yaml`
+emitter + generated `tokens.py` + browser-extension `design-tokens.ts`),
+pins `CX_TEXT_TERTIARY = "#6B6661"`, and switches every consumer to
+`from cortex.apps.desktop_shell.tokens import CX_TEXT_TERTIARY`.
+Regression test `test_token_label_consistency.py` (9 cases) pins the
+registry value and asserts no surface carries the legacy literal.
+`dashboard.py:898` retains `#B25430` for the degraded badge; it's a
+deliberate WCAG-AA-verified deep terracotta scoped to that single
+banner and not a candidate for promotion.
+
+**2. Typography.** ESSENTIALLY CLEAN — ONE PROMOTION.
+Every `setFont(...)` call across the five panels routes through
+`mac_native.system_font(FS_*, weight)`. No `"Arial"` / `"Helvetica"` /
+`QFont("Times")` literals anywhere in desktop_shell. The brand
+Cormorant headings consistently use `BRAND_DISPLAY_FONT`. Commit
+`d661a38` promotes one `font-family: "SF Mono", ui-monospace, ...`
+literal in `dashboard.py:1005` (timeline panel) to the `FONT_MONO`
+token — the literal happened to match verbatim but would have drifted
+on a future stack edit.
+
+**3. Window chrome.** ALREADY CONSISTENT — REGRESSION GUARD ADDED.
+All five top-level windows (`DashboardWindow`, `SettingsDialog`,
+`OnboardingWindow`, `OverlayWindow`, `ConnectionsPanel`) already invoke
+`apply_unified_titlebar` + `apply_vibrancy` in `showEvent`. Commit
+`84a58f4` adds `test_window_chrome_coverage.py` — 10 parameterised
+ast-based cases that pin every top-level window to its required
+`mac_native` calls. A future window class that forgets to apply native
+chrome will fail CI rather than inherit Qt's default opaque titlebar
+silently.
+
+**4. Spacing rhythm.** TWO LITERALS PROMOTED.
+Most layout `setSpacing`/`setContentsMargins` calls already consume the
+SP1-SP10 token scale. Commit `c90d382` promotes two outliers:
+- `overlay.py:282` `setContentsMargins(24, 24, 24, 24)` → `(SP6, SP6,
+  SP6, SP6)`.
+- `onboarding.py:236` `setSpacing(8)` → `setSpacing(SP2)`.
+The remaining raw integers in `dashboard.py` (3px inner pill padding,
+2px inter-column gaps, 10/3/12/3 badge tracker margins) are
+intentional sub-4pt fine tuning below the token granularity — they're
+not candidates for promotion without inventing new sub-grid tokens.
+
+**5. Accessibility coverage.** GAP FOUND + CLOSED.
+F55 wired accessibility on the dashboard + overlay; the three other
+panels were untouched. VoiceOver would announce every control as
+"button" / "checkbox" / "slider" without semantic context, and the
+focus ring escaped the window unpredictably. Commit `bdff047`:
+- Extracts the defensive `set_accessible_name` / `setTabOrder` helpers
+  into `cortex/apps/desktop_shell/a11y.py` so every panel imports them
+  once.
+- Wires 16 controls in `settings.py` (back, 6 checkboxes, slider, 2
+  spinboxes, combo, 4 debug checkboxes, close, apply) into a 15-step
+  tab chain.
+- Wires `connections.py`'s back button + every Connect button into a
+  collected `_tab_order_chain` and chains it.
+- Wires `onboarding.py`'s BYOK token input, region combo, save button,
+  Open Connections, Get Started, and per-step Grant buttons + status
+  pills.
+Regression test `test_a11y_coverage.py` (3 cases) instantiates each
+panel offscreen and asserts the accessible names are present.
+`tray.py` deliberately untouched — on macOS the tray uses the native
+`NSStatusItem` wrapper (`mac_native.StatusBarItem`) which is announced
+by VoiceOver via the system menu-bar role; QAction-based accessibility
+doesn't apply on the mac path.
+
+**6. Browser-extension native feel.** ESSENTIALLY CLEAN — TWO
+PROMOTIONS. Every `fontFamily` already routes through `CX.font` /
+`CX.fontSerif` / `CX.fontBrand` / `CX.mono`. The macOS-system stack is
+`-apple-system, BlinkMacSystemFont, ...` (the correct native chain).
+Focus rings are explicit `outline: 2px solid CX.accent` with
+`outline-offset: 2px` — readable + brand-preserving. Commit `4bd1687`
+promotes two outliers in `popup.tsx`:
+- `toggleTrack.borderRadius: 12` → `CX.radiusFull` (still clamps to
+  half-height for the pill shape).
+- `toggleThumb.background: "#fff"` → `CX.textInverse`.
+Three `transition: "... 0.2s ease"` literals → `CX.durationNormal` +
+`CX.easeDefault`. All 31 vitest specs stay green.
+
+**7. Loading / empty / error states.** ALREADY DISTINGUISHED.
+F18 added the degraded banner; F54 added the four connectivity states
+(`not_installed`, `installed_no_daemon`, `installed_version_mismatch`,
+`handshake_failed`) each with its own title + body + CTA. F40+F54
+tests cover all four states. The morning briefing card (`popup.tsx`)
+renders only when `briefing !== null` — no loading skeleton, no
+explicit error state. This is intentional: the briefing is push-based
+from the daemon, so absence = no briefing yet (= correct silent state).
+The activity-tracker resume cards (`newtab.tsx`) similarly render only
+when `activities.length > 0`. The dashboard timeline panel already has
+the "No events yet" empty state. **Residual:** no explicit loading
+skeleton on the briefing card or activity preview — listed in the
+residual-risk section below.
+
+**8. Motion / micro-interactions.** REVIEWED, NO CHANGES.
+The audit prompt explicitly said "be conservative — don't add motion
+to functional elements like Apply Settings". The two remaining
+`setVisible(True)` call sites are:
+- `connections.py:238` translocation warning — critical functional
+  info, not a candidate for delight motion.
+- `onboarding.py:717` Grant button visibility flip — functional state
+  change, not delight.
+Existing motion is already calibrated (overlay alert `cxAlertIn`,
+heartbeat `cxPulse`, breathing pacer, activity-card fade-in,
+focus-ring transitions). Adding 150ms fades to the degraded badge or
+fallback hint would draw attention to error states — counter-
+productive. **Listed as residual** for a future targeted polish pass.
+
+### Surfaces audited
+
+| Surface | Verdict |
+|---------|---------|
+| `cortex/apps/desktop_shell/dashboard.py` | Already F47/F55/F31; one font-stack literal promoted. |
+| `cortex/apps/desktop_shell/overlay.py` | F47/F55/F06 closed; one margin literal promoted. |
+| `cortex/apps/desktop_shell/onboarding.py` | A11y added; spacing literal promoted; tertiary tint pulled from tokens. |
+| `cortex/apps/desktop_shell/settings.py` | A11y added (16 controls + 15-step tab chain); tertiary tint pulled from tokens. |
+| `cortex/apps/desktop_shell/connections.py` | A11y added; tertiary tint pulled from tokens. |
+| `cortex/apps/desktop_shell/tray.py` | macOS native `NSStatusItem` — no Qt a11y needed. |
+| `cortex/apps/desktop_shell/mac_native.py` | Single point of contact for native chrome — clean. |
+| `cortex/apps/desktop_shell/tokens.py` | Auto-generated; emitter updated for AA tertiary tint. |
+| `cortex/apps/browser_extension/popup.tsx` | Toggle radius + transitions promoted to tokens. |
+| `cortex/apps/browser_extension/newtab.tsx` | Already on tokens; activity card aesthetics preserved. |
+| `cortex/apps/browser_extension/design-tokens.ts` | Auto-generated; tertiary tint synced. |
+
+### Verification
+
+- `QT_QPA_PLATFORM=offscreen pytest cortex/tests/unit/test_overlay_dismiss.py
+  cortex/tests/unit/test_dashboard_stop.py
+  cortex/tests/unit/test_overlay_tokens.py
+  cortex/tests/unit/test_token_label_consistency.py
+  cortex/tests/unit/test_window_chrome_coverage.py
+  cortex/tests/unit/test_a11y_coverage.py -q` → **35 passed**.
+- `QT_QPA_PLATFORM=offscreen pytest cortex/tests/unit/
+  --ignore=cortex/tests/unit/test_desktop_shell.py -q` →
+  **1150 passed**.
+- `cortex/apps/browser_extension && npx vitest run` →
+  **31 passed across 10 spec files**.
+
+`test_desktop_shell.py` installs lightweight PySide6 mocks that bleed
+into modules imported after it inside the same pytest session — a
+pre-existing harness quirk documented in `test_overlay_tokens.py`
+(every dependent test file unloads stale PySide6 mocks at module
+top). The legacy mock suite has one pre-existing failure
+(`TestOverlayWindow::test_show_intervention` — `MockQLabel.clear`
+missing) that is unrelated to this wave's changes; verified by
+running `test_desktop_shell.py` isolated against `HEAD~6` and
+observing the same failure.
+
+### Residual risk
+
+1. **No loading skeleton on morning-briefing / activity-tracker
+   preview.** Both are push-based from the daemon, so absence = no
+   data yet. A future commit could add a 600ms shimmer skeleton if
+   user testing reveals confusion about "is Cortex thinking, or did
+   it fail?" Scoped out of Wave-2 because it's net-new UX, not
+   reconciliation.
+2. **No fade-in on the dashboard degraded badge / overlay fallback
+   hint.** Both are functional notifications; per the audit's "be
+   conservative" rule, no motion added. If user testing shows the
+   abrupt appearance is jarring, a 150ms `QPropertyAnimation` on
+   `windowOpacity` is the targeted fix.
+3. **`test_desktop_shell.py` mock-pollution.** Pre-existing. Affects
+   only intra-session ordering; every dependent test file already
+   defends with the stale-PySide6 unload pattern at module top.
+   Cleanest fix is to migrate the legacy mock suite to real PySide6
+   under `QT_QPA_PLATFORM=offscreen` — out of scope for visual
+   reconciliation.
+
