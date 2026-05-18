@@ -20,17 +20,44 @@ Adaptive behavior:
 
 from __future__ import annotations
 
+import json
 import logging
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
 from cortex.libs.config.settings import InterventionConfig, StateConfig
 from cortex.libs.schemas.state import StateEstimate
+from cortex.libs.utils.atomic_write import atomic_write_json
+from cortex.libs.utils.platform import get_config_dir
 
 logger = logging.getLogger(__name__)
+
+
+# F21: persisted dismissal-model record version. Bump if the weights
+# tuple shape changes so installed clients cold-start instead of loading
+# an incompatible shape.
+DISMISSAL_MODEL_VERSION: int = 1
+
+# F21: debounce window for disk flushes. Whichever comes first
+# (N updates OR T seconds) triggers a write. Tuned to avoid a flush
+# storm during burst-dismissal sessions while still bounding loss
+# at restart.
+_DISMISSAL_FLUSH_EVERY_N_UPDATES: int = 10
+_DISMISSAL_FLUSH_EVERY_SECONDS: float = 30.0
+
+
+def _default_dismissal_model_path() -> Path:
+    """Where the persisted dismissal-model record lives (F21).
+
+    Lazy so tests can override via the ``dismissal_model_path``
+    constructor kwarg instead of monkeypatching globals.
+    """
+    return get_config_dir() / "dismissal_model.json"
 
 
 @dataclass(frozen=True)
@@ -78,6 +105,7 @@ class TriggerPolicy:
         state_config: StateConfig | None = None,
         *,
         hyper_dwell_seconds: float | None = None,
+        dismissal_model_path: Path | None = None,
     ) -> None:
         self._config = config or InterventionConfig()
         # Single source of truth for HYPER dwell is StateConfig (v0.2.0 C.5).
@@ -107,6 +135,22 @@ class TriggerPolicy:
         self._approvals_total: int = 0
         self._dismissal_model_weights: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self._dismissal_outcomes: int = 0
+
+        # F21: dismissal-model persistence.
+        # Lock guards the (weights, write-debounce counters) tuple so a
+        # concurrent ``record_outcome`` cannot tear the persisted record.
+        # The on-disk write itself is atomic via ``atomic_write_json``;
+        # the lock only protects the in-memory state we are about to
+        # serialise.
+        self._dismissal_model_path: Path = (
+            dismissal_model_path
+            if dismissal_model_path is not None
+            else _default_dismissal_model_path()
+        )
+        self._dismissal_persist_lock: threading.Lock = threading.Lock()
+        self._dismissal_updates_since_flush: int = 0
+        self._dismissal_last_flush_at: float = time.monotonic()
+        self._load_dismissal_model()
 
     @property
     def is_quiet_mode(self) -> bool:
@@ -396,12 +440,124 @@ class TriggerPolicy:
             [float(confidence), float(context_complexity), min(1.0, float(typing_burst_seconds) / 10.0)],
             dtype=np.float64,
         )
-        w = np.array(self._dismissal_model_weights, dtype=np.float64)
-        z = float(w @ x)
-        p = 1.0 / (1.0 + np.exp(-np.clip(z, -20.0, 20.0)))
-        grad = (p - y) * x
-        w = w - 0.05 * grad
-        self._dismissal_model_weights = (float(w[0]), float(w[1]), float(w[2]))
+        snapshot: tuple[float, float, float] | None = None
+        outcomes_snapshot = 0
+        with self._dismissal_persist_lock:
+            w = np.array(self._dismissal_model_weights, dtype=np.float64)
+            z = float(w @ x)
+            p = 1.0 / (1.0 + np.exp(-np.clip(z, -20.0, 20.0)))
+            grad = (p - y) * x
+            w = w - 0.05 * grad
+            self._dismissal_model_weights = (float(w[0]), float(w[1]), float(w[2]))
+            self._dismissal_updates_since_flush += 1
+            now = time.monotonic()
+            should_flush = (
+                self._dismissal_updates_since_flush
+                >= _DISMISSAL_FLUSH_EVERY_N_UPDATES
+                or (now - self._dismissal_last_flush_at)
+                >= _DISMISSAL_FLUSH_EVERY_SECONDS
+            )
+            if should_flush:
+                self._dismissal_updates_since_flush = 0
+                self._dismissal_last_flush_at = now
+                snapshot = self._dismissal_model_weights
+                outcomes_snapshot = self._dismissal_outcomes
+
+        if snapshot is not None:
+            self._persist_dismissal_model(snapshot, outcomes_snapshot)
+
+    def flush_dismissal_model(self) -> None:
+        """Force a persistence write of the current dismissal-model record.
+
+        Useful at shutdown, or in tests that want to observe the latest
+        weights without waiting for the debounce window to close (F21).
+        """
+        with self._dismissal_persist_lock:
+            self._dismissal_updates_since_flush = 0
+            self._dismissal_last_flush_at = time.monotonic()
+            snapshot = self._dismissal_model_weights
+            outcomes_snapshot = self._dismissal_outcomes
+        self._persist_dismissal_model(snapshot, outcomes_snapshot)
+
+    def _persist_dismissal_model(
+        self,
+        weights: tuple[float, float, float],
+        outcomes: int,
+    ) -> None:
+        """Write the dismissal-model record to disk atomically (F21)."""
+        record = {
+            "model_version": DISMISSAL_MODEL_VERSION,
+            "weights": [float(w) for w in weights],
+            "outcomes": int(outcomes),
+            "saved_at": time.time(),
+        }
+        try:
+            atomic_write_json(self._dismissal_model_path, record)
+        except OSError as exc:
+            logger.warning(
+                "Failed to persist dismissal model to %s: %s",
+                self._dismissal_model_path,
+                exc,
+            )
+
+    def _load_dismissal_model(self) -> None:
+        """Rehydrate persisted weights on construction (F21).
+
+        Missing file or version mismatch -> cold-start with zeros.
+        Malformed JSON is tolerated identically: log and cold-start.
+        """
+        path = self._dismissal_model_path
+        if not path.exists():
+            logger.debug("No dismissal model at %s; cold-starting.", path)
+            return
+        try:
+            raw = path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "Could not read dismissal model at %s (%s); cold-starting.",
+                path,
+                exc,
+            )
+            return
+        if not isinstance(data, dict):
+            logger.warning(
+                "Dismissal model at %s is not a JSON object; cold-starting.",
+                path,
+            )
+            return
+        version = data.get("model_version")
+        if version != DISMISSAL_MODEL_VERSION:
+            logger.info(
+                "Dismissal model version mismatch (have=%r, want=%r); cold-starting.",
+                version,
+                DISMISSAL_MODEL_VERSION,
+            )
+            return
+        weights = data.get("weights")
+        if (
+            not isinstance(weights, list)
+            or len(weights) != 3
+            or not all(isinstance(w, (int, float)) for w in weights)
+        ):
+            logger.warning(
+                "Dismissal model weights shape invalid at %s; cold-starting.",
+                path,
+            )
+            return
+        self._dismissal_model_weights = (
+            float(weights[0]),
+            float(weights[1]),
+            float(weights[2]),
+        )
+        outcomes = data.get("outcomes", 0)
+        if isinstance(outcomes, int) and outcomes >= 0:
+            self._dismissal_outcomes = outcomes
+        logger.info(
+            "Rehydrated dismissal model from %s (outcomes=%d)",
+            path,
+            self._dismissal_outcomes,
+        )
 
     def activate_quiet_mode(
         self,
@@ -476,3 +632,13 @@ class TriggerPolicy:
         self._dismissals_total = 0
         self._approvals_total = 0
         self._dismissal_model_weights = (0.0, 0.0, 0.0)
+        # F21: also clear the persisted record so a subsequent restart
+        # does not re-hydrate the model we just wiped.
+        try:
+            if self._dismissal_model_path.exists():
+                self._dismissal_model_path.unlink()
+        except OSError:
+            logger.debug(
+                "Could not remove dismissal model file at %s",
+                self._dismissal_model_path,
+            )
