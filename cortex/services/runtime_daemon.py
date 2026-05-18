@@ -136,6 +136,13 @@ class CortexDaemon:
         self.config = config or get_config()
         self._shutdown = asyncio.Event()
         self._tasks: list[asyncio.Task[Any]] = []
+        # F03: every dynamically-spawned background task (intervention
+        # dispatch, in-flight LLM call, etc.) is tracked here so stop()
+        # can cancel it. Previously the state-loop created intervention
+        # tasks via bare ``asyncio.create_task(...)`` with no reference;
+        # shutdown could complete while one was still mid-write,
+        # truncating session JSONL and leaking file handles.
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         self._uvicorn_server: uvicorn.Server | None = None
         self._api_task: asyncio.Task[Any] | None = None
 
@@ -470,6 +477,22 @@ class CortexDaemon:
             return
         loop.call_later(0.3, os.kill, os.getpid(), _signal.SIGTERM)
 
+    def _spawn_background_task(
+        self,
+        coro: Any,
+        *,
+        name: str | None = None,
+    ) -> asyncio.Task[Any]:
+        """Spawn a tracked background task. The task is added to
+        ``self._background_tasks`` and auto-removed on completion so the
+        set stays bounded. ``stop()`` cancels and awaits every
+        outstanding task, so a background coroutine cannot keep file
+        handles open past daemon shutdown."""
+        task = asyncio.create_task(coro, name=name)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
     async def stop(self) -> None:
         """Gracefully stop all runtime services."""
         self._shutdown.set()
@@ -480,6 +503,15 @@ class CortexDaemon:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+        # F03: cancel + drain dynamically-spawned background tasks so
+        # they cannot outlive the daemon and corrupt persisted state.
+        if self._background_tasks:
+            for task in list(self._background_tasks):
+                task.cancel()
+            await asyncio.gather(
+                *list(self._background_tasks), return_exceptions=True
+            )
+            self._background_tasks.clear()
         if self._api_task is not None:
             try:
                 await asyncio.wait_for(self._api_task, timeout=5.0)
@@ -1054,7 +1086,7 @@ class CortexDaemon:
                             # Run intervention in background so the state
                             # loop keeps updating while the LLM responds.
                             self._active_intervention_id = "__pending__"
-                            asyncio.create_task(
+                            self._spawn_background_task(
                                 self._trigger_intervention(
                                     context,
                                     estimate,

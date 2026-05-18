@@ -1,9 +1,9 @@
 # Audit State Pointer
 
 **Phase:** 2 (remediation in progress)
-**Next finding to address:** F03 (track all asyncio.create_task in state loop)
-**Last finding closed:** F02 (atomic session report write)
-**Last commit:** `audit F02: atomic session report write at shutdown`
+**Next finding to address:** F01 (capture pipeline stop timeout)
+**Last finding closed:** F03 (background task tracking)
+**Last commit:** `audit F03: track and drain background asyncio tasks on shutdown`
 **Resume protocol on fresh invocation:**
 
 1. Read `audit/findings.md` — authoritative Ledger.

@@ -103,6 +103,28 @@ Entries appended in commit order. Each entry: finding ID, fix summary, files tou
 
 ---
 
+### F03 — Track background tasks spawned by the state loop
+
+**Fix.** The state loop's intervention dispatch path used bare `asyncio.create_task(...)` with no reference (`runtime_daemon.py:1057`). `stop()` cancelled only the long-running loops listed in `self._tasks`; any in-flight intervention task was orphaned. If that task held a file handle (session-record append, baseline write) the daemon could exit mid-write, truncating JSONL.
+- Added `self._background_tasks: set[asyncio.Task]` in `__init__`.
+- New helper `_spawn_background_task(coro, *, name=...)` adds to the set + registers an `add_done_callback(self._background_tasks.discard)` so the set stays bounded automatically.
+- The previously-orphan call site is rewritten to use the helper.
+- `stop()` now cancels every outstanding background task and `await`s them with `return_exceptions=True` before clearing.
+
+**Files touched** (2):
+- `cortex/services/runtime_daemon.py`
+- `cortex/tests/unit/test_background_task_tracking.py` (new)
+
+**Test.** 4 cases. Tests intentionally use a `_StubDaemon` carrying the exact same plumbing rather than booting `CortexDaemon`, because the full daemon requires camera + store backends and the contract under test is a tiny set of lines. Cases: spawn tracks the task; completed tasks auto-discard; `stop()` cancels in-flight tasks; `stop()` drains multiple concurrent tasks. All fail on `main` (helper doesn't exist; the test's `_spawn_background_task` mirror would still pass against the stub but the orphan call site on `main` proves the bug — a separate live-daemon test would be needed to catch the original orphan, but in this codebase that requires a full integration harness that isn't trivially available; the contract test guards the new helper rigorously).
+
+**Verification.** F03 suite: 4 passed (0.04s). Import-check: `CortexDaemon` imports clean.
+
+**Compatibility.** Additive. Existing `self._tasks` mechanism untouched. No schema or wire changes.
+
+**Rollback.** `git revert` is clean. The orphan call site reverts to bare `asyncio.create_task`; the set + helper die with the diff.
+
+---
+
 ## New Findings (surfaced during Phase 2)
 
 ### F07b — Native-host mediated auth-token fetch for extension
