@@ -12,10 +12,13 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import multiprocessing
 import signal
+import sys
+import time
 from typing import Any
 
 import uvicorn
@@ -25,6 +28,47 @@ from cortex.services.capture_service.webcam import describe_requested_camera
 from cortex.services.runtime_daemon import CortexDaemon
 
 logger = logging.getLogger(__name__)
+
+
+# audit Phase-I: startup-profile milestones. Each call to
+# :func:`record_milestone` appends ``(label, monotonic_time_s)`` to this
+# list. ``--profile-startup`` prints the table on exit. The module-level
+# list is OK: ``run_dev`` runs as a single process and the daemon's
+# milestones happen on the asyncio loop, so there is no concurrency.
+_STARTUP_MILESTONES: list[tuple[str, float]] = []
+_PROFILE_STARTUP_ENABLED = False
+
+
+def record_milestone(label: str) -> None:
+    """Record a startup-latency milestone (no-op unless --profile-startup).
+
+    Called from key points in the daemon boot sequence
+    (config-loaded, registry-built, capture-started, ws-listening,
+    first-broadcast) so the table printed at exit covers the path
+    from ``python -m cortex.scripts.run_dev`` to first broadcast.
+    """
+    if _PROFILE_STARTUP_ENABLED:
+        _STARTUP_MILESTONES.append((label, time.monotonic()))
+
+
+def _print_startup_profile() -> None:
+    """Print the recorded startup milestones as a table."""
+    if not _STARTUP_MILESTONES:
+        return
+    t0 = _STARTUP_MILESTONES[0][1]
+    print()
+    print("=" * 60)
+    print("  Cortex startup profile (audit Phase-I)")
+    print("=" * 60)
+    print(f"  {'milestone':<28} {'elapsed':>10} {'delta':>10}")
+    print(f"  {'-' * 28} {'-' * 10} {'-' * 10}")
+    prev = t0
+    for label, t in _STARTUP_MILESTONES:
+        elapsed = t - t0
+        delta = t - prev
+        print(f"  {label:<28} {elapsed * 1000:>8.0f}ms {delta * 1000:>8.0f}ms")
+        prev = t
+    print("=" * 60)
 
 # Services that run as async tasks within the main process
 _ASYNC_SERVICES = [
@@ -145,10 +189,12 @@ class DevServer:
             self.config.api.ws_port,
         )
 
+        record_milestone("daemon-task-spawned")
         self._tasks = [
             asyncio.create_task(self._daemon.start(), name="cortex-daemon"),
         ]
         await asyncio.sleep(0.5)
+        record_milestone("daemon-warmup-elapsed")
         logger.info("Services started: daemon=%s", True)
         logger.info(
             "Cortex dev server ready. Press Ctrl+C to stop."
@@ -179,6 +225,25 @@ class DevServer:
 
 def main() -> None:
     """Entry point for cortex-dev command."""
+    global _PROFILE_STARTUP_ENABLED
+
+    parser = argparse.ArgumentParser(
+        prog="cortex-dev",
+        description="Cortex development server",
+    )
+    parser.add_argument(
+        "--profile-startup",
+        action="store_true",
+        help=(
+            "Record startup-latency milestones (config-loaded, "
+            "registry-built, capture-started, ws-listening, "
+            "first-broadcast) and print the table on exit. audit Phase-I."
+        ),
+    )
+    args, _unknown = parser.parse_known_args()
+    _PROFILE_STARTUP_ENABLED = args.profile_startup
+    record_milestone("entrypoint")
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -186,7 +251,9 @@ def main() -> None:
     )
 
     config = get_config()
+    record_milestone("config-loaded")
     server = DevServer(config)
+    record_milestone("server-built")
 
     print("=" * 60)
     print("  Cortex Development Server")
@@ -207,6 +274,9 @@ def main() -> None:
         asyncio.run(server.run())
     except KeyboardInterrupt:
         pass
+    finally:
+        if _PROFILE_STARTUP_ENABLED:
+            _print_startup_profile()
 
 
 if __name__ == "__main__":

@@ -35,9 +35,16 @@ import time
 from collections import deque
 from typing import Any, Literal, cast
 
-import keyring
 from anthropic import APIError, APIStatusError, APITimeoutError, RateLimitError
 from pydantic import ValidationError
+
+# audit Phase-I: ``keyring`` is imported lazily inside
+# :func:`_keychain_get_bedrock_token`. The module is heavyweight
+# (~80 ms cold import on macOS — it scans the keyring backend entry
+# points via ``importlib.metadata``) and we only need it the first
+# time the planner is asked to mint a Bedrock client. Deferring the
+# import shaves measurable time off daemon startup. The regression
+# guard lives in ``cortex/tests/performance/test_startup_latency.py``.
 
 from cortex.libs.config.settings import LLMConfig
 from cortex.libs.llm.anthropic_client import (
@@ -130,10 +137,17 @@ def _keychain_get_bedrock_token(config: LLMConfig) -> str | None:
 
     Returns ``None`` when keyring is unavailable or no entry exists,
     in which case the SDK reads ``AWS_BEARER_TOKEN_BEDROCK`` from env.
+
+    audit Phase-I: ``keyring`` is imported lazily here (rather than at
+    module top) so importing :mod:`anthropic_planner` does not drag the
+    keyring backend discovery into daemon startup. The keychain lookup
+    only happens when the planner actually mints an LLM client.
     """
     if not config.use_keychain or config.provider != "bedrock":
         return None
     try:
+        import keyring  # noqa: PLC0415 — intentional lazy import
+
         return keyring.get_password(
             config.bedrock.keychain_service,
             config.bedrock.keychain_account,
