@@ -912,29 +912,39 @@ function injectOverlay(payload: Record<string, unknown>): void {
     const tabRecs = payload.tab_recommendations as { tabs: Array<Record<string, unknown>>; summary: string } | undefined;
     const errA = payload.error_analysis as Record<string, string> | undefined;
 
-    // Synthesize close_tab actions from tab_recommendations when the LLM
-    // generated recommendations but no matching suggested_actions.
+    // F52: synthesise close actions from tab_recommendations only for
+    // tab_index values NOT already covered by suggested_actions. The
+    // tab card carries the close button when an existing action covers
+    // the same tab, so we avoid duplicate close affordances.
     if (tabRecs && tabRecs.tabs && tabRecs.tabs.length > 0) {
-        const hasCloseAction = actions.some(a => a.action_type === "close_tab" || a.action_type === "bookmark_and_close");
-        if (!hasCloseAction) {
-            const closeable = tabRecs.tabs.filter(t => t.action === "close" || t.action === "bookmark_and_close");
-            for (let ci = 0; ci < closeable.length; ci++) {
-                const t = closeable[ci];
-                actions.push({
-                    action_id: `synth_${Date.now()}_${ci}`,
-                    action_type: t.action === "bookmark_and_close" ? "bookmark_and_close" : "close_tab",
-                    tab_index: typeof t.tab_index === "number" ? t.tab_index : Number(t.tab_index),
-                    target: "",
-                    label: `Close ${t.tab_title || "tab"}`,
-                    reason: t.reason || "",
-                    category: "recommended",
-                    reversible: true,
-                    metadata: {
-                        expected_title: t.tab_title || "",
-                        expected_url: t.url || "",
-                    },
-                });
-            }
+        const coveredIndices = new Set<number>();
+        for (const a of actions) {
+            const at = a.action_type;
+            if (at !== "close_tab" && at !== "bookmark_and_close") continue;
+            const ti = typeof a.tab_index === "number" ? a.tab_index : Number(a.tab_index);
+            if (Number.isFinite(ti)) coveredIndices.add(ti);
+        }
+        const closeable = tabRecs.tabs.filter(t => t.action === "close" || t.action === "bookmark_and_close");
+        for (let ci = 0; ci < closeable.length; ci++) {
+            const t = closeable[ci];
+            const ti = typeof t.tab_index === "number" ? t.tab_index : Number(t.tab_index);
+            if (!Number.isFinite(ti)) continue;
+            if (coveredIndices.has(ti)) continue;
+            actions.push({
+                action_id: `synth_${Date.now()}_${ci}`,
+                action_type: t.action === "bookmark_and_close" ? "bookmark_and_close" : "close_tab",
+                tab_index: ti,
+                target: "",
+                label: `Close ${t.tab_title || "tab"}`,
+                reason: t.reason || "",
+                category: "recommended",
+                reversible: true,
+                metadata: {
+                    expected_title: t.tab_title || "",
+                    expected_url: t.url || "",
+                },
+            });
+            coveredIndices.add(ti);
         }
     }
 

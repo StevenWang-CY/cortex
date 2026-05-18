@@ -86,32 +86,58 @@ interface MorningBriefing {
 }
 
 /**
- * Synthesize close_tab actions from tab_recommendations when the LLM
- * generated recommendations but no matching suggested_actions.
+ * F52: synthesize close_tab actions from tab_recommendations *only*
+ * for tab_index values not already covered by suggested_actions.
+ *
+ * Previously, if any suggested_action with a close intent existed, we
+ * skipped synthesis entirely — which dropped the close affordance for
+ * any *other* recommended tab. Conversely, when no suggested_action
+ * close existed, we synthesised one per closeable rec, which could
+ * duplicate the close button when the LLM emitted a partial
+ * suggested_action AND a tab_recommendation for the same tab.
+ *
+ * The rule: if a suggested_action with the same `tab_index` already
+ * exists, drop the synthesised action so the tab card alone carries
+ * the close button.
  */
-function synthesizeActions(
+export function synthesizeActions(
     actions: Record<string, unknown>[],
     tabRecs: { tabs: Record<string, unknown>[]; summary: string } | null,
 ): Record<string, unknown>[] {
     if (!tabRecs || !tabRecs.tabs || tabRecs.tabs.length === 0) return actions;
-    const hasClose = actions.some(a => a.action_type === "close_tab" || a.action_type === "bookmark_and_close");
-    if (hasClose) return actions;
     const closeable = tabRecs.tabs.filter(t => t.action === "close" || t.action === "bookmark_and_close");
     if (closeable.length === 0) return actions;
-    return [
-        ...actions,
-        ...closeable.map((t, i) => ({
+
+    // Collect tab_index values already represented by an existing
+    // close-style suggested_action.
+    const coveredIndices = new Set<number>();
+    for (const a of actions) {
+        const at = a.action_type;
+        if (at !== "close_tab" && at !== "bookmark_and_close") continue;
+        const ti = typeof a.tab_index === "number" ? a.tab_index : Number(a.tab_index);
+        if (Number.isFinite(ti)) coveredIndices.add(ti);
+    }
+
+    const synthesised: Record<string, unknown>[] = [];
+    for (let i = 0; i < closeable.length; i++) {
+        const t = closeable[i];
+        const ti = typeof t.tab_index === "number" ? t.tab_index : Number(t.tab_index);
+        if (!Number.isFinite(ti)) continue;
+        if (coveredIndices.has(ti)) continue; // dedup: card already has close
+        synthesised.push({
             action_id: `synth_${Date.now()}_${i}`,
             action_type: t.action === "bookmark_and_close" ? "bookmark_and_close" : "close_tab",
-            tab_index: typeof t.tab_index === "number" ? t.tab_index : Number(t.tab_index),
+            tab_index: ti,
             target: "",
             label: `Close ${t.tab_title || "tab"}`,
             reason: t.reason || "",
             category: "recommended",
             reversible: true,
             metadata: {},
-        })),
-    ];
+        });
+    }
+    if (synthesised.length === 0) return actions;
+    return [...actions, ...synthesised];
 }
 
 // --- State dot animation helper ---
