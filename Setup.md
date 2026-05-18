@@ -26,7 +26,7 @@ The desktop app bundles the daemon, dashboard, and system tray. No Python, Node.
 | **Python 3.11 or 3.12** | `brew install python@3.11` or [python.org](https://www.python.org/downloads/) |
 | **Node.js 18+** | `brew install node` or [nodejs.org](https://nodejs.org/) |
 | **pnpm** | `npm install -g pnpm` |
-| **LLM backend** | Azure OpenAI key, local Ollama, or `rule_based` mode |
+| **LLM backend** | AWS Bedrock (default), GCP Vertex, or direct Anthropic API — see [Provider Setup](#2-configuration) |
 | **Redis** (optional) | `brew install redis && brew services start redis` — auto-falls back to in-memory |
 
 > **Apple Silicon:** Use native ARM Python, not Rosetta. Verify: `python3 -c "import platform; print(platform.machine())"` should print `arm64`.
@@ -53,45 +53,66 @@ Copy the example config:
 cp cortex/.env.example .env
 ```
 
-Edit `.env` and choose one LLM backend:
-
-### Option A — Azure OpenAI (recommended)
-
-```bash
-CORTEX_LLM__MODE=azure
-CORTEX_LLM__AZURE__ENDPOINT=https://your-resource.openai.azure.com/
-CORTEX_LLM__AZURE__API_KEY=your-key-here
-CORTEX_LLM__AZURE__API_VERSION=2025-01-01-preview
-CORTEX_LLM__AZURE__DEPLOYMENT_NAME=gpt-4o-mini
-CORTEX_LLM__AZURE__MAX_COMPLETION_TOKENS=1024
-```
-
-For production: store the key in macOS Keychain instead of `.env`:
-```bash
-security add-generic-password -s cortex.azure_openai -a default -w YOUR_KEY
-# Then set: CORTEX_LLM__AZURE__USE_KEYCHAIN=true
-```
-
-### Option B — Local Ollama (free, no API key)
+Cortex talks to Claude exclusively via the Anthropic SDK. Three transport
+providers ship today, all selected with a single env var:
 
 ```bash
-brew install ollama
-ollama pull llama3.1:8b
-ollama serve   # keep running in a separate terminal
+CORTEX_LLM__PROVIDER=bedrock   # default — AWS Bedrock
+# CORTEX_LLM__PROVIDER=vertex  # GCP Vertex AI
+# CORTEX_LLM__PROVIDER=direct  # Anthropic API (ANTHROPIC_API_KEY)
 ```
+
+The same value is mirrored into `ANTHROPIC_PROVIDER` at startup so the
+underlying SDK picks the right transport.
+
+### Option A — AWS Bedrock (default)
 
 ```bash
-# In .env:
-CORTEX_LLM__MODE=local
+CORTEX_LLM__PROVIDER=bedrock
+CORTEX_LLM__BEDROCK__AWS_REGION=us-east-2
 ```
 
-### Option C — Rule-based only (no LLM)
+The bearer token lives in macOS Keychain — never in `.env`:
 
 ```bash
-CORTEX_LLM__MODE=rule_based
+security add-generic-password -s cortex.bedrock -a bearer_token -w YOUR_BEDROCK_TOKEN
+# CORTEX_LLM__USE_KEYCHAIN=true is the default; the daemon reads
+# from Keychain and exports AWS_BEARER_TOKEN_BEDROCK for the SDK.
 ```
 
-Uses built-in heuristics. Good for testing the biofeedback pipeline without any LLM setup.
+### Option B — GCP Vertex AI
+
+```bash
+CORTEX_LLM__PROVIDER=vertex
+```
+
+Authenticate Vertex per the standard `gcloud` flow (`gcloud auth
+application-default login`). The Anthropic SDK reads the resulting
+credentials directly.
+
+### Option C — Direct Anthropic API
+
+```bash
+CORTEX_LLM__PROVIDER=direct
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+Useful when you have an Anthropic API key and want to bypass the
+Bedrock / Vertex transports.
+
+If every transport fails the daemon falls back to a deterministic
+rule-based plan (`CORTEX_LLM__FALLBACK_MODE=rule_based`, the default),
+so a missing key never crashes the session — you just lose the
+LLM-generated copy until the provider comes back.
+
+> **Removed providers (v0.2.0+):** Azure OpenAI, self-hosted Qwen, and
+> local Ollama were dropped when Cortex migrated to the Anthropic SDK.
+> The env vars `CORTEX_LLM__MODE`, `CORTEX_LLM__AZURE__*`,
+> `CORTEX_LLM__REMOTE__*`, `CORTEX_LLM__LOCAL__*`, and
+> `CORTEX_LLM__MODEL_NAME` are no longer read by the code; the legacy
+> validator in `LLMConfig` maps stale values to the rule-based fallback
+> rather than raising, so a 0.1.x `.env` boots cleanly while
+> producing no LLM traffic.
 
 ### Camera Configuration
 
@@ -119,7 +140,7 @@ pip install -e "./cortex[dev]"
 
 Verify:
 ```bash
-python -c "from cortex.libs.config.settings import get_config; print(f'LLM mode: {get_config().llm.mode}')"
+python -c "from cortex.libs.config.settings import get_config; print(f'LLM provider: {get_config().llm.provider}')"
 ```
 
 ---
