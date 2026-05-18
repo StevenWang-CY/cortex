@@ -129,6 +129,36 @@ def _extract_tool_use_input(response: Any) -> dict[str, Any]:
     )
 
 
+def _estimate_request_input_tokens(
+    system_blocks: list[dict[str, Any]],
+    messages: list[dict[str, Any]],
+) -> int:
+    """Best-effort input-token estimate for the assembled request.
+
+    Used by F30's cancellation cost path: if the shielded Bedrock call
+    is cancelled before any response arrives, ``response.usage`` is
+    unavailable, so we approximate from the request payload. The chars/4
+    heuristic matches :func:`cortex.services.llm_engine.prompts._estimate_tokens`
+    so the two layers agree on what "a token" means.
+    """
+    total_chars = 0
+    for block in system_blocks or []:
+        text = block.get("text") if isinstance(block, dict) else None
+        if isinstance(text, str):
+            total_chars += len(text)
+    for msg in messages or []:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif isinstance(content, list):
+            for sub in content:
+                if isinstance(sub, dict):
+                    sub_text = sub.get("text")
+                    if isinstance(sub_text, str):
+                        total_chars += len(sub_text)
+    return max(0, total_chars // 4)
+
+
 def _keychain_get_bedrock_token(config: LLMConfig) -> str | None:
     """Fetch the Bedrock bearer token from the macOS Keychain.
 
@@ -343,9 +373,20 @@ class AnthropicPlanner:
             extra_context=extra_context,
         )
 
+        # F30: estimate the input-token cost before issuing the call so
+        # the cancellation cost path can bill *something* if the response
+        # never arrives. The Anthropic SDK does not echo back the
+        # request tokens on cancellation, so we approximate with a
+        # chars/4 heuristic over the assembled prompt — same heuristic
+        # ``prompts._estimate_tokens`` uses internally.
+        estimated_input_tokens = _estimate_request_input_tokens(
+            system_blocks, messages,
+        )
+
         attempts = 3
         for attempt in range(attempts):
             t0 = time.perf_counter()
+            response: Any = None
             try:
                 async with self._semaphore:
                     # swift-concurrency-pro rule (transferred to asyncio):
@@ -354,21 +395,36 @@ class AnthropicPlanner:
                     # tear-down, daemon SIGTERM), we still let the SDK
                     # finish its current HTTP transaction cleanly so the
                     # Bedrock connection isn't left in a half-open state.
-                    response = await asyncio.shield(
-                        self._sdk.messages.create(
-                            model=model_id,
-                            max_tokens=self._config.max_tokens,
-                            temperature=self._config.temperature,
-                            system=system_blocks,
-                            messages=messages,
-                            tools=[self._plan_tool],
-                            tool_choice={
-                                "type": "tool",
-                                "name": _PLAN_TOOL_NAME,
-                            },
-                            timeout=self._config.timeout_seconds,
+                    # F30: catch CancelledError so we still record the
+                    # cost — the shielded call kept billing tokens even
+                    # though the caller stopped waiting.
+                    try:
+                        response = await asyncio.shield(
+                            self._sdk.messages.create(
+                                model=model_id,
+                                max_tokens=self._config.max_tokens,
+                                temperature=self._config.temperature,
+                                system=system_blocks,
+                                messages=messages,
+                                tools=[self._plan_tool],
+                                tool_choice={
+                                    "type": "tool",
+                                    "name": _PLAN_TOOL_NAME,
+                                },
+                                timeout=self._config.timeout_seconds,
+                            )
                         )
-                    )
+                    except asyncio.CancelledError:
+                        # The SDK call may have completed before the
+                        # cancellation propagated. Record cost from the
+                        # response if available; otherwise bill the
+                        # best-estimate input tokens with ``output=0``.
+                        self._record_cost_on_cancellation(
+                            model_id,
+                            response,
+                            estimated_input_tokens,
+                        )
+                        raise
             except (RateLimitError, APITimeoutError, APIStatusError) as exc:
                 latency_ms = (time.perf_counter() - t0) * 1000.0
                 logger.warning(
@@ -517,6 +573,54 @@ class AnthropicPlanner:
             )
         except Exception:  # noqa: BLE001 — telemetry must never break the planner
             logger.exception("cost_tracker.record failed")
+
+    def _record_cost_on_cancellation(
+        self,
+        model_id: str,
+        response: Any,
+        estimated_input_tokens: int,
+    ) -> None:
+        """Cost path taken when the shielded SDK call was cancelled (F30).
+
+        If the response arrived before cancellation propagated we have
+        real ``usage`` numbers; otherwise we bill the request-side
+        estimate with ``output_tokens=0`` so the day's spend at least
+        reflects the tokens the request shipped. The ``cancelled=True``
+        flag on the cost record lets the aggregator distinguish
+        cancellation cost from successful spend.
+        """
+        if self._cost_tracker is None:
+            return
+        usage = (
+            getattr(response, "usage", None) if response is not None else None
+        )
+        if usage is not None:
+            # Response arrived — bill real numbers but tag cancelled.
+            self._record_cost(model_id, usage, cancelled=True)
+            return
+        # Pre-response cancellation — bill the best estimate.
+        try:
+            usd = usd_cost(
+                model_id,
+                input_tokens=max(0, int(estimated_input_tokens)),
+                output_tokens=0,
+            )
+        except (KeyError, ValueError) as exc:
+            logger.warning(
+                "cost_tracker: cancellation cost skipped for %s (%s)",
+                model_id,
+                exc,
+            )
+            return
+        try:
+            self._cost_tracker.record(
+                get_correlation_id(),
+                model_id,
+                usd,
+                cancelled=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("cost_tracker.record (cancellation) failed")
 
     async def health_check(self) -> bool:
         """Cheap readiness check — never crash the daemon if the SDK is down."""
