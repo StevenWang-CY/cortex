@@ -1116,6 +1116,22 @@ class DashboardWindow(QWidget):
         seg_container.addWidget(self._seg, stretch=1)
         layout.addLayout(seg_container)
 
+        # Phase J-2: error toast lives under the segmented control so it
+        # is visible from either tab. Hidden until ``show_error`` is
+        # called. Lazy-import the Toast helper at construction time so a
+        # legacy mock harness that swaps out PySide6 doesn't crash on
+        # module import — the toast is itself test-stub-tolerant.
+        try:
+            from cortex.apps.desktop_shell.components import Toast
+            toast_container = QHBoxLayout()
+            toast_container.setContentsMargins(SP6, 0, SP6, SP3)
+            self._toast: Toast | None = Toast(self)
+            toast_container.addWidget(self._toast, stretch=1)
+            layout.addLayout(toast_container)
+        except Exception:  # pragma: no cover - mock harness without Toast
+            logger.debug("Toast widget unavailable; skipping", exc_info=True)
+            self._toast = None
+
         self._stack = QStackedWidget()
         self._consumer = _ConsumerTab()
         self._advanced = _AdvancedTab()
@@ -1181,3 +1197,22 @@ class DashboardWindow(QWidget):
         budget. ``_STOP_SAFETY_TIMEOUT_MS`` is the production default."""
         if self._consumer is not None:
             self._consumer._stop_safety_timer.setInterval(int(ms))
+
+    # Phase J-2 ----------------------------------------------------------
+
+    def show_error(self, title: str, body: str, cid: str = "") -> None:
+        """Surface a daemon error in the top-bar toast.
+
+        ``cid`` is the F19 correlation id quoted back to the user so a
+        support engineer can grep the daemon log for the matching entry.
+        When the daemon failed to mint one (or the call site didn't have
+        it bound) the empty string is acceptable — the toast still shows
+        the title + body, only the support-handoff slot is empty.
+        """
+        if self._toast is None:
+            logger.warning(
+                "Toast unavailable; error not surfaced: %s — %s [cid=%s]",
+                title, body, cid,
+            )
+            return
+        self._toast.show_error(title, body, cid)
