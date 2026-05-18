@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from cortex.libs.config.settings import APIConfig
+from cortex.libs.logging.correlation import correlation_scope, get_correlation_id
 from cortex.libs.schemas.intervention import InterventionPlan
 from cortex.libs.schemas.state import StateEstimate
 
@@ -262,6 +263,21 @@ class WebSocketServer:
 
         client.last_message_at = time.monotonic()
 
+        # F19: every incoming message enters a correlation scope. If the
+        # client supplied a correlation id we honour it; otherwise we mint
+        # one. The scope ensures every log line emitted by the handlers
+        # below — and by any downstream service they call (LLM planner,
+        # state engine) — carries the same id.
+        with correlation_scope(msg.correlation_id) as cid:
+            if msg.correlation_id is None:
+                msg.correlation_id = cid
+            await self._dispatch_message(client, msg)
+
+    async def _dispatch_message(
+        self, client: WebSocketClient, msg: WSMessage,
+    ) -> None:
+        """Route a message to the matching handler. Always runs inside a
+        correlation scope established by :meth:`_process_message`."""
         if msg.type == "USER_ACTION":
             await self._handle_user_action(client, msg)
         elif msg.type == "ACTION_EXECUTE":
@@ -539,6 +555,12 @@ class WebSocketServer:
         """Broadcast a message to all connected clients."""
         if not self._clients:
             return 0
+
+        # F19: stamp the outgoing message with the caller's correlation id
+        # so receivers can echo it back on USER_ACTION / INTERVENTION_APPLIED
+        # replies and the full intent-to-effect chain stays traceable.
+        if msg.correlation_id is None:
+            msg.correlation_id = get_correlation_id()
 
         sent = 0
         dead_clients: list[str] = []

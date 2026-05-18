@@ -45,6 +45,7 @@ from cortex.libs.llm.anthropic_client import (
     build_anthropic_sdk_client,
     resolve_anthropic_model_id,
 )
+from cortex.libs.logging.correlation import get_correlation_id
 from cortex.libs.schemas.context import TaskContext
 from cortex.libs.schemas.intervention import (
     InterventionPlan,
@@ -356,10 +357,12 @@ class AnthropicPlanner:
             self._circuit.record_success()
             latency_ms = (time.perf_counter() - t0) * 1000.0
             usage = getattr(response, "usage", None)
+            # F19: include the active correlation id so downstream cost
+            # accounting (F20) can group spend by originating request.
             logger.info(
                 "llm.request status=ok model=%s template=%s tier=%s "
                 "latency_ms=%.0f tokens_in=%s tokens_out=%s "
-                "cache_read=%s cache_write=%s",
+                "cache_read=%s cache_write=%s cid=%s",
                 model_id,
                 template_name,
                 tier,
@@ -368,6 +371,7 @@ class AnthropicPlanner:
                 getattr(usage, "output_tokens", None),
                 getattr(usage, "cache_read_input_tokens", None),
                 getattr(usage, "cache_creation_input_tokens", None),
+                get_correlation_id() or "-",
             )
 
             enriched = enrich_plan_with_context(plan, context)
