@@ -585,12 +585,66 @@ async function scrapeVisibleText(tabId?: number): Promise<string> {
 
 // --- Message Handling ---
 
+/**
+ * F15: WS streaming JSON parse failures are surfaced rather than silently
+ * dropped. We count failures within a 10s window and force a reconnect
+ * after 3 errors so a corrupted upstream stream produces a recovery
+ * cycle instead of an indefinitely silent black hole.
+ */
+const WS_PARSE_ERROR_WINDOW_MS = 10_000;
+const WS_PARSE_ERROR_RECONNECT_THRESHOLD = 3;
+let wsParseErrorTimestamps: number[] = [];
+
+export function _resetWsParseErrorCounter(): void {
+    wsParseErrorTimestamps = [];
+}
+
+export function _getWsParseErrorCount(): number {
+    return wsParseErrorTimestamps.length;
+}
+
+function recordWsParseError(err: unknown, msg: Partial<WSMessage> | null): void {
+    const cid =
+        msg && typeof (msg as { correlation_id?: unknown }).correlation_id === "string"
+            ? (msg as { correlation_id?: string }).correlation_id
+            : "-";
+    console.warn(`cortex.ws.parse_error cid=${cid} err=${String(err)}`);
+    const now = Date.now();
+    wsParseErrorTimestamps.push(now);
+    wsParseErrorTimestamps = wsParseErrorTimestamps.filter(
+        (t) => now - t <= WS_PARSE_ERROR_WINDOW_MS,
+    );
+    if (
+        wsParseErrorTimestamps.length >= WS_PARSE_ERROR_RECONNECT_THRESHOLD &&
+        ws !== null
+    ) {
+        console.warn(
+            `cortex.ws.parse_error_storm count=${wsParseErrorTimestamps.length} ` +
+                `window_ms=${WS_PARSE_ERROR_WINDOW_MS} — forcing reconnect`,
+        );
+        wsParseErrorTimestamps = [];
+        try {
+            // Bypass `disconnect()` because that sets intentionalDisconnect
+            // and suppresses the reconnect we want.
+            ws.close(1008, "cortex.ws.parse_error_storm");
+        } catch {
+            // ws already closed; let onclose drive reconnect.
+        }
+    }
+}
+
 async function handleMessage(raw: string): Promise<void> {
     let msg: WSMessage;
     try {
         msg = JSON.parse(raw) as WSMessage;
-    } catch {
+    } catch (err) {
+        recordWsParseError(err, null);
         return;
+    }
+    // Reset the rolling counter on a clean parse so transient flakes do
+    // not stay armed forever.
+    if (wsParseErrorTimestamps.length > 0) {
+        wsParseErrorTimestamps = [];
     }
 
     switch (msg.type) {
