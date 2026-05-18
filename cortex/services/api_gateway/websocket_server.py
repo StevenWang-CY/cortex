@@ -744,17 +744,38 @@ class WebSocketServer:
             )
         return cancelled
 
+    # audit Phase-I: per-send timeout (s) and total broadcast budget (s).
+    # The per-send timeout is bumped from 1 s → 2 s so a transient
+    # network blip on one client does not get classified as a dead
+    # consumer; the hard total budget caps how long any single broadcast
+    # can block the loop. A broadcast that exceeds the budget logs a
+    # ``WS_BROADCAST_SLOW`` event and counts the clients that did not
+    # finish in time as dropped frames for that broadcast — they are
+    # not disconnected on the first slow broadcast (only if their
+    # individual per-send timeout actually fires).
+    _BROADCAST_PER_CLIENT_TIMEOUT_S: float = 2.0
+    _BROADCAST_BUDGET_S: float = 0.1
+
     async def _broadcast(self, msg: WSMessage) -> int:
         """Broadcast a message to all connected clients.
 
-        F22: when a send times out, the client is presumed a "slow
-        consumer" — we emit an explicit ``close(code=1011, reason="slow
-        consumer")`` so the browser-side auto-reconnect logic sees a
-        clean close rather than an EPIPE on the next send. The close is
-        wrapped in a try/except so a socket that has already torn down
-        does not raise, and the disconnect event is recorded via the
-        structured event type ``WS_CLIENT_DISCONNECTED`` with the
-        client id and a reason.
+        Combines two correctness/perf wins:
+        - F19: stamp outgoing messages with the caller's active correlation
+          id so receivers can echo it back on USER_ACTION /
+          INTERVENTION_APPLIED replies and the intent-to-effect chain stays
+          traceable.
+        - F22: when a per-send call times out, the client is presumed a
+          "slow consumer" — emit an explicit ``close(code=1011, reason)``
+          so the browser-side auto-reconnect sees a clean close rather
+          than an EPIPE on the next send, and record a
+          ``WS_CLIENT_DISCONNECTED`` event with the client id + reason.
+        - audit Phase-I: replace the serial ``for client: await send(...)``
+          with ``asyncio.wait`` under a hard total budget. Each send
+          runs as an independent Task so a four-client broadcast costs
+          ~max(client_latencies) instead of ~sum(client_latencies); a
+          slow client that misses the budget logs a ``WS_BROADCAST_SLOW``
+          metric but is NOT disconnected on the first miss (only if its
+          per-send timeout actually fires).
         """
         if not self._clients:
             return 0
@@ -765,22 +786,93 @@ class WebSocketServer:
         if msg.correlation_id is None:
             msg.correlation_id = get_correlation_id()
 
-        sent = 0
-        dead_clients: list[tuple[str, str]] = []  # (client_id, reason)
-
+        payload = msg.to_json()
         target_types = set(msg.target_client_types or [])
-        for client_id, client in self._clients.items():
-            if target_types and client.client_type not in target_types:
-                continue
+        targets = [
+            (client_id, client)
+            for client_id, client in self._clients.items()
+            if not target_types or client.client_type in target_types
+        ]
+        if not targets:
+            return 0
+
+        async def _send_one(client: WebSocketClient) -> str | None:
+            """Return ``None`` on success or a disconnect reason string."""
             try:
-                await asyncio.wait_for(client.websocket.send(msg.to_json()), timeout=1.0)
-                sent += 1
+                await asyncio.wait_for(
+                    client.websocket.send(payload),
+                    timeout=self._BROADCAST_PER_CLIENT_TIMEOUT_S,
+                )
+                return None
             except TimeoutError:
-                dead_clients.append((client_id, "slow consumer"))
+                return "slow consumer"
             except Exception:
+                return "send error"
+
+        # audit Phase-I: parallel-gather under a hard total budget. Each
+        # send is wrapped in its own Task so when the budget elapses we
+        # cancel only the unfinished tasks; already-completed tasks keep
+        # their results (a plain ``asyncio.gather`` would cancel every
+        # inner coroutine when the wrapper is cancelled).
+        broadcast_start = time.monotonic()
+        send_tasks = [
+            asyncio.create_task(_send_one(client)) for _, client in targets
+        ]
+        done, pending = await asyncio.wait(
+            send_tasks, timeout=self._BROADCAST_BUDGET_S,
+        )
+        budget_exceeded = bool(pending)
+        for task in pending:
+            task.cancel()
+        # Drain cancellations so they don't surface as "task was destroyed
+        # but pending" warnings on a busy event loop.
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        results: list[Any] = []
+        for task in send_tasks:
+            if task in pending:
+                results.append(asyncio.CancelledError())
+            else:
+                try:
+                    results.append(task.result())
+                except BaseException as exc:  # noqa: BLE001
+                    results.append(exc)
+
+        elapsed_s = time.monotonic() - broadcast_start
+        sent = 0
+        # F22: track (client_id, reason) so the post-loop close path can
+        # emit the right reason string per disconnect.
+        dead_clients: list[tuple[str, str]] = []
+        slow_clients: list[str] = []
+        for (client_id, _client), outcome in zip(targets, results, strict=False):
+            if outcome is None:
+                sent += 1
+            elif isinstance(outcome, asyncio.CancelledError):
+                # Did not finish inside the budget; not a disconnect.
+                slow_clients.append(client_id)
+            elif isinstance(outcome, str):
+                dead_clients.append((client_id, outcome))
+            else:  # unexpected exception captured by gather
                 dead_clients.append((client_id, "send error"))
 
-        # Clean up dead connections
+        if budget_exceeded or slow_clients:
+            try:
+                from cortex.libs.logging.structured import EventType, get_logger
+
+                get_logger(__name__).warning(
+                    "ws_broadcast_slow",
+                    event_type=EventType.WS_BROADCAST_SLOW.value,
+                    elapsed_ms=int(elapsed_s * 1000),
+                    budget_ms=int(self._BROADCAST_BUDGET_S * 1000),
+                    client_count=len(targets),
+                    dropped_for_budget=len(slow_clients),
+                )
+            except Exception:
+                # Telemetry must never break the hot path.
+                logger.debug("ws_broadcast_slow log failed", exc_info=True)
+
+        # F22: clean up dead connections with explicit close + reason.
         for client_id, reason in dead_clients:
             client = self._clients.pop(client_id, None)
             if client is not None:

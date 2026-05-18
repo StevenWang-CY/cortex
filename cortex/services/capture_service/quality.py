@@ -65,6 +65,7 @@ class FrameQualityScorer:
         self,
         frame: np.ndarray,
         nose_displacement: float = 0.0,
+        gray_frame: np.ndarray | None = None,
     ) -> FrameQuality:
         """
         Score a frame's quality.
@@ -73,12 +74,23 @@ class FrameQualityScorer:
             frame: BGR uint8 image, shape (H, W, 3)
             nose_displacement: Inter-frame nose tip displacement in pixels.
                 If 0.0, motion_score defaults to 1.0 (first frame or no tracking).
+            gray_frame: Optional pre-converted grayscale view of ``frame``.
+                When supplied, the scorer reuses it instead of calling
+                ``cv2.cvtColor`` again — used by the audit Phase-I
+                colour-convert cache so BGR→GRAY runs exactly once per
+                frame even though brightness and blur both need it.
 
         Returns:
             FrameQuality with per-axis scores and gate decision.
         """
-        brightness = self._score_brightness(frame)
-        blur = self._score_blur(frame)
+        # audit Phase-I: compute the grayscale view once and reuse it for
+        # both brightness and blur scoring. The two metrics previously
+        # ran cvtColor independently, doubling the conversion cost on
+        # every frame.
+        if gray_frame is None:
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        brightness = self._score_brightness(gray_frame)
+        blur = self._score_blur(gray_frame)
         motion = self._score_motion(nose_displacement)
 
         passed = (
@@ -94,7 +106,7 @@ class FrameQualityScorer:
             passed=passed,
         )
 
-    def _score_brightness(self, frame: np.ndarray) -> float:
+    def _score_brightness(self, gray: np.ndarray) -> float:
         """
         Score frame brightness.
 
@@ -102,12 +114,11 @@ class FrameQualityScorer:
         Flags frames below ~50 lux (mapped to pixel intensity ~50/255).
 
         Args:
-            frame: BGR uint8 image
+            gray: Grayscale uint8 image already converted from BGR.
 
         Returns:
             Score 0.0 to 1.0 (1.0 = ideal brightness)
         """
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         mean_intensity = float(np.mean(gray))
 
         if mean_intensity < _BRIGHTNESS_LOW:
@@ -122,19 +133,18 @@ class FrameQualityScorer:
             distance_from_ideal = abs(mean_intensity - 128) / 128
             return 1.0 - 0.3 * distance_from_ideal
 
-    def _score_blur(self, frame: np.ndarray) -> float:
+    def _score_blur(self, gray: np.ndarray) -> float:
         """
         Score frame sharpness using Laplacian variance.
 
         Higher variance = sharper image = better quality.
 
         Args:
-            frame: BGR uint8 image
+            gray: Grayscale uint8 image already converted from BGR.
 
         Returns:
             Score 0.0 to 1.0 (1.0 = sharp)
         """
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         laplacian = cv2.Laplacian(gray, cv2.CV_64F)
         variance = float(laplacian.var())
 

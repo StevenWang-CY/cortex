@@ -165,6 +165,12 @@ class CaptureConfig(BaseModel):
     min_brightness: int = 50
     max_jitter_px: float = 5.0
     face_lost_tolerance_frames: int = 5
+    # audit Phase-I: how often to run MediaPipe FaceLandmarker relative
+    # to the capture cadence. ``1`` = every frame (original behaviour),
+    # ``2`` = every other frame (15 Hz at 30 Hz capture). Downstream
+    # state/telemetry loops run at 2 Hz, so the cheaper 15 Hz mesh path
+    # remains well above Nyquist while halving the mediapipe CPU cost.
+    face_mesh_subsample_n: int = 2
 
 
 class StateWeights(BaseModel):

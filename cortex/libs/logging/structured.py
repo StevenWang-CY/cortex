@@ -57,6 +57,12 @@ class EventType(StrEnum):
     WS_CLIENT_DISCONNECTED = "ws_client_disconnected"
     WS_MESSAGE_SENT = "ws_message_sent"
     WS_MESSAGE_RECEIVED = "ws_message_received"
+    # audit Phase-I: emitted by the parallel-gather broadcaster when a
+    # single broadcast exceeds the hard total budget. The payload
+    # carries elapsed_ms, budget_ms, client_count, and the number of
+    # clients dropped for this frame (not disconnected — see the
+    # per-send timeout for the disconnect threshold).
+    WS_BROADCAST_SLOW = "ws_broadcast_slow"
 
     # F10: action-safety events. Emitted when the daemon refuses a
     # specific SuggestedAction (bad URL scheme, out-of-range tab_index,

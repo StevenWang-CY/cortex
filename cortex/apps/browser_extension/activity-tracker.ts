@@ -614,7 +614,7 @@ function initActivityTracker(): void {
     // Immediate exclusion check
     if (isExcludedUrl(currentUrl)) return;
 
-    // LeetCode: handled entirely by leetcode-observer.ts → background bridge
+    // LeetCode: handled entirely by contents/leetcode-observer.ts → background bridge
     try {
         const u = new URL(currentUrl);
         if (u.hostname.includes("leetcode") && u.pathname.includes("/problems/")) return;
