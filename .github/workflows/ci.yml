@@ -1,12 +1,62 @@
 name: ci
 
+# Cortex CI gates two layers:
+#
+# 1. ``schema-codegen-check`` — audit Debt-1 drift gate. The committed
+#    ``cortex/apps/browser_extension/types/generated/cortex_schemas.d.ts``
+#    must stay in sync with the Pydantic source of truth in
+#    ``cortex/libs/schemas/``. Any divergence fails the build and
+#    blocks the merge until the developer runs
+#    ``python -m cortex.scripts.generate_ts_schemas`` and commits the
+#    refreshed file.
+# 2. ``python`` + ``extension`` — F40 (TypeScript test infra) +
+#    pytest/ruff/mypy. Standard quality gates.
+
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
 
+# Cancel in-flight runs on PR updates — saves runner minutes and
+# guarantees the merge-gate result reflects the latest commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  schema-codegen-check:
+    name: schema-codegen-check (Debt-1 drift gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node (for json2ts)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # ``pydantic-to-typescript`` shells out to ``json2ts`` from the
+      # ``json-schema-to-typescript`` npm package. We install both
+      # halves here; the Python script discovers ``json2ts`` on PATH.
+      - name: Install json-schema-to-typescript
+        run: npm install -g json-schema-to-typescript
+
+      - name: Install Python codegen extras
+        run: pip install -e "./cortex[codegen]"
+
+      # The drift gate: regenerate into a tempfile and diff against
+      # the committed copy. Exit 1 prints the diff and fails the job.
+      - name: Verify cortex_schemas.d.ts is in sync
+        run: python -m cortex.scripts.generate_ts_schemas --check
+
   python:
     name: python (pytest + ruff + mypy)
     runs-on: ubuntu-latest

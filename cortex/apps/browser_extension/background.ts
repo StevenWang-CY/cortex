@@ -19,17 +19,50 @@ import {
 } from "./tab-manager";
 import { getAuthToken } from "./lib/auth";
 
-// --- Types ---
+// --- Types (generated from Pydantic — Debt-1 closure) ---
+//
+// ``WSMessage`` and ``SuggestedAction`` are emitted by
+// ``python -m cortex.scripts.generate_ts_schemas`` from
+// ``cortex/libs/schemas/*.py``. Hand-written copies of these
+// interfaces previously lived in this file and drifted from the
+// Pydantic models (F42/F43/F44/F45). The import below is the only
+// canonical source; CI fails if it goes stale.
+import type {
+    SuggestedAction as SuggestedActionSchema,
+    WSMessage as WSMessageSchema,
+} from "./types/generated/cortex_schemas";
 
-interface WSMessage {
-    type: string;
+// The Pydantic JSON Schema marks default-having fields as optional
+// (it reflects the deserialise-side contract). On the wire the
+// serializer always emits every field — including those whose
+// Python-side ``Field(default=...)`` makes the JSON Schema mark them
+// optional. We promote the always-emitted fields back to required here
+// so consumers below can rely on them existing. Genuinely-optional
+// fields (``correlation_id`` etc.) stay optional.
+type WSMessage = Omit<WSMessageSchema, "payload"> & {
     payload: Record<string, unknown>;
-    timestamp: number;
-    sequence: number;
-    correlation_id?: string;
-    target_client_types?: string[];
-    source_client_type?: string;
-}
+};
+
+// The default-factory fields on ``SuggestedAction`` (``action_id``,
+// ``target``, ``category``, ``reversible``, ``metadata``) always exist
+// on the wire — the Pydantic serializer materialises them. We narrow
+// them to non-optional locally; the canonical type definition stays
+// the generated one.
+type SuggestedAction = Omit<
+    SuggestedActionSchema,
+    "action_id" | "target" | "label" | "reason" | "category"
+        | "reversible" | "metadata"
+> & {
+    action_id: string;
+    target: string;
+    label: string;
+    reason: string;
+    category: NonNullable<SuggestedActionSchema["category"]>;
+    reversible: boolean;
+    metadata: Record<string, unknown>;
+};
+
+// --- Types (extension-local — not part of any Pydantic schema) ---
 
 interface CortexState {
     state: string;
@@ -1902,30 +1935,28 @@ function injectDistractionInterceptor(
 }
 
 // --- Action Execution Engine ---
-
-interface SuggestedAction {
-    action_id: string;
-    action_type: string;
-    tab_index: number | null;
-    target: string;
-    label: string;
-    reason: string;
-    category: "recommended" | "optional" | "informational";
-    reversible: boolean;
-    group_id?: string;
-    metadata: Record<string, unknown>;
-}
+//
+// ``SuggestedAction`` is imported from the generated Pydantic types
+// (Debt-1 closure, top of file). The TypeScript compiler now narrows
+// ``action.action_type`` to the exact ``Literal`` union the Python
+// validator enforces, so the ``default`` arm of ``executeAction``'s
+// switch is structurally unreachable when the daemon sends a valid
+// plan (F42 close).
 
 interface ActionExecuteResult {
     action_id: string;
     success: boolean;
     message: string;
-    undo_available: boolean;
+    // F44 closure: aligned with Pydantic's ``SuggestedAction.reversible``.
+    // Was previously ``undo_available`` here — the two names referred to
+    // the same concept and drifted independently. The result envelope
+    // now uses the canonical name on both sides.
+    reversible: boolean;
 }
 
 interface UndoEntry {
     action_id: string;
-    action_type: string;
+    action_type: SuggestedAction["action_type"];
     undo_data: Record<string, unknown>;
     timestamp: number;
 }
@@ -2073,6 +2104,12 @@ function pushUndo(entry: UndoEntry): void {
 
 async function executeAction(action: SuggestedAction): Promise<ActionExecuteResult> {
     try {
+        // F42 closure: ``action.action_type`` is the generated
+        // ``Literal`` union from the Pydantic ``SuggestedAction``.
+        // The TS compiler narrows ``unhandled`` to ``never`` only when
+        // every member of the union is covered; adding a new
+        // ``action_type`` on the Python side will fail this file's
+        // ``tsc --noEmit`` check until a matching case is added.
         switch (action.action_type) {
             case "close_tab":
                 return await executeCloseTab(action);
@@ -2092,15 +2129,27 @@ async function executeAction(action: SuggestedAction): Promise<ActionExecuteResu
                 return await executeCopyToClipboard(action);
             case "start_timer":
                 return await executeStartTimer(action);
-            default:
-                return { action_id: action.action_id, success: false, message: "Unknown action type", undo_available: false };
+            default: {
+                // Compile-time exhaustiveness: ``unhandled`` is ``never``
+                // when the switch covers every union member. Defence in
+                // depth — at runtime, if a malformed plan slipped past
+                // Pydantic somehow (it shouldn't), surface a structured
+                // error rather than crashing.
+                const unhandled: never = action.action_type;
+                return {
+                    action_id: action.action_id,
+                    success: false,
+                    message: `Unknown action type: ${String(unhandled)}`,
+                    reversible: false,
+                };
+            }
         }
     } catch (e) {
         return {
             action_id: action.action_id,
             success: false,
             message: String(e),
-            undo_available: false,
+            reversible: false,
         };
     }
 }
@@ -2112,12 +2161,12 @@ async function executeCloseTab(action: SuggestedAction): Promise<ActionExecuteRe
     try {
         const { cortex_tab_close_disabled } = await chrome.storage.local.get("cortex_tab_close_disabled");
         if (cortex_tab_close_disabled === true) {
-            return { action_id: aid, success: false, message: "Tab closing is disabled", undo_available: false };
+            return { action_id: aid, success: false, message: "Tab closing is disabled", reversible: false };
         }
     } catch { /* storage read failed — proceed normally */ }
     const tabIndex = typeof action.tab_index === "number" ? action.tab_index : Number(action.tab_index);
     if (isNaN(tabIndex)) {
-        return { action_id: aid, success: false, message: "No tab_index provided", undo_available: false };
+        return { action_id: aid, success: false, message: "No tab_index provided", reversible: false };
     }
 
     // Primary path: use snapshot
@@ -2148,7 +2197,7 @@ async function executeCloseTab(action: SuggestedAction): Promise<ActionExecuteRe
             }
         }
         if (tabId === -1) {
-            return { action_id: aid, success: false, message: v.message || "Tab not found", undo_available: false };
+            return { action_id: aid, success: false, message: v.message || "Tab not found", reversible: false };
         }
     }
 
@@ -2156,7 +2205,7 @@ async function executeCloseTab(action: SuggestedAction): Promise<ActionExecuteRe
     try {
         const currentWindowTabs = await chrome.tabs.query({ currentWindow: true });
         if (currentWindowTabs.length <= MIN_TABS_TO_KEEP) {
-            return { action_id: aid, success: false, message: `Only ${currentWindowTabs.length} tabs open — refusing to close (minimum ${MIN_TABS_TO_KEEP})`, undo_available: false };
+            return { action_id: aid, success: false, message: `Only ${currentWindowTabs.length} tabs open — refusing to close (minimum ${MIN_TABS_TO_KEEP})`, reversible: false };
         }
     } catch { /* query failed — proceed with other guards */ }
 
@@ -2164,10 +2213,10 @@ async function executeCloseTab(action: SuggestedAction): Promise<ActionExecuteRe
     try {
         const liveTab = await chrome.tabs.get(tabId);
         if (liveTab.active) {
-            return { action_id: aid, success: false, message: "Refusing to close the active tab", undo_available: false };
+            return { action_id: aid, success: false, message: "Refusing to close the active tab", reversible: false };
         }
     } catch {
-        return { action_id: aid, success: false, message: "Tab already closed", undo_available: false };
+        return { action_id: aid, success: false, message: "Tab already closed", reversible: false };
     }
 
     // LAYER 4: Verify expected title if provided
@@ -2177,17 +2226,17 @@ async function executeCloseTab(action: SuggestedAction): Promise<ActionExecuteRe
             const expected = String(action.metadata.expected_title).toLowerCase();
             const actual = (liveTab.title || "").toLowerCase();
             if (!actual.includes(expected) && !expected.includes(actual)) {
-                return { action_id: aid, success: false, message: "Tab title doesn't match expected — skipping", undo_available: false };
+                return { action_id: aid, success: false, message: "Tab title doesn't match expected — skipping", reversible: false };
             }
         } catch {
-            return { action_id: aid, success: false, message: "Tab already closed", undo_available: false };
+            return { action_id: aid, success: false, message: "Tab already closed", reversible: false };
         }
     }
 
     try {
         await chrome.tabs.remove(tabId);
     } catch {
-        return { action_id: aid, success: false, message: "Failed to close tab", undo_available: false };
+        return { action_id: aid, success: false, message: "Failed to close tab", reversible: false };
     }
     pushUndo({
         action_id: aid,
@@ -2195,7 +2244,7 @@ async function executeCloseTab(action: SuggestedAction): Promise<ActionExecuteRe
         undo_data: { url: tabUrl, title: tabTitle },
         timestamp: Date.now(),
     });
-    return { action_id: aid, success: true, message: "Tab closed", undo_available: true };
+    return { action_id: aid, success: true, message: "Tab closed", reversible: true };
 }
 
 async function executeGroupTabs(action: SuggestedAction): Promise<ActionExecuteResult> {
@@ -2210,7 +2259,7 @@ async function executeGroupTabs(action: SuggestedAction): Promise<ActionExecuteR
         if (v.valid) tabIds.push(v.tabId);
     }
     if (tabIds.length === 0) {
-        return { action_id: action.action_id, success: false, message: "No valid tabs to group", undo_available: false };
+        return { action_id: action.action_id, success: false, message: "No valid tabs to group", reversible: false };
     }
     const groupName = ((action.metadata || {}).group_name as string) || action.label || "Grouped";
     const groupId = await groupSpecificTabs(tabIds, groupName, "blue");
@@ -2220,7 +2269,7 @@ async function executeGroupTabs(action: SuggestedAction): Promise<ActionExecuteR
         undo_data: { tabIds, groupId },
         timestamp: Date.now(),
     });
-    return { action_id: action.action_id, success: true, message: `${tabIds.length} tabs grouped`, undo_available: true };
+    return { action_id: action.action_id, success: true, message: `${tabIds.length} tabs grouped`, reversible: true };
 }
 
 async function executeBookmarkAndClose(action: SuggestedAction): Promise<ActionExecuteResult> {
@@ -2230,12 +2279,12 @@ async function executeBookmarkAndClose(action: SuggestedAction): Promise<ActionE
     try {
         const { cortex_tab_close_disabled } = await chrome.storage.local.get("cortex_tab_close_disabled");
         if (cortex_tab_close_disabled === true) {
-            return { action_id: aid, success: false, message: "Tab closing is disabled", undo_available: false };
+            return { action_id: aid, success: false, message: "Tab closing is disabled", reversible: false };
         }
     } catch { /* storage read failed — proceed normally */ }
     const tabIndex = typeof action.tab_index === "number" ? action.tab_index : Number(action.tab_index);
     if (isNaN(tabIndex)) {
-        return { action_id: aid, success: false, message: "No tab_index", undo_available: false };
+        return { action_id: aid, success: false, message: "No tab_index", reversible: false };
     }
 
     const v = await validateTab(tabIndex);
@@ -2261,7 +2310,7 @@ async function executeBookmarkAndClose(action: SuggestedAction): Promise<ActionE
             } catch { /* query failed */ }
         }
         if (tabId === -1) {
-            return { action_id: aid, success: false, message: v.message || "Tab not found", undo_available: false };
+            return { action_id: aid, success: false, message: v.message || "Tab not found", reversible: false };
         }
     }
 
@@ -2269,10 +2318,10 @@ async function executeBookmarkAndClose(action: SuggestedAction): Promise<ActionE
     try {
         const liveTab = await chrome.tabs.get(tabId);
         if (liveTab.active) {
-            return { action_id: aid, success: false, message: "Refusing to close the active tab", undo_available: false };
+            return { action_id: aid, success: false, message: "Refusing to close the active tab", reversible: false };
         }
     } catch {
-        return { action_id: aid, success: false, message: "Tab already closed", undo_available: false };
+        return { action_id: aid, success: false, message: "Tab already closed", reversible: false };
     }
 
     try {
@@ -2283,7 +2332,7 @@ async function executeBookmarkAndClose(action: SuggestedAction): Promise<ActionE
     try {
         await chrome.tabs.remove(tabId);
     } catch {
-        return { action_id: aid, success: false, message: "Failed to close tab", undo_available: false };
+        return { action_id: aid, success: false, message: "Failed to close tab", reversible: false };
     }
     pushUndo({
         action_id: aid,
@@ -2291,12 +2340,12 @@ async function executeBookmarkAndClose(action: SuggestedAction): Promise<ActionE
         undo_data: { url: tabUrl, title: tabTitle },
         timestamp: Date.now(),
     });
-    return { action_id: aid, success: true, message: "Bookmarked & closed", undo_available: true };
+    return { action_id: aid, success: true, message: "Bookmarked & closed", reversible: true };
 }
 
 async function executeOpenUrl(action: SuggestedAction): Promise<ActionExecuteResult> {
     if (!action.target) {
-        return { action_id: action.action_id, success: false, message: "No URL provided", undo_available: false };
+        return { action_id: action.action_id, success: false, message: "No URL provided", reversible: false };
     }
     const tab = await chrome.tabs.create({ url: action.target, active: false });
     pushUndo({
@@ -2305,13 +2354,13 @@ async function executeOpenUrl(action: SuggestedAction): Promise<ActionExecuteRes
         undo_data: { tabId: tab.id },
         timestamp: Date.now(),
     });
-    return { action_id: action.action_id, success: true, message: "Opened in background", undo_available: true };
+    return { action_id: action.action_id, success: true, message: "Opened in background", reversible: true };
 }
 
 async function executeSearchError(action: SuggestedAction): Promise<ActionExecuteResult> {
     const query = ((action.metadata || {}).search_query as string) || action.target || "";
     if (!query) {
-        return { action_id: action.action_id, success: false, message: "No search query", undo_available: false };
+        return { action_id: action.action_id, success: false, message: "No search query", reversible: false };
     }
     const url = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
     const tab = await chrome.tabs.create({ url, active: false });
@@ -2321,31 +2370,31 @@ async function executeSearchError(action: SuggestedAction): Promise<ActionExecut
         undo_data: { tabId: tab.id },
         timestamp: Date.now(),
     });
-    return { action_id: action.action_id, success: true, message: "Search opened", undo_available: true };
+    return { action_id: action.action_id, success: true, message: "Search opened", reversible: true };
 }
 
 async function executeHighlightTab(action: SuggestedAction): Promise<ActionExecuteResult> {
     if (action.tab_index === null || action.tab_index === undefined) {
-        return { action_id: action.action_id, success: false, message: "No tab_index", undo_available: false };
+        return { action_id: action.action_id, success: false, message: "No tab_index", reversible: false };
     }
     const v = await validateTab(action.tab_index);
     if (!v.valid) {
-        return { action_id: action.action_id, success: false, message: v.message, undo_available: false };
+        return { action_id: action.action_id, success: false, message: v.message, reversible: false };
     }
     await chrome.tabs.update(v.tabId, { active: true });
-    return { action_id: action.action_id, success: true, message: "Tab activated", undo_available: false };
+    return { action_id: action.action_id, success: true, message: "Tab activated", reversible: false };
 }
 
 async function executeSaveSession(action: SuggestedAction): Promise<ActionExecuteResult> {
     const name = action.target || `Session ${new Date().toLocaleTimeString()}`;
     await saveTabSession(name, focusSession?.goal);
-    return { action_id: action.action_id, success: true, message: "Session saved", undo_available: false };
+    return { action_id: action.action_id, success: true, message: "Session saved", reversible: false };
 }
 
 async function executeCopyToClipboard(action: SuggestedAction): Promise<ActionExecuteResult> {
     const text = action.target || ((action.metadata || {}).text as string) || "";
     if (!text) {
-        return { action_id: action.action_id, success: false, message: "Nothing to copy", undo_available: false };
+        return { action_id: action.action_id, success: false, message: "Nothing to copy", reversible: false };
     }
     try {
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -2357,16 +2406,16 @@ async function executeCopyToClipboard(action: SuggestedAction): Promise<ActionEx
             });
         }
     } catch {
-        return { action_id: action.action_id, success: false, message: "Clipboard access failed", undo_available: false };
+        return { action_id: action.action_id, success: false, message: "Clipboard access failed", reversible: false };
     }
-    return { action_id: action.action_id, success: true, message: "Copied to clipboard", undo_available: false };
+    return { action_id: action.action_id, success: true, message: "Copied to clipboard", reversible: false };
 }
 
 async function executeStartTimer(action: SuggestedAction): Promise<ActionExecuteResult> {
     const minutes = ((action.metadata || {}).minutes as number) || 5;
     await chrome.alarms.create("cortex-break-timer", { delayInMinutes: minutes });
     injectToast("Break timer started", `Timer set for ${minutes} minutes. We'll remind you when it's done.`);
-    return { action_id: action.action_id, success: true, message: `${minutes}min timer started`, undo_available: false };
+    return { action_id: action.action_id, success: true, message: `${minutes}min timer started`, reversible: false };
 }
 
 async function undoAction(actionId: string): Promise<boolean> {

@@ -34,6 +34,16 @@ function sendWithCid(
     return correlation_id;
 }
 
+// Generated from Pydantic — Debt-1 closure (F42/F43/F44).
+// Hand-written copies of these interfaces previously lived alongside
+// the popup; they drifted from the Python side. The import is the
+// only canonical source; CI fails if it goes stale.
+import type {
+    SuggestedAction,
+    TabRecommendation,
+    TabRecommendations,
+} from "./types/generated/cortex_schemas";
+
 const CortexLogo = () => (
     <svg width="22" height="22" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ flexShrink: 0 }}>
         <path d="M 51.8 12.2 A 28 28 0 1 0 51.8 51.8" fill="none" stroke="#1a1a1a" strokeWidth="6" strokeLinecap="round" />
@@ -87,14 +97,19 @@ interface MorningBriefing {
 
 /**
  * F52: synthesize close_tab actions from tab_recommendations *only*
- * for tab_index values not already covered by suggested_actions.
+ * for tab_index values not already covered by suggested_actions, and
+ * type the action with the generated ``SuggestedAction["action_type"]``
+ * literal union so a future Pydantic-side rename surfaces as a
+ * compile error here (Debt-1).
  *
- * Previously, if any suggested_action with a close intent existed, we
- * skipped synthesis entirely — which dropped the close affordance for
- * any *other* recommended tab. Conversely, when no suggested_action
- * close existed, we synthesised one per closeable rec, which could
- * duplicate the close button when the LLM emitted a partial
- * suggested_action AND a tab_recommendation for the same tab.
+ * Previously two bugs:
+ *   - If any suggested_action with a close intent existed, we skipped
+ *     synthesis entirely — dropping the close affordance for any
+ *     *other* recommended tab.
+ *   - When no suggested_action close existed, we synthesised one per
+ *     closeable rec, which could duplicate the close button when the
+ *     LLM emitted a partial suggested_action AND a tab_recommendation
+ *     for the same tab.
  *
  * The rule: if a suggested_action with the same `tab_index` already
  * exists, drop the synthesised action so the tab card alone carries
@@ -102,10 +117,13 @@ interface MorningBriefing {
  */
 export function synthesizeActions(
     actions: Record<string, unknown>[],
-    tabRecs: { tabs: Record<string, unknown>[]; summary: string } | null,
+    tabRecs: TabRecommendations | null,
 ): Record<string, unknown>[] {
     if (!tabRecs || !tabRecs.tabs || tabRecs.tabs.length === 0) return actions;
-    const closeable = tabRecs.tabs.filter(t => t.action === "close" || t.action === "bookmark_and_close");
+    const closeable = tabRecs.tabs.filter(
+        (t: TabRecommendation) =>
+            t.action === "close" || t.action === "bookmark_and_close"
+    );
     if (closeable.length === 0) return actions;
 
     // Collect tab_index values already represented by an existing
@@ -124,14 +142,19 @@ export function synthesizeActions(
         const ti = typeof t.tab_index === "number" ? t.tab_index : Number(t.tab_index);
         if (!Number.isFinite(ti)) continue;
         if (coveredIndices.has(ti)) continue; // dedup: card already has close
+        // Narrow the inferred action_type to the generated literal union
+        // so a future rename in the Pydantic catalog surfaces here at
+        // compile time (Debt-1).
+        const action_type: SuggestedAction["action_type"] =
+            t.action === "bookmark_and_close" ? "bookmark_and_close" : "close_tab";
         synthesised.push({
             action_id: `synth_${Date.now()}_${i}`,
-            action_type: t.action === "bookmark_and_close" ? "bookmark_and_close" : "close_tab",
+            action_type,
             tab_index: ti,
             target: "",
             label: `Close ${t.tab_title || "tab"}`,
             reason: t.reason || "",
-            category: "recommended",
+            category: "recommended" as SuggestedAction["category"],
             reversible: true,
             metadata: {},
         });
@@ -219,7 +242,7 @@ function CortexPopup(): React.ReactElement {
     const [goalInput, setGoalInput] = useState("");
     const [alert, setAlert] = useState<{ title: string; body: string } | null>(null);
     const [activeActions, setActiveActions] = useState<Record<string, unknown>[]>([]);
-    const [tabRecs, setTabRecs] = useState<{ tabs: Record<string, unknown>[]; summary: string } | null>(null);
+    const [tabRecs, setTabRecs] = useState<TabRecommendations | null>(null);
     const [errAnalysis, setErrAnalysis] = useState<Record<string, string> | null>(null);
     const [interventionId, setInterventionId] = useState<string>("");
     const [applied, setApplied] = useState(false);
@@ -318,7 +341,7 @@ function CortexPopup(): React.ReactElement {
             if (resp.intervention) {
                 const p = resp.intervention as Record<string, unknown>;
                 const rawActions = (p.suggested_actions as Record<string, unknown>[]) || [];
-                const recs = (p.tab_recommendations as { tabs: Record<string, unknown>[]; summary: string }) || null;
+                const recs = (p.tab_recommendations as TabRecommendations | undefined) ?? null;
                 setActiveActions(synthesizeActions(rawActions, recs));
                 setTabRecs(recs);
                 setErrAnalysis((p.error_analysis as Record<string, string>) || null);
@@ -332,10 +355,11 @@ function CortexPopup(): React.ReactElement {
     }, []);
 
     // F50: stable listener identity so addListener/removeListener
-    // refer to the same function across re-renders. React's setState
-    // identities are already stable; pinning the handler with
-    // `useCallback([])` makes the contract obvious and gives the cleanup
-    // function the exact same reference to remove.
+    // refer to the same function across re-renders. Pinning with
+    // ``useCallback([])`` ensures the cleanup function in the effect
+    // below sees the exact same reference. Phase G (Debt-1) tightened
+    // the ``TabRecommendations`` cast on INTERVENTION_TRIGGER so the
+    // generated schema enforces the shape at compile time.
     const popupMessageListener = useCallback((msg: Record<string, unknown>) => {
         switch (msg.type) {
             case "CONNECTION_CHANGED":
@@ -364,7 +388,7 @@ function CortexPopup(): React.ReactElement {
             case "INTERVENTION_TRIGGER": {
                 const p = msg.payload as Record<string, unknown>;
                 const rawActions = (p.suggested_actions as Record<string, unknown>[]) || [];
-                const recs = (p.tab_recommendations as { tabs: Record<string, unknown>[]; summary: string }) || null;
+                const recs = (p.tab_recommendations as TabRecommendations | undefined) ?? null;
                 setActiveActions(synthesizeActions(rawActions, recs));
                 setTabRecs(recs);
                 setErrAnalysis((p.error_analysis as Record<string, string>) || null);

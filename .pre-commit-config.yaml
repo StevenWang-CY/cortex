@@ -1,0 +1,43 @@
+# Cortex pre-commit gates.
+#
+# The schema-codegen drift hook is the primary gate (audit Debt-1).
+# It regenerates ``cortex/apps/browser_extension/types/generated/
+# cortex_schemas.d.ts`` from the Pydantic source of truth in
+# ``cortex/libs/schemas/`` and fails the commit if the result differs
+# from the staged version. This is the local-dev mirror of the
+# GitHub Actions ``schema-codegen-check`` job — running it before
+# every commit means contributors can't accidentally land a Pydantic
+# change without the regenerated TypeScript declarations.
+#
+# Install:
+#   pip install pre-commit
+#   pre-commit install
+#
+# Run manually (does not require commit):
+#   pre-commit run --all-files
+#
+# Bypass (rarely needed; CI catches drift anyway):
+#   git commit --no-verify
+
+repos:
+  - repo: local
+    hooks:
+      # Hook fires whenever either side of the schema contract is
+      # touched: a Pydantic model under cortex/libs/schemas/, the
+      # generator script itself, or the committed .d.ts (the latter
+      # so a manual hand-edit is rejected — see audit findings F42-
+      # F45).
+      - id: cortex-schema-codegen
+        name: cortex schema codegen (Debt-1 drift gate)
+        entry: python -m cortex.scripts.generate_ts_schemas --check
+        language: system
+        pass_filenames: false
+        files: |
+          (?x)^(
+            cortex/libs/schemas/.*\.py|
+            cortex/scripts/generate_ts_schemas\.py|
+            cortex/apps/browser_extension/types/generated/cortex_schemas\.d\.ts
+          )$
+        # ``--check`` writes the diff to stdout; pre-commit captures
+        # and prints it on failure, so the developer immediately
+        # sees what changed without re-running the generator.

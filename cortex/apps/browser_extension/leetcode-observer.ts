@@ -14,28 +14,23 @@
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
+//
+// The payload shape is the Pydantic ``LeetCodeContext`` model from
+// ``cortex/libs/schemas/leetcode.py``; the type is imported from the
+// generated declaration file rather than maintained as a hand-written
+// copy (Debt-1 closure).
+import type {
+  LeetCodeContext,
+  LeetCodeStage,
+  SubmissionResult,
+} from "./types/generated/cortex_schemas";
 
-type Stage = "READ" | "PLAN" | "IMPLEMENT" | "DEBUG" | "REFLECT";
+type Stage = LeetCodeStage;
 
-interface LeetCodeContextPayload {
-  problem_id: string | null;
-  title: string;
-  difficulty: string;
-  tags: string[];
-  time_elapsed_s: number;
-  submission_count: number;
-  wrong_answer_count: number;
-  last_submission_result: string | null;
-  last_submission_ts: number | null;
-  accepted: boolean;
-  stage: Stage;
-  code_snapshot: string;
-  code_line_count: number;
-  code_delete_ratio_60s: number;
-  chars_per_min: number;
-  reread_count: number;
-  solutions_tab_attempted: boolean;
-}
+// The wire payload always carries every default-factory field; promote
+// them to non-optional locally so observer code can read them without
+// per-site ``?? defaults``.
+type LeetCodeContextPayload = Required<LeetCodeContext>;
 
 interface LeetCodeContextMessage {
   type: "LEETCODE_CONTEXT_UPDATE";
@@ -140,13 +135,16 @@ function queryAllUnique(selectors: readonly string[]): Element[] {
 }
 
 /** Normalize submission result text to a canonical status string. */
-function normalizeResult(raw: string): string | null {
+// The return literals are the generated ``SuggestionResult`` union from
+// the Pydantic ``leetcode.py`` schema. The compiler enforces that every
+// branch maps to a known schema value (F45 closure for this observer).
+function normalizeResult(raw: string): SubmissionResult | null {
   const t = raw.trim().toLowerCase();
   if (t.includes("accepted") && !t.includes("wrong")) return "Accepted";
   if (t.includes("wrong answer")) return "Wrong Answer";
   if (t.includes("runtime error")) return "Runtime Error";
-  if (t.includes("time limit") || t.includes("tle")) return "TLE";
-  if (t.includes("memory limit") || t.includes("mle")) return "MLE";
+  if (t.includes("time limit") || t.includes("tle")) return "Time Limit Exceeded";
+  if (t.includes("memory limit") || t.includes("mle")) return "Memory Limit Exceeded";
   if (t.includes("compile error") || t.includes("compilation")) return "Compile Error";
   return null;
 }
@@ -226,7 +224,7 @@ export class LeetCodeObserver {
   // --- Submission tracking ---
   private submissionCount = 0;
   private wrongAnswerCount = 0;
-  private lastSubmissionResult: string | null = null;
+  private lastSubmissionResult: SubmissionResult | null = null;
   private lastSubmissionTs: number | null = null;
   private accepted = false;
   private seenResultTexts = new Set<string>(); // de-dup hydration re-renders

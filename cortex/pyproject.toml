@@ -93,6 +93,20 @@ dev = [
     "ipython>=8.20.0",
     "rich>=13.7.0",
     "pyinstaller>=6.6.0",
+
+    # Schema codegen — Pydantic → TypeScript (Debt-1 closure).
+    # ``pydantic-to-typescript`` is the actively-maintained package
+    # (formerly known as ``pydantic2ts``); imports as ``pydantic2ts``.
+    # Requires the ``json2ts`` binary from ``json-schema-to-typescript``
+    # to be on PATH (installed via ``npm i -g json-schema-to-typescript``
+    # or co-located in the browser extension's pnpm workspace).
+    "pydantic-to-typescript>=2.0.0",
+]
+
+# Dedicated codegen extra for CI jobs that only need the schema generator
+# without pulling the full dev toolchain (mypy, pyinstaller, etc.).
+codegen = [
+    "pydantic-to-typescript>=2.0.0",
 ]
 
 [project.scripts]

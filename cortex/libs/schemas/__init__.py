@@ -56,6 +56,8 @@ from cortex.libs.schemas.transition_graph import (
     FocusNode,
     FocusTransitionGraph,
 )
+from cortex.libs.schemas.ws_message import WSMessage
+from cortex.libs.schemas.ws_message_types import MessageType
 
 __all__ = [
     # Features
@@ -106,4 +108,7 @@ __all__ = [
     "InterventionSnapshot",
     "HelpfulnessRecord",
     "BanditWeights",
+    # WS Envelope (Debt-1 codegen source of truth)
+    "WSMessage",
+    "MessageType",
 ]
