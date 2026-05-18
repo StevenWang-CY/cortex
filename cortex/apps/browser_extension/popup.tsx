@@ -981,7 +981,7 @@ const S: Record<string, React.CSSProperties> = {
         fontSize: 13,
         fontWeight: 500,
         fontFamily: CX.font,
-        transition: "background 0.2s ease",
+        transition: `background ${CX.durationNormal} ${CX.easeDefault}`,
     },
     statusRow: { display: "flex", alignItems: "center", gap: 8, paddingRight: 4 },
     statusLabel: {
@@ -1232,12 +1232,14 @@ const S: Record<string, React.CSSProperties> = {
         position: "relative" as const,
         width: 40,
         height: 24,
-        borderRadius: 12,
+        // Pill — clamps to half-height. Was hard-coded 12; CX.radiusFull
+        // keeps macOS-toggle proportions stable if dimensions change.
+        borderRadius: CX.radiusFull,
         border: "none",
         cursor: "pointer",
         padding: 0,
         flexShrink: 0,
-        transition: `background 0.2s ease`,
+        transition: `background ${CX.durationNormal} ${CX.easeDefault}`,
     },
     toggleThumb: {
         position: "absolute" as const,
@@ -1246,8 +1248,8 @@ const S: Record<string, React.CSSProperties> = {
         width: 20,
         height: 20,
         borderRadius: "50%",
-        background: "#fff",
-        transition: `transform 0.2s ease`,
+        background: CX.textInverse,
+        transition: `transform ${CX.durationNormal} ${CX.easeDefault}`,
         boxShadow: "0 2px 4px rgba(0,0,0,0.1)",
     },
 
