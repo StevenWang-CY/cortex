@@ -557,12 +557,22 @@ class WebSocketServer:
             return {}
 
     async def _broadcast(self, msg: WSMessage) -> int:
-        """Broadcast a message to all connected clients."""
+        """Broadcast a message to all connected clients.
+
+        F22: when a send times out, the client is presumed a "slow
+        consumer" — we emit an explicit ``close(code=1011, reason="slow
+        consumer")`` so the browser-side auto-reconnect logic sees a
+        clean close rather than an EPIPE on the next send. The close is
+        wrapped in a try/except so a socket that has already torn down
+        does not raise, and the disconnect event is recorded via the
+        structured event type ``WS_CLIENT_DISCONNECTED`` with the
+        client id and a reason.
+        """
         if not self._clients:
             return 0
 
         sent = 0
-        dead_clients: list[str] = []
+        dead_clients: list[tuple[str, str]] = []  # (client_id, reason)
 
         target_types = set(msg.target_client_types or [])
         for client_id, client in self._clients.items():
@@ -571,15 +581,59 @@ class WebSocketServer:
             try:
                 await asyncio.wait_for(client.websocket.send(msg.to_json()), timeout=1.0)
                 sent += 1
+            except TimeoutError:
+                dead_clients.append((client_id, "slow consumer"))
             except Exception:
-                dead_clients.append(client_id)
+                dead_clients.append((client_id, "send error"))
 
         # Clean up dead connections
-        for client_id in dead_clients:
-            self._clients.pop(client_id, None)
-            logger.debug(f"Removed dead client: {client_id}")
+        for client_id, reason in dead_clients:
+            client = self._clients.pop(client_id, None)
+            if client is not None:
+                await self._close_slow_consumer(client, reason)
+            logger.debug("Removed dead client: %s (%s)", client_id, reason)
 
         return sent
+
+    async def _close_slow_consumer(
+        self, client: WebSocketClient, reason: str,
+    ) -> None:
+        """F22: send an explicit close frame (code 1011) to a slow client
+        before removing it from the registry. Emits
+        ``EventType.WS_CLIENT_DISCONNECTED`` with the client id and the
+        reason so log aggregators can correlate retries with the cause.
+
+        Closing an already-dead socket must not raise — websockets'
+        ``close()`` can throw ``ConnectionClosed`` or ``OSError`` on a
+        half-torn-down peer; both are swallowed."""
+        try:
+            await client.websocket.close(code=1011, reason=reason)
+        except Exception:
+            # Socket already gone — that's fine; log at debug for
+            # completeness but don't surface as an error.
+            logger.debug(
+                "close(slow consumer) on already-dead socket %s",
+                client.client_id,
+                exc_info=True,
+            )
+        try:
+            # Structured event so support can grep the launcher log for
+            # slow-client disconnects and correlate with extension
+            # reconnects in the field.
+            from cortex.libs.logging.structured import EventType, get_logger
+
+            get_logger(__name__).info(
+                "ws_client_disconnected",
+                event_type=EventType.WS_CLIENT_DISCONNECTED.value,
+                client_id=client.client_id,
+                client_type=client.client_type,
+                reason=reason,
+            )
+        except Exception:
+            # Logging must never break the broadcast hot path.
+            logger.debug(
+                "structured ws_client_disconnected log failed", exc_info=True,
+            )
 
     def _make_state_update(
         self,
