@@ -128,6 +128,15 @@ class WebSocketServer:
         # Latest state for new connections
         self._latest_state: StateEstimate | None = None
         self._pending_context_requests: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        # F23: track which client_id owns each pending correlation_id so we
+        # can cancel its futures on disconnect (otherwise the requesting
+        # caller hangs until the per-call timeout). One client_id → many
+        # correlation_ids; remove the cid from the set as soon as its
+        # future resolves so the set never grows past in-flight requests.
+        self._pending_cids_by_client: dict[str, set[str]] = {}
+        # F04: monotonic settings version last applied. Older payloads are
+        # rejected (stale double-click that arrived behind a newer apply).
+        self._last_settings_version: int = 0
 
     @property
     def client_count(self) -> int:
@@ -250,6 +259,10 @@ class WebSocketServer:
             logger.debug(f"Client {client_id} disconnected: {e}")
         finally:
             self._clients.pop(client_id, None)
+            # F23: cancel any in-flight context-request futures associated
+            # with this client so the calling coroutine returns promptly
+            # rather than waiting for the per-call timeout.
+            self._cancel_pending_for_client(client_id)
             logger.info(f"Client disconnected: {client_id}")
 
     async def _process_message(
@@ -359,11 +372,37 @@ class WebSocketServer:
         future = self._pending_context_requests.pop(correlation_id, None)
         if future is not None and not future.done():
             future.set_result(msg.payload)
+        # F23: prune the per-client cid tracking so the set only ever
+        # contains in-flight cids. If the response races a disconnect we
+        # may find no owner — that's fine, the disconnect path already
+        # cancelled the future and we'd be a no-op anyway.
+        for client_id, owned in list(self._pending_cids_by_client.items()):
+            if correlation_id in owned:
+                self._drop_pending_cid(client_id, correlation_id)
+                break
 
     async def _handle_settings_sync(self, client: WebSocketClient, msg: WSMessage) -> None:
-        """Forward settings updates to the daemon."""
+        """Forward settings updates to the daemon.
+
+        F04: payloads with a ``settings_version`` field are checked against
+        the last applied version. Older versions (a stale double-click that
+        arrived behind a newer apply) are dropped with a warning so a
+        rapid-fire user cannot accidentally rewind their settings.
+        """
         if self._settings_callback is None:
             return
+        version = msg.payload.get("settings_version")
+        if isinstance(version, int):
+            if version <= self._last_settings_version:
+                logger.warning(
+                    "Dropping stale settings sync from %s: version=%d "
+                    "(last applied=%d)",
+                    client.client_id,
+                    version,
+                    self._last_settings_version,
+                )
+                return
+            self._last_settings_version = version
         try:
             if asyncio.iscoroutinefunction(self._settings_callback):
                 await self._settings_callback(msg.payload)
@@ -545,6 +584,11 @@ class WebSocketServer:
         correlation_id = f"ctx_{client_type}_{self._sequence}"
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending_context_requests[correlation_id] = future
+        # F23: associate the cid with the requesting client so disconnect
+        # can cancel every in-flight future for that client.
+        self._pending_cids_by_client.setdefault(target.client_id, set()).add(
+            correlation_id,
+        )
         message = WSMessage(
             type="CONTEXT_REQUEST",
             payload={},
@@ -558,15 +602,71 @@ class WebSocketServer:
             return await asyncio.wait_for(future, timeout=timeout)
         except TimeoutError:
             self._pending_context_requests.pop(correlation_id, None)
+            self._drop_pending_cid(target.client_id, correlation_id)
             logger.debug("Context request to %s timed out", client_type)
+            return {}
+        except asyncio.CancelledError:
+            # F23: client disconnected and the disconnect handler cancelled
+            # our future. Treat as "no context" rather than propagating
+            # the cancellation up into context-loop code that isn't ready
+            # for it.
+            self._pending_context_requests.pop(correlation_id, None)
+            self._drop_pending_cid(target.client_id, correlation_id)
+            logger.debug(
+                "Context request %s cancelled (client disconnected)",
+                correlation_id,
+            )
             return {}
         except Exception:
             self._pending_context_requests.pop(correlation_id, None)
+            self._drop_pending_cid(target.client_id, correlation_id)
             logger.exception("Context request to %s failed", client_type)
             return {}
 
+    def _drop_pending_cid(self, client_id: str, correlation_id: str) -> None:
+        """F23: remove a correlation_id from the per-client tracking set
+        once its future has resolved (success / timeout / cancel)."""
+        owned = self._pending_cids_by_client.get(client_id)
+        if not owned:
+            return
+        owned.discard(correlation_id)
+        if not owned:
+            self._pending_cids_by_client.pop(client_id, None)
+
+    def _cancel_pending_for_client(self, client_id: str) -> int:
+        """F23: cancel every pending correlation-id future associated with
+        ``client_id``. Returns the number of futures cancelled. Called
+        from ``_handle_client`` when the client disconnects so the
+        requesting coroutine does not hang on a dead client."""
+        owned = self._pending_cids_by_client.pop(client_id, None)
+        if not owned:
+            return 0
+        cancelled = 0
+        for cid in list(owned):
+            future = self._pending_context_requests.pop(cid, None)
+            if future is not None and not future.done():
+                future.cancel()
+                cancelled += 1
+        if cancelled:
+            logger.debug(
+                "Cancelled %d pending correlation futures for %s",
+                cancelled,
+                client_id,
+            )
+        return cancelled
+
     async def _broadcast(self, msg: WSMessage) -> int:
-        """Broadcast a message to all connected clients."""
+        """Broadcast a message to all connected clients.
+
+        F22: when a send times out, the client is presumed a "slow
+        consumer" — we emit an explicit ``close(code=1011, reason="slow
+        consumer")`` so the browser-side auto-reconnect logic sees a
+        clean close rather than an EPIPE on the next send. The close is
+        wrapped in a try/except so a socket that has already torn down
+        does not raise, and the disconnect event is recorded via the
+        structured event type ``WS_CLIENT_DISCONNECTED`` with the
+        client id and a reason.
+        """
         if not self._clients:
             return 0
 
@@ -577,7 +677,7 @@ class WebSocketServer:
             msg.correlation_id = get_correlation_id()
 
         sent = 0
-        dead_clients: list[str] = []
+        dead_clients: list[tuple[str, str]] = []  # (client_id, reason)
 
         target_types = set(msg.target_client_types or [])
         for client_id, client in self._clients.items():
@@ -586,15 +686,59 @@ class WebSocketServer:
             try:
                 await asyncio.wait_for(client.websocket.send(msg.to_json()), timeout=1.0)
                 sent += 1
+            except TimeoutError:
+                dead_clients.append((client_id, "slow consumer"))
             except Exception:
-                dead_clients.append(client_id)
+                dead_clients.append((client_id, "send error"))
 
         # Clean up dead connections
-        for client_id in dead_clients:
-            self._clients.pop(client_id, None)
-            logger.debug(f"Removed dead client: {client_id}")
+        for client_id, reason in dead_clients:
+            client = self._clients.pop(client_id, None)
+            if client is not None:
+                await self._close_slow_consumer(client, reason)
+            logger.debug("Removed dead client: %s (%s)", client_id, reason)
 
         return sent
+
+    async def _close_slow_consumer(
+        self, client: WebSocketClient, reason: str,
+    ) -> None:
+        """F22: send an explicit close frame (code 1011) to a slow client
+        before removing it from the registry. Emits
+        ``EventType.WS_CLIENT_DISCONNECTED`` with the client id and the
+        reason so log aggregators can correlate retries with the cause.
+
+        Closing an already-dead socket must not raise — websockets'
+        ``close()`` can throw ``ConnectionClosed`` or ``OSError`` on a
+        half-torn-down peer; both are swallowed."""
+        try:
+            await client.websocket.close(code=1011, reason=reason)
+        except Exception:
+            # Socket already gone — that's fine; log at debug for
+            # completeness but don't surface as an error.
+            logger.debug(
+                "close(slow consumer) on already-dead socket %s",
+                client.client_id,
+                exc_info=True,
+            )
+        try:
+            # Structured event so support can grep the launcher log for
+            # slow-client disconnects and correlate with extension
+            # reconnects in the field.
+            from cortex.libs.logging.structured import EventType, get_logger
+
+            get_logger(__name__).info(
+                "ws_client_disconnected",
+                event_type=EventType.WS_CLIENT_DISCONNECTED.value,
+                client_id=client.client_id,
+                client_type=client.client_type,
+                reason=reason,
+            )
+        except Exception:
+            # Logging must never break the broadcast hot path.
+            logger.debug(
+                "structured ws_client_disconnected log failed", exc_info=True,
+            )
 
     def _make_state_update(
         self,

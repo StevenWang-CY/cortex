@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import QSettings, Qt, Signal
+from PySide6.QtCore import QMutex, QSettings, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -144,6 +144,16 @@ class SettingsDialog(QWidget):
         # from the widget initializers in _build_ui; we restore over the
         # top once the UI is built.
         self._qs = QSettings("Cortex", "Desktop")
+        # F04: mutex guards _apply_settings against double-click reentrancy.
+        # The Apply button is also disabled for the duration of the apply so
+        # the user sees the UI as busy, not silently failing.
+        self._apply_mutex: QMutex = QMutex()
+        # Monotonic counter — every Apply increments. The daemon's
+        # _handle_settings_sync rejects any payload whose version is older
+        # than the last one it accepted, so a coalesced double-click cannot
+        # land out-of-order behind an in-flight earlier apply.
+        self._settings_version: int = 0
+        self._apply_btn: QPushButton | None = None
         self._build_ui()
         self._load_persisted_settings()
 
@@ -386,6 +396,10 @@ class SettingsDialog(QWidget):
             "QPushButton:pressed { background: #B05439; }"
         )
         apply_btn.clicked.connect(self._apply_settings)
+        # F04: keep a handle on the Apply button so _apply_settings can
+        # disable it while an apply is in-flight (visual coalescing of
+        # double-clicks; the mutex below is the correctness guarantee).
+        self._apply_btn = apply_btn
         btn_row.addWidget(apply_btn)
 
         layout.addLayout(btn_row)
@@ -438,15 +452,43 @@ class SettingsDialog(QWidget):
         }
 
     def _apply_settings(self) -> None:
-        settings = self.get_settings()
-        # Persist before emitting so a crash mid-roundtrip doesn't lose
-        # the user's choices.
-        self._persist_settings(settings)
-        self.settings_changed.emit(settings)
-        logger.info(
-            "Settings applied: sensitivity=%s llm=%s",
-            settings["sensitivity"], settings["llm_mode"],
-        )
+        # F04: serialise applies with a QMutex. ``tryLock`` returns False if
+        # the previous apply is still in flight; in that case we ignore the
+        # second click rather than emit a parallel ``settings_changed`` that
+        # would race the first inside the daemon callback. The Apply button
+        # is also disabled while the mutex is held so the user sees the UI
+        # as busy.
+        if not self._apply_mutex.tryLock():
+            logger.debug(
+                "Apply ignored — previous apply still in flight (coalesced)"
+            )
+            return
+        if self._apply_btn is not None:
+            try:
+                self._apply_btn.setEnabled(False)
+            except RuntimeError:
+                pass
+        try:
+            self._settings_version += 1
+            settings = self.get_settings()
+            # Stamp the monotonic version so the daemon can discard a stale
+            # apply that arrives after a newer one.
+            settings["settings_version"] = self._settings_version
+            self._persist_settings(settings)
+            self.settings_changed.emit(settings)
+            logger.info(
+                "Settings applied: sensitivity=%s llm=%s version=%d",
+                settings["sensitivity"],
+                settings["llm_mode"],
+                self._settings_version,
+            )
+        finally:
+            self._apply_mutex.unlock()
+            if self._apply_btn is not None:
+                try:
+                    self._apply_btn.setEnabled(True)
+                except RuntimeError:
+                    pass
 
     def _persist_settings(self, settings: dict) -> None:
         for key, value in settings.items():

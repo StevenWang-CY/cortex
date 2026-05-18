@@ -171,6 +171,9 @@ class OverlayWindow(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._intervention_id = ""
+        # Idempotency guard: once dismissed (auto or user), subsequent dismiss
+        # calls are no-ops. First emitter wins. See F06.
+        self._dismissed: bool = False
 
         # Frameless + always-on-top. Translucent background lets the
         # NSVisualEffectView under the window show through.
@@ -363,6 +366,8 @@ class OverlayWindow(QWidget):
 
     def show_intervention(self, payload: dict) -> None:
         self._intervention_id = payload.get("intervention_id", "")
+        # Fresh intervention — clear dismissed flag so this one can dismiss.
+        self._dismissed = False
 
         self._headline.setText(payload.get("headline", "Take a moment"))
         self._summary.setText(payload.get("situation_summary", ""))
@@ -488,16 +493,48 @@ class OverlayWindow(QWidget):
         painter.end()
 
     def _user_dismiss(self) -> None:
+        # F06: idempotent dismiss. First caller wins; subsequent calls no-op.
+        # Always stop the timeout timer, even if already dismissed, so that
+        # a stale timer cannot re-trigger on a hidden widget.
         self._timeout_timer.stop()
+        if self._dismissed:
+            return
+        self._dismissed = True
         self._pacer.stop()
         self.hide()
         self.dismissed.emit(self._intervention_id)
         logger.info(f"Intervention {self._intervention_id} dismissed by user")
 
     def _auto_dismiss(self) -> None:
+        # F06: idempotent dismiss. First caller wins; subsequent calls no-op.
+        self._timeout_timer.stop()
+        if self._dismissed:
+            return
+        self._dismissed = True
         self._pacer.stop()
         self.hide()
         self.dismissed.emit(self._intervention_id)
         logger.info(
             f"Intervention {self._intervention_id} auto-dismissed (timeout)"
         )
+
+    def closeEvent(self, event: object) -> None:  # noqa: D401 - Qt override
+        # F06: ensure the timeout timer never fires after the window closes.
+        try:
+            self._timeout_timer.stop()
+        except RuntimeError:
+            # Timer already torn down by Qt; safe to ignore.
+            pass
+        self._dismissed = True
+        super().closeEvent(event)
+
+    def deleteLater(self) -> None:  # noqa: D401 - Qt override
+        # F06: defensive stop on deferred deletion so the timer cannot fire
+        # against a Qt-collected widget. The flag is set before stop() to
+        # short-circuit any callback that races in before the timer is gone.
+        self._dismissed = True
+        try:
+            self._timeout_timer.stop()
+        except RuntimeError:
+            pass
+        super().deleteLater()

@@ -66,6 +66,10 @@ class DaemonBridge(QObject):
     state_updated = Signal(dict)
     intervention_triggered = Signal(dict)
     connection_changed = Signal(bool)
+    # F34: emitted on the Qt main thread when the daemon's ``stop()`` future
+    # resolves (or the safety timer fires). UI surfaces (dashboard, tray)
+    # listen so they can re-enable their Stop affordances.
+    daemon_stopped = Signal()
 
     # -- callbacks invoked from daemon thread ---------------------------------
 
@@ -76,6 +80,10 @@ class DaemonBridge(QObject):
     def on_intervention(self, payload: dict) -> None:
         """Intervention callback — payload is already deep-copied."""
         self.intervention_triggered.emit(payload)
+
+    def on_daemon_stopped(self) -> None:
+        """Called when the in-process daemon's ``stop()`` future resolves."""
+        self.daemon_stopped.emit()
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +151,10 @@ class CortexAppController:
         self._bridge.state_updated.connect(self._on_state_update)
         self._bridge.intervention_triggered.connect(self._on_intervention)
         self._bridge.connection_changed.connect(self._on_connection_changed)
+        # F34: re-enable dashboard + tray Stop affordances when the daemon
+        # actually reports stopped (or the dashboard/tray's own safety-timer
+        # fires).
+        self._bridge.daemon_stopped.connect(self._on_daemon_stopped)
 
         self._overlay.dismissed.connect(self._on_overlay_dismissed)
         self._settings.settings_changed.connect(self._on_settings_changed)
@@ -284,6 +296,15 @@ class CortexAppController:
                 future.result(timeout=5.0)
             except Exception:
                 logger.warning("Daemon stop timed out; daemon thread is daemon=True, process will exit")
+            finally:
+                # F34: notify the UI that the stop attempt resolved (either
+                # successfully or by timeout) so the Stop button re-enables.
+                try:
+                    self._bridge.on_daemon_stopped()
+                except Exception:
+                    logger.debug(
+                        "daemon_stopped emit failed (non-fatal)", exc_info=True
+                    )
 
     # -- Qt slots (main thread) -----------------------------------------------
 
@@ -313,6 +334,19 @@ class CortexAppController:
             self._tray.set_connected(connected)
         if self._dashboard is not None:
             self._dashboard.set_connected(connected)
+
+    @Slot()
+    def _on_daemon_stopped(self) -> None:
+        """F34: the daemon's stop() resolved on the main thread; re-enable
+        the dashboard Stop button and the tray Quit action."""
+        if self._dashboard is not None and hasattr(
+            self._dashboard, "notify_daemon_stopped"
+        ):
+            self._dashboard.notify_daemon_stopped()
+        if self._tray is not None and hasattr(
+            self._tray, "notify_daemon_stopped"
+        ):
+            self._tray.notify_daemon_stopped()
 
     @Slot(str)
     def _on_overlay_dismissed(self, intervention_id: str) -> None:
@@ -446,6 +480,14 @@ class CortexAppController:
                 future.result(timeout=5.0)
             except Exception:
                 logger.warning("Daemon stop timed out from dashboard Stop", exc_info=True)
+            finally:
+                # F34: signal the UI that stop resolved (success or timeout).
+                try:
+                    self._bridge.on_daemon_stopped()
+                except Exception:
+                    logger.debug(
+                        "daemon_stopped emit failed (non-fatal)", exc_info=True
+                    )
         self._quit()
 
     def _on_goal_set(self, goal: str) -> None:

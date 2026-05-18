@@ -508,3 +508,45 @@ class DismissalRecord(BaseModel):
     def age_seconds(self) -> float:
         """Get age of dismissal in seconds."""
         return (datetime.now() - self.timestamp).total_seconds()
+
+
+class InterventionApplyResult(BaseModel):
+    """F05: client-confirmed outcome of an intervention apply.
+
+    The legacy adapter optimistically reported ``success=True`` for every
+    dispatched action. The new path waits for an extension-side
+    ``INTERVENTION_APPLIED`` ack and surfaces the real outcome via this
+    schema. ``confirmed=False`` means either no ack arrived inside the
+    timeout window or the client reported a hard failure (no actions
+    succeeded). ``applied_actions`` / ``errors`` carry the per-action
+    breakdown so partial successes don't masquerade as full successes.
+    """
+
+    intervention_id: str = Field(
+        ..., description="The intervention whose apply was awaited"
+    )
+    correlation_id: str | None = Field(
+        None, description="Apply-call correlation id (mirrored from the ack)"
+    )
+    confirmed: bool = Field(
+        False,
+        description=(
+            "True when the extension explicitly acknowledged the apply and "
+            "reported success. False on timeout or explicit failure."
+        ),
+    )
+    timed_out: bool = Field(
+        False,
+        description="True when the watcher resolved the future on timeout",
+    )
+    applied_actions: list[str] = Field(
+        default_factory=list,
+        description="action_ids reported as applied by the client",
+    )
+    errors: list[str] = Field(
+        default_factory=list,
+        description="Per-action errors reported by the client",
+    )
+    phase: Literal["apply", "restore"] = Field(
+        "apply", description="Which lifecycle phase this result belongs to"
+    )

@@ -24,7 +24,10 @@ import uvicorn
 from cortex.libs.adapters.leetcode_adapter import LeetCodeAdapter
 from cortex.libs.config.settings import CortexConfig, get_config
 from cortex.libs.schemas.features import KinematicFeatures, PhysioFeatures
-from cortex.libs.schemas.intervention import InterventionPlan
+from cortex.libs.schemas.intervention import (
+    InterventionApplyResult,
+    InterventionPlan,
+)
 from cortex.libs.schemas.leetcode import LeetCodeContext
 from cortex.libs.schemas.state import UserBaselines
 
@@ -87,20 +90,33 @@ logger = logging.getLogger(__name__)
 
 
 class _OptimisticInterventionAdapter:
-    """Optimistic in-process adapter.
+    """In-process adapter that awaits the client's ``INTERVENTION_APPLIED`` ack.
 
-    Real workspace effects (DOM, fold ranges, overlay) are performed by the
-    Chrome / VS Code / desktop-shell clients in response to the
-    ``INTERVENTION_TRIGGER`` WebSocket broadcast. The daemon does not own
-    a direct path to those surfaces, so its in-process executor records
-    every dispatched mutation optimistically (success = True) and waits
-    for an ``INTERVENTION_APPLIED`` ack from the client to overwrite
-    ``Mutation.success`` and ``Mutation.error`` with the real outcome.
+    F05: the previous implementation returned ``True`` unconditionally,
+    which meant ``Mutation.success`` was always reported as success — the
+    daemon's session report could not distinguish a partial / failed
+    extension apply from a clean one. The new implementation registers
+    a future per ``intervention_id`` with the daemon's
+    ``await_apply_confirmation`` machinery; the future is resolved by the
+    WS ``INTERVENTION_APPLIED`` handler or by a 30 s timeout watcher. The
+    adapter's ``execute`` still returns immediately (mutation tracking
+    needs *some* boolean before the ack arrives), but the daemon's
+    ``_handle_intervention_applied`` then overwrites ``Mutation.success``
+    with the actual outcome reported by the client. The session report
+    persists the actual ack outcome (see ``await_apply_confirmation``).
 
-    See ``_handle_intervention_applied`` for the ack handler.
+    Real workspace effects (DOM, fold ranges, overlay) are performed by
+    the Chrome / VS Code / desktop-shell clients in response to the
+    ``INTERVENTION_TRIGGER`` WebSocket broadcast.
     """
 
     async def execute(self, action: str, params: dict[str, Any]) -> bool:
+        # The actual outcome is resolved asynchronously when the ack arrives.
+        # Returning True here matches the pre-F05 contract for the executor's
+        # mutation-tracking pass; the daemon's
+        # ``_handle_intervention_applied`` overwrites the value once the
+        # client has reported back, and ``await_apply_confirmation``
+        # surfaces the real outcome to callers of ``apply_intervention``.
         return True
 
 
@@ -279,6 +295,18 @@ class CortexDaemon:
         # overwrite Mutation.success / re-append to the recorder. Keys
         # are tuples of (intervention_id, phase).
         self._intervention_applied_seen: set[tuple[str, str]] = set()
+        # F05: pending apply-confirmation futures keyed by intervention_id.
+        # ``apply_intervention`` populates the future; the WS
+        # ``_handle_intervention_applied`` callback resolves it; the 30 s
+        # timeout watcher resolves it to ``confirmed=False`` if no ack
+        # arrives.
+        self._pending_apply_results: dict[
+            str, asyncio.Future[Any]
+        ] = {}
+        # F05: tracked background tasks (timeout watchers, etc). Mirrors the
+        # F03 pattern from the audit Ledger: any new task spawn must use
+        # ``_spawn_background_task`` so ``stop()`` can drain them cleanly.
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         self._aggregator = FeatureAggregator(
             self._input_hooks,
             self._window_tracker,
@@ -415,6 +443,116 @@ class CortexDaemon:
         """
         self._intervention_callback = fn
 
+    # ------------------------------------------------------------------
+    # F05: background task helper + apply-confirmation primitives
+    # ------------------------------------------------------------------
+
+    def _spawn_background_task(
+        self,
+        coro: Any,
+        *,
+        name: str | None = None,
+    ) -> asyncio.Task[Any]:
+        """Spawn an asyncio task whose lifetime is tracked by the daemon.
+
+        New background tasks introduced by F05 (the apply-confirmation
+        timeout watcher in particular) must use this helper so ``stop()``
+        can cancel them cleanly. Tasks auto-prune themselves from the set
+        on completion via ``add_done_callback``.
+        """
+        task = asyncio.create_task(coro, name=name)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    async def await_apply_confirmation(
+        self,
+        intervention_id: str,
+        *,
+        timeout_seconds: float = 30.0,
+        correlation_id: str | None = None,
+    ) -> "InterventionApplyResult":
+        """Register a pending apply-confirmation future and wait for it.
+
+        Resolved by ``_handle_intervention_applied`` when the client's
+        ``INTERVENTION_APPLIED`` ack arrives, or by a background timeout
+        watcher if the ack never arrives within ``timeout_seconds``.
+
+        F05 — the future is guaranteed to be resolved exactly once. A late
+        ack arriving after the timeout finds no pending future and is
+        treated as a no-op by the handler (existing dedup logic in
+        ``_handle_intervention_applied``).
+        """
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[InterventionApplyResult] = loop.create_future()
+        # Replace any prior in-flight future for the same intervention_id —
+        # the prior call's caller will see the new ack land on its future
+        # via the resolution path; the dropped future is left pending and
+        # garbage-collected. This matches the "future resolved exactly
+        # once per call site" guarantee.
+        old = self._pending_apply_results.get(intervention_id)
+        self._pending_apply_results[intervention_id] = future
+        if old is not None and not old.done():
+            # Resolve the orphaned earlier future to confirmed=False so its
+            # awaiter does not hang.
+            old.set_result(
+                InterventionApplyResult(
+                    intervention_id=intervention_id,
+                    correlation_id=correlation_id,
+                    confirmed=False,
+                    timed_out=True,
+                )
+            )
+
+        async def _timeout_watcher() -> None:
+            try:
+                await asyncio.sleep(timeout_seconds)
+            except asyncio.CancelledError:
+                return
+            # If still pending after the timeout, resolve confirmed=False.
+            if not future.done():
+                future.set_result(
+                    InterventionApplyResult(
+                        intervention_id=intervention_id,
+                        correlation_id=correlation_id,
+                        confirmed=False,
+                        timed_out=True,
+                    )
+                )
+            # Pop the pending entry only if it still refers to *this* future
+            # — a later call may have replaced it.
+            current = self._pending_apply_results.get(intervention_id)
+            if current is future:
+                self._pending_apply_results.pop(intervention_id, None)
+
+        self._spawn_background_task(
+            _timeout_watcher(),
+            name=f"apply-confirm-{intervention_id}",
+        )
+
+        result = await future
+        # Persist outcome to the session recorder (F05: "session report
+        # records the actual ack outcome, not optimistic").
+        try:
+            self._recorder.append(
+                "intervention_apply_confirmation",
+                {
+                    "intervention_id": result.intervention_id,
+                    "correlation_id": result.correlation_id,
+                    "confirmed": result.confirmed,
+                    "timed_out": result.timed_out,
+                    "applied_actions": list(result.applied_actions),
+                    "errors": list(result.errors),
+                    "phase": result.phase,
+                },
+            )
+        except Exception:
+            logger.debug(
+                "Failed to append apply confirmation to session recorder",
+                exc_info=True,
+            )
+        return result
+
     async def start(self) -> None:
         """Start the runtime and block until shutdown."""
         # F07: ensure the local capability token exists before any service
@@ -477,22 +615,6 @@ class CortexDaemon:
             return
         loop.call_later(0.3, os.kill, os.getpid(), _signal.SIGTERM)
 
-    def _spawn_background_task(
-        self,
-        coro: Any,
-        *,
-        name: str | None = None,
-    ) -> asyncio.Task[Any]:
-        """Spawn a tracked background task. The task is added to
-        ``self._background_tasks`` and auto-removed on completion so the
-        set stays bounded. ``stop()`` cancels and awaits every
-        outstanding task, so a background coroutine cannot keep file
-        handles open past daemon shutdown."""
-        task = asyncio.create_task(coro, name=name)
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
-        return task
-
     async def stop(self) -> None:
         """Gracefully stop all runtime services."""
         self._shutdown.set()
@@ -503,8 +625,9 @@ class CortexDaemon:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
-        # F03: cancel + drain dynamically-spawned background tasks so
-        # they cannot outlive the daemon and corrupt persisted state.
+        # F03 + F05: cancel + drain dynamically-spawned background tasks
+        # so they cannot outlive the daemon and corrupt persisted state.
+        # Apply-confirmation timeout watchers (F05) are part of this set.
         if self._background_tasks:
             for task in list(self._background_tasks):
                 task.cancel()
@@ -512,6 +635,19 @@ class CortexDaemon:
                 *list(self._background_tasks), return_exceptions=True
             )
             self._background_tasks.clear()
+        # F05: any apply-confirmation future still pending at shutdown is
+        # treated as a missed ack — resolve to confirmed=False so awaiters
+        # don't hang. "Daemon restart loses in-flight" case from the plan.
+        for intervention_id, future in list(self._pending_apply_results.items()):
+            if not future.done():
+                future.set_result(
+                    InterventionApplyResult(
+                        intervention_id=intervention_id,
+                        confirmed=False,
+                        timed_out=True,
+                    )
+                )
+        self._pending_apply_results.clear()
         if self._api_task is not None:
             try:
                 await asyncio.wait_for(self._api_task, timeout=5.0)
@@ -618,6 +754,10 @@ class CortexDaemon:
             "trigger_policy": self._trigger_policy,
             "project_launcher": self._project_launcher,
             "leetcode_adapter": self._leetcode_adapter,
+            # F05: register the daemon itself so the apply-intervention
+            # route can call ``await_apply_confirmation`` and surface the
+            # actual ack outcome rather than the optimistic assumption.
+            "daemon": self,
             # v2.0 services
             "store": self._store,
             "stress_integral_tracker": self._stress_tracker,
@@ -1586,6 +1726,10 @@ class CortexDaemon:
         overwrite every mutation's ``success`` flag, and accumulate
         ``errors`` into ``Mutation.error`` so downstream
         ``InterventionOutcome.workspace_restored`` reflects reality.
+
+        F05: also resolves any pending ``await_apply_confirmation`` future
+        registered for this intervention_id so the HTTP caller can surface
+        the actual outcome to the user.
         """
         intervention_id = payload.get("intervention_id")
         if not isinstance(intervention_id, str):
@@ -1604,6 +1748,26 @@ class CortexDaemon:
             )
             return
         self._intervention_applied_seen.add(dedup_key)
+
+        # F05: resolve the pending future (if any). Only the apply phase
+        # resolves the future; restore acks land via the existing path.
+        if phase == "apply":
+            future = self._pending_apply_results.pop(intervention_id, None)
+            if future is not None and not future.done():
+                ack_success = bool(payload.get("success", False))
+                ack_applied = list(payload.get("applied_actions") or [])
+                ack_errors = [str(e) for e in (payload.get("errors") or [])]
+                future.set_result(
+                    InterventionApplyResult(
+                        intervention_id=intervention_id,
+                        correlation_id=payload.get("correlation_id"),
+                        confirmed=ack_success,
+                        timed_out=False,
+                        applied_actions=ack_applied,
+                        errors=ack_errors,
+                        phase="apply",
+                    )
+                )
 
         success = bool(payload.get("success", False))
         errors = payload.get("errors") or []
