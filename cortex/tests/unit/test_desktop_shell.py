@@ -76,11 +76,13 @@ def _setup_pyside6_mocks() -> bool:
         def __init__(self, parent=None):
             self._interval = 0
             self._single_shot = False
+            self._active = False
             self.timeout = MockSignal()
         def setInterval(self, ms): self._interval = ms
         def setSingleShot(self, v): self._single_shot = v
-        def start(self, *args): pass
-        def stop(self): pass
+        def start(self, *args): self._active = True
+        def stop(self): self._active = False
+        def isActive(self): return self._active
 
     class MockQRect:
         def __init__(self, *args): pass
@@ -123,6 +125,23 @@ def _setup_pyside6_mocks() -> bool:
     qtcore.QPropertyAnimation = MockQPropertyAnimation
     qtcore.QSettings = MockQSettings
     qtcore.QEvent = type("QEvent", (), {})
+
+    # F04: settings.py imports QMutex; provide a tiny mock that mimics
+    # ``tryLock()`` / ``unlock()`` so SettingsDialog can be constructed
+    # under the mocked Qt stack.
+    class MockQMutex:
+        def __init__(self) -> None:
+            self._locked = False
+        def tryLock(self) -> bool:
+            if self._locked:
+                return False
+            self._locked = True
+            return True
+        def lock(self) -> None:
+            self._locked = True
+        def unlock(self) -> None:
+            self._locked = False
+    qtcore.QMutex = MockQMutex
 
     # --- QtGui mocks ---
     class MockQColor:
@@ -356,12 +375,17 @@ def _setup_pyside6_mocks() -> bool:
             super().__init__(parent)
             self._text = text
             self._checked = False
+            self._enabled = True
             self.clicked = MockSignal()
         def setCheckable(self, v): pass
         def setChecked(self, v): self._checked = v
         def isChecked(self): return self._checked
         def setShortcut(self, *_args): pass
         def setAccessibleName(self, *_args): pass
+        def setEnabled(self, e): self._enabled = e
+        def isEnabled(self): return self._enabled
+        def setText(self, t): self._text = t
+        def text(self): return self._text
 
     class MockQTabWidget(MockQWidget):
         def __init__(self, parent=None):

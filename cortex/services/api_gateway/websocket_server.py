@@ -126,6 +126,9 @@ class WebSocketServer:
         # Latest state for new connections
         self._latest_state: StateEstimate | None = None
         self._pending_context_requests: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        # F04: monotonic settings version last applied. Older payloads are
+        # rejected (stale double-click that arrived behind a newer apply).
+        self._last_settings_version: int = 0
 
     @property
     def client_count(self) -> int:
@@ -331,9 +334,27 @@ class WebSocketServer:
             future.set_result(msg.payload)
 
     async def _handle_settings_sync(self, client: WebSocketClient, msg: WSMessage) -> None:
-        """Forward settings updates to the daemon."""
+        """Forward settings updates to the daemon.
+
+        F04: payloads with a ``settings_version`` field are checked against
+        the last applied version. Older versions (a stale double-click that
+        arrived behind a newer apply) are dropped with a warning so a
+        rapid-fire user cannot accidentally rewind their settings.
+        """
         if self._settings_callback is None:
             return
+        version = msg.payload.get("settings_version")
+        if isinstance(version, int):
+            if version <= self._last_settings_version:
+                logger.warning(
+                    "Dropping stale settings sync from %s: version=%d "
+                    "(last applied=%d)",
+                    client.client_id,
+                    version,
+                    self._last_settings_version,
+                )
+                return
+            self._last_settings_version = version
         try:
             if asyncio.iscoroutinefunction(self._settings_callback):
                 await self._settings_callback(msg.payload)
