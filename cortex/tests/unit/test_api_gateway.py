@@ -702,9 +702,11 @@ class TestConsentEndpoints:
         ladder = ConsentLadder(policy=ConsentPolicy(), store=None)
         registry.register("consent_ladder", ladder)
 
-        # Prime the ladder by checking an action (creates initial state)
+        # Prime the ladder by checking an action (creates initial state).
+        # F24 made ConsentLadder methods async — use ``asyncio.run`` rather
+        # than ``get_event_loop`` so Python 3.10+ does not raise.
         import asyncio
-        asyncio.get_event_loop().run_until_complete(ladder.check("close_tab"))
+        asyncio.run(ladder.check("close_tab"))
 
         resp = client.get("/consent/level")
         assert resp.status_code == 200
@@ -725,9 +727,11 @@ class TestConsentEndpoints:
         registry.register("consent_ladder", ladder)
 
         import asyncio
-        # Record some approvals to change state
-        for _ in range(5):
-            asyncio.get_event_loop().run_until_complete(ladder.record_approval("close_tab"))
+
+        async def _prime() -> None:
+            for _ in range(5):
+                await ladder.record_approval("close_tab")
+        asyncio.run(_prime())
 
         # Reset
         resp = client.post("/consent/reset")
