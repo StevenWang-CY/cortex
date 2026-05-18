@@ -20,9 +20,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from pydantic import ValidationError
+
 from cortex.libs.config.settings import APIConfig
 from cortex.libs.schemas.intervention import InterventionPlan
 from cortex.libs.schemas.state import StateEstimate
+from cortex.libs.schemas.ws_message import WSMessage as _PydanticWSMessage
+from cortex.libs.schemas.ws_message_types import MessageType
 
 logger = logging.getLogger(__name__)
 
@@ -54,9 +58,35 @@ class WebSocketClient:
     last_message_at: float = 0.0
 
 
+# ─── WSMessage: Pydantic source of truth (Debt-1 closure, Commit 2) ───
+#
+# ``WSMessage`` is now an alias for the Pydantic model in
+# ``cortex.libs.schemas.ws_message``. The model is what the schema
+# codegen pipeline (``cortex/scripts/generate_ts_schemas.py``) emits to
+# TypeScript, so the extension consumes a generated type rather than a
+# hand-written interface (audit Debt-1, closes F45 once the dispatch
+# sites in this file route through ``MessageType``).
+#
+# The legacy dataclass below is preserved unchanged for one release per
+# the Debt-1 migration plan; it round-trips structurally with the
+# Pydantic model (covered by ``test_ws_message_schema.py``). New code
+# should construct ``WSMessage`` directly, which now means the Pydantic
+# class.
+WSMessage = _PydanticWSMessage
+
+
 @dataclass
-class WSMessage:
-    """WebSocket message envelope."""
+class WSMessageLegacy:
+    """Legacy dataclass shape preserved for one-release backwards compat.
+
+    Identical field layout and serialisation contract as the previous
+    dataclass-based ``WSMessage``. Kept so external consumers can be
+    migrated incrementally; daemon-internal call sites already use the
+    Pydantic ``WSMessage`` above.
+
+    Deprecated: this class will be removed in the release after the one
+    that ships the codegen pipeline.
+    """
 
     type: str
     payload: dict[str, Any]
@@ -78,7 +108,7 @@ class WSMessage:
         })
 
     @classmethod
-    def from_json(cls, data: str) -> WSMessage:
+    def from_json(cls, data: str) -> WSMessageLegacy:
         parsed = json.loads(data)
         return cls(
             type=parsed.get("type", "UNKNOWN"),
@@ -88,6 +118,20 @@ class WSMessage:
             correlation_id=parsed.get("correlation_id"),
             target_client_types=parsed.get("target_client_types"),
             source_client_type=parsed.get("source_client_type"),
+        )
+
+    def to_pydantic(self) -> _PydanticWSMessage:
+        """Convert this dataclass to the canonical Pydantic ``WSMessage``."""
+        return _PydanticWSMessage.model_validate(
+            {
+                "type": self.type,
+                "payload": self.payload,
+                "timestamp": self.timestamp,
+                "sequence": self.sequence,
+                "correlation_id": self.correlation_id,
+                "target_client_types": self.target_client_types,
+                "source_client_type": self.source_client_type,
+            }
         )
 
 
@@ -253,41 +297,49 @@ class WebSocketServer:
     async def _process_message(
         self, client: WebSocketClient, raw: str,
     ) -> None:
-        """Process an incoming message from a client."""
+        """Process an incoming message from a client.
+
+        ``WSMessage`` is the Pydantic model; ``ValidationError`` is the
+        new failure mode for unknown ``type`` literals (Debt-1 closure,
+        F45). We log + drop the same way the legacy dataclass dropped
+        on ``JSONDecodeError`` — clients see no behaviour change, but
+        the daemon now refuses to dispatch on types not in the
+        ``MessageType`` catalog.
+        """
         try:
             msg = WSMessage.from_json(raw)
-        except (json.JSONDecodeError, KeyError) as e:
+        except (json.JSONDecodeError, KeyError, ValidationError) as e:
             logger.warning(f"Invalid message from {client.client_id}: {e}")
             return
 
         client.last_message_at = time.monotonic()
 
-        if msg.type == "USER_ACTION":
+        if msg.type == MessageType.USER_ACTION.value:
             await self._handle_user_action(client, msg)
-        elif msg.type == "ACTION_EXECUTE":
+        elif msg.type == MessageType.ACTION_EXECUTE.value:
             await self._handle_user_action(client, msg)
-        elif msg.type == "USER_RATING":
+        elif msg.type == MessageType.USER_RATING.value:
             # Route user ratings through the same callback used for user actions.
             await self._handle_user_action(client, msg)
-        elif msg.type == "IDENTIFY":
+        elif msg.type == MessageType.IDENTIFY.value:
             # Client identifying its type
             client.client_type = msg.payload.get("client_type", "unknown")
             logger.info(
                 f"Client {client.client_id} identified as {client.client_type}"
             )
-        elif msg.type == "CONTEXT_RESPONSE":
+        elif msg.type == MessageType.CONTEXT_RESPONSE.value:
             self._handle_context_response(msg)
-        elif msg.type == "SETTINGS_SYNC":
+        elif msg.type == MessageType.SETTINGS_SYNC.value:
             await self._handle_settings_sync(client, msg)
-        elif msg.type == "ACTIVITY_SYNC":
+        elif msg.type == MessageType.ACTIVITY_SYNC.value:
             await self._handle_activity_sync(client, msg)
-        elif msg.type == "TAB_RELEVANCE_FEEDBACK":
+        elif msg.type == MessageType.TAB_RELEVANCE_FEEDBACK.value:
             await self._handle_tab_relevance_feedback(client, msg)
-        elif msg.type == "LEETCODE_CONTEXT_UPDATE":
+        elif msg.type == MessageType.LEETCODE_CONTEXT_UPDATE.value:
             await self._handle_leetcode_context_update(client, msg)
-        elif msg.type == "INTERVENTION_APPLIED":
+        elif msg.type == MessageType.INTERVENTION_APPLIED.value:
             await self._handle_intervention_applied(client, msg)
-        elif msg.type == "SHUTDOWN":
+        elif msg.type == MessageType.SHUTDOWN.value:
             logger.info("Shutdown requested via WebSocket from %s", client.client_id)
             if self._shutdown_callback is not None:
                 try:
@@ -456,7 +508,7 @@ class WebSocketServer:
         self._sequence += 1
         return await self._broadcast(
             WSMessage(
-                type="INTERVENTION_RESTORE",
+                type=MessageType.INTERVENTION_RESTORE,
                 payload={
                     "intervention_id": intervention_id,
                     "user_action": user_action,
@@ -470,7 +522,7 @@ class WebSocketServer:
         self._sequence += 1
         return await self._broadcast(
             WSMessage(
-                type="SETTINGS_SYNC",
+                type=MessageType.SETTINGS_SYNC,
                 payload=settings,
                 sequence=self._sequence,
             )
@@ -516,7 +568,7 @@ class WebSocketServer:
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending_context_requests[correlation_id] = future
         message = WSMessage(
-            type="CONTEXT_REQUEST",
+            type=MessageType.CONTEXT_REQUEST,
             payload={},
             sequence=self._sequence,
             correlation_id=correlation_id,
@@ -600,7 +652,7 @@ class WebSocketServer:
         if biometrics:
             payload["biometrics"] = biometrics
         return WSMessage(
-            type="STATE_UPDATE",
+            type=MessageType.STATE_UPDATE,
             payload=payload,
             sequence=self._sequence,
             source_client_type="daemon",
@@ -637,7 +689,7 @@ class WebSocketServer:
         if plan.tab_recommendations is not None:
             payload["tab_recommendations"] = plan.tab_recommendations.model_dump()
         return WSMessage(
-            type="INTERVENTION_TRIGGER",
+            type=MessageType.INTERVENTION_TRIGGER,
             payload=payload,
             sequence=self._sequence,
             source_client_type="daemon",
