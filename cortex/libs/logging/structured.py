@@ -75,6 +75,28 @@ class EventType(StrEnum):
     # plans suddenly stopped feeling "smart".
     LLM_BUDGET_KILL = "llm_budget_kill"
 
+    # F13: per-route token bucket rejection. Emitted when an HTTP request
+    # exceeds the configured rate cap and the gateway returns 429 instead
+    # of dispatching the route handler. Carries the bound ``cid`` so
+    # downstream observers can correlate the bounce with the upstream
+    # client behaviour that provoked it.
+    RATE_LIMITED = "rate_limited"
+
+    # F18: ``/state/infer`` fell back to synthetic confidence because the
+    # rule scorer / smoother were not registered (cold daemon, partial
+    # boot, or scorer exception). The response envelope already exposes
+    # ``source="fallback"`` and ``degraded=True``; this event surfaces the
+    # same fact at log-stream granularity so a dashboard or alarm rule can
+    # detect the degradation without polling the response.
+    STATE_INFER_DEGRADED = "state_infer_degraded"
+
+    # F29: prompt assembly trimmed at least one section to fit the token
+    # budget. Carries original vs truncated token counts and the names of
+    # the sections that lost content so the overlay can offer the user a
+    # "Show more context" affordance instead of silently shipping a
+    # partial traceback to the LLM.
+    CONTEXT_TRUNCATED = "context_truncated"
+
 
 class StateTransitionEvent(BaseModel):
     """State transition event data."""

@@ -216,6 +216,8 @@ def _setup_pyside6_mocks() -> bool:
         def show(self): self._visible = True
         def hide(self): self._visible = False
         def close(self): self._visible = False
+        def setVisible(self, v): self._visible = bool(v)
+        def isHidden(self): return not self._visible
         def raise_(self): pass
         def activateWindow(self): pass
         def isVisible(self): return self._visible
@@ -238,12 +240,19 @@ def _setup_pyside6_mocks() -> bool:
         def setGraphicsEffect(self, e): pass
 
     class MockQApplication:
-        def __init__(self, *args): pass
+        _instance = None
+
+        def __init__(self, *args):
+            MockQApplication._instance = self
         def setApplicationName(self, n): pass
         def setOrganizationName(self, n): pass
         def setQuitOnLastWindowClosed(self, v): pass
         def exec(self): return 0
         def quit(self): pass
+
+        @classmethod
+        def instance(cls):
+            return cls._instance
 
     class MockQLabel(MockQWidget):
         def __init__(self, text="", parent=None):

@@ -318,17 +318,27 @@ class InterventionPlan(BaseModel):
         default_factory=list,
         description="Non-fatal validation or grounding warnings to surface in debug UI",
     )
-    # F20 / F27 (audit): non-payload metadata stamped by the daemon to
-    # distinguish real-LLM plans from rule-based fallbacks (``source``
-    # ∈ {``llm``, ``fallback``}), and to surface the reason
-    # (``fallback_reason`` ∈ {``circuit_open``, ``retries_exhausted``,
-    # ``budget_killed``}). The dismissal-model training pipeline reads
-    # ``source`` and skips outcomes from fallback origins so cold-start
-    # dismissals don't poison personalisation.
+    # F20 / F27 / F29 (audit): non-payload metadata stamped by the
+    # daemon. Free-form on purpose so future findings can stash
+    # additional non-LLM-controlled hints without bumping the wire
+    # schema each time. Known keys:
+    #   - ``source`` ∈ {``llm``, ``fallback``} — F27, distinguishes
+    #     real-LLM plans from rule-based fallbacks.
+    #   - ``fallback_reason`` ∈ {``circuit_open``, ``retries_exhausted``,
+    #     ``budget_killed``, ``rule_based``} — F27/F20.
+    #   - ``budget_killed`` (bool) — F20, daily-cost kill-switch fired.
+    #   - ``context_truncated_sections`` (list[str]) — F29, names of
+    #     prompt sections the budget enforcer trimmed.
+    # The dismissal-model training pipeline reads ``source`` and skips
+    # outcomes from fallback origins so cold-start dismissals don't
+    # poison personalisation. Never trust this field for executor
+    # decisions — it is purely an observability hint.
     metadata: dict[str, Any] = Field(
         default_factory=dict,
         description=(
-            "Daemon-stamped plan metadata (e.g. {'source': 'fallback'}). "
+            "Daemon-stamped plan metadata (e.g. {'source': 'fallback'}) "
+            "and prompt-budget telemetry (e.g. "
+            "{'context_truncated_sections': ['terminal_errors']}). "
             "Never trust this field for executor decisions — it is "
             "purely an observability hint."
         ),

@@ -62,7 +62,10 @@ from cortex.services.llm_engine.parser import (
     enrich_plan_with_context,
     validate_intervention_plan,
 )
-from cortex.services.llm_engine.prompts import build_anthropic_messages
+from cortex.services.llm_engine.prompts import (
+    build_anthropic_messages,
+    capture_truncation_report,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -384,13 +387,19 @@ class AnthropicPlanner:
 
         tier = self._select_tier(template_name)
         model_id = self._models[tier]
-        system_blocks, messages = build_anthropic_messages(
-            context,
-            state,
-            constraints,
-            template_name=template_name,
-            extra_context=extra_context,
-        )
+        # F29 (audit): scope a TruncationReport across the prompt-build
+        # so we know which sections lost content. The report is stamped
+        # onto ``InterventionPlan.metadata["context_truncated_sections"]``
+        # after parse so the overlay can offer a "Show more context"
+        # affordance.
+        with capture_truncation_report() as _truncation_report:
+            system_blocks, messages = build_anthropic_messages(
+                context,
+                state,
+                constraints,
+                template_name=template_name,
+                extra_context=extra_context,
+            )
 
         # F30: estimate the input-token cost before issuing the call so
         # the cancellation cost path can bill *something* if the response
@@ -533,6 +542,14 @@ class AnthropicPlanner:
                     enriched.ui_plan.max_visible_lines = half
                 except Exception:
                     pass
+            # F29 (audit): stamp truncated-section names on plan.metadata
+            # so the overlay can render the "Show more context"
+            # affordance. Only populated when at least one section
+            # actually lost content — silent on the happy path.
+            if _truncation_report.truncated:
+                enriched.metadata["context_truncated_sections"] = list(
+                    _truncation_report.sections_trimmed
+                )
             self._cache.put(context, enriched, state, constraints)
             return enriched
 

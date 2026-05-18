@@ -27,11 +27,13 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
+from cortex.libs.logging.correlation import get_correlation_id
+from cortex.libs.logging.structured import EventType
 from cortex.libs.schemas.context import TaskContext
 from cortex.libs.schemas.features import (
     FeatureVector,
@@ -111,10 +113,35 @@ class StateInferRequest(BaseModel):
 
 
 class StateInferResponse(BaseModel):
-    """State inference result."""
+    """State inference result.
+
+    F18 (audit): the ``source`` and ``degraded`` envelope fields let the
+    UI distinguish a real classifier confidence from a synthetic
+    fallback. Pre-fix, a 0.5 confidence from the fallback path looked
+    identical to a 0.5 confidence from the rule scorer — observability
+    and correctness in one bug. Defaults are chosen so existing callers
+    that don't read the fields still get the same wire shape they had
+    before plus two extra boolean-ish fields they can safely ignore.
+    """
 
     estimate: StateEstimate
     timestamp: float = Field(default_factory=time.monotonic)
+    source: Literal["classifier", "fallback"] = Field(
+        "classifier",
+        description=(
+            "``classifier`` when the rule scorer + smoother produced the "
+            "estimate; ``fallback`` when those engines were missing or "
+            "raised and the route returned a synthetic estimate."
+        ),
+    )
+    degraded: bool = Field(
+        False,
+        description=(
+            "True when the daemon could not run real inference and is "
+            "serving a synthetic estimate. UIs surface a banner so the "
+            "user understands the state stream is not authoritative."
+        ),
+    )
 
 
 class ContextBuildRequest(BaseModel):
@@ -348,7 +375,16 @@ async def submit_telemetry_features(
 async def infer_state(
     body: StateInferRequest, request: Request,
 ) -> StateInferResponse:
-    """Compute state from fused features."""
+    """Compute state from fused features.
+
+    F18 (audit): two paths now report distinct envelope shapes. The
+    happy path stamps ``source="classifier"`` (the default); the
+    fallback path stamps ``source="fallback"`` and ``degraded=True`` and
+    emits :data:`EventType.STATE_INFER_DEGRADED` with the bound
+    correlation id. A scorer/smoother exception is treated identically
+    to the not-registered case — surfacing a synthetic confidence as if
+    it were real is exactly the failure mode the audit flagged.
+    """
     reg = _get_registry(request)
 
     # Try to use registered scorer + smoother
@@ -356,12 +392,28 @@ async def infer_state(
     smoother = reg.get("score_smoother")
 
     if scorer is not None and smoother is not None:
-        scores = scorer.compute_scores(body.feature_vector)
-        estimate = smoother.update(scores, body.signal_quality)
-        reg.register("latest_state_estimate", estimate)
-        return StateInferResponse(estimate=estimate)
+        try:
+            scores = scorer.compute_scores(body.feature_vector)
+            estimate = smoother.update(scores, body.signal_quality)
+        except Exception:
+            # F18: scorer/smoother raised — fall through to the synthetic
+            # estimate but flag the response as degraded so the UI can
+            # show a banner instead of silently believing a 0.5
+            # confidence is authoritative.
+            logger.exception("rule scorer / smoother raised; serving fallback estimate")
+        else:
+            reg.register("latest_state_estimate", estimate)
+            return StateInferResponse(estimate=estimate)
 
-    # Fallback: produce a basic estimate without engines
+    # Fallback: produce a basic estimate without engines. Emit the
+    # degradation telemetry so a log aggregator sees the failure even if
+    # the response body is not inspected.
+    logger.warning(
+        "%s reason=%s cid=%s",
+        EventType.STATE_INFER_DEGRADED.value,
+        "scorer_or_smoother_missing" if (scorer is None or smoother is None) else "scorer_raised",
+        get_correlation_id() or "-",
+    )
     estimate = StateEstimate(
         state="FLOW",
         confidence=0.5,
@@ -372,7 +424,11 @@ async def infer_state(
         dwell_seconds=0.0,
     )
     reg.register("latest_state_estimate", estimate)
-    return StateInferResponse(estimate=estimate)
+    return StateInferResponse(
+        estimate=estimate,
+        source="fallback",
+        degraded=True,
+    )
 
 
 # =============================================================================
