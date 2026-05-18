@@ -410,6 +410,14 @@ class CortexDaemon:
 
     async def start(self) -> None:
         """Start the runtime and block until shutdown."""
+        # F07: ensure the local capability token exists before any service
+        # that gates on it (WebSocket SHUTDOWN, launcher /stop) comes up.
+        # Generated lazily, persists across restarts.
+        try:
+            from cortex.libs.auth import load_or_create_token
+            load_or_create_token()
+        except Exception:
+            logger.warning("Could not provision Cortex auth token", exc_info=True)
         self._register_services()
         self._input_hooks.start()
         self._window_tracker.start()

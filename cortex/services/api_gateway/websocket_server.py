@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from cortex.libs.auth import verify_token
 from cortex.libs.config.settings import APIConfig
 from cortex.libs.logging.correlation import correlation_scope, get_correlation_id
 from cortex.libs.schemas.intervention import InterventionPlan
@@ -304,6 +305,19 @@ class WebSocketServer:
         elif msg.type == "INTERVENTION_APPLIED":
             await self._handle_intervention_applied(client, msg)
         elif msg.type == "SHUTDOWN":
+            # F07: require the capability token before honouring a remote
+            # SHUTDOWN. Without this gate any localhost origin (malicious
+            # webpage in another tab, hostile extension) could reach this
+            # path and kill the daemon. The token lives in a mode-0600
+            # file legitimate clients (desktop_shell, native_host) can
+            # read; cross-origin web pages cannot.
+            presented = (msg.payload or {}).get("auth_token")
+            if not verify_token(presented):
+                logger.warning(
+                    "Rejected SHUTDOWN from %s: missing or invalid auth token",
+                    client.client_id,
+                )
+                return
             logger.info("Shutdown requested via WebSocket from %s", client.client_id)
             if self._shutdown_callback is not None:
                 try:
