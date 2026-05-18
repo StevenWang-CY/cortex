@@ -249,72 +249,78 @@ function CortexPopup(): React.ReactElement {
         });
     }, []);
 
-    useEffect(() => {
-        const listener = (msg: Record<string, unknown>) => {
-            switch (msg.type) {
-                case "CONNECTION_CHANGED":
-                    setConnected(msg.connected as boolean);
-                    break;
-                case "STATE_UPDATE":
-                    setState(msg.payload as CortexState);
-                    if (msg.focusSession) setFocus(msg.focusSession as FocusSnapshot);
-                    break;
-                case "FOCUS_SESSION_STARTED":
-                    break;
-                case "FOCUS_SESSION_ENDED":
-                    setFocus(null);
-                    chrome.runtime.sendMessage({ type: "GET_DAILY_STATS" }, (stats) => {
-                        if (stats) setDailyStats(stats);
-                    });
-                    break;
-                case "HEALTH_ALERT":
-                    setAlert({ title: msg.title as string, body: msg.body as string });
-                    setTimeout(() => setAlert(null), 10000);
-                    break;
-                case "BREAK_SUGGESTED":
-                    setAlert({ title: "Time for a break", body: msg.reason as string });
-                    setTimeout(() => setAlert(null), 10000);
-                    break;
-                case "INTERVENTION_TRIGGER": {
-                    const p = msg.payload as Record<string, unknown>;
-                    const rawActions = (p.suggested_actions as Record<string, unknown>[]) || [];
-                    const recs = (p.tab_recommendations as { tabs: Record<string, unknown>[]; summary: string }) || null;
-                    setActiveActions(synthesizeActions(rawActions, recs));
-                    setTabRecs(recs);
-                    setErrAnalysis((p.error_analysis as Record<string, string>) || null);
-                    setInterventionId(String(p.intervention_id || ""));
-                    setCausalExplanation(String(p.causal_explanation || ""));
-                    setApplied(false);
-                    break;
-                }
-                case "INTERVENTION_RESTORE":
-                    setActiveActions([]);
-                    setTabRecs(null);
-                    setErrAnalysis(null);
-                    setCausalExplanation("");
-                    setApplied(false);
-                    break;
-                case "SETTINGS_SYNC": {
-                    const settings = msg.payload as Record<string, unknown>;
-                    if (typeof settings.quiet_mode === "boolean") {
-                        setQuietMode(settings.quiet_mode);
-                    }
-                    break;
-                }
-                case "MORNING_BRIEFING": {
-                    const b = msg.payload as Record<string, unknown>;
-                    setBriefing({
-                        summary: String(b.summary || ""),
-                        action_items: (b.action_items as string[]) || [],
-                        left_off_at: String(b.left_off_at || ""),
-                    });
-                    break;
-                }
+    // F50: stable listener identity so addListener/removeListener
+    // refer to the same function across re-renders. React's setState
+    // identities are already stable; pinning the handler with
+    // `useCallback([])` makes the contract obvious and gives the cleanup
+    // function the exact same reference to remove.
+    const popupMessageListener = useCallback((msg: Record<string, unknown>) => {
+        switch (msg.type) {
+            case "CONNECTION_CHANGED":
+                setConnected(msg.connected as boolean);
+                break;
+            case "STATE_UPDATE":
+                setState(msg.payload as CortexState);
+                if (msg.focusSession) setFocus(msg.focusSession as FocusSnapshot);
+                break;
+            case "FOCUS_SESSION_STARTED":
+                break;
+            case "FOCUS_SESSION_ENDED":
+                setFocus(null);
+                chrome.runtime.sendMessage({ type: "GET_DAILY_STATS" }, (stats) => {
+                    if (stats) setDailyStats(stats);
+                });
+                break;
+            case "HEALTH_ALERT":
+                setAlert({ title: msg.title as string, body: msg.body as string });
+                setTimeout(() => setAlert(null), 10000);
+                break;
+            case "BREAK_SUGGESTED":
+                setAlert({ title: "Time for a break", body: msg.reason as string });
+                setTimeout(() => setAlert(null), 10000);
+                break;
+            case "INTERVENTION_TRIGGER": {
+                const p = msg.payload as Record<string, unknown>;
+                const rawActions = (p.suggested_actions as Record<string, unknown>[]) || [];
+                const recs = (p.tab_recommendations as { tabs: Record<string, unknown>[]; summary: string }) || null;
+                setActiveActions(synthesizeActions(rawActions, recs));
+                setTabRecs(recs);
+                setErrAnalysis((p.error_analysis as Record<string, string>) || null);
+                setInterventionId(String(p.intervention_id || ""));
+                setCausalExplanation(String(p.causal_explanation || ""));
+                setApplied(false);
+                break;
             }
-        };
-        chrome.runtime.onMessage.addListener(listener);
-        return () => chrome.runtime.onMessage.removeListener(listener);
+            case "INTERVENTION_RESTORE":
+                setActiveActions([]);
+                setTabRecs(null);
+                setErrAnalysis(null);
+                setCausalExplanation("");
+                setApplied(false);
+                break;
+            case "SETTINGS_SYNC": {
+                const settings = msg.payload as Record<string, unknown>;
+                if (typeof settings.quiet_mode === "boolean") {
+                    setQuietMode(settings.quiet_mode);
+                }
+                break;
+            }
+            case "MORNING_BRIEFING": {
+                const b = msg.payload as Record<string, unknown>;
+                setBriefing({
+                    summary: String(b.summary || ""),
+                    action_items: (b.action_items as string[]) || [],
+                    left_off_at: String(b.left_off_at || ""),
+                });
+                break;
+            }
+        }
     }, []);
+
+    useEffect(() => {
+        chrome.runtime.onMessage.addListener(popupMessageListener);
+        return () => chrome.runtime.onMessage.removeListener(popupMessageListener);
+    }, [popupMessageListener]);
 
     const handleConnect = useCallback(() => {
         sendWithCid({ type: "CONNECT" });

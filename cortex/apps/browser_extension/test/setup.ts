@@ -8,6 +8,11 @@
  */
 
 import { afterEach, beforeEach } from "vitest";
+
+// Suppress React 18 act() warning during component-mount tests; vitest
+// runs them synchronously and we wrap explicit state changes already.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 import {
     installChromeFake,
     resetChromeFake,
