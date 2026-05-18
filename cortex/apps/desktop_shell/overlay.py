@@ -322,6 +322,8 @@ class OverlayWindow(QWidget):
         self._causal_toggle = QToolButton()
         self._causal_toggle.setCheckable(True)
         self._causal_toggle.setText("Show more")
+        # F55: accessible name + description for VoiceOver / screen readers.
+        self._causal_toggle.setAccessibleName("Show full causal explanation")
         self._causal_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
         self._causal_toggle.setStyleSheet(
             "QToolButton {"
@@ -348,6 +350,8 @@ class OverlayWindow(QWidget):
         # Dismiss button — HUD-style capsule.
         self._dismiss_btn = QPushButton("Dismiss (Esc)")
         self._dismiss_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        # F55: accessible name for VoiceOver.
+        self._dismiss_btn.setAccessibleName("Dismiss intervention")
         self._dismiss_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
         self._dismiss_btn.setStyleSheet(
             "QPushButton {"
@@ -368,6 +372,12 @@ class OverlayWindow(QWidget):
         )
 
         self._main_layout.addWidget(self._card)
+
+        # F55: explicit tab-order chain. Without setTabOrder, Qt falls
+        # back to widget-creation order which the cascading micro-step
+        # rebuilds in show_intervention can scramble. Causal toggle (if
+        # surfaced) comes between the steps and the dismiss button.
+        QWidget.setTabOrder(self._causal_toggle, self._dismiss_btn)
 
     # ------------------------------------------------------------------
     # Public API (preserved byte-identical)

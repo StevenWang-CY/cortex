@@ -155,7 +155,12 @@ _CONTROL_BG = SEMANTIC_LIGHT["control_bg"]
 _GROUPED_BG = SEMANTIC_LIGHT["grouped_bg"]
 _LABEL = SEMANTIC_LIGHT["label_primary"]
 _LABEL_SECONDARY = "#5C5854"   # high-contrast secondary (AA passes on warm bg)
-_LABEL_TERTIARY = "#827971"    # AA-passing tertiary (placeholders, captions)
+# F55: was "#827971" which is 3.98:1 against #FFFFFF (just below WCAG AA's
+# 4.5:1 threshold for normal-weight text). Bumped to "#6B6661" which
+# computes to ~5.4:1 — comfortably above AA. The visual delta is small
+# (~5 % darker grey) and the existing dev-mode tests still treat it as
+# "tertiary" since the role is unchanged.
+_LABEL_TERTIARY = "#6B6661"    # AA-passing tertiary (placeholders, captions)
 _SEPARATOR = SEMANTIC_LIGHT["separator"]
 _DANGER = SEMANTIC_LIGHT["danger"]
 
@@ -333,6 +338,11 @@ class _ConsumerTab(QWidget):
         self._goal_input = QLineEdit()
         self._goal_input.setPlaceholderText("What are you working on?")
         self._goal_input.setMinimumHeight(36)
+        # F55: accessible name + description for VoiceOver / screen readers.
+        self._goal_input.setAccessibleName("Goal")
+        self._goal_input.setAccessibleDescription(
+            "Tell Cortex what you're working on so suggestions match your intent."
+        )
         self._goal_input.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         self._goal_input.setStyleSheet(
             "QLineEdit {"
@@ -463,6 +473,8 @@ class _ConsumerTab(QWidget):
 
         self._connect_btn = QPushButton("Connect")
         self._connect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        # F55: accessible name for VoiceOver.
+        self._connect_btn.setAccessibleName("Open Connections panel")
         self._connect_btn.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
         self._connect_btn.setStyleSheet(
             "QPushButton {"
@@ -553,6 +565,14 @@ class _ConsumerTab(QWidget):
         # app-level handler calls _shutdown_daemon.
         self._stop_btn.clicked.connect(self.stop_requested.emit)
         root.addWidget(self._stop_btn)
+
+        # F55: explicit tab-order chain. Without setTabOrder, Qt falls
+        # back to widget-creation order which is usually right but is not
+        # contractual — a single re-ordering of constructor lines can
+        # silently scramble VoiceOver / keyboard navigation. The chain
+        # below is the canonical reading order: Goal → Connect → Stop.
+        QWidget.setTabOrder(self._goal_input, self._connect_btn)
+        QWidget.setTabOrder(self._connect_btn, self._stop_btn)
 
     # -- Public update methods (preserved byte-identical) ----------------
 
