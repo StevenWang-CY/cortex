@@ -7,6 +7,7 @@ that picks the right template based on workspace mode and context.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 
@@ -509,6 +510,35 @@ PROMPT_TEMPLATES: dict[str, str] = {
     "alignment_summary": _ALIGNMENT_SUMMARY,
     "deep_bottleneck_diagnosis": _DEEP_BOTTLENECK_DIAGNOSIS,
 }
+
+
+def _compute_prompt_template_version() -> str:
+    """Hash SYSTEM_PROMPT + every registered template body (F28).
+
+    Used as part of :class:`cortex.services.llm_engine.cache.LLMCache`'s
+    key so a template edit invalidates cached plans on the next call
+    instead of serving stale results for up to ``cache_ttl_seconds``.
+
+    The hash sorts the template names alphabetically before feeding the
+    body in so the version is stable across import-order shuffles (e.g.
+    a future refactor that registers templates via a decorator).
+    """
+    h = hashlib.sha256()
+    h.update(SYSTEM_PROMPT.encode("utf-8"))
+    h.update(b"\x00")
+    for name in sorted(PROMPT_TEMPLATES):
+        h.update(name.encode("utf-8"))
+        h.update(b"\x00")
+        h.update(PROMPT_TEMPLATES[name].encode("utf-8"))
+        h.update(b"\x00")
+    return h.hexdigest()[:12]
+
+
+# F28: short hex fingerprint of SYSTEM_PROMPT + every template body.
+# Included in :class:`LLMCache`'s key so a template edit invalidates
+# cached plans on next call instead of serving stale results for up to
+# ``cache_ttl_seconds``. Recomputed at import time only.
+PROMPT_TEMPLATE_VERSION: str = _compute_prompt_template_version()
 
 
 def select_prompt_template(context: TaskContext) -> str:
