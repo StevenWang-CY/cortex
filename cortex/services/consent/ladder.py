@@ -13,6 +13,8 @@ based on the user's approval history.
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import logging
 import time
 from typing import Any
@@ -91,6 +93,23 @@ class ConsentLadder:
         self._action_states: dict[str, dict] = {}
         self._loaded = False
 
+        # F24: serialize concurrent reads and writes against the
+        # in-memory state. The TriggerPolicy reads consent levels while
+        # ``POST /consent/reset`` may be clearing them in parallel; the
+        # pre-fix code had no synchronisation, so a reset arriving
+        # mid-plan-construction could leave a partially-reset state
+        # dict visible to the in-flight planner. We lazy-instantiate
+        # because ``asyncio.Lock()`` binds to whichever loop is current
+        # at construction time and the ladder may be built on a
+        # different loop than the one that actually serves requests.
+        self._lock: asyncio.Lock | None = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Return the lock bound to the running event loop (F24)."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
     async def _ensure_loaded(self) -> None:
         """Load consent state from store if available."""
         if self._loaded:
@@ -150,11 +169,13 @@ class ConsentLadder:
             ConsentDecision with allowed/denied and effective level.
         """
         await self._ensure_loaded()
-
-        state = self._get_state(action_type)
-        current_level = state["level"]
-        min_level = self._policy.get_minimum_level(action_type)
-        global_max = self._policy.global_max_level
+        # F24: read the state under the lock so a concurrent reset()
+        # cannot leave us looking at a half-cleared dict.
+        async with self._get_lock():
+            state = self._get_state(action_type)
+            current_level = state["level"]
+            min_level = self._policy.get_minimum_level(action_type)
+            global_max = self._policy.global_max_level
 
         # Effective level is capped by global max and current earned level
         max_allowed = min(current_level, global_max)
@@ -189,37 +210,41 @@ class ConsentLadder:
         After enough approvals, the consent level escalates.
         """
         await self._ensure_loaded()
-        state = self._get_state(action_type)
-        state["approvals"] += 1
-        state["total_approvals"] += 1
-        state["last_approval"] = time.time()
-        state.setdefault("approval_timestamps", []).append(state["last_approval"])
-        self._prune_old_timestamps(state)
+        # F24: mutate the state under the lock so a concurrent
+        # ``record_rejection`` or ``reset`` cannot interleave with the
+        # escalation check and leave the dict in an inconsistent shape.
+        async with self._get_lock():
+            state = self._get_state(action_type)
+            state["approvals"] += 1
+            state["total_approvals"] += 1
+            state["last_approval"] = time.time()
+            state.setdefault("approval_timestamps", []).append(state["last_approval"])
+            self._prune_old_timestamps(state)
 
-        # Check for escalation (recency-weighted trust, no recent reversals).
-        now = time.time()
-        weighted_approvals = self._weighted_recent_approvals(state, now)
-        recent_rejections = len(state.get("rejection_timestamps", []))
-        recent_approvals = len(state.get("approval_timestamps", []))
-        if (
-            recent_approvals >= self._escalation_threshold
-            and weighted_approvals >= (self._escalation_threshold * 0.8)
-            and recent_rejections == 0
-            and state["level"] < AUTONOMOUS_ACT
-        ):
-            old_level = state["level"]
-            state["level"] = min(state["level"] + 1, AUTONOMOUS_ACT)
-            state["approvals"] = 0  # Reset counter for next level
-            state["approval_timestamps"] = []  # Recency window resets per earned tier.
-            logger.info(
-                "Consent escalated for '%s': %s → %s (after %d approvals)",
-                action_type,
-                _LEVEL_NAMES.get(old_level, "?"),
-                _LEVEL_NAMES.get(state["level"], "?"),
-                self._escalation_threshold,
-            )
+            # Check for escalation (recency-weighted trust, no recent reversals).
+            now = time.time()
+            weighted_approvals = self._weighted_recent_approvals(state, now)
+            recent_rejections = len(state.get("rejection_timestamps", []))
+            recent_approvals = len(state.get("approval_timestamps", []))
+            if (
+                recent_approvals >= self._escalation_threshold
+                and weighted_approvals >= (self._escalation_threshold * 0.8)
+                and recent_rejections == 0
+                and state["level"] < AUTONOMOUS_ACT
+            ):
+                old_level = state["level"]
+                state["level"] = min(state["level"] + 1, AUTONOMOUS_ACT)
+                state["approvals"] = 0  # Reset counter for next level
+                state["approval_timestamps"] = []  # Recency window resets per earned tier.
+                logger.info(
+                    "Consent escalated for '%s': %s -> %s (after %d approvals)",
+                    action_type,
+                    _LEVEL_NAMES.get(old_level, "?"),
+                    _LEVEL_NAMES.get(state["level"], "?"),
+                    self._escalation_threshold,
+                )
 
-        await self._persist()
+            await self._persist()
 
     async def record_rejection(self, action_type: str) -> None:
         """
@@ -228,26 +253,27 @@ class ConsentLadder:
         Rejections count against the approval progress.
         """
         await self._ensure_loaded()
-        state = self._get_state(action_type)
-        state["rejections"] += 1
-        state["last_rejection"] = time.time()
-        state.setdefault("rejection_timestamps", []).append(state["last_rejection"])
-        self._prune_old_timestamps(state)
+        async with self._get_lock():
+            state = self._get_state(action_type)
+            state["rejections"] += 1
+            state["last_rejection"] = time.time()
+            state.setdefault("rejection_timestamps", []).append(state["last_rejection"])
+            self._prune_old_timestamps(state)
 
-        # 3 rejections at current level → de-escalate
-        if state["rejections"] >= 3 and state["level"] > SUGGEST:
-            old_level = state["level"]
-            state["level"] = max(state["level"] - 1, SUGGEST)
-            state["rejections"] = 0
-            state["approvals"] = 0
-            logger.info(
-                "Consent de-escalated for '%s': %s → %s (after 3 rejections)",
-                action_type,
-                _LEVEL_NAMES.get(old_level, "?"),
-                _LEVEL_NAMES.get(state["level"], "?"),
-            )
+            # 3 rejections at current level -> de-escalate
+            if state["rejections"] >= 3 and state["level"] > SUGGEST:
+                old_level = state["level"]
+                state["level"] = max(state["level"] - 1, SUGGEST)
+                state["rejections"] = 0
+                state["approvals"] = 0
+                logger.info(
+                    "Consent de-escalated for '%s': %s -> %s (after 3 rejections)",
+                    action_type,
+                    _LEVEL_NAMES.get(old_level, "?"),
+                    _LEVEL_NAMES.get(state["level"], "?"),
+                )
 
-        await self._persist()
+            await self._persist()
 
     def _prune_old_timestamps(self, state: dict) -> None:
         now = time.time()
@@ -268,8 +294,9 @@ class ConsentLadder:
     async def get_level(self, action_type: str) -> int:
         """Get current consent level for an action type."""
         await self._ensure_loaded()
-        state = self._get_state(action_type)
-        return state["level"]
+        async with self._get_lock():
+            state = self._get_state(action_type)
+            return state["level"]
 
     async def get_level_name(self, action_type: str) -> str:
         """Get human-readable consent level name."""
@@ -279,12 +306,20 @@ class ConsentLadder:
     async def get_all_states(self) -> dict[str, dict]:
         """Get all action consent states for display."""
         await self._ensure_loaded()
-        return dict(self._action_states)
+        # F24: deep-copy under the lock so the caller cannot observe a
+        # mid-mutation snapshot if a writer is also in flight.
+        async with self._get_lock():
+            return copy.deepcopy(self._action_states)
 
     async def reset(self, action_type: str | None = None) -> None:
         """Reset consent state for one or all action types."""
-        if action_type:
-            self._action_states.pop(action_type, None)
-        else:
-            self._action_states.clear()
-        await self._persist()
+        # F24: gate the reset behind the same lock readers use, so a
+        # plan being constructed cannot bake a now-rescinded level into
+        # an outgoing intervention. Lock is released even on exception
+        # because ``async with`` always runs ``__aexit__``.
+        async with self._get_lock():
+            if action_type:
+                self._action_states.pop(action_type, None)
+            else:
+                self._action_states.clear()
+            await self._persist()
