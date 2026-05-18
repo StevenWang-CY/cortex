@@ -45,6 +45,7 @@ from cortex.libs.llm.anthropic_client import (
     build_anthropic_sdk_client,
     resolve_anthropic_model_id,
 )
+from cortex.libs.logging.correlation import get_correlation_id
 from cortex.libs.schemas.context import TaskContext
 from cortex.libs.schemas.intervention import (
     InterventionPlan,
@@ -196,16 +197,40 @@ class AnthropicPlanner:
     ) -> None:
         self._config = config or LLMConfig()
 
-        if self._config.provider == "bedrock":
-            token = _keychain_get_bedrock_token(self._config)
-            if token and not os.environ.get("AWS_BEARER_TOKEN_BEDROCK"):
-                # Surface to env so the SDK constructor can read it.
-                os.environ["AWS_BEARER_TOKEN_BEDROCK"] = token
-
-        self._sdk = sdk or build_anthropic_sdk_client(
-            provider=self._config.provider,
-            bedrock_region=self._config.bedrock.aws_region,
-        )
+        # F11: previously the keychain-sourced Bedrock token was written
+        # to ``os.environ`` permanently, which then propagated to every
+        # subprocess the daemon spawned (capture worker, native host
+        # re-launches, project launcher terminals). A debugger or
+        # crash-dump tool attached to any descendant could read it.
+        # The Anthropic SDK reads ``AWS_BEARER_TOKEN_BEDROCK`` at
+        # construction time only, so we narrow the env mutation to that
+        # window and restore the prior value (or unset) on exit.
+        if sdk is None and self._config.provider == "bedrock":
+            keychain_token = (
+                _keychain_get_bedrock_token(self._config)
+                if not os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
+                else None
+            )
+            prior = os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
+            try:
+                if keychain_token:
+                    os.environ["AWS_BEARER_TOKEN_BEDROCK"] = keychain_token
+                self._sdk = build_anthropic_sdk_client(
+                    provider=self._config.provider,
+                    bedrock_region=self._config.bedrock.aws_region,
+                )
+            finally:
+                if keychain_token:
+                    # Restore the prior state precisely: re-set or unset.
+                    if prior is None:
+                        os.environ.pop("AWS_BEARER_TOKEN_BEDROCK", None)
+                    else:
+                        os.environ["AWS_BEARER_TOKEN_BEDROCK"] = prior
+        else:
+            self._sdk = sdk or build_anthropic_sdk_client(
+                provider=self._config.provider,
+                bedrock_region=self._config.bedrock.aws_region,
+            )
 
         # Resolve each tier's provider-specific model identifier once.
         self._models: dict[ModelTier, str] = {
@@ -356,10 +381,12 @@ class AnthropicPlanner:
             self._circuit.record_success()
             latency_ms = (time.perf_counter() - t0) * 1000.0
             usage = getattr(response, "usage", None)
+            # F19: include the active correlation id so downstream cost
+            # accounting (F20) can group spend by originating request.
             logger.info(
                 "llm.request status=ok model=%s template=%s tier=%s "
                 "latency_ms=%.0f tokens_in=%s tokens_out=%s "
-                "cache_read=%s cache_write=%s",
+                "cache_read=%s cache_write=%s cid=%s",
                 model_id,
                 template_name,
                 tier,
@@ -368,6 +395,7 @@ class AnthropicPlanner:
                 getattr(usage, "output_tokens", None),
                 getattr(usage, "cache_read_input_tokens", None),
                 getattr(usage, "cache_creation_input_tokens", None),
+                get_correlation_id() or "-",
             )
 
             enriched = enrich_plan_with_context(plan, context)

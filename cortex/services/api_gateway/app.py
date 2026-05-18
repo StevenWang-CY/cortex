@@ -21,10 +21,14 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from cortex.libs.config.settings import APIConfig, CortexConfig
+from cortex.libs.logging.correlation import correlation_scope
+
+_REQUEST_ID_HEADER = "X-Cortex-Request-ID"
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +122,22 @@ def create_app(
         lifespan=lifespan,
     )
 
-    # CORS — allow local extensions to connect
+    # F19: correlation IDs. Every request enters a scope that mints (or
+    # accepts via ``X-Cortex-Request-ID``) a correlation id, binds it to
+    # both ``contextvars`` and structlog, and echoes it back on the
+    # response so the calling UI can quote it in error toasts.
+    class _CorrelationMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            incoming = request.headers.get(_REQUEST_ID_HEADER)
+            with correlation_scope(incoming) as cid:
+                response = await call_next(request)
+                response.headers[_REQUEST_ID_HEADER] = cid
+                return response
+
+    app.add_middleware(_CorrelationMiddleware)
+
+    # CORS — allow local extensions to connect. Expose the request-id
+    # header so browser-side clients can read it off responses.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
@@ -134,6 +153,7 @@ def create_app(
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=[_REQUEST_ID_HEADER],
     )
 
     # Store config on app state for access in routes

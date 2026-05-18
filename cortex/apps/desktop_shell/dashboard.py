@@ -347,13 +347,20 @@ class _ConsumerTab(QWidget):
         root.addSpacing(SP5)
 
         # ── Biometrics inset section (no shadow, hairline border) ──
+        # NB: Qt's stylesheet selector ``QFrame`` matches QFrame *and every
+        # subclass* (incl. QLabel, QLCDNumber, QStackedWidget). Without the
+        # objectName scope, the card's white-background / hairline-border /
+        # 8px-radius leak into every QLabel descendant, which scrambles
+        # text rendering (see the Connections panel regression). All six
+        # card stylesheets in desktop_shell are scoped this way.
         bio_card = QFrame()
+        bio_card.setObjectName("CortexBioCard")
         bio_card.setStyleSheet(
-            f"QFrame {{"
+            "QFrame#CortexBioCard {"
             f"  background: {_CONTROL_BG};"
             f"  border: 0.5px solid {_SEPARATOR};"
             f"  border-radius: {RADIUS_CARD}px;"
-            "}}"
+            "}"
         )
         bio_inner = QVBoxLayout(bio_card)
         bio_inner.setContentsMargins(SP5, SP4, SP5, SP4)
@@ -904,6 +911,22 @@ class DashboardWindow(QWidget):
 
     def showEvent(self, event: object) -> None:  # noqa: D401 - Qt override
         super().showEvent(event)
+        # On first show, snap to the centre of whatever screen the user
+        # currently has so a stale geometry from a previous multi-monitor
+        # session can't strand the window at e.g. x=2412 on a 1728-wide
+        # display. Subsequent shows respect wherever the user dragged it.
+        if not getattr(self, "_positioned_once", False):
+            try:
+                screen = self.screen()
+                if screen is not None:
+                    geo = screen.availableGeometry()
+                    self.move(
+                        geo.x() + (geo.width() - self.width()) // 2,
+                        geo.y() + (geo.height() - self.height()) // 3,
+                    )
+            except Exception:
+                pass
+            self._positioned_once = True
         # Apply native materials once winId() is valid. Re-applying on each
         # show is cheap and idempotent.
         try:

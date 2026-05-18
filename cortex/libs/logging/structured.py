@@ -58,6 +58,11 @@ class EventType(StrEnum):
     WS_MESSAGE_SENT = "ws_message_sent"
     WS_MESSAGE_RECEIVED = "ws_message_received"
 
+    # F10: action-safety events. Emitted when the daemon refuses a
+    # specific SuggestedAction (bad URL scheme, out-of-range tab_index,
+    # etc.) before it can reach the executor in the extension.
+    INTERVENTION_ACTION_REJECTED = "intervention_action_rejected"
+
 
 class StateTransitionEvent(BaseModel):
     """State transition event data."""
@@ -148,8 +153,11 @@ def configure_logging(
         level=getattr(logging, level.upper()),
     )
 
-    # Build processor chain
+    # Build processor chain. ``merge_contextvars`` pulls bound context (e.g.
+    # the correlation id from ``cortex.libs.logging.correlation``) into
+    # every record so callers don't have to thread it explicitly.
     processors: list[structlog.types.Processor] = [
+        structlog.contextvars.merge_contextvars,
         structlog.stdlib.filter_by_level,
         structlog.stdlib.add_logger_name,
         structlog.stdlib.add_log_level,
@@ -175,6 +183,13 @@ def configure_logging(
         logger_factory=structlog.stdlib.LoggerFactory(),
         cache_logger_on_first_use=True,
     )
+
+    # Mirror the correlation id onto stdlib log records so non-structlog
+    # callers (e.g. ``logging.getLogger(__name__)``) can surface it via
+    # JSON formatters / filters downstream. Idempotent.
+    from cortex.libs.logging.correlation import install_stdlib_filter
+
+    install_stdlib_filter()
 
 
 def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:

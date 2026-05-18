@@ -188,8 +188,9 @@ class ConnectionsPanel(QWidget):
 
         # ── Translocation warning (yellow info banner) ────────────────
         self._transloc_warning = QFrame()
+        self._transloc_warning.setObjectName("CortexTranslocWarn")
         self._transloc_warning.setStyleSheet(
-            "QFrame {"
+            "QFrame#CortexTranslocWarn {"
             f"  background: {_WARNING_BG};"
             f"  border: 0.5px solid rgba(217, 161, 0, 0.30);"
             f"  border-radius: {RADIUS_CARD}px;"
@@ -266,8 +267,12 @@ class ConnectionsPanel(QWidget):
 
     def _row_card(self) -> QFrame:
         card = QFrame()
+        card.setObjectName("CortexConnRow")
+        # Give cards a comfortable minimum height so Qt can't squish
+        # their inner widgets into invisibility on small windows.
+        card.setMinimumHeight(110)
         card.setStyleSheet(
-            "QFrame {"
+            "QFrame#CortexConnRow {"
             f"  background: {_CONTROL_BG};"
             f"  border: 0.5px solid {_SEPARATOR};"
             f"  border-radius: {RADIUS_CARD}px;"

@@ -259,6 +259,22 @@ def stop_daemon() -> dict:
     return {"status": "stopped"}
 
 
+def _get_auth_token_response() -> dict:
+    """Return the daemon's capability token to the extension.
+
+    Loads or creates the token via :func:`cortex.libs.auth.load_or_create_token`.
+    On import failure (e.g. running this script outside an installed
+    venv) returns a structured error so the extension can degrade
+    gracefully rather than blocking on a missing token.
+    """
+    try:
+        from cortex.libs.auth import load_or_create_token
+
+        return {"status": "ok", "token": load_or_create_token()}
+    except Exception as exc:  # pragma: no cover - import-path dependent
+        return {"status": "error", "error": f"auth_token_unavailable: {exc}"}
+
+
 def main() -> None:
     log("--- invoked ---")
     try:
@@ -272,6 +288,14 @@ def main() -> None:
             result = stop_daemon()
         elif command == "status":
             result = {"status": "running" if is_daemon_running() else "stopped"}
+        elif command == "get_auth_token":
+            # F07b/F08: extension cannot read mode-0600 files directly;
+            # the native host runs as the user and CAN. The browser↔host
+            # boundary is already OS-authenticated (chrome.runtime.host
+            # is provisioned per-profile), so returning the token here
+            # does not widen the attack surface — it just reaches the
+            # capability gates we added on WS SHUTDOWN and launcher /stop.
+            result = _get_auth_token_response()
         else:
             result = {"status": "error", "error": f"Unknown command: {command}"}
 

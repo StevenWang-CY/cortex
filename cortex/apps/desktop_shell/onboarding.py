@@ -18,7 +18,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -188,24 +188,118 @@ class OnboardingWindow(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Cortex Setup")
-        self.setMinimumSize(560, 620)
+        # Roomy default. The previous 560×620 was shorter than the
+        # combined card heights, so Qt compressed widgets into each
+        # other (e.g. card 3's region picker + token row overlapped the
+        # description and hint paragraphs).
+        self.setMinimumSize(600, 720)
+        self.resize(640, 820)
         self.setStyleSheet(f"background: {_WINDOW_BG}; color: {_LABEL};")
         self._build_ui()
+
+        # Permissions are granted in System Settings out-of-process — there's
+        # no callback path back into the app. Poll every 1.5s while the
+        # wizard is visible so the "Not granted" pills flip to "Granted"
+        # without a relaunch. Timer is paused on hide via showEvent below.
+        self._permission_timer = QTimer(self)
+        self._permission_timer.setInterval(1500)
+        self._permission_timer.timeout.connect(self._refresh_permission_states)
+        self._permission_timer.start()
+
+    def _refresh_permission_states(self) -> None:
+        try:
+            cam = check_camera_permission()
+            getattr(self._camera_step, "_cortex_set_state", lambda _b: None)(cam)
+        except Exception:
+            pass
+        try:
+            acc = check_accessibility_permission()
+            getattr(self._accessibility_step, "_cortex_set_state", lambda _b: None)(acc)
+        except Exception:
+            pass
 
     # -- Native chrome ---------------------------------------------------
 
     def showEvent(self, event: object) -> None:  # noqa: D401 - Qt override
         super().showEvent(event)
+        # First-show centering — prevents stale Qt geometry from a previous
+        # multi-monitor session from stranding the window off-screen.
+        if not getattr(self, "_positioned_once", False):
+            try:
+                screen = self.screen()
+                if screen is not None:
+                    geo = screen.availableGeometry()
+                    self.move(
+                        geo.x() + (geo.width() - self.width()) // 2,
+                        geo.y() + max(40, (geo.height() - self.height()) // 4),
+                    )
+            except Exception:
+                pass
+            self._positioned_once = True
         try:
             mac_native.apply_unified_titlebar(self)
             mac_native.apply_vibrancy(self, material="popover")
         except Exception:
             pass
+        # Resume permission polling whenever the wizard becomes visible.
+        try:
+            if not self._permission_timer.isActive():
+                self._permission_timer.start()
+            self._refresh_permission_states()
+        except Exception:
+            pass
+
+    def hideEvent(self, event: object) -> None:  # noqa: D401 - Qt override
+        try:
+            self._permission_timer.stop()
+        except Exception:
+            pass
+        super().hideEvent(event)
 
     def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
+        # Two-tier layout:
+        #   outer: window itself (no margin) → host QScrollArea
+        #   inner: scrollable content widget with the actual layout
+        # This way the user can shrink the window without overlapping
+        # any card, and tall content scrolls naturally.
+        try:
+            from PySide6.QtWidgets import QScrollArea
+        except ImportError:  # pragma: no cover
+            QScrollArea = None  # type: ignore[assignment]
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        content = QWidget()
+        content.setObjectName("CortexOnboardingContent")
+        content.setStyleSheet(
+            f"#CortexOnboardingContent {{ background: {_WINDOW_BG}; }}"
+        )
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(SP8, SP8, SP8, SP8)
         layout.setSpacing(SP5)
+
+        if QScrollArea is not None:
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setStyleSheet(
+                "QScrollArea { border: none; background: transparent; }"
+                "QScrollBar:vertical { background: transparent; width: 8px; }"
+                "QScrollBar::handle:vertical {"
+                "  background: rgba(0,0,0,0.18); border-radius: 4px;"
+                "  min-height: 24px;"
+                "}"
+                "QScrollBar::handle:vertical:hover { background: rgba(0,0,0,0.32); }"
+                "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {"
+                "  height: 0;"
+                "}"
+            )
+            scroll.setWidget(content)
+            outer.addWidget(scroll)
+        else:  # pragma: no cover - test stub path
+            outer.addWidget(content)
 
         # ── Brand wordmark + welcome header ───────────────────────────
         brand = QLabel("Cortex")
@@ -241,26 +335,26 @@ class OnboardingWindow(QWidget):
         layout.addSpacing(SP3)
 
         # ── Step 1: Camera ────────────────────────────────────────────
-        layout.addWidget(self._make_step(
+        self._camera_step = self._make_step(
             "Camera access",
             "Required for biometric sensing via webcam.",
-            "Granted" if check_camera_permission() else "Not granted",
             check_camera_permission(),
             "Grant Access",
             request_camera_permission,
             "1",
-        ))
+        )
+        layout.addWidget(self._camera_step)
 
         # ── Step 2: Accessibility ─────────────────────────────────────
-        layout.addWidget(self._make_step(
+        self._accessibility_step = self._make_step(
             "Accessibility",
             "Required for keyboard and mouse tracking.",
-            "Granted" if check_accessibility_permission() else "Not granted",
             check_accessibility_permission(),
             "Grant Access",
             request_accessibility_permission,
             "2",
-        ))
+        )
+        layout.addWidget(self._accessibility_step)
 
         # ── Step 3: LLM backend ───────────────────────────────────────
         layout.addWidget(self._make_llm_step())
@@ -326,8 +420,14 @@ class OnboardingWindow(QWidget):
 
     def _make_section(self, number: str, title: str) -> QFrame:
         frame = QFrame()
+        # Scope to objectName so the QFrame stylesheet (background +
+        # 0.5px hairline + 8px radius) doesn't cascade onto every
+        # QLabel/QPushButton descendant (those classes inherit QFrame
+        # in Qt and would otherwise pick up the white background +
+        # border, scrambling text rendering).
+        frame.setObjectName("CortexOnbStep")
         frame.setStyleSheet(
-            "QFrame {"
+            "QFrame#CortexOnbStep {"
             f"  background: {_CONTROL_BG};"
             f"  border: 0.5px solid {_SEPARATOR};"
             f"  border-radius: {RADIUS_CARD}px;"
@@ -364,12 +464,20 @@ class OnboardingWindow(QWidget):
         self,
         title: str,
         description: str,
-        status_text: str,
         granted: bool,
         btn_text: str,
         action: object,
         number: str,
     ) -> QFrame:
+        """Build a permission step.
+
+        The status pill + Grant button are kept as attributes on the frame
+        so the polling timer (``_refresh_permission_states``) can flip them
+        when the user grants the underlying OS permission without forcing
+        the user to relaunch the wizard. This addresses the bug where
+        granting Accessibility in System Settings didn't update the
+        onboarding "Not granted" pill.
+        """
         frame = self._make_section(number, title)
         layout = frame.layout()
 
@@ -383,41 +491,52 @@ class OnboardingWindow(QWidget):
 
         row = QHBoxLayout()
 
-        if granted:
-            status_color = _SUCCESS
-            status_bg = _SUCCESS_DIM
-        else:
-            status_color = _LABEL_TERTIARY
-            status_bg = "rgba(0,0,0,0.04)"
-
-        status = QLabel(status_text)
+        status = QLabel("")
         status.setFont(mac_native.system_font(FS_CAPTION, "medium"))
-        status.setStyleSheet(
-            f"color: {status_color}; background: {status_bg};"
-            f" border: none; border-radius: {RADIUS_BUTTON}px;"
-            "  padding: 3px 8px;"
-        )
         row.addWidget(status)
         row.addStretch()
 
-        if not granted:
-            btn = QPushButton(btn_text)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setMinimumHeight(28)
-            btn.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
-            btn.setStyleSheet(
-                "QPushButton {"
-                "  padding: 4px 12px;"
-                f"  border-radius: {RADIUS_BUTTON}px;"
-                f"  background: {BRAND_ACCENT};"
-                "  color: #FFF; border: none;"
-                "}"
-                f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
-            )
+        btn = QPushButton(btn_text)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setMinimumHeight(28)
+        btn.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
+        btn.setStyleSheet(
+            "QPushButton {"
+            "  padding: 4px 12px;"
+            f"  border-radius: {RADIUS_BUTTON}px;"
+            f"  background: {BRAND_ACCENT};"
+            "  color: #FFF; border: none;"
+            "}"
+            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
+        )
+        if callable(action):
             btn.clicked.connect(action)
-            row.addWidget(btn)
+        row.addWidget(btn)
 
         layout.addLayout(row)
+
+        def _set_state(is_granted: bool) -> None:
+            if is_granted:
+                status.setText("Granted")
+                status.setStyleSheet(
+                    f"color: {_SUCCESS}; background: {_SUCCESS_DIM};"
+                    f" border: none; border-radius: {RADIUS_BUTTON}px;"
+                    "  padding: 3px 8px;"
+                )
+                btn.setVisible(False)
+            else:
+                status.setText("Not granted")
+                status.setStyleSheet(
+                    f"color: {_LABEL_TERTIARY}; background: rgba(0,0,0,0.04);"
+                    f" border: none; border-radius: {RADIUS_BUTTON}px;"
+                    "  padding: 3px 8px;"
+                )
+                btn.setVisible(True)
+
+        _set_state(bool(granted))
+        # Stash the refresh closure on the frame so the polling timer can
+        # call it without re-resolving widgets by index.
+        frame._cortex_set_state = _set_state  # type: ignore[attr-defined]
         return frame
 
     def _make_llm_step(self) -> QFrame:
@@ -442,6 +561,9 @@ class OnboardingWindow(QWidget):
         ])
         region_combo.setCurrentText(config.llm.bedrock.aws_region)
         region_combo.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
+        # Explicit min-height so the combo doesn't get squashed when Qt
+        # tries to fit a too-tall card into a too-short window.
+        region_combo.setMinimumHeight(30)
         region_combo.setStyleSheet(
             "QComboBox {"
             f"  color: {_LABEL};"
@@ -460,6 +582,7 @@ class OnboardingWindow(QWidget):
         self._key_input.setPlaceholderText("AWS Bedrock bearer token")
         self._key_input.setEchoMode(QLineEdit.EchoMode.Password)
         self._key_input.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
+        self._key_input.setMinimumHeight(32)
         self._key_input.setStyleSheet(
             "QLineEdit {"
             f"  color: {_LABEL};"

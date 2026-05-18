@@ -9,9 +9,28 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Literal
+from urllib.parse import urlparse
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+# F10: only these URL schemes may appear in an ``open_url`` action target.
+# Excludes ``javascript:``, ``data:``, ``chrome:``, ``file:``, ``vbscript:``
+# and other schemes that could trigger code execution or local-file access
+# when the extension hands the URL to ``chrome.tabs.create``.
+_ALLOWED_URL_SCHEMES: frozenset[str] = frozenset({"http", "https"})
+
+# F10: per-action_type maximum length of the ``target`` string. The
+# overall ``max_length=500`` on the field remains as an outer bound;
+# these tighter caps catch obvious shape misuse (e.g. a search query
+# that is actually a paragraph of malicious instructions).
+_TARGET_MAX_LEN: dict[str, int] = {
+    "search_error": 200,
+    "open_url": 500,
+    "copy_to_clipboard": 500,
+    "save_session": 200,
+    "start_timer": 32,
+}
 
 
 def generate_intervention_id() -> str:
@@ -73,6 +92,67 @@ class SuggestedAction(BaseModel):
         max_length=80,
         description="Optional curated intervention catalog identifier",
     )
+
+    # F10 (audit): executor-safety validators. The LLM cannot be trusted
+    # to produce safe arguments; even a well-behaved model can be coaxed
+    # into emitting ``open_url`` with a ``javascript:`` URL via prompt
+    # injection (F09 closes most of that path, but defence-in-depth
+    # requires the executor to refuse unsafe inputs regardless).
+
+    @field_validator("tab_index")
+    @classmethod
+    def _validate_tab_index(cls, v: int | None) -> int | None:
+        if v is None:
+            return v
+        if v < 0:
+            raise ValueError(
+                f"tab_index must be non-negative; got {v}. The upper bound "
+                "is enforced server-side against the live tab list."
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _validate_target_for_action_type(self) -> "SuggestedAction":
+        # Per-action_type length cap. The outer ``max_length=500`` field
+        # constraint already ran by the time we reach this validator;
+        # this is the tighter per-type cap.
+        max_len = _TARGET_MAX_LEN.get(self.action_type)
+        if max_len is not None and self.target and len(self.target) > max_len:
+            raise ValueError(
+                f"target too long for action_type={self.action_type!r}: "
+                f"{len(self.target)} > {max_len}"
+            )
+
+        # ``search_error`` queries must be single-line so they can't smuggle
+        # extra instructions into the search box.
+        if self.action_type == "search_error" and self.target:
+            if "\n" in self.target or "\r" in self.target:
+                raise ValueError(
+                    "search_error target must not contain line breaks"
+                )
+
+        # ``open_url`` target must be a real http(s) URL. Empty target is
+        # allowed at parse time (the LLM sometimes emits a placeholder
+        # that the enrichment step fills in); a non-empty value with a
+        # banned scheme is rejected outright.
+        if self.action_type == "open_url" and self.target:
+            try:
+                parsed = urlparse(self.target)
+            except Exception as exc:  # pragma: no cover - urlparse rarely raises
+                raise ValueError(
+                    f"open_url target is not a parseable URL: {exc}"
+                ) from exc
+            scheme = (parsed.scheme or "").lower()
+            if scheme not in _ALLOWED_URL_SCHEMES:
+                raise ValueError(
+                    "open_url target must use http or https scheme; got "
+                    f"{scheme or '(no scheme)'!r}"
+                )
+            if not parsed.netloc:
+                raise ValueError(
+                    "open_url target must include a hostname"
+                )
+        return self
 
 
 class ErrorAnalysis(BaseModel):

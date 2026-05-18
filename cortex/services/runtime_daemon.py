@@ -136,6 +136,13 @@ class CortexDaemon:
         self.config = config or get_config()
         self._shutdown = asyncio.Event()
         self._tasks: list[asyncio.Task[Any]] = []
+        # F03: every dynamically-spawned background task (intervention
+        # dispatch, in-flight LLM call, etc.) is tracked here so stop()
+        # can cancel it. Previously the state-loop created intervention
+        # tasks via bare ``asyncio.create_task(...)`` with no reference;
+        # shutdown could complete while one was still mid-write,
+        # truncating session JSONL and leaking file handles.
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         self._uvicorn_server: uvicorn.Server | None = None
         self._api_task: asyncio.Task[Any] | None = None
 
@@ -410,6 +417,14 @@ class CortexDaemon:
 
     async def start(self) -> None:
         """Start the runtime and block until shutdown."""
+        # F07: ensure the local capability token exists before any service
+        # that gates on it (WebSocket SHUTDOWN, launcher /stop) comes up.
+        # Generated lazily, persists across restarts.
+        try:
+            from cortex.libs.auth import load_or_create_token
+            load_or_create_token()
+        except Exception:
+            logger.warning("Could not provision Cortex auth token", exc_info=True)
         self._register_services()
         self._input_hooks.start()
         self._window_tracker.start()
@@ -462,6 +477,22 @@ class CortexDaemon:
             return
         loop.call_later(0.3, os.kill, os.getpid(), _signal.SIGTERM)
 
+    def _spawn_background_task(
+        self,
+        coro: Any,
+        *,
+        name: str | None = None,
+    ) -> asyncio.Task[Any]:
+        """Spawn a tracked background task. The task is added to
+        ``self._background_tasks`` and auto-removed on completion so the
+        set stays bounded. ``stop()`` cancels and awaits every
+        outstanding task, so a background coroutine cannot keep file
+        handles open past daemon shutdown."""
+        task = asyncio.create_task(coro, name=name)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
     async def stop(self) -> None:
         """Gracefully stop all runtime services."""
         self._shutdown.set()
@@ -472,6 +503,15 @@ class CortexDaemon:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+        # F03: cancel + drain dynamically-spawned background tasks so
+        # they cannot outlive the daemon and corrupt persisted state.
+        if self._background_tasks:
+            for task in list(self._background_tasks):
+                task.cancel()
+            await asyncio.gather(
+                *list(self._background_tasks), return_exceptions=True
+            )
+            self._background_tasks.clear()
         if self._api_task is not None:
             try:
                 await asyncio.wait_for(self._api_task, timeout=5.0)
@@ -484,30 +524,75 @@ class CortexDaemon:
                 self._api_task = None
         # Always stop the capture pipeline to release the camera — even if
         # _capture_available is False (pipeline may have started then errored)
+        #
+        # F01: bound the stop() with a hard timeout. A disconnected USB
+        # webcam or a stuck mediapipe worker can block forever inside the
+        # capture loop; without a timeout the daemon hangs in stop(),
+        # only SIGKILL unblocks, and SIGKILL leaves the AVFoundation
+        # camera handle owned by a dead process — next launch fails. By
+        # forcing a CancelledError after 5 s we surrender the graceful
+        # close window in exchange for a deterministic shutdown; the
+        # AVFoundation handle is reclaimed by the kernel on process exit
+        # regardless, but only if we actually exit.
         try:
-            await self._capture_pipeline.stop()
+            await asyncio.wait_for(
+                self._capture_pipeline.stop(), timeout=5.0
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Capture pipeline stop() exceeded 5s; abandoning graceful "
+                "close — relying on process exit to release the camera",
+            )
         except Exception:
-            pass
+            logger.exception("Capture pipeline stop() raised; continuing shutdown")
         self._input_hooks.stop()
         self._window_tracker.stop()
         # G.1: write the session debrief BEFORE shutting down the WS
         # server so a future "view last report" endpoint can serve it
         # immediately on next launch.
-        try:
-            if self._session_report_started:
+        #
+        # F02: split compute-vs-write error handling and use an atomic
+        # write so disk-full / SIGKILL mid-write does not silently lose
+        # the session. Previously a single ``try/except Exception`` wrapped
+        # both ``finish()`` and ``write_text``; either path's failure was
+        # logged once and the report was gone forever. Now compute errors
+        # log the report's last-known state, and disk-write errors retain
+        # the previous on-disk file (if any) because ``os.replace`` is
+        # atomic.
+        if self._session_report_started:
+            try:
                 report = self._session_report.finish()
-                sessions_dir = (
-                    Path(self.config.storage.path).expanduser() / "sessions"
+            except Exception:
+                logger.error(
+                    "Failed to compute session report; nothing to persist",
+                    exc_info=True,
                 )
-                sessions_dir.mkdir(parents=True, exist_ok=True)
-                session_path = sessions_dir / f"session_{report.session_id}.json"
-                session_path.write_text(
-                    json.dumps(report.model_dump(mode="json"), indent=2),
-                    encoding="utf-8",
-                )
-                logger.info("Wrote session report to %s", session_path)
-        except Exception:
-            logger.warning("Failed to finalise session report", exc_info=True)
+                report = None
+            if report is not None:
+                try:
+                    from cortex.libs.utils.atomic_write import atomic_write_json
+
+                    sessions_dir = (
+                        Path(self.config.storage.path).expanduser() / "sessions"
+                    )
+                    session_path = sessions_dir / f"session_{report.session_id}.json"
+                    atomic_write_json(session_path, report.model_dump(mode="json"))
+                    logger.info("Wrote session report to %s", session_path)
+                except OSError as exc:
+                    # Disk-full, permission denied, etc. The previous
+                    # on-disk version (if any) survives because the
+                    # atomic write never crossed the rename point.
+                    logger.error(
+                        "Failed to persist session report at shutdown "
+                        "(session_id=%s err=%s); prior file preserved",
+                        getattr(report, "session_id", "?"),
+                        exc,
+                    )
+                except Exception:
+                    logger.error(
+                        "Unexpected failure persisting session report",
+                        exc_info=True,
+                    )
         await self._ws_server.stop()
         self._uvicorn_server = None
         registry.reset()
@@ -1018,7 +1103,7 @@ class CortexDaemon:
                             # Run intervention in background so the state
                             # loop keeps updating while the LLM responds.
                             self._active_intervention_id = "__pending__"
-                            asyncio.create_task(
+                            self._spawn_background_task(
                                 self._trigger_intervention(
                                     context,
                                     estimate,
