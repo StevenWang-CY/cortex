@@ -164,10 +164,55 @@ function getStateDotStyle(stateStr: string, stateColor: string): React.CSSProper
     }
 }
 
+/**
+ * F54: four distinct connectivity states for the popup connection
+ * indicator + diagnostic block.
+ *
+ * - not_installed:           native messaging host missing
+ * - installed_no_daemon:     native host present but daemon WS unreachable
+ * - installed_version_mismatch: daemon up but its version disagrees with ours
+ * - handshake_failed:        WS opened but daemon rejected handshake
+ *
+ * The connected boolean already covers the happy path; this enum
+ * disambiguates the failure modes so each can carry its own
+ * diagnostic and fix-action button. `ok` is the happy path.
+ */
+export type ConnectivityState =
+    | "ok"
+    | "not_installed"
+    | "installed_no_daemon"
+    | "installed_version_mismatch"
+    | "handshake_failed";
+
+export function classifyConnectivity(input: {
+    connected: boolean;
+    nativeHostStatus: "present" | "missing" | "unknown";
+    daemonVersion: string | null;
+    expectedVersion: string;
+    handshakeError: string | null;
+}): ConnectivityState {
+    if (input.connected && input.handshakeError) return "handshake_failed";
+    if (input.connected) {
+        if (
+            input.daemonVersion &&
+            input.expectedVersion &&
+            input.daemonVersion !== input.expectedVersion
+        ) {
+            return "installed_version_mismatch";
+        }
+        return "ok";
+    }
+    if (input.nativeHostStatus === "missing") return "not_installed";
+    return "installed_no_daemon";
+}
+
 // --- Main ---
 
 function CortexPopup(): React.ReactElement {
     const [connected, setConnected] = useState(false);
+    const [nativeHostStatus, setNativeHostStatus] = useState<"present" | "missing" | "unknown">("unknown");
+    const [daemonVersion, setDaemonVersion] = useState<string | null>(null);
+    const [handshakeError, setHandshakeError] = useState<string | null>(null);
     const [state, setState] = useState<CortexState | null>(null);
     const [focus, setFocus] = useState<FocusSnapshot | null>(null);
     const [dailyStats, setDailyStats] = useState<DailyStats | null>(null);
@@ -233,6 +278,17 @@ function CortexPopup(): React.ReactElement {
     }, [quietMode]);
 
     const [launchStatus, setLaunchStatus] = useState("");
+
+    // F54: pinned in code rather than read from manifest at runtime so a
+    // mismatch with the daemon is immediately surfaceable in tests.
+    const EXPECTED_VERSION = "0.2.1";
+    const connectivity = classifyConnectivity({
+        connected,
+        nativeHostStatus,
+        daemonVersion,
+        expectedVersion: EXPECTED_VERSION,
+        handshakeError,
+    });
 
     const handleLaunchCortex = useCallback(() => {
         setLaunching(true);
@@ -338,6 +394,19 @@ function CortexPopup(): React.ReactElement {
                     action_items: (b.action_items as string[]) || [],
                     left_off_at: String(b.left_off_at || ""),
                 });
+                break;
+            }
+            case "CONNECTIVITY_DIAGNOSTIC": {
+                // F54: background pushes the resolved diagnostic so the
+                // popup can pick the right disconnected-state UI.
+                const d = msg.payload as Record<string, unknown>;
+                if (d.native_host_status === "present" || d.native_host_status === "missing") {
+                    setNativeHostStatus(d.native_host_status as "present" | "missing");
+                }
+                if (typeof d.daemon_version === "string") setDaemonVersion(d.daemon_version);
+                if (d.daemon_version === null) setDaemonVersion(null);
+                if (typeof d.handshake_error === "string") setHandshakeError(d.handshake_error);
+                if (d.handshake_error === null) setHandshakeError(null);
                 break;
             }
         }
@@ -469,8 +538,11 @@ function CortexPopup(): React.ReactElement {
                 </div>
             )}
 
-            {/* Disconnected state — centered, quiet notice with one-click launch */}
-            {!connected && (
+            {/* F54: render the diagnostic block whenever we're not fully ok.
+                 installed_version_mismatch and handshake_failed both happen
+                 while `connected` is true, so the visibility predicate is
+                 the resolved connectivity enum rather than the bare flag. */}
+            {connectivity !== "ok" && (
                 <div style={S.disconnectedArea}>
                     <div style={{
                         width: 40,
@@ -502,27 +574,65 @@ function CortexPopup(): React.ReactElement {
                             }} />
                         )}
                     </div>
-                    <div style={S.disconnectedTitle}>{launching ? "Starting Cortex" : "Not connected"}</div>
-                    <div style={S.disconnectedBody}>
-                        {launchStatus || "Launch daemon with camera"}
-                    </div>
-                    <button
-                        style={{
-                            ...S.primaryBtn,
-                            marginTop: 16,
-                            opacity: launching ? 0.5 : 1,
-                            pointerEvents: launching ? "none" as const : "auto" as const,
-                            maxWidth: 200,
-                        }}
-                        onClick={handleLaunchCortex}
-                        disabled={launching}
-                    >
-                        {launchError
-                            ? "Retry"
-                            : launching
-                                ? "Starting\u2026"
-                                : "Start Cortex"}
-                    </button>
+                    {(() => {
+                        // F54: pick title/body/CTA per distinct connectivity state.
+                        let title: string;
+                        let body: string;
+                        let ctaLabel: string;
+                        let ctaHandler: () => void = handleLaunchCortex;
+                        let testId: string;
+                        if (launching) {
+                            title = "Starting Cortex";
+                            body = launchStatus || "Launching daemon\u2026";
+                            ctaLabel = "Starting\u2026";
+                            testId = "conn-state-launching";
+                        } else if (connectivity === "not_installed") {
+                            title = "Native host not installed";
+                            body = "Cortex needs its native messaging host registered. Run `python -m cortex.scripts.install_native_host` once, then relaunch your browser.";
+                            ctaLabel = "Open install instructions";
+                            ctaHandler = () => {
+                                chrome.tabs.create({ url: chrome.runtime.getURL("tabs/onboarding.html") });
+                            };
+                            testId = "conn-state-not_installed";
+                        } else if (connectivity === "installed_version_mismatch") {
+                            title = "Daemon version mismatch";
+                            body = `Extension expects v${EXPECTED_VERSION}; daemon is v${daemonVersion ?? "?"}. Update the daemon or downgrade the extension to match.`;
+                            ctaLabel = "Restart daemon";
+                            ctaHandler = handleLaunchCortex;
+                            testId = "conn-state-installed_version_mismatch";
+                        } else if (connectivity === "handshake_failed") {
+                            title = "Handshake failed";
+                            body = handshakeError || "The daemon answered but rejected this extension's handshake. Check the local auth token.";
+                            ctaLabel = "Retry handshake";
+                            ctaHandler = () => sendWithCid({ type: "CONNECT" });
+                            testId = "conn-state-handshake_failed";
+                        } else {
+                            // installed_no_daemon (default disconnect path)
+                            title = "Not connected";
+                            body = launchStatus || "Launch daemon with camera";
+                            ctaLabel = launchError ? "Retry" : "Start Cortex";
+                            testId = "conn-state-installed_no_daemon";
+                        }
+                        return (
+                            <>
+                                <div style={S.disconnectedTitle} data-testid={testId}>{title}</div>
+                                <div style={S.disconnectedBody}>{body}</div>
+                                <button
+                                    style={{
+                                        ...S.primaryBtn,
+                                        marginTop: 16,
+                                        opacity: launching ? 0.5 : 1,
+                                        pointerEvents: launching ? "none" as const : "auto" as const,
+                                        maxWidth: 240,
+                                    }}
+                                    onClick={ctaHandler}
+                                    disabled={launching}
+                                >
+                                    {ctaLabel}
+                                </button>
+                            </>
+                        );
+                    })()}
                     {launchError && launchStatus && (
                         <div style={{
                             fontSize: 10,
