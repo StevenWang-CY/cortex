@@ -1079,6 +1079,20 @@ class WebSocketServer:
         and ``timestamp`` so clients can detect stale broadcasts.
         """
         self._sequence += 1
+        # F18 (audit Wave-2): mirror the ``StateInferResponse`` envelope
+        # onto the WS broadcast. The dashboard's "classifier unavailable"
+        # banner reads ``payload.get("degraded")`` / ``payload.get("source")``
+        # off the STATE_UPDATE payload; before this stamp the banner could
+        # never fire through the WS path because the producer omitted the
+        # fields. ``degraded`` is True when no real classifier ran
+        # (``classifier_source is None``) — that is the same condition the
+        # ``/state/infer`` fallback branch uses to flag synthetic
+        # confidence. ``source`` is the literal pair ``classifier`` /
+        # ``fallback`` so the reader can branch without conflating with
+        # the debug-overlay ``classifier_source`` field (``rule`` / ``ml`` /
+        # ``ensemble``).
+        degraded = estimate.classifier_source is None
+        envelope_source = "fallback" if degraded else "classifier"
         payload: dict[str, Any] = {
             "state": estimate.state,
             "confidence": estimate.confidence,
@@ -1100,6 +1114,8 @@ class WebSocketServer:
             "calibrated_probabilities": estimate.calibrated_probabilities,
             "classifier_source": estimate.classifier_source,
             "classifier_alpha": estimate.classifier_alpha,
+            "source": envelope_source,
+            "degraded": degraded,
             "timestamp": _serialize_timestamp(estimate.timestamp),
         }
         if biometrics:

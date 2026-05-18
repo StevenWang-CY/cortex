@@ -1035,13 +1035,18 @@ class _AdvancedTab(QWidget):
         state = payload.get("state", "FLOW")
         bio = payload.get("biometrics", {})
 
-        # F18 (audit): surface the daemon's degraded state. The
-        # ``degraded`` flag piggybacks the same payload dict that the
-        # controller already forwards from /state/infer responses and WS
-        # state-update frames. Falling back to ``source != "classifier"``
-        # keeps the badge correct on payloads that only carry ``source``.
+        # F18 (audit): surface the daemon's degraded state. ``degraded``
+        # and ``source`` are mirrored from the ``StateInferResponse``
+        # envelope onto every WS STATE_UPDATE payload by
+        # ``WebSocketServer._make_state_update`` (audit Wave-2 fix), so
+        # the same reader works for both the /state/infer round-trip and
+        # the live WS stream. The literal ``fallback`` is the only value
+        # ``source`` takes when the classifier is unavailable; treating
+        # it as the trigger keeps the badge from flipping on a healthy
+        # ``classifier_source="rule"`` debug field (which lives on the
+        # same payload but is unrelated to envelope-level degradation).
         is_degraded = bool(payload.get("degraded", False)) or (
-            payload.get("source") not in (None, "classifier")
+            payload.get("source") == "fallback"
         )
         self._degraded_badge.setVisible(is_degraded)
 
