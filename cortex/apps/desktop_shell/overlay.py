@@ -36,12 +36,16 @@ from cortex.apps.desktop_shell.tokens import (
     FS_FOOTNOTE,
     FS_TITLE,
     FW_REGULAR,
+    HUD_ACCENT,
     RADIUS_BUTTON,
     RADIUS_WINDOW,
     SP3,
     SP4,
     SP6,
     SP8,
+    TEXT_HUD_PRIMARY,
+    TEXT_HUD_SECONDARY,
+    TEXT_HUD_TERTIARY,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,13 +56,15 @@ _HOLD_SECONDS = 7
 _EXHALE_SECONDS = 8
 _CYCLE_SECONDS = _INHALE_SECONDS + _HOLD_SECONDS + _EXHALE_SECONDS
 
-# HUD palette — the only hardcoded colors in the file. The vibrancy view
-# below the window provides the actual dark blur; these colors are how the
-# overlay's content layers itself on top of that material.
-_ACCENT = QColor(217, 119, 87)              # Terracotta #D97757 (brand)
-_TEXT_PRIMARY = QColor(255, 255, 255, 235)  # SF system "labelColor" on HUD
-_TEXT_SECONDARY = QColor(255, 255, 255, 150)
-_TEXT_TERTIARY = QColor(255, 255, 255, 100)
+# HUD palette — resolved from :mod:`cortex.apps.desktop_shell.tokens` (F47).
+# The vibrancy view below the window provides the actual dark blur; these
+# QColors are how the overlay's content layers itself on top of that
+# material. The token values are the spec; do not introduce hex literals
+# in this module — extend ``tokens.py`` instead.
+_ACCENT = QColor(*HUD_ACCENT)
+_TEXT_PRIMARY = QColor(*TEXT_HUD_PRIMARY)
+_TEXT_SECONDARY = QColor(*TEXT_HUD_SECONDARY)
+_TEXT_TERTIARY = QColor(*TEXT_HUD_TERTIARY)
 
 
 class BreathingPacer(QWidget):
