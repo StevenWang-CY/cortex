@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  python:
+    name: python (pytest + ruff + mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e "./cortex[dev]"
+      - name: Lint (ruff)
+        run: ruff check cortex/
+      - name: Typecheck (mypy)
+        run: mypy cortex/ --strict
+      - name: Test (pytest)
+        run: pytest cortex/tests/
+
+  extension:
+    name: extension (lint + vitest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cortex/apps/browser_extension
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+          cache-dependency-path: cortex/apps/browser_extension/pnpm-lock.yaml
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm exec tsc --noEmit
+      - name: Test
+        run: pnpm test
