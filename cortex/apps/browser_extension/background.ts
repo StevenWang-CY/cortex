@@ -17,6 +17,7 @@ import {
     saveTabSession,
     restoreTabSession,
 } from "./tab-manager";
+import { getAuthToken } from "./lib/auth";
 
 // --- Types ---
 
@@ -2664,12 +2665,24 @@ chrome.runtime.onMessage.addListener(
                         ]);
                     } catch { /* storage.session may be unavailable */ }
 
+                    // F07b/F08b: fetch the local capability token (cached in
+                    // chrome.storage.session after the first call) so the
+                    // gated SHUTDOWN/`/stop` endpoints accept this client.
+                    // A token-fetch failure is non-fatal: the steps below
+                    // still get tried, the auth-gated ones will 401 cleanly.
+                    let authToken: string | null = null;
+                    try {
+                        authToken = await getAuthToken();
+                    } catch (e) {
+                        console.warn(`cortex.auth.token_unavailable err=${String(e)}`);
+                    }
+
                     // Step 1: Send SHUTDOWN over WebSocket (graceful — triggers daemon stop chain)
                     if (ws && connected) {
                         try {
                             send({
                                 type: "SHUTDOWN",
-                                payload: {},
+                                payload: authToken ? { auth_token: authToken } : {},
                                 timestamp: Date.now() / 1000,
                                 sequence: ++sequence,
                                 // F19b: carry the popup's cid through so the
@@ -2687,6 +2700,7 @@ chrome.runtime.onMessage.addListener(
                         await fetch(`${DAEMON_HTTP_URL}/shutdown`, {
                             method: "POST",
                             signal: AbortSignal.timeout(3000),
+                            headers: authToken ? { "X-Cortex-Auth-Token": authToken } : undefined,
                         });
                     } catch { /* daemon may already be dead */ }
                     // Step 4: Wait briefly for graceful shutdown to complete
@@ -2706,6 +2720,7 @@ chrome.runtime.onMessage.addListener(
                         await fetch(`${LAUNCHER_HTTP_URL}/stop`, {
                             method: "POST",
                             signal: AbortSignal.timeout(3000),
+                            headers: authToken ? { "X-Cortex-Auth-Token": authToken } : undefined,
                         });
                     } catch { /* launcher may not be running */ }
                     // Close any onboarding tabs
