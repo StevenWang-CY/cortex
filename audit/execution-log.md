@@ -513,3 +513,156 @@ asyncio.run(go())
 "
 # websockets.exceptions.ConnectionClosedError: ... [code=1011 reason=auth required]
 ```
+
+---
+
+## Audit Wave 2 — Contract drift sweep (post Phase G + Phase H)
+
+**Date.** 2026-05-19. **Posture.** Senior coordination engineer verifying
+no residual frontend ↔ backend contract drift survived the Debt-1 schema
+codegen + Debt-2 systemic-auth waves.
+
+**Commits shipped.**
+
+| SHA | Subject |
+|-----|---------|
+| `a7bcf70` | thread F18 degraded/source through STATE_UPDATE WS payload |
+| `e8bac22` | surface unhandled-but-known WS frames in extension |
+
+### Per-category verdict
+
+**1. HTTP routes ↔ extension fetches.** VERIFIED CLEAN.
+Three fetch sites in the entire extension surface
+(``background.ts:2860`` ``/shutdown``, ``background.ts:2880`` ``/stop``,
+``background.ts:2947`` ``/launch``). All three carry the
+``X-Cortex-Auth-Token`` header when the cached capability token is
+available; ``/launch`` is intentionally unauthenticated because the
+launcher boots the daemon before the daemon's keychain is loaded
+(launcher_agent.py exposes it on its own port 9471, separate trust
+boundary). Verb / path / body / response field reads match the FastAPI
+routes one-for-one.
+
+**2. WS client → server.** VERIFIED CLEAN.
+12 distinct ``send()`` types in ``background.ts`` (``AUTH``,
+``IDENTIFY``, ``USER_ACTION``, ``ACTION_EXECUTE``, ``USER_RATING``,
+``CONTEXT_RESPONSE``, ``SETTINGS_SYNC``, ``ACTIVITY_SYNC``,
+``TAB_RELEVANCE_FEEDBACK``, ``LEETCODE_CONTEXT_UPDATE``,
+``INTERVENTION_APPLIED``, ``SHUTDOWN``); ``WebSocketServer._dispatch_message``
+has explicit dispatch arms for all 12. The ``AUTH`` frame goes first
+per Debt-2.
+
+**3. WS server → extension broadcast.** GAP FOUND + CLOSED.
+The ``MessageType`` enum lists 15 ``LEETCODE_*`` cues; ``background.ts``
+explicitly handles 6 (the 5 actions the live ``InterventionMatrix``
+emits plus ``SHOW_CONSOLIDATION``). The other 9
+(``LEETCODE_LOCK_EDITOR``, ``LEETCODE_INTERCEPT_SUBMIT``,
+``LEETCODE_GATE_SOLUTIONS``, ``LEETCODE_SHOW_SESSION_BRIEFING``,
+``LEETCODE_AI_RESTATEMENT_CHECK`` / ``LEETCODE_AI_COMPREHENSION_CHECK`` /
+``LEETCODE_AI_HYPOTHESIS_CHECK`` / ``LEETCODE_AI_STUCK_ANALYSIS`` /
+``LEETCODE_AI_SESSION_BRIEFING``) are catalogue-only — the ``LeetCodeAdapter``
+advertises them but no runtime selector calls
+``_leetcode_adapter.execute(<capability>, ...)`` for them today. Commit
+``e8bac22`` adds a defensive ``default:`` arm in the message switch so a
+future regression where the daemon adds a new emitter (or the matrix
+grows to cover the AI checks) is visible in DEBUG logs instead of
+silently swallowed. ``COPILOT_THROTTLE`` is targeted at vscode clients
+only (``target_client_types=["vscode"]``) and never reaches the chrome
+peer, so the chrome extension's lack of a handler is correct.
+
+**4. Generated types coverage.** VERIFIED CLEAN.
+``cortex_schemas.d.ts`` includes ``WSMessage``, ``MessageType`` (the
+enum-string union of all 37 wire types), ``StateEstimate``,
+``InterventionPlan``, ``SuggestedAction``, ``TaskContext``,
+``InterventionApplyResult``, plus ``LeetCodeContext`` /
+``LeetCodeModeEstimate``. ``StateInferResponse`` is defined in
+``routes.py`` not in ``cortex/libs/schemas/`` so the codegen walk does
+not pick it up; verified no extension client consumes the
+``/state/infer`` envelope (the dashboard reads ``degraded`` /
+``source`` off the WS ``STATE_UPDATE`` stream — see category 5).
+
+**5. F18 degraded envelope surfaced.** GAP FOUND + CLOSED.
+The F18 fix added ``source`` / ``degraded`` to ``StateInferResponse``;
+the dashboard advanced tab reads both off the payload dict to toggle the
+"classifier unavailable" banner. But the dashboard is fed by the WS
+``STATE_UPDATE`` broadcast, not by ``/state/infer`` —
+``WebSocketServer._make_state_update`` never stamped the two fields, so
+the banner could not fire through the WS path. F18 was end-to-end
+silently broken. Commit ``a7bcf70`` mirrors the envelope fields onto
+every STATE_UPDATE frame (``degraded = estimate.classifier_source is
+None``; ``source = "fallback" if degraded else "classifier"``) and
+fixes a brittle dashboard fallback test that conflated the envelope
+``source`` literal (``classifier``/``fallback``) with the debug-overlay
+``classifier_source`` field (``rule``/``ml``/``ensemble``) — on a healthy
+``classifier_source="rule"`` payload the banner would have flipped True
+and stuck visible.
+
+**6. F20 cost telemetry surfaced.** PARTIALLY VERIFIED.
+``CostTracker.record`` emits ``EventType.LLM_COST`` per call and
+``EventType.LLM_BUDGET_KILL`` when the daily budget trips. The kill
+path stamps ``plan.metadata["budget_killed"] = True`` and the overlay
+(``cortex/apps/desktop_shell/overlay.py:510``) surfaces a per-intervention
+"Cortex offline mode — daily AI budget reached" hint. The persistent
+dashboard banner contemplated in Phase A is NOT implemented — only the
+per-intervention overlay hint. Filed as residual (net-new UX, not
+contract drift).
+
+**7. F10 action-rejection telemetry.** VERIFIED CLEAN.
+``filter_unsafe_actions`` emits ``EventType.INTERVENTION_ACTION_REJECTED``
+per drop with the bound cid; by design the rejection is log-only — the
+user never sees a banned action, so there is no UI to suppress. The plan
+notes this explicitly.
+
+**8. Per-route auth dependency coverage.** VERIFIED CLEAN.
+``cortex/services/api_gateway/app.py:183`` mounts the gated router via
+``app.include_router(router, dependencies=[Depends(require_capability_token)])``;
+``app.include_router(health_router)`` at line 182 mounts only ``/health``
+without auth. Every mutating endpoint in ``routes.py`` lives on
+``router`` and inherits the gate; ``/health`` is the only endpoint
+reachable without the capability token, which is the documented design.
+
+### Surfaces audited
+
+| Surface | Verdict |
+|---------|---------|
+| ``cortex/services/api_gateway/routes.py`` | Auth coverage clean; F18 envelope set on HTTP. |
+| ``cortex/services/api_gateway/auth.py`` | Two FastAPI deps; only health route uses ``optional_capability_token``. |
+| ``cortex/services/api_gateway/app.py`` | Single ``include_router(dependencies=[…])`` wire — adding new route inherits the gate. |
+| ``cortex/services/api_gateway/websocket_server.py`` | AUTH-first dispatch; broadcast skips unauth peers; STATE_UPDATE now stamps F18 envelope fields. |
+| ``cortex/apps/browser_extension/background.ts`` | All 3 fetches gated; 12 send-types match dispatch; unhandled-frame default arm added. |
+| ``cortex/apps/desktop_shell/dashboard.py`` | F18 banner reader hardened against the ``classifier_source`` / ``source`` conflation. |
+| ``cortex/libs/schemas/ws_message_types.py`` | 37 enum members; catalogue surfaces the 9 still-unwired LEETCODE_* cues so the schema gate notices future drift. |
+| ``cortex/apps/browser_extension/types/generated/cortex_schemas.d.ts`` | 2050 lines; codegen still in sync. |
+
+### Verification
+
+```bash
+# F18 WS plumbing + envelope contract:
+pytest cortex/tests/unit/test_ws_state_update_degraded.py \
+       cortex/tests/unit/test_state_infer_envelope.py -q
+# 7 passed in 0.53s
+
+# Defensive default arm in extension switch:
+cd cortex/apps/browser_extension
+./node_modules/.bin/vitest run __tests__/audit_w2_unhandled_ws_frame.spec.ts
+# 2 passed
+
+# Schema codegen still in sync (no Python schema changes in this wave):
+CORTEX_JSON2TS_CMD=$(which json2ts) \
+  python -m cortex.scripts.generate_ts_schemas --check
+# exit 0 (no diff)
+```
+
+### Residual
+
+1. **F20 persistent dashboard banner.** The Phase A plan called for a
+   dashboard-level banner on ``LLM_BUDGET_KILL`` in addition to the
+   per-intervention overlay hint. The hint is wired; the banner is not.
+   This is net-new UX (not contract drift) and is scoped out of the
+   Wave-2 sweep.
+2. **9 catalogue-only LEETCODE_* types.** The schema lists them and the
+   ``LeetCodeAdapter`` exposes the capabilities, but no live
+   ``InterventionMatrix`` selector emits them. The default-arm log line
+   is the visibility hatch for when a future fix wires them up; no
+   handler implementations land here because there is no caller to
+   regression-test against.
+
