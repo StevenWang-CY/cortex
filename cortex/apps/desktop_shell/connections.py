@@ -29,6 +29,11 @@ from PySide6.QtWidgets import (
 )
 
 from cortex.apps.desktop_shell import mac_native
+from cortex.apps.desktop_shell.a11y import (
+    chain_tab_order,
+    set_accessible_description,
+    set_accessible_name,
+)
 from cortex.apps.desktop_shell.tokens import (
     BRAND_ACCENT,
     BRAND_ACCENT_HOVER,
@@ -146,6 +151,10 @@ class ConnectionsPanel(QWidget):
         self.setFixedWidth(480)
         self.setStyleSheet(f"background: {_WINDOW_BG}; color: {_LABEL};")
 
+        # audit-w2 (F55 carry-over): keep button refs so we can chain
+        # tab order at the end of __init__ once every card is built.
+        self._tab_order_chain: list[QPushButton] = []
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(SP6, SP5, SP6, SP6)
         layout.setSpacing(SP5)
@@ -164,6 +173,8 @@ class ConnectionsPanel(QWidget):
             f"QPushButton:hover {{ color: {_LABEL}; }}"
         )
         back_btn.clicked.connect(self._on_back)
+        set_accessible_name(back_btn, "Back to dashboard")
+        self._tab_order_chain.append(back_btn)
         header.addWidget(back_btn)
         header.addStretch()
         layout.addLayout(header)
@@ -251,6 +262,11 @@ class ConnectionsPanel(QWidget):
         layout.addWidget(self._make_editor_card(editor, translocated))
 
         layout.addStretch()
+
+        # audit-w2 (F55 carry-over): chain tab order across every action
+        # button. VoiceOver users can now walk Back → browser Connect
+        # buttons → editor Connect with the keyboard alone.
+        chain_tab_order(*self._tab_order_chain)
 
     # -- Lifecycle ------------------------------------------------------
 
@@ -359,6 +375,13 @@ class ConnectionsPanel(QWidget):
         btn.clicked.connect(
             lambda checked=False, n=name, s=scheme: self._connect_browser(n, s)
         )
+        set_accessible_name(btn, f"Connect {name}")
+        set_accessible_description(
+            btn,
+            f"Install Cortex native messaging host for {name} and load "
+            "the browser extension.",
+        )
+        self._tab_order_chain.append(btn)
         layout.addWidget(btn)
 
         return card
@@ -406,6 +429,12 @@ class ConnectionsPanel(QWidget):
         if editor:
             cli_path = editor[0]
             btn.clicked.connect(lambda: self._connect_editor(cli_path, editor_name))
+        set_accessible_name(btn, f"Connect {editor_name}")
+        set_accessible_description(
+            btn,
+            f"Install the Cortex extension into {editor_name}.",
+        )
+        self._tab_order_chain.append(btn)
         layout.addWidget(btn)
         return card
 

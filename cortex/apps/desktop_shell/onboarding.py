@@ -42,6 +42,11 @@ from PySide6.QtWidgets import (
 )
 
 from cortex.apps.desktop_shell import mac_native
+from cortex.apps.desktop_shell.a11y import (
+    chain_tab_order,
+    set_accessible_description,
+    set_accessible_name,
+)
 from cortex.apps.desktop_shell.tokens import (
     BRAND_ACCENT,
     BRAND_ACCENT_DIM,
@@ -491,6 +496,12 @@ class OnboardingWindow(QWidget):
             f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
         )
         connect_btn.clicked.connect(self.extensions_requested.emit)
+        set_accessible_name(connect_btn, "Open Connections panel")
+        set_accessible_description(
+            connect_btn,
+            "Install the Cortex browser and editor extensions.",
+        )
+        self._connect_btn_ref = connect_btn
         ext_layout.addWidget(connect_btn)
         layout.addWidget(ext_frame)
 
@@ -514,8 +525,31 @@ class OnboardingWindow(QWidget):
             "QPushButton:hover { background: #333; }"
         )
         finish_btn.clicked.connect(self._on_finish)
+        set_accessible_name(finish_btn, "Finish onboarding")
+        set_accessible_description(
+            finish_btn,
+            "Mark every onboarding step complete and start Cortex.",
+        )
         btn_row.addWidget(finish_btn)
         layout.addLayout(btn_row)
+
+        # audit-w2 (F55 carry-over): chain tab order across the wizard.
+        # Step 1 + 2 Grant buttons live behind a closure (``_cortex_set_state``);
+        # we walk the BYOK card → Connect Extensions → Get Started
+        # explicitly so the keyboard user lands on the primary actions
+        # without bouncing through every non-interactive label.
+        chain_targets = [
+            w
+            for w in (
+                getattr(self, "_region_combo", None),
+                getattr(self, "_key_input", None),
+                getattr(self, "_save_key_btn", None),
+                connect_btn,
+                finish_btn,
+            )
+            if w is not None
+        ]
+        chain_tab_order(*chain_targets)
 
     # ------------------------------------------------------------------
     # F49: completion-marker hooks
@@ -658,6 +692,8 @@ class OnboardingWindow(QWidget):
         )
         if callable(action):
             btn.clicked.connect(action)
+        set_accessible_name(btn, f"{title} — {btn_text}")
+        set_accessible_name(status, f"{title} status")
         row.addWidget(btn)
 
         layout.addLayout(row)
@@ -756,6 +792,15 @@ class OnboardingWindow(QWidget):
             f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
         )
         save_key_btn.clicked.connect(self._save_api_key)
+        set_accessible_name(save_key_btn, "Save Bedrock bearer token")
+        set_accessible_description(
+            save_key_btn,
+            "Store the AWS Bedrock bearer token in the macOS Keychain.",
+        )
+        # Stash so the wizard's tab-order chain can pin focus.
+        self._save_key_btn = save_key_btn
+        set_accessible_name(self._key_input, "Bedrock bearer token")
+        set_accessible_name(region_combo, "Bedrock AWS region")
         key_row.addWidget(save_key_btn)
 
         self._key_widget = QWidget()

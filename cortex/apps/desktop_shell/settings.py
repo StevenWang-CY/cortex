@@ -34,6 +34,11 @@ from PySide6.QtWidgets import (
 )
 
 from cortex.apps.desktop_shell import mac_native
+from cortex.apps.desktop_shell.a11y import (
+    chain_tab_order,
+    set_accessible_description,
+    set_accessible_name,
+)
 from cortex.apps.desktop_shell.tokens import (
     BRAND_ACCENT,
     BRAND_ACCENT_HOVER,
@@ -412,6 +417,54 @@ class SettingsDialog(QWidget):
         btn_row.addWidget(apply_btn)
 
         layout.addLayout(btn_row)
+
+        # audit-w2 (F55 carry-over): accessible names + tab order. Without
+        # these, VoiceOver announces every control as "checkbox" / "button"
+        # and the focus ring skips around the panel unpredictably.
+        set_accessible_name(back_btn, "Back to dashboard")
+        set_accessible_name(self._webcam_enabled, "Enable webcam")
+        set_accessible_description(
+            self._webcam_enabled,
+            "Allow Cortex to use the webcam for biometric sensing.",
+        )
+        set_accessible_name(
+            self._input_telemetry_enabled,
+            "Enable keyboard and mouse tracking",
+        )
+        set_accessible_name(self._interventions_enabled, "Enable interventions")
+        set_accessible_name(self._sensitivity_slider, "Intervention sensitivity")
+        set_accessible_description(
+            self._sensitivity_slider,
+            "Lower values intervene less often; higher values intervene earlier.",
+        )
+        set_accessible_name(self._cooldown_spin, "Intervention cooldown (seconds)")
+        set_accessible_name(self._quiet_mode, "Quiet mode")
+        set_accessible_name(self._quiet_duration, "Quiet duration (minutes)")
+        set_accessible_name(self._llm_backend, "LLM backend provider")
+        set_accessible_name(self._debug_capture, "Capture debug logging")
+        set_accessible_name(self._debug_rppg, "rPPG debug logging")
+        set_accessible_name(self._debug_state, "State engine debug logging")
+        set_accessible_name(self._debug_llm, "LLM engine debug logging")
+        set_accessible_name(close_btn, "Close settings")
+        set_accessible_name(apply_btn, "Apply settings")
+
+        chain_tab_order(
+            back_btn,
+            self._webcam_enabled,
+            self._input_telemetry_enabled,
+            self._interventions_enabled,
+            self._sensitivity_slider,
+            self._cooldown_spin,
+            self._quiet_mode,
+            self._quiet_duration,
+            self._llm_backend,
+            self._debug_capture,
+            self._debug_rppg,
+            self._debug_state,
+            self._debug_llm,
+            close_btn,
+            apply_btn,
+        )
 
     def _make_card(self) -> QFrame:
         card = QFrame()
