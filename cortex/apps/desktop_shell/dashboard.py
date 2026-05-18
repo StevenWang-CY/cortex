@@ -273,6 +273,18 @@ class _MacSegmentedControl(QWidget):
             btn.setCheckable(True)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
+            # Phase J-5 a11y sweep: segmented-control buttons need
+            # explicit accessible names (the visible label is the
+            # text but VoiceOver also needs the role context to
+            # announce "tab — Dashboard, selected"), and StrongFocus
+            # so the keyboard tab cycle reaches them rather than the
+            # default WheelFocus which excludes them from tabbing.
+            _set_accessible_name(btn, f"{label} tab")
+            _set_accessible_description(btn, f"Switch to the {label} view.")
+            try:
+                btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            except Exception:
+                pass
             btn.setStyleSheet(
                 "QPushButton {"
                 "  padding: 4px 14px;"
@@ -329,6 +341,13 @@ class _ConsumerTab(QWidget):
         # Qt's restyle / paint chain when the user's state is unchanged.
         # Keyed by id(widget) because QWidget is not hashable on every Qt build.
         self._render_cache: dict[int, dict[str, str]] = {}
+        # Phase J-3: empty-state flag. Flips False on the first ``update_state``
+        # call so the placeholder paragraph in the biometrics card vanishes
+        # and the live BPM / HRV / BLK numerics take over. The flag is sticky
+        # — once Cortex has rendered live data, subsequent reconnects keep
+        # the live UI (the dashboard reuses cached values rather than
+        # collapsing back to "no data yet").
+        self._has_received_state: bool = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(SP6, SP5, SP6, SP6)
@@ -460,6 +479,32 @@ class _ConsumerTab(QWidget):
         )
         bio_inner.addWidget(bio_heading)
 
+        # Phase J-3: empty-state placeholder. Pre-first-frame the BPM /
+        # HRV / BLK numerics carry placeholder "--" glyphs but that
+        # reads as "stuck at zero" rather than "we haven't started yet".
+        # The placeholder paragraph below sets the expectation: nothing
+        # is broken; the daemon simply hasn't captured a frame. Hidden
+        # the moment ``update_state`` arrives.
+        self._bio_empty_state = QLabel(
+            "Start a session to see your biometrics."
+        )
+        self._bio_empty_state.setObjectName("CortexBioEmptyState")
+        self._bio_empty_state.setWordWrap(True)
+        self._bio_empty_state.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._bio_empty_state.setFont(
+            mac_native.system_font(FS_CAPTION, "regular")
+        )
+        self._bio_empty_state.setStyleSheet(
+            "QLabel#CortexBioEmptyState {"
+            f"  color: {_LABEL_TERTIARY};"
+            "  background: transparent;"
+            "  padding: 2px 0 6px 0;"
+            "  font-style: italic;"
+            "}"
+        )
+        _set_accessible_name(self._bio_empty_state, "Biometrics empty state")
+        bio_inner.addWidget(self._bio_empty_state)
+
         bio_row = QHBoxLayout()
         bio_row.setSpacing(0)
 
@@ -528,6 +573,15 @@ class _ConsumerTab(QWidget):
         self._connect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         # F55: accessible name for VoiceOver.
         _set_accessible_name(self._connect_btn, "Open Connections panel")
+        # Phase J-5: QPushButton defaults to TabFocus on most platforms
+        # but macOS Qt builds occasionally inherit WheelFocus, which
+        # silently excludes the button from the keyboard tab cycle.
+        # StrongFocus is the union of Tab + Click + Wheel and is the
+        # safe default for any user-driven control.
+        try:
+            self._connect_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        except Exception:
+            pass
         self._connect_btn.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
         self._connect_btn.setStyleSheet(
             "QPushButton {"
@@ -603,6 +657,13 @@ class _ConsumerTab(QWidget):
         self._stop_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
         self._stop_btn.setShortcut("Ctrl+Q")  # VoiceOver picks this up
         _set_accessible_name(self._stop_btn, "Stop Cortex")
+        # Phase J-5: ensure the destructive Stop button is keyboard
+        # reachable on every Qt build. The shortcut alone doesn't put
+        # the button into the tab cycle.
+        try:
+            self._stop_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        except Exception:
+            pass
         self._stop_btn.setStyleSheet(
             "QPushButton {"
             f"  border: 0.5px solid {_SEPARATOR};"
@@ -659,6 +720,19 @@ class _ConsumerTab(QWidget):
         return True
 
     def update_state(self, payload: dict) -> None:
+        # Phase J-3: first frame retires the empty state. The flag is
+        # sticky so a transient WS disconnect doesn't collapse the UI
+        # back to "no data yet" — the rendered numerics carry the last
+        # known reading, which is more useful than a placeholder.
+        if not self._has_received_state:
+            self._has_received_state = True
+            try:
+                self._bio_empty_state.setVisible(False)
+            except Exception:
+                # Lightweight mock widgets may not expose setVisible —
+                # the flag itself is what the contract pins on.
+                pass
+
         state = payload.get("state", "FLOW")
         color = STATE_COLORS.get(state, _LABEL_TERTIARY)
         label = STATE_LABELS.get(state, state)
@@ -878,10 +952,40 @@ class _AdvancedTab(QWidget):
         # F31: render-cache per widget; only setText / setValue when the
         # value differs from the last applied write.
         self._render_cache: dict[int, dict[str, object]] = {}
+        # Phase J-3: empty-state flag. Before the first capture frame
+        # arrives the developer-debug widgets are uninformative (all
+        # bars at zero, plot blank, scores all 0.00). The empty-state
+        # panel below sets expectations; ``update_state`` flips the flag
+        # and hides it.
+        self._has_received_state: bool = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(SP6, SP5, SP6, SP6)
         layout.setSpacing(SP4)
+
+        # Phase J-3: empty-state panel at the top of the advanced tab.
+        # Communicates "we haven't started yet" before any state arrives
+        # so the developer (and curious user) doesn't read the zero bars
+        # as "Cortex is broken". Hidden once update_state arrives.
+        self._empty_state = QLabel(
+            "Start a session to populate signal quality, heart-rate "
+            "trace, and state scores."
+        )
+        self._empty_state.setObjectName("CortexAdvancedEmptyState")
+        self._empty_state.setWordWrap(True)
+        self._empty_state.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self._empty_state.setFont(mac_native.system_font(FS_CAPTION, "regular"))
+        self._empty_state.setStyleSheet(
+            "QLabel#CortexAdvancedEmptyState {"
+            f"  color: {_LABEL_TERTIARY};"
+            f"  background: {_GROUPED_BG};"
+            f"  border-radius: {RADIUS_CARD}px;"
+            "  padding: 10px 14px;"
+            "  font-style: italic;"
+            "}"
+        )
+        _set_accessible_name(self._empty_state, "Advanced tab empty state")
+        layout.addWidget(self._empty_state)
 
         # F18 (audit): a small badge that surfaces when the daemon falls
         # back to synthetic state inference. Hidden by default so the
@@ -1028,6 +1132,14 @@ class _AdvancedTab(QWidget):
         return True
 
     def update_state(self, payload: dict) -> None:
+        # Phase J-3: first frame retires the empty-state panel.
+        if not self._has_received_state:
+            self._has_received_state = True
+            try:
+                self._empty_state.setVisible(False)
+            except Exception:
+                pass
+
         scores = payload.get("scores", {})
         sig_q = payload.get("signal_quality", {})
         confidence = payload.get("confidence", 0.0)
@@ -1121,6 +1233,22 @@ class DashboardWindow(QWidget):
         seg_container.addWidget(self._seg, stretch=1)
         layout.addLayout(seg_container)
 
+        # Phase J-2: error toast lives under the segmented control so it
+        # is visible from either tab. Hidden until ``show_error`` is
+        # called. Lazy-import the Toast helper at construction time so a
+        # legacy mock harness that swaps out PySide6 doesn't crash on
+        # module import — the toast is itself test-stub-tolerant.
+        try:
+            from cortex.apps.desktop_shell.components import Toast
+            toast_container = QHBoxLayout()
+            toast_container.setContentsMargins(SP6, 0, SP6, SP3)
+            self._toast: Toast | None = Toast(self)
+            toast_container.addWidget(self._toast, stretch=1)
+            layout.addLayout(toast_container)
+        except Exception:  # pragma: no cover - mock harness without Toast
+            logger.debug("Toast widget unavailable; skipping", exc_info=True)
+            self._toast = None
+
         self._stack = QStackedWidget()
         self._consumer = _ConsumerTab()
         self._advanced = _AdvancedTab()
@@ -1186,3 +1314,22 @@ class DashboardWindow(QWidget):
         budget. ``_STOP_SAFETY_TIMEOUT_MS`` is the production default."""
         if self._consumer is not None:
             self._consumer._stop_safety_timer.setInterval(int(ms))
+
+    # Phase J-2 ----------------------------------------------------------
+
+    def show_error(self, title: str, body: str, cid: str = "") -> None:
+        """Surface a daemon error in the top-bar toast.
+
+        ``cid`` is the F19 correlation id quoted back to the user so a
+        support engineer can grep the daemon log for the matching entry.
+        When the daemon failed to mint one (or the call site didn't have
+        it bound) the empty string is acceptable — the toast still shows
+        the title + body, only the support-handoff slot is empty.
+        """
+        if self._toast is None:
+            logger.warning(
+                "Toast unavailable; error not surfaced: %s — %s [cid=%s]",
+                title, body, cid,
+            )
+            return
+        self._toast.show_error(title, body, cid)

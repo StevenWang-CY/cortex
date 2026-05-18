@@ -70,6 +70,11 @@ class DaemonBridge(QObject):
     # resolves (or the safety timer fires). UI surfaces (dashboard, tray)
     # listen so they can re-enable their Stop affordances.
     daemon_stopped = Signal()
+    # Phase J-2: surface daemon errors to the dashboard top-bar toast with
+    # a correlation id quoted back to the user. Payload is (title, body,
+    # cid) — strings rather than a dict so Qt's queued-connection
+    # marshalling is dirt-cheap and the contract is easy to grep.
+    error_occurred = Signal(str, str, str)
 
     # -- callbacks invoked from daemon thread ---------------------------------
 
@@ -84,6 +89,20 @@ class DaemonBridge(QObject):
     def on_daemon_stopped(self) -> None:
         """Called when the in-process daemon's ``stop()`` future resolves."""
         self.daemon_stopped.emit()
+
+    def on_error(self, title: str, body: str, cid: str = "") -> None:
+        """Phase J-2: surface a daemon error in the dashboard toast.
+
+        Daemon-thread callers reach into the F19 correlation context to
+        pull the cid; if none is bound they pass the empty string and the
+        toast simply renders ``ref:`` with no value. Callers do not need
+        to wrap title/body — the toast clips overflowing text via the
+        host QLabel's word-wrap.
+        """
+        # Defensive: title is the only mandatory field. Body + cid can be
+        # empty so the controller can surface a "Cortex offline" toast
+        # before any cid has been minted (e.g. WS handshake failure).
+        self.error_occurred.emit(str(title or "Error"), str(body or ""), str(cid or ""))
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +174,8 @@ class CortexAppController:
         # actually reports stopped (or the dashboard/tray's own safety-timer
         # fires).
         self._bridge.daemon_stopped.connect(self._on_daemon_stopped)
+        # Phase J-2: route daemon errors into the dashboard top-bar toast.
+        self._bridge.error_occurred.connect(self._on_error_occurred)
 
         self._overlay.dismissed.connect(self._on_overlay_dismissed)
         self._settings.settings_changed.connect(self._on_settings_changed)
@@ -347,6 +368,23 @@ class CortexAppController:
             self._tray, "notify_daemon_stopped"
         ):
             self._tray.notify_daemon_stopped()
+
+    @Slot(str, str, str)
+    def _on_error_occurred(self, title: str, body: str, cid: str) -> None:
+        """Phase J-2: forward bridge error events to the dashboard's
+        top-bar toast. Defensive: the dashboard may not yet exist on
+        early-startup errors; we drop the toast in that case (the daemon's
+        own structured-log already carries the cid)."""
+        if self._dashboard is None or not hasattr(self._dashboard, "show_error"):
+            logger.warning(
+                "Dashboard unavailable for error toast: %s — %s [cid=%s]",
+                title, body, cid,
+            )
+            return
+        try:
+            self._dashboard.show_error(title, body, cid)
+        except Exception:
+            logger.debug("Toast surface failed", exc_info=True)
 
     @Slot(str)
     def _on_overlay_dismissed(self, intervention_id: str) -> None:

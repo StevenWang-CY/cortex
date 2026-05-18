@@ -74,6 +74,61 @@ from cortex.libs.utils.platform import get_config_dir
 
 logger = logging.getLogger(__name__)
 
+
+# Phase J-1: copy keyed by step id. Surfaced from the "Why we need this"
+# expand-on-click affordance on each card so a first-run user can see the
+# rationale without leaving the wizard. The copy is short and scoped to
+# the single permission/setup ask of that card — it is not a substitute
+# for documentation, it is a trust-building inline reminder.
+_WHY_COPY: dict[str, str] = {
+    "camera": (
+        "Cortex reads tiny facial cues (blink rate, breathing rhythm) "
+        "to detect overwhelm. The video stream never leaves your Mac."
+    ),
+    "accessibility": (
+        "Cortex listens for keyboard idle time and window switches to "
+        "gauge focus. macOS requires the permission so we can see "
+        "system-wide events, not just our own window."
+    ),
+    "llm_backend": (
+        "Your Bedrock token stays in the macOS Keychain. Cortex reads "
+        "it once at launch and never persists it elsewhere."
+    ),
+    "extensions": (
+        "The browser + VS Code extensions are how Cortex sees what "
+        "you're working on and offers one-click interventions."
+    ),
+}
+
+
+def _detect_continuity_camera() -> bool:
+    """Return True when AVFoundation is currently advertising at least
+    one iPhone / iPad / Continuity Camera device.
+
+    The existing webcam.py logic already skips Continuity Camera devices
+    silently, but the user has no visibility into that — first-runners
+    plugged in to an iPhone for a meeting wonder whether Cortex is
+    about to grab the wrong feed. Surfacing the skip here closes the
+    feedback gap.
+
+    Defensive: failures (no AVFoundation, non-mac, enumeration crash)
+    return False so the callout simply doesn't appear.
+    """
+    try:
+        from cortex.services.capture_service.webcam import (
+            _CONTINUITY_CAMERA_KEYWORDS,
+            _list_macos_video_device_names,
+        )
+
+        names = _list_macos_video_device_names() or []
+        for name in names:
+            normalized = (name or "").lower()
+            if any(kw in normalized for kw in _CONTINUITY_CAMERA_KEYWORDS):
+                return True
+    except Exception:
+        logger.debug("Continuity Camera detection failed", exc_info=True)
+    return False
+
 # F49: canonical step identifiers used by ``OnboardingState``. Order
 # matches the four cards rendered in ``OnboardingWindow``.
 ONBOARDING_STEPS: tuple[str, ...] = (
@@ -450,6 +505,7 @@ class OnboardingWindow(QWidget):
             "Grant Access",
             request_camera_permission,
             "1",
+            step_id="camera",
         )
         layout.addWidget(self._camera_step)
 
@@ -461,14 +517,17 @@ class OnboardingWindow(QWidget):
             "Grant Access",
             request_accessibility_permission,
             "2",
+            step_id="accessibility",
         )
         layout.addWidget(self._accessibility_step)
 
         # ── Step 3: LLM backend ───────────────────────────────────────
-        layout.addWidget(self._make_llm_step())
+        self._llm_step = self._make_llm_step()
+        layout.addWidget(self._llm_step)
 
         # ── Step 4: Connect Extensions ────────────────────────────────
-        ext_frame = self._make_section("4", "Connect extensions")
+        ext_frame = self._make_section("4", "Connect extensions", step_id="extensions")
+        self._extensions_step = ext_frame
         ext_layout = ext_frame.layout()
         hint = QLabel(
             "Install the browser and editor extensions to give Cortex "
@@ -599,7 +658,13 @@ class OnboardingWindow(QWidget):
     # Section helpers
     # ------------------------------------------------------------------
 
-    def _make_section(self, number: str, title: str) -> QFrame:
+    def _make_section(
+        self,
+        number: str,
+        title: str,
+        *,
+        step_id: str | None = None,
+    ) -> QFrame:
         frame = QFrame()
         # Scope to objectName so the QFrame stylesheet (background +
         # 0.5px hairline + 8px radius) doesn't cascade onto every
@@ -638,7 +703,56 @@ class OnboardingWindow(QWidget):
         )
         header.addWidget(heading)
         header.addStretch()
-        layout.addLayout(header)
+
+        # Phase J-1: "Why we need this" expand-on-click chevron. The
+        # chevron sits on the right of the header so it doesn't compete
+        # with the primary action button below; clicking it toggles a
+        # collapsible paragraph with the rationale.
+        if step_id and step_id in _WHY_COPY:
+            why_btn = QPushButton("Why?  ›")
+            why_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            why_btn.setCheckable(True)
+            why_btn.setFont(mac_native.system_font(FS_CAPTION, "medium"))
+            why_btn.setStyleSheet(
+                "QPushButton {"
+                "  padding: 2px 8px;"
+                f"  border-radius: {RADIUS_BUTTON}px;"
+                "  background: transparent;"
+                f"  color: {BRAND_ACCENT};"
+                "  border: none;"
+                "}"
+                f"QPushButton:hover {{ color: {BRAND_ACCENT_HOVER}; }}"
+            )
+            set_accessible_name(why_btn, f"Why Cortex needs {title}")
+            set_accessible_description(
+                why_btn,
+                "Expand a short explanation of why Cortex requests this.",
+            )
+            header.addWidget(why_btn)
+            layout.addLayout(header)
+
+            why_body = QLabel(_WHY_COPY[step_id])
+            why_body.setWordWrap(True)
+            why_body.setFont(mac_native.system_font(FS_CAPTION, "regular"))
+            why_body.setStyleSheet(
+                f"color: {_LABEL_SECONDARY}; border: none; background: transparent;"
+            )
+            why_body.setVisible(False)
+            set_accessible_name(why_body, f"{title} rationale")
+            layout.addWidget(why_body)
+
+            def _toggle_why(checked: bool, body: QLabel = why_body, btn: QPushButton = why_btn) -> None:
+                body.setVisible(checked)
+                btn.setText("Why?  ⌄" if checked else "Why?  ›")
+
+            why_btn.toggled.connect(_toggle_why)
+            # Stash refs on the frame so tests (and future surfaces) can
+            # introspect the expander without re-walking the layout.
+            frame._cortex_why_btn = why_btn  # type: ignore[attr-defined]
+            frame._cortex_why_body = why_body  # type: ignore[attr-defined]
+        else:
+            layout.addLayout(header)
+
         return frame
 
     def _make_step(
@@ -649,6 +763,8 @@ class OnboardingWindow(QWidget):
         btn_text: str,
         action: object,
         number: str,
+        *,
+        step_id: str | None = None,
     ) -> QFrame:
         """Build a permission step.
 
@@ -659,7 +775,7 @@ class OnboardingWindow(QWidget):
         granting Accessibility in System Settings didn't update the
         onboarding "Not granted" pill.
         """
-        frame = self._make_section(number, title)
+        frame = self._make_section(number, title, step_id=step_id)
         layout = frame.layout()
 
         desc = QLabel(description)
@@ -669,6 +785,30 @@ class OnboardingWindow(QWidget):
             f"color: {_LABEL_SECONDARY}; border: none;"
         )
         layout.addWidget(desc)
+
+        # Phase J-1: surface Continuity Camera skip rationale on the
+        # Camera step. The webcam.py logic already deprioritises
+        # iPhone/iPad cameras silently; this inline callout tells the
+        # user explicitly so they aren't surprised when a paired iPhone
+        # doesn't drive the biometrics.
+        if step_id == "camera" and _detect_continuity_camera():
+            callout = QLabel(
+                "We will skip your iPhone camera and use the MacBook camera."
+            )
+            callout.setObjectName("CortexContinuityCallout")
+            callout.setWordWrap(True)
+            callout.setFont(mac_native.system_font(FS_CAPTION, "medium"))
+            callout.setStyleSheet(
+                "QLabel#CortexContinuityCallout {"
+                f"  color: {BRAND_ACCENT};"
+                f"  background: {BRAND_ACCENT_DIM};"
+                f"  border-radius: {RADIUS_BUTTON}px;"
+                "  padding: 6px 10px;"
+                "}"
+            )
+            set_accessible_name(callout, "Continuity Camera skip notice")
+            layout.addWidget(callout)
+            frame._cortex_continuity_callout = callout  # type: ignore[attr-defined]
 
         row = QHBoxLayout()
 
@@ -723,7 +863,7 @@ class OnboardingWindow(QWidget):
         return frame
 
     def _make_llm_step(self) -> QFrame:
-        frame = self._make_section("3", "AWS Bedrock bearer token")
+        frame = self._make_section("3", "AWS Bedrock bearer token", step_id="llm_backend")
         layout = frame.layout()
 
         desc = QLabel(

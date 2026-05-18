@@ -1,0 +1,119 @@
+# Changelog
+
+All notable changes to Cortex. The format follows
+[Keep a Changelog](https://keepachangelog.com/) and the project adheres
+to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased] — Phase J: user-facing polish
+
+This release closes the audit's user-facing polish layer that sits on
+top of the foundational fixes (Phase A through Phase H). The
+hostile auditor wouldn't flag any of it; a real first-time user would
+notice all of it.
+
+### Added
+
+* **Onboarding refinement.** The first-run wizard now (a) detects a
+  paired iPhone / iPad Continuity Camera and surfaces an inline "we
+  will skip your iPhone camera" callout on the Camera card, and (b)
+  renders a "Why we need this" expand-on-click chevron on every card
+  with rationale copy explaining where the data lives (e.g. "video
+  stream never leaves your Mac", "Bedrock token stays in the macOS
+  Keychain"). Expander buttons carry accessible names so VoiceOver
+  announces them semantically.
+* **Top-bar error toast with cid quote-back.** Daemon errors now
+  surface in a dashboard top-bar toast that shows the F19 correlation
+  id (rendered in the mono font as `ref: <cid>`) selectable so the
+  user can copy it into a support ticket. Auto-dismisses after 8 s; a
+  manual close button is always available. Hooked to a new
+  `DaemonBridge.error_occurred(str, str, str)` Signal so any daemon
+  callback that has a correlation context bound can surface a toast.
+* **Empty states.** Before the first capture frame arrives, both the
+  consumer biometrics card ("Start a session to see your
+  biometrics.") and the developer-debug advanced tab ("Start a
+  session to populate signal quality, heart-rate trace, and state
+  scores.") render explicit empty-state placeholders. The flag is
+  sticky — a transient WS disconnect does not collapse the UI back to
+  an empty state because the cached numerics are more useful than a
+  placeholder.
+* **Overlay micro-interactions.** The intervention overlay plays a
+  subtle scale-in (250 ms, OutCubic) on the headline and a fade-in
+  (180 ms, InOutSine) on the causal-explanation row when the overlay
+  appears. The two read as one continuous motion (the fade starts
+  exactly when the headline tween finishes). Strictly purposeful: the
+  dismiss button and micro-step checkboxes are not animated; the
+  breathing pacer keeps its existing rhythm.
+* **Reduce Motion support.** `mac_native.prefers_reduced_motion`
+  consults `NSWorkspace.accessibilityDisplayShouldReduceMotion`; when
+  the user has the System Settings → Accessibility → Display → Reduce
+  motion preference enabled, the overlay's tweens are skipped and the
+  end state is applied directly.
+* **A11y sweep on remaining surfaces.** Segmented-control tab buttons,
+  the dashboard Connect / Stop buttons, the connections-panel back
+  button, and every `_primary_button` on the connections panel now
+  carry `setFocusPolicy(Qt.StrongFocus)` so they participate in the
+  keyboard tab cycle on every Qt build (macOS Qt sometimes inherits
+  `WheelFocus` which silently excludes a button from tabbing).
+  Segmented-control buttons gain explicit accessible names + a
+  descriptive long-form description for VoiceOver.
+
+### Known limitations (residual a11y, intentionally deferred)
+
+These are documented here so a future polish pass (or the v0.3 audit)
+can pick them up; they did not block the Phase J close-out.
+
+* **VoiceOver rotor item announcement on the biometrics numerics
+  (P3).** The Cormorant numerics (BPM / HRV / BLK) are decorative font
+  glyphs; VoiceOver reads them as raw text. A future commit could wrap
+  each numeric in a `QAccessibleWidget` subclass that surfaces a
+  semantic "62 beats per minute" string for screen readers. The
+  current behaviour is not WCAG-failing — the labels above the
+  numerics provide context — but it is not as rich as the visual
+  affordance.
+* **High-contrast mode (P2).** Cortex respects the system light/dark
+  appearance but does not yet honour the macOS Increase Contrast
+  accessibility preference. Under increased contrast, the warm
+  greyscale label tints would benefit from a flatter palette. The
+  token registry is already structured to support a third tier
+  (`SEMANTIC_HIGH_CONTRAST`), so the work is plumbing rather than
+  design.
+* **Live-region announcements on state transitions (P3).** When
+  Cortex detects an overwhelm transition, VoiceOver does not announce
+  the new state — the dashboard's state pill updates but is not
+  registered as a live region. A future commit should
+  `setAccessibleRole(QAccessible.Role.StaticText)` on the state pill
+  and emit `QAccessibleEvent.UpdateContents` on every state change.
+* **Reduce Motion on non-overlay surfaces (P3).** The Phase J pass
+  honours Reduce Motion on the overlay tweens only. The dashboard's
+  HR-trace plot, the breathing pacer, the focus-ring transitions, and
+  the connections-panel status pill colour transitions are not yet
+  gated by `prefers_reduced_motion`. They are all small (≤ 200 ms,
+  easing curves) and below the typical perceptual threshold for
+  motion sensitivity, but a thorough Reduce Motion pass would gate
+  them too.
+
+### Verification
+
+```bash
+QT_QPA_PLATFORM=offscreen pytest \
+    cortex/tests/unit/test_dashboard_toast.py \
+    cortex/tests/unit/test_dashboard_empty_state.py \
+    cortex/tests/unit/test_onboarding_hints.py \
+    cortex/tests/unit/test_overlay_animation.py -q
+# 26 passed
+```
+
+Manual QA: start daemon, open onboarding, click each "Why?" chevron,
+confirm rationale appears. Plug in an iPhone, reopen onboarding, see
+the Continuity callout on the Camera card. Trigger an overlay, watch
+the headline scale-in then the causal row fade-in. Toggle System
+Settings → Accessibility → Display → Reduce motion, trigger again,
+confirm both elements appear without tweens.
+
+---
+
+The pre-Phase-J audit work (Phase A through Phase H) is tracked in
+`audit/findings.md` (the 56-finding ledger) and
+`audit/execution-log.md` (the per-commit log). This CHANGELOG starts
+with Phase J because that is the release boundary at which the audit
+closes out.
