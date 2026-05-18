@@ -26,7 +26,7 @@ import collections
 import logging
 import time
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 
 try:
     from PySide6.QtCore import QRectF
@@ -146,6 +146,12 @@ logger = logging.getLogger(__name__)
 
 _MAX_HR_HISTORY = 120
 _MAX_TIMELINE_EVENTS = 50
+
+# F34: how long to keep the Stop button disabled before assuming the daemon
+# shutdown is stuck and re-enabling so the user can try again. 10 s matches
+# the audit-plan budget; controller's ``daemon_stopped`` signal short-circuits
+# this when the daemon actually reports stopped.
+_STOP_SAFETY_TIMEOUT_MS = 10_000
 
 # Resolved semantic colors. These hex strings are dev-mode fallbacks; on
 # macOS, ``mac_native`` re-tints widgets at runtime when the user toggles
@@ -275,6 +281,11 @@ class _ConsumerTab(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setStyleSheet(f"background: transparent; color: {_LABEL};")
+
+        # F34: state machine for the Stop button. ``_stopping`` flips to True
+        # on first click and back to False on ``notify_daemon_stopped`` (or
+        # the safety-timer expiry). Coalesces double-clicks at the slot level.
+        self._stopping: bool = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(SP6, SP5, SP6, SP6)
@@ -521,7 +532,16 @@ class _ConsumerTab(QWidget):
         )
         # E.1: emit stop_requested so the parent dashboard re-emits and the
         # app-level handler calls _shutdown_daemon.
-        self._stop_btn.clicked.connect(self.stop_requested.emit)
+        # F34: clicking the button transitions to the "stopping" state.
+        # The button disables itself, displays "Stopping…", and arms a safety
+        # timer that re-enables after `_STOP_SAFETY_TIMEOUT_MS` even if the
+        # daemon never reports `daemon_stopped`. Double-click coalesces to a
+        # single emission because the second click hits a disabled button.
+        self._stop_safety_timer = QTimer(self)
+        self._stop_safety_timer.setSingleShot(True)
+        self._stop_safety_timer.setInterval(_STOP_SAFETY_TIMEOUT_MS)
+        self._stop_safety_timer.timeout.connect(self._stop_safety_expired)
+        self._stop_btn.clicked.connect(self._handle_stop_clicked)
         root.addWidget(self._stop_btn)
 
     # -- Public update methods (preserved byte-identical) ----------------
@@ -557,6 +577,42 @@ class _ConsumerTab(QWidget):
             self._state_dot.setStyleSheet(
                 f"background: {_LABEL_TERTIARY}; border-radius: 3px;"
             )
+
+    # ------------------------------------------------------------------
+    # F34 — Stop button state machine
+    # ------------------------------------------------------------------
+
+    def _handle_stop_clicked(self) -> None:
+        """Disable the Stop button, swap its text to "Stopping…", arm the
+        safety timer, then emit ``stop_requested`` exactly once. Double-clicks
+        are silently coalesced because the second click lands on a disabled
+        button (the ``clicked`` signal still fires in some Qt versions when a
+        button transitions to disabled mid-event, so we also guard with
+        ``self._stopping``)."""
+        if getattr(self, "_stopping", False):
+            return
+        self._stopping = True
+        self._stop_btn.setEnabled(False)
+        self._stop_btn.setText("Stopping…")
+        self._stop_safety_timer.start()
+        self.stop_requested.emit()
+
+    def _stop_safety_expired(self) -> None:
+        """F34 safety net: if the daemon never reports stopped, re-enable
+        the button so the user can try again rather than be wedged."""
+        logger.warning(
+            "Stop button safety timeout fired; re-enabling without daemon ack"
+        )
+        self.notify_daemon_stopped()
+
+    def notify_daemon_stopped(self) -> None:
+        """Called when the daemon confirms shutdown (controller wires this).
+        Idempotent — safe to call from both the daemon-ack path and the
+        safety-timer path."""
+        self._stop_safety_timer.stop()
+        self._stopping = False
+        self._stop_btn.setEnabled(True)
+        self._stop_btn.setText("Stop Cortex")
 
 
 # ---------------------------------------------------------------------------
@@ -921,3 +977,17 @@ class DashboardWindow(QWidget):
     def set_connected(self, connected: bool) -> None:
         self._connected = connected
         self._consumer.set_connected(connected)
+
+    # F34 -----------------------------------------------------------------
+
+    def notify_daemon_stopped(self) -> None:
+        """Re-enable the Stop button. Forwarded to the consumer tab; called
+        from ``controller._on_daemon_stopped`` (or test fixtures)."""
+        if self._consumer is not None:
+            self._consumer.notify_daemon_stopped()
+
+    def set_stop_safety_timeout_ms(self, ms: int) -> None:
+        """Allow tests (or future settings) to shorten the safety-timer
+        budget. ``_STOP_SAFETY_TIMEOUT_MS`` is the production default."""
+        if self._consumer is not None:
+            self._consumer._stop_safety_timer.setInterval(int(ms))

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import QPointF, Qt, Signal
+from PySide6.QtCore import QPointF, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
@@ -32,6 +32,11 @@ STATE_COLORS: dict[str, QColor] = {
 }
 
 DISCONNECTED_COLOR = QColor(140, 140, 140)
+
+# F34: keep the tray Quit action disabled for this long after a stop is
+# requested. Re-enables earlier on ``notify_daemon_stopped``. Mirrors the
+# dashboard's safety-timer budget.
+_STOP_SAFETY_TIMEOUT_MS = 10_000
 
 
 def _heart_path(size: int) -> QPainterPath:
@@ -98,6 +103,8 @@ class CortexTrayIcon(QSystemTrayIcon):
         self._confidence = 0.0
         self._connected = False
         self._paused = False
+        # F34: tray-side mirror of the dashboard stop-button state machine.
+        self._stopping: bool = False
 
         self.setIcon(_make_heart_icon(DISCONNECTED_COLOR))
         self.setToolTip("Cortex — Disconnected")
@@ -105,6 +112,14 @@ class CortexTrayIcon(QSystemTrayIcon):
         self._menu = QMenu()
         self._build_menu()
         self.setContextMenu(self._menu)
+
+        # F34: safety timer for the tray Quit action. Re-enables the action
+        # if the daemon never reports stopped (e.g. wedged shutdown), so the
+        # user is not permanently stuck without a kill control.
+        self._stop_safety_timer = QTimer(self)
+        self._stop_safety_timer.setSingleShot(True)
+        self._stop_safety_timer.setInterval(_STOP_SAFETY_TIMEOUT_MS)
+        self._stop_safety_timer.timeout.connect(self._stop_safety_expired)
 
         self.activated.connect(self._on_activated)
 
@@ -208,8 +223,13 @@ class CortexTrayIcon(QSystemTrayIcon):
 
         quit_action = QAction("Quit Cortex", self._menu)
         quit_action.setShortcut("Ctrl+Q")
-        quit_action.triggered.connect(self.quit_requested.emit)
+        # F34: route through ``_handle_quit_triggered`` so we can disable the
+        # action and swap the label to "Stopping…" on first click, coalescing
+        # double-clicks to a single ``quit_requested`` emission.
+        quit_action.triggered.connect(self._handle_quit_triggered)
         self._menu.addAction(quit_action)
+        # Keep a handle for state transitions below.
+        self._quit_action = quit_action
 
     # ------------------------------------------------------------------
     # State / connection updates (public API preserved)
@@ -249,3 +269,47 @@ class CortexTrayIcon(QSystemTrayIcon):
     def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             self.show_dashboard_requested.emit()
+
+    # ------------------------------------------------------------------
+    # F34 — Stop / Quit state machine
+    # ------------------------------------------------------------------
+
+    def _handle_quit_triggered(self) -> None:
+        """Disable the Quit action, swap label to "Stopping…", emit exactly
+        one ``quit_requested``. Double-trigger coalesces because the second
+        click hits a disabled action (and the ``_stopping`` guard also
+        rejects it explicitly if Qt still fires the signal)."""
+        if self._stopping:
+            return
+        self._stopping = True
+        try:
+            self._quit_action.setEnabled(False)
+            self._quit_action.setText("Stopping…")
+        except RuntimeError:
+            # Action torn down; safe to ignore.
+            pass
+        self._stop_safety_timer.start()
+        self.quit_requested.emit()
+
+    def _stop_safety_expired(self) -> None:
+        """If the daemon never reports stopped, re-enable so the user can
+        retry the kill rather than being stuck."""
+        logger.warning(
+            "Tray Quit safety timeout fired; re-enabling without daemon ack"
+        )
+        self.notify_daemon_stopped()
+
+    def notify_daemon_stopped(self) -> None:
+        """Called when the daemon confirms shutdown (controller wires this).
+        Idempotent."""
+        self._stop_safety_timer.stop()
+        self._stopping = False
+        try:
+            self._quit_action.setEnabled(True)
+            self._quit_action.setText("Quit Cortex")
+        except RuntimeError:
+            pass
+
+    def set_stop_safety_timeout_ms(self, ms: int) -> None:
+        """Allow tests to shorten the safety-timer budget."""
+        self._stop_safety_timer.setInterval(int(ms))
