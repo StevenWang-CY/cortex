@@ -148,6 +148,11 @@ class SettingsDialog(QWidget):
     # the failure to the user via a toast / dialog rather than letting it
     # disappear into the prior bare ``except: pass``.
     settings_save_failed = Signal(str)
+    # Audit Debt-2 Commit 5: emitted after the user rotates the
+    # capability token via the Security section. Controller listens
+    # to refresh ``WebSocketBridge._auth_token`` and to surface a
+    # confirmation toast.
+    auth_token_rotated = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -345,6 +350,69 @@ class SettingsDialog(QWidget):
         llm_inner.addWidget(self._llm_backend)
 
         layout.addWidget(llm_card)
+
+        # ── Security ────────────────────────────────────────────────
+        # Audit Debt-2 Commit 5: the capability token gates every
+        # HTTP/WS request the daemon accepts. Rotation invalidates the
+        # current token, forces every connected client to re-AUTH with
+        # the new value, and is the user-visible escape hatch for
+        # "someone might know my token" (shared-machine flag).
+        sec_label = QLabel("Security")
+        sec_label.setStyleSheet(_SECTION_HEADING_QSS)
+        layout.addWidget(sec_label)
+
+        sec_card = self._make_card()
+        sec_inner = QVBoxLayout(sec_card)
+        sec_inner.setContentsMargins(SP4, SP4, SP4, SP4)
+        sec_inner.setSpacing(SP2)
+
+        rotate_btn = QPushButton("Rotate authentication token")
+        rotate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        rotate_btn.setMinimumHeight(32)
+        rotate_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
+        rotate_btn.setStyleSheet(
+            "QPushButton {"
+            f"  padding: 6px 14px;"
+            f"  border-radius: {RADIUS_BUTTON}px;"
+            "  background: transparent;"
+            f"  color: {_LABEL};"
+            f"  border: 0.5px solid {_SEPARATOR};"
+            "}"
+            "QPushButton:hover { background: rgba(0,0,0,0.03); }"
+        )
+        set_accessible_name(rotate_btn, "Rotate authentication token")
+        set_accessible_description(
+            rotate_btn,
+            "Replaces the capability token used by the dashboard and "
+            "browser extension. All currently-connected clients will "
+            "reconnect with the new token automatically.",
+        )
+        rotate_btn.clicked.connect(self._on_rotate_token)
+        sec_inner.addWidget(rotate_btn)
+
+        sec_hint = QLabel(
+            "Use if you suspect another user on this Mac may have "
+            "read your auth token file."
+        )
+        sec_hint.setFont(mac_native.system_font(FS_CAPTION, "regular"))
+        sec_hint.setWordWrap(True)
+        sec_hint.setStyleSheet(
+            f"color: {_LABEL_SECONDARY}; background: transparent;"
+        )
+        sec_inner.addWidget(sec_hint)
+
+        self._rotate_token_btn = rotate_btn
+        self._rotate_token_status = QLabel("")
+        self._rotate_token_status.setFont(
+            mac_native.system_font(FS_CAPTION, "regular"),
+        )
+        self._rotate_token_status.setWordWrap(True)
+        self._rotate_token_status.setStyleSheet(
+            f"color: {_LABEL_SECONDARY}; background: transparent;"
+        )
+        sec_inner.addWidget(self._rotate_token_status)
+
+        layout.addWidget(sec_card)
 
         # ── Debug ────────────────────────────────────────────────────
         debug_label = QLabel("Debug")
@@ -615,6 +683,45 @@ class SettingsDialog(QWidget):
         except Exception:
             pass
         return f"QSettings status={status!r}"
+
+    def _on_rotate_token(self) -> None:
+        """Audit Debt-2 Commit 5: mint a fresh capability token, drop
+        the old one, and emit ``auth_token_rotated`` so the controller
+        forces a WS reconnect with the new value.
+
+        Failures (filesystem read-only, etc.) update the inline status
+        label instead of raising — the user explicitly asked for this
+        action and deserves visible feedback either way.
+        """
+        from cortex.libs.auth import rotate_token
+        from cortex.libs.logging.structured import EventType
+
+        try:
+            new_token = rotate_token()
+        except Exception as exc:
+            logger.exception("Token rotation failed")
+            self._rotate_token_status.setText(
+                f"Could not rotate token: {exc}"
+            )
+            return
+
+        logger.info(
+            "%s actor=user",
+            EventType.AUTH_TOKEN_ROTATED.value,
+        )
+        # Briefly disable the button so a frustrated double-click does
+        # not stack three rotations in 500 ms; re-enable after a beat.
+        self._rotate_token_btn.setEnabled(False)
+        self._rotate_token_status.setText(
+            "Token rotated. Clients will reconnect within a few seconds."
+        )
+        self.auth_token_rotated.emit(new_token)
+
+        # Re-enable after 1.5 s so the user can rotate again if they
+        # have additional clients to invalidate.
+        from PySide6.QtCore import QTimer
+
+        QTimer.singleShot(1500, lambda: self._rotate_token_btn.setEnabled(True))
 
     def _load_persisted_settings(self) -> None:
         def _get_bool(key: str, default: bool) -> bool:

@@ -355,6 +355,12 @@ class CortexApp:
 
         # Connect settings changes
         self._settings.settings_changed.connect(self._on_settings_changed)
+        # Debt-2 Commit 5: rotation drops the bridge's cached token,
+        # forces a reconnect, and surfaces a confirmation toast.
+        if hasattr(self._settings, "auth_token_rotated"):
+            self._settings.auth_token_rotated.connect(
+                lambda _tok: self._bridge.refresh_auth_token(),
+            )
         self._onboarding.open_settings_requested.connect(self._show_settings)
         self._onboarding.run_calibration_requested.connect(self._run_calibration)
         self._onboarding.completed.connect(self._complete_onboarding)

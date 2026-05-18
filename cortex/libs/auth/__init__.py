@@ -12,6 +12,7 @@ from cortex.libs.auth.local_token import (
     AUTH_TOKEN_FILENAME,
     auth_token_path,
     load_or_create_token,
+    rotate_token,
     verify_token,
 )
 
@@ -19,5 +20,6 @@ __all__ = [
     "AUTH_TOKEN_FILENAME",
     "auth_token_path",
     "load_or_create_token",
+    "rotate_token",
     "verify_token",
 ]
