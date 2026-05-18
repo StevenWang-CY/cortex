@@ -174,6 +174,11 @@ class ConnectionsPanel(QWidget):
         )
         back_btn.clicked.connect(self._on_back)
         set_accessible_name(back_btn, "Back to dashboard")
+        # Phase J-5: keyboard-reachable Back button.
+        try:
+            back_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        except Exception:
+            pass
         self._tab_order_chain.append(back_btn)
         header.addWidget(back_btn)
         header.addStretch()
@@ -322,6 +327,14 @@ class ConnectionsPanel(QWidget):
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.setMinimumHeight(34)
         btn.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
+        # Phase J-5: ensure every primary action button on the
+        # connections panel is keyboard-reachable. QPushButton's
+        # default on macOS can fall back to WheelFocus which excludes
+        # the button from the tab cycle.
+        try:
+            btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        except Exception:
+            pass
         btn.setStyleSheet(
             "QPushButton {"
             "  padding: 6px 16px;"

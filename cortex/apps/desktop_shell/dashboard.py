@@ -273,6 +273,18 @@ class _MacSegmentedControl(QWidget):
             btn.setCheckable(True)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
+            # Phase J-5 a11y sweep: segmented-control buttons need
+            # explicit accessible names (the visible label is the
+            # text but VoiceOver also needs the role context to
+            # announce "tab — Dashboard, selected"), and StrongFocus
+            # so the keyboard tab cycle reaches them rather than the
+            # default WheelFocus which excludes them from tabbing.
+            _set_accessible_name(btn, f"{label} tab")
+            _set_accessible_description(btn, f"Switch to the {label} view.")
+            try:
+                btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            except Exception:
+                pass
             btn.setStyleSheet(
                 "QPushButton {"
                 "  padding: 4px 14px;"
@@ -561,6 +573,15 @@ class _ConsumerTab(QWidget):
         self._connect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         # F55: accessible name for VoiceOver.
         _set_accessible_name(self._connect_btn, "Open Connections panel")
+        # Phase J-5: QPushButton defaults to TabFocus on most platforms
+        # but macOS Qt builds occasionally inherit WheelFocus, which
+        # silently excludes the button from the keyboard tab cycle.
+        # StrongFocus is the union of Tab + Click + Wheel and is the
+        # safe default for any user-driven control.
+        try:
+            self._connect_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        except Exception:
+            pass
         self._connect_btn.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
         self._connect_btn.setStyleSheet(
             "QPushButton {"
@@ -636,6 +657,13 @@ class _ConsumerTab(QWidget):
         self._stop_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
         self._stop_btn.setShortcut("Ctrl+Q")  # VoiceOver picks this up
         _set_accessible_name(self._stop_btn, "Stop Cortex")
+        # Phase J-5: ensure the destructive Stop button is keyboard
+        # reachable on every Qt build. The shortcut alone doesn't put
+        # the button into the tab cycle.
+        try:
+            self._stop_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        except Exception:
+            pass
         self._stop_btn.setStyleSheet(
             "QPushButton {"
             f"  border: 0.5px solid {_SEPARATOR};"

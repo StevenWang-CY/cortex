@@ -24,7 +24,8 @@ node_modules/
 .ralphrc
 .vscode/
 CLAUDE.md
-CHANGELOG.md
+# CHANGELOG.md is tracked starting at Phase J — it's the user-facing
+# audit close-out summary at the release boundary.
 
 # VS Code extension compiled output
 cortex/apps/vscode_extension/out/
