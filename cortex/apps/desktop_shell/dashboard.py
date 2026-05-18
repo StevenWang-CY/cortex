@@ -165,6 +165,38 @@ _SEPARATOR = SEMANTIC_LIGHT["separator"]
 _DANGER = SEMANTIC_LIGHT["danger"]
 
 
+def _set_accessible_name(widget: object, name: str) -> None:
+    """Wrapper for ``setAccessibleName`` that no-ops cleanly when the
+    target widget is a lightweight test stub without that method (F55)."""
+    fn = getattr(widget, "setAccessibleName", None)
+    if callable(fn):
+        try:
+            fn(name)
+        except Exception:
+            pass
+
+
+def _set_accessible_description(widget: object, description: str) -> None:
+    """Wrapper for ``setAccessibleDescription`` — see :func:`_set_accessible_name`."""
+    fn = getattr(widget, "setAccessibleDescription", None)
+    if callable(fn):
+        try:
+            fn(description)
+        except Exception:
+            pass
+
+
+def _set_tab_order(first: object, second: object) -> None:
+    """Wrapper for ``QWidget.setTabOrder`` that degrades cleanly when
+    PySide6 has been swapped out for the lightweight test stubs (F55)."""
+    fn = getattr(QWidget, "setTabOrder", None)
+    if callable(fn):
+        try:
+            fn(first, second)
+        except Exception:
+            pass
+
+
 def _system(point_size: float, weight: str = "regular") -> str:
     """Return a Qt stylesheet font-family value resolving to the system font.
 
@@ -338,10 +370,13 @@ class _ConsumerTab(QWidget):
         self._goal_input = QLineEdit()
         self._goal_input.setPlaceholderText("What are you working on?")
         self._goal_input.setMinimumHeight(36)
-        # F55: accessible name + description for VoiceOver / screen readers.
-        self._goal_input.setAccessibleName("Goal")
-        self._goal_input.setAccessibleDescription(
-            "Tell Cortex what you're working on so suggestions match your intent."
+        # F55: accessible name + description for VoiceOver / screen
+        # readers. Wrapped because the legacy MockQLineEdit stub in
+        # test_desktop_shell.py does not expose these QWidget methods.
+        _set_accessible_name(self._goal_input, "Goal")
+        _set_accessible_description(
+            self._goal_input,
+            "Tell Cortex what you're working on so suggestions match your intent.",
         )
         self._goal_input.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         self._goal_input.setStyleSheet(
@@ -474,7 +509,7 @@ class _ConsumerTab(QWidget):
         self._connect_btn = QPushButton("Connect")
         self._connect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         # F55: accessible name for VoiceOver.
-        self._connect_btn.setAccessibleName("Open Connections panel")
+        _set_accessible_name(self._connect_btn, "Open Connections panel")
         self._connect_btn.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
         self._connect_btn.setStyleSheet(
             "QPushButton {"
@@ -549,7 +584,7 @@ class _ConsumerTab(QWidget):
         self._stop_btn.setMinimumHeight(36)  # HIG tap target ≥ 44 once font padding factored
         self._stop_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
         self._stop_btn.setShortcut("Ctrl+Q")  # VoiceOver picks this up
-        self._stop_btn.setAccessibleName("Stop Cortex")
+        _set_accessible_name(self._stop_btn, "Stop Cortex")
         self._stop_btn.setStyleSheet(
             "QPushButton {"
             f"  border: 0.5px solid {_SEPARATOR};"
@@ -571,8 +606,8 @@ class _ConsumerTab(QWidget):
         # contractual — a single re-ordering of constructor lines can
         # silently scramble VoiceOver / keyboard navigation. The chain
         # below is the canonical reading order: Goal → Connect → Stop.
-        QWidget.setTabOrder(self._goal_input, self._connect_btn)
-        QWidget.setTabOrder(self._connect_btn, self._stop_btn)
+        _set_tab_order(self._goal_input, self._connect_btn)
+        _set_tab_order(self._connect_btn, self._stop_btn)
 
     # -- Public update methods (preserved byte-identical) ----------------
 

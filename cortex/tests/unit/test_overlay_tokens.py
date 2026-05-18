@@ -23,12 +23,33 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from pathlib import Path
 
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+
+def _pyside6_is_mocked() -> bool:
+    """test_desktop_shell.py installs lightweight mock PySide6 modules
+    that have no ``__file__``. Re-importing real PySide6 segfaults."""
+    pyside6 = sys.modules.get("PySide6")
+    if pyside6 is None:
+        return False
+    return getattr(pyside6, "__file__", None) is None
+
+
 pytest.importorskip("PySide6")
+
+
+@pytest.fixture(autouse=True)
+def _skip_if_pyside6_mocked():
+    """Skip when test_desktop_shell.py's mocks override real PySide6."""
+    if _pyside6_is_mocked():
+        pytest.skip(
+            "PySide6 mocked by earlier test in session — run in isolation",
+        )
 
 
 OVERLAY = (

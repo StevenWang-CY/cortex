@@ -19,19 +19,48 @@ Two cases:
 from __future__ import annotations
 
 import os
+import sys
 from unittest.mock import patch
 
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+
+def _pyside6_is_mocked() -> bool:
+    """test_desktop_shell.py installs lightweight mock PySide6 modules
+    that have no ``__file__``. Re-importing real PySide6 segfaults."""
+    pyside6 = sys.modules.get("PySide6")
+    if pyside6 is None:
+        return False
+    return getattr(pyside6, "__file__", None) is None
+
+
 pytest.importorskip("PySide6")
 from PySide6.QtCore import QSettings  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _skip_if_pyside6_mocked():
+    """Skip when test_desktop_shell.py's mocks override real PySide6."""
+    if _pyside6_is_mocked():
+        pytest.skip(
+            "PySide6 mocked by earlier test in session — run in isolation",
+        )
+
+
 @pytest.fixture(scope="module")
-def qapp() -> QApplication:
-    app = QApplication.instance() or QApplication([])
+def qapp():
+    """Lazily resolve QApplication so a mocked import doesn't bind us
+    to MockQApplication at module-load time."""
+    if _pyside6_is_mocked():
+        pytest.skip("PySide6 mocked", allow_module_level=False)
+    qt_widgets = sys.modules.get("PySide6.QtWidgets")
+    real_qapp = getattr(qt_widgets, "QApplication", None)
+    if real_qapp is None:
+        pytest.skip("PySide6.QtWidgets unavailable", allow_module_level=False)
+    app = getattr(real_qapp, "instance", lambda: None)() or real_qapp([])
     return app
 
 
