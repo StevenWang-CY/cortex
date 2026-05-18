@@ -1,9 +1,9 @@
 # Audit State Pointer
 
 **Phase:** 2 (remediation in progress)
-**Next finding to address:** F08 (launcher /stop auth gate + native-host token fetch — picks up F07b)
-**Last finding closed:** F07 (WS SHUTDOWN capability token)
-**Last commit:** `audit F07: capability token on WS SHUTDOWN`
+**Next finding to address:** F02 (atomic session report write)
+**Last finding closed:** F08 + F07b (launcher /stop capability token, native-host get_auth_token)
+**Last commit:** `audit F08+F07b: capability token on launcher /stop + native-host token fetch`
 **Resume protocol on fresh invocation:**
 
 1. Read `audit/findings.md` — authoritative Ledger.

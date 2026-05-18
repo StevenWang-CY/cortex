@@ -31,6 +31,53 @@ DAEMON_WS_PORT = 9473
 DAEMON_HTTP_PORT = 9472
 
 
+# F08: capability-token gate on destructive endpoints. The full helper
+# lives in ``cortex.libs.auth.local_token``; this file's docstring
+# mandates zero cortex imports so the launcher survives a broken
+# package install. We therefore inline a minimal path resolver and a
+# constant-time compare. Token-file format must stay in sync with
+# ``cortex/libs/auth/local_token.py``.
+
+_AUTH_TOKEN_HEADER = "X-Cortex-Auth-Token"
+
+
+def _auth_token_path() -> str:
+    """Resolve the auth-token file path without importing cortex."""
+    if sys.platform == "darwin":
+        return os.path.expanduser(
+            "~/Library/Application Support/Cortex/auth.token"
+        )
+    if sys.platform.startswith("linux"):
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        return os.path.join(base, "cortex", "auth.token")
+    if sys.platform in ("win32", "cygwin"):
+        base = os.environ.get("APPDATA") or os.path.expanduser(
+            "~\\AppData\\Roaming"
+        )
+        return os.path.join(base, "Cortex", "auth.token")
+    return os.path.expanduser("~/.cortex/auth.token")
+
+
+def _verify_auth_token(presented: str | None) -> bool:
+    """Constant-time check against the on-disk token. Falls closed on
+    any read/compare error so a missing or unreadable file results in
+    a 401 rather than open access."""
+    if not presented:
+        return False
+    try:
+        with open(_auth_token_path(), encoding="utf-8") as fp:
+            stored = fp.read().strip()
+    except OSError:
+        return False
+    if not stored:
+        return False
+    import hmac
+    try:
+        return hmac.compare_digest(stored, presented.strip())
+    except Exception:
+        return False
+
+
 def _project_root() -> str:
     """Return the project root directory."""
     env = os.environ.get("CORTEX_PROJECT_ROOT")
@@ -260,6 +307,20 @@ class LauncherHandler(BaseHTTPRequestHandler):
             result = _launch_daemon()
             self._send_json(result)
         elif self.path == "/stop":
+            # F08: require the capability token. Any localhost origin
+            # (malicious tab, hostile extension on the same browser
+            # profile) can reach this port; without the gate, any such
+            # origin could enumerate PIDs and SIGTERM the daemon at
+            # will. The token is supplied via the X-Cortex-Auth-Token
+            # header; the legitimate extension fetches it from the
+            # native host (see native_host.py:get_auth_token).
+            presented = self.headers.get(_AUTH_TOKEN_HEADER)
+            if not _verify_auth_token(presented):
+                self._send_json(
+                    {"error": "unauthorized", "reason": "missing or invalid auth token"},
+                    401,
+                )
+                return
             result = _stop_daemon()
             self._send_json(result)
         else:

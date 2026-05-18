@@ -56,18 +56,44 @@ Entries appended in commit order. Each entry: finding ID, fix summary, files tou
 
 ---
 
+### F08 + F07b — Capability token gate on launcher /stop and native-host token fetch
+
+**Fix.** Same threat model as F07 — close cross-origin localhost. Two changes ship together because the legitimate extension path needs both halves of the plumbing to remain functional:
+
+1. `launcher_agent.py` requires `X-Cortex-Auth-Token` on `POST /stop`. Header missing or wrong → 401, no PID enumeration, no SIGTERM. `/launch`, `/health`, `/status` remain open (non-destructive; needed for liveness probes and supervisor start-up). The launcher's "zero cortex imports" invariant is preserved by inlining a minimal `_auth_token_path()` + `_verify_auth_token()` (`hmac.compare_digest`).
+2. `native_host.py` gains a `get_auth_token` command that returns the daemon's token. The browser↔native-host channel is already OS-authenticated per-profile, so returning the token here does not widen the attack surface; the mode-0600 file is still unreadable from any sandboxed page context.
+
+**Files touched** (4):
+- `cortex/scripts/launcher_agent.py`
+- `cortex/scripts/native_host.py`
+- `cortex/tests/unit/test_launcher_auth.py` (new)
+- `cortex/tests/unit/test_native_host_auth.py` (new)
+
+**Test.** 5 cases in `test_launcher_auth.py` + 2 cases in `test_native_host_auth.py`. The launcher tests boot the real `LauncherHandler` on an ephemeral port, monkeypatch `_stop_daemon` to a no-op so the test does not kill the developer's running daemon, and verify (a) /stop without token → 401, (b) /stop with wrong token → 401, (c) /stop with the file's token → 200, (d) /health stays open, (e) missing token file → fall-closed (401, not open). The native-host tests verify `get_auth_token` returns an existing token unchanged and provisions a new one when absent. All fail on `main`.
+
+**Verification.** `pytest cortex/tests/unit/test_launcher_auth.py cortex/tests/unit/test_native_host_auth.py cortex/tests/unit/test_auth_local_token.py cortex/tests/integration/test_correlation_ids.py` → 23 passed.
+
+**Compatibility.** Breaking for external `POST /stop` callers without the token. Internal callers: `background.ts:2578-2583`. After this commit the extension's Step 6 of its kill chain fails 401; Steps 2–5 still run (HTTP /shutdown, native-messaging stop). To fully restore Step 6, the extension must fetch the token via `chrome.runtime.sendNativeMessage("com.cortex.launcher", {command: "get_auth_token"})` and add it as `X-Cortex-Auth-Token` to its `/stop` fetch. Wiring this in `background.ts` is split out as **F08b** (gated on F40 TS test infra).
+
+**Rollback.** `git revert` is clean. The launcher's inline auth helper is self-contained; the native-host new command has no side effects.
+
+---
+
 ## New Findings (surfaced during Phase 2)
 
 ### F07b — Native-host mediated auth-token fetch for extension
 
-**Summary.** F07 closed the WS SHUTDOWN gap by requiring `auth_token` on the SHUTDOWN message. The legitimate browser extension can't read the mode-0600 token file directly. After F07, the extension's `Stop Cortex` flow Step 1 (WS SHUTDOWN) becomes a silent no-op; user-facing function is preserved by Steps 2–6 in the same kill chain, but Step 1's "graceful flush" intent is lost.
-**Fix outline.** Add a `get_auth_token` command to `cortex/scripts/native_host.py` that reads the file and returns the token. Extension calls it on connect, caches in memory, attaches to outbound SHUTDOWN. Native-host runs as the user → can read the file; sandboxed page-context cannot reach the native host.
-**Location.** `cortex/scripts/native_host.py`, `cortex/apps/browser_extension/background.ts:2546-2554`.
-**Category.** Backend + UI.
-**Blast radius.** maintainability (Step 1 of stop chain currently dead) → correctness when other steps fail.
+**Status.** Daemon-side closed in F08. Extension-side wiring still open as **F08b**.
+
+### F08b — Extension wires native-host get_auth_token into SHUTDOWN and /stop
+
+**Summary.** F07+F08+F07b shipped the daemon-side primitives. The browser extension still does not fetch the token via `chrome.runtime.sendNativeMessage("com.cortex.launcher", {command: "get_auth_token"})`, so its Step 1 (WS SHUTDOWN with `auth_token`) and Step 6 (`POST /stop` with `X-Cortex-Auth-Token`) currently fail. User-facing kill chain still works via Steps 2–5; the legacy redundancy absorbs the gap, but Step 1's graceful-flush intent and Step 6's belt-and-braces shutdown are lost.
+**Fix outline.** On WS connect or first SHUTDOWN attempt, send `{command:"get_auth_token"}` to the native host, cache in memory, attach to outbound SHUTDOWN payload and `/stop` fetch.
+**Location.** `cortex/apps/browser_extension/background.ts:2544-2583`.
+**Category.** UI.
+**Blast radius.** maintainability.
 **Fix complexity.** S.
-**Dependencies.** F07 (closed), F08 (same native-host plumbing).
-**Why deferred.** Bundled with F08 in the next commit since the same native-host token-fetch primitive serves both gates.
+**Dependencies.** F08 (closed), F40 (no TS test infra to satisfy Phase-2 quality bar).
 
 ### F19b — Correlation IDs in browser extension
 
