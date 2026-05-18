@@ -26,7 +26,7 @@ import collections
 import logging
 import time
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 
 try:
     from PySide6.QtCore import QRectF
@@ -346,9 +346,33 @@ class _ConsumerTab(QWidget):
             f"QLineEdit::placeholder {{ color: {_LABEL_TERTIARY}; }}"
         )
         # E.1: emit goal_set when the user hits return.
-        self._goal_input.returnPressed.connect(
-            lambda: self.goal_set.emit(self._goal_input.text().strip())
-        )
+        # F33: debounce the goal-set emission. A held-down Return key fires
+        # ``returnPressed`` repeatedly (Qt key auto-repeat); without a
+        # coalescer the daemon receives N rapid-fire goals, the LLM kicks
+        # off N planner calls, and the user pays the latency + cost of
+        # the bursts. Schedule a single 150 ms singleShot per burst and
+        # ignore subsequent presses while one is pending — the emit reads
+        # the latest input text at fire time, so the user still gets the
+        # value they typed last.
+        self._goal_debounce_pending = False
+
+        def _schedule_goal_emit() -> None:
+            if self._goal_debounce_pending:
+                return
+            self._goal_debounce_pending = True
+            QTimer.singleShot(150, _fire_goal_emit)
+
+        def _fire_goal_emit() -> None:
+            self._goal_debounce_pending = False
+            self.goal_set.emit(self._goal_input.text().strip())
+
+        self._goal_input.returnPressed.connect(_schedule_goal_emit)
+        # Expose the scheduler for tests so they can drive the coalescer
+        # deterministically (the QTimer.singleShot path needs an event
+        # loop tick which the offscreen test harness provides via
+        # ``QApplication.processEvents``).
+        self._schedule_goal_emit = _schedule_goal_emit
+        self._fire_goal_emit = _fire_goal_emit
         root.addWidget(self._goal_input)
         root.addSpacing(SP5)
 
