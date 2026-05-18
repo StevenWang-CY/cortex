@@ -215,4 +215,20 @@ Entries appended in commit order. Each entry: finding ID, fix summary, files tou
 
 ## Deferred From Phase 1
 
-(none yet — all original Ledger entries remain open)
+(All Ledger entries not yet visited remain open — see `audit/state.md` for the locked execution order. None has been formally deferred yet; the session ended on a natural cohort boundary, not a scope-failure boundary.)
+
+---
+
+## Phase 2 Session 1 — Residual Risk Statement
+
+The eight commits in this session close the data-loss tier (F01, F02, F03), the security tier on local-CSRF + prompt injection + credential containment (F07, F08, F09, F11), and the observability foundation (F19). The following residual risks remain after this session — three things most likely to still go wrong in production:
+
+1. **Cost runaway via state oscillation (F20, F25, F26, F27 still open).** A user whose biometric signal oscillates at the HYPER/FLOW boundary can drive 60+ LLM calls/hour. F19 added `cid=` to the planner's success log so per-request grouping is now possible, but the per-user budget, the kill-switch, and the hysteresis fix are still pending. **Monitoring needed:** alarm on per-user planner calls/hour > 30 in any 60-minute window. The `cid=` field is already in place; a downstream log aggregator can group by user and count.
+
+2. **TS extension is uncovered by tests (F40 still open, blocks F19b/F08b/F07b's extension wiring).** The extension-side correlation propagation, native-host token fetch, and `/stop` token attachment are all daemon-ready but extension-unwired. The extension currently fails its WS SHUTDOWN step (Step 1 of stop chain) and its launcher `/stop` step (Step 6) 401. User-facing function is preserved by the redundant other steps; if one of those fails, the user will discover daemons that don't shut down cleanly. **Monitoring needed:** the launcher's `/stop` access log will now show 401s from the extension. That should be the first thing a fresh tail of `~/Library/Application Support/Cortex/launcher.log` reveals.
+
+3. **Action validation gap (F10 still open).** F09 closed the prompt-injection path; F10 — the executor-side allowlist for `open_url`/`close_tab` arguments — is the matching defence and is the next finding in the locked order. Until F10 lands, an LLM that *was* persuaded by injection (e.g. via a vector the F09 defence doesn't cover, like a Unicode homograph not yet in our defang list) can still emit a structurally-valid action with a malicious URL or tab index. **Monitoring needed:** log every `suggested_actions[*].target` value at INFO so post-hoc review can flag novel URLs.
+
+## Phase 2 Session 1 — Least-Confident Fix
+
+**F03** (background task tracking). The fix itself is straightforward — a tracked set + `_spawn_background_task` helper + cancellation in `stop()`. What I am least confident about is whether the test coverage is sufficient. The test runs against a `_StubDaemon` that mirrors the helper because booting the full `CortexDaemon` requires a real camera, real store backends, and other dependencies. The stub exercises the contract precisely, but it cannot catch the case where a future call site in the daemon adds another bare `asyncio.create_task(...)` instead of using `_spawn_background_task`. A `pytest --collect-only` style lint or a one-line grep CI check (`! grep -rn "asyncio.create_task" cortex/services/runtime_daemon.py | grep -v "_spawn_background_task"`) would close that gap. Filing as **F03b** but not opening a Ledger row this session because the existing failure mode (orphan tasks) is closed at the call site that was flagged; the residual risk is regression-only, not active.
