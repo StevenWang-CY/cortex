@@ -126,6 +126,7 @@ from cortex.apps.desktop_shell.tokens import (
     CX_TEXT_TERTIARY,
     DASHBOARD_MAX_HEIGHT,
     DASHBOARD_WIDTH,
+    FONT_MONO,
     FS_CAPTION,
     FS_FOOTNOTE,
     FS_HERO_NUMERIC,
@@ -1002,7 +1003,7 @@ class _AdvancedTab(QWidget):
         self._timeline_text = QLabel("No events yet")
         self._timeline_text.setWordWrap(True)
         self._timeline_text.setStyleSheet(
-            f"font-family: \"SF Mono\", ui-monospace, Menlo, monospace;"
+            f"font-family: {FONT_MONO};"
             f"font-size: {FS_CAPTION}px; color: {_LABEL_SECONDARY};"
             f"background: transparent; line-height: 1.6;"
         )
