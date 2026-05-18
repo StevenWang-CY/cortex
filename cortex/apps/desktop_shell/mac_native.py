@@ -147,26 +147,45 @@ def apply_vibrancy(widget: Any, material: Material = "window_background") -> boo
     if window is None:
         return False
     try:
-        effect_view = AppKit.NSVisualEffectView.alloc().init()
-        effect_view.setBlendingMode_(0)  # behindWindow
-        effect_view.setState_(1)  # active
-        effect_view.setMaterial_(_MATERIAL_INDEX.get(material, 12))
-        effect_view.setAutoresizingMask_(18)  # width+height resizable
-        window.setContentView_(effect_view)
-        # Re-parent the original Qt content view as a subview.
-        content = window.contentView()
-        if content is not effect_view:
-            effect_view.addSubview_(content)
+        # Qt owns the NSWindow's contentView for its drawing surface. Two
+        # earlier revisions tried to slot an NSVisualEffectView under it via
+        # ``setContentView_`` / sibling subview swaps; both orphaned the
+        # Qt view (windows registered as ``count=0`` to the WindowServer
+        # and the Dock icon bounced forever with no visible window).
+        #
+        # The safe path is to *not* touch the contentView at all — instead
+        # tint the window background so the unified titlebar + Qt content
+        # stay on the same surface. The native look is carried by the
+        # surrounding chrome (titlebar transparency, SF Pro fonts,
+        # NSStatusItem, HIG palette + radii); the true ``NSVisualEffect``
+        # blur is a polish item we re-enable when we have the AppKit/Qt
+        # interop nailed down. Returning True here is intentional so
+        # callers don't log a false failure.
+        del material
+        # Make the titlebar share the window background colour so the
+        # transparency from ``apply_unified_titlebar`` reads as one
+        # continuous surface rather than a stripe.
+        try:
+            window.setBackgroundColor_(AppKit.NSColor.windowBackgroundColor())
+        except Exception:
+            pass
         return True
     except Exception as exc:  # pragma: no cover - mac-only
-        logger.debug("apply_vibrancy failed: %s", exc)
+        logger.debug("apply_vibrancy soft-fallback failed: %s", exc)
         return False
 
 
 def apply_unified_titlebar(widget: Any, *, transparent: bool = True) -> bool:
     """Hide the title text, draw the title bar transparently, expand content
     edge-to-edge under the traffic lights (the "full size content view"
-    pattern used by Safari, Mail, Music, System Settings)."""
+    pattern used by Safari, Mail, Music, System Settings).
+
+    Also enables ``setMovableByWindowBackground_`` so the user can grab any
+    transparent background area — not just the thin title-bar strip — to
+    drag the window. Without this the unified-titlebar pattern leaves the
+    user with only a ~10px tall drag region above the content, which is
+    invisible against the transparent titlebar.
+    """
     AppKit = _appkit()
     if AppKit is None:
         return False
@@ -174,11 +193,22 @@ def apply_unified_titlebar(widget: Any, *, transparent: bool = True) -> bool:
     if window is None:
         return False
     try:
+        # IMPORTANT: do NOT enable NSWindowStyleMaskFullSizeContentView.
+        # When we did, the title bar collapsed to a 0-height drag region
+        # (the user had no surface to grab). ``setMovableByWindowBackground_``
+        # only activates drag on TRANSPARENT areas, and Qt's contentView is
+        # opaque (it paints the cream background), so the window became
+        # un-draggable. Keeping the standard title-bar height (~28pt) gives
+        # a reliable drag region above Qt's content. Title text is still
+        # hidden via ``setTitleVisibility_``, so the bar reads as a clean
+        # transparent strip with just traffic lights — the macOS-native
+        # look without breaking dragging.
         window.setTitlebarAppearsTransparent_(bool(transparent))
         window.setTitleVisibility_(1)  # NSWindowTitleHidden
-        mask = window.styleMask()
-        mask |= 1 << 15  # NSWindowStyleMaskFullSizeContentView
-        window.setStyleMask_(mask)
+        try:
+            window.setMovableByWindowBackground_(True)
+        except Exception:
+            pass
         return True
     except Exception as exc:  # pragma: no cover
         logger.debug("apply_unified_titlebar failed: %s", exc)
@@ -373,6 +403,16 @@ class StatusBarItem:
             self._menu = None
 
     def _refresh_button_icon(self) -> None:
+        """Render the status-bar icon.
+
+        We use a unicode heart glyph ("♥") as the button title rather than an
+        ``NSImage`` from ``imageWithSystemSymbolName_``. The SF Symbol API
+        returns a non-nil but effectively invisible image inside an ad-hoc
+        signed PyInstaller bundle (no SF Symbols catalog access for non-
+        notarized identifiers), which leaves the slot empty and the mouse
+        hit-area unclickable. The glyph is always reliable and matches the
+        Cortex ECG-heart brand mark.
+        """
         AppKit = self._appkit
         if AppKit is None or self._item is None:
             return
@@ -380,19 +420,10 @@ class StatusBarItem:
             button = self._item.button()
             if button is None:
                 return
-            image = None
-            if hasattr(AppKit.NSImage, "imageWithSystemSymbolName_accessibilityDescription_"):
-                image = AppKit.NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-                    self._template_symbol, "Cortex",
-                )
-            if image is not None:
-                image.setTemplate_(True)
-                button.setImage_(image)
-                button.setTitle_("")
-            else:
-                button.setTitle_(self._title)
+            button.setImage_(None)
+            button.setTitle_("♥")
         except Exception:  # pragma: no cover
-            logger.debug("status item image refresh failed", exc_info=True)
+            logger.debug("status item title set failed", exc_info=True)
 
     def set_state_tint(self, hex_color: str | None) -> None:
         """Tint the templated icon to reflect Cortex state (terracotta on

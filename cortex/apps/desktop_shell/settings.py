@@ -392,8 +392,9 @@ class SettingsDialog(QWidget):
 
     def _make_card(self) -> QFrame:
         card = QFrame()
+        card.setObjectName("CortexSettingsCard")
         card.setStyleSheet(
-            "QFrame {"
+            "QFrame#CortexSettingsCard {"
             f"  background: {_CONTROL_BG};"
             f"  border: 0.5px solid {_SEPARATOR};"
             f"  border-radius: {RADIUS_CARD}px;"

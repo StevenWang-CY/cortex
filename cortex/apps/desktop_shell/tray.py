@@ -121,11 +121,22 @@ class CortexTrayIcon(QSystemTrayIcon):
     def install_native_status_item(self) -> None:
         """If running on macOS with pyobjc available, attach a real
         ``NSStatusItem`` so the menu bar icon is a templated SF Symbol
-        (matches Apple's menu-bar look)."""
+        (matches Apple's menu-bar look).
+
+        On success we hide the Qt ``QSystemTrayIcon``: otherwise macOS shows
+        TWO icons in the menu bar, and the Qt one only responds to right /
+        double-clicks — confusing UX.
+        """
         if not mac_native.is_macos() or self._native_status is not None:
             return
         try:
             status = mac_native.StatusBarItem(title="Cortex", template_symbol="heart.fill")
+            # Sanity check: the AppKit bridge silently returns a no-op shell
+            # if NSStatusBar.systemStatusBar() refused to allocate (rare, but
+            # we shouldn't hide the Qt icon in that case).
+            if getattr(status, "_item", None) is None:
+                logger.debug("NSStatusItem allocation returned None; keeping Qt tray")
+                return
             status.add_action(
                 "Dashboard", lambda: self.show_dashboard_requested.emit(),
             )
@@ -159,6 +170,12 @@ class CortexTrayIcon(QSystemTrayIcon):
                 "Quit Cortex", lambda: self.quit_requested.emit(), key="q",
             )
             self._native_status = status
+            # AppKit owns the menu-bar slot now — hide the Qt fallback so
+            # we don't double up.
+            try:
+                self.setVisible(False)
+            except Exception:
+                pass
         except Exception:
             logger.debug("native status item install failed", exc_info=True)
 

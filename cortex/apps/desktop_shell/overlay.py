@@ -209,8 +209,9 @@ class OverlayWindow(QWidget):
         # vibrancy material below. The 6% white border picks out the card
         # edge against the blur.
         self._card = QFrame()
+        self._card.setObjectName("CortexOverlayCard")
         self._card.setStyleSheet(
-            "QFrame {"
+            "QFrame#CortexOverlayCard {"
             "  background-color: rgba(30, 30, 32, 0.55);"
             f"  border-radius: {RADIUS_WINDOW}px;"
             "  border: 0.5px solid rgba(255, 255, 255, 0.10);"
