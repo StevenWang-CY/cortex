@@ -201,17 +201,25 @@ class TestFaceTracker:
         return mock_result
 
     def test_initialization_and_release(self) -> None:
-        """Tracker can be initialized and released without errors."""
+        """Tracker can be initialized and released without errors.
+
+        audit Phase-I made mediapipe a lazy import via
+        ``_ensure_mediapipe`` so this test patches that helper to return
+        a stub module instead of relying on an eager-imported ``mp``.
+        """
         tracker = FaceTracker()
-        # Mock the landmarker creation to avoid needing the model file
         mock_landmarker = self._make_mock_landmarker()
+        stub_mp = MagicMock()
+        stub_mp.tasks.vision.FaceLandmarker.create_from_options.return_value = (
+            mock_landmarker
+        )
         with patch.object(tracker, '_model_path') as mock_path:
             mock_path.exists.return_value = True
-            with patch("cortex.services.capture_service.face_tracker.mp.tasks.vision.FaceLandmarker") as MockFL:
-                MockFL.create_from_options.return_value = mock_landmarker
-                with patch("cortex.services.capture_service.face_tracker.mp.tasks.BaseOptions"):
-                    with patch("cortex.services.capture_service.face_tracker.mp.tasks.vision.FaceLandmarkerOptions"):
-                        tracker.initialize()
+            with patch(
+                "cortex.services.capture_service.face_tracker._ensure_mediapipe",
+                return_value=stub_mp,
+            ):
+                tracker.initialize()
         assert tracker._landmarker is not None
         tracker.release()
         assert tracker._landmarker is None
@@ -255,8 +263,14 @@ class TestFaceTracker:
         assert result.face_stable is True
 
     def test_hysteresis_keeps_stable_during_brief_loss(self) -> None:
-        """Face should remain 'stable' during brief detection gaps."""
-        config = CaptureConfig(face_lost_tolerance_frames=3)
+        """Face should remain 'stable' during brief detection gaps.
+
+        Explicitly opts out of the audit Phase-I mediapipe sub-sample
+        cache (``face_mesh_subsample_n=1``) so each call exercises the
+        hysteresis counter rather than replaying the cached result for
+        the sub-sampled frames.
+        """
+        config = CaptureConfig(face_lost_tolerance_frames=3, face_mesh_subsample_n=1)
         tracker = FaceTracker(config)
         # Use mock landmarker that returns no face
         tracker._landmarker = self._make_mock_landmarker()

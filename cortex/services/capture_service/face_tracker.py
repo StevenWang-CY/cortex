@@ -18,14 +18,39 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import cv2
-import mediapipe as mp
 import numpy as np
 
 from cortex.libs.config.settings import CaptureConfig
 
 logger = logging.getLogger(__name__)
+
+# audit Phase-I: ``mediapipe`` is imported lazily inside
+# :func:`_ensure_mediapipe`. The module is heavyweight (>200 ms cold
+# import on M-series) and we only need it once the capture pipeline is
+# actually started, so deferring the import keeps daemon startup below
+# 2 s. ``cortex/tests/performance/test_startup_latency.py`` is the
+# regression guard.
+#
+# ``mp`` is exposed as a module-level attribute so existing tests can
+# monkey-patch ``cortex.services.capture_service.face_tracker.mp`` to a
+# stand-in (they did so against the eager-import shape); production code
+# routes through :func:`_ensure_mediapipe` which performs the real
+# import on first use.
+mp: Any = None
+
+
+def _ensure_mediapipe() -> Any:
+    """Import ``mediapipe`` on first use and cache the module handle."""
+    global mp
+    if mp is None:
+        import mediapipe as _mediapipe  # noqa: PLC0415 — intentional lazy import
+
+        mp = _mediapipe
+    return mp
+
 
 # Default model path relative to the cortex package root
 _DEFAULT_MODEL_PATH = Path(__file__).parent.parent.parent / "models" / "face_landmarker.task"
@@ -87,7 +112,7 @@ class FaceTracker:
     ) -> None:
         self._config = config or CaptureConfig()
         self._model_path = Path(model_path) if model_path else _DEFAULT_MODEL_PATH
-        self._landmarker: mp.tasks.vision.FaceLandmarker | None = None
+        self._landmarker: Any = None  # mediapipe FaceLandmarker (lazy import)
         self._frame_timestamp_ms = 0
 
         # Hysteresis state
@@ -97,6 +122,14 @@ class FaceTracker:
 
         # Previous landmarks for motion tracking
         self._prev_landmarks_px: np.ndarray | None = None
+
+        # audit Phase-I: cached result for sub-sampled frames. When
+        # ``face_mesh_subsample_n > 1`` we run MediaPipe only every
+        # ``n``-th frame and replay the most recent landmarks/bbox for
+        # the frames we skip. ``_last_result`` is the cache slot;
+        # ``_subsample_counter`` is the frame counter modulo ``n``.
+        self._last_result: FaceTrackingResult | None = None
+        self._subsample_counter = 0
 
     def initialize(self) -> None:
         """
@@ -112,6 +145,7 @@ class FaceTracker:
                 "face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
             )
 
+        mp = _ensure_mediapipe()
         base_options = mp.tasks.BaseOptions(
             model_asset_path=str(self._model_path)
         )
@@ -133,14 +167,26 @@ class FaceTracker:
             self._landmarker.close()
             self._landmarker = None
         self._prev_landmarks_px = None
+        # audit Phase-I: discard the sub-sample cache so a restart never
+        # replays stale landmarks from a previous session.
+        self._last_result = None
+        self._subsample_counter = 0
         logger.info("FaceTracker released")
 
-    def process_frame(self, frame: np.ndarray) -> FaceTrackingResult:
+    def process_frame(
+        self, frame: np.ndarray, rgb_frame: np.ndarray | None = None,
+    ) -> FaceTrackingResult:
         """
         Process a single BGR frame and extract face landmarks.
 
         Args:
-            frame: BGR uint8 image, shape (H, W, 3)
+            frame: BGR uint8 image, shape (H, W, 3).
+            rgb_frame: Optional pre-converted RGB view of ``frame``. When
+                supplied, the FaceTracker reuses it instead of calling
+                ``cv2.cvtColor`` again — used by the audit Phase-I
+                colour-convert cache so the BGR→RGB conversion runs
+                exactly once per captured frame even when multiple
+                detectors consume the same frame.
 
         Returns:
             FaceTrackingResult with landmarks, bounding box, and confidence.
@@ -148,10 +194,30 @@ class FaceTracker:
         if self._landmarker is None:
             raise RuntimeError("FaceTracker not initialized. Call initialize() first.")
 
+        # audit Phase-I: sub-sample mediapipe at ``face_mesh_subsample_n``.
+        # When the counter is not 0 we replay the cached result so
+        # downstream consumers still receive a structurally-valid
+        # FaceTrackingResult on every frame; mediapipe itself runs at
+        # ``fps / subsample_n``. ``n=1`` (the legacy default) disables the
+        # skip path entirely. The first frame always runs through
+        # mediapipe so the cache is primed.
+        subsample_n = max(1, self._config.face_mesh_subsample_n)
+        if subsample_n > 1 and self._last_result is not None:
+            self._subsample_counter = (self._subsample_counter + 1) % subsample_n
+            if self._subsample_counter != 0:
+                return self._last_result
+        else:
+            self._subsample_counter = 0
+
         h, w = frame.shape[:2]
 
-        # MediaPipe Tasks API expects RGB input via mp.Image
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # MediaPipe Tasks API expects RGB input via mp.Image. The caller
+        # may supply a cached RGB view (audit Phase-I colour-convert
+        # cache) to avoid duplicating the cvtColor across detectors that
+        # share the same frame.
+        if rgb_frame is None:
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp = _ensure_mediapipe()
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
         # Advance timestamp (must be monotonically increasing for VIDEO mode)
@@ -160,9 +226,12 @@ class FaceTracker:
 
         if result.face_landmarks and len(result.face_landmarks) > 0:
             face_landmarks = result.face_landmarks[0]
-            return self._process_detected_face(face_landmarks, h, w)
+            tracking = self._process_detected_face(face_landmarks, h, w)
         else:
-            return self._process_no_face()
+            tracking = self._process_no_face()
+
+        self._last_result = tracking
+        return tracking
 
     def _process_detected_face(
         self,
