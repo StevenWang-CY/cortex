@@ -2913,7 +2913,10 @@ chrome.runtime.onMessage.addListener(
 );
 
 // --- LeetCode → Activity Bridge ---
-// Bridges leetcode-observer.ts session data into the unified ActivityRecord format
+// Bridges contents/leetcode-observer.ts session data into the unified
+// ActivityRecord format. The observer ships as a content-script-only
+// module under contents/ (audit Phase-I bundle hygiene) so its code
+// never gets pulled into the background service worker bundle.
 
 chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== "local" || !changes.cortex_leetcode_session) return;
