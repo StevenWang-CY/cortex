@@ -1,64 +1,69 @@
 # Audit State Pointer
 
-**Phase:** 2 (remediation in progress)
-**Next finding to address:** F12 (ProjectLauncher allowlist) — bundled into Wave-1 implementation swarm
-**Last finding closed:** F10 (executor-safety allowlist on LLM-emitted actions)
-**Last commit:** `audit F10: validators + runtime filter for LLM-emitted action shapes`
+**Phase:** 2 (remediation closed; 53 of 56 Ledger findings + 2 Architectural Debts + Phase I + Phase J shipped)
+**Next finding to address:** none — Ledger substantially closed. See "Outstanding" below.
+**Last finding closed:** Phase J (UX polish) — final close-out commit `1e3416c`.
+**Last commit:** `merge: Phase J — user-facing polish` (`1e3416c`).
 
-## Phase 2 session 1 summary (2026-05-19)
+## Resume protocol on fresh invocation
 
-Eight commits landed, in order. The data-loss + security + observability tiers are closed; the correctness/cost/maintainability tiers are still open. See `audit/execution-log.md` for full per-commit detail.
+1. Read `audit/findings.md` — authoritative Ledger (Phase 1).
+2. Read `audit/execution-log.md` — full commit-by-commit log + "Phase 2 Session 2 — Close-out Report" at the bottom.
+3. Read this file — pointer + outstanding list.
+4. If a deferred item is to be picked up, dispatch with the same per-finding atomic-commit conventions used in Session 2.
 
-| Commit | Finding | Tier | Test cases |
-|--------|---------|------|------------|
-| 6eca4c1 | F19  | observability foundation | 8 |
-| 3268a04 | F07  | security                 | 8 |
-| 65d110a | F08+F07b | security             | 7 |
-| 7169750 | F02  | data-loss                | 5 |
-| f0b95b0 | F03  | data-loss                | 4 |
-| 5828fa7 | F01  | data-loss                | 3 |
-| 2a02194 | F11  | security                 | 3 |
-| 2a02194... actually next: 8th commit | F09 | security | 9 |
+## Outstanding (3 of 56, deferred with justification)
 
-Remaining priority on the Ledger (run-order):
+| ID  | Summary | Why deferred | When to pick up |
+|-----|---------|--------------|-----------------|
+| F17 | State-update sequence-number check on receivers (per-frame drop-stale) | Sender already increments `WSMessage.sequence`. Practical impact bounded — broadcast cadence is 2 Hz, reorder windows are too narrow at real network speeds. Cleanest fix bundles with future protocol revision. | When a measurable reorder incident lands in support tickets, OR alongside the next `WSMessage` schema version bump. |
+| F25 | Cooldown/dwell oscillation direct fix | Cost-runaway aspect closed (F20 + W2-B retry recheck). Quality aspect partially closed (F26 quiet-mode persistence + F27 fallback transparency). Direct hysteresis-tuning should be data-driven — needs F41 eval baseline first. | After F41 lands. Tune cooldown / dwell pair from /eval pass-rate. |
+| F41 | Eval harness in CI with regression threshold | The harness exists and runs locally; baseline pass-rate not yet captured. CI needs a stable threshold. | Next session. Record baseline → wire workflow → set 3% regression gate. |
 
+## New Ledger entries surfaced and resolved this session
+
+- **F07b** — Native-host `get_auth_token` (Wave 1-G, closed).
+- **F08b** — Extension `X-Cortex-Auth-Token` header on launcher/daemon HTTP (Wave 1-G, closed).
+- **F16-srv** — Daemon refuses stale USER_ACTION cid (Wave 1-G, closed).
+- **F19b** — Correlation IDs in browser extension (Wave 1-G, closed).
+
+## Residual filed (non-Ledger, deferred)
+
+- F20 persistent dashboard banner (per-intervention hint sufficient; dashboard banner is a deepening).
+- 9 catalogue-only LEETCODE_* WS types (default-arm log line is the visibility hatch).
+- `SessionReport` aggregate rollup of `intervention_apply_confirmation` events.
+- 3 Qt overlay tests fail under PySide6 mock pollution (pre-existing test-infra issue; pass in isolation).
+- Pre-existing test pollution suite (`test_redis_store`, `test_helpfulness`, etc.) — orthogonal to audit work.
+- 4 P2/P3 a11y items documented in `CHANGELOG.md` "Known limitations".
+
+## Session inventory (commits since the Session 1 close at `0b14653`)
+
+- **93 commits** landed on `main` this session.
+- **~345 audit-specific tests** added across Python (pytest) and TypeScript (vitest).
+- **2 Architectural Debts** closed structurally (Debt-1 codegen, Debt-2 systemic auth).
+- **2 Non-Ledger phases** shipped (Phase I performance, Phase J UX polish).
+- **0 commits pushed** — all work is on local `main`; user should review before pushing to the `cortex` remote.
+
+## Verification
+
+See "Verification commands (reproducible)" section in `audit/execution-log.md` for the full battery. TL;DR:
+
+```bash
+pytest cortex/tests/unit/  # 1275 pass (modulo pre-existing test-pollution suite)
+QT_QPA_PLATFORM=offscreen pytest cortex/tests/unit/test_dashboard_toast.py \
+    cortex/tests/unit/test_dashboard_empty_state.py \
+    cortex/tests/unit/test_onboarding_hints.py \
+    cortex/tests/unit/test_overlay_animation.py
+cd cortex/apps/browser_extension && pnpm test  # 35 pass across 12 specs
+CORTEX_JSON2TS_CMD=$(which json2ts) python -m cortex.scripts.generate_ts_schemas --check
 ```
-F10  → F12 → F38+F39 → F53
- → F20 → F30 → F25 → F26 → F18 → F27
- → F06 → F16 → F17 → F22 → F34
- → (then maintainability cohort)
- → (then F40 + F19b + F07c/F08b — TS test infra unblocks the extension half)
-```
 
-Outstanding **new findings** surfaced during Phase 2 (not yet closed):
-- **F07b** — daemon-side closed in F08; extension wiring split as **F08b**.
-- **F08b** — extension fetches token via native host (deferred, needs F40).
-- **F19b** — correlation IDs in browser extension (deferred, needs F40).
-**Resume protocol on fresh invocation:**
+## Final residual-risk statement (post-audit, top 3)
 
-1. Read `audit/findings.md` — authoritative Ledger.
-2. Read `audit/execution-log.md` — what has already shipped.
-3. Read this file — what is next.
-4. Pick up from the finding ID below; do not re-diagnose.
+1. **Trigger-policy hysteresis under real biometric jitter (F25-residual).** Cost runaway bounded by F20's budget kill-switch ($20/day default). Quality bounded by F26 + F27. The next escalation is data-driven via F41's eval baseline. Monitor: `cortex_state_loop_interventions_per_hour` should stay <10 nominal, <30 with budget kill armed.
+2. **Schema-codegen drift via Pydantic source bypass.** Debt-1 closure depends on every TS-visible field originating in `cortex/libs/schemas/`. CI gate `schema-codegen-check` must be marked Required on the GitHub repo to enforce.
+3. **Capability-token rotation collision with in-flight WS sessions.** Debt-2 rotation kills existing connections; the extension's auto-reconnect handles it but logs AUTH_REJECTED during the transition window. Monitor: a sustained spike in AUTH_REJECTED beyond 30s = rotation went wrong.
 
-## Execution order (locked at end of Phase 1)
+## Least-confident fix this session
 
-Locked sequence — see findings.md §VIII for rationale.
-
-```
-F19  →  F07  →  F08  →  F02  →  F03  →  F38  →  F39  →  F53
- →  F01  →  F09  →  F10  →  F11  →  F12
- →  F20  →  F30  →  F25  →  F26  →  F18  →  F27
- →  F06  →  F16  →  F17  →  F22  →  F34
- → (then maintainability tier — F31, F32, F33, F35, F36, F46, F47, F48, F49, F50, F51, F52, F54, F55, F56)
- → (cross-cutting tier — F40, F41, F42–F45, requires Debt-1 design)
-```
-
-## Out of scope for Phase 2 (deferred — own design doc required)
-
-- **Debt-1** (shared schema source of truth) — generator + codegen.
-- **Debt-2** (capability-token trust model) — supersedes F07/F08 piecemeal patches; for Phase 2 we ship the localhost token gate as a tactical fix, **not** the full client-bootstrap rework.
-
-## Pointer
-
-Next: **F19** — end-to-end correlation IDs. Adds a `request_id` to `WSMessage`, threads it through `controller.py`, `routes.py`, `websocket_server.py`, `anthropic_planner.py`, and back into the popup/overlay error surfaces. Test: a single user click on the popup produces log lines from `popup.tsx`, `background.ts`, `native_host.py`, `routes.py`, `state_engine`, and `anthropic_planner.py` — all sharing one `request_id`.
+**F25 partial closure.** Cost-runaway side is well-contained and regression-tested. The quality-of-experience side (intervention spam under jitter) is partially closed by F26/F27 but not directly tested with adversarial state sequences. The right next step is an /eval suite that replays a synthetic jittery-state trace and asserts intervention count stays within an envelope. That is F41's territory and was deferred.

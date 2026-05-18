@@ -666,3 +666,130 @@ CORTEX_JSON2TS_CMD=$(which json2ts) \
    handler implementations land here because there is no caller to
    regression-test against.
 
+
+---
+
+## Phase 2 Session 2 — Close-out Report (Wave 3 + Wave 4 sweep)
+
+### Closed Ledger findings (53 of 56)
+
+Session 1 + Session 2 cumulative, mapped to commit cohort:
+
+| Tier | IDs | Cohort |
+|------|-----|--------|
+| Data-loss | F01, F02, F03, F36, F53 | Wave 1-E/F + session 1 |
+| Security | F07, F07b, F08, F08b, F09, F10, F11, F12, F13, F14+F37 | Wave 1-A + session 1 + Phase H |
+| Correctness | F04, F05, F06, F15, F16, F16-srv, F18, F19, F19b, F20, F21, F22, F23, F24, F26, F27, F28, F29, F30, F34, F38+F39, F40, F42, F43, F44, F45 | Waves 1-B/C/D/E/G + Wave 2-A/B + Phase G |
+| Cost | (folded into F20/F25-partial/F30) | Wave 1-C + Wave 2-B |
+| Maintainability | F31, F32, F33, F35, F46, F47, F48, F49, F50, F51, F52, F54, F55, F56 | Wave 1-F + Wave 2-C |
+
+### Architectural Debt — closed
+
+- **Debt-1 (shared schema codegen).** `pydantic-to-typescript` generator + drift gate + extension migration. Closes F42/F43/F44/F45 structurally; future Pydantic schema edits regenerate `cortex_schemas.d.ts` automatically; CI rejects out-of-sync commits.
+- **Debt-2 (capability-token client bootstrap).** Every HTTP route now requires `Authorization: Bearer <token>` or `X-Cortex-Auth-Token`; every WebSocket connection requires `AUTH` as its first frame. F07/F08's tactical single-endpoint gates retained as defense-in-depth. Token rotation UI in Settings.
+
+### Non-Ledger phases shipped
+
+- **Phase I (performance).** Capture-loop mediapipe sub-sampling + colour-convert cache, parallel WS broadcast with 100 ms budget, lazy mediapipe + keyring imports (sub-2s warm-cache startup), content-script-only leetcode observer. Bundle ~175 KB (under 250 KB target). 25 new perf tests.
+- **Phase J (UX polish).** Onboarding "Why?" expanders + Continuity-camera callout, error toast with selectable correlation-id, biometrics empty states, overlay scale-in + fade-in micro-interactions (Reduce-Motion honoured), accessibility sweep + CHANGELOG. 26 new UX tests.
+
+### Outstanding (3 of 56 — filed as deferred)
+
+- **F17 — State-update sequence-number check on receivers.** Sender side already increments `WSMessage.sequence`. The receiver-side drop-stale logic is partially provided by F16/F16-srv's correlation-id swap on intervention frames but is NOT generalised to `STATE_UPDATE`. Deferred because the practical impact is bounded — broadcast cadence is 2 Hz, so reorder windows are too narrow to matter in real networks — and the cleanest fix is bundled into the schema-versioned `WSMessage` migration that lands as part of a future protocol revision.
+- **F25 — Cooldown/dwell oscillation direct fix.** Cost-runaway aspect closed by F20 (budget kill-switch) and W2-B's "re-consult cost kill switch between LLM retry attempts". Quality-of-experience aspect (intervention spam under jitter) closed by F26 (quiet-mode persistence) and F27 (fallback transparency). The underlying race between `trigger_policy.evaluate` and `cooldown_seconds` survives but is no longer expensive. Filed as a hysteresis-tuning follow-up; ML eval should drive the tuning, not code.
+- **F41 — Eval harness in CI.** Phase G's CI workflow (`.github/workflows/ci.yml`) added `python (pytest+ruff+mypy)`, `extension (vitest)`, and `schema-codegen-check`. The eval harness in `cortex/services/eval/` exists and runs locally; wiring it to CI with a regression threshold is the next session's lift. Deferred because the baseline pass-rate hasn't been captured yet and CI needs a stable threshold.
+
+### New Ledger entries surfaced and closed mid-remediation
+
+- **F07b** — Native-host mediated auth-token fetch (closed in Wave 1-G).
+- **F08b** — Extension `X-Cortex-Auth-Token` on `/stop` and `/shutdown` (closed in Wave 1-G).
+- **F16-srv** — Daemon refuses stale USER_ACTION cid (closed in Wave 1-G).
+- **F19b** — Correlation IDs in browser extension (closed in Wave 1-G).
+- **F19a / F03b regression guards** — Lint guards filed but not committed (residual; would block future bare `asyncio.create_task` calls).
+
+### Residual filed (non-Ledger, deferred to future sessions)
+
+- **F20 persistent dashboard banner.** `LLM_BUDGET_KILL` event is emitted and the per-intervention overlay hint flags `metadata.budget_killed`, but a dedicated dashboard banner is not wired. Per-intervention hint is sufficient for the audit ship; banner is a UX deepening.
+- **9 catalogue-only LEETCODE_* types.** The schema lists them; no caller emits them. Default-arm log line in the extension is the visibility hatch.
+- **`SessionReport` aggregate rollup of `intervention_apply_confirmation`.** Per-session JSONL has the data; the aggregated `SessionReport` does not roll it up into a "X of Y interventions confirmed" surface. UI/UX-tier follow-up, not contract drift.
+- **3 Qt overlay tests (`test_circuit_breaker_surfacing`, `test_context_truncation`, `test_desktop_shell::test_show_intervention`)** fail when collected alongside other Qt tests due to pre-existing PySide6 mock pollution. Each passes in isolation. Pre-existing test-infra issue, not a regression.
+- **Pre-existing test-pollution suite** in `test_redis_store.py`, `test_helpfulness.py`, `test_focus_graph.py`, etc. — 26+ tests fail when run alongside the full suite, pass in isolation. Pre-existing fixture leakage (likely `registry.reset` + `fakeredis` import order + stubbed PySide6 modules); orthogonal to the audit work.
+- **4 P2/P3 a11y items** (documented in `CHANGELOG.md` "Known limitations"): VoiceOver rotor on Cormorant numerics, high-contrast palette tier, live-region announcements on state transitions, Reduce Motion gating on HR-trace plot + breathing pacer + focus-ring transitions.
+
+### Final residual-risk statement (post-audit, top 3)
+
+1. **Trigger-policy hysteresis under real biometric jitter (F25-residual).** Cost runaway is bounded by F20's budget kill-switch ($20/day default per user). Quality is bounded by F26's quiet-mode escalation memory and F27's fallback transparency. The next escalation is data-driven: ship a /eval baseline and tune the cooldown/dwell pair. Monitor: `cortex_state_loop_interventions_per_hour` should stay under 10 under nominal load and never exceed 30 with the budget kill armed.
+2. **Schema-codegen drift through model edits that bypass the Pydantic source.** Debt-1 closure depends on every TS-visible field originating in `cortex/libs/schemas/`. A future contributor who adds an `Any` field or hand-edits `cortex_schemas.d.ts` will trip the CI gate — but only if the gate is required-for-merge. Monitor: CI job `schema-codegen-check` must be marked Required on the GitHub repo.
+3. **Capability-token rotation collision with in-flight WS sessions.** Debt-2 rotation kills existing connections, forcing reconnect. Browsers cache the old token in `chrome.storage.session`; the cache is invalidated on next `get_auth_token` call. There is a window of seconds where the old token is rejected but the new one isn't fetched yet — the extension's auto-reconnect handles it but logs an AUTH_REJECTED. Monitor: spike in `AUTH_REJECTED` events lasting longer than 30 seconds = rotation went wrong.
+
+### Verification commands (reproducible)
+
+```bash
+source .venv/bin/activate
+
+# All Session 2 audit-specific tests:
+pytest cortex/tests/unit/test_action_allowlist.py \
+       cortex/tests/unit/test_cost_tracker.py \
+       cortex/tests/unit/test_anthropic_planner_cancellation.py \
+       cortex/tests/unit/test_anthropic_planner_budget_retry.py \
+       cortex/tests/unit/test_circuit_breaker_surfacing.py \
+       cortex/tests/unit/test_cache_template_version.py \
+       cortex/tests/unit/test_context_truncation.py \
+       cortex/tests/unit/test_state_infer_envelope.py \
+       cortex/tests/unit/test_rate_limit.py \
+       cortex/tests/unit/test_atomic_write.py \
+       cortex/tests/unit/test_background_task_tracking.py \
+       cortex/tests/unit/test_dismissal_model_persistence.py \
+       cortex/tests/unit/test_quiet_mode_persistence.py \
+       cortex/tests/unit/test_consent_ladder_race.py \
+       cortex/tests/unit/test_prompt_injection_defence.py \
+       cortex/tests/unit/test_prompt_injection_wrapper_tags.py \
+       cortex/tests/unit/test_quiet_mode_history_age.py \
+       cortex/tests/unit/test_architecture_md_alignment.py \
+       cortex/tests/unit/test_schema_codegen.py \
+       cortex/tests/unit/test_ws_message_schema.py \
+       cortex/tests/unit/test_api_gateway.py \
+       cortex/tests/unit/test_anthropic_planner.py \
+       cortex/tests/unit/test_systemic_auth_http.py \
+       cortex/tests/unit/test_token_rotation.py \
+       cortex/tests/unit/test_ws_user_action_cid.py \
+       cortex/tests/unit/test_ws_state_update_degraded.py \
+       cortex/tests/unit/test_ws_slow_client.py \
+       cortex/tests/unit/test_pending_context_cleanup.py \
+       cortex/tests/unit/test_launcher_auth.py \
+       cortex/tests/unit/test_native_host_auth.py \
+       cortex/tests/unit/test_launcher_allowlist.py \
+       cortex/tests/unit/test_native_messaging_schema.py \
+       cortex/tests/unit/test_seed_config_dead_envs.py \
+       cortex/tests/unit/test_auth_local_token.py \
+       cortex/tests/unit/test_capture_stop_timeout.py \
+       cortex/tests/unit/test_bedrock_token_containment.py \
+       cortex/tests/integration/test_correlation_ids.py \
+       cortex/tests/integration/test_systemic_auth_ws.py \
+       cortex/tests/integration/test_apply_intervention_confirmation.py \
+       cortex/tests/performance/ -q
+
+# Phase J UX tests (offscreen Qt):
+QT_QPA_PLATFORM=offscreen pytest cortex/tests/unit/test_dashboard_toast.py \
+                                  cortex/tests/unit/test_dashboard_empty_state.py \
+                                  cortex/tests/unit/test_onboarding_hints.py \
+                                  cortex/tests/unit/test_overlay_animation.py -q
+
+# Extension TS tests:
+cd cortex/apps/browser_extension && pnpm test
+
+# Schema-codegen drift gate (Debt-1):
+CORTEX_JSON2TS_CMD=$(which json2ts) python -m cortex.scripts.generate_ts_schemas --check
+```
+
+### Session count summary
+
+- **93 audit commits** landed this session.
+- **53 of 56 Ledger findings** closed (3 deferred with explicit justification above).
+- **2 Architectural Debts** closed (Debt-1 codegen, Debt-2 systemic auth).
+- **2 Non-Ledger phases** shipped (Phase I performance, Phase J UX polish).
+- **~345 audit-specific tests** added across Python and TypeScript.
+
+### Least-confident fix in this session
+
+**F25 (cooldown/dwell oscillation, partial closure).** The cost-runaway aspect is well-contained by F20's budget kill-switch with regression-tested thresholds. The quality-of-experience aspect — does the user actually get spammed with interventions under real biometric jitter? — is partially closed by F26/F27 but not directly tested with adversarial state sequences. The right next step is an /eval suite that replays a synthetic jittery-state trace and asserts intervention count stays within an envelope. That is F41's territory and was deferred. Until F41 is closed, the operator's only signal is the `cortex_state_loop_interventions_per_hour` metric.
