@@ -476,6 +476,15 @@ class CortexDaemon:
 
     async def start(self) -> None:
         """Start the runtime and block until shutdown."""
+        # F56: register SIGINT/SIGTERM through ``loop.add_signal_handler``
+        # so the handler runs as a regular loop callback rather than
+        # interrupting whatever native frame (numpy, mediapipe, OpenCV)
+        # we happen to be inside. ``signal.signal`` invokes the handler
+        # in the *signal frame*; if that frame is in the middle of a
+        # native extension call it can lead to a segfault on resume. The
+        # loop variant defers the handler to the next event-loop tick,
+        # which is always Python-frame-safe.
+        self._install_loop_signal_handlers()
         self._register_services()
         self._input_hooks.start()
         self._window_tracker.start()
@@ -514,6 +523,52 @@ class CortexDaemon:
 
         logger.info("Cortex daemon started (v2.0)")
         await self._shutdown.wait()
+
+    def _install_loop_signal_handlers(self) -> None:
+        """Register SIGINT / SIGTERM via ``loop.add_signal_handler`` so
+        the handler is dispatched as a normal event-loop callback rather
+        than as a true asynchronous-signal interrupt (F56).
+
+        Why this matters: ``signal.signal`` registers a C-level handler
+        that the kernel runs in the signal frame — which on Cortex is
+        almost always somewhere inside numpy / mediapipe / OpenCV native
+        code. Running Python in the signal frame violates the GIL
+        contract those extensions rely on and can segfault on resume.
+        The loop variant defers the callback to the next event-loop
+        tick, so the daemon's Python state is always frame-safe when
+        the handler runs.
+
+        On platforms that don't support ``add_signal_handler`` (Windows
+        Python, some embedded scenarios) we fall back to a no-op and
+        rely on the caller's outer harness (``run_dev.py``,
+        ``main.py``) to provide signal delivery.
+        """
+        import signal as _signal
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Called from a non-async context — nothing to register.
+            return
+        for sig in (_signal.SIGINT, _signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, self._on_signal_received)
+            except (NotImplementedError, RuntimeError, ValueError):
+                # NotImplementedError: Windows.
+                # ValueError: nested asyncio.run reusing a loop without
+                # privileges to install handlers.
+                logger.debug(
+                    "loop.add_signal_handler unsupported for %s; "
+                    "falling back to outer harness",
+                    sig,
+                )
+
+    def _on_signal_received(self) -> None:
+        """Event-loop-safe signal handler. Runs on the asyncio loop
+        thread, not the signal frame, so native extensions complete
+        their current op cleanly before we proceed to shutdown."""
+        logger.info("Shutdown signal received in asyncio loop")
+        self._shutdown.set()
 
     def _request_shutdown(self) -> None:
         """Request process shutdown via SIGTERM (triggers full graceful stop chain)."""
