@@ -63,6 +63,13 @@ class EventType(StrEnum):
     # etc.) before it can reach the executor in the extension.
     INTERVENTION_ACTION_REJECTED = "intervention_action_rejected"
 
+    # F13: per-route token bucket rejection. Emitted when an HTTP request
+    # exceeds the configured rate cap and the gateway returns 429 instead
+    # of dispatching the route handler. Carries the bound ``cid`` so
+    # downstream observers can correlate the bounce with the upstream
+    # client behaviour that provoked it.
+    RATE_LIMITED = "rate_limited"
+
 
 class StateTransitionEvent(BaseModel):
     """State transition event data."""

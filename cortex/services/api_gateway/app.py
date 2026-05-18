@@ -27,6 +27,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from cortex.libs.config.settings import APIConfig, CortexConfig
 from cortex.libs.logging.correlation import correlation_scope
+from cortex.services.api_gateway.middleware.rate_limit import RateLimitMiddleware
 
 _REQUEST_ID_HEADER = "X-Cortex-Request-ID"
 
@@ -121,6 +122,13 @@ def create_app(
         version="0.1.0",
         lifespan=lifespan,
     )
+
+    # F13: per-route rate limiting. Registered BEFORE the correlation
+    # middleware in source order — Starlette's middleware stack treats
+    # the last ``add_middleware`` call as the outermost wrapper, so this
+    # ordering puts correlation OUTSIDE rate-limit at runtime. The cid is
+    # therefore bound by the time the limiter's 429 log line is emitted.
+    app.add_middleware(RateLimitMiddleware)
 
     # F19: correlation IDs. Every request enters a scope that mints (or
     # accepts via ``X-Cortex-Request-ID``) a correlation id, binds it to
