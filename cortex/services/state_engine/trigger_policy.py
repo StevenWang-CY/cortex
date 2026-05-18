@@ -673,17 +673,33 @@ class TriggerPolicy:
         record_dismissal writer.
         """
         with self._quiet_mode_history_lock:
+            now = time.monotonic()
+            # ``quiet_mode_until`` is in the future, so the remainder is
+            # ``until - now`` (positive while the window is still open).
+            # ``quiet_mode_count_reset_at`` is the monotonic timestamp of
+            # the LAST escalation — strictly in the past — so the "how
+            # long ago did the last escalation fire" delta is
+            # ``now - reset_at``. audit-w2: the original implementation
+            # flipped these operands and ``max(0.0, ...)`` clamped the
+            # negative result to 0, so the persisted age was always 0 and
+            # rehydration stamped ``quiet_mode_count_reset_at`` back at
+            # load-time (i.e. "the last escalation was just now"). The
+            # field is currently diagnostic only — no other branch reads
+            # it — but the latent bug would land the moment any
+            # follow-up consumer trusts the value.
             record = {
                 "version": QUIET_MODE_HISTORY_VERSION,
                 "quiet_mode_count": int(self._quiet_mode_count),
                 "quiet_mode_until_monotonic_delta": max(
                     0.0,
-                    self._quiet_mode_until - time.monotonic(),
+                    self._quiet_mode_until - now,
                 ),
-                "last_escalation_at_monotonic_delta": max(
+                "last_escalation_age_seconds": max(
                     0.0,
-                    self._quiet_mode_count_reset_at - time.monotonic(),
-                ),
+                    now - self._quiet_mode_count_reset_at,
+                )
+                if self._quiet_mode_count_reset_at > 0.0
+                else 0.0,
                 "saved_at": time.time(),
             }
         try:
@@ -741,9 +757,18 @@ class TriggerPolicy:
         remaining = data.get("quiet_mode_until_monotonic_delta", 0.0)
         if isinstance(remaining, (int, float)) and remaining > 0.0:
             self._quiet_mode_until = time.monotonic() + float(remaining)
-        last_delta = data.get("last_escalation_at_monotonic_delta", 0.0)
-        if isinstance(last_delta, (int, float)) and last_delta >= 0.0:
-            self._quiet_mode_count_reset_at = time.monotonic() + float(last_delta)
+        # audit-w2: ``last_escalation_age_seconds`` replaces the legacy
+        # ``last_escalation_at_monotonic_delta`` field whose sign was
+        # inverted at write time. Read both names so an upgrade-in-place
+        # does not lose the field; subtract the age from ``now`` to get
+        # the monotonic timestamp of the last escalation. Legacy records
+        # carrying the bugged 0-clamped value rehydrate to "just now",
+        # which matches the pre-fix observable behaviour.
+        last_age = data.get("last_escalation_age_seconds")
+        if last_age is None:
+            last_age = data.get("last_escalation_at_monotonic_delta", 0.0)
+        if isinstance(last_age, (int, float)) and last_age >= 0.0:
+            self._quiet_mode_count_reset_at = time.monotonic() - float(last_age)
         logger.info(
             "Rehydrated quiet-mode history from %s (level=%d)",
             path,
