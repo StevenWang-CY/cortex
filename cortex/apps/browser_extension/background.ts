@@ -527,13 +527,45 @@ function connect(): void {
             // keep waiting 30s on the next transient drop.
             reconnectDelay = INITIAL_RECONNECT_DELAY;
 
-            // Identify as Chrome extension
-            send({
-                type: "IDENTIFY",
-                payload: { client_type: "chrome" },
-                timestamp: Date.now() / 1000,
-                sequence: ++sequence,
-            });
+            // Debt-2 (audit): AUTH is the contractual first frame on
+            // every WebSocket connection. The daemon refuses every other
+            // type until this validates. We fire-and-forget the token
+            // fetch and send the AUTH frame as soon as it resolves;
+            // IDENTIFY follows so the daemon can tag this client
+            // ``client_type="chrome"`` for targeted broadcasts.
+            //
+            // ``getAuthToken`` is async because it may need to roundtrip
+            // through the native host. The socket stays open in the
+            // meantime; the daemon's gate will simply close us if we
+            // delay too long, at which point ``onclose`` runs and the
+            // reconnect loop retries with the (now-cached) token.
+            void (async () => {
+                try {
+                    const authToken = await getAuthToken();
+                    if (!ws || ws.readyState !== WebSocket.OPEN) {
+                        return;
+                    }
+                    ws.send(JSON.stringify({
+                        type: "AUTH",
+                        payload: { auth_token: authToken },
+                        timestamp: Date.now() / 1000,
+                        sequence: ++sequence,
+                    }));
+                    // Identify as Chrome extension (AFTER auth so the
+                    // daemon-side ``IDENTIFY`` handler runs in the
+                    // authenticated branch of dispatch).
+                    send({
+                        type: "IDENTIFY",
+                        payload: { client_type: "chrome" },
+                        timestamp: Date.now() / 1000,
+                        sequence: ++sequence,
+                    });
+                } catch {
+                    // Token unavailable — let the daemon close us; the
+                    // reconnect loop will retry. Silent failure here is
+                    // safer than crashing the service worker.
+                }
+            })();
 
             // Notify popup
             broadcastToPopup({ type: "CONNECTION_CHANGED", connected: true });
@@ -742,6 +774,15 @@ async function handleMessage(raw: string): Promise<void> {
     }
 
     switch (msg.type) {
+        case "AUTH_OK":
+            // Debt-2 (audit): the daemon ACKed our AUTH frame. Nothing
+            // to do — the daemon will start broadcasting STATE_UPDATE
+            // and other types on its own cadence. We accept this frame
+            // as a known type so the legacy `default` branch (which
+            // would otherwise treat it as "unknown") cannot accidentally
+            // re-classify it as a parse error.
+            break;
+
         case "STATE_UPDATE":
             currentState = msg.payload as unknown as CortexState;
             updateFocusSession(msg.payload);

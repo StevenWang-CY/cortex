@@ -45,10 +45,28 @@ def _reset_registry():
 
 
 @pytest.fixture()
-def client() -> TestClient:
-    """Create a test client for the FastAPI app."""
+def client(tmp_path, monkeypatch) -> TestClient:
+    """Create an authenticated test client for the FastAPI app.
+
+    Debt-2 (audit): every mutating route now requires a capability
+    token. We redirect ``auth_token_path`` into ``tmp_path`` so the
+    test does not collide with the developer's real token file, mint
+    a token, and inject it as a default ``Authorization: Bearer``
+    header on the ``TestClient`` so every existing test continues to
+    exercise the route's business logic without each call having to
+    pass the header explicitly. Tests that want to assert the unauth
+    path live in ``test_systemic_auth_http.py``.
+    """
+    from cortex.libs.auth.local_token import load_or_create_token
+
+    token_file = tmp_path / "auth.token"
+    monkeypatch.setattr(
+        "cortex.libs.auth.local_token.auth_token_path", lambda: token_file
+    )
+    token = load_or_create_token(token_file)
     app = create_app()
     with TestClient(app) as c:
+        c.headers.update({"Authorization": f"Bearer {token}"})
         yield c
 
 
@@ -668,10 +686,13 @@ class TestWebSocketServer:
                 self.sent.append(raw)
 
         socket = _MockSocket()
+        # Debt-2: ``_broadcast`` skips unauthenticated clients; this test
+        # is about restore broadcast, not the AUTH handshake.
         server._clients["c1"] = WebSocketClient(
             client_id="c1",
             websocket=socket,
             client_type="desktop",
+            authenticated=True,
         )
 
         count = await server.send_restore("int_123", user_action="dismissed")

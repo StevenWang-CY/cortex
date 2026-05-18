@@ -112,7 +112,13 @@ async def test_ws_shutdown_rejects_unauthenticated_message(
 async def test_ws_shutdown_accepts_correct_token(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With the matching auth token, SHUTDOWN must invoke the callback."""
+    """With the matching auth token, SHUTDOWN must invoke the callback.
+
+    Debt-2 (audit): the systemic AUTH-first gate runs before the
+    SHUTDOWN handler can ever dispatch, so we AUTH the client first.
+    The legacy F07 inline check is preserved as defense-in-depth and
+    is exercised separately by ``test_ws_shutdown_rejects_unauthenticated_message``.
+    """
     token_file = tmp_path / "auth.token"
     monkeypatch.setattr(
         "cortex.libs.auth.local_token.auth_token_path", lambda: token_file
@@ -131,7 +137,22 @@ async def test_ws_shutdown_accepts_correct_token(
         async def send(self, raw: str) -> None:
             return None
 
+        async def close(self, code: int = 1000, reason: str = "") -> None:
+            return None
+
     client = WebSocketClient(client_id="legit", websocket=_FakeWS())
+    # Debt-2 prerequisite: AUTH before any other frame.
+    await server._process_message(
+        client,
+        json.dumps({
+            "type": "AUTH",
+            "payload": {"auth_token": token},
+            "timestamp": 0,
+            "sequence": 0,
+        }),
+    )
+    assert client.authenticated is True
+
     payload = {
         "type": "SHUTDOWN",
         "payload": {"auth_token": token},

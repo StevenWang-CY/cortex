@@ -103,6 +103,22 @@ class EventType(StrEnum):
     # partial traceback to the LLM.
     CONTEXT_TRUNCATED = "context_truncated"
 
+    # Debt-2 (audit): the systemic capability-token gate rejected an
+    # HTTP request or a WebSocket message because the presented token
+    # was missing, malformed, or did not match the on-disk secret.
+    # Emitted by ``cortex/services/api_gateway/auth.py`` and the
+    # WebSocket AUTH-first handshake in
+    # ``cortex/services/api_gateway/websocket_server.py``. Spikes on
+    # this event point at a hostile localhost client (compromised
+    # extension, malicious webpage) or, more benignly, a stale client
+    # that survived a token rotation and needs to reread its cache.
+    AUTH_REJECTED = "auth_rejected"
+    # Debt-2 (audit): the user rotated the capability token via the
+    # Settings panel. The daemon force-disconnects every WS client so
+    # they reconnect and present the new token, and refreshes the
+    # in-process desktop_shell cache.
+    AUTH_TOKEN_ROTATED = "auth_token_rotated"
+
 
 class StateTransitionEvent(BaseModel):
     """State transition event data."""

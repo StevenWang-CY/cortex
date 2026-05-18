@@ -21,12 +21,13 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from cortex.libs.config.settings import APIConfig, CortexConfig
 from cortex.libs.logging.correlation import correlation_scope
+from cortex.services.api_gateway.auth import require_capability_token
 from cortex.services.api_gateway.middleware.rate_limit import RateLimitMiddleware
 
 _REQUEST_ID_HEADER = "X-Cortex-Request-ID"
@@ -169,10 +170,17 @@ def create_app(
     app.state.cortex_config = cortex_config
     app.state.registry = registry
 
-    # Register routes
-    from cortex.services.api_gateway.routes import router
+    # Register routes — health is mounted without auth so the supervisor
+    # liveness probe can reach the daemon before the UI has presented
+    # its token; every other route inherits the systemic capability-token
+    # gate via ``dependencies=[Depends(require_capability_token)]``
+    # (audit Debt-2). A new route added to ``router`` automatically gets
+    # the gate; a new route added to ``health_router`` is by-convention
+    # liveness-only and visible in code review.
+    from cortex.services.api_gateway.routes import health_router, router
 
-    app.include_router(router)
+    app.include_router(health_router)
+    app.include_router(router, dependencies=[Depends(require_capability_token)])
 
     logger.info(f"API Gateway configured on {cfg.host}:{cfg.port}")
 

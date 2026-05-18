@@ -449,3 +449,67 @@ observing the same failure.
    under `QT_QPA_PLATFORM=offscreen` — out of scope for visual
    reconciliation.
 
+
+
+---
+
+## Debt-2 closure — capability-token client bootstrap
+
+The Wave-1 tactical token gates (F07 SHUTDOWN, F08 launcher `/stop`) defended only two destructive endpoints. Every other HTTP route on the API gateway and every other WebSocket message type still trusted "comes from localhost" as proof of legitimacy — the implicit trust model named in `audit/findings.md` Debt-2. A hostile webpage in another browser tab could connect to `ws://127.0.0.1:9473` and watch the daemon's STATE_UPDATE stream without ever owning the token; the same page could `POST /state/infer` and burn the daemon's numpy allocators. The systemic close-out flips the default: every connection presents the capability token; servers reject anything else.
+
+Five atomic commits in the locked order from `implement-all-that-s-helpful-mellow-hammock.md` §4 Phase H:
+
+| Commit | SHA       | Headline                                                | Files |
+|--------|-----------|---------------------------------------------------------|------:|
+| 1      | `0fe609a` | Server-side capability-token gate on every HTTP route   | 7     |
+| 2      | `78d9d57` | WebSocket AUTH-first handshake                          | 8     |
+| 3      | `f16a46a` | desktop_shell WS client AUTHs before IDENTIFY           | 2     |
+| 4      | `5eaef88` | extension WS sends AUTH before IDENTIFY                 | 2     |
+| 5      | `9066df1` | capability-token rotation UI in Settings                | 5     |
+
+**Server side.** `cortex/services/api_gateway/auth.py` (new) exports `require_capability_token` (a FastAPI dependency that raises 401 on miss/mismatch and emits `EventType.AUTH_REJECTED`) and `optional_capability_token` (used nowhere yet but reserved for `/health` extensions). `routes.py` is split into `router` (the default — gates every mutating endpoint via `Depends(require_capability_token)`) and `health_router` (the supervisor liveness probe; no auth, mounted separately). Adding a new mutating route on `router` automatically inherits the gate; adding a route to `health_router` is auditable in code review. The 401 response carries `WWW-Authenticate: Bearer` per RFC 7235.
+
+**WebSocket side.** `WebSocketServer._dispatch_message` short-circuits to `_handle_auth` on the `AUTH` message type; until the client's `authenticated` flag flips True, every other type triggers `close(code=1011, reason="auth required")` + `EventType.AUTH_REJECTED`. `_handle_auth` validates via `cortex.libs.auth.verify_token`, replies with an `AUTH_OK` frame, and replays the latest cached `STATE_UPDATE` so the legacy "new connection sees current state on attach" UX is preserved. `_broadcast` skips unauthenticated peers so a connect-and-listen origin cannot harvest the state stream. `MessageType.AUTH` and `MessageType.AUTH_OK` were added to `cortex/libs/schemas/ws_message_types.py`; the Phase G codegen regenerated `cortex_schemas.d.ts` automatically.
+
+**Client side.** `cortex/apps/desktop_shell/main.py::WebSocketBridge` reads the token at startup via `load_or_create_token`, sends `AUTH` as the first frame on every connect (ahead of `IDENTIFY`), and exposes `refresh_auth_token` for the rotation path. `cortex/apps/browser_extension/background.ts::connect()` fires `getAuthToken().then(send AUTH then IDENTIFY)` inside `onopen`; the existing Wave-1 `X-Cortex-Auth-Token` header on `/shutdown` and `/stop` fetches continues to satisfy the systemic HTTP gate. A new `case "AUTH_OK"` no-op landed in `handleMessage` so the daemon's ACK is recognised rather than logged as an unknown type.
+
+**Rotation.** `cortex/libs/auth/local_token.py::rotate_token` writes a fresh `secrets.token_hex(32)` to the same path `auth_token_path()` returns, atomically (`.tmp` sibling chmod 0600, then `os.replace`). The Settings panel's new "Security" section exposes this as a "Rotate authentication token" button with an inline status label. The button briefly disables itself after a click to absorb a double-click. `EventType.AUTH_TOKEN_ROTATED` lands in the structured log so a support engineer can correlate "the user just rotated" with "all WS clients suddenly reconnected."
+
+**Defense in depth (Commit 6 deliberately omitted).** The Wave-1 F07 inline `verify_token` call on the WebSocket `SHUTDOWN` handler stays. The Wave-1 F08 launcher `/stop` token gate stays (the launcher binary has a zero-cortex-imports invariant so we cannot apply the systemic FastAPI dependency to it). Both are now redundant given the systemic gate, but they remain as cheap belt-and-braces: a future regression in `_dispatch_message` that accidentally lets a non-AUTH message through still cannot fire SHUTDOWN, and the launcher's `/stop` is still gated even when the daemon API gateway is unreachable. The trade is ~20 lines of duplicated check for a much harder-to-bypass invariant — worth it.
+
+**Migration path.** Existing installs (Wave-1 already shipped the token file via daemon startup `load_or_create_token`) get the systemic gate for free — the token file is already on disk. Fresh installs mint the file on first daemon start. The browser extension's existing `getAuthToken()` cache (`chrome.storage.session`) survives across service-worker restarts; the desktop_shell reads the file fresh on every launch via `WebSocketBridge.__init__`. No coordinated rollout needed because the legacy WS handshake (`IDENTIFY` first, no `AUTH`) was never broadcast to a wire — the daemon's gate simply closes any peer that sends `IDENTIFY` first, and the reconnect loop on both clients retries with the now-cached token in the AUTH frame.
+
+**Threat model recap.** Closes cross-origin localhost — a hostile webpage in another browser tab that can speak the HTTP / WS protocols cannot read the mode-0600 token file, so it cannot present the token, so every request it makes returns 401 / 1011. Explicitly does NOT close malware-as-the-user (a compromised account on the same Mac can read any user-readable file the daemon can read); that threat is named in `audit/findings.md` and is out of scope for this debt.
+
+### Reproducible verification commands
+
+```bash
+# New auth tests:
+pytest cortex/tests/unit/test_systemic_auth_http.py \
+       cortex/tests/integration/test_systemic_auth_ws.py \
+       cortex/tests/unit/test_desktop_controller_auth.py \
+       cortex/tests/unit/test_token_rotation.py -q          # 17 passed
+
+# Full Python suite (excl. legacy desktop_shell mock-pollution suite):
+pytest cortex/tests/ -q --ignore=cortex/tests/unit/test_desktop_shell.py
+# 1307 passed, 3 skipped
+
+# TS suite (browser extension):
+cd cortex/apps/browser_extension
+./node_modules/.bin/vitest run                              # 33 passed
+
+# Schema codegen still in sync after AUTH/AUTH_OK addition:
+CORTEX_JSON2TS_CMD=$(which json2ts) python -m cortex.scripts.generate_ts_schemas --check
+# exit 0
+
+# Manual adversarial test (closes within 2s without AUTH):
+python -c "
+import asyncio, websockets
+async def go():
+    async with websockets.connect('ws://127.0.0.1:9473') as ws:
+        await ws.send('{\"type\":\"STATE_UPDATE\",\"payload\":{},\"timestamp\":0,\"sequence\":0}')
+        print(await asyncio.wait_for(ws.recv(), 2))
+asyncio.run(go())
+"
+# websockets.exceptions.ConnectionClosedError: ... [code=1011 reason=auth required]
+```

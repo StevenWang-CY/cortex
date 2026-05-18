@@ -31,6 +31,7 @@ from cortex.apps.desktop_shell.onboarding import OnboardingWindow, onboarding_ma
 from cortex.apps.desktop_shell.overlay import OverlayWindow
 from cortex.apps.desktop_shell.settings import SettingsDialog
 from cortex.apps.desktop_shell.tray import CortexTrayIcon
+from cortex.libs.auth import load_or_create_token
 from cortex.libs.config.settings import APIConfig, get_config
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,16 @@ class WebSocketBridge(QObject):
         # successful connect.
         self._reconnect_delay = 3.0
         self._reconnect_delay_max = 30.0
+        # Debt-2 (audit): cache the capability token at startup so we can
+        # AUTH on every (re)connect without re-reading the file. The
+        # token rotates via Settings → "Rotate authentication token";
+        # that path calls :meth:`refresh_auth_token` so the cache here
+        # stays in sync.
+        try:
+            self._auth_token: str | None = load_or_create_token()
+        except Exception:
+            logger.exception("Could not load capability token; AUTH will fail")
+            self._auth_token = None
 
     def start(self) -> None:
         """Start the WebSocket listener in a background thread."""
@@ -130,6 +141,31 @@ class WebSocketBridge(QObject):
             except Exception:
                 pass
 
+    def refresh_auth_token(self) -> str | None:
+        """Re-read the capability token from disk and force a reconnect
+        so the new value is sent on the AUTH handshake. Audit Debt-2:
+        called by the Settings panel's "Rotate authentication token"
+        button. Returns the new token (or None on read failure)."""
+        try:
+            self._auth_token = load_or_create_token()
+        except Exception:
+            logger.exception("Failed to refresh capability token")
+            self._auth_token = None
+            return None
+        # Drop the active socket so the connect loop reconnects with the
+        # new token in the AUTH frame. ``_running`` stays True so the
+        # loop iterates again.
+        ws = self._ws
+        loop = self._loop
+        if ws is not None and loop is not None:
+            async def _close_active_ws() -> None:
+                try:
+                    await ws.close()
+                except Exception:
+                    logger.debug("close on active WS failed", exc_info=True)
+            asyncio.run_coroutine_threadsafe(_close_active_ws(), loop)
+        return self._auth_token
+
     def _run_loop(self) -> None:
         """Run the asyncio event loop in a background thread."""
         self._loop = asyncio.new_event_loop()
@@ -156,6 +192,26 @@ class WebSocketBridge(QObject):
                     logger.info(f"Connected to Cortex daemon at {uri}")
                     # E.6: successful connect → reset backoff.
                     self._reconnect_delay = 3.0
+
+                    # Debt-2 (audit): AUTH is the contractual first
+                    # frame. The daemon refuses every other type until
+                    # this message validates. We send the cached token
+                    # synchronously inline rather than via :meth:`_send`
+                    # so an unauthenticated socket cannot be tricked
+                    # into emitting a state frame from another path.
+                    if self._auth_token:
+                        auth_msg = json.dumps({
+                            "type": "AUTH",
+                            "payload": {"auth_token": self._auth_token},
+                            "timestamp": 0,
+                            "sequence": 0,
+                        })
+                        await ws.send(auth_msg)
+                    else:
+                        logger.warning(
+                            "No auth token available; daemon will close "
+                            "this connection. Retry after token provisioning.",
+                        )
 
                     # Identify as desktop client
                     identify_msg = json.dumps({
@@ -299,6 +355,12 @@ class CortexApp:
 
         # Connect settings changes
         self._settings.settings_changed.connect(self._on_settings_changed)
+        # Debt-2 Commit 5: rotation drops the bridge's cached token,
+        # forces a reconnect, and surfaces a confirmation toast.
+        if hasattr(self._settings, "auth_token_rotated"):
+            self._settings.auth_token_rotated.connect(
+                lambda _tok: self._bridge.refresh_auth_token(),
+            )
         self._onboarding.open_settings_requested.connect(self._show_settings)
         self._onboarding.run_calibration_requested.connect(self._run_calibration)
         self._onboarding.completed.connect(self._complete_onboarding)

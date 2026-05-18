@@ -53,7 +53,15 @@ from cortex.services.intervention_engine import capture_snapshot, prepare_plan
 
 logger = logging.getLogger(__name__)
 
+# Two routers — a public liveness-only router and an authenticated
+# router that owns every mutating endpoint. ``app.py`` mounts each with
+# the appropriate dependency. The split is structural: defining a new
+# mutating endpoint on ``health_router`` is visible in code review;
+# defining it on ``router`` automatically inherits the systemic auth
+# gate via the ``include_router(dependencies=[…])`` wiring. See audit
+# Debt-2 closure in ``audit/execution-log.md``.
 router = APIRouter()
+health_router = APIRouter()
 
 
 # =============================================================================
@@ -252,7 +260,7 @@ async def _build_snapshot_for_plan(registry: Any, plan: InterventionPlan) -> Wor
 # =============================================================================
 
 
-@router.get("/health", response_model=HealthResponse)
+@health_router.get("/health", response_model=HealthResponse)
 async def health_check(request: Request) -> HealthResponse:
     """Health check for all services."""
     reg = _get_registry(request)

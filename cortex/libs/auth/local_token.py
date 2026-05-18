@@ -89,6 +89,38 @@ def load_or_create_token(path: Path | None = None) -> str:
     return token
 
 
+def rotate_token(path: Path | None = None) -> str:
+    """Replace the on-disk capability token with a freshly-minted one
+    and return the new value (audit Debt-2 Commit 5).
+
+    Atomic on POSIX: writes to a sibling ``.tmp`` file mode 0600 first,
+    then ``os.replace`` swaps it in. The old token is unrecoverable
+    after this call returns; existing clients that present the old
+    token will start getting 401 / WS close(1011) until they re-read
+    the file (the desktop_shell does this via
+    ``WebSocketBridge.refresh_auth_token``; the browser extension does
+    this via the native host's ``get_auth_token`` command on next
+    connect cycle).
+
+    Idempotency: callers may invoke rotation back-to-back; each call
+    returns a fresh token. There is no quota — the threat model
+    assumes the user actively chose to rotate.
+    """
+    target = path or auth_token_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    token = secrets.token_hex(_TOKEN_BYTES)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.write_text(token + "\n", encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        if sys.platform not in ("win32", "cygwin"):
+            logger.warning("Could not set 0600 on %s", tmp)
+    os.replace(tmp, target)
+    logger.info("Rotated Cortex auth token at %s", target)
+    return token
+
+
 def verify_token(presented: str | None, *, path: Path | None = None) -> bool:
     """Constant-time compare of ``presented`` against the stored token.
 

@@ -52,6 +52,14 @@ class MessageType(str, Enum):
 
     # ─── Client → Daemon (inbound, dispatched by _process_message) ───
 
+    AUTH = "AUTH"
+    """First message every client MUST send after connecting; carries the
+    capability token in ``payload.auth_token``. Audit Debt-2: the server
+    holds the connection in ``pending_auth`` until this frame validates;
+    any other type before ``AUTH`` triggers a close(code=1011) with
+    ``EventType.AUTH_REJECTED`` logged. Defense-in-depth: the F07 SHUTDOWN
+    handler keeps its inline token check too."""
+
     IDENTIFY = "IDENTIFY"
     """First message after connect; carries ``client_type``."""
 
@@ -86,6 +94,13 @@ class MessageType(str, Enum):
     """Request the daemon shut itself down (gated by capability token)."""
 
     # ─── Daemon → Client (outbound, made by _make_* helpers) ─────────
+
+    AUTH_OK = "AUTH_OK"
+    """Daemon acknowledgment of a successful ``AUTH`` handshake. Audit
+    Debt-2: clients block on this frame before sending further requests
+    (e.g. ``IDENTIFY``) so they know the server accepted the token. A
+    missing ``AUTH_OK`` (close-immediately) means the token was wrong
+    and the client must refresh its cache."""
 
     STATE_UPDATE = "STATE_UPDATE"
     """Periodic state estimate broadcast (every ~500 ms)."""

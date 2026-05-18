@@ -25,12 +25,33 @@ from pydantic import ValidationError
 from cortex.libs.auth import verify_token
 from cortex.libs.config.settings import APIConfig
 from cortex.libs.logging.correlation import correlation_scope, get_correlation_id
+from cortex.libs.logging.structured import EventType
 from cortex.libs.schemas.intervention import InterventionPlan
 from cortex.libs.schemas.state import StateEstimate
 from cortex.libs.schemas.ws_message import WSMessage as _PydanticWSMessage
 from cortex.libs.schemas.ws_message_types import MessageType
 
 logger = logging.getLogger(__name__)
+
+
+def _auth_ok_frame() -> str:
+    """Serialise a minimal ``AUTH_OK`` reply frame (audit Debt-2).
+
+    The Pydantic ``WSMessage`` would also work but is slightly heavier
+    than needed for a confirmation that carries no payload data. We hand
+    the JSON to ``websocket.send`` directly. ``type`` is the canonical
+    ``MessageType.AUTH_OK.value`` so the client side narrows it via the
+    same generated TypeScript union.
+    """
+    return json.dumps({
+        "type": MessageType.AUTH_OK.value,
+        "payload": {},
+        "timestamp": time.monotonic(),
+        "sequence": 0,
+        "correlation_id": None,
+        "target_client_types": None,
+        "source_client_type": "daemon",
+    })
 
 
 def _serialize_timestamp(ts: Any) -> Any:
@@ -51,13 +72,22 @@ def _serialize_timestamp(ts: Any) -> Any:
 
 @dataclass
 class WebSocketClient:
-    """Represents a connected WebSocket client."""
+    """Represents a connected WebSocket client.
+
+    ``authenticated`` is False until the client sends a valid ``AUTH``
+    frame as its first message (audit Debt-2). Until then the server
+    refuses every other ``type`` and closes the socket with code 1011 +
+    ``EventType.AUTH_REJECTED``. Setting the flag is intentionally
+    one-way per connection — there is no way for a peer to demote
+    itself back to ``pending_auth`` mid-session.
+    """
 
     client_id: str
     websocket: Any  # websockets.WebSocketServerProtocol
     connected_at: float = field(default_factory=time.monotonic)
     client_type: str = "unknown"  # "vscode", "chrome", "desktop", "unknown"
     last_message_at: float = 0.0
+    authenticated: bool = False
 
 
 # ─── WSMessage: Pydantic source of truth (Debt-1 closure, Commit 2) ───
@@ -286,7 +316,14 @@ class WebSocketServer:
         logger.info("WebSocket server stopped")
 
     async def _handle_client(self, websocket: Any) -> None:
-        """Handle a new WebSocket client connection."""
+        """Handle a new WebSocket client connection.
+
+        Debt-2 (audit): no outbound frames before the client AUTHs. The
+        legacy ``send latest state on connect`` happened unconditionally
+        — that leaked the daemon's current STATE_UPDATE to any localhost
+        origin that opened a socket. We now defer that send until
+        :meth:`_handle_auth` flips ``client.authenticated``.
+        """
         client_id = f"client_{id(websocket)}"
         client = WebSocketClient(
             client_id=client_id,
@@ -294,14 +331,6 @@ class WebSocketServer:
         )
         self._clients[client_id] = client
         logger.info(f"Client connected: {client_id}")
-
-        # Send current state to new client if available
-        if self._latest_state is not None:
-            try:
-                msg = self._make_state_update(self._latest_state)
-                await websocket.send(msg.to_json())
-            except Exception:
-                pass
 
         try:
             async for raw_message in websocket:
@@ -353,7 +382,39 @@ class WebSocketServer:
         correlation scope established by :meth:`_process_message`.
         Type comparison uses ``MessageType`` (Debt-1 codegen) so a typo
         in the dispatch table is a compile-time error instead of a
-        silently-unhandled message."""
+        silently-unhandled message.
+
+        Debt-2 (audit): the first frame on every connection MUST be
+        ``AUTH``. Until ``client.authenticated`` flips True, every other
+        ``type`` triggers a close(code=1011, reason="auth required") and
+        emits ``EventType.AUTH_REJECTED``. ``AUTH`` itself is a no-op
+        once the client is already authenticated (idempotent — a replay
+        does not cycle the connection).
+        """
+        # ─── Debt-2 AUTH-first gate ─────────────────────────────────
+        if msg.type == MessageType.AUTH.value:
+            await self._handle_auth(client, msg)
+            return
+        if not client.authenticated:
+            logger.warning(
+                "%s reason=pre_auth_message type=%s client=%s cid=%s",
+                EventType.AUTH_REJECTED.value,
+                msg.type,
+                client.client_id,
+                msg.correlation_id or "-",
+            )
+            try:
+                await client.websocket.close(
+                    code=1011, reason="auth required",
+                )
+            except Exception:
+                logger.debug(
+                    "close(auth required) on already-dead socket %s",
+                    client.client_id,
+                    exc_info=True,
+                )
+            return
+
         if msg.type == MessageType.USER_ACTION.value:
             await self._handle_user_action(client, msg)
         elif msg.type == MessageType.ACTION_EXECUTE.value:
@@ -404,6 +465,82 @@ class WebSocketServer:
                     logger.error("Shutdown callback error: %s", exc)
         else:
             logger.debug(f"Unknown message type from {client.client_id}: {msg.type}")
+
+    async def _handle_auth(
+        self, client: WebSocketClient, msg: WSMessage,
+    ) -> None:
+        """Validate the ``AUTH`` handshake frame (audit Debt-2).
+
+        On success, flips ``client.authenticated`` to True, replies with
+        an ``AUTH_OK`` frame so the peer knows the channel is open, and
+        — to preserve the legacy "new connection sees the latest state
+        on attach" behaviour — sends a fresh STATE_UPDATE if one is
+        cached. On failure (no token, wrong token, malformed payload)
+        logs ``AUTH_REJECTED`` and closes the socket with code 1011.
+
+        Replay-safe: a second ``AUTH`` on an already-authenticated
+        connection short-circuits to a re-ACK with no other side effect.
+        That keeps clients that retry on transient WS errors from
+        bouncing themselves out of a healthy session.
+        """
+        if client.authenticated:
+            # Idempotent replay — just re-ACK so the peer's promise resolves.
+            try:
+                await client.websocket.send(_auth_ok_frame())
+            except Exception:
+                logger.debug(
+                    "AUTH_OK replay send failed for %s",
+                    client.client_id,
+                    exc_info=True,
+                )
+            return
+
+        presented = (msg.payload or {}).get("auth_token")
+        if not isinstance(presented, str) or not verify_token(presented):
+            reason = "missing" if not presented else "invalid"
+            logger.warning(
+                "%s reason=%s_token client=%s cid=%s",
+                EventType.AUTH_REJECTED.value,
+                reason,
+                client.client_id,
+                msg.correlation_id or "-",
+            )
+            try:
+                await client.websocket.close(
+                    code=1011, reason="invalid auth token",
+                )
+            except Exception:
+                logger.debug(
+                    "close(invalid auth) on already-dead socket %s",
+                    client.client_id,
+                    exc_info=True,
+                )
+            return
+
+        client.authenticated = True
+        try:
+            await client.websocket.send(_auth_ok_frame())
+        except Exception:
+            logger.debug(
+                "AUTH_OK send failed for %s",
+                client.client_id,
+                exc_info=True,
+            )
+            return
+
+        # Debt-2: legacy behaviour was to push the latest state on every
+        # new connection. Defer that send until after AUTH succeeds so
+        # an unauthenticated peer never sees STATE_UPDATE.
+        if self._latest_state is not None:
+            try:
+                state_msg = self._make_state_update(self._latest_state)
+                await client.websocket.send(state_msg.to_json())
+            except Exception:
+                logger.debug(
+                    "post-AUTH state push failed for %s",
+                    client.client_id,
+                    exc_info=True,
+                )
 
     async def _handle_user_action(
         self, client: WebSocketClient, msg: WSMessage,
@@ -788,10 +925,17 @@ class WebSocketServer:
 
         payload = msg.to_json()
         target_types = set(msg.target_client_types or [])
+        # Debt-2 (audit): never broadcast to a peer that has not
+        # completed the AUTH handshake. A connection in ``pending_auth``
+        # should not see STATE_UPDATE / INTERVENTION frames; the gate in
+        # ``_dispatch_message`` already drops non-AUTH inbound frames
+        # from such peers, but a connect-and-listen-only client would
+        # still receive broadcasts without this filter.
         targets = [
             (client_id, client)
             for client_id, client in self._clients.items()
-            if not target_types or client.client_type in target_types
+            if (not target_types or client.client_type in target_types)
+            and client.authenticated
         ]
         if not targets:
             return 0
