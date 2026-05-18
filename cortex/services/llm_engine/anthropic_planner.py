@@ -45,6 +45,7 @@ from cortex.libs.llm.anthropic_client import (
     build_anthropic_sdk_client,
     resolve_anthropic_model_id,
 )
+from cortex.libs.llm.pricing import usd_cost
 from cortex.libs.logging.correlation import get_correlation_id
 from cortex.libs.schemas.context import TaskContext
 from cortex.libs.schemas.intervention import (
@@ -52,8 +53,10 @@ from cortex.libs.schemas.intervention import (
     SimplificationConstraints,
 )
 from cortex.libs.schemas.state import StateEstimate
+from cortex.libs.utils.platform import get_config_dir
 from cortex.services.llm_engine.cache import LLMCache
 from cortex.services.llm_engine.client import build_fallback_plan
+from cortex.services.llm_engine.cost_tracker import CostTracker
 from cortex.services.llm_engine.parser import (
     enrich_plan_with_context,
     validate_intervention_plan,
@@ -194,6 +197,7 @@ class AnthropicPlanner:
         cache: LLMCache | None = None,
         *,
         sdk: Any | None = None,
+        cost_tracker: CostTracker | None = None,
     ) -> None:
         self._config = config or LLMConfig()
 
@@ -257,6 +261,31 @@ class AnthropicPlanner:
         )
         self._plan_tool = _make_intervention_plan_tool()
 
+        # F20: per-day USD spend ledger + kill-switch. Use the injected
+        # tracker in tests; in production fall back to the per-user
+        # config-dir ledger so spend survives across daemon restarts.
+        if cost_tracker is not None:
+            self._cost_tracker: CostTracker | None = cost_tracker
+        else:
+            try:
+                ledger_path = get_config_dir() / "cost_ledger.json"
+                self._cost_tracker = CostTracker(
+                    ledger_path=ledger_path,
+                    warn_usd=self._config.cost_warn_usd,
+                    kill_usd=self._config.daily_cost_budget_usd,
+                )
+            except (OSError, ValueError) as exc:
+                # Cost tracking is best-effort: a broken ledger path
+                # must not break the planner. The daemon logs the issue
+                # but continues; spend will be invisible until the path
+                # is made writable.
+                logger.warning(
+                    "cost_tracker: disabled (%s: %s)",
+                    type(exc).__name__,
+                    exc,
+                )
+                self._cost_tracker = None
+
     def _select_tier(self, template_name: str | None) -> ModelTier:
         if template_name:
             overrides = self._config.template_tier_overrides
@@ -283,6 +312,22 @@ class AnthropicPlanner:
         if cached is not None:
             logger.debug("LLM cache hit (template=%s)", template_name)
             return cached
+
+        # F20: hard kill-switch — once today's spend crosses the
+        # configured ceiling, serve the deterministic fallback plan and
+        # stamp the metadata so the dashboard banner can explain why.
+        if (
+            self._cost_tracker is not None
+            and self._cost_tracker.check_budget() == "KILL"
+        ):
+            logger.error(
+                "LLM daily budget exceeded; serving deterministic fallback "
+                "(cid=%s)",
+                get_correlation_id() or "-",
+            )
+            killed = build_fallback_plan(context)
+            killed.metadata["budget_killed"] = True
+            return killed
 
         if not self._circuit.allow(now_mono):
             logger.warning("LLM circuit open; serving deterministic fallback")
@@ -398,6 +443,11 @@ class AnthropicPlanner:
                 get_correlation_id() or "-",
             )
 
+            # F20: persist the per-call USD cost into the daily ledger
+            # and emit ``LLM_COST``. Best-effort — never let an
+            # accounting bug propagate up and break the planner result.
+            self._record_cost(model_id, usage, cancelled=False)
+
             enriched = enrich_plan_with_context(plan, context)
             # D.6: surface the simplification constraint window into the
             # UIPlan so VS Code can size its fold window per-plan instead
@@ -417,6 +467,56 @@ class AnthropicPlanner:
             template_name,
         )
         return build_fallback_plan(context)
+
+    # ------------------------------------------------------------------
+    # F20: cost accounting helper
+    # ------------------------------------------------------------------
+
+    def _record_cost(
+        self,
+        model_id: str,
+        usage: Any,
+        *,
+        cancelled: bool,
+    ) -> None:
+        """Persist the per-call USD cost into the daily ledger.
+
+        Best-effort: surfaces an exception only if the ledger path is
+        broken at the file-system level, in which case the tracker has
+        already logged the failure.
+        """
+        if self._cost_tracker is None:
+            return
+        input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+        cache_read = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+        cache_write = int(
+            getattr(usage, "cache_creation_input_tokens", 0) or 0
+        )
+        try:
+            usd = usd_cost(
+                model_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read=cache_read,
+                cache_write=cache_write,
+            )
+        except (KeyError, ValueError) as exc:
+            logger.warning(
+                "cost_tracker: skipped unknown model %s (%s)",
+                model_id,
+                exc,
+            )
+            return
+        try:
+            self._cost_tracker.record(
+                get_correlation_id(),
+                model_id,
+                usd,
+                cancelled=cancelled,
+            )
+        except Exception:  # noqa: BLE001 — telemetry must never break the planner
+            logger.exception("cost_tracker.record failed")
 
     async def health_check(self) -> bool:
         """Cheap readiness check — never crash the daemon if the SDK is down."""

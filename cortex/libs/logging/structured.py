@@ -63,6 +63,18 @@ class EventType(StrEnum):
     # etc.) before it can reach the executor in the extension.
     INTERVENTION_ACTION_REJECTED = "intervention_action_rejected"
 
+    # F20: per-call LLM cost telemetry. Each ``LLM_COST`` line carries
+    # the correlation id, the resolved model identifier, the USD
+    # estimate from :mod:`cortex.libs.llm.pricing`, and whether the
+    # underlying call was cancelled mid-flight (F30 wraps the shielded
+    # SDK call so cancellations still produce a cost entry).
+    LLM_COST = "llm_cost"
+    # F20: the daily budget kill-switch fired — the planner is serving
+    # deterministic fallback plans for the rest of the local day. The
+    # dashboard surfaces this as a banner so the user understands why
+    # plans suddenly stopped feeling "smart".
+    LLM_BUDGET_KILL = "llm_budget_kill"
+
 
 class StateTransitionEvent(BaseModel):
     """State transition event data."""

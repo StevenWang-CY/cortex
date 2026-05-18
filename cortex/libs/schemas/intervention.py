@@ -318,6 +318,21 @@ class InterventionPlan(BaseModel):
         default_factory=list,
         description="Non-fatal validation or grounding warnings to surface in debug UI",
     )
+    # F20 / F27 (audit): non-payload metadata stamped by the daemon to
+    # distinguish real-LLM plans from rule-based fallbacks (``source``
+    # ∈ {``llm``, ``fallback``}), and to surface the reason
+    # (``fallback_reason`` ∈ {``circuit_open``, ``retries_exhausted``,
+    # ``budget_killed``}). The dismissal-model training pipeline reads
+    # ``source`` and skips outcomes from fallback origins so cold-start
+    # dismissals don't poison personalisation.
+    metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Daemon-stamped plan metadata (e.g. {'source': 'fallback'}). "
+            "Never trust this field for executor decisions — it is "
+            "purely an observability hint."
+        ),
+    )
 
     @property
     def is_valid(self) -> bool:

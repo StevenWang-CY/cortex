@@ -145,6 +145,15 @@ class LLMConfig(BaseModel):
     circuit_window_seconds: float = 60.0
     circuit_open_seconds: float = 30.0
 
+    # F20: per-day USD spend rails. ``cost_warn_usd`` emits a single
+    # ``llm.budget.warn`` log line per local day; ``daily_cost_budget_usd``
+    # is the hard kill — the planner serves the deterministic fallback
+    # plan and stamps ``metadata["budget_killed"] = True`` for the rest
+    # of the day. Defaults are deliberately tight (≈$20/day) because an
+    # oscillating state machine can issue 60+ planner calls per hour.
+    cost_warn_usd: float = 5.0
+    daily_cost_budget_usd: float = 20.0
+
 
 class CaptureConfig(BaseModel):
     """Webcam capture configuration."""
