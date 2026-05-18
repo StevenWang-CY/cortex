@@ -20,7 +20,8 @@ L3 Trigger/Policy
         │
         ▼
 L4 LLM Planning
-  llm_engine (Azure/Ollama/remote/rule) + parser + planner validation
+  llm_engine (Anthropic SDK over AWS Bedrock / GCP Vertex / direct Anthropic
+  API, with a deterministic rule-based fallback) + parser + planner validation
         │
         ▼
 L5 Intervention Execution

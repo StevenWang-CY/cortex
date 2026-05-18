@@ -118,7 +118,7 @@ All layers communicate via FastAPI (port 9472) and WebSocket (port 9473). The de
 | **Backend** | Python 3.11+, FastAPI, MediaPipe, OpenCV, pynput, PySide6 |
 | **Browser Extension** | TypeScript, React, Plasmo (Manifest V3), Chrome + Edge |
 | **VS Code Extension** | TypeScript, VS Code Extension API |
-| **LLM** | Azure OpenAI, Qwen-3-8B (remote via SSH tunnel), Ollama (local) |
+| **LLM** | Anthropic SDK over AWS Bedrock (default), GCP Vertex, or direct Anthropic API; rule-based deterministic fallback |
 | **Storage** | Redis 7+ with automatic in-memory fallback |
 | **Testing** | pytest (55 test files, 995+ tests), mypy (strict), ruff |
 
@@ -136,7 +136,7 @@ All layers communicate via FastAPI (port 9472) and WebSocket (port 9473). The de
 | **Python 3.11 or 3.12** | `brew install python@3.11` or [python.org](https://www.python.org/downloads/) |
 | **Node.js 18+** | `brew install node` or [nodejs.org](https://nodejs.org/) |
 | **pnpm** | `npm install -g pnpm` (after installing Node.js) |
-| **LLM backend** | One of: Azure OpenAI API key, local [Ollama](https://ollama.com), or `rule_based` mode (no LLM needed) |
+| **LLM backend** | One of: AWS Bedrock bearer token (default), GCP Vertex application-default credentials, or direct Anthropic API key. Falls back to a deterministic rule-based plan if every provider is unavailable. |
 | **Redis** (optional) | `brew install redis && brew services start redis` — falls back to in-memory if not running |
 
 > **Apple Silicon note:** Use native ARM Python, not Rosetta. Verify with: `python3 -c "import platform; print(platform.machine())"` — should print `arm64`.
@@ -162,27 +162,41 @@ pip install -e "./cortex[dev]"
 cp cortex/.env.example .env
 ```
 
-Edit `.env` and set your LLM backend. Pick ONE:
+Edit `.env` and pick an Anthropic SDK provider via `CORTEX_LLM__PROVIDER`:
 
-**Option A — Azure OpenAI** (recommended):
+**Option A — AWS Bedrock** (default):
 ```bash
-CORTEX_LLM__MODE=azure
-CORTEX_LLM__AZURE__ENDPOINT=https://your-resource.openai.azure.com/
-CORTEX_LLM__AZURE__API_KEY=your-key-here
-CORTEX_LLM__AZURE__DEPLOYMENT_NAME=gpt-4o-mini
+CORTEX_LLM__PROVIDER=bedrock
+CORTEX_LLM__BEDROCK__AWS_REGION=us-east-2
+# Store the bearer token in Keychain (BYOK), not in .env:
+security add-generic-password -s cortex.bedrock -a bearer_token -w YOUR_BEDROCK_TOKEN
 ```
 
-**Option B — Local Ollama** (free, no API key):
+**Option B — GCP Vertex AI**:
 ```bash
-# Install and start Ollama first:
-#   brew install ollama && ollama pull llama3.1:8b && ollama serve
-CORTEX_LLM__MODE=local
+CORTEX_LLM__PROVIDER=vertex
+# Authenticate Vertex with: gcloud auth application-default login
 ```
 
-**Option C — Rule-based only** (no LLM, limited interventions):
+**Option C — Direct Anthropic API**:
 ```bash
-CORTEX_LLM__MODE=rule_based
+CORTEX_LLM__PROVIDER=direct
+export ANTHROPIC_API_KEY=sk-ant-...
 ```
+
+If every provider fails, Cortex falls back to a deterministic
+rule-based plan so the daemon keeps working — you just lose
+LLM-generated copy until the provider comes back. Configure the
+fallback explicitly with `CORTEX_LLM__FALLBACK_MODE=rule_based`
+(the default).
+
+> **Removed providers (v0.2.0+):** Azure OpenAI, self-hosted Qwen, and
+> local Ollama were dropped when Cortex migrated to the Anthropic SDK.
+> The env vars `CORTEX_LLM__MODE`, `CORTEX_LLM__AZURE__*`,
+> `CORTEX_LLM__REMOTE__*`, `CORTEX_LLM__LOCAL__*`, and
+> `CORTEX_LLM__MODEL_NAME` are no longer read; legacy `.env` files boot
+> cleanly because the validator maps stale values to the rule-based
+> fallback rather than raising.
 
 Then initialize storage directories:
 ```bash
@@ -248,7 +262,7 @@ Cortex watches you through your webcam while you study — not to record you, bu
 
 What works well today: the state classification system is conservative and well-tuned — in testing, it correctly avoids false alarms for caffeinated studying, debugging sessions, and deep reading. The biological break timer (which replaces arbitrary Pomodoro intervals with actual HRV-based fatigue tracking) is a genuinely novel feature that works as designed. The LeetCode mode's multi-selector DOM strategy is resilient to LeetCode's frequent UI changes, and the intervention matrix covers real failure modes students hit. The context-aware fallback system means you still get useful help even when the AI model is slow or unavailable. The progressive consent system lets Cortex earn your trust gradually — it starts by just observing, and only takes actions after you've approved similar ones multiple times.
 
-Cortex asks for your webcam (for pulse and posture — no video is saved or sent anywhere), broad browser permissions (to read tab titles and URLs for context — the AI model never sees your biometrics), and a 2-minute baseline calibration session where you sit still so it can learn your resting heart rate. It runs a local daemon on your machine that communicates with a Chrome extension and optionally a VS Code extension. The AI model (Azure OpenAI, Qwen, or a local Ollama instance) sees only workspace context: file paths, error messages, and tab titles. Your physiological data stays on your machine.
+Cortex asks for your webcam (for pulse and posture — no video is saved or sent anywhere), broad browser permissions (to read tab titles and URLs for context — the AI model never sees your biometrics), and a 2-minute baseline calibration session where you sit still so it can learn your resting heart rate. It runs a local daemon on your machine that communicates with a Chrome extension and optionally a VS Code extension. The AI model (Claude via AWS Bedrock by default; GCP Vertex or the direct Anthropic API are also supported) sees only workspace context: file paths, error messages, and tab titles. Your physiological data stays on your machine.
 
 Cortex is not a study planner, a to-do app, or a replacement for actually understanding the material. The heart rate signal from a webcam is noisier than a chest strap — in dim lighting or if you move a lot, the biological signals degrade and the system falls back to behavioral-only detection. The HRV measurement at 30 FPS is at the edge of what's physiologically meaningful and works best as a trend indicator over minutes, not a precise beat-by-beat measurement. The AI-generated interventions are sometimes generic or slightly off-target, especially early on before the learning system has calibrated to your preferences. And if you're the kind of student who studies past midnight, you'll want to adjust the wind-down hour from its default — it was set for an earlier bedtime than most college students keep.
 
@@ -280,10 +294,12 @@ python3 -c "import cv2; [print(f'Device {i}: {cv2.VideoCapture(i).isOpened()}') 
   - DMG install: `osascript -e 'tell application "Cortex" to quit'`
   - Dev checkout: `pkill -f "cortex.scripts.run_dev"`
 
-### Azure LLM errors
-- Verify your `.env` has `CORTEX_LLM__AZURE__ENDPOINT`, `API_KEY`, and `DEPLOYMENT_NAME` set
-- Check API version is `2025-01-01-preview`
-- Use `CORTEX_LLM__MODE=rule_based` to run without any LLM
+### LLM provider errors
+- Verify `CORTEX_LLM__PROVIDER` is one of `bedrock`, `vertex`, or `direct`
+- For Bedrock: confirm the bearer token is in Keychain (`security find-generic-password -s cortex.bedrock -a bearer_token`) and `CORTEX_LLM__BEDROCK__AWS_REGION` is set
+- For Vertex: re-run `gcloud auth application-default login`
+- For direct: confirm `ANTHROPIC_API_KEY` is exported into the daemon's environment
+- Use `CORTEX_LLM__FALLBACK_MODE=rule_based` (the default) to run with no LLM at all
 
 ### MediaPipe import errors on Apple Silicon
 ```bash
