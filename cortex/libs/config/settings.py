@@ -341,6 +341,14 @@ class StorageConfig(BaseModel):
     session_retention_days: int = 7
     feature_retention_days: int = 7
     error_retention_days: int = 90
+    # F36: hard ceiling on the cumulative size of ``storage/sessions/*.json``.
+    # When writing a new session report would push the total over budget,
+    # oldest sessions (lowest mtime) are evicted first until the total
+    # drops back under the cap. Default 500 MB roughly corresponds to
+    # 6 months of typical use (1-3 MB per session × ~3 sessions/day).
+    # Set to 0 to evict every existing session before each write — used in
+    # tests as the lowest-bound smoke test of the eviction path.
+    max_total_size_mb: int = 500
 
 
 class DebugConfig(BaseModel):

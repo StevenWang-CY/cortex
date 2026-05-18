@@ -89,6 +89,69 @@ from cortex.services.throttle.copilot_throttle import CopilotThrottle
 logger = logging.getLogger(__name__)
 
 
+def enforce_session_storage_budget(
+    sessions_dir: Path,
+    *,
+    incoming_bytes: int,
+    max_total_size_mb: int,
+) -> int:
+    """Evict oldest session reports until adding ``incoming_bytes``
+    would keep the cumulative size of ``sessions_dir/*.json`` at or
+    under ``max_total_size_mb`` (F36).
+
+    Returns the number of files evicted (0 if the directory is below
+    budget already, > 0 if eviction occurred). ``max_total_size_mb == 0``
+    is a sentinel that evicts every existing session before each write —
+    callers depending on a strict bound use this; tests use it as the
+    lowest-bound smoke test of the eviction path.
+
+    Files are stat-ed once for both size and mtime; oldest mtime is
+    evicted first. The function is a no-op if the directory does not
+    exist or contains no ``.json`` files.
+    """
+    if max_total_size_mb < 0:
+        return 0
+    if not sessions_dir.exists() or not sessions_dir.is_dir():
+        return 0
+
+    budget_bytes = max_total_size_mb * 1024 * 1024
+    entries: list[tuple[float, int, Path]] = []
+    for p in sessions_dir.iterdir():
+        if not p.is_file() or p.suffix != ".json":
+            continue
+        try:
+            stat = p.stat()
+        except OSError:
+            continue
+        entries.append((stat.st_mtime, stat.st_size, p))
+
+    total = sum(size for _mtime, size, _p in entries)
+    if total + incoming_bytes <= budget_bytes:
+        return 0
+
+    # Evict oldest-first until the headroom fits the new write.
+    entries.sort(key=lambda e: e[0])
+    evicted = 0
+    for _mtime, size, path in entries:
+        if total + incoming_bytes <= budget_bytes:
+            break
+        try:
+            path.unlink()
+            total -= size
+            evicted += 1
+        except OSError:
+            logger.warning(
+                "F36 storage budget: could not evict %s", path, exc_info=True
+            )
+    if evicted > 0:
+        logger.info(
+            "F36 storage budget: evicted %d session(s) to make room for "
+            "%d-byte write (cap=%d MB)",
+            evicted, incoming_bytes, max_total_size_mb,
+        )
+    return evicted
+
+
 class _OptimisticInterventionAdapter:
     """Optimistic in-process adapter.
 
@@ -504,10 +567,19 @@ class CortexDaemon:
                 )
                 sessions_dir.mkdir(parents=True, exist_ok=True)
                 session_path = sessions_dir / f"session_{report.session_id}.json"
-                session_path.write_text(
-                    json.dumps(report.model_dump(mode="json"), indent=2),
-                    encoding="utf-8",
+                encoded = json.dumps(
+                    report.model_dump(mode="json"), indent=2
                 )
+                # F36: enforce the cumulative-size budget BEFORE writing.
+                # If existing sessions + the incoming payload would push
+                # the directory over ``max_total_size_mb``, evict oldest
+                # files first until the new write fits.
+                enforce_session_storage_budget(
+                    sessions_dir,
+                    incoming_bytes=len(encoded.encode("utf-8")),
+                    max_total_size_mb=self.config.storage.max_total_size_mb,
+                )
+                session_path.write_text(encoded, encoding="utf-8")
                 logger.info("Wrote session report to %s", session_path)
         except Exception:
             logger.warning("Failed to finalise session report", exc_info=True)
