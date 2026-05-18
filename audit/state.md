@@ -1,9 +1,39 @@
 # Audit State Pointer
 
 **Phase:** 2 (remediation in progress)
-**Next finding to address:** F38+F39 (strip dead provider config / fix docs) — Cheap Win cohort
-**Last finding closed:** F11 (Bedrock token containment)
-**Last commit:** `audit F11: scope Bedrock token mutation to SDK construction only`
+**Next finding to address:** F10 (allowlist for LLM-emitted actions before executor dispatch) — security pair with F09
+**Last finding closed:** F09 (prompt-injection defence)
+**Last commit:** `audit F09: prompt-injection defence — sanitiser + delimiter wrapping + system prompt clause`
+
+## Phase 2 session 1 summary (2026-05-19)
+
+Eight commits landed, in order. The data-loss + security + observability tiers are closed; the correctness/cost/maintainability tiers are still open. See `audit/execution-log.md` for full per-commit detail.
+
+| Commit | Finding | Tier | Test cases |
+|--------|---------|------|------------|
+| 6eca4c1 | F19  | observability foundation | 8 |
+| 3268a04 | F07  | security                 | 8 |
+| 65d110a | F08+F07b | security             | 7 |
+| 7169750 | F02  | data-loss                | 5 |
+| f0b95b0 | F03  | data-loss                | 4 |
+| 5828fa7 | F01  | data-loss                | 3 |
+| 2a02194 | F11  | security                 | 3 |
+| 2a02194... actually next: 8th commit | F09 | security | 9 |
+
+Remaining priority on the Ledger (run-order):
+
+```
+F10  → F12 → F38+F39 → F53
+ → F20 → F30 → F25 → F26 → F18 → F27
+ → F06 → F16 → F17 → F22 → F34
+ → (then maintainability cohort)
+ → (then F40 + F19b + F07c/F08b — TS test infra unblocks the extension half)
+```
+
+Outstanding **new findings** surfaced during Phase 2 (not yet closed):
+- **F07b** — daemon-side closed in F08; extension wiring split as **F08b**.
+- **F08b** — extension fetches token via native host (deferred, needs F40).
+- **F19b** — correlation IDs in browser extension (deferred, needs F40).
 **Resume protocol on fresh invocation:**
 
 1. Read `audit/findings.md` — authoritative Ledger.

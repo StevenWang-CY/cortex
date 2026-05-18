@@ -161,6 +161,30 @@ Entries appended in commit order. Each entry: finding ID, fix summary, files tou
 
 ---
 
+### F09 — Prompt-injection defence in the LLM engine
+
+**Fix.** Two-sided defence shipping together:
+
+1. **Sanitiser hardened.** `sanitize_prompt_text` now defangs the prompt-injection patterns most commonly seen in the wild: leading `System:` / `Assistant:` / `Human:` lines, the XML role tags `<SYSTEM>` / `</SYSTEM>` / `<INSTRUCTION>` / `<ASSISTANT>`, the Llama-style `[INST]` / `[/INST]` markers, and any premature `</USER_CONTENT>` close tag. Defang inserts spaces inside the marker — the human-readable text survives, the byte pattern the model recognises does not.
+2. **Delimiter wrapping.** New `wrap_user_content(text, *, tag)` helper. Every user-controlled string interpolated into the user prompt (`context`, `constraints_text`, `goal_hint`, `extra_context`) is wrapped in a tag-distinct delimiter — `<WORKSPACE_CONTEXT>`, `<CONSTRAINTS>`, `<USER_GOAL>`, `<EXTRA_CONTEXT>`.
+3. **SYSTEM_PROMPT** gains a "PROMPT INJECTION DEFENCE" clause that tells the model these tagged regions are DATA, never instructions, and to ignore any embedded "System:" prefix, "ignore previous instructions" directive, or new-rules text inside them.
+
+**Files touched** (2):
+- `cortex/services/llm_engine/prompts.py`
+- `cortex/tests/unit/test_prompt_injection_defence.py` (new)
+
+**Test.** 9 cases. Sanitiser defangs `System:`/`Assistant:`/`Human:` prefixes, XML role tags, `[INST]` brackets, and `</USER_CONTENT>` close tag. `wrap_user_content` produces the expected delimiter. Round-trip attack (a tab title combining every injection pattern) is fully neutralised. The system prompt carries the matching defence clause. Pre-existing brace-escape behaviour is preserved (regression guard). All fail on `main` (sanitiser pre-F09 did not defang any of these patterns; system prompt had no injection-defence clause).
+
+**Verification.**
+- F09 suite: 9 passed (1.00s).
+- Regression check on prompt/context tests (`pytest -k "prompt or context"`): 104 passed.
+
+**Compatibility.** Wire/schema unchanged. The LLM's effective prompt grows slightly (one tag-wrapper per interpolated value), well within token budget. The injection-defence clause may marginally bias the model toward refusing tab titles that contain `System:` literally — acceptable given the threat.
+
+**Rollback.** `git revert` is clean. Single file modified plus the test; the previous sanitiser is restored straight-line.
+
+---
+
 ## New Findings (surfaced during Phase 2)
 
 ### F07b — Native-host mediated auth-token fetch for extension
