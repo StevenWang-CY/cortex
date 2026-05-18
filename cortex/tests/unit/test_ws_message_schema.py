@@ -90,6 +90,32 @@ def test_message_type_catalog_covers_outbound() -> None:
     assert not missing, f"MessageType missing outbound literals: {missing}"
 
 
+def test_message_type_catalog_covers_leetcode_adapter_emissions() -> None:
+    """The LeetCode adapter emits typed messages through ``send_message``;
+    each LEETCODE_* literal it can produce must be enumerated so the
+    Pydantic validator does not reject the message at construction time."""
+    leetcode_outbound = {
+        "LEETCODE_SHOW_SCRATCHPAD",
+        "LEETCODE_SHOW_PATTERN_LADDER",
+        "LEETCODE_SHOW_LOCKOUT",
+        "LEETCODE_SHOW_CONSOLIDATION",
+        "LEETCODE_SHOW_SUBMISSION_GATE",
+        "LEETCODE_SHOW_SOLUTION_FRICTION",
+        "LEETCODE_SHOW_SESSION_BRIEFING",
+        "LEETCODE_LOCK_EDITOR",
+        "LEETCODE_INTERCEPT_SUBMIT",
+        "LEETCODE_GATE_SOLUTIONS",
+        "LEETCODE_AI_RESTATEMENT_CHECK",
+        "LEETCODE_AI_COMPREHENSION_CHECK",
+        "LEETCODE_AI_HYPOTHESIS_CHECK",
+        "LEETCODE_AI_STUCK_ANALYSIS",
+        "LEETCODE_AI_SESSION_BRIEFING",
+    }
+    catalog = {m.value for m in MessageType}
+    missing = leetcode_outbound - catalog
+    assert not missing, f"MessageType missing LeetCode literals: {missing}"
+
+
 def test_construct_with_string_literal() -> None:
     """Plain-string ``type`` works (existing call sites untouched)."""
     msg = WSMessage(type="STATE_UPDATE", payload={"state": "FLOW"})

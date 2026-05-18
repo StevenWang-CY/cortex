@@ -116,3 +116,54 @@ class MessageType(str, Enum):
 
     AMBIENT_STATE_UPDATE = "AMBIENT_STATE_UPDATE"
     """Lightweight state heartbeat for the always-on ambient overlay."""
+
+    # ─── LeetCode adapter cues (Daemon → Chrome, target_client_types=["chrome"]) ─
+    # Emitted by ``LeetCodeAdapter.execute`` via
+    # ``runtime_daemon._send_leetcode_ws_message`` → ``WebSocketServer.send_message``
+    # → ``WSMessage(type=...)``. These literals MUST be enumerated here or
+    # the Pydantic validator rejects them at construction time.
+
+    LEETCODE_SHOW_SCRATCHPAD = "LEETCODE_SHOW_SCRATCHPAD"
+    """Inject the LeetCode scratchpad overlay (problem reframing prompts)."""
+
+    LEETCODE_SHOW_PATTERN_LADDER = "LEETCODE_SHOW_PATTERN_LADDER"
+    """Surface the pattern ladder (DP/graph/etc. scaffold)."""
+
+    LEETCODE_SHOW_LOCKOUT = "LEETCODE_SHOW_LOCKOUT"
+    """Block the editor — destructive-struggle gate."""
+
+    LEETCODE_SHOW_CONSOLIDATION = "LEETCODE_SHOW_CONSOLIDATION"
+    """Post-solve consolidation prompt (recap + retain)."""
+
+    LEETCODE_SHOW_SUBMISSION_GATE = "LEETCODE_SHOW_SUBMISSION_GATE"
+    """Pre-submit gate (run examples / sanity-check before submit)."""
+
+    LEETCODE_SHOW_SOLUTION_FRICTION = "LEETCODE_SHOW_SOLUTION_FRICTION"
+    """Friction overlay before revealing the editorial / solution."""
+
+    LEETCODE_SHOW_SESSION_BRIEFING = "LEETCODE_SHOW_SESSION_BRIEFING"
+    """Daily LeetCode briefing for the popup/newtab."""
+
+    LEETCODE_LOCK_EDITOR = "LEETCODE_LOCK_EDITOR"
+    """Force-focus the LeetCode editor (no other tabs)."""
+
+    LEETCODE_INTERCEPT_SUBMIT = "LEETCODE_INTERCEPT_SUBMIT"
+    """Intercept the submit button until acknowledgement."""
+
+    LEETCODE_GATE_SOLUTIONS = "LEETCODE_GATE_SOLUTIONS"
+    """Gate the editorial / community-solution tab."""
+
+    LEETCODE_AI_RESTATEMENT_CHECK = "LEETCODE_AI_RESTATEMENT_CHECK"
+    """Trigger AI-powered restatement check (paraphrase the problem)."""
+
+    LEETCODE_AI_COMPREHENSION_CHECK = "LEETCODE_AI_COMPREHENSION_CHECK"
+    """Trigger AI-powered comprehension check (examples / edges)."""
+
+    LEETCODE_AI_HYPOTHESIS_CHECK = "LEETCODE_AI_HYPOTHESIS_CHECK"
+    """Trigger AI-powered hypothesis check (approach articulation)."""
+
+    LEETCODE_AI_STUCK_ANALYSIS = "LEETCODE_AI_STUCK_ANALYSIS"
+    """Trigger AI-powered stuck-analysis explanation."""
+
+    LEETCODE_AI_SESSION_BRIEFING = "LEETCODE_AI_SESSION_BRIEFING"
+    """Trigger AI-powered session-briefing generation."""

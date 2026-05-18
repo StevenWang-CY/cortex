@@ -10,6 +10,16 @@ import React, { useCallback, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { CX, STATE_COLORS, STATE_LABELS, CX_KEYFRAMES } from "./design-tokens";
 
+// Generated from Pydantic — Debt-1 closure (F42/F43/F44).
+// Hand-written copies of these interfaces previously lived alongside
+// the popup; they drifted from the Python side. The import is the
+// only canonical source; CI fails if it goes stale.
+import type {
+    SuggestedAction,
+    TabRecommendation,
+    TabRecommendations,
+} from "./types/generated/cortex_schemas";
+
 const CortexLogo = () => (
     <svg width="22" height="22" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ flexShrink: 0 }}>
         <path d="M 51.8 12.2 A 28 28 0 1 0 51.8 51.8" fill="none" stroke="#1a1a1a" strokeWidth="6" strokeLinecap="round" />
@@ -64,29 +74,44 @@ interface MorningBriefing {
 /**
  * Synthesize close_tab actions from tab_recommendations when the LLM
  * generated recommendations but no matching suggested_actions.
+ *
+ * The ``action_type`` literals below are checked against the generated
+ * ``SuggestedAction["action_type"]`` union, so a Python-side schema
+ * rename will fail this file's ``tsc --noEmit`` check (F42).
  */
 function synthesizeActions(
     actions: Record<string, unknown>[],
-    tabRecs: { tabs: Record<string, unknown>[]; summary: string } | null,
+    tabRecs: TabRecommendations | null,
 ): Record<string, unknown>[] {
     if (!tabRecs || !tabRecs.tabs || tabRecs.tabs.length === 0) return actions;
-    const hasClose = actions.some(a => a.action_type === "close_tab" || a.action_type === "bookmark_and_close");
+    const hasClose = actions.some(
+        a => a.action_type === "close_tab" || a.action_type === "bookmark_and_close"
+    );
     if (hasClose) return actions;
-    const closeable = tabRecs.tabs.filter(t => t.action === "close" || t.action === "bookmark_and_close");
+    const closeable = tabRecs.tabs.filter(
+        (t: TabRecommendation) => t.action === "close" || t.action === "bookmark_and_close"
+    );
     if (closeable.length === 0) return actions;
     return [
         ...actions,
-        ...closeable.map((t, i) => ({
-            action_id: `synth_${Date.now()}_${i}`,
-            action_type: t.action === "bookmark_and_close" ? "bookmark_and_close" : "close_tab",
-            tab_index: typeof t.tab_index === "number" ? t.tab_index : Number(t.tab_index),
-            target: "",
-            label: `Close ${t.tab_title || "tab"}`,
-            reason: t.reason || "",
-            category: "recommended",
-            reversible: true,
-            metadata: {},
-        })),
+        ...closeable.map((t, i) => {
+            // Narrow the inferred action_type to the generated literal
+            // union so a future rename in the Pydantic catalog surfaces
+            // here at compile time.
+            const action_type: SuggestedAction["action_type"] =
+                t.action === "bookmark_and_close" ? "bookmark_and_close" : "close_tab";
+            return {
+                action_id: `synth_${Date.now()}_${i}`,
+                action_type,
+                tab_index: typeof t.tab_index === "number" ? t.tab_index : Number(t.tab_index),
+                target: "",
+                label: `Close ${t.tab_title || "tab"}`,
+                reason: t.reason || "",
+                category: "recommended" as SuggestedAction["category"],
+                reversible: true,
+                metadata: {},
+            };
+        }),
     ];
 }
 
@@ -124,7 +149,7 @@ function CortexPopup(): React.ReactElement {
     const [goalInput, setGoalInput] = useState("");
     const [alert, setAlert] = useState<{ title: string; body: string } | null>(null);
     const [activeActions, setActiveActions] = useState<Record<string, unknown>[]>([]);
-    const [tabRecs, setTabRecs] = useState<{ tabs: Record<string, unknown>[]; summary: string } | null>(null);
+    const [tabRecs, setTabRecs] = useState<TabRecommendations | null>(null);
     const [errAnalysis, setErrAnalysis] = useState<Record<string, string> | null>(null);
     const [interventionId, setInterventionId] = useState<string>("");
     const [applied, setApplied] = useState(false);
@@ -211,7 +236,7 @@ function CortexPopup(): React.ReactElement {
             if (resp.intervention) {
                 const p = resp.intervention as Record<string, unknown>;
                 const rawActions = (p.suggested_actions as Record<string, unknown>[]) || [];
-                const recs = (p.tab_recommendations as { tabs: Record<string, unknown>[]; summary: string }) || null;
+                const recs = (p.tab_recommendations as TabRecommendations | undefined) ?? null;
                 setActiveActions(synthesizeActions(rawActions, recs));
                 setTabRecs(recs);
                 setErrAnalysis((p.error_analysis as Record<string, string>) || null);
@@ -253,7 +278,7 @@ function CortexPopup(): React.ReactElement {
                 case "INTERVENTION_TRIGGER": {
                     const p = msg.payload as Record<string, unknown>;
                     const rawActions = (p.suggested_actions as Record<string, unknown>[]) || [];
-                    const recs = (p.tab_recommendations as { tabs: Record<string, unknown>[]; summary: string }) || null;
+                    const recs = (p.tab_recommendations as TabRecommendations | undefined) ?? null;
                     setActiveActions(synthesizeActions(rawActions, recs));
                     setTabRecs(recs);
                     setErrAnalysis((p.error_analysis as Record<string, string>) || null);
