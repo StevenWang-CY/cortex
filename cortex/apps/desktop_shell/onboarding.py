@@ -11,11 +11,21 @@ Visual layer adopts:
   ``AXIsProcessTrustedWithOptions`` for accessibility
 
 Public API (Signals + ``onboarding_marker_path``) preserved byte-identical.
+
+F49: in addition to the legacy ``.onboarding_complete`` marker in the
+storage path, per-step completion is persisted to
+``<config_dir>/onboarding_state.json`` via ``atomic_write_json``. The
+state survives back-then-forward navigation (the user can re-open the
+wizard, edit a step, and re-finish without resetting prior progress)
+and is the authoritative resume signal on next app launch.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
@@ -52,6 +62,91 @@ from cortex.apps.desktop_shell.tokens import (
     SP8,
 )
 from cortex.libs.config.settings import get_config
+from cortex.libs.utils.atomic_write import atomic_write_json
+from cortex.libs.utils.platform import get_config_dir
+
+logger = logging.getLogger(__name__)
+
+# F49: canonical step identifiers used by ``OnboardingState``. Order
+# matches the four cards rendered in ``OnboardingWindow``.
+ONBOARDING_STEPS: tuple[str, ...] = (
+    "camera",
+    "accessibility",
+    "llm_backend",
+    "extensions",
+)
+
+
+def onboarding_state_path() -> Path:
+    """Resolve the on-disk path for the onboarding completion marker
+    introduced in F49. Lives under :func:`get_config_dir` (not the
+    storage data dir) because it is a system-state record, not a user
+    data artifact."""
+    return get_config_dir() / "onboarding_state.json"
+
+
+@dataclass
+class OnboardingState:
+    """Per-step completion state persisted to
+    ``<config_dir>/onboarding_state.json`` (F49).
+
+    ``completed_steps`` is a set of step identifiers from
+    :data:`ONBOARDING_STEPS`. The wizard marks each step complete after
+    the user successfully advances past it (either by granting a
+    permission, saving a token, or clicking the explicit Get Started
+    button at the end). A subsequent re-entry that toggles a step back
+    to incomplete and forward to complete preserves the rest of the
+    state — no whole-flow reset.
+    """
+
+    completed_steps: set[str] = field(default_factory=set)
+
+    @classmethod
+    def load(cls, path: Path | None = None) -> "OnboardingState":
+        target = path or onboarding_state_path()
+        if not target.exists():
+            return cls()
+        try:
+            payload = json.loads(target.read_text(encoding="utf-8"))
+            steps = payload.get("completed_steps", [])
+            if not isinstance(steps, list):
+                steps = []
+            return cls(completed_steps={str(s) for s in steps})
+        except (OSError, json.JSONDecodeError):
+            logger.warning(
+                "Onboarding state file exists but is unreadable; "
+                "treating as fresh: %s", target, exc_info=True,
+            )
+            return cls()
+
+    def save(self, path: Path | None = None) -> None:
+        target = path or onboarding_state_path()
+        atomic_write_json(
+            target,
+            {
+                "completed_steps": sorted(self.completed_steps),
+                "version": 1,
+            },
+        )
+
+    def mark_complete(self, step: str, *, path: Path | None = None) -> None:
+        """Mark a single step complete and persist via atomic_write_json."""
+        if step not in ONBOARDING_STEPS:
+            raise ValueError(f"unknown onboarding step: {step}")
+        self.completed_steps.add(step)
+        self.save(path=path)
+
+    def mark_incomplete(self, step: str, *, path: Path | None = None) -> None:
+        """Reset a step (user went 'back' to edit it) and persist."""
+        if step not in ONBOARDING_STEPS:
+            raise ValueError(f"unknown onboarding step: {step}")
+        self.completed_steps.discard(step)
+        self.save(path=path)
+
+    @property
+    def is_complete(self) -> bool:
+        """True only when every step in :data:`ONBOARDING_STEPS` is done."""
+        return set(ONBOARDING_STEPS).issubset(self.completed_steps)
 
 _WINDOW_BG = SEMANTIC_LIGHT["window_bg"]
 _CONTROL_BG = SEMANTIC_LIGHT["control_bg"]
@@ -195,6 +290,9 @@ class OnboardingWindow(QWidget):
         self.setMinimumSize(600, 720)
         self.resize(640, 820)
         self.setStyleSheet(f"background: {_WINDOW_BG}; color: {_LABEL};")
+        # F49: durable per-step completion record. Loaded from disk so
+        # a re-entry into the wizard does not lose prior progress.
+        self._onboarding_state = OnboardingState.load()
         self._build_ui()
 
         # Permissions are granted in System Settings out-of-process — there's
@@ -410,9 +508,53 @@ class OnboardingWindow(QWidget):
             "}"
             "QPushButton:hover { background: #333; }"
         )
-        finish_btn.clicked.connect(self.completed.emit)
+        finish_btn.clicked.connect(self._on_finish)
         btn_row.addWidget(finish_btn)
         layout.addLayout(btn_row)
+
+    # ------------------------------------------------------------------
+    # F49: completion-marker hooks
+    # ------------------------------------------------------------------
+
+    def _on_finish(self) -> None:
+        """Click handler for the Get Started button. Persists every step
+        as complete BEFORE re-emitting ``completed`` so a crash between
+        the click and the daemon-launch path does not lose progress."""
+        for step in ONBOARDING_STEPS:
+            try:
+                self._onboarding_state.mark_complete(step)
+            except OSError:
+                # Atomic write failed (disk full, read-only filesystem).
+                # Log but don't block the user from finishing onboarding.
+                logger.warning(
+                    "Failed to persist onboarding step %s", step,
+                    exc_info=True,
+                )
+        self.completed.emit()
+
+    def mark_step_complete(self, step: str) -> None:
+        """Public hook for individual step affordances (camera grant,
+        accessibility grant, BYOK save, Connections panel close) to mark
+        that step complete the moment the user finishes it — independent
+        of whether they click Get Started. F49."""
+        try:
+            self._onboarding_state.mark_complete(step)
+        except (OSError, ValueError):
+            logger.warning(
+                "Failed to mark onboarding step %s complete", step,
+                exc_info=True,
+            )
+
+    def mark_step_incomplete(self, step: str) -> None:
+        """Inverse of :meth:`mark_step_complete` — used when the user
+        navigates 'back' to re-edit a step. F49."""
+        try:
+            self._onboarding_state.mark_incomplete(step)
+        except (OSError, ValueError):
+            logger.warning(
+                "Failed to mark onboarding step %s incomplete", step,
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # Section helpers

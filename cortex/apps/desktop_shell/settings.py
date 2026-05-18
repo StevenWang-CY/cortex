@@ -134,6 +134,11 @@ class SettingsDialog(QWidget):
 
     settings_changed = Signal(dict)
     back_requested = Signal()
+    # F53: surfaced when QSettings.sync() fails (read-only filesystem,
+    # disk full, sandbox container ACL). Controller subscribes and shows
+    # the failure to the user via a toast / dialog rather than letting it
+    # disappear into the prior bare ``except: pass``.
+    settings_save_failed = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -491,15 +496,68 @@ class SettingsDialog(QWidget):
                     pass
 
     def _persist_settings(self, settings: dict) -> None:
+        """Push every setting into QSettings and trigger a sync().
+
+        F53: sync() can fail silently (NoError but no actual on-disk
+        write) on a read-only filesystem, in a sandbox container with a
+        revoked ACL, or with the disk full. Prior code swallowed every
+        exception and the user's "Apply" appeared to succeed even when
+        nothing persisted. Now: catch exceptions explicitly, inspect
+        ``QSettings.status()`` for the error class, and emit
+        ``settings_save_failed(reason)`` so the controller can surface
+        the failure.
+        """
         for key, value in settings.items():
             try:
                 self._qs.setValue(key, value)
             except Exception:
-                pass
+                # Per-key set failures are rare and per-key recoverable;
+                # we continue setting the rest and let the sync() pass
+                # be the canonical failure signal.
+                logger.debug(
+                    "Failed to set QSettings key %s", key, exc_info=True,
+                )
+        reason: str | None = None
         try:
             self._qs.sync()
+        except Exception as exc:
+            reason = f"sync raised: {exc!s}"
+        else:
+            # QSettings.sync() returns void; ``status()`` reports the
+            # last error class. Anything other than NoError counts as a
+            # failed save and must reach the user.
+            try:
+                status = self._qs.status()
+                no_error = getattr(
+                    QSettings.Status, "NoError",
+                    getattr(QSettings, "NoError", 0),
+                )
+                if status != no_error:
+                    reason = self._describe_qsettings_status(status)
+            except Exception:
+                # ``status()`` itself shouldn't raise, but if it does we
+                # have no better signal than the absent sync exception.
+                pass
+
+        if reason is not None:
+            logger.warning("QSettings sync failed: %s", reason)
+            self.settings_save_failed.emit(reason)
+
+    @staticmethod
+    def _describe_qsettings_status(status: object) -> str:
+        """Human-readable name for a QSettings.Status enum value."""
+        try:
+            access = getattr(QSettings.Status, "AccessError", None)
+            fmt = getattr(QSettings.Status, "FormatError", None)
+            if access is not None and status == access:
+                return (
+                    "access denied (read-only filesystem or sandbox ACL)"
+                )
+            if fmt is not None and status == fmt:
+                return "settings file format invalid"
         except Exception:
             pass
+        return f"QSettings status={status!r}"
 
     def _load_persisted_settings(self) -> None:
         def _get_bool(key: str, default: bool) -> bool:

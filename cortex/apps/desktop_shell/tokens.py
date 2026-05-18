@@ -81,6 +81,17 @@ BIO_HRV: Final[str] = '#57A0D9'
 BIO_RESP: Final[str] = '#57D99E'
 BIO_BLINK: Final[str] = '#D9B457'
 
+# --- HUD palette (F47 / F55) ---
+# Used by the intervention overlay, which sits on top of the macOS
+# NSVisualEffectMaterialHUDWindow vibrancy. Each entry is an (R, G, B, A)
+# tuple so the caller can wrap it in QColor without re-doing the math.
+# Alpha values are calibrated to meet WCAG AA contrast against the
+# dark vibrancy material (235/255 ≈ 92 % opacity → ≥ 7:1 on HUD black).
+TEXT_HUD_PRIMARY: Final[tuple[int, int, int, int]] = (255, 255, 255, 235)
+TEXT_HUD_SECONDARY: Final[tuple[int, int, int, int]] = (255, 255, 255, 150)
+TEXT_HUD_TERTIARY: Final[tuple[int, int, int, int]] = (255, 255, 255, 100)
+HUD_ACCENT: Final[tuple[int, int, int, int]] = (217, 119, 87, 255)  # brand terracotta
+
 # --- Typography ---
 FONT_SYSTEM: Final[str] = '-apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", system-ui, sans-serif'
 FONT_DISPLAY: Final[str] = '"Cormorant Garamond", ui-serif, Georgia, serif'

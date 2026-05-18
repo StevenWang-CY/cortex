@@ -232,6 +232,11 @@ class InterventionConfig(BaseModel):
     adaptive_threshold_max: float = 0.95
     dismissal_model_enabled: bool = True
     dismissal_model_threshold: float = 0.6
+    # F48: breathing pacer cadence (inhale, hold, exhale) in seconds.
+    # Default 4-7-8 (Dr. Andrew Weil's relaxation pattern); the overlay's
+    # ``BreathingPacer`` reads this so users with different rhythm
+    # preferences can override without patching the source.
+    breathing_pattern: tuple[int, int, int] = (4, 7, 8)
 
 
 class HandoverConfig(BaseModel):
@@ -350,6 +355,14 @@ class StorageConfig(BaseModel):
     session_retention_days: int = 7
     feature_retention_days: int = 7
     error_retention_days: int = 90
+    # F36: hard ceiling on the cumulative size of ``storage/sessions/*.json``.
+    # When writing a new session report would push the total over budget,
+    # oldest sessions (lowest mtime) are evicted first until the total
+    # drops back under the cap. Default 500 MB roughly corresponds to
+    # 6 months of typical use (1-3 MB per session × ~3 sessions/day).
+    # Set to 0 to evict every existing session before each write — used in
+    # tests as the lowest-bound smoke test of the eviction path.
+    max_total_size_mb: int = 500
 
 
 class DebugConfig(BaseModel):

@@ -59,7 +59,10 @@ from cortex.services.intervention_engine.leetcode_interventions import Intervent
 from cortex.services.intervention_engine.planner import prepare_plan
 from cortex.services.intervention_engine.restore import RestoreManager
 from cortex.services.intervention_engine.snapshot import capture_snapshot
-from cortex.services.janitor.retention import sweep_once as run_retention_sweep
+from cortex.services.janitor.retention import (
+    sweep_once as run_retention_sweep,
+    sweep_once_async as run_retention_sweep_async,
+)
 from cortex.services.kinematics_engine.blink_detector import BlinkDetector
 from cortex.services.kinematics_engine.head_pose import HeadPoseEstimator
 from cortex.services.kinematics_engine.posture import PostureAnalyzer
@@ -87,6 +90,69 @@ from cortex.services.telemetry_engine.window_tracker import WindowTracker
 from cortex.services.throttle.copilot_throttle import CopilotThrottle
 
 logger = logging.getLogger(__name__)
+
+
+def enforce_session_storage_budget(
+    sessions_dir: Path,
+    *,
+    incoming_bytes: int,
+    max_total_size_mb: int,
+) -> int:
+    """Evict oldest session reports until adding ``incoming_bytes``
+    would keep the cumulative size of ``sessions_dir/*.json`` at or
+    under ``max_total_size_mb`` (F36).
+
+    Returns the number of files evicted (0 if the directory is below
+    budget already, > 0 if eviction occurred). ``max_total_size_mb == 0``
+    is a sentinel that evicts every existing session before each write —
+    callers depending on a strict bound use this; tests use it as the
+    lowest-bound smoke test of the eviction path.
+
+    Files are stat-ed once for both size and mtime; oldest mtime is
+    evicted first. The function is a no-op if the directory does not
+    exist or contains no ``.json`` files.
+    """
+    if max_total_size_mb < 0:
+        return 0
+    if not sessions_dir.exists() or not sessions_dir.is_dir():
+        return 0
+
+    budget_bytes = max_total_size_mb * 1024 * 1024
+    entries: list[tuple[float, int, Path]] = []
+    for p in sessions_dir.iterdir():
+        if not p.is_file() or p.suffix != ".json":
+            continue
+        try:
+            stat = p.stat()
+        except OSError:
+            continue
+        entries.append((stat.st_mtime, stat.st_size, p))
+
+    total = sum(size for _mtime, size, _p in entries)
+    if total + incoming_bytes <= budget_bytes:
+        return 0
+
+    # Evict oldest-first until the headroom fits the new write.
+    entries.sort(key=lambda e: e[0])
+    evicted = 0
+    for _mtime, size, path in entries:
+        if total + incoming_bytes <= budget_bytes:
+            break
+        try:
+            path.unlink()
+            total -= size
+            evicted += 1
+        except OSError:
+            logger.warning(
+                "F36 storage budget: could not evict %s", path, exc_info=True
+            )
+    if evicted > 0:
+        logger.info(
+            "F36 storage budget: evicted %d session(s) to make room for "
+            "%d-byte write (cap=%d MB)",
+            evicted, incoming_bytes, max_total_size_mb,
+        )
+    return evicted
 
 
 class _OptimisticInterventionAdapter:
@@ -563,6 +629,13 @@ class CortexDaemon:
             load_or_create_token()
         except Exception:
             logger.warning("Could not provision Cortex auth token", exc_info=True)
+        # F56: register SIGINT/SIGTERM through ``loop.add_signal_handler``
+        # so the handler runs as a regular loop callback rather than
+        # interrupting whatever native frame (numpy, mediapipe, OpenCV)
+        # we happen to be inside. ``signal.signal`` invokes the handler
+        # in the *signal frame*; if that frame is in the middle of a
+        # native extension call it can lead to a segfault on resume.
+        self._install_loop_signal_handlers()
         self._register_services()
         self._input_hooks.start()
         self._window_tracker.start()
@@ -601,6 +674,52 @@ class CortexDaemon:
 
         logger.info("Cortex daemon started (v2.0)")
         await self._shutdown.wait()
+
+    def _install_loop_signal_handlers(self) -> None:
+        """Register SIGINT / SIGTERM via ``loop.add_signal_handler`` so
+        the handler is dispatched as a normal event-loop callback rather
+        than as a true asynchronous-signal interrupt (F56).
+
+        Why this matters: ``signal.signal`` registers a C-level handler
+        that the kernel runs in the signal frame — which on Cortex is
+        almost always somewhere inside numpy / mediapipe / OpenCV native
+        code. Running Python in the signal frame violates the GIL
+        contract those extensions rely on and can segfault on resume.
+        The loop variant defers the callback to the next event-loop
+        tick, so the daemon's Python state is always frame-safe when
+        the handler runs.
+
+        On platforms that don't support ``add_signal_handler`` (Windows
+        Python, some embedded scenarios) we fall back to a no-op and
+        rely on the caller's outer harness (``run_dev.py``,
+        ``main.py``) to provide signal delivery.
+        """
+        import signal as _signal
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Called from a non-async context — nothing to register.
+            return
+        for sig in (_signal.SIGINT, _signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, self._on_signal_received)
+            except (NotImplementedError, RuntimeError, ValueError):
+                # NotImplementedError: Windows.
+                # ValueError: nested asyncio.run reusing a loop without
+                # privileges to install handlers.
+                logger.debug(
+                    "loop.add_signal_handler unsupported for %s; "
+                    "falling back to outer harness",
+                    sig,
+                )
+
+    def _on_signal_received(self) -> None:
+        """Event-loop-safe signal handler. Runs on the asyncio loop
+        thread, not the signal frame, so native extensions complete
+        their current op cleanly before we proceed to shutdown."""
+        logger.info("Shutdown signal received in asyncio loop")
+        self._shutdown.set()
 
     def _request_shutdown(self) -> None:
         """Request process shutdown via SIGTERM (triggers full graceful stop chain)."""
@@ -711,13 +830,27 @@ class CortexDaemon:
                     sessions_dir = (
                         Path(self.config.storage.path).expanduser() / "sessions"
                     )
+                    sessions_dir.mkdir(parents=True, exist_ok=True)
                     session_path = sessions_dir / f"session_{report.session_id}.json"
-                    atomic_write_json(session_path, report.model_dump(mode="json"))
+                    payload = report.model_dump(mode="json")
+                    encoded_bytes = json.dumps(payload, indent=2).encode("utf-8")
+                    # F36: enforce the cumulative-size budget BEFORE writing.
+                    # If existing sessions + the incoming payload would push
+                    # the directory over ``max_total_size_mb``, evict oldest
+                    # first until the new write fits.
+                    enforce_session_storage_budget(
+                        sessions_dir,
+                        incoming_bytes=len(encoded_bytes),
+                        max_total_size_mb=getattr(
+                            self.config.storage, "max_total_size_mb", 500
+                        ),
+                    )
+                    # F02: atomic write so disk-full / SIGKILL mid-write
+                    # does not silently lose the session. The atomic helper
+                    # writes to <path>.tmp, fsyncs, then ``os.replace``s.
+                    atomic_write_json(session_path, payload)
                     logger.info("Wrote session report to %s", session_path)
                 except OSError as exc:
-                    # Disk-full, permission denied, etc. The previous
-                    # on-disk version (if any) survives because the
-                    # atomic write never crossed the rename point.
                     logger.error(
                         "Failed to persist session report at shutdown "
                         "(session_id=%s err=%s); prior file preserved",
@@ -959,8 +1092,10 @@ class CortexDaemon:
             while True:
                 try:
                     storage_root = Path(self.config.storage.path).expanduser()
-                    await asyncio.to_thread(
-                        run_retention_sweep,
+                    # F35: use the chunked async variant so a sweep over
+                    # a large storage root does not starve the state /
+                    # telemetry / broadcast coroutines.
+                    await run_retention_sweep_async(
                         self.config.storage,
                         storage_root=storage_root,
                     )

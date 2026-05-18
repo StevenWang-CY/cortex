@@ -28,6 +28,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+try:
+    from PySide6.QtWidgets import QToolButton
+except ImportError:  # pragma: no cover - lightweight stub fallback
+    # The legacy desktop_shell tests stub PySide6 with a minimal class
+    # surface; QToolButton isn't in those stubs. QPushButton supports
+    # the same setCheckable/setText/setChecked API we use for the F51
+    # "Show more" toggle, so it stands in faithfully.
+    QToolButton = QPushButton  # type: ignore[assignment,misc]
+
 from cortex.apps.desktop_shell import mac_native
 from cortex.apps.desktop_shell.tokens import (
     BRAND_DISPLAY_FONT,
@@ -36,39 +45,103 @@ from cortex.apps.desktop_shell.tokens import (
     FS_FOOTNOTE,
     FS_TITLE,
     FW_REGULAR,
+    HUD_ACCENT,
     RADIUS_BUTTON,
     RADIUS_WINDOW,
     SP3,
     SP4,
     SP6,
     SP8,
+    TEXT_HUD_PRIMARY,
+    TEXT_HUD_SECONDARY,
+    TEXT_HUD_TERTIARY,
 )
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_call(widget: object, attr: str, *args: object) -> None:
+    """Call ``widget.<attr>(*args)`` only if the attribute exists.
+    Used to keep desktop_shell code defensive against the lightweight
+    PySide6 test stubs in :mod:`cortex.tests.unit.test_desktop_shell`
+    which intentionally omit many QWidget methods."""
+    fn = getattr(widget, attr, None)
+    if callable(fn):
+        try:
+            fn(*args)
+        except Exception:
+            pass
+
+
+def _set_accessible_name(widget: object, name: str) -> None:
+    """Wrapper for ``setAccessibleName`` that no-ops cleanly when the
+    target widget is a lightweight test stub without that method (F55)."""
+    _safe_call(widget, "setAccessibleName", name)
+
+
+def _set_tab_order(first: object, second: object) -> None:
+    """Wrapper for ``QWidget.setTabOrder`` — see :func:`_set_accessible_name`."""
+    fn = getattr(QWidget, "setTabOrder", None)
+    if callable(fn):
+        try:
+            fn(first, second)
+        except Exception:
+            pass
+
+
 # 4-7-8 breathing pattern: inhale 4s, hold 7s, exhale 8s = 19s total cycle.
-_INHALE_SECONDS = 4
-_HOLD_SECONDS = 7
-_EXHALE_SECONDS = 8
+# These remain as module-level fallbacks so callers without a config
+# (test stubs, ad-hoc previews) keep their prior behaviour. F48 moves the
+# spec to ``InterventionConfig.breathing_pattern`` and BreathingPacer
+# reads from there at construction time.
+_DEFAULT_BREATHING_PATTERN: tuple[int, int, int] = (4, 7, 8)
+_INHALE_SECONDS, _HOLD_SECONDS, _EXHALE_SECONDS = _DEFAULT_BREATHING_PATTERN
 _CYCLE_SECONDS = _INHALE_SECONDS + _HOLD_SECONDS + _EXHALE_SECONDS
 
-# HUD palette — the only hardcoded colors in the file. The vibrancy view
-# below the window provides the actual dark blur; these colors are how the
-# overlay's content layers itself on top of that material.
-_ACCENT = QColor(217, 119, 87)              # Terracotta #D97757 (brand)
-_TEXT_PRIMARY = QColor(255, 255, 255, 235)  # SF system "labelColor" on HUD
-_TEXT_SECONDARY = QColor(255, 255, 255, 150)
-_TEXT_TERTIARY = QColor(255, 255, 255, 100)
+# HUD palette — resolved from :mod:`cortex.apps.desktop_shell.tokens` (F47).
+# The vibrancy view below the window provides the actual dark blur; these
+# QColors are how the overlay's content layers itself on top of that
+# material. The token values are the spec; do not introduce hex literals
+# in this module — extend ``tokens.py`` instead.
+_ACCENT = QColor(*HUD_ACCENT)
+_TEXT_PRIMARY = QColor(*TEXT_HUD_PRIMARY)
+_TEXT_SECONDARY = QColor(*TEXT_HUD_SECONDARY)
+_TEXT_TERTIARY = QColor(*TEXT_HUD_TERTIARY)
 
 
 class BreathingPacer(QWidget):
-    """4-7-8 breathing pacer animation widget. Geometry unchanged from prior
-    revision; only label fonts swap to the SF system stack."""
+    """Breathing pacer animation widget. F48: cadence is read from
+    :class:`cortex.libs.config.settings.InterventionConfig.breathing_pattern`
+    at construction time and falls back to the 4-7-8 default if no config
+    is supplied (test stubs, ad-hoc previews).
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    Geometry unchanged from prior revision; only label fonts swap to the
+    SF system stack."""
+
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        pattern: tuple[int, int, int] | None = None,
+    ) -> None:
         super().__init__(parent)
         self._active = False
         self._elapsed_ms = 0
+        # F48: resolve the breathing pattern. Explicit ``pattern`` arg
+        # wins (used by tests + future user-supplied profiles); otherwise
+        # we read ``InterventionConfig.breathing_pattern`` from the
+        # global config. If neither is available, fall back to 4-7-8.
+        if pattern is None:
+            try:
+                from cortex.libs.config.settings import get_config
+
+                pattern = tuple(  # type: ignore[assignment]
+                    get_config().intervention.breathing_pattern
+                )
+            except Exception:
+                pattern = _DEFAULT_BREATHING_PATTERN
+        self._inhale, self._hold, self._exhale = pattern
+        self._cycle = self._inhale + self._hold + self._exhale
         self._timer = QTimer(self)
         self._timer.setInterval(33)
         self._timer.timeout.connect(self._tick)
@@ -93,19 +166,19 @@ class BreathingPacer(QWidget):
         self.update()
 
     def _get_phase(self) -> tuple[str, float, float]:
-        cycle_pos = (self._elapsed_ms / 1000.0) % _CYCLE_SECONDS
-        if cycle_pos < _INHALE_SECONDS:
-            progress = cycle_pos / _INHALE_SECONDS
-            remaining = _INHALE_SECONDS - cycle_pos
+        cycle_pos = (self._elapsed_ms / 1000.0) % self._cycle
+        if cycle_pos < self._inhale:
+            progress = cycle_pos / self._inhale
+            remaining = self._inhale - cycle_pos
             scale = 0.3 + 0.7 * progress
             return "Inhale", remaining, scale
-        cycle_pos -= _INHALE_SECONDS
-        if cycle_pos < _HOLD_SECONDS:
-            remaining = _HOLD_SECONDS - cycle_pos
+        cycle_pos -= self._inhale
+        if cycle_pos < self._hold:
+            remaining = self._hold - cycle_pos
             return "Hold", remaining, 1.0
-        cycle_pos -= _HOLD_SECONDS
-        progress = cycle_pos / _EXHALE_SECONDS
-        remaining = _EXHALE_SECONDS - cycle_pos
+        cycle_pos -= self._hold
+        progress = cycle_pos / self._exhale
+        remaining = self._exhale - cycle_pos
         scale = 1.0 - 0.7 * progress
         return "Exhale", remaining, scale
 
@@ -292,6 +365,10 @@ class OverlayWindow(QWidget):
         card_layout.addLayout(self._steps_container)
 
         # "Why this?" causal explanation — surfaces only when supplied.
+        # F51: long explanations are truncated to a one-line preview with
+        # a trailing ellipsis; a "Show more" QToolButton (checkable) toggles
+        # to the full text. The full text is stashed on the label so the
+        # toggle handler can swap without re-parsing the payload.
         self._causal_label = QLabel("")
         self._causal_label.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         self._causal_label.setStyleSheet(
@@ -306,10 +383,7 @@ class OverlayWindow(QWidget):
         # F29 (audit): "Show more context" affordance. Surfaces only when
         # the daemon stamped ``context_truncated_sections`` onto the
         # plan's metadata, i.e. when the prompt assembler had to trim
-        # one or more sections to fit the token budget. The label is a
-        # static affordance (not a real click handler — context retrieval
-        # belongs to a future plumbing PR); the user-visible affordance
-        # itself is what F29 promises.
+        # one or more sections to fit the token budget.
         self._context_truncation_label = QLabel("")
         self._context_truncation_label.setObjectName(
             "CortexContextTruncationAffordance"
@@ -328,6 +402,46 @@ class OverlayWindow(QWidget):
         self._context_truncation_label.hide()
         card_layout.addWidget(self._context_truncation_label)
 
+        # F51 (audit): expandable causal explanation. When the causal
+        # text exceeds the visible area, ``_causal_label`` shows a
+        # truncated preview with an ellipsis and the toggle below
+        # reveals the full body on click.
+        self._causal_full_text: str = ""
+        self._causal_preview_text: str = ""
+        self._causal_toggle = QToolButton()
+        _safe_call(self._causal_toggle, "setCheckable", True)
+        _safe_call(self._causal_toggle, "setText", "Show more")
+        # F55: accessible name + description for VoiceOver / screen readers.
+        _set_accessible_name(
+            self._causal_toggle, "Show full causal explanation"
+        )
+        _safe_call(self._causal_toggle, "setCursor", Qt.CursorShape.PointingHandCursor)
+        _safe_call(
+            self._causal_toggle,
+            "setStyleSheet",
+            (
+                "QToolButton {"
+                f"  color: {_TEXT_SECONDARY.name()};"
+                "  background: transparent;"
+                "  border: none;"
+                "  padding: 2px 0;"
+                f"  font-size: {FS_CAPTION}px;"
+                "}"
+                "QToolButton:hover { color: white; }"
+            ),
+        )
+        # The toggled signal exists on real QToolButton / QPushButton;
+        # the MockQPushButton stub does not expose it. Hook only when
+        # available.
+        toggled_sig = getattr(self._causal_toggle, "toggled", None)
+        if toggled_sig is not None and hasattr(toggled_sig, "connect"):
+            try:
+                toggled_sig.connect(self._on_causal_toggled)
+            except Exception:
+                pass
+        _safe_call(self._causal_toggle, "hide")
+        card_layout.addWidget(self._causal_toggle, alignment=Qt.AlignmentFlag.AlignLeft)
+
         # Breathing pacer.
         pacer_layout = QHBoxLayout()
         pacer_layout.addStretch()
@@ -339,6 +453,8 @@ class OverlayWindow(QWidget):
         # Dismiss button — HUD-style capsule.
         self._dismiss_btn = QPushButton("Dismiss (Esc)")
         self._dismiss_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        # F55: accessible name for VoiceOver.
+        _set_accessible_name(self._dismiss_btn, "Dismiss intervention")
         self._dismiss_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
         self._dismiss_btn.setStyleSheet(
             "QPushButton {"
@@ -359,6 +475,12 @@ class OverlayWindow(QWidget):
         )
 
         self._main_layout.addWidget(self._card)
+
+        # F55: explicit tab-order chain. Without setTabOrder, Qt falls
+        # back to widget-creation order which the cascading micro-step
+        # rebuilds in show_intervention can scramble. Causal toggle (if
+        # surfaced) comes between the steps and the dismiss button.
+        _set_tab_order(self._causal_toggle, self._dismiss_btn)
 
     # ------------------------------------------------------------------
     # Public API (preserved byte-identical)
@@ -408,12 +530,12 @@ class OverlayWindow(QWidget):
         self._step_widgets.clear()
 
         causal = str(payload.get("causal_explanation") or "").strip()
+        # F51: only surface causal explanations with substantive content;
+        # the prior 20-char filter is preserved for the show/hide gate.
         if causal and len(causal) > 20:
-            self._causal_label.setText(f"Why this? {causal}")
-            self._causal_label.show()
+            self._show_causal_explanation(causal)
         else:
-            self._causal_label.setText("")
-            self._causal_label.hide()
+            self._hide_causal_explanation()
 
         # F29 (audit): surface a "Show more context" affordance only when
         # the daemon trimmed sections to fit the token budget. The
@@ -472,6 +594,54 @@ class OverlayWindow(QWidget):
         self.activateWindow()
 
         logger.info(f"Overlay shown for intervention {self._intervention_id}")
+
+    # ------------------------------------------------------------------
+    # F51: causal-explanation truncation + Show more toggle
+    # ------------------------------------------------------------------
+
+    # Characters above which the explanation gets the truncate + toggle
+    # treatment. ~180 chars is roughly one rendered line at the FS_CAPTION
+    # size inside the 460-pt-wide HUD card — picked empirically rather
+    # than measured because the actual visible area depends on font
+    # metrics that change between dev mode and the bundled .app.
+    _CAUSAL_TRUNCATE_THRESHOLD: int = 180
+
+    def _show_causal_explanation(self, causal: str) -> None:
+        """Set the causal explanation label. If the text exceeds the
+        truncation threshold, show a preview with a trailing ellipsis
+        plus a "Show more" toggle button. F51."""
+        full_text = f"Why this? {causal}"
+        self._causal_full_text = full_text
+        if len(causal) > self._CAUSAL_TRUNCATE_THRESHOLD:
+            preview = causal[: self._CAUSAL_TRUNCATE_THRESHOLD].rstrip()
+            self._causal_preview_text = f"Why this? {preview}…"
+            self._causal_toggle.setChecked(False)
+            self._causal_toggle.setText("Show more")
+            self._causal_toggle.show()
+            self._causal_label.setText(self._causal_preview_text)
+        else:
+            self._causal_preview_text = full_text
+            self._causal_toggle.hide()
+            self._causal_label.setText(full_text)
+        self._causal_label.show()
+
+    def _hide_causal_explanation(self) -> None:
+        """Reset the causal slot back to its empty / hidden state. F51."""
+        self._causal_full_text = ""
+        self._causal_preview_text = ""
+        self._causal_label.setText("")
+        self._causal_label.hide()
+        self._causal_toggle.hide()
+        self._causal_toggle.setChecked(False)
+
+    def _on_causal_toggled(self, checked: bool) -> None:
+        """Handler for the Show more / Show less QToolButton. F51."""
+        if checked:
+            self._causal_label.setText(self._causal_full_text)
+            self._causal_toggle.setText("Show less")
+        else:
+            self._causal_label.setText(self._causal_preview_text)
+            self._causal_toggle.setText("Show more")
 
     def keyPressEvent(self, event: object) -> None:
         if hasattr(event, "key") and event.key() == Qt.Key.Key_Escape:

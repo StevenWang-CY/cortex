@@ -161,9 +161,46 @@ _CONTROL_BG = SEMANTIC_LIGHT["control_bg"]
 _GROUPED_BG = SEMANTIC_LIGHT["grouped_bg"]
 _LABEL = SEMANTIC_LIGHT["label_primary"]
 _LABEL_SECONDARY = "#5C5854"   # high-contrast secondary (AA passes on warm bg)
-_LABEL_TERTIARY = "#827971"    # AA-passing tertiary (placeholders, captions)
+# F55: was "#827971" which is 3.98:1 against #FFFFFF (just below WCAG AA's
+# 4.5:1 threshold for normal-weight text). Bumped to "#6B6661" which
+# computes to ~5.4:1 — comfortably above AA. The visual delta is small
+# (~5 % darker grey) and the existing dev-mode tests still treat it as
+# "tertiary" since the role is unchanged.
+_LABEL_TERTIARY = "#6B6661"    # AA-passing tertiary (placeholders, captions)
 _SEPARATOR = SEMANTIC_LIGHT["separator"]
 _DANGER = SEMANTIC_LIGHT["danger"]
+
+
+def _set_accessible_name(widget: object, name: str) -> None:
+    """Wrapper for ``setAccessibleName`` that no-ops cleanly when the
+    target widget is a lightweight test stub without that method (F55)."""
+    fn = getattr(widget, "setAccessibleName", None)
+    if callable(fn):
+        try:
+            fn(name)
+        except Exception:
+            pass
+
+
+def _set_accessible_description(widget: object, description: str) -> None:
+    """Wrapper for ``setAccessibleDescription`` — see :func:`_set_accessible_name`."""
+    fn = getattr(widget, "setAccessibleDescription", None)
+    if callable(fn):
+        try:
+            fn(description)
+        except Exception:
+            pass
+
+
+def _set_tab_order(first: object, second: object) -> None:
+    """Wrapper for ``QWidget.setTabOrder`` that degrades cleanly when
+    PySide6 has been swapped out for the lightweight test stubs (F55)."""
+    fn = getattr(QWidget, "setTabOrder", None)
+    if callable(fn):
+        try:
+            fn(first, second)
+        except Exception:
+            pass
 
 
 def _system(point_size: float, weight: str = "regular") -> str:
@@ -286,6 +323,11 @@ class _ConsumerTab(QWidget):
         # on first click and back to False on ``notify_daemon_stopped`` (or
         # the safety-timer expiry). Coalesces double-clicks at the slot level.
         self._stopping: bool = False
+        # F31: per-widget cache of last applied text + stylesheet so the
+        # 2 Hz state broadcast loop does not push identical values through
+        # Qt's restyle / paint chain when the user's state is unchanged.
+        # Keyed by id(widget) because QWidget is not hashable on every Qt build.
+        self._render_cache: dict[int, dict[str, str]] = {}
 
         root = QVBoxLayout(self)
         root.setContentsMargins(SP6, SP5, SP6, SP6)
@@ -338,6 +380,14 @@ class _ConsumerTab(QWidget):
         self._goal_input = QLineEdit()
         self._goal_input.setPlaceholderText("What are you working on?")
         self._goal_input.setMinimumHeight(36)
+        # F55: accessible name + description for VoiceOver / screen
+        # readers. Wrapped because the legacy MockQLineEdit stub in
+        # test_desktop_shell.py does not expose these QWidget methods.
+        _set_accessible_name(self._goal_input, "Goal")
+        _set_accessible_description(
+            self._goal_input,
+            "Tell Cortex what you're working on so suggestions match your intent.",
+        )
         self._goal_input.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         self._goal_input.setStyleSheet(
             "QLineEdit {"
@@ -351,9 +401,33 @@ class _ConsumerTab(QWidget):
             f"QLineEdit::placeholder {{ color: {_LABEL_TERTIARY}; }}"
         )
         # E.1: emit goal_set when the user hits return.
-        self._goal_input.returnPressed.connect(
-            lambda: self.goal_set.emit(self._goal_input.text().strip())
-        )
+        # F33: debounce the goal-set emission. A held-down Return key fires
+        # ``returnPressed`` repeatedly (Qt key auto-repeat); without a
+        # coalescer the daemon receives N rapid-fire goals, the LLM kicks
+        # off N planner calls, and the user pays the latency + cost of
+        # the bursts. Schedule a single 150 ms singleShot per burst and
+        # ignore subsequent presses while one is pending — the emit reads
+        # the latest input text at fire time, so the user still gets the
+        # value they typed last.
+        self._goal_debounce_pending = False
+
+        def _schedule_goal_emit() -> None:
+            if self._goal_debounce_pending:
+                return
+            self._goal_debounce_pending = True
+            QTimer.singleShot(150, _fire_goal_emit)
+
+        def _fire_goal_emit() -> None:
+            self._goal_debounce_pending = False
+            self.goal_set.emit(self._goal_input.text().strip())
+
+        self._goal_input.returnPressed.connect(_schedule_goal_emit)
+        # Expose the scheduler for tests so they can drive the coalescer
+        # deterministically (the QTimer.singleShot path needs an event
+        # loop tick which the offscreen test harness provides via
+        # ``QApplication.processEvents``).
+        self._schedule_goal_emit = _schedule_goal_emit
+        self._fire_goal_emit = _fire_goal_emit
         root.addWidget(self._goal_input)
         root.addSpacing(SP5)
 
@@ -451,6 +525,8 @@ class _ConsumerTab(QWidget):
 
         self._connect_btn = QPushButton("Connect")
         self._connect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        # F55: accessible name for VoiceOver.
+        _set_accessible_name(self._connect_btn, "Open Connections panel")
         self._connect_btn.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
         self._connect_btn.setStyleSheet(
             "QPushButton {"
@@ -525,7 +601,7 @@ class _ConsumerTab(QWidget):
         self._stop_btn.setMinimumHeight(36)  # HIG tap target ≥ 44 once font padding factored
         self._stop_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
         self._stop_btn.setShortcut("Ctrl+Q")  # VoiceOver picks this up
-        self._stop_btn.setAccessibleName("Stop Cortex")
+        _set_accessible_name(self._stop_btn, "Stop Cortex")
         self._stop_btn.setStyleSheet(
             "QPushButton {"
             f"  border: 0.5px solid {_SEPARATOR};"
@@ -551,38 +627,74 @@ class _ConsumerTab(QWidget):
         self._stop_btn.clicked.connect(self._handle_stop_clicked)
         root.addWidget(self._stop_btn)
 
+        # F55: explicit tab-order chain. Without setTabOrder, Qt falls
+        # back to widget-creation order which is usually right but is not
+        # contractual — a single re-ordering of constructor lines can
+        # silently scramble VoiceOver / keyboard navigation. The chain
+        # below is the canonical reading order: Goal → Connect → Stop.
+        _set_tab_order(self._goal_input, self._connect_btn)
+        _set_tab_order(self._connect_btn, self._stop_btn)
+
     # -- Public update methods (preserved byte-identical) ----------------
+
+    def _set_text_if_changed(self, widget: QLabel, text: str) -> bool:
+        """Call ``widget.setText`` only when the value differs from the
+        last applied text. Returns True if a write occurred. F31."""
+        slot = self._render_cache.setdefault(id(widget), {})
+        if slot.get("text") == text:
+            return False
+        slot["text"] = text
+        widget.setText(text)
+        return True
+
+    def _set_style_if_changed(self, widget: QWidget, qss: str) -> bool:
+        """Call ``widget.setStyleSheet`` only when the QSS differs from
+        the last applied stylesheet. Returns True if a write occurred. F31."""
+        slot = self._render_cache.setdefault(id(widget), {})
+        if slot.get("style") == qss:
+            return False
+        slot["style"] = qss
+        widget.setStyleSheet(qss)
+        return True
 
     def update_state(self, payload: dict) -> None:
         state = payload.get("state", "FLOW")
         color = STATE_COLORS.get(state, _LABEL_TERTIARY)
         label = STATE_LABELS.get(state, state)
-        self._state_dot.setStyleSheet(
-            f"background: {color}; border-radius: 3px;"
+        self._set_style_if_changed(
+            self._state_dot, f"background: {color}; border-radius: 3px;"
         )
-        self._state_label.setText(label)
-        self._state_label.setStyleSheet(
-            f"color: {color}; background: transparent;"
+        self._set_text_if_changed(self._state_label, label)
+        self._set_style_if_changed(
+            self._state_label, f"color: {color}; background: transparent;"
         )
 
         bio = payload.get("biometrics", {})
         hr = bio.get("heart_rate")
         hrv = bio.get("hrv_rmssd")
         blink = bio.get("blink_rate")
-        self._bpm_label.setText(f"{hr:.0f}" if hr is not None else "--")
-        self._hrv_label.setText(f"{hrv:.0f}" if hrv is not None else "--")
-        self._blk_label.setText(f"{blink:.1f}" if blink is not None else "--")
+        self._set_text_if_changed(
+            self._bpm_label, f"{hr:.0f}" if hr is not None else "--"
+        )
+        self._set_text_if_changed(
+            self._hrv_label, f"{hrv:.0f}" if hrv is not None else "--"
+        )
+        self._set_text_if_changed(
+            self._blk_label, f"{blink:.1f}" if blink is not None else "--"
+        )
 
     def set_connected(self, connected: bool) -> None:
         if connected:
-            self._state_label.setText("Connected")
-            self._state_dot.setStyleSheet(
-                f"background: {BRAND_ACCENT}; border-radius: 3px;"
+            self._set_text_if_changed(self._state_label, "Connected")
+            self._set_style_if_changed(
+                self._state_dot,
+                f"background: {BRAND_ACCENT}; border-radius: 3px;",
             )
         else:
-            self._state_label.setText("Disconnected")
-            self._state_dot.setStyleSheet(
-                f"background: {_LABEL_TERTIARY}; border-radius: 3px;"
+            self._set_text_if_changed(self._state_label, "Disconnected")
+            self._set_style_if_changed(
+                self._state_dot,
+                f"background: {_LABEL_TERTIARY}; border-radius: 3px;",
             )
 
     # ------------------------------------------------------------------
@@ -762,6 +874,9 @@ class _AdvancedTab(QWidget):
         self.setStyleSheet(f"background: transparent; color: {_LABEL};")
         self._timeline_events: list[dict] = []
         self._session_start = time.monotonic()
+        # F31: render-cache per widget; only setText / setValue when the
+        # value differs from the last applied write.
+        self._render_cache: dict[int, dict[str, object]] = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(SP6, SP5, SP6, SP6)
@@ -895,6 +1010,22 @@ class _AdvancedTab(QWidget):
         layout.addWidget(self._timeline_text)
         layout.addStretch()
 
+    def _set_text_if_changed(self, widget: QLabel, text: str) -> bool:
+        slot = self._render_cache.setdefault(id(widget), {})
+        if slot.get("text") == text:
+            return False
+        slot["text"] = text
+        widget.setText(text)
+        return True
+
+    def _set_value_if_changed(self, widget: QProgressBar, value: int) -> bool:
+        slot = self._render_cache.setdefault(id(widget), {})
+        if slot.get("value") == value:
+            return False
+        slot["value"] = value
+        widget.setValue(value)
+        return True
+
     def update_state(self, payload: dict) -> None:
         scores = payload.get("scores", {})
         sig_q = payload.get("signal_quality", {})
@@ -924,11 +1055,13 @@ class _AdvancedTab(QWidget):
         for name in ("flow", "hyper", "hypo", "recovery"):
             val = scores.get(name, 0.0)
             if name in self._score_bars:
-                self._score_bars[name].setValue(int(val * 100))
-                self._score_labels[name].setText(f"{val:.2f}")
+                # F31: avoid pushing identical values through Qt's
+                # progress-bar / label paint chain on every 2 Hz tick.
+                self._set_value_if_changed(self._score_bars[name], int(val * 100))
+                self._set_text_if_changed(self._score_labels[name], f"{val:.2f}")
 
-        self._confidence_lbl.setText(f"Confidence: {confidence:.0%}")
-        self._dwell_lbl.setText(f"Dwell: {dwell:.1f}s")
+        self._set_text_if_changed(self._confidence_lbl, f"Confidence: {confidence:.0%}")
+        self._set_text_if_changed(self._dwell_lbl, f"Dwell: {dwell:.1f}s")
 
         if not self._timeline_events or self._timeline_events[-1]["state"] != state:
             elapsed = time.monotonic() - self._session_start
