@@ -52,11 +52,16 @@ class _FakeSocket:
 
 def _make_server_with_fakes(client_specs: list[float]) -> WebSocketServer:
     """Construct a ``WebSocketServer`` with N fake clients. ``client_specs``
-    is a list of per-client send delays in seconds."""
+    is a list of per-client send delays in seconds. Each fake client is
+    marked ``authenticated=True`` because Debt-2 systemic auth filters
+    pending-auth peers out of the broadcast set; the Phase I throughput
+    contract under test assumes legitimately-connected clients."""
     server = WebSocketServer()
     for idx, delay in enumerate(client_specs):
         sock = _FakeSocket(delay_s=delay)
-        client = WebSocketClient(client_id=f"fake_{idx}", websocket=sock)
+        client = WebSocketClient(
+            client_id=f"fake_{idx}", websocket=sock, authenticated=True
+        )
         server._clients[client.client_id] = client
     return server
 
