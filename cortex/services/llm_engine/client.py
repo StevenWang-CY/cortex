@@ -170,6 +170,12 @@ def build_fallback_plan(context: TaskContext | None = None) -> InterventionPlan:
         tone="supportive",
         tab_recommendations=tab_recs,
         suggested_actions=actions,
+        # F27: every rule-based plan is stamped so the overlay can
+        # surface "offline mode" and the dismissal model can skip the
+        # outcome. Callers may overwrite ``fallback_reason`` with a
+        # more specific value (``circuit_open``, ``retries_exhausted``,
+        # ``budget_killed``); the base plan is always labelled.
+        metadata={"source": "fallback", "fallback_reason": "rule_based"},
     )
 
 

@@ -235,6 +235,27 @@ class OverlayWindow(QWidget):
         self._headline.setAlignment(Qt.AlignmentFlag.AlignCenter)
         card_layout.addWidget(self._headline)
 
+        # F27 (audit): fallback / offline-mode hint. Shown only when the
+        # plan was produced by the rule-based fallback path (LLM circuit
+        # open, retries exhausted, or daily budget killed). Placed
+        # directly below the headline so the user sees the degradation
+        # before they read the rest. Distinct widget below the headline
+        # is intentional — coordinates with the F29 truncation affordance
+        # which lands next to the causal explanation.
+        self._fallback_hint = QLabel("")
+        self._fallback_hint.setFont(
+            mac_native.system_font(FS_CAPTION, "medium")
+        )
+        self._fallback_hint.setStyleSheet(
+            "color: rgba(255, 224, 178, 0.85);"  # warm amber for "degraded"
+            "background: transparent;"
+        )
+        self._fallback_hint.setObjectName("CortexOverlayFallbackHint")
+        self._fallback_hint.setWordWrap(True)
+        self._fallback_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._fallback_hint.hide()
+        card_layout.addWidget(self._fallback_hint)
+
         # Situation summary — SF system, FN-size, secondary alpha.
         self._summary = QLabel("")
         self._summary.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
@@ -323,6 +344,33 @@ class OverlayWindow(QWidget):
         self._focus_label.setText(
             f"Focus: {payload.get('primary_focus', '')}"
         )
+
+        # F27 (audit): show the offline-mode hint when the daemon
+        # stamped ``metadata["source"] = "fallback"``. Hide otherwise so
+        # successful LLM plans look identical to before.
+        metadata = payload.get("metadata") or {}
+        if (
+            isinstance(metadata, dict)
+            and metadata.get("source") == "fallback"
+        ):
+            reason = str(metadata.get("fallback_reason") or "")
+            if reason == "budget_killed":
+                hint = (
+                    "Cortex offline mode — daily AI budget reached; "
+                    "using rule-based suggestions."
+                )
+            elif reason == "circuit_open":
+                hint = (
+                    "Cortex offline mode — Claude unreachable; "
+                    "using rule-based suggestions."
+                )
+            else:
+                hint = "Cortex offline mode — using rule-based suggestions."
+            self._fallback_hint.setText(hint)
+            self._fallback_hint.show()
+        else:
+            self._fallback_hint.clear()
+            self._fallback_hint.hide()
 
         for cb in self._step_widgets:
             self._steps_container.removeWidget(cb)

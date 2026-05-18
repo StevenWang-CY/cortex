@@ -47,6 +47,7 @@ from cortex.libs.llm.anthropic_client import (
 )
 from cortex.libs.llm.pricing import usd_cost
 from cortex.libs.logging.correlation import get_correlation_id
+from cortex.libs.logging.structured import EventType
 from cortex.libs.schemas.context import TaskContext
 from cortex.libs.schemas.intervention import (
     InterventionPlan,
@@ -356,12 +357,30 @@ class AnthropicPlanner:
                 get_correlation_id() or "-",
             )
             killed = build_fallback_plan(context)
+            killed.metadata["fallback_reason"] = "budget_killed"
             killed.metadata["budget_killed"] = True
             return killed
 
         if not self._circuit.allow(now_mono):
-            logger.warning("LLM circuit open; serving deterministic fallback")
-            return build_fallback_plan(context)
+            # F27: surface the fact that this plan came from the rule-
+            # based fallback path, not the LLM. ``build_fallback_plan``
+            # already stamps ``source=fallback``; we overwrite
+            # ``fallback_reason`` with the specific cause so the overlay
+            # / dashboard can present it. ``LLM_FALLBACK`` is emitted
+            # so an aggregator can count breaker openings without
+            # parsing the warning-text format.
+            logger.warning(
+                "LLM circuit open; serving deterministic fallback (cid=%s)",
+                get_correlation_id() or "-",
+            )
+            logger.info(
+                "%s reason=circuit_open cid=%s",
+                EventType.LLM_FALLBACK.value,
+                get_correlation_id() or "-",
+            )
+            fallback = build_fallback_plan(context)
+            fallback.metadata["fallback_reason"] = "circuit_open"
+            return fallback
 
         tier = self._select_tier(template_name)
         model_id = self._models[tier]
@@ -518,11 +537,20 @@ class AnthropicPlanner:
             return enriched
 
         # All retries exhausted → deterministic fallback.
+        # F27: stamp metadata so the overlay can surface "offline mode"
+        # and so dismissal-model training can exclude fallback outcomes.
         logger.warning(
             "LLM call exhausted retries for template=%s; using fallback",
             template_name,
         )
-        return build_fallback_plan(context)
+        logger.info(
+            "%s reason=retries_exhausted cid=%s",
+            EventType.LLM_FALLBACK.value,
+            get_correlation_id() or "-",
+        )
+        fallback = build_fallback_plan(context)
+        fallback.metadata["fallback_reason"] = "retries_exhausted"
+        return fallback
 
     # ------------------------------------------------------------------
     # F20: cost accounting helper

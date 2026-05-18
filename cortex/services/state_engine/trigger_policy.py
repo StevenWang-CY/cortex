@@ -76,6 +76,24 @@ class DismissalEvent:
 
 
 @dataclass(frozen=True)
+class Outcome:
+    """Structured outcome record passed to :meth:`TriggerPolicy.record_outcome`.
+
+    Carries the F27 ``is_fallback_origin`` flag so the dismissal model
+    can exclude rule-based-fallback outcomes from training. Without the
+    flag, a user dismissing a generic fallback plan during a Bedrock
+    outage would push the dismissal model toward "no plans wanted",
+    making real LLM plans harder to fire once Bedrock recovered.
+    """
+
+    dismissed: bool
+    confidence: float = 0.0
+    context_complexity: float = 0.0
+    typing_burst_seconds: float = 0.0
+    is_fallback_origin: bool = False
+
+
+@dataclass(frozen=True)
 class TriggerDecision:
     """Result of trigger policy evaluation."""
 
@@ -455,12 +473,35 @@ class TriggerPolicy:
         confidence: float = 0.0,
         context_complexity: float = 0.0,
         typing_burst_seconds: float = 0.0,
+        is_fallback_origin: bool = False,
     ) -> None:
-        """Update adaptive thresholding and dismissal model with user feedback."""
+        """Update adaptive thresholding and dismissal model with user feedback.
+
+        F27: when ``is_fallback_origin`` is true the outcome came from a
+        rule-based fallback plan (circuit-breaker open, retries
+        exhausted, or budget kill). We skip the logistic-regression
+        update so a Bedrock outage cannot poison the personalisation
+        layer with "user dismissed a generic plan" labels. The aggregate
+        approval/dismissal counters still tick so quiet-mode escalation
+        and adaptive threshold feedback still see the user behaviour.
+        """
         if dismissed:
             self._dismissals_total += 1
         else:
             self._approvals_total += 1
+
+        # F27: a fallback-origin outcome is real user behaviour that the
+        # quiet-mode counter and adaptive threshold should reflect, but
+        # it must NOT teach the dismissal model — the generic plan is
+        # not representative of what the LLM would have proposed.
+        if is_fallback_origin:
+            logger.debug(
+                "record_outcome: skipping dismissal-model update for "
+                "fallback-origin outcome (dismissed=%s)",
+                dismissed,
+            )
+            return
+
         self._dismissal_outcomes += 1
 
         # Online logistic update (very small-step SGD).
