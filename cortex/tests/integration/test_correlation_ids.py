@@ -95,10 +95,16 @@ async def test_broadcast_stamps_active_correlation_id_on_outgoing_message() -> N
             sent_payloads.append(raw)
 
     fake = _FakeWebSocket()
+    # Debt-2: clients must be authenticated for ``_broadcast`` to send.
     server._clients["fake"] = type(
         "C",
         (),
-        {"websocket": fake, "client_type": "test", "client_id": "fake"},
+        {
+            "websocket": fake,
+            "client_type": "test",
+            "client_id": "fake",
+            "authenticated": True,
+        },
     )()
 
     msg = WSMessage(type="STATE_UPDATE", payload={"state": "FLOW"})
@@ -127,7 +133,12 @@ async def test_broadcast_preserves_caller_supplied_id() -> None:
     server._clients["fake"] = type(
         "C",
         (),
-        {"websocket": _FakeWebSocket(), "client_type": "test", "client_id": "fake"},
+        {
+            "websocket": _FakeWebSocket(),
+            "client_type": "test",
+            "client_id": "fake",
+            "authenticated": True,
+        },
     )()
 
     msg = WSMessage(

@@ -686,10 +686,13 @@ class TestWebSocketServer:
                 self.sent.append(raw)
 
         socket = _MockSocket()
+        # Debt-2: ``_broadcast`` skips unauthenticated clients; this test
+        # is about restore broadcast, not the AUTH handshake.
         server._clients["c1"] = WebSocketClient(
             client_id="c1",
             websocket=socket,
             client_type="desktop",
+            authenticated=True,
         )
 
         count = await server.send_restore("int_123", user_action="dismissed")

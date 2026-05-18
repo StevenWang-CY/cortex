@@ -69,7 +69,10 @@ async def test_slow_client_receives_close_frame_and_is_removed(monkeypatch):
     server = WebSocketServer()
     slow_ws = _SlowSocket()
     client = WebSocketClient(
-        client_id="c-slow", websocket=slow_ws, client_type="chrome"
+        client_id="c-slow",
+        websocket=slow_ws,
+        client_type="chrome",
+        authenticated=True,
     )
     server._clients["c-slow"] = client
 
@@ -114,11 +117,16 @@ async def test_healthy_client_unaffected_by_slow_peer():
     server = WebSocketServer()
     slow_ws = _SlowSocket()
     healthy_ws = _HealthySocket()
+    # Debt-2: clients participate in broadcast only after AUTH; mark
+    # both authenticated since this test is about slow-consumer
+    # disconnect, not the auth handshake.
     server._clients["c-slow"] = WebSocketClient(
-        client_id="c-slow", websocket=slow_ws, client_type="chrome"
+        client_id="c-slow", websocket=slow_ws,
+        client_type="chrome", authenticated=True,
     )
     server._clients["c-fast"] = WebSocketClient(
-        client_id="c-fast", websocket=healthy_ws, client_type="vscode"
+        client_id="c-fast", websocket=healthy_ws,
+        client_type="vscode", authenticated=True,
     )
 
     sent = await server._broadcast(
@@ -139,7 +147,8 @@ async def test_reconnection_cycle_after_slow_close():
     server = WebSocketServer()
     slow_ws = _SlowSocket()
     server._clients["c1"] = WebSocketClient(
-        client_id="c1", websocket=slow_ws, client_type="chrome"
+        client_id="c1", websocket=slow_ws,
+        client_type="chrome", authenticated=True,
     )
     await server._broadcast(WSMessage(type="STATE_UPDATE", payload={}))
     assert "c1" not in server._clients
@@ -149,7 +158,8 @@ async def test_reconnection_cycle_after_slow_close():
     # Now simulate reconnection — fresh client, fresh socket.
     new_ws = _HealthySocket()
     server._clients["c1"] = WebSocketClient(
-        client_id="c1", websocket=new_ws, client_type="chrome"
+        client_id="c1", websocket=new_ws,
+        client_type="chrome", authenticated=True,
     )
     sent = await server._broadcast(WSMessage(type="STATE_UPDATE", payload={}))
     assert sent == 1
@@ -166,7 +176,8 @@ async def test_close_on_already_dead_socket_does_not_raise():
     server = WebSocketServer()
     dead_ws = _AlreadyDeadSocket()
     server._clients["c-dead"] = WebSocketClient(
-        client_id="c-dead", websocket=dead_ws, client_type="chrome"
+        client_id="c-dead", websocket=dead_ws,
+        client_type="chrome", authenticated=True,
     )
 
     # Must not raise even though close() throws.

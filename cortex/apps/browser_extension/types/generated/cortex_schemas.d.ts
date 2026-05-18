@@ -9,6 +9,7 @@
 // Debt-1 closure (audit/findings.md) — closes F42, F43, F44, F45.
 
 export type MessageType =
+  | "AUTH"
   | "IDENTIFY"
   | "USER_ACTION"
   | "ACTION_EXECUTE"
@@ -20,6 +21,7 @@ export type MessageType =
   | "LEETCODE_CONTEXT_UPDATE"
   | "INTERVENTION_APPLIED"
   | "SHUTDOWN"
+  | "AUTH_OK"
   | "STATE_UPDATE"
   | "INTERVENTION_TRIGGER"
   | "INTERVENTION_RESTORE"
@@ -895,6 +897,12 @@ export interface InterventionPlan {
    * Non-fatal validation or grounding warnings to surface in debug UI
    */
   plan_warnings?: string[];
+  /**
+   * Daemon-stamped plan metadata (e.g. {'source': 'fallback'}) and prompt-budget telemetry (e.g. {'context_truncated_sections': ['terminal_errors']}). Never trust this field for executor decisions — it is purely an observability hint.
+   */
+  metadata?: {
+    [k: string]: unknown;
+  };
 }
 /**
  * UI manipulation instructions
@@ -1775,6 +1783,47 @@ export interface ActivityTimeline {
   dominant_topics?: string[];
 }
 /**
+ * F05: client-confirmed outcome of an intervention apply.
+ *
+ * The legacy adapter optimistically reported ``success=True`` for every
+ * dispatched action. The new path waits for an extension-side
+ * ``INTERVENTION_APPLIED`` ack and surfaces the real outcome via this
+ * schema. ``confirmed=False`` means either no ack arrived inside the
+ * timeout window or the client reported a hard failure (no actions
+ * succeeded). ``applied_actions`` / ``errors`` carry the per-action
+ * breakdown so partial successes don't masquerade as full successes.
+ */
+export interface InterventionApplyResult {
+  /**
+   * The intervention whose apply was awaited
+   */
+  intervention_id: string;
+  /**
+   * Apply-call correlation id (mirrored from the ack)
+   */
+  correlation_id?: string | null;
+  /**
+   * True when the extension explicitly acknowledged the apply and reported success. False on timeout or explicit failure.
+   */
+  confirmed?: boolean;
+  /**
+   * True when the watcher resolved the future on timeout
+   */
+  timed_out?: boolean;
+  /**
+   * action_ids reported as applied by the client
+   */
+  applied_actions?: string[];
+  /**
+   * Per-action errors reported by the client
+   */
+  errors?: string[];
+  /**
+   * Which lifecycle phase this result belongs to
+   */
+  phase?: "apply" | "restore";
+}
+/**
  * Output from the destructive struggle detector.
  */
 export interface DestructiveStruggleEstimate {
@@ -1964,4 +2013,37 @@ export interface PatternLadderRung {
    * Timestamp when revealed
    */
   revealed_at?: number | null;
+}
+export interface GetAuthTokenMessage {
+  command: "get_auth_token";
+}
+/**
+ * ``{"command":"launch", "project_root": "/Users/.../Project X"}``.
+ *
+ * ``project_root`` is optional. When present the value must be an
+ * existing directory that lives under the project-root allowlist; the
+ * validator runs at parse time so an invalid path is reported before
+ * dispatch.
+ */
+export interface LaunchMessage {
+  command: "launch";
+  project_root?: string | null;
+}
+/**
+ * Outcome of :func:`parse_native_message`.
+ *
+ * Exactly one of ``message`` / ``error`` is populated. The native host
+ * inspects ``error`` to build the response envelope returned to the
+ * extension.
+ */
+export interface ParseResult {
+  message?: (LaunchMessage | StopMessage | StatusMessage | GetAuthTokenMessage) | null;
+  error?: string | null;
+  detail?: string | null;
+}
+export interface StopMessage {
+  command: "stop";
+}
+export interface StatusMessage {
+  command: "status";
 }
