@@ -8,6 +8,31 @@
 //
 // Debt-1 closure (audit/findings.md) — closes F42, F43, F44, F45.
 
+export type MessageType =
+  | "IDENTIFY"
+  | "USER_ACTION"
+  | "ACTION_EXECUTE"
+  | "USER_RATING"
+  | "CONTEXT_RESPONSE"
+  | "SETTINGS_SYNC"
+  | "ACTIVITY_SYNC"
+  | "TAB_RELEVANCE_FEEDBACK"
+  | "LEETCODE_CONTEXT_UPDATE"
+  | "INTERVENTION_APPLIED"
+  | "SHUTDOWN"
+  | "STATE_UPDATE"
+  | "INTERVENTION_TRIGGER"
+  | "INTERVENTION_RESTORE"
+  | "CONTEXT_REQUEST"
+  | "ACTIVE_RECALL"
+  | "BREATHING_OVERLAY"
+  | "PRE_BREAK_WARNING"
+  | "MORNING_BRIEFING"
+  | "COPILOT_THROTTLE"
+  | "AMBIENT_STATE_UPDATE";
+/**
+ * LeetCode submission outcome types.
+ */
 export type SubmissionResult =
   | "Accepted"
   | "Wrong Answer"
@@ -1577,6 +1602,53 @@ export interface UserBaselines {
    * Exponential-decay half life for baseline updates
    */
   ew_decay_half_life_days?: number;
+}
+/**
+ * A WebSocket message exchanged between the Cortex daemon and clients.
+ *
+ * Field set is identical to the legacy dataclass; the only change is
+ * that ``type`` is a ``MessageType`` enum so callers cannot send a
+ * typo at the wire boundary (F45 closure).
+ *
+ * Serialisation contract
+ * ----------------------
+ *
+ * ``model_dump_json()`` produces JSON with ``"type": "STATE_UPDATE"``
+ * style string values (not the enum's ``str(member)`` repr). This is
+ * guaranteed by ``ConfigDict(use_enum_values=True)`` so the wire
+ * format matches the legacy dataclass's ``json.dumps`` output.
+ *
+ * Field ordering matches the legacy dataclass for stability of the
+ * generated TypeScript interface and the recorded session JSONL.
+ */
+export interface WSMessage {
+  type: MessageType;
+  /**
+   * Message-specific JSON-serialisable payload.
+   */
+  payload?: {
+    [k: string]: unknown;
+  };
+  /**
+   * Monotonic timestamp at construction time.
+   */
+  timestamp?: number;
+  /**
+   * Monotonically-increasing sequence number assigned by the producer; clients drop frames with stale sequences (F17).
+   */
+  sequence?: number;
+  /**
+   * End-to-end correlation id (F19). Threaded from the original user action through every layer that touches this message.
+   */
+  correlation_id?: string | null;
+  /**
+   * If set, only clients whose ``client_type`` appears in this list receive the message. None = broadcast to all.
+   */
+  target_client_types?: string[] | null;
+  /**
+   * Producer's identity (``daemon``, ``chrome``, ``desktop``, ``vscode``). Receivers can route on this without parsing the payload.
+   */
+  source_client_type?: string | null;
 }
 /**
  * Pre-intervention workspace state for restoration.
