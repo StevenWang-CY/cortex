@@ -2,7 +2,17 @@
 
 ## Overview
 
-Cortex is an in-process supervisor (`cortex/services/runtime_daemon.py`) orchestrating a 5-layer sensing-to-action loop exposed via FastAPI (`:9472`) and WebSocket (`:9473`).
+Cortex is an in-process supervisor (`cortex/services/runtime_daemon.py`) orchestrating a 5-layer sensing-to-action loop exposed via FastAPI (`:9472`) and WebSocket (`:9473`), with an optional sidecar launcher agent on `:9471` that the browser extension uses to start/stop the daemon.
+
+## Ports
+
+| Port | Service | Bound by | Notes |
+|------|---------|----------|-------|
+| 9471 | Launcher agent (HTTP) | `cortex/scripts/launcher_agent.py` | Sidecar that the extension and the desktop shell call to spawn or kill the daemon. `/stop` is capability-token gated (audit F08); `/health` is open for liveness probes. |
+| 9472 | FastAPI HTTP API | `cortex/services/api_gateway/app.py` | Mutating endpoints (`/shutdown`, `/apply_intervention`, `/state/infer`, `/llm/plan`) carry the per-request correlation id from F19 in `X-Cortex-Request-ID`. |
+| 9473 | WebSocket | `cortex/services/api_gateway/websocket_server.py` | Real-time STATE_UPDATE / INTERVENTION_TRIGGER stream. `SHUTDOWN` payloads require the local capability token (audit F07). |
+
+All three bind to `127.0.0.1` only.
 
 ## Layered Design
 
@@ -82,9 +92,22 @@ All additions are backward-compatible (additive fields only).
 
 ## Repository Map
 
+- `cortex/services/capture_service/*`: camera selection (incl. Continuity Camera filtering), frame capture.
 - `cortex/services/physio_engine/*`: rPPG, SQI, pulse, respiration, ROI.
-- `cortex/services/state_engine/*`: scoring, smoothing, trigger, detectors, ML classifier.
+- `cortex/services/kinematics_engine/*`: blink/EAR/PERCLOS, head pose, posture from face landmarks.
+- `cortex/services/telemetry_engine/*`: keyboard / mouse / scroll variability + correction/scroll-back rates.
+- `cortex/services/state_engine/*`: scoring, smoothing, trigger, detectors, ML classifier, persisted dismissal model (F21) and quiet-mode escalation memory (F26).
+- `cortex/services/context_engine/*`: workspace context fusion (editor / terminal / browser tab snapshots) used to build the prompt envelope.
 - `cortex/services/eval/*`: legacy bandit + AMIP + causal report + replay.
-- `cortex/services/llm_engine/*`: backend clients, prompt construction, parsing.
+- `cortex/services/llm_engine/*`: backend clients, prompt construction (with F09 prompt-injection wrappers and F29 truncation telemetry), parsing, parser-side action allowlist (F10), cost tracker (F20).
 - `cortex/services/intervention_engine/*`: planner, executor, restore, LeetCode interventions.
 - `cortex/services/consent/*`: policy + ladder.
+- `cortex/services/session_report/*`: per-session aggregate report (state breakdown, flow streaks, golden hour, comparison stats).
+- `cortex/services/api_gateway/*`: FastAPI app, WebSocket server, route handlers (`/state/infer`, `/apply_intervention`, `/llm/plan`, `/shutdown`).
+- `cortex/services/launcher/*`: project-config-driven workspace launcher (with the F12 shell-injection allowlist).
+- `cortex/services/janitor/*`: retention sweep (`storage/sessions/`, `storage/logs/`, `storage/policy_log/`).
+- `cortex/services/activity_tracker/*`: browser tab/activity feed forwarded by the extension.
+- `cortex/services/handover/*`, `cortex/services/throttle/*`: ancillary helpers for hand-off between modes and rate-limiting helpers used by the API gateway.
+- `cortex/scripts/launcher_agent.py`, `cortex/scripts/native_host.py`: out-of-process glue (port 9471 launcher and Chrome native messaging host) — described under "Ports" above.
+- `cortex/apps/desktop_shell/*`: PySide6 macOS UI (dashboard, overlay, settings, tray, onboarding).
+- `cortex/apps/browser_extension/*`: Plasmo / React MV3 extension.
