@@ -132,6 +132,21 @@ def sanitize_prompt_text(value: str, *, max_len: int = 4000) -> str:
     # without scrubbing the surrounding human-readable text.
     text = text.replace("</USER_CONTENT>", "</ USER_CONTENT >")
     text = text.replace("<USER_CONTENT>", "< USER_CONTENT >")
+    # audit-w2: ``build_user_prompt`` wraps each interpolated value in a
+    # tag-distinct delimiter (``WORKSPACE_CONTEXT``, ``CONSTRAINTS``,
+    # ``USER_GOAL``, ``EXTRA_CONTEXT``) rather than the legacy generic
+    # ``USER_CONTENT`` tag. The defang must cover those wrappers too,
+    # otherwise an attacker placing ``</WORKSPACE_CONTEXT>`` inside a
+    # tab title prematurely closes the data envelope and the model
+    # treats subsequent bytes as instructions. Defanging is conservative:
+    # only the angle-bracketed forms are touched, so the literal phrase
+    # "workspace context" inside human prose survives untouched.
+    text = re.sub(
+        r"<\s*/?\s*(USER_CONTENT|WORKSPACE_CONTEXT|CONSTRAINTS|USER_GOAL|EXTRA_CONTEXT)\s*>",
+        lambda m: m.group(0).replace("<", "< ").replace(">", " >"),
+        text,
+        flags=re.IGNORECASE,
+    )
     text = re.sub(
         r"<\s*/?\s*(SYSTEM|INSTRUCTION|ASSISTANT|HUMAN)\s*>",
         lambda m: m.group(0).replace("<", "< ").replace(">", " >"),
