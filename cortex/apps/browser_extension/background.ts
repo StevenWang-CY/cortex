@@ -17,6 +17,7 @@ import {
     saveTabSession,
     restoreTabSession,
 } from "./tab-manager";
+import { getAuthToken } from "./lib/auth";
 
 // --- Types ---
 
@@ -40,17 +41,64 @@ interface CortexState {
 }
 
 // --- Debug ---
-// Flip to true while debugging to surface intervention/overlay/tab-context noise.
-// Production builds should keep this false to avoid leaking internals to the
-// devtools console of any inspected service worker.
-const DEBUG = false;
+// F46: DEBUG is now a *variable* with two layered sources:
+//   1. Build-time env (`import.meta.env.CORTEX_DEBUG === "true"`).
+//      Plasmo exposes process.env.PLASMO_PUBLIC_*; for our purposes we
+//      read CORTEX_DEBUG via both `import.meta.env` (vite/vitest) and
+//      `process.env` (node) so tests can flip it.
+//   2. Runtime override via `chrome.storage.local.cortex_debug`. A
+//      change to that key flips `DEBUG` immediately, no reload required.
+function readBuildDebug(): boolean {
+    try {
+        const ime = (import.meta as unknown as { env?: Record<string, unknown> }).env;
+        if (ime && typeof ime.CORTEX_DEBUG === "string" && ime.CORTEX_DEBUG === "true") {
+            return true;
+        }
+    } catch {
+        // import.meta may not be available in all execution contexts.
+    }
+    try {
+        if (typeof process !== "undefined" && process.env && process.env.CORTEX_DEBUG === "true") {
+            return true;
+        }
+    } catch {
+        // process is not defined in plain browser builds.
+    }
+    return false;
+}
+
+let DEBUG = readBuildDebug();
+
+// Hydrate runtime override on startup, then keep listening for changes.
+try {
+    chrome.storage.local.get("cortex_debug", (data) => {
+        if (data && data.cortex_debug === true) DEBUG = true;
+        if (data && data.cortex_debug === false) DEBUG = readBuildDebug();
+    });
+    chrome.storage.onChanged.addListener((changes, area) => {
+        if (area !== "local" || !changes.cortex_debug) return;
+        const next = changes.cortex_debug.newValue;
+        if (next === true) DEBUG = true;
+        else if (next === false) DEBUG = readBuildDebug();
+    });
+} catch {
+    // chrome.storage may not be present in some test harness branches.
+}
+
+/** Test-only: read the current resolved DEBUG value. */
+export function _getDebugFlag(): boolean {
+    return DEBUG;
+}
 
 // --- State ---
 
 let ws: WebSocket | null = null;
 let connected = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-let reconnectDelay = 3000;
+// F32: keep the initial delay symbolic so the reset on `open` is
+// obviously paired with the doubling in `scheduleReconnect`.
+const INITIAL_RECONNECT_DELAY = 3000;
+let reconnectDelay = INITIAL_RECONNECT_DELAY;
 const MAX_RECONNECT_DELAY = 30000;
 let intentionalDisconnect = false;
 let sequence = 0;
@@ -59,7 +107,23 @@ const DAEMON_HTTP_URL = "http://127.0.0.1:9472";
 const LAUNCHER_HTTP_URL = "http://127.0.0.1:9471";
 
 let currentState: CortexState | null = null;
-let activeIntervention: Record<string, unknown> | null = null;
+
+/**
+ * F16: active intervention is now an atomic swap by correlation_id.
+ *
+ * A burst of overlapping INTERVENTION_TRIGGER frames must not overwrite
+ * each other in arbitrary order. We mount the latest one and stamp it
+ * with the daemon's correlation_id; outgoing USER_ACTION carries the
+ * same cid so the daemon can ignore stale ACKs from a now-superseded
+ * plan. `mountedAt` is the local mount timestamp (ms since epoch).
+ */
+interface ActiveInterventionRecord {
+    plan: Record<string, unknown>;
+    correlation_id: string;
+    mountedAt: number;
+}
+
+let activeIntervention: ActiveInterventionRecord | null = null;
 let quietMode = false;
 
 // Dismissal cooldown: maps intervention_id → timestamp when dismissed
@@ -425,7 +489,10 @@ function connect(): void {
 
         ws.onopen = () => {
             connected = true;
-            reconnectDelay = 3000;
+            // F32: reset the reconnect backoff on every successful open so a
+            // long-running disconnect cycle that finally succeeds doesn't
+            // keep waiting 30s on the next transient drop.
+            reconnectDelay = INITIAL_RECONNECT_DELAY;
 
             // Identify as Chrome extension
             send({
@@ -569,12 +636,76 @@ async function scrapeVisibleText(tabId?: number): Promise<string> {
 
 // --- Message Handling ---
 
+/**
+ * F15: WS streaming JSON parse failures are surfaced rather than silently
+ * dropped. We count failures within a 10s window and force a reconnect
+ * after 3 errors so a corrupted upstream stream produces a recovery
+ * cycle instead of an indefinitely silent black hole.
+ */
+const WS_PARSE_ERROR_WINDOW_MS = 10_000;
+const WS_PARSE_ERROR_RECONNECT_THRESHOLD = 3;
+let wsParseErrorTimestamps: number[] = [];
+
+export function _resetWsParseErrorCounter(): void {
+    wsParseErrorTimestamps = [];
+}
+
+export function _getWsParseErrorCount(): number {
+    return wsParseErrorTimestamps.length;
+}
+
+/** Test-only: expose the F32 reconnect delay so tests can verify it
+ * resets on every successful WS open. */
+export function _getReconnectDelay(): number {
+    return reconnectDelay;
+}
+
+export function _getInitialReconnectDelay(): number {
+    return INITIAL_RECONNECT_DELAY;
+}
+
+function recordWsParseError(err: unknown, msg: Partial<WSMessage> | null): void {
+    const cid =
+        msg && typeof (msg as { correlation_id?: unknown }).correlation_id === "string"
+            ? (msg as { correlation_id?: string }).correlation_id
+            : "-";
+    console.warn(`cortex.ws.parse_error cid=${cid} err=${String(err)}`);
+    const now = Date.now();
+    wsParseErrorTimestamps.push(now);
+    wsParseErrorTimestamps = wsParseErrorTimestamps.filter(
+        (t) => now - t <= WS_PARSE_ERROR_WINDOW_MS,
+    );
+    if (
+        wsParseErrorTimestamps.length >= WS_PARSE_ERROR_RECONNECT_THRESHOLD &&
+        ws !== null
+    ) {
+        console.warn(
+            `cortex.ws.parse_error_storm count=${wsParseErrorTimestamps.length} ` +
+                `window_ms=${WS_PARSE_ERROR_WINDOW_MS} — forcing reconnect`,
+        );
+        wsParseErrorTimestamps = [];
+        try {
+            // Bypass `disconnect()` because that sets intentionalDisconnect
+            // and suppresses the reconnect we want.
+            ws.close(1008, "cortex.ws.parse_error_storm");
+        } catch {
+            // ws already closed; let onclose drive reconnect.
+        }
+    }
+}
+
 async function handleMessage(raw: string): Promise<void> {
     let msg: WSMessage;
     try {
         msg = JSON.parse(raw) as WSMessage;
-    } catch {
+    } catch (err) {
+        recordWsParseError(err, null);
         return;
+    }
+    // Reset the rolling counter on a clean parse so transient flakes do
+    // not stay armed forever.
+    if (wsParseErrorTimestamps.length > 0) {
+        wsParseErrorTimestamps = [];
     }
 
     switch (msg.type) {
@@ -596,12 +727,6 @@ async function handleMessage(raw: string): Promise<void> {
             break;
 
         case "INTERVENTION_TRIGGER": {
-            // Skip if an intervention is already being shown
-            if (activeIntervention) {
-                if (DEBUG) console.log("Cortex: skipping intervention — one is already active");
-                break;
-            }
-
             const iid = typeof msg.payload.intervention_id === "string" ? msg.payload.intervention_id : null;
             const now = Date.now();
 
@@ -629,9 +754,37 @@ async function handleMessage(raw: string): Promise<void> {
                 schedulePersist();
             }
 
-            activeIntervention = msg.payload;
+            // F16: atomic swap by correlation_id. The latest INTERVENTION_TRIGGER
+            // always wins; any in-flight USER_ACTION ACK for a superseded plan
+            // is ignored by the daemon (F16-srv). The local cid falls back to
+            // a synthetic value so the swap still works when the daemon omits
+            // a correlation_id (e.g. legacy frames).
+            const inboundCid = typeof msg.correlation_id === "string" && msg.correlation_id.length > 0
+                ? msg.correlation_id
+                : `local_${now.toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+
+            if (activeIntervention) {
+                if (DEBUG) {
+                    console.log(
+                        `Cortex: superseding intervention cid=${activeIntervention.correlation_id} ` +
+                        `→ cid=${inboundCid}`,
+                    );
+                }
+            }
+
+            activeIntervention = {
+                plan: msg.payload,
+                correlation_id: inboundCid,
+                mountedAt: now,
+            };
             // Persist so popup can load it after SW restart
-            try { chrome.storage.session.set({ cortex_active_intervention: msg.payload }); } catch {}
+            try {
+                chrome.storage.session.set({
+                    cortex_active_intervention: msg.payload,
+                    cortex_active_intervention_cid: inboundCid,
+                    cortex_active_intervention_mounted_at: now,
+                });
+            } catch {}
             handleIntervention(msg.payload);
             break;
         }
@@ -759,29 +912,39 @@ function injectOverlay(payload: Record<string, unknown>): void {
     const tabRecs = payload.tab_recommendations as { tabs: Array<Record<string, unknown>>; summary: string } | undefined;
     const errA = payload.error_analysis as Record<string, string> | undefined;
 
-    // Synthesize close_tab actions from tab_recommendations when the LLM
-    // generated recommendations but no matching suggested_actions.
+    // F52: synthesise close actions from tab_recommendations only for
+    // tab_index values NOT already covered by suggested_actions. The
+    // tab card carries the close button when an existing action covers
+    // the same tab, so we avoid duplicate close affordances.
     if (tabRecs && tabRecs.tabs && tabRecs.tabs.length > 0) {
-        const hasCloseAction = actions.some(a => a.action_type === "close_tab" || a.action_type === "bookmark_and_close");
-        if (!hasCloseAction) {
-            const closeable = tabRecs.tabs.filter(t => t.action === "close" || t.action === "bookmark_and_close");
-            for (let ci = 0; ci < closeable.length; ci++) {
-                const t = closeable[ci];
-                actions.push({
-                    action_id: `synth_${Date.now()}_${ci}`,
-                    action_type: t.action === "bookmark_and_close" ? "bookmark_and_close" : "close_tab",
-                    tab_index: typeof t.tab_index === "number" ? t.tab_index : Number(t.tab_index),
-                    target: "",
-                    label: `Close ${t.tab_title || "tab"}`,
-                    reason: t.reason || "",
-                    category: "recommended",
-                    reversible: true,
-                    metadata: {
-                        expected_title: t.tab_title || "",
-                        expected_url: t.url || "",
-                    },
-                });
-            }
+        const coveredIndices = new Set<number>();
+        for (const a of actions) {
+            const at = a.action_type;
+            if (at !== "close_tab" && at !== "bookmark_and_close") continue;
+            const ti = typeof a.tab_index === "number" ? a.tab_index : Number(a.tab_index);
+            if (Number.isFinite(ti)) coveredIndices.add(ti);
+        }
+        const closeable = tabRecs.tabs.filter(t => t.action === "close" || t.action === "bookmark_and_close");
+        for (let ci = 0; ci < closeable.length; ci++) {
+            const t = closeable[ci];
+            const ti = typeof t.tab_index === "number" ? t.tab_index : Number(t.tab_index);
+            if (!Number.isFinite(ti)) continue;
+            if (coveredIndices.has(ti)) continue;
+            actions.push({
+                action_id: `synth_${Date.now()}_${ci}`,
+                action_type: t.action === "bookmark_and_close" ? "bookmark_and_close" : "close_tab",
+                tab_index: ti,
+                target: "",
+                label: `Close ${t.tab_title || "tab"}`,
+                reason: t.reason || "",
+                category: "recommended",
+                reversible: true,
+                metadata: {
+                    expected_title: t.tab_title || "",
+                    expected_url: t.url || "",
+                },
+            });
+            coveredIndices.add(ti);
         }
     }
 
@@ -1429,7 +1592,7 @@ async function handleRestore(payload: Record<string, unknown>): Promise<void> {
         errors.push("remove_overlay");
     }
     activeIntervention = null;
-    try { chrome.storage.session.remove(["cortex_active_intervention", "cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]); } catch {}
+    try { chrome.storage.session.remove(["cortex_active_intervention", "cortex_active_intervention_cid", "cortex_active_intervention_mounted_at", "cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]); } catch {}
     broadcastToPopup({ type: "INTERVENTION_RESTORE", payload });
 
     if (typeof interventionId === "string") {
@@ -2268,10 +2431,16 @@ async function executeAllRecommended(
 
     // Clear the intervention after execution so popup doesn't show stale data
     const hadIntervention = activeIntervention !== null;
-    const interventionId = activeIntervention?.intervention_id;
+    const interventionId =
+        typeof activeIntervention?.plan.intervention_id === "string"
+            ? (activeIntervention.plan.intervention_id as string)
+            : undefined;
+    // F16: outbound USER_ACTION carries the same cid the daemon stamped on
+    // the plan, so a superseded ACK is ignored by `_handle_user_action`.
+    const interventionCid = activeIntervention?.correlation_id;
     activeIntervention = null;
     // Persist cleared state
-    try { await chrome.storage.session.remove(["cortex_active_intervention", "cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]); } catch {}
+    try { await chrome.storage.session.remove(["cortex_active_intervention", "cortex_active_intervention_cid", "cortex_active_intervention_mounted_at", "cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]); } catch {}
 
     // Notify daemon that user engaged with the intervention
     if (hadIntervention && interventionId) {
@@ -2284,6 +2453,7 @@ async function executeAllRecommended(
             },
             timestamp: Date.now() / 1000,
             sequence: ++sequence,
+            correlation_id: interventionCid,
         });
     }
 
@@ -2473,26 +2643,50 @@ chrome.runtime.onMessage.addListener(
         _sender: chrome.runtime.MessageSender,
         sendResponse: (response: unknown) => void,
     ) => {
+        // F19b: every popup/newtab message can carry a correlation_id minted
+        // by `sendWithCid`. Log it on receive so the chain
+        // `popup → bg → daemon` is greppable end-to-end.
+        const __cid = typeof message.correlation_id === "string" ? message.correlation_id : null;
+        if (__cid) {
+            console.debug(`cortex.bg.recv cid=${__cid} type=${String(message.type)}`);
+        }
         switch (message.type) {
             case "GET_STATE":
                 // If activeIntervention was lost (SW restart), load from session storage
                 if (!activeIntervention) {
-                    chrome.storage.session.get("cortex_active_intervention", (data) => {
-                        const stored = data?.cortex_active_intervention || null;
-                        if (stored) activeIntervention = stored;
-                        sendResponse({
-                            connected,
-                            state: currentState,
-                            intervention: activeIntervention,
-                            focusSession: focusSession ? getFocusSessionSnapshot() : null,
-                        });
-                    });
+                    chrome.storage.session.get(
+                        [
+                            "cortex_active_intervention",
+                            "cortex_active_intervention_cid",
+                            "cortex_active_intervention_mounted_at",
+                        ],
+                        (data) => {
+                            const stored = data?.cortex_active_intervention || null;
+                            if (stored) {
+                                activeIntervention = {
+                                    plan: stored as Record<string, unknown>,
+                                    correlation_id:
+                                        (data?.cortex_active_intervention_cid as string) ||
+                                        `restore_${Date.now().toString(36)}`,
+                                    mountedAt:
+                                        (data?.cortex_active_intervention_mounted_at as number) ||
+                                        Date.now(),
+                                };
+                            }
+                            sendResponse({
+                                connected,
+                                state: currentState,
+                                intervention: activeIntervention?.plan ?? null,
+                                focusSession: focusSession ? getFocusSessionSnapshot() : null,
+                            });
+                        },
+                    );
                     return true; // async
                 }
                 sendResponse({
                     connected,
                     state: currentState,
-                    intervention: activeIntervention,
+                    intervention: activeIntervention.plan,
                     focusSession: focusSession ? getFocusSessionSnapshot() : null,
                 });
                 break;
@@ -2541,14 +2735,30 @@ chrome.runtime.onMessage.addListener(
                         ]);
                     } catch { /* storage.session may be unavailable */ }
 
+                    // F07b/F08b: fetch the local capability token (cached in
+                    // chrome.storage.session after the first call) so the
+                    // gated SHUTDOWN/`/stop` endpoints accept this client.
+                    // A token-fetch failure is non-fatal: the steps below
+                    // still get tried, the auth-gated ones will 401 cleanly.
+                    let authToken: string | null = null;
+                    try {
+                        authToken = await getAuthToken();
+                    } catch (e) {
+                        console.warn(`cortex.auth.token_unavailable err=${String(e)}`);
+                    }
+
                     // Step 1: Send SHUTDOWN over WebSocket (graceful — triggers daemon stop chain)
                     if (ws && connected) {
                         try {
                             send({
                                 type: "SHUTDOWN",
-                                payload: {},
+                                payload: authToken ? { auth_token: authToken } : {},
                                 timestamp: Date.now() / 1000,
                                 sequence: ++sequence,
+                                // F19b: carry the popup's cid through so the
+                                // daemon can correlate the SHUTDOWN with the
+                                // upstream user click.
+                                correlation_id: __cid ?? undefined,
                             });
                             await new Promise((r) => setTimeout(r, 500));
                         } catch { /* ws may already be closing */ }
@@ -2560,6 +2770,7 @@ chrome.runtime.onMessage.addListener(
                         await fetch(`${DAEMON_HTTP_URL}/shutdown`, {
                             method: "POST",
                             signal: AbortSignal.timeout(3000),
+                            headers: authToken ? { "X-Cortex-Auth-Token": authToken } : undefined,
                         });
                     } catch { /* daemon may already be dead */ }
                     // Step 4: Wait briefly for graceful shutdown to complete
@@ -2579,6 +2790,7 @@ chrome.runtime.onMessage.addListener(
                         await fetch(`${LAUNCHER_HTTP_URL}/stop`, {
                             method: "POST",
                             signal: AbortSignal.timeout(3000),
+                            headers: authToken ? { "X-Cortex-Auth-Token": authToken } : undefined,
                         });
                     } catch { /* launcher may not be running */ }
                     // Close any onboarding tabs
@@ -2706,7 +2918,14 @@ chrome.runtime.onMessage.addListener(
                 })();
                 return true; // async
 
-            case "USER_ACTION":
+            case "USER_ACTION": {
+                // F16: stamp every outbound USER_ACTION with the cid of the
+                // currently mounted plan so the daemon can ignore a stale ACK
+                // when an intervention has been superseded.
+                const outboundCid =
+                    typeof message.correlation_id === "string" && message.correlation_id.length > 0
+                        ? (message.correlation_id as string)
+                        : activeIntervention?.correlation_id;
                 send({
                     type: "USER_ACTION",
                     payload: {
@@ -2716,15 +2935,17 @@ chrome.runtime.onMessage.addListener(
                     },
                     timestamp: Date.now() / 1000,
                     sequence: ++sequence,
+                    correlation_id: outboundCid,
                 });
                 if (message.action === "dismissed") {
+                    const activePlanId =
+                        typeof activeIntervention?.plan.intervention_id === "string"
+                            ? (activeIntervention.plan.intervention_id as string)
+                            : null;
                     const interventionId =
                         typeof message.intervention_id === "string"
-                            ? message.intervention_id
-                            : typeof activeIntervention?.intervention_id ===
-                                "string"
-                              ? (activeIntervention.intervention_id as string)
-                              : null;
+                            ? (message.intervention_id as string)
+                            : activePlanId;
 
                     // Record dismissal for cooldown
                     const now = Date.now();
@@ -2751,7 +2972,7 @@ chrome.runtime.onMessage.addListener(
                     schedulePersist();
 
                     activeIntervention = null;
-                    try { chrome.storage.session.remove(["cortex_active_intervention", "cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]); } catch {}
+                    try { chrome.storage.session.remove(["cortex_active_intervention", "cortex_active_intervention_cid", "cortex_active_intervention_mounted_at", "cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]); } catch {}
                     if (interventionId) {
                         restoreTabsForIntervention(interventionId);
                     } else {
@@ -2760,6 +2981,7 @@ chrome.runtime.onMessage.addListener(
                 }
                 sendResponse({ ok: true });
                 break;
+            }
 
             case "RESTORE_TABS":
                 restoreAllTabs().then(() => sendResponse({ ok: true }));

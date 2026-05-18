@@ -12,7 +12,9 @@
     "build:edge": "plasmo build --target=edge-mv3",
     "package": "plasmo package",
     "package:chrome": "plasmo package",
-    "package:edge": "plasmo build --target=edge-mv3"
+    "package:edge": "plasmo build --target=edge-mv3",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "plasmo": "^0.88.0",
@@ -21,10 +23,13 @@
   },
   "devDependencies": {
     "@plasmohq/prettier-plugin-sort-imports": "^4.0.0",
+    "@testing-library/dom": "^10.4.0",
     "@types/chrome": "^0.0.260",
     "@types/react": "^18.2.0",
     "@types/react-dom": "^18.2.0",
-    "typescript": "^5.3.0"
+    "jsdom": "^25.0.1",
+    "typescript": "^5.3.0",
+    "vitest": "^2.1.5"
   },
   "manifest": {
     "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3QWBf3QPTw9b46iUfdAPdataoGAXsv/U+OONIG4C6x4kMQUj1Tn+g7P3of8UrKEX8QxHpCeFKFl0uFxBYlK/TsyrcysPR5uPxeTXJbSG1uS/OEPJgoS3ICTyTeMcvZ45GxOdeEtBzVRp8G/eyZEcu5ZjqaIUysj10qHmDbH9JqgsbNzaBzvOLUlecWSt1gha4A+MSyiM9kbF1a/HRxdagWSqACUNlnSq3Ib/+Rvu1zm/xMceDPzJm+4j6wqRcQJqnUBlsGqUDzrU1fI8mzhA6GwiG0olqPVhkE+7ZLSuuIZMEXOoz6wXKOEFAWG+7lDpTQ5NXHzZ00diJBC+hkt7VwIDAQAB",

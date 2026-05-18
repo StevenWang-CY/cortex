@@ -11,6 +11,24 @@
 import React, { useEffect, useRef, useState } from "react";
 import "./page-reset.css";
 import { CX, STATE_COLORS_RGB, CX_KEYFRAMES } from "./design-tokens";
+import { newCorrelationId } from "./lib/correlation";
+
+// F19b: every newtab-initiated user click mints a cid so the trace is
+// continuous from this page through the background and daemon logs.
+function nt_sendWithCid(
+    msg: Record<string, unknown>,
+    cb?: (resp: unknown) => void,
+): string {
+    const correlation_id = newCorrelationId();
+    const enriched = { ...msg, correlation_id };
+    console.debug(`cortex.newtab.send cid=${correlation_id} type=${String(msg.type)}`);
+    if (cb) {
+        chrome.runtime.sendMessage(enriched, cb);
+    } else {
+        chrome.runtime.sendMessage(enriched);
+    }
+    return correlation_id;
+}
 
 interface Ring {
     born: number;
@@ -283,7 +301,8 @@ function PulseRoom(): React.ReactElement {
     function handleLaunch() {
         setLaunching(true);
         setLaunchError("");
-        chrome.runtime.sendMessage({ type: "LAUNCH_CORTEX" }, (resp) => {
+        nt_sendWithCid({ type: "LAUNCH_CORTEX" }, (raw: unknown) => {
+            const resp = raw as { ok?: boolean; status?: string; error?: string } | undefined;
             setLaunching(false);
             if (resp?.ok && resp.status === "camera_enabled") {
                 // Connected — state updates will flow via polling

@@ -138,6 +138,13 @@ class WebSocketServer:
         # rejected (stale double-click that arrived behind a newer apply).
         self._last_settings_version: int = 0
 
+        # F16-srv: track the cid the daemon stamped on the most recent
+        # outbound INTERVENTION_TRIGGER for each intervention_id. A
+        # USER_ACTION ACK whose cid does not match is treated as stale
+        # (the active plan was superseded on the extension side) and is
+        # logged + ignored rather than poisoning the dismissal model.
+        self._active_intervention_cid: dict[str, str] = {}
+
     @property
     def client_count(self) -> int:
         return len(self._clients)
@@ -346,13 +353,40 @@ class WebSocketServer:
     async def _handle_user_action(
         self, client: WebSocketClient, msg: WSMessage,
     ) -> None:
-        """Handle USER_ACTION message from extension."""
+        """Handle USER_ACTION message from extension.
+
+        F16-srv: if the extension's cid does not match the cid the daemon
+        stamped on the most recent INTERVENTION_TRIGGER for this
+        intervention_id, the ACK belongs to a plan that was superseded
+        on the extension side (atomic-swap by latest cid). Log a warning
+        and drop the message without invoking the callback so the
+        dismissal model is not poisoned by stale ACKs.
+        """
         action = msg.payload.get("action")
         intervention_id = msg.payload.get("intervention_id")
+        incoming_cid = msg.correlation_id
+
+        if isinstance(intervention_id, str) and intervention_id:
+            active_cid = self._active_intervention_cid.get(intervention_id)
+            # Only enforce when both sides supplied a cid. A missing
+            # incoming cid is treated as a legacy client and honoured;
+            # a missing active cid means we never emitted a trigger for
+            # this intervention_id (e.g. on test fixtures), also honoured.
+            if active_cid and incoming_cid and active_cid != incoming_cid:
+                logger.warning(
+                    "Dropping stale USER_ACTION action=%s intervention_id=%s "
+                    "cid=%s active_cid=%s client=%s",
+                    action,
+                    intervention_id,
+                    incoming_cid,
+                    active_cid,
+                    client.client_id,
+                )
+                return
 
         logger.info(
             f"User action from {client.client_id}: {action} "
-            f"(intervention: {intervention_id})"
+            f"(intervention: {intervention_id}, cid: {incoming_cid})"
         )
 
         if self._user_action_callback is not None:
@@ -816,10 +850,16 @@ class WebSocketServer:
             payload["error_analysis"] = plan.error_analysis.model_dump()
         if plan.tab_recommendations is not None:
             payload["tab_recommendations"] = plan.tab_recommendations.model_dump()
+        # F16-srv: stamp a deterministic cid per intervention emission so a
+        # later USER_ACTION can be matched against the active emission.
+        cid = f"iv_{plan.intervention_id}_{self._sequence}"
+        if plan.intervention_id:
+            self._active_intervention_cid[plan.intervention_id] = cid
         return WSMessage(
             type="INTERVENTION_TRIGGER",
             payload=payload,
             sequence=self._sequence,
+            correlation_id=cid,
             source_client_type="daemon",
         )
 
@@ -828,3 +868,4 @@ class WebSocketServer:
         self._sequence = 0
         self._latest_state = None
         self._pending_context_requests.clear()
+        self._active_intervention_cid.clear()

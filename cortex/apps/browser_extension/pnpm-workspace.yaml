@@ -1,3 +1,7 @@
+packages:
+  - "."
+
+# Plasmo + native deps require build scripts to run on install
 allowBuilds:
   '@parcel/watcher': true
   '@swc/core': true

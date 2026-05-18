@@ -9,6 +9,30 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { CX, STATE_COLORS, STATE_LABELS, CX_KEYFRAMES } from "./design-tokens";
+import { newCorrelationId } from "./lib/correlation";
+
+/**
+ * F19b: every popup-initiated request mints a correlation id at the click
+ * boundary. The background script logs the id on receive and stamps it
+ * on the outbound WS frame so a single click can be traced through
+ * `popup → bg → native_host → daemon`.
+ */
+function sendWithCid(
+    msg: Record<string, unknown>,
+    cb?: (resp: unknown) => void,
+): string {
+    const correlation_id = newCorrelationId();
+    const enriched = { ...msg, correlation_id };
+    console.debug(
+        `cortex.popup.send cid=${correlation_id} type=${String(msg.type)}`,
+    );
+    if (cb) {
+        chrome.runtime.sendMessage(enriched, cb);
+    } else {
+        chrome.runtime.sendMessage(enriched);
+    }
+    return correlation_id;
+}
 
 const CortexLogo = () => (
     <svg width="22" height="22" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ flexShrink: 0 }}>
@@ -62,32 +86,58 @@ interface MorningBriefing {
 }
 
 /**
- * Synthesize close_tab actions from tab_recommendations when the LLM
- * generated recommendations but no matching suggested_actions.
+ * F52: synthesize close_tab actions from tab_recommendations *only*
+ * for tab_index values not already covered by suggested_actions.
+ *
+ * Previously, if any suggested_action with a close intent existed, we
+ * skipped synthesis entirely — which dropped the close affordance for
+ * any *other* recommended tab. Conversely, when no suggested_action
+ * close existed, we synthesised one per closeable rec, which could
+ * duplicate the close button when the LLM emitted a partial
+ * suggested_action AND a tab_recommendation for the same tab.
+ *
+ * The rule: if a suggested_action with the same `tab_index` already
+ * exists, drop the synthesised action so the tab card alone carries
+ * the close button.
  */
-function synthesizeActions(
+export function synthesizeActions(
     actions: Record<string, unknown>[],
     tabRecs: { tabs: Record<string, unknown>[]; summary: string } | null,
 ): Record<string, unknown>[] {
     if (!tabRecs || !tabRecs.tabs || tabRecs.tabs.length === 0) return actions;
-    const hasClose = actions.some(a => a.action_type === "close_tab" || a.action_type === "bookmark_and_close");
-    if (hasClose) return actions;
     const closeable = tabRecs.tabs.filter(t => t.action === "close" || t.action === "bookmark_and_close");
     if (closeable.length === 0) return actions;
-    return [
-        ...actions,
-        ...closeable.map((t, i) => ({
+
+    // Collect tab_index values already represented by an existing
+    // close-style suggested_action.
+    const coveredIndices = new Set<number>();
+    for (const a of actions) {
+        const at = a.action_type;
+        if (at !== "close_tab" && at !== "bookmark_and_close") continue;
+        const ti = typeof a.tab_index === "number" ? a.tab_index : Number(a.tab_index);
+        if (Number.isFinite(ti)) coveredIndices.add(ti);
+    }
+
+    const synthesised: Record<string, unknown>[] = [];
+    for (let i = 0; i < closeable.length; i++) {
+        const t = closeable[i];
+        const ti = typeof t.tab_index === "number" ? t.tab_index : Number(t.tab_index);
+        if (!Number.isFinite(ti)) continue;
+        if (coveredIndices.has(ti)) continue; // dedup: card already has close
+        synthesised.push({
             action_id: `synth_${Date.now()}_${i}`,
             action_type: t.action === "bookmark_and_close" ? "bookmark_and_close" : "close_tab",
-            tab_index: typeof t.tab_index === "number" ? t.tab_index : Number(t.tab_index),
+            tab_index: ti,
             target: "",
             label: `Close ${t.tab_title || "tab"}`,
             reason: t.reason || "",
             category: "recommended",
             reversible: true,
             metadata: {},
-        })),
-    ];
+        });
+    }
+    if (synthesised.length === 0) return actions;
+    return [...actions, ...synthesised];
 }
 
 // --- State dot animation helper ---
@@ -114,10 +164,55 @@ function getStateDotStyle(stateStr: string, stateColor: string): React.CSSProper
     }
 }
 
+/**
+ * F54: four distinct connectivity states for the popup connection
+ * indicator + diagnostic block.
+ *
+ * - not_installed:           native messaging host missing
+ * - installed_no_daemon:     native host present but daemon WS unreachable
+ * - installed_version_mismatch: daemon up but its version disagrees with ours
+ * - handshake_failed:        WS opened but daemon rejected handshake
+ *
+ * The connected boolean already covers the happy path; this enum
+ * disambiguates the failure modes so each can carry its own
+ * diagnostic and fix-action button. `ok` is the happy path.
+ */
+export type ConnectivityState =
+    | "ok"
+    | "not_installed"
+    | "installed_no_daemon"
+    | "installed_version_mismatch"
+    | "handshake_failed";
+
+export function classifyConnectivity(input: {
+    connected: boolean;
+    nativeHostStatus: "present" | "missing" | "unknown";
+    daemonVersion: string | null;
+    expectedVersion: string;
+    handshakeError: string | null;
+}): ConnectivityState {
+    if (input.connected && input.handshakeError) return "handshake_failed";
+    if (input.connected) {
+        if (
+            input.daemonVersion &&
+            input.expectedVersion &&
+            input.daemonVersion !== input.expectedVersion
+        ) {
+            return "installed_version_mismatch";
+        }
+        return "ok";
+    }
+    if (input.nativeHostStatus === "missing") return "not_installed";
+    return "installed_no_daemon";
+}
+
 // --- Main ---
 
 function CortexPopup(): React.ReactElement {
     const [connected, setConnected] = useState(false);
+    const [nativeHostStatus, setNativeHostStatus] = useState<"present" | "missing" | "unknown">("unknown");
+    const [daemonVersion, setDaemonVersion] = useState<string | null>(null);
+    const [handshakeError, setHandshakeError] = useState<string | null>(null);
     const [state, setState] = useState<CortexState | null>(null);
     const [focus, setFocus] = useState<FocusSnapshot | null>(null);
     const [dailyStats, setDailyStats] = useState<DailyStats | null>(null);
@@ -179,16 +274,28 @@ function CortexPopup(): React.ReactElement {
     const handleQuietModeToggle = useCallback(() => {
         const newValue = !quietMode;
         setQuietMode(newValue);
-        chrome.runtime.sendMessage({ type: "TOGGLE_QUIET_MODE", quiet: newValue });
+        sendWithCid({ type: "TOGGLE_QUIET_MODE", quiet: newValue });
     }, [quietMode]);
 
     const [launchStatus, setLaunchStatus] = useState("");
+
+    // F54: pinned in code rather than read from manifest at runtime so a
+    // mismatch with the daemon is immediately surfaceable in tests.
+    const EXPECTED_VERSION = "0.2.1";
+    const connectivity = classifyConnectivity({
+        connected,
+        nativeHostStatus,
+        daemonVersion,
+        expectedVersion: EXPECTED_VERSION,
+        handshakeError,
+    });
 
     const handleLaunchCortex = useCallback(() => {
         setLaunching(true);
         setLaunchError(false);
         setLaunchStatus("Launching daemon\u2026");
-        chrome.runtime.sendMessage({ type: "LAUNCH_CORTEX" }, (resp) => {
+        sendWithCid({ type: "LAUNCH_CORTEX" }, (raw: unknown) => {
+            const resp = raw as { ok?: boolean; status?: string; error?: string } | undefined;
             if (resp?.ok && resp.status === "camera_enabled") {
                 setLaunching(false);
                 setLaunchStatus("");
@@ -224,75 +331,94 @@ function CortexPopup(): React.ReactElement {
         });
     }, []);
 
-    useEffect(() => {
-        const listener = (msg: Record<string, unknown>) => {
-            switch (msg.type) {
-                case "CONNECTION_CHANGED":
-                    setConnected(msg.connected as boolean);
-                    break;
-                case "STATE_UPDATE":
-                    setState(msg.payload as CortexState);
-                    if (msg.focusSession) setFocus(msg.focusSession as FocusSnapshot);
-                    break;
-                case "FOCUS_SESSION_STARTED":
-                    break;
-                case "FOCUS_SESSION_ENDED":
-                    setFocus(null);
-                    chrome.runtime.sendMessage({ type: "GET_DAILY_STATS" }, (stats) => {
-                        if (stats) setDailyStats(stats);
-                    });
-                    break;
-                case "HEALTH_ALERT":
-                    setAlert({ title: msg.title as string, body: msg.body as string });
-                    setTimeout(() => setAlert(null), 10000);
-                    break;
-                case "BREAK_SUGGESTED":
-                    setAlert({ title: "Time for a break", body: msg.reason as string });
-                    setTimeout(() => setAlert(null), 10000);
-                    break;
-                case "INTERVENTION_TRIGGER": {
-                    const p = msg.payload as Record<string, unknown>;
-                    const rawActions = (p.suggested_actions as Record<string, unknown>[]) || [];
-                    const recs = (p.tab_recommendations as { tabs: Record<string, unknown>[]; summary: string }) || null;
-                    setActiveActions(synthesizeActions(rawActions, recs));
-                    setTabRecs(recs);
-                    setErrAnalysis((p.error_analysis as Record<string, string>) || null);
-                    setInterventionId(String(p.intervention_id || ""));
-                    setCausalExplanation(String(p.causal_explanation || ""));
-                    setApplied(false);
-                    break;
-                }
-                case "INTERVENTION_RESTORE":
-                    setActiveActions([]);
-                    setTabRecs(null);
-                    setErrAnalysis(null);
-                    setCausalExplanation("");
-                    setApplied(false);
-                    break;
-                case "SETTINGS_SYNC": {
-                    const settings = msg.payload as Record<string, unknown>;
-                    if (typeof settings.quiet_mode === "boolean") {
-                        setQuietMode(settings.quiet_mode);
-                    }
-                    break;
-                }
-                case "MORNING_BRIEFING": {
-                    const b = msg.payload as Record<string, unknown>;
-                    setBriefing({
-                        summary: String(b.summary || ""),
-                        action_items: (b.action_items as string[]) || [],
-                        left_off_at: String(b.left_off_at || ""),
-                    });
-                    break;
-                }
+    // F50: stable listener identity so addListener/removeListener
+    // refer to the same function across re-renders. React's setState
+    // identities are already stable; pinning the handler with
+    // `useCallback([])` makes the contract obvious and gives the cleanup
+    // function the exact same reference to remove.
+    const popupMessageListener = useCallback((msg: Record<string, unknown>) => {
+        switch (msg.type) {
+            case "CONNECTION_CHANGED":
+                setConnected(msg.connected as boolean);
+                break;
+            case "STATE_UPDATE":
+                setState(msg.payload as CortexState);
+                if (msg.focusSession) setFocus(msg.focusSession as FocusSnapshot);
+                break;
+            case "FOCUS_SESSION_STARTED":
+                break;
+            case "FOCUS_SESSION_ENDED":
+                setFocus(null);
+                chrome.runtime.sendMessage({ type: "GET_DAILY_STATS" }, (stats) => {
+                    if (stats) setDailyStats(stats);
+                });
+                break;
+            case "HEALTH_ALERT":
+                setAlert({ title: msg.title as string, body: msg.body as string });
+                setTimeout(() => setAlert(null), 10000);
+                break;
+            case "BREAK_SUGGESTED":
+                setAlert({ title: "Time for a break", body: msg.reason as string });
+                setTimeout(() => setAlert(null), 10000);
+                break;
+            case "INTERVENTION_TRIGGER": {
+                const p = msg.payload as Record<string, unknown>;
+                const rawActions = (p.suggested_actions as Record<string, unknown>[]) || [];
+                const recs = (p.tab_recommendations as { tabs: Record<string, unknown>[]; summary: string }) || null;
+                setActiveActions(synthesizeActions(rawActions, recs));
+                setTabRecs(recs);
+                setErrAnalysis((p.error_analysis as Record<string, string>) || null);
+                setInterventionId(String(p.intervention_id || ""));
+                setCausalExplanation(String(p.causal_explanation || ""));
+                setApplied(false);
+                break;
             }
-        };
-        chrome.runtime.onMessage.addListener(listener);
-        return () => chrome.runtime.onMessage.removeListener(listener);
+            case "INTERVENTION_RESTORE":
+                setActiveActions([]);
+                setTabRecs(null);
+                setErrAnalysis(null);
+                setCausalExplanation("");
+                setApplied(false);
+                break;
+            case "SETTINGS_SYNC": {
+                const settings = msg.payload as Record<string, unknown>;
+                if (typeof settings.quiet_mode === "boolean") {
+                    setQuietMode(settings.quiet_mode);
+                }
+                break;
+            }
+            case "MORNING_BRIEFING": {
+                const b = msg.payload as Record<string, unknown>;
+                setBriefing({
+                    summary: String(b.summary || ""),
+                    action_items: (b.action_items as string[]) || [],
+                    left_off_at: String(b.left_off_at || ""),
+                });
+                break;
+            }
+            case "CONNECTIVITY_DIAGNOSTIC": {
+                // F54: background pushes the resolved diagnostic so the
+                // popup can pick the right disconnected-state UI.
+                const d = msg.payload as Record<string, unknown>;
+                if (d.native_host_status === "present" || d.native_host_status === "missing") {
+                    setNativeHostStatus(d.native_host_status as "present" | "missing");
+                }
+                if (typeof d.daemon_version === "string") setDaemonVersion(d.daemon_version);
+                if (d.daemon_version === null) setDaemonVersion(null);
+                if (typeof d.handshake_error === "string") setHandshakeError(d.handshake_error);
+                if (d.handshake_error === null) setHandshakeError(null);
+                break;
+            }
+        }
     }, []);
 
+    useEffect(() => {
+        chrome.runtime.onMessage.addListener(popupMessageListener);
+        return () => chrome.runtime.onMessage.removeListener(popupMessageListener);
+    }, [popupMessageListener]);
+
     const handleConnect = useCallback(() => {
-        chrome.runtime.sendMessage({ type: "CONNECT" });
+        sendWithCid({ type: "CONNECT" });
     }, []);
 
     const [stopping, setStopping] = useState(false);
@@ -303,7 +429,7 @@ function CortexPopup(): React.ReactElement {
         setState(null);
         setFocus(null);
         // Tell background to disconnect WS, kill daemon via HTTP, close tabs
-        chrome.runtime.sendMessage({ type: "STOP_CORTEX" });
+        sendWithCid({ type: "STOP_CORTEX" });
         // Wait a moment for shutdown to propagate, then release button
         setTimeout(() => setStopping(false), 2000);
     }, []);
@@ -313,15 +439,12 @@ function CortexPopup(): React.ReactElement {
         if (goal === "") {
             return;
         }
-        chrome.runtime.sendMessage({
-            type: "START_FOCUS",
-            goal,
-        });
+        sendWithCid({ type: "START_FOCUS", goal });
         setGoalInput("");
     }, [goalInput]);
 
     const handleStopFocus = useCallback(() => {
-        chrome.runtime.sendMessage({ type: "STOP_FOCUS" });
+        sendWithCid({ type: "STOP_FOCUS" });
     }, []);
 
     // Derived
@@ -407,7 +530,7 @@ function CortexPopup(): React.ReactElement {
                         <button style={S.ghostBtn} onClick={() => {
                             const leftOff = (briefing.left_off_at ?? "").trim();
                             if (leftOff !== "") {
-                                chrome.runtime.sendMessage({ type: "START_FOCUS", goal: leftOff });
+                                sendWithCid({ type: "START_FOCUS", goal: leftOff });
                             }
                             setBriefing(null);
                         }}>Resume</button>
@@ -415,8 +538,11 @@ function CortexPopup(): React.ReactElement {
                 </div>
             )}
 
-            {/* Disconnected state — centered, quiet notice with one-click launch */}
-            {!connected && (
+            {/* F54: render the diagnostic block whenever we're not fully ok.
+                 installed_version_mismatch and handshake_failed both happen
+                 while `connected` is true, so the visibility predicate is
+                 the resolved connectivity enum rather than the bare flag. */}
+            {connectivity !== "ok" && (
                 <div style={S.disconnectedArea}>
                     <div style={{
                         width: 40,
@@ -448,27 +574,65 @@ function CortexPopup(): React.ReactElement {
                             }} />
                         )}
                     </div>
-                    <div style={S.disconnectedTitle}>{launching ? "Starting Cortex" : "Not connected"}</div>
-                    <div style={S.disconnectedBody}>
-                        {launchStatus || "Launch daemon with camera"}
-                    </div>
-                    <button
-                        style={{
-                            ...S.primaryBtn,
-                            marginTop: 16,
-                            opacity: launching ? 0.5 : 1,
-                            pointerEvents: launching ? "none" as const : "auto" as const,
-                            maxWidth: 200,
-                        }}
-                        onClick={handleLaunchCortex}
-                        disabled={launching}
-                    >
-                        {launchError
-                            ? "Retry"
-                            : launching
-                                ? "Starting\u2026"
-                                : "Start Cortex"}
-                    </button>
+                    {(() => {
+                        // F54: pick title/body/CTA per distinct connectivity state.
+                        let title: string;
+                        let body: string;
+                        let ctaLabel: string;
+                        let ctaHandler: () => void = handleLaunchCortex;
+                        let testId: string;
+                        if (launching) {
+                            title = "Starting Cortex";
+                            body = launchStatus || "Launching daemon\u2026";
+                            ctaLabel = "Starting\u2026";
+                            testId = "conn-state-launching";
+                        } else if (connectivity === "not_installed") {
+                            title = "Native host not installed";
+                            body = "Cortex needs its native messaging host registered. Run `python -m cortex.scripts.install_native_host` once, then relaunch your browser.";
+                            ctaLabel = "Open install instructions";
+                            ctaHandler = () => {
+                                chrome.tabs.create({ url: chrome.runtime.getURL("tabs/onboarding.html") });
+                            };
+                            testId = "conn-state-not_installed";
+                        } else if (connectivity === "installed_version_mismatch") {
+                            title = "Daemon version mismatch";
+                            body = `Extension expects v${EXPECTED_VERSION}; daemon is v${daemonVersion ?? "?"}. Update the daemon or downgrade the extension to match.`;
+                            ctaLabel = "Restart daemon";
+                            ctaHandler = handleLaunchCortex;
+                            testId = "conn-state-installed_version_mismatch";
+                        } else if (connectivity === "handshake_failed") {
+                            title = "Handshake failed";
+                            body = handshakeError || "The daemon answered but rejected this extension's handshake. Check the local auth token.";
+                            ctaLabel = "Retry handshake";
+                            ctaHandler = () => sendWithCid({ type: "CONNECT" });
+                            testId = "conn-state-handshake_failed";
+                        } else {
+                            // installed_no_daemon (default disconnect path)
+                            title = "Not connected";
+                            body = launchStatus || "Launch daemon with camera";
+                            ctaLabel = launchError ? "Retry" : "Start Cortex";
+                            testId = "conn-state-installed_no_daemon";
+                        }
+                        return (
+                            <>
+                                <div style={S.disconnectedTitle} data-testid={testId}>{title}</div>
+                                <div style={S.disconnectedBody}>{body}</div>
+                                <button
+                                    style={{
+                                        ...S.primaryBtn,
+                                        marginTop: 16,
+                                        opacity: launching ? 0.5 : 1,
+                                        pointerEvents: launching ? "none" as const : "auto" as const,
+                                        maxWidth: 240,
+                                    }}
+                                    onClick={ctaHandler}
+                                    disabled={launching}
+                                >
+                                    {ctaLabel}
+                                </button>
+                            </>
+                        );
+                    })()}
                     {launchError && launchStatus && (
                         <div style={{
                             fontSize: 10,
@@ -609,24 +773,28 @@ function CortexPopup(): React.ReactElement {
                                 style={applied ? { ...S.primaryBtn, ...S.doneBtnStyle } : S.primaryBtn}
                                 disabled={applied}
                                 onClick={() => {
-                                    chrome.runtime.sendMessage({
-                                        type: "EXECUTE_ALL_RECOMMENDED",
-                                        actions: rec,
-                                        intervention_id: interventionId,
-                                    }, (results: Array<{ success: boolean }> | undefined) => {
-                                        const succeeded = Array.isArray(results) && results.some(r => r.success);
-                                        if (succeeded) {
-                                            setApplied(true);
-                                            setTimeout(() => {
-                                                setActiveActions([]);
-                                                setTabRecs(null);
-                                                setErrAnalysis(null);
-                                                setApplied(false);
-                                            }, 10000);
-                                        } else {
-                                            setApplied(true);
-                                        }
-                                    });
+                                    sendWithCid(
+                                        {
+                                            type: "EXECUTE_ALL_RECOMMENDED",
+                                            actions: rec,
+                                            intervention_id: interventionId,
+                                        },
+                                        (raw: unknown) => {
+                                            const results = raw as Array<{ success: boolean }> | undefined;
+                                            const succeeded = Array.isArray(results) && results.some(r => r.success);
+                                            if (succeeded) {
+                                                setApplied(true);
+                                                setTimeout(() => {
+                                                    setActiveActions([]);
+                                                    setTabRecs(null);
+                                                    setErrAnalysis(null);
+                                                    setApplied(false);
+                                                }, 10000);
+                                            } else {
+                                                setApplied(true);
+                                            }
+                                        },
+                                    );
                                 }}
                             >
                                 {applied
@@ -643,7 +811,7 @@ function CortexPopup(): React.ReactElement {
                                     <button
                                         style={S.undoLink}
                                         onClick={() => {
-                                            chrome.runtime.sendMessage(
+                                            sendWithCid(
                                                 { type: "UNDO_ALL_RECENT", intervention_id: interventionId },
                                                 () => setApplied(false),
                                             );
