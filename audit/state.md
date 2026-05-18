@@ -1,9 +1,9 @@
 # Audit State Pointer
 
 **Phase:** 2 (remediation in progress)
-**Next finding to address:** F10 (allowlist for LLM-emitted actions before executor dispatch) — security pair with F09
-**Last finding closed:** F09 (prompt-injection defence)
-**Last commit:** `audit F09: prompt-injection defence — sanitiser + delimiter wrapping + system prompt clause`
+**Next finding to address:** F12 (ProjectLauncher allowlist) — bundled into Wave-1 implementation swarm
+**Last finding closed:** F10 (executor-safety allowlist on LLM-emitted actions)
+**Last commit:** `audit F10: validators + runtime filter for LLM-emitted action shapes`
 
 ## Phase 2 session 1 summary (2026-05-19)
 

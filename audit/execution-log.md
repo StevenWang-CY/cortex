@@ -229,6 +229,30 @@ The eight commits in this session close the data-loss tier (F01, F02, F03), the 
 
 3. **Action validation gap (F10 still open).** F09 closed the prompt-injection path; F10 — the executor-side allowlist for `open_url`/`close_tab` arguments — is the matching defence and is the next finding in the locked order. Until F10 lands, an LLM that *was* persuaded by injection (e.g. via a vector the F09 defence doesn't cover, like a Unicode homograph not yet in our defang list) can still emit a structurally-valid action with a malicious URL or tab index. **Monitoring needed:** log every `suggested_actions[*].target` value at INFO so post-hoc review can flag novel URLs.
 
+## Phase 2 Session 2 — F10 closed (executor-safety allowlist)
+
+### F10 — Pydantic validators + runtime filter for LLM-emitted actions
+
+**Fix.** Two-layer defence against unsafe ``SuggestedAction`` payloads. Layer 1: ``@field_validator``/``@model_validator`` on ``SuggestedAction`` reject non-http(s) ``open_url`` targets, newlines in ``search_error`` queries, negative ``tab_index``, and per-action_type ``target`` length caps tighter than the outer ``max_length=500``. Layer 2: ``filter_unsafe_actions(plan, tab_count=N)`` in ``parser.py`` runs after enrichment and drops actions whose ``tab_index >= tab_count`` (live upper bound the schema cannot know) or that mutated post-parse into an unsafe shape. New ``EventType.INTERVENTION_ACTION_REJECTED`` log line per drop, carrying the correlation id from F19.
+
+**Files touched** (4):
+- `cortex/libs/schemas/intervention.py` (validators + allowlist constants)
+- `cortex/services/llm_engine/parser.py` (`filter_unsafe_actions`, wired into `enrich_plan_with_context`)
+- `cortex/libs/logging/structured.py` (new EventType)
+- `cortex/tests/unit/test_action_allowlist.py` (new test)
+
+**Test.** 17 cases. URL-scheme rejections (javascript/data/file/none), positive accepts (http/https), empty-target parse leniency + runtime drop, search_error newline + length caps, negative tab_index rejection, tab_index upper-bound drop at runtime, non-tab actions untouched, rejection logging carries cid + reason, filter idempotence. All fail on `main` (validators don't exist; filter doesn't exist).
+
+**Verification.**
+- F10 suite: 17 passed (0.89s).
+- Regression check: 76 LLM-engine/planner/injection tests passed.
+
+**Compatibility.** Breaking on the schema: any historical plan with a `javascript:`/`data:`/etc. URL fails Pydantic parse. Grep of `storage/sessions/*.json` (none in repo) confirms no existing session contains such payloads. For deployed installs, banned actions on replay would surface as parse warnings, not crashes.
+
+**Rollback.** `git revert` is clean. Validators are additive; the filter call is a single line in `enrich_plan_with_context`.
+
+---
+
 ## Phase 2 Session 1 — Least-Confident Fix
 
 **F03** (background task tracking). The fix itself is straightforward — a tracked set + `_spawn_background_task` helper + cancellation in `stop()`. What I am least confident about is whether the test coverage is sufficient. The test runs against a `_StubDaemon` that mirrors the helper because booting the full `CortexDaemon` requires a real camera, real store backends, and other dependencies. The stub exercises the contract precisely, but it cannot catch the case where a future call site in the daemon adds another bare `asyncio.create_task(...)` instead of using `_spawn_background_task`. A `pytest --collect-only` style lint or a one-line grep CI check (`! grep -rn "asyncio.create_task" cortex/services/runtime_daemon.py | grep -v "_spawn_background_task"`) would close that gap. Filing as **F03b** but not opening a Ledger row this session because the existing failure mode (orphan tasks) is closed at the call site that was flagged; the residual risk is regression-only, not active.

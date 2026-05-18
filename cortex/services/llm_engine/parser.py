@@ -15,14 +15,94 @@ Falls back to rule-based plan after 2 failed parse attempts.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 from pydantic import ValidationError
 
+from cortex.libs.logging.correlation import get_correlation_id
+from cortex.libs.logging.structured import EventType
 from cortex.libs.schemas.context import TaskContext
-from cortex.libs.schemas.intervention import InterventionPlan
+from cortex.libs.schemas.intervention import InterventionPlan, SuggestedAction
 from cortex.services.context_engine.tab_classifier import classify_tab
+
+logger = logging.getLogger(__name__)
+
+# F10: action_types that reference a tab by integer index. These get the
+# upper-bound check against the live tab count.
+_TAB_INDEX_ACTIONS: frozenset[str] = frozenset({
+    "close_tab",
+    "group_tabs",
+    "bookmark_and_close",
+    "highlight_tab",
+})
+
+
+def filter_unsafe_actions(
+    plan: InterventionPlan,
+    *,
+    tab_count: int,
+) -> InterventionPlan:
+    """Drop ``SuggestedAction`` entries the executor must not run (audit F10).
+
+    Pydantic validators on :class:`SuggestedAction` (URL scheme, target
+    length, tab_index non-negativity) catch most of the shape-level
+    issues at parse time. This runtime filter covers two cases the
+    schema cannot:
+
+    1. **Upper bound on ``tab_index``.** The schema does not know how
+       many tabs exist; it can only check ``>= 0``. We reject any
+       action whose ``tab_index >= tab_count`` here.
+    2. **Post-enrichment mutation.** Other code paths build or mutate
+       a plan after Pydantic parsing (e.g. ``build_fallback_plan``,
+       ad-hoc test fixtures). The filter is an idempotent safety net
+       that runs once before the plan goes on the wire.
+
+    Every drop emits a structured ``INTERVENTION_ACTION_REJECTED`` log
+    line with the active correlation id (F19) so operators can audit
+    rejections and tune the allowlist if a real user workflow gets
+    blocked.
+    """
+    kept: list[SuggestedAction] = []
+    for action in plan.suggested_actions:
+        reason = _action_rejection_reason(action, tab_count=tab_count)
+        if reason is None:
+            kept.append(action)
+            continue
+        logger.warning(
+            "%s action_id=%s action_type=%s reason=%s cid=%s",
+            EventType.INTERVENTION_ACTION_REJECTED.value,
+            action.action_id,
+            action.action_type,
+            reason,
+            get_correlation_id() or "-",
+        )
+    plan.suggested_actions = kept
+    return plan
+
+
+def _action_rejection_reason(
+    action: SuggestedAction,
+    *,
+    tab_count: int,
+) -> str | None:
+    """Return a short reason if the action should be dropped, else None."""
+    if action.action_type in _TAB_INDEX_ACTIONS:
+        if action.tab_index is None:
+            return "tab_action_missing_tab_index"
+        if action.tab_index >= tab_count:
+            return f"tab_index_out_of_range:{action.tab_index}>={tab_count}"
+    if action.action_type == "open_url":
+        if not action.target:
+            return "open_url_empty_target"
+        # Re-check scheme defensively even though the Pydantic validator
+        # already ran; cheap, and protects against post-parse mutation.
+        scheme = (urlparse(action.target).scheme or "").lower()
+        if scheme not in ("http", "https"):
+            return f"open_url_disallowed_scheme:{scheme or 'none'}"
+    return None
 
 
 def parse_llm_response(raw: str) -> dict[str, Any] | None:
@@ -264,6 +344,12 @@ def enrich_plan_with_context(
         # If all steps were generic, keep the originals (schema requires ≥1)
 
     plan.causal_explanation = verify_causal_explanation(plan, context)
+
+    # F10: drop any action the executor must refuse — out-of-range
+    # tab_index, ``open_url`` with a non-http(s) scheme, etc. Runs
+    # AFTER enrichment so labels/titles are already up to date and we
+    # can log meaningful telemetry.
+    plan = filter_unsafe_actions(plan, tab_count=len(tabs))
 
     return plan
 

@@ -58,6 +58,11 @@ class EventType(StrEnum):
     WS_MESSAGE_SENT = "ws_message_sent"
     WS_MESSAGE_RECEIVED = "ws_message_received"
 
+    # F10: action-safety events. Emitted when the daemon refuses a
+    # specific SuggestedAction (bad URL scheme, out-of-range tab_index,
+    # etc.) before it can reach the executor in the extension.
+    INTERVENTION_ACTION_REJECTED = "intervention_action_rejected"
+
 
 class StateTransitionEvent(BaseModel):
     """State transition event data."""
