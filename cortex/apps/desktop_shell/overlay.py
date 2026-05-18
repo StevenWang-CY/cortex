@@ -37,6 +37,32 @@ except ImportError:  # pragma: no cover - lightweight stub fallback
     # "Show more" toggle, so it stands in faithfully.
     QToolButton = QPushButton  # type: ignore[assignment,misc]
 
+# Phase J-4: subtle scale-in (headline) + fade-in (causal row) micro-
+# interactions. QPropertyAnimation / QEasingCurve / QGraphicsOpacityEffect
+# are real-PySide6 only — the lightweight stubs don't expose them. The
+# import-time guard keeps this file importable from the legacy mock
+# harness; the runtime guard inside ``_play_show_animations`` short-
+# circuits when any piece is missing or when the user has Reduce Motion
+# enabled.
+try:
+    from PySide6.QtCore import QEasingCurve, QPropertyAnimation
+    from PySide6.QtWidgets import QGraphicsOpacityEffect
+    _ANIMATION_AVAILABLE = True
+except ImportError:  # pragma: no cover - lightweight stubs
+    QEasingCurve = None  # type: ignore[assignment]
+    QPropertyAnimation = None  # type: ignore[assignment]
+    QGraphicsOpacityEffect = None  # type: ignore[assignment]
+    _ANIMATION_AVAILABLE = False
+
+# Phase J-4: tween constants. Chosen to be "perceptible but never
+# distracting" — the headline scale-in is fast enough to feel
+# responsive (under 300 ms is below the typical user attention
+# threshold) and the causal fade lags by exactly the headline duration
+# so the two animations read as one continuous motion rather than two
+# competing tweens. The Reduce Motion path forces both to 0 ms.
+HEADLINE_SCALE_DURATION_MS: int = 250
+CAUSAL_FADE_DURATION_MS: int = 180
+
 from cortex.apps.desktop_shell import mac_native
 from cortex.apps.desktop_shell.tokens import (
     BRAND_DISPLAY_FONT,
@@ -264,6 +290,20 @@ class OverlayWindow(QWidget):
         self._timeout_timer.setSingleShot(True)
         self._timeout_timer.setInterval(5 * 60 * 1000)
         self._timeout_timer.timeout.connect(self._auto_dismiss)
+
+        # Phase J-4: animation slots. Created on demand inside
+        # ``_play_show_animations`` so a Qt build without the animation
+        # module never pays the import cost. Stashed on the instance so
+        # back-to-back interventions reuse the same animation objects.
+        self._headline_anim: object | None = None
+        self._causal_fade_anim: object | None = None
+        self._causal_opacity_effect: object | None = None
+        # Test affordance: when True, ``_play_show_animations`` records
+        # the durations it would use without actually starting the
+        # timers. Useful in offscreen tests where the real Qt event loop
+        # is not free to tick at 16ms intervals.
+        self._record_animations: bool = False
+        self._last_animation_log: dict[str, int] = {}
 
         self._build_ui()
 
@@ -594,7 +634,130 @@ class OverlayWindow(QWidget):
         self.raise_()
         self.activateWindow()
 
+        # Phase J-4: subtle scale-in (headline) + fade-in (causal row)
+        # micro-interactions. Skipped entirely under Reduce Motion or
+        # when the Qt build lacks QPropertyAnimation. The animations
+        # are visually subordinate to the breathing pacer (which keeps
+        # its existing rhythm); the dismiss button and checkboxes are
+        # NOT animated per the audit's "strictly purposeful" rule.
+        self._play_show_animations()
+
         logger.info(f"Overlay shown for intervention {self._intervention_id}")
+
+    # ------------------------------------------------------------------
+    # Phase J-4: micro-interactions
+    # ------------------------------------------------------------------
+
+    def _play_show_animations(self) -> None:
+        """Animate the headline (scale-in 250 ms) and the causal row
+        (fade-in 180 ms, starts after the headline animation completes).
+
+        Honours the macOS "Reduce Motion" accessibility preference: when
+        enabled, both end states are applied directly and the animations
+        skip entirely.
+
+        Defensive: short-circuits when the Qt build lacks the animation
+        classes (the lightweight test stubs) or when the headline /
+        causal widgets are unavailable. The end state is always applied
+        so the UI never gets stuck in a half-animated state.
+        """
+        # Always record the durations we *would* use so the unit test
+        # can assert against the wired-up constants without spinning a
+        # real event loop.
+        reduced = self._reduce_motion_enabled()
+        if reduced:
+            headline_ms = 0
+            causal_ms = 0
+        else:
+            headline_ms = HEADLINE_SCALE_DURATION_MS
+            causal_ms = CAUSAL_FADE_DURATION_MS
+        self._last_animation_log = {
+            "headline_ms": headline_ms,
+            "causal_ms": causal_ms,
+            "reduce_motion": int(reduced),
+        }
+
+        if self._record_animations:
+            # Test mode: capture the contract and return without
+            # touching the real animation classes.
+            return
+
+        if reduced or not _ANIMATION_AVAILABLE:
+            # Reduce-motion / mocked-out path: apply the end state directly.
+            # The causal label is whatever ``_show_causal_explanation``
+            # set; ensure its opacity effect (if any) is at full.
+            self._reset_causal_opacity_to_full()
+            return
+
+        # Headline scale-in: animate ``geometry`` from a slightly
+        # squashed rect to the natural rect. The squash is 90 % height
+        # so the eye reads it as growing into place; lateral position
+        # is preserved so the text doesn't appear to drift.
+        try:
+            target_rect = self._headline.geometry()
+            squashed = QRect(
+                target_rect.x(),
+                target_rect.y() + target_rect.height() // 20,
+                target_rect.width(),
+                max(1, int(target_rect.height() * 0.9)),
+            )
+            self._headline.setGeometry(squashed)
+            anim = QPropertyAnimation(self._headline, b"geometry")
+            anim.setDuration(HEADLINE_SCALE_DURATION_MS)
+            anim.setStartValue(squashed)
+            anim.setEndValue(target_rect)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._headline_anim = anim
+            anim.start()
+        except Exception:
+            logger.debug("Headline scale-in animation failed", exc_info=True)
+
+        # Causal fade-in: opacity 0 → 1 over 180 ms, started after the
+        # headline animation completes so the two reads as one
+        # continuous motion. We arm a singleShot timer for the start
+        # rather than chaining via ``finished`` because the headline
+        # animation may be replaced (back-to-back interventions) and a
+        # finished signal carries no context about which run it
+        # belongs to.
+        if not getattr(self, "_causal_label", None):
+            return
+        try:
+            effect = self._causal_opacity_effect
+            if effect is None:
+                effect = QGraphicsOpacityEffect(self._causal_label)
+                self._causal_label.setGraphicsEffect(effect)
+                self._causal_opacity_effect = effect
+            effect.setOpacity(0.0)
+            fade = QPropertyAnimation(effect, b"opacity")
+            fade.setDuration(CAUSAL_FADE_DURATION_MS)
+            fade.setStartValue(0.0)
+            fade.setEndValue(1.0)
+            fade.setEasingCurve(QEasingCurve.Type.InOutSine)
+            self._causal_fade_anim = fade
+            QTimer.singleShot(HEADLINE_SCALE_DURATION_MS, fade.start)
+        except Exception:
+            logger.debug("Causal fade-in animation failed", exc_info=True)
+            self._reset_causal_opacity_to_full()
+
+    def _reduce_motion_enabled(self) -> bool:
+        """Wrapper around :func:`mac_native.prefers_reduced_motion` so a
+        test can monkeypatch the predicate without reaching into
+        ``mac_native``."""
+        try:
+            return bool(mac_native.prefers_reduced_motion())
+        except Exception:
+            return False
+
+    def _reset_causal_opacity_to_full(self) -> None:
+        """Restore the causal row's opacity effect (if any) to full so
+        a Reduce-Motion path doesn't leave the label hidden behind a
+        stale 0-opacity effect from a prior intervention."""
+        effect = self._causal_opacity_effect
+        if effect is not None:
+            try:
+                effect.setOpacity(1.0)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # F51: causal-explanation truncation + Show more toggle

@@ -239,6 +239,39 @@ def is_dark_appearance() -> bool:
         return False
 
 
+def prefers_reduced_motion() -> bool:
+    """Return True when the user has the macOS "Reduce Motion"
+    accessibility preference enabled (System Settings → Accessibility →
+    Display → Reduce motion). Phase J-4.
+
+    UI surfaces that animate (overlay headline scale-in, fade-ins,
+    transitions) should consult this and skip the tween — applying the
+    end state directly — when it returns True. The result is read fresh
+    every call rather than cached because the user can toggle the
+    preference mid-session; the AppKit call is cheap (a single property
+    read on ``NSWorkspace``).
+
+    Falls back to ``False`` on non-mac platforms and when AppKit is
+    unavailable — motion is then governed by the calling code's
+    explicit timing constants. This is intentional: a non-mac harness
+    or test stub should exercise the animation path, not the skip path.
+    """
+    AppKit = _appkit()
+    if AppKit is None:
+        return False
+    try:
+        workspace = AppKit.NSWorkspace.sharedWorkspace()
+        if workspace is None:
+            return False
+        # ``accessibilityDisplayShouldReduceMotion`` is the canonical
+        # public API (10.12+). Older fallback path is the deprecated
+        # ``defaults read com.apple.universalaccess reduceMotion`` which
+        # we do not need — Cortex's minimum macOS is well above 10.12.
+        return bool(workspace.accessibilityDisplayShouldReduceMotion())
+    except Exception:  # pragma: no cover
+        return False
+
+
 def system_accent_hex() -> str | None:
     """Hex string of the user's current macOS accent color, or None.
 
