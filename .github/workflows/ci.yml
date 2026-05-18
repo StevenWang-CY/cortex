@@ -1,0 +1,59 @@
+name: ci
+
+# Cortex CI — primary gate is the schema-codegen drift check (audit
+# Debt-1 closure). The check ensures the committed
+# ``cortex/apps/browser_extension/types/generated/cortex_schemas.d.ts``
+# stays in sync with the Pydantic source of truth in
+# ``cortex/libs/schemas/``. Any divergence fails the build and
+# blocks the merge until the developer runs
+# ``python -m cortex.scripts.generate_ts_schemas`` and commits the
+# refreshed file.
+#
+# Future phases of the audit plan extend this workflow with pytest,
+# ruff, mypy, and the TypeScript test suite (F40). Those jobs land
+# in their own commits to keep ordering atomic.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-flight runs on PR updates — saves runner minutes and
+# guarantees the merge-gate result reflects the latest commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  schema-codegen-check:
+    name: schema-codegen-check (Debt-1 drift gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node (for json2ts)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # ``pydantic-to-typescript`` shells out to ``json2ts`` from the
+      # ``json-schema-to-typescript`` npm package. We install both
+      # halves here; the Python script discovers ``json2ts`` on PATH.
+      - name: Install json-schema-to-typescript
+        run: npm install -g json-schema-to-typescript
+
+      - name: Install Python codegen extras
+        run: pip install -e "./cortex[codegen]"
+
+      # The drift gate: regenerate into a tempfile and diff against
+      # the committed copy. Exit 1 prints the diff and fails the job.
+      - name: Verify cortex_schemas.d.ts is in sync
+        run: python -m cortex.scripts.generate_ts_schemas --check
