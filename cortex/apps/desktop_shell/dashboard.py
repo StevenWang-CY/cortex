@@ -329,6 +329,13 @@ class _ConsumerTab(QWidget):
         # Qt's restyle / paint chain when the user's state is unchanged.
         # Keyed by id(widget) because QWidget is not hashable on every Qt build.
         self._render_cache: dict[int, dict[str, str]] = {}
+        # Phase J-3: empty-state flag. Flips False on the first ``update_state``
+        # call so the placeholder paragraph in the biometrics card vanishes
+        # and the live BPM / HRV / BLK numerics take over. The flag is sticky
+        # — once Cortex has rendered live data, subsequent reconnects keep
+        # the live UI (the dashboard reuses cached values rather than
+        # collapsing back to "no data yet").
+        self._has_received_state: bool = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(SP6, SP5, SP6, SP6)
@@ -459,6 +466,32 @@ class _ConsumerTab(QWidget):
             f"color: {_LABEL_SECONDARY}; background: transparent;"
         )
         bio_inner.addWidget(bio_heading)
+
+        # Phase J-3: empty-state placeholder. Pre-first-frame the BPM /
+        # HRV / BLK numerics carry placeholder "--" glyphs but that
+        # reads as "stuck at zero" rather than "we haven't started yet".
+        # The placeholder paragraph below sets the expectation: nothing
+        # is broken; the daemon simply hasn't captured a frame. Hidden
+        # the moment ``update_state`` arrives.
+        self._bio_empty_state = QLabel(
+            "Start a session to see your biometrics."
+        )
+        self._bio_empty_state.setObjectName("CortexBioEmptyState")
+        self._bio_empty_state.setWordWrap(True)
+        self._bio_empty_state.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._bio_empty_state.setFont(
+            mac_native.system_font(FS_CAPTION, "regular")
+        )
+        self._bio_empty_state.setStyleSheet(
+            "QLabel#CortexBioEmptyState {"
+            f"  color: {_LABEL_TERTIARY};"
+            "  background: transparent;"
+            "  padding: 2px 0 6px 0;"
+            "  font-style: italic;"
+            "}"
+        )
+        _set_accessible_name(self._bio_empty_state, "Biometrics empty state")
+        bio_inner.addWidget(self._bio_empty_state)
 
         bio_row = QHBoxLayout()
         bio_row.setSpacing(0)
@@ -659,6 +692,19 @@ class _ConsumerTab(QWidget):
         return True
 
     def update_state(self, payload: dict) -> None:
+        # Phase J-3: first frame retires the empty state. The flag is
+        # sticky so a transient WS disconnect doesn't collapse the UI
+        # back to "no data yet" — the rendered numerics carry the last
+        # known reading, which is more useful than a placeholder.
+        if not self._has_received_state:
+            self._has_received_state = True
+            try:
+                self._bio_empty_state.setVisible(False)
+            except Exception:
+                # Lightweight mock widgets may not expose setVisible —
+                # the flag itself is what the contract pins on.
+                pass
+
         state = payload.get("state", "FLOW")
         color = STATE_COLORS.get(state, _LABEL_TERTIARY)
         label = STATE_LABELS.get(state, state)
@@ -878,10 +924,40 @@ class _AdvancedTab(QWidget):
         # F31: render-cache per widget; only setText / setValue when the
         # value differs from the last applied write.
         self._render_cache: dict[int, dict[str, object]] = {}
+        # Phase J-3: empty-state flag. Before the first capture frame
+        # arrives the developer-debug widgets are uninformative (all
+        # bars at zero, plot blank, scores all 0.00). The empty-state
+        # panel below sets expectations; ``update_state`` flips the flag
+        # and hides it.
+        self._has_received_state: bool = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(SP6, SP5, SP6, SP6)
         layout.setSpacing(SP4)
+
+        # Phase J-3: empty-state panel at the top of the advanced tab.
+        # Communicates "we haven't started yet" before any state arrives
+        # so the developer (and curious user) doesn't read the zero bars
+        # as "Cortex is broken". Hidden once update_state arrives.
+        self._empty_state = QLabel(
+            "Start a session to populate signal quality, heart-rate "
+            "trace, and state scores."
+        )
+        self._empty_state.setObjectName("CortexAdvancedEmptyState")
+        self._empty_state.setWordWrap(True)
+        self._empty_state.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self._empty_state.setFont(mac_native.system_font(FS_CAPTION, "regular"))
+        self._empty_state.setStyleSheet(
+            "QLabel#CortexAdvancedEmptyState {"
+            f"  color: {_LABEL_TERTIARY};"
+            f"  background: {_GROUPED_BG};"
+            f"  border-radius: {RADIUS_CARD}px;"
+            "  padding: 10px 14px;"
+            "  font-style: italic;"
+            "}"
+        )
+        _set_accessible_name(self._empty_state, "Advanced tab empty state")
+        layout.addWidget(self._empty_state)
 
         # F18 (audit): a small badge that surfaces when the daemon falls
         # back to synthetic state inference. Hidden by default so the
@@ -1028,6 +1104,14 @@ class _AdvancedTab(QWidget):
         return True
 
     def update_state(self, payload: dict) -> None:
+        # Phase J-3: first frame retires the empty-state panel.
+        if not self._has_received_state:
+            self._has_received_state = True
+            try:
+                self._empty_state.setVisible(False)
+            except Exception:
+                pass
+
         scores = payload.get("scores", {})
         sig_q = payload.get("signal_quality", {})
         confidence = payload.get("confidence", 0.0)
