@@ -60,7 +60,6 @@ from cortex.apps.desktop_shell.tokens import (
     SEMANTIC_LIGHT,
     SP2,
     SP3,
-    SP4,
 )
 
 logger = logging.getLogger(__name__)
@@ -242,6 +241,24 @@ class Toast(QFrame):
                 "title": title,
             },
         )
+
+    def show_info(self, title: str, body: str) -> None:
+        """B2 (audit-prod): info-toast variant for success / status
+        messages (e.g. "Cortex is now using your LLM" after BYOK reload).
+
+        Reuses the same slots as ``show_error`` — only the title/body
+        copy and the absence of a cid distinguish the two. The toast
+        component itself is style-neutral; callers decide the message
+        tone via the title text.
+        """
+        self._current_cid = ""
+        self._title_label.setText(title or "")
+        self._body_label.setText(body or "")
+        self._cid_label.setText("")
+        self._timer.start(self._duration_ms)
+        self.show()
+        self.raise_()
+        logger.info("Toast surfaced (info): %s — %s", title, body)
 
     @property
     def current_cid(self) -> str:

@@ -27,13 +27,11 @@ surfaced as a toast.
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from typing import Deque
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -95,7 +93,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         # ``defaultdict`` over a tuple key keeps the API simple; tests
         # can introspect ``self._buckets`` directly to assert window
         # behaviour without touching private internals.
-        self._buckets: dict[tuple[str, str], Deque[float]] = defaultdict(deque)
+        self._buckets: dict[tuple[str, str], deque[float]] = defaultdict(deque)
 
     # -- Public surface used by the FastAPI app ---------------------------
 

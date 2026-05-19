@@ -352,6 +352,10 @@ function CortexPopup(): React.ReactElement {
         chrome.runtime.sendMessage({ type: "GET_DAILY_STATS" }, (stats) => {
             if (stats) setDailyStats(stats);
         });
+        // G2 (audit-prod): ask the background script to re-run its
+        // connectivity probe so the popup renders a fresh diagnostic
+        // (native-host / daemon-version / handshake) at open time.
+        chrome.runtime.sendMessage({ type: "REQUEST_CONNECTIVITY_DIAGNOSTIC" });
     }, []);
 
     // F50: stable listener identity so addListener/removeListener

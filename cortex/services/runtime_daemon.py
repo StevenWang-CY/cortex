@@ -32,6 +32,7 @@ from cortex.libs.schemas.intervention import (
 )
 from cortex.libs.schemas.leetcode import LeetCodeContext
 from cortex.libs.schemas.state import UserBaselines
+from cortex.libs.schemas.ws_message_types import MessageType
 
 # v2.0 imports
 from cortex.libs.store import InMemoryStore, RedisStore
@@ -401,6 +402,11 @@ class CortexDaemon:
         self._ws_server.set_shutdown_callback(self._request_shutdown)
         self._ws_server.set_leetcode_context_callback(self._handle_leetcode_context_update)
         self._ws_server.set_intervention_applied_callback(self._handle_intervention_applied)
+        # G1 (audit-prod): caller registers via set_client_identified_callback
+        # to bridge connection events to the desktop shell. Default is a
+        # noop list so the daemon can still run headless.
+        self._client_identified_listeners: list[Callable[[str, bool], None]] = []
+        self._ws_server.set_client_identified_callback(self._on_client_identified)
 
         self._leetcode_adapter = LeetCodeAdapter()
         self._leetcode_adapter.set_ws_sender(self._send_leetcode_ws_message)
@@ -1435,6 +1441,15 @@ class CortexDaemon:
                             "calibrated_probabilities": getattr(estimate, "calibrated_probabilities", None),
                             "classifier_source": getattr(estimate, "classifier_source", None),
                             "classifier_alpha": getattr(estimate, "classifier_alpha", None),
+                            # G1 (audit-prod): forward the WS server's view of
+                            # currently-IDENTIFY-ed clients so the dashboard
+                            # dots react in real time even on the in-process
+                            # DMG path (no WS roundtrip).
+                            "connected_clients": (
+                                self._ws_server.connected_client_types()
+                                if hasattr(self._ws_server, "connected_client_types")
+                                else []
+                            ),
                         }
                         self._state_callback(copy.deepcopy(_payload))
 
@@ -1844,6 +1859,28 @@ class CortexDaemon:
                 user_action=outcome.user_action,
             )
 
+    async def dispatch_action_to_browser(
+        self,
+        intervention_id: str,
+        action: dict[str, Any],
+    ) -> int:
+        """G4 (audit-prod): forward a desktop-overlay action click to the
+        browser extension(s) so they actually execute it. Returns the
+        count of clients the dispatch reached (0 = no browser client
+        connected).
+        """
+        if not intervention_id or not isinstance(action, dict):
+            return 0
+        try:
+            return await self._ws_server.send_message(
+                MessageType.ACTION_DISPATCH.value,
+                {"intervention_id": intervention_id, "action": action},
+                target_client_types=["chrome", "edge"],
+            )
+        except Exception:
+            logger.exception("ACTION_DISPATCH send failed")
+            return 0
+
     async def _handle_user_action(self, payload: dict[str, Any]) -> None:
         # Log suggested action executions from the Chrome extension
         if payload.get("action_id") and payload.get("action_type"):
@@ -1853,6 +1890,26 @@ class CortexDaemon:
                 "action_type": payload.get("action_type"),
                 "result": payload.get("result"),
             })
+            # G4 (audit-prod): when the request originates from the
+            # desktop shell (no ``result`` field; the result only exists
+            # on the executed-by-extension reply path), forward to the
+            # browser so the action actually runs.
+            if (
+                payload.get("result") is None
+                and payload.get("request_dispatch") is True
+            ):
+                action = payload.get("action") if isinstance(payload.get("action"), dict) else {
+                    "action_id": payload.get("action_id"),
+                    "action_type": payload.get("action_type"),
+                    "label": payload.get("label", ""),
+                    "reason": payload.get("reason", ""),
+                    "target": payload.get("target"),
+                    "tab_index": payload.get("tab_index"),
+                }
+                await self.dispatch_action_to_browser(
+                    str(payload.get("intervention_id") or ""),
+                    action,
+                )
             return
 
         # v2.0: Handle user ratings
@@ -2461,6 +2518,32 @@ class CortexDaemon:
                 await asyncio.sleep(3600.0)  # every hour
         except asyncio.CancelledError:
             pass
+
+    def register_client_identified_listener(
+        self, listener: Callable[[str, bool], None],
+    ) -> None:
+        """Audit-prod G1: subscribe to (client_type, connected) events.
+
+        The desktop shell registers exactly one listener; it forwards the
+        event onto the Qt main thread and updates the dashboard's
+        Chrome / Edge / Editor dots. Idempotent for duplicate listeners.
+        """
+        if listener not in self._client_identified_listeners:
+            self._client_identified_listeners.append(listener)
+
+    def _on_client_identified(self, client_type: str, connected: bool) -> None:
+        """Fan-out helper bound to ``WebSocketServer._client_identified_callback``.
+
+        Runs on the daemon's asyncio loop thread. Each listener is
+        expected to marshal onto its own UI thread if needed.
+        """
+        for listener in list(self._client_identified_listeners):
+            try:
+                listener(client_type, connected)
+            except Exception:
+                logger.debug(
+                    "client_identified listener raised", exc_info=True
+                )
 
     async def reload_llm_credentials(self) -> bool:
         """Audit-2 fix: hot-reload the planner SDK after a BYOK save.

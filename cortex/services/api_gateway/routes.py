@@ -102,6 +102,10 @@ class HealthResponse(BaseModel):
     status: str
     services: dict[str, str]
     uptime_seconds: float
+    # G2 (audit-prod): expose the daemon version so the browser
+    # extension's CONNECTIVITY_DIAGNOSTIC can detect a version mismatch
+    # between the installed extension and the running daemon.
+    version: str | None = None
 
 
 class StatusResponse(BaseModel):
@@ -275,10 +279,32 @@ async def health_check(request: Request) -> HealthResponse:
 
     overall = "healthy" if reg.healthy else "unhealthy"
 
+    # G2 (audit-prod): include the daemon version so the browser
+    # extension's connectivity diagnostic can flag a version mismatch
+    # (popup currently has a UI state for ``installed_version_mismatch``
+    # but no producer until now).
+    daemon_version: str | None
+    try:
+        from importlib.metadata import PackageNotFoundError
+        from importlib.metadata import version as _pkg_version
+
+        try:
+            daemon_version = _pkg_version("cortex")
+        except PackageNotFoundError:
+            try:
+                from cortex import __version__ as _v
+
+                daemon_version = _v
+            except Exception:
+                daemon_version = None
+    except Exception:
+        daemon_version = None
+
     return HealthResponse(
         status=overall,
         services=services,
         uptime_seconds=time.monotonic() - _start_time,
+        version=daemon_version,
     )
 
 

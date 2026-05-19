@@ -34,7 +34,6 @@ import logging
 import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable
 
 import numpy as np
 

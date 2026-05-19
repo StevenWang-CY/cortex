@@ -67,6 +67,7 @@ type ConnectionHandler = (connected: boolean) => void;
 type ContextRequestHandler = () => Promise<Record<string, unknown>>;
 type RestoreHandler = (payload: Record<string, unknown>) => void;
 type SettingsHandler = (payload: Record<string, unknown>) => void;
+type CopilotThrottleHandler = (payload: Record<string, unknown>) => void;
 type GenericMessageHandler = (msg: { type: string; payload: Record<string, unknown> }) => void;
 
 /**
@@ -95,6 +96,13 @@ export class CortexWSClient {
     private _contextRequestHandler: ContextRequestHandler | undefined;
     private _restoreHandlers: RestoreHandler[] = [];
     private _settingsHandlers: SettingsHandler[] = [];
+    // B1 (audit-prod): explicit handler list for COPILOT_THROTTLE so the
+    // message is dispatched through a dedicated arm of the switch rather
+    // than falling through to the generic-default. The generic arm
+    // silently drops the message if no listener happens to be
+    // registered at the time the frame arrives; the explicit arm makes
+    // the contract visible at the dispatch site.
+    private _copilotThrottleHandlers: CopilotThrottleHandler[] = [];
     private _genericMessageHandlers: GenericMessageHandler[] = [];
 
     constructor(url: string) {
@@ -132,6 +140,14 @@ export class CortexWSClient {
 
     onSettingsSync(handler: SettingsHandler): void {
         this._settingsHandlers.push(handler);
+    }
+
+    /** B1 (audit-prod): register a handler for COPILOT_THROTTLE
+     * directives from the daemon. The handler is invoked from the
+     * explicit ``case "COPILOT_THROTTLE"`` arm rather than via the
+     * generic-default fallback. */
+    onCopilotThrottle(handler: CopilotThrottleHandler): void {
+        this._copilotThrottleHandlers.push(handler);
     }
 
     /** Register a handler for any message type (called for all messages). */
@@ -350,6 +366,31 @@ export class CortexWSClient {
                         handler(msg.payload);
                     } catch {
                         // Ignore handler errors
+                    }
+                }
+                break;
+
+            case "COPILOT_THROTTLE":
+                // B1 (audit-prod): explicit arm. Previously the message
+                // dropped to the generic-default and worked only as long
+                // as the extension.ts ``onMessage`` listener was
+                // registered before the first frame arrived. The
+                // dedicated handler list makes the contract visible at
+                // the dispatch site.
+                for (const handler of this._copilotThrottleHandlers) {
+                    try {
+                        handler(msg.payload);
+                    } catch {
+                        // Handler error should not crash the client
+                    }
+                }
+                // Also forward to generic handlers for backwards-compat
+                // with existing extension.ts that listens via onMessage.
+                for (const handler of this._genericMessageHandlers) {
+                    try {
+                        handler(msg);
+                    } catch {
+                        // Handler error should not crash the client
                     }
                 }
                 break;

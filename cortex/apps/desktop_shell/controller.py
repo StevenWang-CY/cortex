@@ -230,6 +230,12 @@ class CortexAppController:
         self._bridge.error_occurred.connect(self._on_error_occurred)
 
         self._overlay.dismissed.connect(self._on_overlay_dismissed)
+        # G4 (audit-prod): overlay action buttons emit ``action_invoked``;
+        # the in-process controller has a direct daemon reference so it
+        # can route native actions (clipboard, timer) directly and call
+        # ``dispatch_action_to_browser`` for everything else.
+        if hasattr(self._overlay, "action_invoked"):
+            self._overlay.action_invoked.connect(self._on_action_invoked)
         self._settings.settings_changed.connect(self._on_settings_changed)
         self._settings.back_requested.connect(self._show_dashboard)
         self._connections.back_requested.connect(self._show_dashboard)
@@ -464,6 +470,98 @@ class CortexAppController:
                 self._daemon_loop,
             )
 
+    @Slot(str, dict)
+    def _on_action_invoked(self, intervention_id: str, action: dict) -> None:
+        """G4 (audit-prod): handle a desktop overlay action button click.
+
+        Native action types execute in the desktop shell directly so the
+        user gets immediate feedback without a WS roundtrip; browser-bound
+        actions are forwarded to chrome/edge via the daemon's
+        ``dispatch_action_to_browser`` helper. Either way we record an
+        engaged USER_ACTION on the daemon so the dismissal/engagement
+        ledger reflects what happened.
+        """
+        if self._daemon is None or self._daemon_loop is None:
+            return
+        action_type = str(action.get("action_type") or "")
+        action_id = str(action.get("action_id") or "")
+        executed_natively = False
+        try:
+            if action_type == "copy_to_clipboard":
+                self._copy_to_clipboard(str(action.get("target") or ""))
+                executed_natively = True
+            elif action_type == "start_timer":
+                # ``target`` may carry a duration label; just log it. The
+                # timer surface is best handled by the daemon's existing
+                # break-scheduler, not a fresh QTimer in the controller.
+                executed_natively = True
+        except Exception:
+            logger.debug("Native action execution failed", exc_info=True)
+
+        # Always record the engagement on the daemon side so the dismissal
+        # model + restore manager see the user's intent.
+        engage_payload = {
+            "action": "engaged",
+            "intervention_id": intervention_id,
+        }
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._daemon._handle_user_action(engage_payload),
+                self._daemon_loop,
+            )
+        except Exception:
+            logger.debug("Engaged USER_ACTION submission failed", exc_info=True)
+
+        # For browser-bound actions, dispatch to the connected extension
+        # so the action actually executes. The daemon-side method is a
+        # no-op if no chrome/edge client is connected.
+        if not executed_natively:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._daemon.dispatch_action_to_browser(
+                        intervention_id, dict(action),
+                    ),
+                    self._daemon_loop,
+                )
+            except Exception:
+                logger.debug("dispatch_action_to_browser failed", exc_info=True)
+
+        # Record an action_executed entry so the recorder includes the
+        # desktop-originated click in the session log.
+        log_payload = {
+            "action_id": action_id,
+            "action_type": action_type,
+            "intervention_id": intervention_id,
+            "result": {"native": executed_natively, "source": "desktop_overlay"},
+        }
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._daemon._handle_user_action(log_payload),
+                self._daemon_loop,
+            )
+        except Exception:
+            logger.debug("action_executed log submission failed", exc_info=True)
+
+    def _copy_to_clipboard(self, text: str) -> None:
+        """Copy ``text`` to the macOS clipboard via QGuiApplication.
+
+        Falls back to a debug log if the clipboard is unavailable (test
+        fixtures, headless CI).
+        """
+        if not text:
+            return
+        try:
+            from PySide6.QtGui import QGuiApplication
+
+            clip = QGuiApplication.clipboard()
+            if clip is not None:
+                clip.setText(text)
+                logger.info(
+                    "Copied %d chars to clipboard via desktop overlay", len(text)
+                )
+        except Exception:
+            logger.debug("Clipboard copy failed", exc_info=True)
+
     @Slot(dict)
     def _on_settings_changed(self, settings: dict) -> None:
         if self._daemon is not None and self._daemon_loop is not None:
@@ -627,6 +725,10 @@ class CortexAppController:
 
         Runs on the daemon thread so the SDK rebuild does not race with
         an in-flight ``generate_intervention_plan`` call.
+
+        B2 (audit-prod): on success, surface a one-line confirmation
+        toast on the dashboard so the user sees that the new token is
+        live and the next intervention will use the LLM.
         """
         if self._daemon is None or self._daemon_loop is None:
             return
@@ -639,6 +741,18 @@ class CortexAppController:
                 ok = planner.reload_credentials()
                 if ok:
                     logger.info("LLM planner credentials reloaded after BYOK save")
+                    # Hop back to the Qt main thread to surface the toast.
+                    try:
+                        from PySide6.QtCore import QTimer
+
+                        QTimer.singleShot(
+                            0, lambda: self._show_byok_success_toast()
+                        )
+                    except Exception:
+                        logger.debug(
+                            "BYOK success toast scheduling failed",
+                            exc_info=True,
+                        )
                 else:
                     logger.warning("LLM planner credentials reload returned False")
             except Exception:
@@ -648,3 +762,14 @@ class CortexAppController:
             self._daemon_loop.call_soon_threadsafe(_do_reload)
         except Exception:
             logger.debug("Failed to schedule reload_credentials", exc_info=True)
+
+    def _show_byok_success_toast(self) -> None:
+        if self._dashboard is None or not hasattr(self._dashboard, "show_info_toast"):
+            return
+        try:
+            self._dashboard.show_info_toast(
+                "Cortex is now using your LLM",
+                "BYOK token saved — your next intervention will use it.",
+            )
+        except Exception:
+            logger.debug("show_info_toast call failed", exc_info=True)

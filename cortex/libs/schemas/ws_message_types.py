@@ -132,6 +132,17 @@ class MessageType(str, Enum):
     AMBIENT_STATE_UPDATE = "AMBIENT_STATE_UPDATE"
     """Lightweight state heartbeat for the always-on ambient overlay."""
 
+    ACTION_DISPATCH = "ACTION_DISPATCH"
+    """Audit-prod G4: daemon → browser-extension directive to actually
+    execute a ``SuggestedAction`` (e.g. close a tab, group tabs). Emitted
+    when the desktop-shell overlay's action button is clicked for a
+    browser-bound action — the desktop shell can't directly run
+    ``chrome.tabs.*`` so the daemon forwards the action object to a
+    chrome/edge client. Payload:
+    ``{intervention_id: str, action: SuggestedAction.model_dump()}``.
+    The receiver runs ``executeAction(action)`` then sends back the
+    standard ``ACTION_EXECUTE`` log message."""
+
     # ─── LeetCode adapter cues (Daemon → Chrome, target_client_types=["chrome"]) ─
     # Emitted by ``LeetCodeAdapter.execute`` via
     # ``runtime_daemon._send_leetcode_ws_message`` → ``WebSocketServer.send_message``

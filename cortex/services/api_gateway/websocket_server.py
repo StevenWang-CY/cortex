@@ -198,6 +198,8 @@ class WebSocketServer:
         self._tab_relevance_feedback_callback: Any = None
         self._leetcode_context_callback: Any = None
         self._intervention_applied_callback: Any = None
+        # G1 (audit-prod): fired on IDENTIFY + on identified-client disconnect.
+        self._client_identified_callback: Any = None
 
         # Latest state for new connections
         self._latest_state: StateEstimate | None = None
@@ -230,6 +232,20 @@ class WebSocketServer:
     @property
     def connected_clients(self) -> list[str]:
         return list(self._clients.keys())
+
+    def connected_client_types(self) -> list[str]:
+        """G1 (audit-prod): return the deduped list of IDENTIFY-ed client
+        types currently connected (e.g. ``["chrome", "vscode"]``). Each
+        type appears exactly once even if multiple browser tabs or VS
+        Code windows are connected. ``"unknown"`` and ``"desktop"`` are
+        filtered out so the dashboard doesn't see itself.
+        """
+        seen: set[str] = set()
+        for client in self._clients.values():
+            ct = client.client_type
+            if ct and ct not in ("unknown", "desktop"):
+                seen.add(ct)
+        return sorted(seen)
 
     def set_user_action_callback(self, callback: Any) -> None:
         """Set callback for USER_ACTION messages from extensions."""
@@ -266,6 +282,21 @@ class WebSocketServer:
         real world rather than the assumed default.
         """
         self._intervention_applied_callback = callback
+
+    def set_client_identified_callback(self, callback: Any) -> None:
+        """Audit-prod fix (G1): callback fired when a client IDENTIFY frame
+        is received OR when a previously-identified client disconnects.
+
+        Signature: ``callback(client_type: str, connected: bool)``.
+
+        Used by the desktop shell to update the Chrome / Edge / Editor
+        connection dots on the dashboard. The dot only changes color
+        when an IDENTIFY succeeds — the WS ``connected`` flag alone
+        is not sufficient because IDENTIFY can fail (wrong client_type
+        literal, auth pending, etc.). The disconnect case re-grays the
+        dot so the user can see when the extension goes away.
+        """
+        self._client_identified_callback = callback
 
     async def start(self) -> bool:
         """
@@ -343,6 +374,24 @@ class WebSocketServer:
             # with this client so the calling coroutine returns promptly
             # rather than waiting for the per-call timeout.
             self._cancel_pending_for_client(client_id)
+            # G1 (audit-prod): if this client previously IDENTIFY-ed, tell
+            # the listener it's gone so the dashboard dot re-grays.
+            cb = self._client_identified_callback
+            if (
+                cb is not None
+                and client.client_type
+                and client.client_type != "unknown"
+            ):
+                try:
+                    if asyncio.iscoroutinefunction(cb):
+                        await cb(client.client_type, False)
+                    else:
+                        cb(client.client_type, False)
+                except Exception:
+                    logger.debug(
+                        "client_identified callback raised (disconnect)",
+                        exc_info=True,
+                    )
             logger.info(f"Client disconnected: {client_id}")
 
     async def _process_message(
@@ -428,6 +477,20 @@ class WebSocketServer:
             logger.info(
                 f"Client {client.client_id} identified as {client.client_type}"
             )
+            # G1 (audit-prod): notify any registered listener (the desktop
+            # shell uses this to update the Chrome / Edge / Editor dots).
+            cb = self._client_identified_callback
+            if cb is not None and client.client_type and client.client_type != "unknown":
+                try:
+                    if asyncio.iscoroutinefunction(cb):
+                        await cb(client.client_type, True)
+                    else:
+                        cb(client.client_type, True)
+                except Exception:
+                    logger.debug(
+                        "client_identified callback raised (connect)",
+                        exc_info=True,
+                    )
         elif msg.type == MessageType.CONTEXT_RESPONSE.value:
             self._handle_context_response(msg)
         elif msg.type == MessageType.SETTINGS_SYNC.value:
@@ -1117,6 +1180,11 @@ class WebSocketServer:
             "source": envelope_source,
             "degraded": degraded,
             "timestamp": _serialize_timestamp(estimate.timestamp),
+            # G1 (audit-prod): stamp the deduped list of currently-IDENTIFY-ed
+            # client types so consumers (desktop dashboard) can light up the
+            # Chrome / Edge / Editor connection dots without subscribing to
+            # a separate event stream.
+            "connected_clients": self.connected_client_types(),
         }
         if biometrics:
             payload["biometrics"] = biometrics

@@ -656,9 +656,89 @@ function handleDisconnect(): void {
         connected = false;
         broadcastToPopup({ type: "CONNECTION_CHANGED", connected: false });
     }
+    // G2 (audit-prod): probe the four-state diagnostic on disconnect so
+    // the popup can render an actionable error (not_installed /
+    // installed_no_daemon / version_mismatch / handshake_failed).
+    void probeConnectivity("disconnected").catch(() => undefined);
     if (!intentionalDisconnect) {
         scheduleReconnect();
     }
+}
+
+/**
+ * G2 (audit-prod): emit a ``CONNECTIVITY_DIAGNOSTIC`` extension-internal
+ * message that the popup consumes (popup.tsx:423). Three probes:
+ *  1. native-host present? (chrome.runtime.sendNativeMessage round-trip)
+ *  2. daemon version (HTTP /health → ``version`` field)
+ *  3. last WS close reason (handshake error?)
+ *
+ * Each probe is best-effort with a tight timeout; failures slot into
+ * the diagnostic payload as ``missing`` / ``null`` so the popup can map
+ * to its four-state UI.
+ */
+async function probeConnectivity(trigger: string): Promise<void> {
+    let nativeHostStatus: "present" | "missing" = "missing";
+    try {
+        await new Promise<void>((resolve, reject) => {
+            const timeout = setTimeout(() => reject(new Error("native_host_ping_timeout")), 1500);
+            try {
+                chrome.runtime.sendNativeMessage(
+                    "com.cortex.launcher",
+                    { command: "status" },
+                    (response) => {
+                        clearTimeout(timeout);
+                        if (chrome.runtime.lastError) {
+                            reject(new Error(chrome.runtime.lastError.message || "native_host_error"));
+                        } else if (response) {
+                            nativeHostStatus = "present";
+                            resolve();
+                        } else {
+                            reject(new Error("native_host_empty_response"));
+                        }
+                    },
+                );
+            } catch (e) {
+                clearTimeout(timeout);
+                reject(e instanceof Error ? e : new Error(String(e)));
+            }
+        });
+    } catch {
+        nativeHostStatus = "missing";
+    }
+
+    let daemonVersion: string | null = null;
+    try {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 1500);
+        const resp = await fetch(`${DAEMON_HTTP_URL}/health`, {
+            signal: ctrl.signal,
+        });
+        clearTimeout(t);
+        if (resp.ok) {
+            const body = (await resp.json()) as { version?: string | null };
+            daemonVersion = body.version ?? null;
+        }
+    } catch {
+        daemonVersion = null;
+    }
+
+    let handshakeError: string | null = null;
+    if (trigger === "disconnected" && !connected) {
+        // The close reason is captured by the ws.onclose listener; for
+        // now, surface a generic indicator that the WS path failed.
+        handshakeError = daemonVersion === null && nativeHostStatus === "missing"
+            ? null
+            : "websocket_failed";
+    }
+
+    broadcastToPopup({
+        type: "CONNECTIVITY_DIAGNOSTIC",
+        payload: {
+            native_host_status: nativeHostStatus,
+            daemon_version: daemonVersion,
+            handshake_error: handshakeError,
+        },
+    });
 }
 
 function scheduleReconnect(): void {
@@ -955,6 +1035,49 @@ async function handleMessage(raw: string): Promise<void> {
             schedulePersist();
             broadcastToPopup({ type: "SETTINGS_SYNC", payload: msg.payload });
             break;
+
+        case "ACTION_DISPATCH": {
+            // G4 (audit-prod): daemon-forwarded request to execute a
+            // suggested action that the desktop-shell overlay's button
+            // initiated. The extension runs the action via the existing
+            // ``executeAction`` helper and reports back the standard
+            // ACTION_EXECUTE log so the daemon can record success.
+            const dispatchPayload = msg.payload as Record<string, unknown>;
+            const interventionId = String(dispatchPayload.intervention_id || "");
+            const action = dispatchPayload.action as SuggestedAction | undefined;
+            if (action && action.action_id && action.action_type) {
+                executeAction(action)
+                    .then((result) => {
+                        send({
+                            type: "ACTION_EXECUTE",
+                            payload: {
+                                intervention_id: interventionId,
+                                action_id: action.action_id,
+                                action_type: action.action_type,
+                                result,
+                                source: "desktop_overlay_dispatch",
+                            },
+                            timestamp: Date.now() / 1000,
+                            sequence: ++sequence,
+                        });
+                    })
+                    .catch(() => {
+                        send({
+                            type: "ACTION_EXECUTE",
+                            payload: {
+                                intervention_id: interventionId,
+                                action_id: action.action_id,
+                                action_type: action.action_type,
+                                result: { success: false, error: "executeAction threw" },
+                                source: "desktop_overlay_dispatch",
+                            },
+                            timestamp: Date.now() / 1000,
+                            sequence: ++sequence,
+                        });
+                    });
+            }
+            break;
+        }
 
         case "BREATHING_OVERLAY": {
             // Route to active tab's content script
@@ -2897,6 +3020,12 @@ chrome.runtime.onMessage.addListener(
                 });
                 return true; // async
 
+            case "REQUEST_CONNECTIVITY_DIAGNOSTIC":
+                // G2 (audit-prod): popup opened; refresh the diagnostic.
+                void probeConnectivity("popup_open").catch(() => undefined);
+                sendResponse({ ok: true });
+                break;
+
             case "CONNECT":
                 connect();
                 sendResponse({ ok: true });
@@ -3514,6 +3643,9 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 chrome.runtime.onInstalled.addListener((details) => {
     chrome.alarms.create("cortex-keepalive", { periodInMinutes: 0.4 });
     connect();
+    // G2 (audit-prod): probe connectivity on install so the popup
+    // immediately renders the right four-state UI before any WS attempt.
+    void probeConnectivity("install").catch(() => undefined);
     // Open onboarding tab only on first-ever install (not updates/reloads)
     if (details.reason === "install") {
         chrome.storage.local.get("cortex_onboarded", (data) => {
@@ -3527,7 +3659,12 @@ chrome.runtime.onInstalled.addListener((details) => {
 
 chrome.runtime.onStartup.addListener(() => {
     connect();
+    // G2 (audit-prod): same probe on every browser-startup activation.
+    void probeConnectivity("startup").catch(() => undefined);
 });
 
 // Start immediately (service worker activation)
 connect();
+// G2 (audit-prod): cold-start probe so a popup opened immediately after
+// service-worker activation has a non-null connectivity diagnostic.
+void probeConnectivity("activation").catch(() => undefined);

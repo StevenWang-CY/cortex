@@ -266,6 +266,12 @@ class OverlayWindow(QWidget):
     """Frameless always-on-top intervention overlay backed by HUD vibrancy."""
 
     dismissed = Signal(str)
+    # G4 (audit-prod): emitted when the user clicks a suggested-action
+    # button. Payload is ``(intervention_id, action_dict)`` matching the
+    # ``SuggestedAction`` schema; the controller / main routes it to
+    # either a native handler (clipboard, timer) or the WS
+    # ``ACTION_EXECUTE`` channel for browser-bound actions.
+    action_invoked = Signal(str, dict)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -404,6 +410,31 @@ class OverlayWindow(QWidget):
         self._steps_container.setSpacing(SP3)
         self._step_widgets: list[QCheckBox] = []
         card_layout.addLayout(self._steps_container)
+
+        # G4 (audit-prod): suggested-action buttons. Rendered in
+        # ``show_intervention`` whenever the plan carries a non-empty
+        # ``suggested_actions`` list. Each click emits ``action_invoked``;
+        # the controller routes browser-bound actions through the WS
+        # ACTION_EXECUTE channel and handles ``copy_to_clipboard`` /
+        # ``start_timer`` natively in the desktop shell.
+        self._actions_container = QVBoxLayout()
+        self._actions_container.setSpacing(SP2)
+        self._action_buttons: list[QPushButton] = []
+        # Sentinel caption shown when the plan contains browser-bound
+        # actions but no Chrome/Edge client is currently identified.
+        self._actions_caption = QLabel("")
+        self._actions_caption.setFont(
+            mac_native.system_font(FS_CAPTION, "regular")
+        )
+        self._actions_caption.setStyleSheet(
+            f"color: {_TEXT_TERTIARY.name()};"
+            "background: transparent;"
+            "font-style: italic;"
+        )
+        self._actions_caption.setWordWrap(True)
+        self._actions_caption.hide()
+        card_layout.addLayout(self._actions_container)
+        card_layout.addWidget(self._actions_caption)
 
         # "Why this?" causal explanation — surfaces only when supplied.
         # F51: long explanations are truncated to a one-line preview with
@@ -609,6 +640,17 @@ class OverlayWindow(QWidget):
             )
             self._steps_container.addWidget(cb)
             self._step_widgets.append(cb)
+
+        # G4 (audit-prod): render the suggested_actions as clickable
+        # buttons. ``_render_actions`` clears the prior list, builds new
+        # QPushButtons, and wires each click to emit ``action_invoked``.
+        try:
+            self._render_actions(
+                payload.get("suggested_actions") or [],
+                connected_clients=payload.get("connected_clients") or [],
+            )
+        except Exception:
+            logger.debug("Action rendering failed", exc_info=True)
 
         ui_plan = payload.get("ui_plan", {})
         level = payload.get("level", "overlay_only")
@@ -825,6 +867,134 @@ class OverlayWindow(QWidget):
         else:
             painter.fillRect(self.rect(), QColor(0, 0, 0, 30))
         painter.end()
+
+    # ------------------------------------------------------------------
+    # G4 (audit-prod): suggested-action rendering + dispatch
+    # ------------------------------------------------------------------
+
+    # Action types that the desktop shell can execute natively without
+    # routing through the browser extension. Everything else needs an
+    # IDENTIFY-ed Chrome / Edge / VS Code client to receive the
+    # ACTION_EXECUTE frame.
+    _NATIVE_ACTION_TYPES = frozenset({"copy_to_clipboard", "start_timer"})
+    _BROWSER_ACTION_TYPES = frozenset({
+        "close_tab",
+        "bookmark_and_close",
+        "group_tabs",
+        "open_url",
+        "search_error",
+        "highlight_tab",
+        "save_session",
+    })
+
+    def _render_actions(
+        self,
+        actions: list[dict],
+        connected_clients: list[str] | None = None,
+    ) -> None:
+        """Re-render the suggested_action button list.
+
+        Idempotent: every call clears the prior buttons and creates fresh
+        ones bound to the current payload's ``action_id`` / ``action_type``.
+        Browser-bound actions are disabled (with a caption) when no
+        chrome/edge/vscode client is currently identified.
+        """
+        # Tear down previous buttons.
+        for btn in self._action_buttons:
+            try:
+                self._actions_container.removeWidget(btn)
+                btn.deleteLater()
+            except Exception:
+                pass
+        self._action_buttons.clear()
+
+        if not actions:
+            self._actions_caption.hide()
+            return
+
+        connected = {str(c).lower() for c in (connected_clients or [])}
+        # The desktop shell can drive any browser-side action if either
+        # Chrome OR Edge is identified; VS Code is the executor for
+        # editor-bound actions but none of the 7 browser-bound types
+        # require it. The map of "which client_type executes which
+        # action_type" lives implicitly here.
+        has_browser_executor = bool(connected & {"chrome", "edge"})
+        any_browser_bound = False
+
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            action_type = str(action.get("action_type") or "")
+            label = str(action.get("label") or action_type or "Action")
+            reason = str(action.get("reason") or "")
+            is_browser = action_type in self._BROWSER_ACTION_TYPES
+            is_native = action_type in self._NATIVE_ACTION_TYPES
+
+            btn = QPushButton(label)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
+            if reason:
+                btn.setToolTip(reason)
+            btn.setStyleSheet(
+                "QPushButton {"
+                "  background-color: rgba(255, 255, 255, 0.10);"
+                "  color: rgba(255, 255, 255, 0.92);"
+                "  border: 0.5px solid rgba(255, 255, 255, 0.18);"
+                f"  border-radius: {RADIUS_BUTTON}px;"
+                "  padding: 8px 16px;"
+                "  text-align: left;"
+                "}"
+                "QPushButton:hover {"
+                "  background-color: rgba(255, 255, 255, 0.18);"
+                "  color: white;"
+                "}"
+                "QPushButton:disabled {"
+                "  color: rgba(255, 255, 255, 0.42);"
+                "  background-color: rgba(255, 255, 255, 0.04);"
+                "}"
+            )
+            _set_accessible_name(btn, label)
+
+            if is_browser and not has_browser_executor:
+                btn.setEnabled(False)
+                any_browser_bound = True
+            elif not is_browser and not is_native:
+                # Unknown action_type: disable rather than silently fail.
+                btn.setEnabled(False)
+                btn.setToolTip(f"Unsupported action type: {action_type}")
+
+            # Capture-by-default to bind the action dict to this button.
+            action_snapshot = dict(action)
+            try:
+                btn.clicked.connect(
+                    lambda _checked=False, a=action_snapshot:
+                        self._on_action_clicked(a)
+                )
+            except Exception:
+                pass
+            self._actions_container.addWidget(btn)
+            self._action_buttons.append(btn)
+
+        if any_browser_bound and not has_browser_executor:
+            self._actions_caption.setText(
+                "Open Cortex in Chrome or Edge to enable these actions."
+            )
+            self._actions_caption.show()
+        else:
+            self._actions_caption.clear()
+            self._actions_caption.hide()
+
+    def _on_action_clicked(self, action: dict) -> None:
+        """Emit ``action_invoked`` carrying the current intervention_id +
+        the action dict. The host (controller / main) decides how to
+        dispatch.
+        """
+        if not self._intervention_id:
+            return
+        try:
+            self.action_invoked.emit(self._intervention_id, dict(action))
+        except Exception:
+            logger.debug("action_invoked emit failed", exc_info=True)
 
     def _user_dismiss(self) -> None:
         # F06: idempotent dismiss. First caller wins; subsequent calls no-op.

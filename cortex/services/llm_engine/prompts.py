@@ -63,7 +63,7 @@ def _active_report() -> TruncationReport | None:
     return getattr(_REPORT_BUFFER, "report", None)
 
 
-def capture_truncation_report() -> "_TruncationCapture":
+def capture_truncation_report() -> _TruncationCapture:
     """Context manager that captures a :class:`TruncationReport`.
 
     Usage from the planner::

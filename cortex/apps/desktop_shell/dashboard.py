@@ -770,6 +770,53 @@ class _ConsumerTab(QWidget):
             # Don't let a stats bug crash state rendering.
             pass
 
+        # G1 (audit-prod): the daemon stamps the currently-IDENTIFY-ed
+        # client types into every STATE_UPDATE. Map daemon-side names
+        # (chrome / edge / vscode) onto the dashboard's dot keys
+        # (Chrome / Edge / Editor) and update each in turn. The mapping
+        # is deliberately one-way; a daemon-side type that the dashboard
+        # doesn't render is silently dropped.
+        try:
+            connected = payload.get("connected_clients")
+            if isinstance(connected, list):
+                _CLIENT_TYPE_TO_DOT = {
+                    "chrome": "Chrome",
+                    "edge": "Edge",
+                    "vscode": "Editor",
+                }
+                connected_set = {str(c).lower() for c in connected}
+                for ct, dot_name in _CLIENT_TYPE_TO_DOT.items():
+                    self.set_extension_connected(dot_name, ct in connected_set)
+        except Exception:
+            pass
+
+    # G3 (audit-prod): seconds without a STATE_UPDATE before we consider
+    # the prior session ended (daemon stopped / network blip / sleep).
+    _TODAY_SESSION_GAP_SECONDS = 1800.0  # 30 min
+
+    def _reset_today_stats(self) -> None:
+        """Reset every Today/* accumulator. Called on a long gap between
+        STATE_UPDATEs, on a local-date rollover, or when the daemon
+        connection drops (so the user doesn't see yesterday's numbers
+        mixed into today's). Idempotent.
+        """
+        import time as _t
+
+        self._today_last_tick = _t.monotonic()
+        self._today_flow_seconds = 0.0
+        self._today_current_streak = 0.0
+        self._today_best_streak = 0.0
+        self._today_intervention_count = 0
+        self._today_session_yday = _t.localtime().tm_yday
+        self._today_session_started_at = self._today_last_tick
+        try:
+            self._set_text_if_changed(self._today_focus, "0m")
+            self._set_text_if_changed(self._today_sessions, "1")
+            self._set_text_if_changed(self._today_best, "0s")
+            self._set_text_if_changed(self._today_blocked, "0")
+        except Exception:
+            pass
+
     def _accumulate_today_stats(self, state: str) -> None:
         import time as _t
 
@@ -778,11 +825,19 @@ class _ConsumerTab(QWidget):
         # constructor doesn't see ``time.monotonic`` to avoid early
         # import side effects).
         if not hasattr(self, "_today_last_tick"):
-            self._today_last_tick = now
-            self._today_flow_seconds = 0.0
-            self._today_current_streak = 0.0
-            self._today_best_streak = 0.0
-            self._today_intervention_count = 0
+            self._reset_today_stats()
+
+        # G3 (audit-prod): if the daemon went away for a while (>30 min
+        # gap) OR the calendar date rolled over, reset all accumulators
+        # so the user sees fresh numbers, not yesterday's tail.
+        gap = now - self._today_last_tick
+        yday_now = _t.localtime().tm_yday
+        if (
+            gap > self._TODAY_SESSION_GAP_SECONDS
+            or yday_now != getattr(self, "_today_session_yday", yday_now)
+        ):
+            self._reset_today_stats()
+
         dt = max(0.0, min(now - self._today_last_tick, 2.0))
         self._today_last_tick = now
         if state == "FLOW":
@@ -846,6 +901,12 @@ class _ConsumerTab(QWidget):
             pass
 
     def set_connected(self, connected: bool) -> None:
+        # G3 (audit-prod): when the daemon connection drops, gray every
+        # extension dot too — they can't possibly be alive without the
+        # daemon. This keeps the dashboard's connection story coherent.
+        if not connected:
+            for name in list(self._conn_dots.keys()):
+                self.set_extension_connected(name, False)
         if connected:
             self._set_text_if_changed(self._state_label, "Connected")
             self._set_style_if_changed(
@@ -1437,3 +1498,15 @@ class DashboardWindow(QWidget):
             )
             return
         self._toast.show_error(title, body, cid)
+
+    def show_info_toast(self, title: str, body: str = "") -> None:
+        """B2 (audit-prod): surface a positive / status message in the
+        top-bar toast (e.g. "Cortex is now using your LLM"). Reuses the
+        Phase J-2 toast widget with empty cid slot."""
+        if self._toast is None or not hasattr(self._toast, "show_info"):
+            logger.info("Toast unavailable; info toast skipped: %s", title)
+            return
+        try:
+            self._toast.show_info(title, body)
+        except Exception:
+            logger.debug("show_info_toast failed", exc_info=True)

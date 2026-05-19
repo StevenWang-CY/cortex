@@ -112,7 +112,7 @@ class SuggestedAction(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _validate_target_for_action_type(self) -> "SuggestedAction":
+    def _validate_target_for_action_type(self) -> SuggestedAction:
         # Per-action_type length cap. The outer ``max_length=500`` field
         # constraint already ran by the time we reach this validator;
         # this is the tighter per-type cap.

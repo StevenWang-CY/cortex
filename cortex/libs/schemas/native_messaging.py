@@ -37,7 +37,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Annotated, Any, Literal, Union
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -152,7 +152,7 @@ class GetAuthTokenMessage(_Base):
 
 
 NativeMessage = Annotated[
-    Union[LaunchMessage, StopMessage, StatusMessage, GetAuthTokenMessage],
+    LaunchMessage | StopMessage | StatusMessage | GetAuthTokenMessage,
     Field(discriminator="command"),
 ]
 

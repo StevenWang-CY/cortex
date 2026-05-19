@@ -112,36 +112,40 @@ export function activate(context: vscode.ExtensionContext): void {
         }
     });
 
-    // --- v2.0: Handle MORNING_BRIEFING and COPILOT_THROTTLE messages ---
+    // --- v2.0: MORNING_BRIEFING via generic handler ---
     wsClient.onMessage((msg) => {
-        switch (msg.type) {
-            case 'MORNING_BRIEFING': {
-                const summary = msg.payload?.summary || 'Welcome back!';
-                const items = msg.payload?.action_items || [];
-                const leftOff = msg.payload?.left_off_at || '';
-                const detail = (items as string[]).length > 0
-                    ? (items as string[]).map((item: string, i: number) => `${i + 1}. ${item}`).join('\n')
-                    : leftOff as string;
-                vscode.window.showInformationMessage(
-                    `☀️ ${summary}`,
-                    { modal: false, detail },
-                    'Show Details',
-                ).then(choice => {
-                    if (choice === 'Show Details' && panelProvider) {
-                        panelProvider.showMorningBriefing(msg.payload);
-                    }
-                });
-                break;
-            }
-            case 'COPILOT_THROTTLE': {
-                const action = msg.payload?.action;
-                if (action === 'disable') {
-                    vscode.commands.executeCommand('cortex.disableInlineSuggestions');
-                } else if (action === 'enable') {
-                    vscode.commands.executeCommand('cortex.enableInlineSuggestions');
+        if (msg.type === 'MORNING_BRIEFING') {
+            const summary = msg.payload?.summary || 'Welcome back!';
+            const items = msg.payload?.action_items || [];
+            const leftOff = msg.payload?.left_off_at || '';
+            const detail = (items as string[]).length > 0
+                ? (items as string[]).map((item: string, i: number) => `${i + 1}. ${item}`).join('\n')
+                : leftOff as string;
+            vscode.window.showInformationMessage(
+                `☀️ ${summary}`,
+                { modal: false, detail },
+                'Show Details',
+            ).then(choice => {
+                if (choice === 'Show Details' && panelProvider) {
+                    panelProvider.showMorningBriefing(msg.payload);
                 }
-                break;
-            }
+            });
+        }
+    });
+
+    // B1 (audit-prod): explicit COPILOT_THROTTLE registration.
+    // The dedicated dispatch arm in ws-client guarantees the throttle
+    // command runs even if generic-handler registration order ever
+    // changes; the prior implementation depended on onMessage being
+    // bound before the first daemon-pushed throttle frame.
+    wsClient.onCopilotThrottle((payload) => {
+        const action = payload?.action;
+        if (action === 'disable') {
+            vscode.commands.executeCommand('cortex.disableInlineSuggestions');
+            console.log('[cortex] COPILOT_THROTTLE: disabling inline suggestions');
+        } else if (action === 'enable') {
+            vscode.commands.executeCommand('cortex.enableInlineSuggestions');
+            console.log('[cortex] COPILOT_THROTTLE: re-enabling inline suggestions');
         }
     });
 

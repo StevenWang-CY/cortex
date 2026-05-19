@@ -110,6 +110,41 @@ class WebSocketBridge(QObject):
         })
         asyncio.run_coroutine_threadsafe(self._send(msg), self._loop)
 
+    def send_action_execute(
+        self,
+        intervention_id: str,
+        action: dict[str, Any],
+        *,
+        request_dispatch: bool,
+    ) -> None:
+        """G4 (audit-prod): send ACTION_EXECUTE from the desktop overlay.
+
+        ``request_dispatch=True`` tells the daemon to additionally
+        forward as ACTION_DISPATCH to chrome/edge so the action actually
+        runs in the browser. For native-executed actions, set False —
+        the message becomes a pure recorder log.
+        """
+        if self._loop is None or self._ws is None:
+            return
+        payload: dict[str, Any] = {
+            "intervention_id": intervention_id,
+            "action_id": action.get("action_id"),
+            "action_type": action.get("action_type"),
+            "label": action.get("label"),
+            "reason": action.get("reason"),
+            "target": action.get("target"),
+            "tab_index": action.get("tab_index"),
+            "action": action,
+            "request_dispatch": bool(request_dispatch),
+        }
+        msg = json.dumps({
+            "type": "ACTION_EXECUTE",
+            "payload": payload,
+            "timestamp": 0,
+            "sequence": 0,
+        })
+        asyncio.run_coroutine_threadsafe(self._send(msg), self._loop)
+
     def send_shutdown(self) -> None:
         """E.1 (WS-mode Stop button): send a top-level SHUTDOWN message.
 
@@ -404,6 +439,13 @@ class CortexApp:
 
         # Connect overlay dismiss to user action
         self._overlay.dismissed.connect(self._on_overlay_dismissed)
+        # G4 (audit-prod): overlay action buttons route here. Native
+        # action types execute inline in the desktop shell; browser-bound
+        # ones go to the daemon as an ACTION_EXECUTE with
+        # ``request_dispatch=True`` so the daemon forwards as
+        # ACTION_DISPATCH to the connected chrome / edge client.
+        if hasattr(self._overlay, "action_invoked"):
+            self._overlay.action_invoked.connect(self._on_action_invoked)
 
         # Connect settings changes
         self._settings.settings_changed.connect(self._on_settings_changed)
@@ -419,11 +461,10 @@ class CortexApp:
         # Audit-2 fix: ask the remote daemon to reload LLM credentials
         # after a BYOK save. Settings change with reload_llm_credentials=True
         # is the WS-protocol-friendly way to signal hot-reload.
+        # B2 (audit-prod): on success we also surface a confirmation
+        # toast on the dashboard.
         if hasattr(self._onboarding, "byok_token_saved"):
-            self._onboarding.byok_token_saved.connect(
-                lambda: self._bridge.send_settings({"reload_llm_credentials": True})
-                if self._bridge is not None else None,
-            )
+            self._onboarding.byok_token_saved.connect(self._on_byok_token_saved)
         # E.5: step-4 "Open Connections" button.
         if hasattr(self._onboarding, "extensions_requested"):
             self._onboarding.extensions_requested.connect(self._show_connections)
@@ -504,6 +545,64 @@ class CortexApp:
         """Handle overlay dismiss by user."""
         if self._bridge is not None:
             self._bridge.send_user_action("dismissed", intervention_id)
+
+    def _on_byok_token_saved(self) -> None:
+        """B2 (audit-prod): user saved a BYOK token; ask daemon to reload
+        AND surface the success toast so the user knows the new token is
+        live without having to restart.
+        """
+        if self._bridge is not None:
+            try:
+                self._bridge.send_settings({"reload_llm_credentials": True})
+            except Exception:
+                logger.debug("reload_llm_credentials send failed", exc_info=True)
+        if self._dashboard is not None and hasattr(
+            self._dashboard, "show_info_toast"
+        ):
+            try:
+                self._dashboard.show_info_toast(
+                    "Cortex is now using your LLM",
+                    "BYOK token saved — your next intervention will use it.",
+                )
+            except Exception:
+                logger.debug("BYOK info toast failed", exc_info=True)
+
+    @Slot(str, dict)
+    def _on_action_invoked(self, intervention_id: str, action: dict) -> None:
+        """G4 (audit-prod): handle a desktop overlay action button click
+        in WS mode.
+
+        Native action types (clipboard, timer) execute in the shell
+        directly. Everything else goes to the daemon as ACTION_EXECUTE
+        with ``request_dispatch=True`` so the daemon broadcasts an
+        ACTION_DISPATCH frame to the connected chrome / edge client.
+        """
+        if self._bridge is None:
+            return
+        action_type = str(action.get("action_type") or "")
+        executed_natively = False
+        if action_type == "copy_to_clipboard":
+            try:
+                from PySide6.QtGui import QGuiApplication
+
+                clip = QGuiApplication.clipboard()
+                target = str(action.get("target") or "")
+                if clip is not None and target:
+                    clip.setText(target)
+                    executed_natively = True
+            except Exception:
+                logger.debug("Clipboard copy failed", exc_info=True)
+        elif action_type == "start_timer":
+            executed_natively = True
+
+        # Always record engagement on the daemon (engaged USER_ACTION).
+        self._bridge.send_user_action("engaged", intervention_id)
+        # Send the ACTION_EXECUTE log + dispatch request.
+        self._bridge.send_action_execute(
+            intervention_id,
+            dict(action),
+            request_dispatch=not executed_natively,
+        )
 
     @Slot(dict)
     def _on_settings_changed(self, settings: dict) -> None:
