@@ -43,7 +43,10 @@ pip install -e "./cortex[dev]"
 
 # 2. Configure LLM
 cp cortex/.env.example .env
-# Edit .env — set CORTEX_LLM__MODE and credentials
+# Edit .env — set CORTEX_LLM__PROVIDER to one of:
+#   bedrock (default, AWS Bedrock bearer token)
+#   vertex  (GCP Vertex AI application-default credentials)
+#   direct  (Anthropic API key)
 
 # 3. Start daemon
 cortex-dev

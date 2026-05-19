@@ -8,13 +8,19 @@ Base URL: `http://127.0.0.1:9472`
 
 All request and response bodies are JSON. Timestamps use monotonic seconds (`time.monotonic()`).
 
+### Authentication
+
+All mutating HTTP routes require a capability token, sent as `Authorization: Bearer <token>` (canonical) or via the legacy `X-Cortex-Auth-Token: <token>` header. The token is generated at first daemon start and persisted with mode `0600` at `~/Library/Application Support/Cortex/auth.token`. Missing or wrong tokens return `401 Unauthorized` with `WWW-Authenticate: Bearer`. `GET /health` accepts an optional token (the supervisor liveness probe must reach the daemon without owning the token).
+
+Every mutating response also carries an `X-Cortex-Request-ID` header. Clients may set their own on the request to correlate across logs (F19); otherwise the server generates one.
+
 ---
 
 ### Health & Status
 
 #### `GET /health`
 
-Health check for all registered services.
+Health check for all registered services. Capability token is optional.
 
 **Response:**
 ```json
@@ -392,6 +398,38 @@ loop.
 
 ---
 
+### Consent
+
+#### `GET /consent/level`
+
+Return the consent ladder state for every tracked action type.
+
+**Response:**
+```json
+{
+  "levels": {
+    "close_tab": { "level": 2, "approvals": 4, "rejections": 0 },
+    "group_tabs": { "level": 1, "approvals": 1, "rejections": 0 }
+  },
+  "timestamp": 1000.5
+}
+```
+
+#### `POST /consent/reset`
+
+Reset the consent ladder to its defaults and return the new state.
+
+**Response:**
+```json
+{
+  "reset": true,
+  "levels": { "close_tab": { "level": 0 } },
+  "timestamp": 1000.5
+}
+```
+
+---
+
 ### Project Launcher
 
 #### `GET /api/projects`
@@ -436,7 +474,42 @@ All messages are JSON objects with the following envelope:
 }
 ```
 
+### Auth Handshake
+
+Every connection MUST send an `AUTH` frame before any other message. The server holds the connection in `pending_auth` until the token validates; any non-AUTH frame sent first triggers `close(code=1011, reason="auth required")` and emits an `AUTH_REJECTED` event.
+
+Client → server (first frame):
+
+```json
+{
+  "type": "AUTH",
+  "payload": { "auth_token": "<capability_token>" },
+  "timestamp": 12300.0,
+  "sequence": 0
+}
+```
+
+Server → client on success:
+
+```json
+{ "type": "AUTH_OK", "payload": {}, "timestamp": 12300.05, "sequence": 0 }
+```
+
+After `AUTH_OK`, the client follows with `IDENTIFY` (declaring `client_type`) and then exchanges normal traffic.
+
+### Generated TypeScript Types
+
+The full list below is the canonical message-type catalog (Python source of truth: `cortex/libs/schemas/ws_message_types.py::MessageType`). The browser extension imports matching types from `cortex/apps/browser_extension/types/generated/cortex_schemas.d.ts`, which is regenerated from the Pydantic models by `python -m cortex.scripts.generate_ts_schemas` and gated against drift by pre-commit and CI.
+
 ### Message Types
+
+**Inbound (client → daemon):** `AUTH`, `IDENTIFY`, `USER_ACTION`, `ACTION_EXECUTE`, `USER_RATING`, `CONTEXT_RESPONSE`, `SETTINGS_SYNC`, `ACTIVITY_SYNC`, `TAB_RELEVANCE_FEEDBACK`, `LEETCODE_CONTEXT_UPDATE`, `INTERVENTION_APPLIED`, `SHUTDOWN`.
+
+**Outbound (daemon → client):** `AUTH_OK`, `STATE_UPDATE`, `INTERVENTION_TRIGGER`, `INTERVENTION_RESTORE`, `CONTEXT_REQUEST`, `ACTIVE_RECALL`, `BREATHING_OVERLAY`, `PRE_BREAK_WARNING`, `MORNING_BRIEFING`, `COPILOT_THROTTLE`, `AMBIENT_STATE_UPDATE`.
+
+**LeetCode cues (daemon → chrome, `target_client_types=["chrome"]`):** `LEETCODE_SHOW_SCRATCHPAD`, `LEETCODE_SHOW_PATTERN_LADDER`, `LEETCODE_SHOW_LOCKOUT`, `LEETCODE_SHOW_CONSOLIDATION`, `LEETCODE_SHOW_SUBMISSION_GATE`, `LEETCODE_SHOW_SOLUTION_FRICTION`, `LEETCODE_SHOW_SESSION_BRIEFING`, `LEETCODE_LOCK_EDITOR`, `LEETCODE_INTERCEPT_SUBMIT`, `LEETCODE_GATE_SOLUTIONS`, `LEETCODE_AI_RESTATEMENT_CHECK`, `LEETCODE_AI_COMPREHENSION_CHECK`, `LEETCODE_AI_HYPOTHESIS_CHECK`, `LEETCODE_AI_STUCK_ANALYSIS`, `LEETCODE_AI_SESSION_BRIEFING`.
+
+Selected payload shapes follow.
 
 #### `STATE_UPDATE` (server → client)
 

@@ -26,7 +26,7 @@ pip install -e "./cortex[dev]"
 
 Check the log output for the specific error. Common causes:
 - Missing `.env` file: `cp cortex/.env.example .env`
-- Invalid LLM config: set `CORTEX_LLM__MODE=rule_based` to test without a LLM
+- Invalid LLM config: set `CORTEX_LLM__FALLBACK_MODE=rule_based` to keep running with a deterministic plan when no provider can be reached
 - Missing storage directory: `python -m cortex.scripts.seed_config --root .`
 
 ---
@@ -107,28 +107,30 @@ pkill -f "cortex.scripts.run_dev"
 
 ## LLM Errors
 
-### Azure OpenAI errors
+### LLM provider errors
 
-- Verify `.env` has `ENDPOINT`, `API_KEY`, `DEPLOYMENT_NAME`, and `API_VERSION=2025-01-01-preview`
-- Test connectivity:
-  ```bash
-  python -c "from cortex.services.llm_engine.azure_client import AzureClient; print('ok')"
-  ```
-- Fallback: set `CORTEX_LLM__MODE=rule_based` to bypass LLM entirely
+Cortex talks to Claude through the Anthropic SDK. Pick exactly one transport via `CORTEX_LLM__PROVIDER`:
 
-### Ollama errors ("connection refused")
+- Verify `CORTEX_LLM__PROVIDER` is one of `bedrock`, `vertex`, or `direct`.
 
-Ollama is not running:
+**Bedrock (default).** Confirm the bearer token is in Keychain and the region is set:
 ```bash
-ollama serve   # in a separate terminal
+security find-generic-password -s cortex.bedrock -a bearer_token
+# CORTEX_LLM__BEDROCK__AWS_REGION must be set in .env (e.g. us-east-2)
 ```
+If you opt out of Keychain with `CORTEX_LLM__USE_KEYCHAIN=false`, export `AWS_BEARER_TOKEN_BEDROCK` into the daemon's environment instead.
 
-Verify the model is pulled:
+**Vertex.** Re-run the gcloud application-default login flow:
 ```bash
-ollama list
-# If llama3.1:8b is missing:
-ollama pull llama3.1:8b
+gcloud auth application-default login
 ```
+The Anthropic SDK reads the resulting credentials automatically.
+
+**Direct Anthropic API.** Confirm `ANTHROPIC_API_KEY` is exported into the daemon's environment (the daemon does not read it from Keychain in `direct` mode).
+
+**Fallback.** `CORTEX_LLM__FALLBACK_MODE=rule_based` (the default) keeps the daemon working with a deterministic rule-based plan when every provider is unavailable. Set it explicitly if you want to test without any LLM at all.
+
+See [Setup](Setup) for the full per-provider configuration.
 
 ---
 

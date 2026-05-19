@@ -82,6 +82,7 @@ L5 Intervention Execution
 
 ## L4: LLM Grounding/Safety
 
+- Cortex talks to Claude exclusively through the Anthropic SDK; transport is selected per-deployment via `CORTEX_LLM__PROVIDER` (`bedrock` default, `vertex`, or `direct`). When every transport is unavailable, the engine falls back to a deterministic rule-based plan (`CORTEX_LLM__FALLBACK_MODE=rule_based`, the default). See [Setup](Setup) for credentials.
 - Structured output is required (JSON mode + parser/schema validation).
 - Invalid actions are dropped individually (graceful degradation), not full-plan hard-fail.
 - Causal explanation is verified against observable context values; fallback text is injected if ungrounded.

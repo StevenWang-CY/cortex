@@ -31,10 +31,11 @@ For developers who want to modify Cortex or contribute to the project.
 - **Node.js 18+** — `brew install node` or [nodejs.org](https://nodejs.org/)
 - **pnpm** — `npm install -g pnpm` (after installing Node.js)
 - **Webcam** (built-in MacBook camera or USB; 640x480 @ 30 FPS minimum)
-- **LLM backend** (one of):
-  - Azure OpenAI API key (recommended)
-  - [Ollama](https://ollama.com) running locally (free)
-  - `rule_based` mode (no LLM needed, limited interventions)
+- **LLM backend** (one Anthropic SDK transport):
+  - **AWS Bedrock** (default) — bearer token stored in macOS Keychain, no AWS CLI needed
+  - **Google Vertex AI** — via standard `gcloud auth application-default login`
+  - **Direct Anthropic API** — via `ANTHROPIC_API_KEY`
+  - **Rule-based fallback** — `CORTEX_LLM__FALLBACK_MODE=rule_based` (default) keeps the daemon running with a deterministic plan if every provider fails. Set to `direct_anthropic` to retry via the direct API instead.
 - **Optional:** Redis 7+ (`brew install redis`) — falls back to in-memory automatically
 
 > **Apple Silicon:** Use native ARM Python, not Rosetta. Verify: `python3 -c "import platform; print(platform.machine())"` should print `arm64`.
@@ -61,42 +62,55 @@ Edit `.env` and set your LLM backend. Cortex uses nested environment variables w
 
 #### LLM Options
 
-**Azure OpenAI** (recommended):
+Cortex uses the Anthropic SDK with three swappable transports. Pick one provider — credentials never bundle into the .app, and the configured provider is mirrored into `ANTHROPIC_PROVIDER` at startup so the SDK picks the right transport.
+
+**Option A — AWS Bedrock** (default, recommended):
 
 ```bash
-CORTEX_LLM__MODE=azure
-CORTEX_LLM__AZURE__ENDPOINT=https://your-resource.openai.azure.com/
-CORTEX_LLM__AZURE__API_KEY=your-key-here
-CORTEX_LLM__AZURE__API_VERSION=2025-01-01-preview
-CORTEX_LLM__AZURE__DEPLOYMENT_NAME=gpt-4o-mini
-CORTEX_LLM__AZURE__REASONING_DEPLOYMENT_NAME=gpt-4o-mini
-CORTEX_LLM__AZURE__MAX_COMPLETION_TOKENS=1024
+CORTEX_LLM__PROVIDER=bedrock
+CORTEX_LLM__BEDROCK__AWS_REGION=us-east-2
+CORTEX_LLM__USE_KEYCHAIN=true   # default; reads the bearer token from macOS Keychain
+                                # and exports AWS_BEARER_TOKEN_BEDROCK for the SDK
+```
+
+Store the Bedrock bearer token in macOS Keychain (one-time):
+
+```bash
+security add-generic-password -s cortex.bedrock -a bearer_token -w YOUR_TOKEN
+```
+
+**Option B — Google Vertex AI:**
+
+```bash
+CORTEX_LLM__PROVIDER=vertex
+gcloud auth application-default login
+```
+
+**Option C — Direct Anthropic API:**
+
+```bash
+CORTEX_LLM__PROVIDER=direct
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+**Model tiers** (logical IDs resolved per provider by `cortex.libs.llm.anthropic_client.resolve_anthropic_model_id`):
+
+```bash
+CORTEX_LLM__MODEL_DEFAULT=claude-sonnet-4-6
+CORTEX_LLM__MODEL_FAST=claude-haiku-4-5
+CORTEX_LLM__MODEL_DEEP=claude-opus-4-7
+```
+
+**Fallback when every provider fails:**
+
+```bash
+CORTEX_LLM__FALLBACK_MODE=rule_based   # default — deterministic plan keeps daemon running
+# CORTEX_LLM__FALLBACK_MODE=direct_anthropic  # retry via direct API instead
 ```
 
 Notes:
-- Azure `gpt-4o-mini` and `gpt-5-mini` reject `max_tokens`; Cortex sends `max_completion_tokens` instead.
-- Cortex only sends workspace text context, current state label/confidence, and allowed intervention constraints to Azure. Raw camera frames and biometrics stay local.
-- For production macOS installs, store the API key in Keychain: set `CORTEX_LLM__AZURE__USE_KEYCHAIN=true` and add the key via `security add-generic-password -s cortex.azure_openai -a default -w YOUR_KEY`.
-
-**Local Ollama** (free, no API key):
-
-```bash
-# Install Ollama first:
-brew install ollama
-ollama pull llama3.1:8b
-ollama serve   # keep running in a separate terminal
-
-# Then in .env:
-CORTEX_LLM__MODE=local
-```
-
-**Rule-based only** (no LLM, no API key needed):
-
-```bash
-CORTEX_LLM__MODE=rule_based
-```
-
-This mode uses built-in heuristics instead of LLM-generated interventions. Good for testing the biofeedback pipeline without any LLM setup.
+- Cortex only sends workspace text context, current state label/confidence, and allowed intervention constraints to the LLM. Raw camera frames and biometrics stay local.
+- Legacy env vars (`CORTEX_LLM__MODE`, `CORTEX_LLM__AZURE__*`, `CORTEX_LLM__REMOTE__*`, `CORTEX_LLM__LOCAL__*`, `CORTEX_LLM__MODEL_NAME`) are silently ignored by the validator — a 0.1.x `.env` will not crash on first launch.
 
 #### Camera Configuration
 
@@ -122,7 +136,7 @@ pip install -e "./cortex[dev]"
 
 Verify:
 ```bash
-python -c "from cortex.libs.config.settings import get_config; print(f'LLM mode: {get_config().llm.mode}')"
+python -c "from cortex.libs.config.settings import get_config; print(f'LLM provider: {get_config().llm.provider}')"
 ```
 
 ### 4. Initialize Storage
@@ -270,9 +284,11 @@ pytest -m "not requires_webcam and not requires_gpu"
 - Click Stop again — uses multi-layer kill chain
 - Manual kill: `pkill -f "cortex.scripts.run_dev"`
 
-### Azure LLM errors
-- Verify `.env` has `ENDPOINT`, `API_KEY`, and `DEPLOYMENT_NAME` set
-- Switch to `CORTEX_LLM__MODE=rule_based` to run without LLM
+### LLM provider errors
+- **Bedrock:** confirm the bearer token is in Keychain — `security find-generic-password -s cortex.bedrock -a bearer_token` should print the entry. Re-run `security add-generic-password -s cortex.bedrock -a bearer_token -w YOUR_TOKEN -U` to overwrite. Verify `CORTEX_LLM__BEDROCK__AWS_REGION` matches a region your account is provisioned for (default `us-east-2`).
+- **Vertex:** re-run `gcloud auth application-default login`. The SDK reads the standard ADC location; no extra env var needed.
+- **Direct:** confirm `ANTHROPIC_API_KEY` is exported in the same shell that runs `cortex-dev`.
+- **Fallback:** if all providers are down, the planner serves the rule-based deterministic plan and tags responses with `metadata["budget_killed"] = True` when the daily USD rail is hit. Set `CORTEX_LLM__FALLBACK_MODE=direct_anthropic` to retry the direct API instead.
 
 ### MediaPipe import errors on Apple Silicon
 ```bash

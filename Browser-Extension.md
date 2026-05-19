@@ -147,12 +147,17 @@ Resume cards appear on return to previously-visited content.
 
 ## WebSocket Connection
 
-The extension connects to the daemon WebSocket at `ws://127.0.0.1:9473` and:
+The extension connects to the daemon WebSocket at `ws://127.0.0.1:9473`. The very first frame on every connection is `AUTH`, carrying the capability token the native host reads from `~/Library/Application Support/Cortex/auth.token`; the extension only sends `IDENTIFY` and other frames once it receives `AUTH_OK`. A pre-`AUTH` frame causes the server to close the socket with WebSocket close code 1011.
+
+After the handshake the extension:
 
 - Receives `STATE_UPDATE` every 500ms (updates popup state indicator)
 - Receives `INTERVENTION_TRIGGER` (shows overlay)
-- Sends `USER_ACTION` when the user interacts with the overlay
+- Receives the LeetCode adapter cues (`LEETCODE_SHOW_*`, `LEETCODE_AI_*`) when a LeetCode problem tab is active
+- Sends `USER_ACTION` / `ACTION_EXECUTE` / `USER_RATING` when the user interacts with the overlay
 - Sends `ACTIVITY_SYNC` when learning progress changes
-- Sends `CONTEXT_REQUEST` responses with tab data
+- Sends `CONTEXT_RESPONSE` with tab data in reply to `CONTEXT_REQUEST`
 
-The extension implements exponential backoff reconnection if the daemon is not running.
+The extension implements exponential backoff reconnection if the daemon is not running, replaying the `AUTH` → `IDENTIFY` handshake on every reconnect.
+
+All wire-level types the extension consumes are generated from the Pydantic schemas in `cortex/libs/schemas/` into `cortex/apps/browser_extension/types/generated/cortex_schemas.d.ts`; never hand-edit that file. See [API Reference](API-Reference) for the full message catalog.

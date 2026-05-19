@@ -30,16 +30,18 @@ cortex-calibrate --simulate
 
 ```json
 {
-  "resting_hr": 72.0,
-  "resting_hrv": 50.0,
-  "baseline_blink_rate": 17.0,
-  "baseline_mouse_velocity": 500.0,
+  "hr_baseline": 72.0,
+  "hrv_baseline": 50.0,
+  "blink_rate_baseline": 17.0,
+  "mouse_velocity_baseline": 500.0,
   "metric_distributions": {
     "hr": {"mu": 72.0, "sigma": 4.2, "p10": 66.0, "p90": 78.0},
     "hrv": {"mu": 50.0, "sigma": 9.5, "p10": 38.0, "p90": 63.0}
   }
 }
 ```
+
+The full `UserBaselines` schema (including `hr_std`, `mouse_variance_baseline`, `shoulder_neutral_y`, `resp_baseline`, `circadian_hr_cosinor`, and rolling/decay knobs) lives in `cortex/libs/schemas/state.py`.
 
 ## How Baselines Are Used
 

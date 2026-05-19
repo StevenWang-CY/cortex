@@ -4,6 +4,30 @@ Cortex exposes a REST API on `http://127.0.0.1:9472` and a WebSocket server on `
 
 All request/response bodies are JSON. Timestamps are `time.monotonic()` seconds.
 
+The Pydantic models under `cortex/libs/schemas/` are the single source of truth for every wire-level shape on this page; the corresponding TypeScript types live at `cortex/apps/browser_extension/types/generated/cortex_schemas.d.ts` and are regenerated from those models — see [Browser Extension](Browser-Extension) and `CLAUDE.md` for the codegen flow.
+
+---
+
+## Authentication
+
+Every mutating route is gated by a capability token. The token is written at first launch to:
+
+```
+~/Library/Application Support/Cortex/auth.token   (mode 0600)
+```
+
+Clients present it via the canonical header:
+
+```
+Authorization: Bearer <token>
+```
+
+The legacy `X-Cortex-Auth-Token: <token>` header is still accepted as a fallback for older browser-extension builds.
+
+On failure the server returns `401 Unauthorized` with `WWW-Authenticate: Bearer`. `GET /health` accepts the token but does not require it (optional auth), so liveness probes work without a token.
+
+The daemon also assigns each mutating request a correlation id and echoes it back on the response as `X-Cortex-Request-ID`; if a client sets the header on the way in, the server reuses that value end-to-end.
+
 ---
 
 ## REST API
@@ -11,6 +35,8 @@ All request/response bodies are JSON. Timestamps are `time.monotonic()` seconds.
 ### Health & Status
 
 #### `GET /health`
+
+Optional-auth liveness probe. Returns service status without requiring a capability token.
 
 ```json
 {
@@ -213,7 +239,13 @@ Valid `user_action` values: `dismissed` · `engaged` · `snoozed` · `timed_out`
 #### `GET /api/stress-integral`
 
 ```json
-{ "stress_integral": 12.5, "threshold": 30.0, "percentage": 41.7 }
+{
+  "current_value": 12.5,
+  "threshold": 500.0,
+  "should_break": false,
+  "sensitivity_multiplier": 1.0,
+  "timestamp": 12345.6
+}
 ```
 
 #### `GET /api/helpfulness/summary`
@@ -222,22 +254,63 @@ Valid `user_action` values: `dismissed` · `engaged` · `snoozed` · `timed_out`
 {
   "total_interventions": 15,
   "mean_reward": 0.62,
-  "best_arm": "simplified_workspace",
-  "arm_counts": {
-    "overlay_only": 3,
-    "simplified_workspace": 5,
-    "guided_mode": 2,
-    "breathing": 2,
-    "active_recall": 1,
-    "circuit_breaker": 1,
-    "none": 1
-  }
+  "engagement_rate": 0.47,
+  "recent_rewards": [0.5, 0.8, 0.3, 0.9, 0.6],
+  "timestamp": 12345.6
 }
 ```
 
 #### `POST /shutdown`
 
-Gracefully shuts down the daemon.
+Gracefully shuts down the daemon. Requires `Authorization: Bearer <token>`.
+
+---
+
+### Consent
+
+#### `GET /consent/level`
+
+Returns the current consent ladder state for every action type.
+
+```json
+{
+  "levels": {
+    "close_tab": { "level": "ask", "decay_until": 12345.6 },
+    "rearrange_workspace": { "level": "auto", "decay_until": null }
+  },
+  "timestamp": 12345.6
+}
+```
+
+#### `POST /consent/reset`
+
+Resets the consent ladder to defaults and returns the post-reset state.
+
+```json
+{ "reset": true, "levels": { /* same shape as GET /consent/level */ }, "timestamp": 12345.6 }
+```
+
+---
+
+### Projects
+
+#### `GET /api/projects`
+
+Lists the configured project launch profiles.
+
+```json
+{ "projects": [ { "name": "thesis", "apps": ["Zotero", "Obsidian"], "browser_tabs": ["..."] } ] }
+```
+
+#### `POST /api/launch/{project_name}`
+
+Applies a saved project workspace (opens apps, restores tabs, focuses editor). Returns a flat result.
+
+```json
+{ "launched": true, "project_name": "thesis", "errors": [] }
+```
+
+On failure `launched` is `false` and `errors` carries a human-readable diagnosis.
 
 ---
 
@@ -250,18 +323,76 @@ Message envelope:
 { "type": "<TYPE>", "payload": { ... }, "timestamp": 12345.6, "sequence": 42 }
 ```
 
+The canonical enumeration of every `type` literal lives in `cortex/libs/schemas/ws_message_types.py::MessageType`; the codegen step emits a matching TypeScript union, so extension dispatch sites fail type-check if a literal is ever typo'd.
+
+### Auth handshake
+
+The very first frame the client sends on every new connection MUST be `AUTH`:
+
+```json
+{ "type": "AUTH", "payload": { "auth_token": "<contents of auth.token>" } }
+```
+
+The server replies with `AUTH_OK` (and, if a cached `STATE_UPDATE` exists, replays it immediately so the client sees current state on attach). Only after `AUTH_OK` may the client send `IDENTIFY` or any other frame.
+
+Any non-`AUTH` frame sent before the handshake completes is logged as `AUTH_REJECTED` and the server closes the socket with WebSocket close code `1011` (`"auth required"`). `SHUTDOWN` carries a defense-in-depth inline token check on top of this gate.
+
 ### Message Types
 
-| Type | Direction | Description |
-|------|-----------|-------------|
-| `STATE_UPDATE` | server → client | Cognitive state broadcast every 500ms |
-| `INTERVENTION_TRIGGER` | server → client | Intervention plan ready to show |
-| `USER_ACTION` | client → server | User interacted with overlay |
-| `IDENTIFY` | client → server | Client identifies its type on connect |
-| `SETTINGS_SYNC` | bidirectional | Sync consent levels and quiet mode |
-| `ACTIVITY_SYNC` | client → server | Learning activity progress report |
-| `CONTEXT_REQUEST` | server → client | Request context from extension |
-| `SHUTDOWN` | client → server | Request graceful daemon shutdown |
+#### Client → server (inbound, dispatched by `_process_message`)
+
+| Type | Description |
+|------|-------------|
+| `AUTH` | Capability-token handshake; MUST be the first frame on every connection |
+| `IDENTIFY` | Declares `client_type` (`vscode` · `chrome` · `desktop`) — sent after `AUTH_OK` |
+| `USER_ACTION` | User dismissed / engaged / snoozed an intervention |
+| `ACTION_EXECUTE` | User invoked a `SuggestedAction` from the overlay |
+| `USER_RATING` | Thumbs up/down on an intervention outcome |
+| `CONTEXT_RESPONSE` | Reply to a `CONTEXT_REQUEST`; resolves a pending future |
+| `SETTINGS_SYNC` | Bidirectional — push new settings or receive current ones |
+| `ACTIVITY_SYNC` | Per-tab activity records for aggregation |
+| `TAB_RELEVANCE_FEEDBACK` | User-reported relevance signal for the tab triage classifier |
+| `LEETCODE_CONTEXT_UPDATE` | Live LeetCode DOM/code telemetry from the content script |
+| `INTERVENTION_APPLIED` | Extension confirms it applied (or failed to apply) a plan |
+| `SHUTDOWN` | Request graceful daemon shutdown; payload MUST include `auth_token` |
+
+#### Server → client (outbound)
+
+| Type | Description |
+|------|-------------|
+| `AUTH_OK` | Acknowledgment of a successful `AUTH` handshake |
+| `STATE_UPDATE` | Periodic state estimate broadcast (every ~500ms) |
+| `INTERVENTION_TRIGGER` | Intervention plan + UI hints ready to show |
+| `INTERVENTION_RESTORE` | Explicit cue for clients to undo their workspace mutations |
+| `CONTEXT_REQUEST` | Daemon asks a specific `client_type` for live workspace context |
+| `ACTIVE_RECALL` | Active-recall prompt (e.g. recap before context switch) |
+| `BREATHING_OVERLAY` | Breathing pacer overlay cue (4-7-8 by default) |
+| `PRE_BREAK_WARNING` | Heads-up that a break will be recommended shortly |
+| `MORNING_BRIEFING` | Daily kickoff summary delivered to the popup |
+| `COPILOT_THROTTLE` | Throttle/unthrottle signal for the editor copilot adapter |
+| `AMBIENT_STATE_UPDATE` | Lightweight state heartbeat for the ambient overlay |
+
+#### LeetCode adapter cues (server → Chrome only)
+
+Emitted by `LeetCodeAdapter.execute` and targeted at `client_type=chrome`.
+
+| Type | Description |
+|------|-------------|
+| `LEETCODE_SHOW_SCRATCHPAD` | Inject the scratchpad overlay (problem reframing prompts) |
+| `LEETCODE_SHOW_PATTERN_LADDER` | Surface the pattern ladder scaffold |
+| `LEETCODE_SHOW_LOCKOUT` | Destructive-struggle gate — block the editor |
+| `LEETCODE_SHOW_CONSOLIDATION` | Post-solve consolidation prompt |
+| `LEETCODE_SHOW_SUBMISSION_GATE` | Pre-submit sanity check |
+| `LEETCODE_SHOW_SOLUTION_FRICTION` | Friction overlay before revealing the editorial |
+| `LEETCODE_SHOW_SESSION_BRIEFING` | Daily LeetCode briefing for popup/newtab |
+| `LEETCODE_LOCK_EDITOR` | Force-focus the LeetCode editor |
+| `LEETCODE_INTERCEPT_SUBMIT` | Intercept submit until acknowledgement |
+| `LEETCODE_GATE_SOLUTIONS` | Gate the editorial / community-solution tab |
+| `LEETCODE_AI_RESTATEMENT_CHECK` | AI-powered restatement check |
+| `LEETCODE_AI_COMPREHENSION_CHECK` | AI-powered comprehension check (examples / edges) |
+| `LEETCODE_AI_HYPOTHESIS_CHECK` | AI-powered hypothesis / approach check |
+| `LEETCODE_AI_STUCK_ANALYSIS` | AI-powered stuck-analysis explanation |
+| `LEETCODE_AI_SESSION_BRIEFING` | AI-powered session-briefing generation |
 
 ### `STATE_UPDATE`
 
@@ -292,6 +423,8 @@ Valid actions: `dismissed` · `engaged` · `snoozed`
 
 ### `IDENTIFY`
 
+Sent after `AUTH_OK`. Carries the client's role.
+
 ```json
 {
   "type": "IDENTIFY",
@@ -303,6 +436,6 @@ Valid client types: `vscode` · `chrome` · `desktop`
 
 ### Connection Behavior
 
-- New clients receive the latest `STATE_UPDATE` immediately on connect
+- New clients receive the latest cached `STATE_UPDATE` immediately after `AUTH_OK`
 - Dead connections are cleaned up on next broadcast
-- Extensions should reconnect with exponential backoff
+- Extensions should reconnect with exponential backoff, replaying the `AUTH` → `IDENTIFY` sequence on each reconnect

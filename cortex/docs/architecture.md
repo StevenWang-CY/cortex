@@ -20,7 +20,7 @@ L3 Trigger/Policy
         │
         ▼
 L4 LLM Planning
-  llm_engine (Azure/Ollama/remote/rule) + parser + planner validation
+  llm_engine (Anthropic SDK — Bedrock / Vertex / direct — with rule-based fallback) + parser + planner validation
         │
         ▼
 L5 Intervention Execution
@@ -73,6 +73,10 @@ All additions are backward-compatible (additive fields only).
 - Destructive-looking actions undergo a self-critique filter before execution.
 - Consent is recency-aware and applied consistently, including LeetCode actions.
 
+### Capability Token (HTTP + WebSocket)
+
+Every mutating HTTP route on `cortex/services/api_gateway/` is gated by a capability token via the `require_capability_token` FastAPI dependency. The token lives at `~/Library/Application Support/Cortex/auth.token` with mode 0600 and is regenerated on first daemon start. Clients send either `Authorization: Bearer <token>` (canonical) or the legacy `X-Cortex-Auth-Token` header — both validate against the same on-disk value, and missing/wrong tokens return `401` with `WWW-Authenticate: Bearer`. The WebSocket protocol mirrors this: a connection is held in `pending_auth` until it sends an `AUTH` frame carrying `payload.auth_token`; the server replies with `AUTH_OK`, and any other type before `AUTH` triggers `close(code=1011)`. The token can be rotated from the desktop shell settings UI.
+
 ## Durable Learning Artifacts
 
 - Policy log WAL: `storage/policy_log/YYYY-MM-DD.jsonl`
@@ -81,9 +85,20 @@ All additions are backward-compatible (additive fields only).
 
 ## Repository Map
 
+- `cortex/services/capture_service/*`: webcam capture, smart camera selection (skips Continuity Camera), MediaPipe face tracking, quality gating.
 - `cortex/services/physio_engine/*`: rPPG, SQI, pulse, respiration, ROI.
-- `cortex/services/state_engine/*`: scoring, smoothing, trigger, detectors, ML classifier.
-- `cortex/services/eval/*`: legacy bandit + AMIP + causal report + replay.
-- `cortex/services/llm_engine/*`: backend clients, prompt construction, parsing.
+- `cortex/services/kinematics_engine/*`: EAR blink detection, solvePnP head pose, shoulder posture.
+- `cortex/services/telemetry_engine/*`: pynput input hooks, window tracker, focus transition graph aggregation.
+- `cortex/services/state_engine/*`: scoring, smoothing, trigger, detectors, ML classifier, LeetCode mode resolver, stress integral, longitudinal tracker.
+- `cortex/services/context_engine/*`: editor / browser / terminal adapters and app classifier.
+- `cortex/services/eval/*`: legacy LinUCB bandit + AMIP policy + helpfulness tracker + tab-relevance EMA + causal report + policy replay.
+- `cortex/services/llm_engine/*`: Anthropic SDK client (Bedrock / Vertex / direct), planner, prompt construction, parsing, cost tracker, cache.
 - `cortex/services/intervention_engine/*`: planner, executor, restore, LeetCode interventions.
 - `cortex/services/consent/*`: policy + ladder.
+- `cortex/services/handover/*`: ShutdownDetector, HandoverSnapshot, MorningBriefing.
+- `cortex/services/activity_tracker/*`: ActivityAggregator (daily timelines), ActivitySummarizer (LLM recaps).
+- `cortex/services/session_report/*`: session report generation.
+- `cortex/services/throttle/*`: CopilotThrottle (silences inline suggestions in HYPER).
+- `cortex/services/launcher/*`: ProjectConfig (YAML profiles), ProjectLauncher.
+- `cortex/services/janitor/*`: background cleanup of expired storage records and stale artifacts.
+- `cortex/services/api_gateway/*`: FastAPI app, REST routes, capability-token dependency, WebSocket server (AUTH handshake + dispatch).

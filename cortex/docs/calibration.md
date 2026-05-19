@@ -26,18 +26,26 @@ cortex-calibrate --simulate
 
 ## Output Schema (Key Fields)
 
-`UserBaselines` now persists both legacy scalar baselines and additive distribution metadata:
+`UserBaselines` (in `cortex/libs/schemas/state.py`) persists both scalar baselines and additive distribution metadata. The schema's actual field names:
 
 ```json
 {
-  "resting_hr": 72.0,
-  "resting_hrv": 50.0,
-  "baseline_blink_rate": 17.0,
-  "baseline_mouse_velocity": 500.0,
+  "hr_baseline": 72.0,
+  "hr_std": 5.0,
+  "hrv_baseline": 50.0,
+  "blink_rate_baseline": 17.0,
+  "mouse_velocity_baseline": 500.0,
+  "mouse_variance_baseline": 10000.0,
+  "shoulder_neutral_y": 0.5,
+  "resp_baseline": 15.0,
+  "calibrated_at": "2026-05-19T08:00:00",
   "metric_distributions": {
     "hr": {"mu": 72.0, "sigma": 4.2, "p10": 66.0, "p90": 78.0},
     "hrv": {"mu": 50.0, "sigma": 9.5, "p10": 38.0, "p90": 63.0}
-  }
+  },
+  "circadian_hr_cosinor": {},
+  "rolling_rebaseline_seconds": 60.0,
+  "ew_decay_half_life_days": 7.0
 }
 ```
 

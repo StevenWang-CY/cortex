@@ -21,7 +21,7 @@ Cortex captures at 30 FPS and fuses signals into state estimates every 500ms, en
 1. **Bio-Extraction** — extracts heart rate, HRV, and respiratory rate from your face via rPPG (no camera storage), tracks blink rate, head pose, and posture via MediaPipe, and monitors mouse/keyboard patterns via pynput.
 2. **State Classification** — fuses signals into a cognitive state score every 500ms. Uses rule-based scoring with EMA smoothing, hysteresis, and focus-graph thrashing analysis to classify you as FLOW, HYPER, HYPO, or RECOVERY. When webcam signal quality is low (poor lighting), falls back to telemetry-only mode with stricter confidence thresholds.
 3. **Context Engine** — when an intervention is warranted, gathers workspace context: open file + diagnostics from VS Code, active tab + content from Chrome, recent terminal output. Tabs are pre-filtered (30 cap with type-diverse sampling) to fit LLM context windows.
-4. **LLM Engine** — sends workspace context (no biometrics) to the configured LLM backend — Azure OpenAI, Remote Qwen-3-8B (via SSH tunnel), or local Ollama. Backend selected by `LLM_MODE` in config. The model returns a structured intervention plan: headline, micro-steps, causal explanation, suggested actions, error analysis, and per-tab recommendations. A contextual bandit selects the optimal intervention type per context.
+4. **LLM Engine** — sends workspace context (no biometrics) to the Anthropic SDK over one of three transports: AWS Bedrock (default), Google Vertex AI, or the direct Anthropic API. Transport is selected by `CORTEX_LLM__PROVIDER` ∈ {`bedrock`, `vertex`, `direct`} and mirrored to `ANTHROPIC_PROVIDER` for the SDK at startup. Three logical model tiers map to Claude Sonnet 4.6 (default), Haiku 4.5 (fast), and Opus 4.7 (deep) — `cortex/libs/llm/anthropic_client.resolve_anthropic_model_id` resolves each logical id to the provider-specific identifier. When every provider fails, a deterministic rule-based plan (`CORTEX_LLM__FALLBACK_MODE=rule_based`, default) keeps the daemon running. The model returns a structured intervention plan: headline, micro-steps, causal explanation, suggested actions, error analysis, and per-tab recommendations. AMIP (Adaptive Microrandomized Intervention Policy — contextual Thompson sampling) selects the optimal intervention arm per context.
 5. **Intervention Engine** — validates and executes the plan through a pluggable adapter registry: closes distraction tabs, groups related tabs, folds irrelevant code in VS Code, shows an overlay with one-click actions. All interventions are gated by a consent ladder. Snapshots workspace state first. All actions are reversible via undo.
 
 ---
@@ -41,11 +41,11 @@ Interventions trigger on HYPER with confidence > 0.85, workspace complexity > 0.
 
 ## Active Interventions
 
-When Cortex detects you need help, the LLM analyzes your full workspace context and generates specific, executable actions. A contextual bandit (LinUCB) selects the best intervention type based on learned user preferences. The intervention overlay appears in the bottom-right of your active tab.
+When Cortex detects you need help, the LLM analyzes your full workspace context and generates specific, executable actions. AMIP (`cortex/services/eval/amip.py`) — a contextual Thompson-sampling policy with deterministic safety floor and write-ahead propensity logging — selects the best intervention arm based on learned user preferences. The legacy LinUCB bandit (`cortex/services/eval/bandit.py`) remains available as a non-default option. The intervention overlay appears in the bottom-right of your active tab.
 
 ### Intervention Types
 
-The bandit selects from these arms based on context and learned reward signals:
+The policy selects from these arms based on context and learned reward signals:
 
 | Arm | When It Fires | What It Does |
 |-----|---------------|-------------|
@@ -55,7 +55,7 @@ The bandit selects from these arms based on context and learned reward signals:
 | `breathing` | Screen apnea detected | Gentle stretch/break reminder (auto-dismisses after 15s) |
 | `active_recall` | Zombie reading detected | Fill-in-the-blank comprehension test |
 | `circuit_breaker` | Sustained stress | Break recommendation with stress data |
-| `none` | Low confidence | No intervention (bandit learns when to stay quiet) |
+| `none` | Low confidence | No intervention (policy learns when to stay quiet) |
 
 ### What the LLM generates
 
@@ -208,7 +208,7 @@ Cortex learns from every intervention to get better over time:
 
 1. **Helpfulness Tracker** — captures pre/post intervention state and computes a reward signal from implicit signals (was it undone? ignored? engaged with?) and explicit signals (thumbs up/down rating). Reward = recovery weight (40%) + complexity reduction (15%) + explicit rating (30%) + implicit signals (15%).
 
-2. **Contextual Bandit (LinUCB)** — selects which intervention type to deploy based on 8 context features: state code, complexity, tab count, error count, hour of day, thrashing score, stress integral, and consent level. Updates A matrices and b vectors after each intervention. Persists weights to store every 10 updates.
+2. **AMIP Policy (default)** — contextual Thompson sampling in `cortex/services/eval/amip.py` selects which intervention arm to deploy. Features a temperature-controlled softmax, a deterministic safety floor, propensity logging, and a write-ahead decision log (`storage/policy_log/YYYY-MM-DD.jsonl`) so a nightly causal report (`storage/reports/causal_YYYY-MM-DD.md`) can audit policy quality. The legacy LinUCB bandit in `cortex/services/eval/bandit.py` remains as a non-default option, selecting interventions from 8 context features (state code, complexity, tab count, error count, hour of day, thrashing score, stress integral, consent level) with A-matrix / b-vector updates persisted every 10 records.
 
 3. **Tab Relevance Tracker** — learns per-domain relevance from user feedback on tab close recommendations. Uses exponential moving average (α=0.3) to update domain scores: keeping a tab → relevant (1.0), confirming a close → irrelevant (0.0). Per-tab feedback: when the user uses Keep buttons on individual tabs in the overlay, each tab's kept/closed decision is recorded separately (not all-or-nothing). Scores persist with 90-day TTL and are scoped per focus goal. Personalizes which tabs Cortex recommends closing.
 
@@ -421,11 +421,27 @@ Pluggable architecture for workspace integrations. Adapters implement the `Corte
 
 ---
 
+## Schema Codegen
+
+The Pydantic models in `cortex/libs/schemas/` are the single source of truth for every shape that crosses the daemon ↔ browser-extension boundary. The generator emits matching TypeScript types so the extension and the daemon cannot drift.
+
+```bash
+# Regenerate after editing any Pydantic schema in cortex/libs/schemas/
+python -m cortex.scripts.generate_ts_schemas
+
+# Verify in sync (used by pre-commit + CI; exits 1 on drift)
+python -m cortex.scripts.generate_ts_schemas --check
+```
+
+Output: `cortex/apps/browser_extension/types/generated/cortex_schemas.d.ts` (carries an `AUTOGENERATED — DO NOT EDIT BY HAND` header). A pre-commit hook and the `schema-codegen-check` GitHub Actions job run `--check` on every commit / PR that touches the schemas, the generator script, or the committed `.d.ts`.
+
+---
+
 ## Setup
 
 **Requirements:** macOS 13+, Python 3.11+, Node.js 18+, pnpm (`npm install -g pnpm`), webcam. Optional: Redis 7+ (falls back to in-memory).
 
-**LLM backend** (pick one): Azure OpenAI API key, local [Ollama](https://ollama.com), or `rule_based` mode (no LLM needed).
+**LLM backend** (pick one Anthropic SDK transport): AWS Bedrock with a bearer token stored in macOS Keychain (default), Google Vertex AI via `gcloud auth application-default login`, or direct Anthropic API via `ANTHROPIC_API_KEY`. If every provider fails, `CORTEX_LLM__FALLBACK_MODE=rule_based` (default) keeps the daemon running with a deterministic plan; set it to `direct_anthropic` to retry via the direct API instead.
 
 ```bash
 cd /path/to/Ralph
@@ -434,7 +450,7 @@ cd /path/to/Ralph
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e "./cortex[dev]"
 
-# Copy config and edit .env (set CORTEX_LLM__MODE and credentials)
+# Copy config and edit .env (set CORTEX_LLM__PROVIDER and credentials)
 cp cortex/.env.example .env
 
 # Initialize storage
@@ -546,17 +562,22 @@ python -m cortex.scripts.test_intervention
 
 ## API Endpoints
 
+All mutating HTTP routes require a capability token, sent as `Authorization: Bearer <token>` (canonical) or the legacy `X-Cortex-Auth-Token: <token>` header. The token is generated at first daemon start and persisted with mode 0600 at `~/Library/Application Support/Cortex/auth.token`. Missing or wrong tokens return `401` with `WWW-Authenticate: Bearer`. `GET /health` accepts an optional token. Every mutating response also carries a `X-Cortex-Request-ID` correlation header. The WebSocket opens with an `AUTH` handshake (carrying `auth_token`) before `IDENTIFY`; pre-AUTH non-AUTH frames trigger a `close(code=1011)`.
+
 **Daemon API** (`http://127.0.0.1:9472`):
 
 | Method | Path | Description |
 |--------|------|-------------|
+| GET | `/health` | Service health roll-up (optional token) |
 | GET | `/status/current` | Current cognitive state estimate |
 | GET | `/api/stress-integral` | Current stress load, threshold, and break recommendation |
 | GET | `/api/helpfulness/summary` | Intervention helpfulness metrics |
+| GET | `/consent/level` | Current consent ladder state per action type |
+| POST | `/consent/reset` | Reset consent ladder to defaults |
 | GET | `/api/projects` | List configured project launch profiles |
 | POST | `/api/launch/{name}` | Launch a project workspace |
 | POST | `/shutdown` | Graceful daemon shutdown |
-| WS | `ws://127.0.0.1:9473` | Real-time state, interventions, briefings |
+| WS | `ws://127.0.0.1:9473` | Real-time state, interventions, briefings (AUTH → IDENTIFY) |
 
 **Launcher Agent** (`http://127.0.0.1:9471`, optional):
 
@@ -616,8 +637,8 @@ Additional signals (not weighted into state score, used by detectors):
                            │  TaskContext
           ┌────────────────▼─────────────────┐
           │  L4: LLM Engine                  │
-          │  Azure OpenAI · Qwen-3 · Ollama │
-          │  Contextual Bandit arm selection  │
+          │  Anthropic SDK · Bedrock /        │
+          │  Vertex / Direct · AMIP arm sel.  │
           └────────────────┬─────────────────┘
                            │  InterventionPlan + causal_explanation
           ┌────────────────▼─────────────────┐
@@ -687,12 +708,15 @@ cortex/
 │   │                        #   amygdala hijack, destructive struggle, parasympathetic rebound,
 │   │                        #   LeetCode mode resolver, LeetCode longitudinal tracker
 │   ├── context_engine/      # Editor, browser, terminal adapters + app classifier
-│   ├── llm_engine/          # Azure OpenAI client, Ollama fallback, prompts, parser, cache
+│   ├── llm_engine/          # Anthropic SDK client (Bedrock / Vertex / direct), planner,
+│   │                        #   prompts, parser, cost tracker, cache
 │   ├── intervention_engine/ # Trigger, snapshot, planner, executor (adapter registry), restore,
 │   │                        #   LeetCode interventions (lockout, scratchpad, ladder, guards)
 │   ├── consent/             # ConsentPolicy + ConsentLadder (progressive trust)
-│   ├── eval/                # HelpfulnessTracker, ContextualBandit (LinUCB), bandit trainer,
-│   │                        #   TabRelevanceTracker (per-domain EMA learning)
+│   ├── eval/                # HelpfulnessTracker, AMIPPolicy (default contextual Thompson
+│   │                        #   sampling), legacy ContextualBandit (LinUCB), bandit trainer,
+│   │                        #   policy replay, causal report, TabRelevanceTracker (per-domain
+│   │                        #   EMA learning)
 │   ├── handover/            # ShutdownDetector, HandoverSnapshot, MorningBriefing
 │   ├── activity_tracker/    # ActivityAggregator (daily timelines), ActivitySummarizer (LLM recaps)
 │   ├── launcher/            # ProjectConfig (YAML profiles), ProjectLauncher
@@ -708,7 +732,9 @@ cortex/
 │                            #   tab manager, ambient engine, action executor, undo stack,
 │                            #   breathing overlay, active recall overlay, LeetCode observer,
 │                            #   intervention dismissal cooldown, activity tracker, resume card,
-│                            #   tab-close toggle, design tokens
+│                            #   tab-close toggle, design tokens. TypeScript schema types
+│                            #   under types/generated/ are auto-generated from
+│                            #   cortex/libs/schemas/ (CI-gated, see Schema Codegen below)
 ├── scripts/
 │   ├── run_dev.py           # Start all services (daemon entry point)
 │   ├── calibrate.py         # Capture personal baselines
@@ -721,12 +747,15 @@ cortex/
 │   ├── install_launcher.py  # Manual start/stop helper for the launcher agent
 │   └── build_macos_app.sh   # macOS app packaging
 ├── tests/
-│   ├── unit/                # Per-module unit tests (43 test files)
+│   ├── unit/                # Per-module unit tests (100+ test files total across unit + integration)
 │   └── integration/         # Pipeline integration tests
 └── docs/
     ├── setup.md
-    ├── deploy_azure.md
+    ├── deploy_anthropic.md
     ├── calibration.md
+    ├── adapters.md
+    ├── apis.md
+    ├── architecture.md
     └── ...
 ```
 
@@ -764,8 +793,7 @@ python -m cortex.services.eval.bandit_trainer --data sessions/ --output models/
 
 ## Docs
 
-- [Setup](docs/setup.md) — installation, Azure config, packaging, troubleshooting
-- [Azure Deployment](docs/deploy_azure.md) — deploy-and-experience checklist
+- [Setup](docs/setup.md) — installation, LLM config, packaging, troubleshooting
 - [Calibration](docs/calibration.md) — personal baseline capture and usage
 
 ---

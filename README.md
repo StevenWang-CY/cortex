@@ -120,7 +120,7 @@ All layers communicate via FastAPI (port 9472) and WebSocket (port 9473). The de
 | **VS Code Extension** | TypeScript, VS Code Extension API |
 | **LLM** | Anthropic SDK over AWS Bedrock (default), GCP Vertex, or direct Anthropic API; rule-based deterministic fallback |
 | **Storage** | Redis 7+ with automatic in-memory fallback |
-| **Testing** | pytest (55 test files, 995+ tests), mypy (strict), ruff |
+| **Testing** | pytest (120+ test files), mypy (strict), ruff |
 
 ---
 

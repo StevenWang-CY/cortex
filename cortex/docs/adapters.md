@@ -4,34 +4,34 @@ Workspace adapters connect Cortex to external applications (VS Code, Chrome, ter
 
 ## Formal Adapter Protocol
 
-Cortex defines a formal `CortexAdapter` protocol in `libs/adapters/base.py` with properties `name` and `capabilities`, and methods `execute`, `get_context`, and `health_check`. The `AdapterRegistry` in `libs/adapters/registry.py` handles discovery, capability querying, and action routing across all registered adapters.
+Cortex defines a formal `CortexAdapter` protocol in `cortex/libs/adapters/base.py` with properties `name` and `capabilities`, and async methods `execute`, `get_context`, and `health_check`. Action results flow back as `AdapterResult` (`success`, `data`, `reversible`, `reverse_action`, `error`). The `AdapterRegistry` in `cortex/libs/adapters/registry.py` handles discovery, capability querying, action routing, health checks, and plugin discovery via Python entry points. Legacy adapters that pre-date the protocol are auto-wrapped for backward compatibility.
 
 ## Adapter Interface
 
 All adapters follow the same pattern:
 
 ```python
+from cortex.libs.adapters.base import AdapterResult, CortexAdapter
+
 class MyAdapter:
-    def __init__(self, ws_send_fn=None, ws_receive_fn=None):
-        self._ws_send = ws_send_fn
-        self._ws_receive = ws_receive_fn
-        self._available = False
-        self._last_context = None
+    @property
+    def name(self) -> str:
+        return "myapp"
 
     @property
-    def available(self) -> bool:
-        return self._available
+    def capabilities(self) -> list[str]:
+        return ["fold_except", "scroll_to"]
 
-    async def get_context(self, timeout: float = 2.0):
-        """Gather context from the application. Returns None if unavailable."""
+    async def execute(self, action: str, params: dict) -> AdapterResult:
+        """Execute an action. Returns AdapterResult with success / reversible / error."""
         ...
 
-    async def apply_action(self, action: str, params: dict) -> bool:
-        """Apply a workspace modification. Returns True on success."""
+    async def get_context(self) -> dict:
+        """Gather context from the application. Returns {} if unavailable."""
         ...
 
-    async def restore_state(self, snapshot: dict) -> bool:
-        """Restore application state from a snapshot. Returns True on success."""
+    async def health_check(self) -> bool:
+        """Return True if the adapter is healthy and connected."""
         ...
 ```
 
@@ -99,10 +99,15 @@ class MyAppContext(BaseModel):
 
 ### Step 2: Implement the Adapter
 
-Create `services/context_engine/my_adapter.py`:
+Create `cortex/services/context_engine/my_adapter.py`:
 
 ```python
+import asyncio
+import json
+
+from cortex.libs.adapters.base import AdapterResult
 from cortex.libs.schemas.context import MyAppContext
+
 
 class MyAppAdapter:
     def __init__(self, ws_send_fn=None, ws_receive_fn=None):
@@ -110,43 +115,44 @@ class MyAppAdapter:
         self._ws_receive = ws_receive_fn
         self._available = False
 
-    async def get_context(self, timeout: float = 2.0) -> MyAppContext | None:
+    @property
+    def name(self) -> str:
+        return "myapp"
+
+    @property
+    def capabilities(self) -> list[str]:
+        return ["apply_action"]
+
+    async def get_context(self) -> dict:
         if self._ws_send is None or self._ws_receive is None:
-            return None
+            return {}
 
         try:
-            # Request context from extension
-            await self._ws_send(json.dumps({
-                "type": "GET_CONTEXT",
-                "payload": {}
-            }))
-
-            # Wait for response with timeout
-            raw = await asyncio.wait_for(self._ws_receive(), timeout=timeout)
+            await self._ws_send(json.dumps({"type": "GET_CONTEXT", "payload": {}}))
+            raw = await asyncio.wait_for(self._ws_receive(), timeout=2.0)
             data = json.loads(raw)
-
             if data.get("type") != "CONTEXT_RESPONSE":
-                return None
-
+                return {}
             self._available = True
-            return MyAppContext(**data["payload"])
-
+            return MyAppContext(**data["payload"]).model_dump()
         except (asyncio.TimeoutError, json.JSONDecodeError, Exception):
             self._available = False
-            return None
+            return {}
 
-    async def apply_action(self, action: str, params: dict) -> bool:
+    async def execute(self, action: str, params: dict) -> AdapterResult:
         if self._ws_send is None:
-            return False
-
+            return AdapterResult(success=False, error="adapter unavailable")
         try:
             await self._ws_send(json.dumps({
                 "type": "APPLY_ACTION",
-                "payload": {"action": action, **params}
+                "payload": {"action": action, **params},
             }))
-            return True
-        except Exception:
-            return False
+            return AdapterResult(success=True, reversible=True)
+        except Exception as exc:
+            return AdapterResult(success=False, error=str(exc))
+
+    async def health_check(self) -> bool:
+        return self._available
 ```
 
 ### Step 3: Register with Context Assembly
