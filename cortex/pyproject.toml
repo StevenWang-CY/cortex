@@ -45,7 +45,7 @@ dependencies = [
     # Data Validation & Config
     "pydantic>=2.6.0",
     "pydantic-settings>=2.1.0",
-    "pyyaml>=6.0.1",
+    "pyyaml>=6.0.3",
 
     # Computer Vision & Face Tracking
     "opencv-python>=4.9.0",
