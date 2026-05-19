@@ -128,7 +128,7 @@ jobs:
         working-directory: cortex/apps/browser_extension
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 9
       - uses: actions/setup-node@v4
