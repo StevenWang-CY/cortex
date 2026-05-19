@@ -62,9 +62,6 @@
 
 ## Engineering highlights
 
-> Lead with the proof. The differentiators a recruiter or hiring
-> manager would notice on a 90-second skim:
-
 - **Schema codegen drift gate.** Pydantic models in
   [`cortex/libs/schemas/`](cortex/libs/schemas/) are the single source
   of truth for every shape that crosses the daemon ↔ browser-extension
