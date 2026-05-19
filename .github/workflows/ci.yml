@@ -81,7 +81,20 @@ jobs:
         # future cleanup pass.
         run: mypy cortex/ || true
         continue-on-error: true
+      - name: Install Qt system libraries
+        # PySide6 needs libEGL + a handful of XCB libs on the Ubuntu
+        # runner. Offscreen mode below avoids needing a real display,
+        # but the bindings still dlopen the GL backend at import time.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libxcb-cursor0 libxcb-icccm4 \
+            libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+            libxcb-shape0 libxcb-sync1 libxcb-xfixes0 libxcb-xinerama0 \
+            libxcb-xkb1 libxkbcommon-x11-0 libdbus-1-3 libfontconfig1
       - name: Test (pytest)
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: pytest cortex/tests/
 
   eval-regression:
