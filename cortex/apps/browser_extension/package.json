@@ -17,14 +17,14 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "plasmo": "^0.88.0",
+    "plasmo": "^0.90.5",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
   },
   "devDependencies": {
     "@plasmohq/prettier-plugin-sort-imports": "^4.0.0",
     "@testing-library/dom": "^10.4.0",
-    "@types/chrome": "^0.0.260",
+    "@types/chrome": "^0.1.42",
     "@types/react": "^18.2.0",
     "@types/react-dom": "^18.2.0",
     "jsdom": "^25.0.1",
