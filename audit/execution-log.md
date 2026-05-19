@@ -793,3 +793,145 @@ CORTEX_JSON2TS_CMD=$(which json2ts) python -m cortex.scripts.generate_ts_schemas
 ### Least-confident fix in this session
 
 **F25 (cooldown/dwell oscillation, partial closure).** The cost-runaway aspect is well-contained by F20's budget kill-switch with regression-tested thresholds. The quality-of-experience aspect — does the user actually get spammed with interventions under real biometric jitter? — is partially closed by F26/F27 but not directly tested with adversarial state sequences. The right next step is an /eval suite that replays a synthetic jittery-state trace and asserts intervention count stays within an envelope. That is F41's territory and was deferred. Until F41 is closed, the operator's only signal is the `cortex_state_loop_interventions_per_hour` metric.
+
+---
+
+## Phase 2 Session 3 — F17 + F25 + F41 closure
+
+The three previously-deferred Ledger findings now ship; the audit Ledger
+is fully closed (56 of 56).
+
+### F17 — State-update sequence-number drop on receivers
+
+**Cite:** `cortex/apps/desktop_shell/controller.py:290-300`,
+`cortex/services/api_gateway/websocket_server.py:60-72`.
+
+**Failure mode.** `WSMessage.sequence` already incremented sender-side,
+but in-process `DaemonBridge` and WS-mode `WebSocketBridge` (and the
+extension's `handleMessage`) applied every frame unconditionally. A
+reordered `STATE_UPDATE` could overwrite the biometric UI with stale
+data; a reordered `INTERVENTION_TRIGGER` could clobber the active plan.
+
+**Fix.**
+- Daemon: `CortexDaemon._state_callback_seq` / `_intervention_callback_seq`
+  monotonic counters; each callback invocation stamps `payload["_seq"]`.
+- `DaemonBridge`: per-channel `_last_state_seq` / `_last_intervention_seq`;
+  drops frames whose `_seq` is not strictly greater. `reset_sequence_counters()`
+  lets a daemon restart's seq=1 win.
+- `WebSocketBridge`: per-type `_last_seq_by_type`; cleared on every WS
+  open so a restart wins.
+- `background.ts`: per-type `lastSeqByType` + `_acceptSequencedFrame`
+  test export; cleared in `ws.onopen`.
+
+**Tests.** 12 Python + 7 TS cases. Reorder drop, duplicate drop,
+per-channel independence, sequence=0 / missing-`_seq` bypass, reset on
+reconnect, daemon-side monotonic stamping invariant. All fail on the
+pre-F17 main.
+
+**Compatibility.** Additive. Frames without `_seq` / with `sequence=0`
+bypass the check so older daemons and unsequenced types (AUTH_OK,
+INTERVENTION_RESTORE) continue to apply unchanged.
+
+**Commit.** `71b94c1`.
+
+### F25 — Cooldown/dwell oscillation hysteresis
+
+**Cite:** `cortex/services/state_engine/trigger_policy.py:147,283-294,329-334`.
+
+**Failure mode.** Default cooldown_seconds=60 + hyper_dwell_seconds=30
+admit a 90-second adversarial cycle (HYPER 30 s → trigger → FLOW 60 s
+→ HYPER 30 s → trigger again). Pre-F25 fired on every cycle (~40/hr);
+the eval harness's `oscillation_intervention_rate_per_hr` metric pins
+the post-F25 figure at 1.25/hr.
+
+**Fix.** Two gates added on top of the existing cooldown:
+1. **Hourly cap** — `InterventionConfig.max_interventions_per_hour` (default 6).
+   `TriggerPolicy._intervention_timestamps` deque is pruned to the
+   trailing 60-minute window; rejects when the count crosses the cap.
+   `record_intervention()` appends so the next evaluate enforces.
+2. **Oscillation-aware dwell** — `InterventionConfig.oscillation_max_flips`
+   (default 6) + `oscillation_window_seconds` (600 s) +
+   `oscillation_dwell_multiplier` (2.0). `_hyper_enter_timestamps`
+   tracks False→True transitions; when the count in the window
+   exceeds the cap, the required dwell is multiplied. Jittery flicker
+   fails the stretched dwell; genuine sustained overwhelm still passes.
+
+**Drive-by fix.** Replaced four `now = timestamp or time.monotonic()`
+patterns with explicit `if X is None else X` so callers passing
+`timestamp=0.0` (test harnesses, synthetic traces) get the literal 0.0
+instead of silently falling back to monotonic time. The "or" form
+treated 0.0 as falsy. Behaviour-preserving for every existing caller
+(none pass 0.0 in production).
+
+**Tests.** 7 cases: hourly cap blocks after N triggers + releases as
+the window slides + cap=0 disables; oscillation lengthens dwell + does
+NOT block sustained overwhelm + flips outside window pruned;
+integration trace clamps from ~160/hr to ≤24/4hr.
+
+**Commit.** `16c8bd5`.
+
+### F41 — Regression harness + baseline + CI gate
+
+**Cite:** `cortex/services/eval/` exists locally; `.github/workflows/`
+ran pytest+ruff+mypy+extension+codegen but not eval.
+
+**Failure mode.** Eval ran once locally; no baseline pass-rate captured;
+no regression gate on PRs touching llm_engine/state_engine/prompts.
+
+**Fix.**
+- New `cortex/services/eval/regression_harness.py` replays four
+  synthetic traces and computes four metrics (oscillation rate per
+  hour, sustained-overwhelm pass rate, FLOW false-positive rate,
+  bandit regret p95).
+- Deterministic via `DEFAULT_SEED=20260519`; same seed → byte-identical
+  metrics.
+- `BaselineFile` round-trip via `save_baseline()` /
+  `load_baseline()`; tolerance bands per metric (3 % rel + abs floor
+  for near-zero) + per-metric direction (higher-is-worse vs
+  lower-is-worse).
+- New `cortex/services/eval/baseline.json` (committed). Current
+  metrics: oscillation 1.25/hr, sustained pass 1.0, FLOW false-pos
+  0.0, bandit regret p95 0.0.
+- New CI job `eval-regression` in `.github/workflows/ci.yml`. Runs on
+  push and on PRs touching llm_engine/, state_engine/, eval/, or
+  `libs/schemas/intervention.py`. Exits 1 on any metric crossing its
+  tolerance band.
+- CLI:
+  - `python -m cortex.services.eval.regression_harness` runs and
+    compares.
+  - `--update-baseline` writes a fresh baseline after a reviewed
+    change.
+
+**Tests.** 17 cases: determinism (same seed → same metrics), per-metric
+sanity (oscillation clamped, sustained passes, FLOW false-pos=0,
+bandit regret bounded), baseline round-trip, committed baseline
+self-compares clean, committed baseline matches fresh run byte-
+identically, regression detection (higher / lower direction, in-band
+drift OK, missing metric → NaN sentinel), abs-tolerance band rescues
+near-zero baselines, CLI exits 0/1 as expected, `--update-baseline`
+writes the requested path.
+
+**Commit.** `4fc42fd`.
+
+### Verification
+
+```bash
+source .venv/bin/activate
+python -m pytest cortex/tests/unit/test_f17_sequence_drop.py \
+                  cortex/tests/unit/test_f25_hysteresis.py \
+                  cortex/tests/unit/test_f41_eval_regression.py -q
+# 36 passed
+
+python -m cortex.services.eval.regression_harness
+# Cortex eval regression report — every metric ok against the committed baseline
+
+cd cortex/apps/browser_extension && ./node_modules/.bin/vitest run __tests__/f17_sequence_drop.spec.ts
+# 7 passed
+```
+
+### Closure
+
+Ledger is fully closed: 56 of 56. Architectural Debts both shipped
+(Debt-1 codegen, Debt-2 systemic auth). Phase I performance + Phase J
+UX polish shipped. The regression harness is the live floor against
+which future LLM/state-engine work is measured.

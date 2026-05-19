@@ -1,9 +1,9 @@
 # Audit State Pointer
 
-**Phase:** 2 (remediation closed; 53 of 56 Ledger findings + 2 Architectural Debts + Phase I + Phase J shipped)
-**Next finding to address:** none — Ledger substantially closed. See "Outstanding" below.
-**Last finding closed:** Phase J (UX polish) — final close-out commit `1e3416c`.
-**Last commit:** `merge: Phase J — user-facing polish` (`1e3416c`).
+**Phase:** 2 (remediation FULLY closed; 56 of 56 Ledger findings + 2 Architectural Debts + Phase I + Phase J shipped)
+**Next finding to address:** none — Ledger fully closed.
+**Last finding closed:** F41 (eval-harness CI regression gate) — commit `4fc42fd`.
+**Last commit:** `audit F41: regression harness + committed baseline + CI gate` (`4fc42fd`).
 
 ## Resume protocol on fresh invocation
 
@@ -12,13 +12,15 @@
 3. Read this file — pointer + outstanding list.
 4. If a deferred item is to be picked up, dispatch with the same per-finding atomic-commit conventions used in Session 2.
 
-## Outstanding (3 of 56, deferred with justification)
+## Outstanding (0 of 56 — Ledger fully closed)
 
-| ID  | Summary | Why deferred | When to pick up |
-|-----|---------|--------------|-----------------|
-| F17 | State-update sequence-number check on receivers (per-frame drop-stale) | Sender already increments `WSMessage.sequence`. Practical impact bounded — broadcast cadence is 2 Hz, reorder windows are too narrow at real network speeds. Cleanest fix bundles with future protocol revision. | When a measurable reorder incident lands in support tickets, OR alongside the next `WSMessage` schema version bump. |
-| F25 | Cooldown/dwell oscillation direct fix | Cost-runaway aspect closed (F20 + W2-B retry recheck). Quality aspect partially closed (F26 quiet-mode persistence + F27 fallback transparency). Direct hysteresis-tuning should be data-driven — needs F41 eval baseline first. | After F41 lands. Tune cooldown / dwell pair from /eval pass-rate. |
-| F41 | Eval harness in CI with regression threshold | The harness exists and runs locally; baseline pass-rate not yet captured. CI needs a stable threshold. | Next session. Record baseline → wire workflow → set 3% regression gate. |
+All three previously-deferred items shipped:
+
+| ID  | Summary | Closure |
+|-----|---------|---------|
+| F17 | State-update sequence-number drop on receivers | Daemon stamps `_seq` on in-process callbacks (`runtime_daemon.py`); `DaemonBridge` + `WebSocketBridge` + `background.ts` each maintain per-channel/per-type last-applied counters and drop stale frames. Trackers cleared on (re)connect so a daemon restart's seq=1 wins. 12 Python + 7 TS tests. Commit `71b94c1`. |
+| F25 | Cooldown/dwell oscillation hysteresis | New `InterventionConfig.max_interventions_per_hour` (default 6) imposes a sliding-window hourly cap; new `oscillation_max_flips` + `oscillation_dwell_multiplier` lengthen the required dwell when the state has been entering HYPER more than N times in a 10-minute window. Drive-by fix to the `now = timestamp or time.monotonic()` 0.0-falsy bug across 4 call sites. 7 tests. Commit `16c8bd5`. |
+| F41 | Eval harness in CI with regression threshold | New `cortex/services/eval/regression_harness.py` replays four synthetic traces (oscillation, sustained-overwhelm, pure-FLOW, bandit) and compares against `cortex/services/eval/baseline.json` (committed). CLI exits 1 on any metric crossing its 3%-relative-+-abs-floor tolerance band. New `eval-regression` job in `.github/workflows/ci.yml` runs on PRs touching llm_engine/state_engine/eval/. 17 tests. Commit `4fc42fd`. |
 
 ## New Ledger entries surfaced and resolved this session
 
