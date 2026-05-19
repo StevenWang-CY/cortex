@@ -1,0 +1,60 @@
+Cortex
+Copyright (c) 2026 Steven Wang
+
+This product includes software developed by third parties, listed below
+with their original licenses. Source-code dependencies are pinned in
+`cortex/pyproject.toml` and `cortex/apps/browser_extension/package.json`.
+
+---
+
+## Bundled binary models
+
+cortex/models/face_landmarker.task
+    MediaPipe Face Landmarker model bundle from Google LLC.
+    Licensed under the Apache License, Version 2.0.
+    https://www.apache.org/licenses/LICENSE-2.0
+    Source: https://developers.google.com/mediapipe/solutions/vision/face_landmarker
+
+cortex/models/tscan.onnx  (optional, user-supplied at runtime — NOT bundled)
+    TS-CAN remote-photoplethysmography model.
+    If you provide this file, ensure your local copy complies with the
+    license of the checkpoint you exported from. The Cortex repository
+    does not ship pre-trained TS-CAN weights.
+    Reference: Liu, X., et al. (2020). "Multi-Task Temporal Shift
+    Attention Networks for On-Device Contactless Vitals Measurement."
+
+## Major runtime dependencies (see pyproject.toml for full list)
+
+MediaPipe                Apache-2.0    https://github.com/google/mediapipe
+OpenCV                   Apache-2.0    https://github.com/opencv/opencv
+ONNX Runtime             MIT           https://github.com/microsoft/onnxruntime
+NumPy                    BSD-3-Clause  https://numpy.org/
+SciPy                    BSD-3-Clause  https://scipy.org/
+PySide6                  LGPL-3.0      https://wiki.qt.io/Qt_for_Python
+FastAPI                  MIT           https://github.com/tiangolo/fastapi
+Uvicorn                  BSD-3-Clause  https://github.com/encode/uvicorn
+websockets               BSD-3-Clause  https://github.com/python-websockets/websockets
+pynput                   LGPL-3.0      https://github.com/moses-palmer/pynput
+Pydantic                 MIT           https://github.com/pydantic/pydantic
+structlog                Apache-2.0    https://github.com/hynek/structlog
+keyring                  MIT           https://github.com/jaraco/keyring
+Anthropic SDK (Python)   MIT           https://github.com/anthropics/anthropic-sdk-python
+
+## Browser extension
+
+Plasmo                   MIT           https://github.com/PlasmoHQ/plasmo
+React                    MIT           https://github.com/facebook/react
+
+## Scientific references
+
+The rPPG pipeline implements published algorithms; see in-code
+docstrings for citations:
+
+  - Wang, W., den Brinker, A. C., Stuijk, S., & de Haan, G. (2017).
+    "Algorithmic principles of remote PPG." IEEE TBME.
+  - de Haan, G., & Jeanne, V. (2013).
+    "Robust pulse rate from chrominance-based rPPG." IEEE TBME.
+
+This NOTICE file is informational. The MIT LICENSE in this repository
+applies to Cortex's own source code; third-party components remain
+under their respective licenses.

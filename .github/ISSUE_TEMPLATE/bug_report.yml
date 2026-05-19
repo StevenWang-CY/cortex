@@ -1,0 +1,87 @@
+name: Bug report
+description: Something is broken or behaving unexpectedly.
+title: "bug: <one-line summary>"
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Before submitting,
+        please skim
+        [Troubleshooting](https://github.com/StevenWang-CY/cortex/wiki/Troubleshooting)
+        — most camera, native-messaging, and stop-button issues are
+        covered there.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, what did you see instead?
+      placeholder: |
+        I clicked Start Cortex in the Chrome popup, expected the dashboard
+        to open, but the daemon never started and the popup showed "Native host not found".
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal numbered steps.
+      placeholder: |
+        1. Open Chrome
+        2. Click the Cortex extension icon
+        3. Click "Start Cortex"
+        4. ...
+    validations:
+      required: true
+  - type: input
+    id: cortex-version
+    attributes:
+      label: Cortex version
+      description: From the dashboard "About" panel or `cortex/pyproject.toml`.
+      placeholder: "v0.2.1"
+    validations:
+      required: true
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: Install method
+      options:
+        - DMG (Cortex.app)
+        - Developer setup (cortex-dev from source)
+    validations:
+      required: true
+  - type: input
+    id: macos-version
+    attributes:
+      label: macOS version
+      placeholder: "14.5 (Sonoma) / Apple Silicon"
+    validations:
+      required: true
+  - type: input
+    id: browser
+    attributes:
+      label: Browser + version (if relevant)
+      placeholder: "Chrome 124 / Edge 124 / N/A"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Daemon log excerpt
+      description: |
+        From `cortex-dev` stdout or
+        `~/Library/Logs/Cortex/cortex.log`. Include the
+        `cid:` correlation id from any error toast if present.
+      render: shell
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots / video
+      description: Drag-and-drop welcomed.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I searched existing issues (open + closed) before filing.
+          required: true
+        - label: I am not reporting a security vulnerability (those go to [Security Advisories](https://github.com/StevenWang-CY/cortex/security/advisories/new)).
+          required: true

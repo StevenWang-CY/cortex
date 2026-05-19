@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/StevenWang-CY/cortex/security/advisories/new
+    about: Privately disclose a security issue. Please do NOT open a public issue for security reports.
+  - name: Wiki & Troubleshooting
+    url: https://github.com/StevenWang-CY/cortex/wiki/Troubleshooting
+    about: Camera permission, native messaging, stop button, MediaPipe on Apple Silicon — most setup issues are answered here first.
+  - name: Discussions
+    url: https://github.com/StevenWang-CY/cortex/discussions
+    about: Ask a question, share a session, or float a half-formed idea.

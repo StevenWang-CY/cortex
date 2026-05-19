@@ -1,0 +1,56 @@
+name: Feature request
+description: Propose a new capability or change in behavior.
+title: "feat: <one-line summary>"
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Cortex is a personal portfolio project — features are evaluated
+        against scope, signal quality, and the project's privacy
+        invariants ([SECURITY.md](../SECURITY.md)). Concrete use cases
+        beat abstract wish lists.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Concrete moment when the lack of this feature hurt your workflow.
+      placeholder: |
+        "When I'm debugging at 2am and have 30 tabs open, the
+        intervention closes things I want to keep because the
+        relevance learner hasn't calibrated to my late-night habits."
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How would you like it to work?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What workarounds exist today, and why aren't they enough?
+  - type: textarea
+    id: scope
+    attributes:
+      label: Privacy & scope impact
+      description: |
+        If your feature requires biometrics in LLM payloads, persisted
+        video frames, network calls outside `127.0.0.1`, or removal of
+        the consent ladder, please explain — those are usually
+        non-starters (see [SECURITY.md](../SECURITY.md)).
+  - type: input
+    id: audit-link
+    attributes:
+      label: Related audit finding (if any)
+      description: e.g. F32, F45 — link to the entry in `audit/findings.md`.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I searched existing issues (open + closed) before filing.
+          required: true
