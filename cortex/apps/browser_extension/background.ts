@@ -18,6 +18,7 @@ import {
     restoreTabSession,
 } from "./tab-manager";
 import { getAuthToken } from "./lib/auth";
+import { detectBrowser } from "./lib/browser";
 
 // --- Types (generated from Pydantic — Debt-1 closure) ---
 //
@@ -557,12 +558,18 @@ function connect(): void {
                         timestamp: Date.now() / 1000,
                         sequence: ++sequence,
                     }));
-                    // Identify as Chrome extension (AFTER auth so the
+                    // Identify the host browser (AFTER auth so the
                     // daemon-side ``IDENTIFY`` handler runs in the
-                    // authenticated branch of dispatch).
+                    // authenticated branch of dispatch). The same JS
+                    // ships to both Chrome and Edge; ``detectBrowser()``
+                    // chooses the right ``client_type`` so the desktop
+                    // dashboard lights up the correct connection dot
+                    // and downstream broadcasts that target a specific
+                    // browser ("send only to Edge") work as advertised.
+                    const browserClientType = detectBrowser();
                     send({
                         type: "IDENTIFY",
-                        payload: { client_type: "chrome" },
+                        payload: { client_type: browserClientType },
                         timestamp: Date.now() / 1000,
                         sequence: ++sequence,
                     });

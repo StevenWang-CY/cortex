@@ -478,10 +478,36 @@ function CortexPopup(): React.ReactElement {
     // Derived
     const stateStr = state?.state ?? "";
     const stateColor = STATE_COLORS[stateStr] || CX.textTertiary;
-    const stateLabel = STATE_LABELS[stateStr] || "Idle";
+    // ``Idle`` only when we've actually received a STATE_UPDATE whose
+    // ``state`` field is missing/unknown. Pre-first-frame (the WS has
+    // opened but the daemon hasn't broadcast yet because AUTH is still
+    // round-tripping the native host) shows ``Connecting…`` instead —
+    // ``Idle`` would mis-attribute the wait to the user being inactive.
+    const stateLabel = state
+        ? STATE_LABELS[stateStr] || "Idle"
+        : connected
+            ? "Connecting…"
+            : "Idle";
     const hr = state?.biometrics?.heart_rate;
     const hrv = state?.biometrics?.hrv_rmssd;
     const blink = state?.biometrics?.blink_rate;
+    // Capture-pipeline status mirrored from the daemon (set in
+    // ``WebSocketServer._make_state_update``). Drives the
+    // "Camera offline / Looking for your face / Reading your pulse"
+    // banner shown in the BPM/HRV/BLK area when no HR is available.
+    // ``state`` may be null pre-first-STATE_UPDATE; default both flags
+    // to ``true`` so the most benign message ("Reading your pulse…")
+    // wins until we hear otherwise — same fallback as the desktop tab.
+    const captureRaw = (state as unknown as { capture?: { frames_flowing?: boolean; face_detected?: boolean } })?.capture;
+    const framesFlowing = captureRaw?.frames_flowing ?? true;
+    const faceDetected = captureRaw?.face_detected ?? true;
+    const bioStatusMessage = !state
+        ? "Connecting to daemon…"
+        : !framesFlowing
+            ? "Camera offline — open System Settings → Privacy & Security → Camera"
+            : !faceDetected
+                ? "Looking for your face…"
+                : "Reading your pulse…";
 
     const focusMin = focus ? Math.round(focus.focusMs / 60000) : 0;
     const elapsedMin = focus ? Math.round(focus.elapsedMs / 60000) : 0;
@@ -853,11 +879,11 @@ function CortexPopup(): React.ReactElement {
             )}
 
             {/* Biometrics row — no card, 1px separators above/below */}
-            {connected && (
+            {connected && hr ? (
                 <div style={S.bioRow}>
                     <div style={S.bioCol}>
                         <span style={{ ...S.bioLabel, color: `${CX.bioHr}80` }}>BPM</span>
-                        <span style={S.bioVal} aria-label={hr ? `${Math.round(hr)} beats per minute` : "no heart rate data"}>{hr ? Math.round(hr) : "\u2014"}</span>
+                        <span style={S.bioVal} aria-label={`${Math.round(hr)} beats per minute`}>{Math.round(hr)}</span>
                     </div>
                     <div style={S.bioCol}>
                         <span style={{ ...S.bioLabel, color: `${CX.bioHrv}80` }}>HRV</span>
@@ -868,7 +894,16 @@ function CortexPopup(): React.ReactElement {
                         <span style={S.bioVal} aria-label={blink ? `${Math.round(blink)} blinks per minute` : "no blink rate data"}>{blink ? `${Math.round(blink)}/m` : "\u2014"}</span>
                     </div>
                 </div>
-            )}
+            ) : connected ? (
+                <div
+                    style={S.bioStatusBox}
+                    role="status"
+                    aria-live="polite"
+                    aria-label={`Biometrics status: ${bioStatusMessage}`}
+                >
+                    {bioStatusMessage}
+                </div>
+            ) : null}
 
             {/* Settings — no card, just label + toggle, 1px separator above */}
             <div style={S.settingsArea}>
@@ -1243,6 +1278,22 @@ const S: Record<string, React.CSSProperties> = {
         fontWeight: 400,
         fontFamily: CX.fontSerif,
         color: CX.text,
+    },
+    // Contextual banner shown in the BPM/HRV/BLK slot when no HR
+    // reading has landed yet. Visual: same border treatment as the
+    // numerics row so the layout doesn't reflow when the first reading
+    // arrives. Italic + secondary color signals "not your data".
+    bioStatusBox: {
+        padding: "22px 12px",
+        marginBottom: 16,
+        borderTop: `1px solid ${CX.borderDefault}`,
+        borderBottom: `1px solid ${CX.borderDefault}`,
+        textAlign: "center" as const,
+        fontSize: 12,
+        fontStyle: "italic" as const,
+        color: CX.textSecondary,
+        fontFamily: CX.font,
+        lineHeight: 1.4,
     },
 
     // Settings

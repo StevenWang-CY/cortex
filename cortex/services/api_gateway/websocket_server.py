@@ -1214,6 +1214,34 @@ class WebSocketServer:
             # a separate event stream.
             "connected_clients": self.connected_client_types(),
         }
+
+        # Surface capture status so the consumer dashboard can render
+        # "Camera offline" vs "Looking for your face" vs "Reading your
+        # pulse" instead of a bare ``--`` while the rPPG window fills.
+        # ``latest_frame_meta`` is stamped on every capture tick by
+        # ``runtime_daemon._process_capture_output``; absence here means
+        # the capture loop hasn't produced a frame yet (camera not open,
+        # permission denied, or daemon mid-startup).
+        capture_status: dict[str, bool] = {
+            "frames_flowing": False,
+            "face_detected": False,
+        }
+        try:
+            from cortex.services.api_gateway.app import registry as _registry
+            frame_meta = _registry.get("latest_frame_meta")
+            if frame_meta is not None:
+                fm_ts = float(getattr(frame_meta, "timestamp", 0.0))
+                capture_status["frames_flowing"] = (
+                    time.monotonic() - fm_ts < 2.0
+                )
+                capture_status["face_detected"] = bool(
+                    getattr(frame_meta, "face_detected", False)
+                )
+        except Exception:
+            # Registry lookup is best-effort; never block a broadcast.
+            pass
+        payload["capture"] = capture_status
+
         if biometrics:
             payload["biometrics"] = biometrics
         return WSMessage(

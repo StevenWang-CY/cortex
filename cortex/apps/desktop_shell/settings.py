@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import QMutex, QSettings, Qt, Signal
+from PySide6.QtCore import QMutex, QSettings, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -176,6 +176,17 @@ class SettingsDialog(QWidget):
         self._build_ui()
         self._load_persisted_settings()
 
+        # macOS Privacy & Security grants are made out-of-process — there is
+        # no callback into the app when the user flips the toggle. Poll
+        # every 1.5s while the dialog is visible so the camera /
+        # accessibility status pills reflect reality without a relaunch
+        # or "Check again" click. Paused on hide via ``hideEvent``.
+        self._permission_timer: QTimer = QTimer(self)
+        self._permission_timer.setInterval(1500)
+        self._permission_timer.timeout.connect(self._refresh_permission_states)
+        self._permission_timer.start()
+        self._refresh_permission_states()
+
     # -- Native chrome ---------------------------------------------------
 
     def showEvent(self, event: object) -> None:  # noqa: D401 - Qt override
@@ -185,6 +196,26 @@ class SettingsDialog(QWidget):
             mac_native.apply_vibrancy(self, material="window_background")
         except Exception:
             logger.debug("native chrome application failed", exc_info=True)
+        # Resume + force-refresh the permission poll whenever the dialog
+        # becomes visible. ``_permission_timer`` may have been stopped by
+        # a prior hide; restart it so users opening Settings always see
+        # the current grant state on the first frame, not 1.5s later.
+        try:
+            if not self._permission_timer.isActive():
+                self._permission_timer.start()
+            self._refresh_permission_states()
+        except Exception:
+            logger.debug("permission poll resume failed", exc_info=True)
+
+    def hideEvent(self, event: object) -> None:  # noqa: D401 - Qt override
+        # Stop polling when the dialog is not visible — saves ~40 syscalls/
+        # minute on TCC + AVCaptureDevice queries and prevents background
+        # work from spinning when Cortex is minimised.
+        try:
+            self._permission_timer.stop()
+        except Exception:
+            logger.debug("permission poll stop failed", exc_info=True)
+        super().hideEvent(event)
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -227,10 +258,29 @@ class SettingsDialog(QWidget):
         self._webcam_enabled.setStyleSheet(_CHECKBOX_QSS)
         sensing_inner.addWidget(self._webcam_enabled)
 
+        # macOS Privacy & Security status pill, polled every 1.5s while
+        # the dialog is visible. Clicking opens the relevant pane in
+        # System Settings. Pre-fix this status only existed in the
+        # onboarding wizard; users who flipped the toggle from System
+        # Settings mid-session had no in-app feedback until relaunch.
+        self._camera_perm_row = self._make_permission_row(
+            label_not_granted="Camera access not granted — open System Settings",
+            label_granted="Camera access granted",
+            target="camera",
+        )
+        sensing_inner.addLayout(self._camera_perm_row["layout"])
+
         self._input_telemetry_enabled = QCheckBox("Enable keyboard & mouse tracking")
         self._input_telemetry_enabled.setChecked(True)
         self._input_telemetry_enabled.setStyleSheet(_CHECKBOX_QSS)
         sensing_inner.addWidget(self._input_telemetry_enabled)
+
+        self._accessibility_perm_row = self._make_permission_row(
+            label_not_granted="Accessibility access not granted — open System Settings",
+            label_granted="Accessibility access granted",
+            target="accessibility",
+        )
+        sensing_inner.addLayout(self._accessibility_perm_row["layout"])
 
         layout.addWidget(sensing_card)
 
@@ -545,6 +595,151 @@ class SettingsDialog(QWidget):
             "}"
         )
         return card
+
+    def _make_permission_row(
+        self,
+        *,
+        label_not_granted: str,
+        label_granted: str,
+        target: str,
+    ) -> dict:
+        """Build a status row that reflects a live macOS permission grant.
+
+        Returns a dict with:
+          * ``layout`` — the QHBoxLayout to add into the parent
+          * ``label`` — the QLabel updated on every poll
+          * ``label_granted`` / ``label_not_granted`` — text variants
+          * ``target`` — ``"camera"`` | ``"accessibility"``
+          * ``granted`` — last polled state (bool)
+
+        The row is non-interactive in the not-yet-granted state besides
+        a clickable text link to ``x-apple.systempreferences:`` deep-links
+        for the relevant pane. Once granted, the row collapses to a
+        single-line confirmation in the secondary text colour with a
+        check glyph.
+        """
+        row_layout = QHBoxLayout()
+        row_layout.setContentsMargins(SP4, 0, 0, 0)
+        row_layout.setSpacing(SP2)
+
+        label = QLabel(label_not_granted)
+        label.setFont(mac_native.system_font(FS_CAPTION, "regular"))
+        label.setWordWrap(True)
+        label.setOpenExternalLinks(False)
+        label.setTextFormat(Qt.TextFormat.RichText)
+        label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextBrowserInteraction
+        )
+        label.linkActivated.connect(  # type: ignore[attr-defined]
+            lambda _href, t=target: self._open_system_settings(t)
+        )
+        row_layout.addWidget(label, stretch=1)
+
+        set_accessible_name(label, f"{target} permission status")
+        set_accessible_description(
+            label,
+            "Reflects the current macOS Privacy & Security grant for this "
+            "permission. Polled every 1.5 seconds while Settings is open.",
+        )
+
+        return {
+            "layout": row_layout,
+            "label": label,
+            "label_granted": label_granted,
+            "label_not_granted": label_not_granted,
+            "target": target,
+            "granted": False,
+        }
+
+    def _refresh_permission_states(self) -> None:
+        """Poll macOS TCC + AX for the current grant state and update
+        the camera / accessibility status rows accordingly.
+
+        Called every 1.5s by ``_permission_timer`` while the dialog is
+        visible (see ``showEvent`` / ``hideEvent``). The helpers live
+        in ``cortex.libs.utils.platform`` and return ``False`` on any
+        Cocoa-bridge surprise, so the UI never crashes here even on
+        non-macOS dev runs.
+        """
+        try:
+            from cortex.libs.utils import (
+                check_accessibility_permission,
+                check_camera_permission,
+            )
+        except Exception:
+            logger.debug("permission helpers unavailable", exc_info=True)
+            return
+
+        try:
+            cam = bool(check_camera_permission())
+        except Exception:
+            cam = False
+        try:
+            acc = bool(check_accessibility_permission())
+        except Exception:
+            acc = False
+
+        self._render_permission_row(self._camera_perm_row, cam)
+        self._render_permission_row(self._accessibility_perm_row, acc)
+
+    def _render_permission_row(self, row: dict, granted: bool) -> None:
+        """Mutate a row to reflect a fresh poll. Guarded against repeat
+        writes — when ``granted`` matches the cached state, the label /
+        stylesheet are left alone so Qt's paint loop doesn't churn at
+        1.5 Hz across two rows.
+        """
+        if row.get("granted") == granted:
+            return
+        row["granted"] = granted
+        label: QLabel = row["label"]
+        if granted:
+            # Sentence-case "Granted" pill, secondary text colour, leading
+            # check glyph. Not a hyperlink — there is nothing for the
+            # user to do here, and an underline would invite mis-clicks.
+            label.setText(f"✓ {row['label_granted']}")
+            label.setStyleSheet(
+                f"color: {CX_TEXT_SECONDARY}; background: transparent;"
+            )
+        else:
+            # Embed the call-to-action as an inline link so VoiceOver
+            # announces "link" and clicks deep-link to System Settings.
+            target = row["target"]
+            base = row["label_not_granted"]
+            label.setText(
+                f'<a href="cortex://open-system-settings/{target}" '
+                f'style="color: {BRAND_ACCENT}; text-decoration: none;">'
+                f"{base}</a>"
+            )
+            label.setStyleSheet(
+                f"color: {CX_TEXT_TERTIARY}; background: transparent;"
+            )
+
+    def _open_system_settings(self, target: str) -> None:
+        """Deep-link System Settings to the correct Privacy & Security
+        pane. ``target`` is one of ``"camera"`` / ``"accessibility"``.
+
+        Uses the documented ``x-apple.systempreferences:`` URL scheme via
+        ``open(1)``. Safe to call from the GUI thread — no subprocess
+        result is needed and the call is non-blocking; failures are
+        logged at debug level.
+        """
+        urls = {
+            "camera": "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera",
+            "accessibility": "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+        }
+        url = urls.get(target)
+        if url is None:
+            return
+        try:
+            import subprocess
+
+            subprocess.Popen(
+                ["open", url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            logger.debug("open System Settings failed", exc_info=True)
 
     def _on_back(self) -> None:
         self.hide()

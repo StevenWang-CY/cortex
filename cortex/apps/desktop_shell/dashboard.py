@@ -507,6 +507,7 @@ class _ConsumerTab(QWidget):
 
         bio_row = QHBoxLayout()
         bio_row.setSpacing(0)
+        bio_row.setContentsMargins(0, 0, 0, 0)
 
         self._bpm_label = QLabel("--")
         self._hrv_label = QLabel("--")
@@ -542,7 +543,41 @@ class _ConsumerTab(QWidget):
             col.addWidget(heading)
             bio_row.addLayout(col, stretch=1)
 
-        bio_inner.addLayout(bio_row)
+        # Wrap the numerics row in a container so we can swap it for a
+        # status banner ("Reading your pulse…" / "Camera offline" / …)
+        # while the rPPG window fills. The container's preferred height
+        # matches the populated state so the card doesn't reflow when
+        # the first reading lands.
+        self._bio_numerics = QWidget()
+        self._bio_numerics.setStyleSheet("background: transparent;")
+        self._bio_numerics.setLayout(bio_row)
+        bio_inner.addWidget(self._bio_numerics)
+
+        # Contextual status banner. Shown only when ``heart_rate`` is
+        # ``None`` post-first-STATE_UPDATE; the message is driven by
+        # ``payload["capture"]`` (camera frames flowing, face detected).
+        # Three states:
+        #   • camera offline (no frames)        → "Camera offline …"
+        #   • frames flowing, no face yet       → "Looking for your face…"
+        #   • frames flowing, face, no rPPG yet → "Reading your pulse…"
+        self._bio_status_label = QLabel("")
+        self._bio_status_label.setObjectName("CortexBioStatus")
+        self._bio_status_label.setWordWrap(True)
+        self._bio_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._bio_status_label.setFont(
+            mac_native.system_font(FS_CAPTION, "regular")
+        )
+        self._bio_status_label.setStyleSheet(
+            "QLabel#CortexBioStatus {"
+            f"  color: {_LABEL_SECONDARY};"
+            "  background: transparent;"
+            "  padding: 22px 8px 22px 8px;"
+            "  font-style: italic;"
+            "}"
+        )
+        self._bio_status_label.setVisible(False)
+        _set_accessible_name(self._bio_status_label, "Biometrics status")
+        bio_inner.addWidget(self._bio_status_label)
         root.addWidget(bio_card)
         root.addSpacing(SP4)
 
@@ -748,15 +783,47 @@ class _ConsumerTab(QWidget):
         hr = bio.get("heart_rate")
         hrv = bio.get("hrv_rmssd")
         blink = bio.get("blink_rate")
-        self._set_text_if_changed(
-            self._bpm_label, f"{hr:.0f}" if hr is not None else "--"
-        )
-        self._set_text_if_changed(
-            self._hrv_label, f"{hrv:.0f}" if hrv is not None else "--"
-        )
-        self._set_text_if_changed(
-            self._blk_label, f"{blink:.1f}" if blink is not None else "--"
-        )
+
+        # When no heart-rate has landed yet, swap the BPM/HRV/BLK row for
+        # a contextual status line so the user can tell apart "camera off"
+        # from "camera on, still warming up". The daemon stamps
+        # ``payload["capture"]`` on every STATE_UPDATE; older daemons
+        # that lack the field fall through to the "Reading your pulse…"
+        # default, which is the most benign of the three states.
+        if hr is None:
+            capture = payload.get("capture") or {}
+            frames_flowing = bool(capture.get("frames_flowing", True))
+            face_detected = bool(capture.get("face_detected", True))
+            if not frames_flowing:
+                status_text = (
+                    "Camera offline — check System Settings → Privacy "
+                    "& Security → Camera"
+                )
+            elif not face_detected:
+                status_text = "Looking for your face…"
+            else:
+                # Camera + face are both healthy; the rPPG sliding window
+                # is filling. First HR usually lands inside ~25 s.
+                status_text = "Reading your pulse…"
+            self._set_text_if_changed(self._bio_status_label, status_text)
+            try:
+                self._bio_status_label.setVisible(True)
+                self._bio_numerics.setVisible(False)
+            except Exception:
+                pass
+        else:
+            try:
+                self._bio_status_label.setVisible(False)
+                self._bio_numerics.setVisible(True)
+            except Exception:
+                pass
+            self._set_text_if_changed(self._bpm_label, f"{hr:.0f}")
+            self._set_text_if_changed(
+                self._hrv_label, f"{hrv:.0f}" if hrv is not None else "--"
+            )
+            self._set_text_if_changed(
+                self._blk_label, f"{blink:.1f}" if blink is not None else "--"
+            )
 
         # Audit-2 fix: drive the Today panel from accumulated session
         # stats instead of leaving the placeholder "--" labels. We
