@@ -263,11 +263,6 @@ When every provider fails, Cortex falls back to a deterministic
 rule-based plan (`CORTEX_LLM__FALLBACK_MODE=rule_based`, the default)
 so the daemon keeps working.
 
-> **Removed providers (v0.2.0+):** Azure OpenAI, self-hosted Qwen, and
-> local Ollama were dropped when Cortex migrated to the Anthropic SDK.
-> Legacy `.env` files boot cleanly because the validator maps stale
-> values to the rule-based fallback rather than raising.
-
 ### Browser extension
 
 ```bash

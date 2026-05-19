@@ -41,7 +41,7 @@ Interventions trigger on HYPER with confidence > 0.85, workspace complexity > 0.
 
 ## Active Interventions
 
-When Cortex detects you need help, the LLM analyzes your full workspace context and generates specific, executable actions. AMIP (`cortex/services/eval/amip.py`) — a contextual Thompson-sampling policy with deterministic safety floor and write-ahead propensity logging — selects the best intervention arm based on learned user preferences. The legacy LinUCB bandit (`cortex/services/eval/bandit.py`) remains available as a non-default option. The intervention overlay appears in the bottom-right of your active tab.
+When Cortex detects you need help, the LLM analyzes your full workspace context and generates specific, executable actions. AMIP (`cortex/services/eval/amip.py`) — a contextual Thompson-sampling policy with deterministic safety floor and write-ahead propensity logging — selects the best intervention arm based on learned user preferences. The intervention overlay appears in the bottom-right of your active tab.
 
 ### Intervention Types
 
@@ -208,18 +208,15 @@ Cortex learns from every intervention to get better over time:
 
 1. **Helpfulness Tracker** — captures pre/post intervention state and computes a reward signal from implicit signals (was it undone? ignored? engaged with?) and explicit signals (thumbs up/down rating). Reward = recovery weight (40%) + complexity reduction (15%) + explicit rating (30%) + implicit signals (15%).
 
-2. **AMIP Policy (default)** — contextual Thompson sampling in `cortex/services/eval/amip.py` selects which intervention arm to deploy. Features a temperature-controlled softmax, a deterministic safety floor, propensity logging, and a write-ahead decision log (`storage/policy_log/YYYY-MM-DD.jsonl`) so a nightly causal report (`storage/reports/causal_YYYY-MM-DD.md`) can audit policy quality. The legacy LinUCB bandit in `cortex/services/eval/bandit.py` remains as a non-default option, selecting interventions from 8 context features (state code, complexity, tab count, error count, hour of day, thrashing score, stress integral, consent level) with A-matrix / b-vector updates persisted every 10 records.
+2. **AMIP Policy** — contextual Thompson sampling in `cortex/services/eval/amip.py` selects which intervention arm to deploy. Features a temperature-controlled softmax, a deterministic safety floor, propensity logging, and a write-ahead decision log (`storage/policy_log/YYYY-MM-DD.jsonl`) so a nightly causal report (`storage/reports/causal_YYYY-MM-DD.md`) can audit policy quality. Uses 8 context features (state code, complexity, tab count, error count, hour of day, thrashing score, stress integral, consent level).
 
 3. **Tab Relevance Tracker** — learns per-domain relevance from user feedback on tab close recommendations. Uses exponential moving average (α=0.3) to update domain scores: keeping a tab → relevant (1.0), confirming a close → irrelevant (0.0). Per-tab feedback: when the user uses Keep buttons on individual tabs in the overlay, each tab's kept/closed decision is recorded separately (not all-or-nothing). Scores persist with 90-day TTL and are scoped per focus goal. Personalizes which tabs Cortex recommends closing.
 
 4. **Replay Harness** — offline A/B testing. Load JSONL session recordings and replay them through alternative scoring policies and prompt configurations. Compare baseline vs. variant on reward delta, engagement delta, and intervention count.
 
 ```bash
-# Offline evaluation
-python -m cortex.scripts.replay_harness --scorer v2 --prompts v2 sessions/*.jsonl
-
-# Batch bandit training
-python -m cortex.services.eval.bandit_trainer --data sessions/ --output models/
+# Offline evaluation — replay sessions through alternative scoring policies or prompts
+python -m cortex.scripts.replay_harness sessions/*.jsonl
 ```
 
 ---
@@ -417,7 +414,7 @@ Dual-backend persistence layer (Redis with automatic in-memory fallback). All se
 
 ## Adapter Registry
 
-Pluggable architecture for workspace integrations. Adapters implement the `CortexAdapter` protocol (name, capabilities, execute, get_context, health_check). The registry handles discovery, capability querying, action routing, and health checks. Supports plugin discovery via Python entry points. Legacy adapters are auto-wrapped for backward compatibility.
+Pluggable architecture for workspace integrations. Adapters implement the `CortexAdapter` protocol (name, capabilities, execute, get_context, health_check). The registry handles discovery, capability querying, action routing, and health checks. Supports plugin discovery via Python entry points.
 
 ---
 
@@ -444,21 +441,16 @@ Output: `cortex/apps/browser_extension/types/generated/cortex_schemas.d.ts` (car
 **LLM backend** (pick one Anthropic SDK transport): AWS Bedrock with a bearer token stored in macOS Keychain (default), Google Vertex AI via `gcloud auth application-default login`, or direct Anthropic API via `ANTHROPIC_API_KEY`. If every provider fails, `CORTEX_LLM__FALLBACK_MODE=rule_based` (default) keeps the daemon running with a deterministic plan; set it to `direct_anthropic` to retry via the direct API instead.
 
 ```bash
-cd /path/to/Ralph
+git clone https://github.com/StevenWang-CY/cortex.git
+cd cortex
 
-# Create venv and install
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e "./cortex[dev]"
-
-# Copy config and edit .env (set CORTEX_LLM__PROVIDER and credentials)
-cp cortex/.env.example .env
-
-# Initialize storage
-python -m cortex.scripts.seed_config --root .
-
-# Start the daemon
-cortex-dev
+make setup                          # venv, deps, storage seed
+cp cortex/.env.example .env         # set CORTEX_LLM__PROVIDER + credentials
+make dev                            # start the daemon
 ```
+
+`make help` lists every shortcut (`make test`, `make ci`, `make codegen`,
+`make ext`, `make dmg`, …).
 
 REST API runs at `http://127.0.0.1:9472`. WebSocket runs at `ws://127.0.0.1:9473`.
 
@@ -713,8 +705,7 @@ cortex/
 │   ├── intervention_engine/ # Trigger, snapshot, planner, executor (adapter registry), restore,
 │   │                        #   LeetCode interventions (lockout, scratchpad, ladder, guards)
 │   ├── consent/             # ConsentPolicy + ConsentLadder (progressive trust)
-│   ├── eval/                # HelpfulnessTracker, AMIPPolicy (default contextual Thompson
-│   │                        #   sampling), legacy ContextualBandit (LinUCB), bandit trainer,
+│   ├── eval/                # HelpfulnessTracker, AMIPPolicy (contextual Thompson sampling),
 │   │                        #   policy replay, causal report, TabRelevanceTracker (per-domain
 │   │                        #   EMA learning)
 │   ├── handover/            # ShutdownDetector, HandoverSnapshot, MorningBriefing
@@ -722,7 +713,7 @@ cortex/
 │   ├── launcher/            # ProjectConfig (YAML profiles), ProjectLauncher
 │   ├── throttle/            # CopilotThrottle (silence inline suggestions in HYPER)
 │   ├── api_gateway/         # FastAPI REST routes, WebSocket server
-│   └── runtime_daemon.py    # Main orchestrator — ties all v1 + v2 services together
+│   └── runtime_daemon.py    # Main orchestrator — wires every service into a single asyncio supervisor
 ├── apps/
 │   ├── desktop_shell/       # PySide6: tray, dashboard, overlay, settings, onboarding
 │   ├── vscode_extension/    # TypeScript: WS client, context provider, fold controller,
@@ -746,9 +737,11 @@ cortex/
 │   ├── launcher_agent.py    # HTTP launcher server on port 9471 (alternative to native messaging)
 │   ├── install_launcher.py  # Manual start/stop helper for the launcher agent
 │   └── build_macos_app.sh   # macOS app packaging
-├── tests/
-│   ├── unit/                # Per-module unit tests (100+ test files total across unit + integration)
-│   └── integration/         # Pipeline integration tests
+├── tests/                   # 124 pytest files, 1,334 test functions (unit + integration +
+│                            #   eval + a11y); see make test, make test-eval, make test-unit
+│   ├── unit/
+│   ├── integration/
+│   └── eval/                # AMIP regret, IPS unbiasedness, safety-floor invariants
 └── docs/
     ├── setup.md
     ├── deploy_anthropic.md
@@ -764,29 +757,21 @@ cortex/
 ## Development
 
 ```bash
-# Run all tests
-pytest
+make ci                # ruff + mypy --strict + pytest + schema-codegen drift
+make test              # full pytest suite
+make test-eval         # AMIP / IPS / safety-floor / calibration suite
+make typecheck         # mypy --strict
+make codegen-check     # schema drift gate (pre-commit + CI mirror)
+make ext               # build Chrome MV3 extension
 
 # With coverage
 pytest --cov=cortex --cov-report=html
 
-# Type check
-mypy cortex/
-
-# Lint
-ruff check cortex/
-
-# Build Chrome extension
-cd cortex/apps/browser_extension && npx plasmo build
-
-# Test intervention overlay without full daemon
+# Test the intervention overlay without a full daemon
 python -m cortex.scripts.test_intervention
 
-# Replay a session with alternative config
-python -m cortex.scripts.replay_harness --scorer v2 --prompts v2 sessions/*.jsonl
-
-# Train bandit offline
-python -m cortex.services.eval.bandit_trainer --data sessions/ --output models/
+# Offline session replay (alternative scoring / prompt configs)
+python -m cortex.scripts.replay_harness sessions/*.jsonl
 ```
 
 ---

@@ -105,15 +105,6 @@ rule-based plan (`CORTEX_LLM__FALLBACK_MODE=rule_based`, the default),
 so a missing key never crashes the session — you just lose the
 LLM-generated copy until the provider comes back.
 
-> **Removed providers (v0.2.0+):** Azure OpenAI, self-hosted Qwen, and
-> local Ollama were dropped when Cortex migrated to the Anthropic SDK.
-> The env vars `CORTEX_LLM__MODE`, `CORTEX_LLM__AZURE__*`,
-> `CORTEX_LLM__REMOTE__*`, `CORTEX_LLM__LOCAL__*`, and
-> `CORTEX_LLM__MODEL_NAME` are no longer read by the code; the legacy
-> validator in `LLMConfig` maps stale values to the rule-based fallback
-> rather than raising, so a 0.1.x `.env` boots cleanly while
-> producing no LLM traffic.
-
 ### Camera Configuration
 
 Leave `CORTEX_CAPTURE__DEVICE_ID` commented out for automatic selection. Cortex will:
