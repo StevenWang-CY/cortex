@@ -1,9 +1,22 @@
+# Dependabot configuration
+#
+# Groups are essential — without them dependabot files one PR per
+# package and floods the queue (the v0.2.1 release surfaced exactly
+# this: 17 PRs in 30 minutes). With grouping we get at most
+# 2 PRs per ecosystem per cycle (one for safe updates, one if there
+# are any major-version bumps that need manual review).
+#
+# Cadence is monthly so the queue stays calm; security advisories
+# bypass this schedule and arrive immediately regardless.
+
 version: 2
 updates:
+
+  # ─── Python (cortex daemon) ─────────────────────────────────────────
   - package-ecosystem: "pip"
     directory: "/cortex"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
       day: "monday"
       time: "09:00"
       timezone: "America/Los_Angeles"
@@ -13,45 +26,115 @@ updates:
       - "python"
     commit-message:
       prefix: "deps(py)"
+    groups:
+      python-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+      python-types-and-dev:
+        applies-to: version-updates
+        patterns:
+          - "mypy*"
+          - "ruff*"
+          - "pytest*"
+          - "types-*"
+    # Major version bumps still get their own PR (default behaviour
+    # for anything outside a group). Pin the ones that historically
+    # require coordinated work across services so they don't keep
+    # showing up as failing CI runs.
+    ignore:
+      - dependency-name: "anthropic"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "pydantic"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "fastapi"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "uvicorn"
+        update-types: ["version-update:semver-major"]
 
+  # ─── Browser extension (Plasmo / React / MV3) ───────────────────────
   - package-ecosystem: "npm"
     directory: "/cortex/apps/browser_extension"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
       day: "monday"
       time: "09:00"
       timezone: "America/Los_Angeles"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 3
     labels:
       - "dependencies"
       - "browser-extension"
     commit-message:
       prefix: "deps(ext)"
+    groups:
+      ext-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+      ext-types:
+        applies-to: version-updates
+        patterns:
+          - "@types/*"
+    ignore:
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "react"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "react-dom"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "plasmo"
+        update-types: ["version-update:semver-major"]
 
+  # ─── VS Code extension ──────────────────────────────────────────────
   - package-ecosystem: "npm"
     directory: "/cortex/apps/vscode_extension"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
       day: "monday"
       time: "09:00"
       timezone: "America/Los_Angeles"
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 2
     labels:
       - "dependencies"
       - "vscode-extension"
     commit-message:
       prefix: "deps(vscode)"
+    groups:
+      vscode-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+      vscode-types:
+        applies-to: version-updates
+        patterns:
+          - "@types/*"
+    ignore:
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@types/vscode"
+        update-types: ["version-update:semver-major"]
 
+  # ─── GitHub Actions ─────────────────────────────────────────────────
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
       day: "monday"
       time: "09:00"
       timezone: "America/Los_Angeles"
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 2
     labels:
       - "dependencies"
       - "ci"
     commit-message:
       prefix: "deps(ci)"
+    groups:
+      ci-actions:
+        applies-to: version-updates
+        update-types:
+          - "major"
+          - "minor"
+          - "patch"
