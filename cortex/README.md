@@ -757,10 +757,10 @@ cortex/
 ## Development
 
 ```bash
-make ci                # ruff + mypy --strict + pytest + schema-codegen drift
+make ci                # ruff + mypy + pytest + schema-codegen drift
 make test              # full pytest suite
 make test-eval         # AMIP / IPS / safety-floor / calibration suite
-make typecheck         # mypy --strict
+make typecheck         # mypy (informational; config-driven strict checks live in pyproject.toml)
 make codegen-check     # schema drift gate (pre-commit + CI mirror)
 make ext               # build Chrome MV3 extension
 

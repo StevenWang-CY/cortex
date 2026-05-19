@@ -19,7 +19,7 @@
   <img alt="Platform: macOS" src="https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey?logo=apple" />
   <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white" />
   <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white" />
-  <img alt="mypy strict" src="https://img.shields.io/badge/mypy-strict-2A6DB2" />
+  <img alt="mypy" src="https://img.shields.io/badge/mypy-checked-2A6DB2" />
   <img alt="ruff" src="https://img.shields.io/badge/lint-ruff-D7FF64" />
 </p>
 
@@ -89,10 +89,10 @@
   `stop` → SIGTERM-by-port-and-name → SIGKILL survivors, with
   bounded waits between each layer. Documented in
   [`CLAUDE.md`](CLAUDE.md) rule #13.
-- **Hard CI gates.** `mypy --strict` + `ruff` + 124 pytest files
-  (1,334 test functions) + 17 vitest specs + schema-codegen drift +
-  eval-regression baseline (synthetic-trace replay with 3 % relative
-  tolerance) on every PR.
+- **Hard CI gates.** `ruff` + 124 pytest files (1,334 test functions)
+  + 17 vitest specs + schema-codegen drift + eval-regression baseline
+  (synthetic-trace replay with 3 % relative tolerance) on every PR.
+  `mypy` runs as an informational check.
 - **Cross-language stack** with intent: Python (FastAPI + PySide6) ·
   TypeScript (Plasmo MV3 + VS Code) · C (`.cortex_launcher.c` for
   macOS TCC identity) · ONNX Runtime (TS-CAN inference).

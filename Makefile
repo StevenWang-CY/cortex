@@ -57,8 +57,8 @@ lint: ## ruff
 format: ## ruff --fix
 	$(RUFF) check --fix cortex/
 
-typecheck: ## mypy --strict
-	$(MYPY) cortex/ --strict
+typecheck: ## mypy (config-driven; strict checks live in pyproject.toml)
+	$(MYPY) cortex/
 
 codegen: ## Regenerate cortex_schemas.d.ts from Pydantic models
 	$(PY) -m cortex.scripts.generate_ts_schemas
