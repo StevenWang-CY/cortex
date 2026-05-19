@@ -1,320 +1,308 @@
 <p align="center">
   <img src="cortex/assets/banner.svg?v=2" alt="Cortex Banner" width="450" />
 </p>
-<h1 align="center">The Biological Browser Engine</h1>
+
+<h1 align="center">Cortex — The Biological Browser Engine</h1>
+
 <p align="center">
-  [ 30 FPS ] REAL-TIME COGNITIVE TRACKING
-</p>
-<hr />
-<p align="center">
-  <a href="cortex/apps/browser_extension">EXTENSION</a> &nbsp; <a href="cortex/apps/desktop_shell">DESKTOP</a> &nbsp; <a href="cortex/docs/setup.md">DOCS</a> &nbsp; <a href="https://github.com/StevenWang-CY/cortex">SOURCE</a> &nbsp;&nbsp;&nbsp; ⭐️ ACTIVE
+  Real-time biofeedback for macOS. Reads cognitive overwhelm from your face and webcam at 30 FPS, then lets Claude restructure your workspace.
 </p>
 
-**Cortex** is a real-time biofeedback engine that watches you work through your webcam and input devices, detects cognitive overwhelm, and actively restructures your digital workspace so you can stay focused. Unlike timer-based productivity tools, Cortex uses your biology to decide when you need help, and uses LLMs to decide how to help.
+<p align="center">
+  <a href="https://github.com/StevenWang-CY/cortex/actions/workflows/ci.yml">
+    <img alt="CI" src="https://img.shields.io/github/actions/workflow/status/StevenWang-CY/cortex/ci.yml?branch=main&label=CI&logo=github" />
+  </a>
+  <a href="https://github.com/StevenWang-CY/cortex/releases/latest">
+    <img alt="Latest release" src="https://img.shields.io/github/v/release/StevenWang-CY/cortex?label=release&logo=github" />
+  </a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg" /></a>
+  <img alt="Platform: macOS" src="https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey?logo=apple" />
+  <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white" />
+  <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white" />
+  <img alt="mypy strict" src="https://img.shields.io/badge/mypy-strict-2A6DB2" />
+  <img alt="ruff" src="https://img.shields.io/badge/lint-ruff-D7FF64" />
+</p>
 
-> **Platform:** macOS only (requires AVFoundation for camera, TCC for permissions, and macOS-specific frameworks). Linux and Windows are not supported.
-
----
-
-## Key Features
-
-- **Bio-extraction at 30 FPS** — heart rate, HRV, and respiratory rate via rPPG from your face (no video stored); blink rate, head pose, and posture via MediaPipe; mouse/keyboard patterns via pynput. Gracefully degrades to telemetry-only mode in poor lighting
-- **Cognitive state classification** — fuses signals into state estimates every 500ms as FLOW, HYPER (overwhelmed), HYPO (disengaged), or RECOVERY using rule-based scoring with EMA smoothing and hysteresis
-- **LLM-powered interventions** — workspace context (never biometrics) is sent to the LLM, which returns executable actions: close distraction tabs, group related tabs, surface error fixes, decompose tasks into micro-steps. Smart tab algorithm protects recently-visited tabs, AI assistants, and goal-relevant content from being closed
-- **Activity tracking and resume** — tracks learning progress across YouTube, Bilibili, Coursera, LeetCode, PDFs, Jupyter, and more. On return, shows a one-click resume card that seeks video, scrolls to position, or pastes saved code
-- **LeetCode mode** — DOM observer, stage inference (READ/PLAN/IMPLEMENT/DEBUG/REFLECT), amygdala hijack lockout, pattern ladder hints, submission discipline guard
-- **Biology-driven breaks** — cumulative HRV suppression integral replaces arbitrary Pomodoro timers; you can ride deep FLOW until your body says stop
-- **Progressive consent** — 5-level trust ladder (OBSERVE → SUGGEST → PREVIEW → REVERSIBLE_ACT → AUTONOMOUS_ACT) per action type; Cortex earns autonomy through repeated approvals
-- **Learning loop** — contextual bandit (LinUCB) selects intervention type; helpfulness tracker computes reward from user engagement and explicit ratings; per-tab relevance tracker learns individual tab preferences from Keep button feedback
-- **Ambient somatic feedback** — sub-threshold color vignettes, weather particles, and flow shield that fades distraction elements during sustained focus
-- **Chrome + Edge** — Plasmo/React Manifest V3 extension with popup dashboard, one-click daemon launch (via native messaging + Terminal.app for camera access), camera restart, intervention overlay, Pulse Room new tab, and focus sessions with distraction blocking
-
----
-
-## Download
-
-1. Download **Cortex.dmg** from the [latest release](https://github.com/StevenWang-CY/cortex/releases/latest)
-2. Drag **Cortex.app** to Applications
-3. Strip quarantine: `xattr -cr /Applications/Cortex.app`
-4. Open Cortex — follow the 4-step setup wizard (Camera, Accessibility, API key, Extensions)
-
-That's it — no terminal, no Python, no Node.js required. The daemon runs in-process inside Cortex.app; the browser extension's **Start Cortex** button launches the installed .app automatically (`open -a Cortex.app`) and reuses its in-process daemon.
+<p align="center">
+  <a href="https://github.com/StevenWang-CY/cortex/releases/latest">Download DMG</a> &nbsp;·&nbsp;
+  <a href="https://github.com/StevenWang-CY/cortex/wiki">Wiki</a> &nbsp;·&nbsp;
+  <a href="audit/findings.md">Audit ledger</a> &nbsp;·&nbsp;
+  <a href="CHANGELOG.md">Changelog</a> &nbsp;·&nbsp;
+  <a href="cortex/docs/apis.md">API reference</a>
+</p>
 
 ---
 
-## How It Works
+## Demo
+
+<!-- TODO(media): replace with real captures. See assets/demo/README.md for capture guidance. -->
+
+<p align="center">
+  <img src="assets/demo/hero.gif" alt="Cortex intervention cycle: detect HYPER → overlay → execute → undo" width="720" />
+</p>
+
+<table>
+  <tr>
+    <td width="33%" align="center">
+      <img src="assets/demo/dashboard.png" alt="Cortex desktop dashboard showing live biometrics" />
+      <sub><b>Desktop dashboard</b><br/>HR, HRV, blink rate, posture in real time</sub>
+    </td>
+    <td width="33%" align="center">
+      <img src="assets/demo/overlay.png" alt="Intervention overlay live on a Chrome tab" />
+      <sub><b>Intervention overlay</b><br/>Causal explanation, per-tab recommendations, single-CTA execute, undo</sub>
+    </td>
+    <td width="33%" align="center">
+      <img src="assets/demo/pulse-room.png" alt="Pulse Room new-tab page pulsing at the user's heart rate" />
+      <sub><b>Pulse Room (new tab)</b><br/>Central orb pulses at your live HR; ambient ECG-style trace</sub>
+    </td>
+  </tr>
+</table>
+
+---
+
+## Engineering highlights
+
+> Lead with the proof. The differentiators a recruiter or hiring
+> manager would notice on a 90-second skim:
+
+- **Schema codegen drift gate.** Pydantic models in
+  [`cortex/libs/schemas/`](cortex/libs/schemas/) are the single source
+  of truth for every shape that crosses the daemon ↔ browser-extension
+  boundary; a custom generator emits the TypeScript `.d.ts`. Stale
+  generated output is rejected by **both** the pre-commit hook and a
+  required CI job — a class of bug it makes structurally impossible.
+- **Capability-token auth, end-to-end correlation IDs.** Every
+  mutating HTTP route and the WebSocket handshake gate on a 256-bit
+  token (`mode 0600` at `~/Library/Application Support/Cortex/auth.token`,
+  rotatable from the UI). Each mutating request is assigned an
+  `X-Cortex-Request-ID` that surfaces in dashboard error toasts so
+  users can quote the cid back when filing issues.
+- **AMIP — Adaptive Microrandomized Intervention Policy.** Contextual
+  Thompson sampling over fixed intervention arms with temperature
+  softmax, deterministic safety floor, propensity logging, and a
+  write-ahead policy log for off-policy evaluation; nightly causal
+  reports written locally. Implemented from scratch in
+  [`cortex/services/eval/amip.py`](cortex/services/eval/amip.py).
+- **Four rPPG algorithms** — POS / CHROM / GREEN / TS-CAN (ONNX) with
+  peer-reviewed citations; composite SQI vetoes physiology before
+  publication; 60-second-window HRV (RMSSD, SDNN, pNN50, SD1/SD2,
+  LF/HF via Lomb-Scargle, sample entropy).
+- **Multi-layer kill chain.** Stopping the daemon executes
+  WebSocket `SHUTDOWN` → HTTP `/shutdown` → Chrome native-messaging
+  `stop` → SIGTERM-by-port-and-name → SIGKILL survivors, with
+  bounded waits between each layer. Documented in
+  [`CLAUDE.md`](CLAUDE.md) rule #13.
+- **Hard CI gates.** `mypy --strict` + `ruff` + 124 pytest files
+  (1,334 test functions) + 17 vitest specs + schema-codegen drift +
+  eval-regression baseline (synthetic-trace replay with 3 % relative
+  tolerance) on every PR.
+- **Cross-language stack** with intent: Python (FastAPI + PySide6) ·
+  TypeScript (Plasmo MV3 + VS Code) · C (`.cortex_launcher.c` for
+  macOS TCC identity) · ONNX Runtime (TS-CAN inference).
+- **56 / 56 audit findings closed** across 2 sessions, plus 2
+  Architectural Debts (schema codegen, capability-token auth) — see
+  [`audit/state.md`](audit/state.md). The ledger is the design-process
+  artifact, not vapourware.
+
+---
+
+## Key features
+
+- **Bio-extraction at 30 FPS** — HR / HRV / respiratory rate via rPPG; blink rate, head pose, posture via MediaPipe; mouse/keyboard via pynput. Gracefully degrades to telemetry-only in poor lighting.
+- **Cognitive state classification** — fuses signals every 500 ms into FLOW · HYPER (overwhelmed) · HYPO (disengaged) · RECOVERY using rule-based scoring with EMA smoothing, Schmitt hysteresis, and per-user calibration.
+- **LLM-powered interventions** — workspace context (never biometrics) is sent to Claude via the Anthropic SDK (Bedrock default, Vertex or direct API supported); structured JSON output, schema-validated, schema-degraded on parse failure. Closes distraction tabs, groups related tabs, surfaces error fixes, decomposes tasks into micro-steps.
+- **LeetCode mode** — DOM observer, stage inference (READ / PLAN / IMPLEMENT / DEBUG / REFLECT), amygdala-hijack lockout, pattern-ladder hints, submission-discipline guard.
+- **Biology-driven breaks** — cumulative HRV-suppression integral replaces arbitrary Pomodoro timers.
+- **Progressive consent** — 5-level trust ladder per action type (OBSERVE → SUGGEST → PREVIEW → REVERSIBLE_ACT → AUTONOMOUS_ACT). Cortex earns autonomy through repeated approvals; rejections de-escalate.
+- **Learning loop** — AMIP selects the intervention arm; per-tab relevance tracker learns from Keep-button feedback (EMA, 90-day TTL).
+- **Ambient somatic feedback** — sub-threshold color vignettes, weather particles, flow shield that fades distractions during sustained focus.
+- **Chrome + Edge extension** — Plasmo / React MV3 with popup, intervention overlay, Pulse Room new tab, focus sessions, activity tracker, resume cards.
+
+---
+
+## How it works
 
 ```
 Webcam (30 FPS)
      │
      ▼
-L1: Bio-Extraction ─── rPPG (POS/CHROM/TSCAN) · Respiration Fusion · Blink/PERCLOS · Pose · Telemetry
+L1: Bio-Extraction ─── rPPG (POS/CHROM/GREEN + optional TS-CAN/ONNX) · Respiration · Blink/PERCLOS · Pose · Telemetry
      │
-     ▼  SQI Gate (NSQI + SNR + motion + face-loss) → FeatureVector (500ms)
-L2: State Engine ────── Personalized Scoring · Optional ML Ensemble · Calibrated Confidence
+     ▼  SQI Gate (NSQI + SNR + motion + face-loss) → FeatureVector (500 ms)
+L2: State Engine ────── Personalized scoring · optional ML ensemble · calibrated confidence
      │
      ▼  StateEstimate + stress_integral
-L3: Trigger Policy ──── Receptivity Gate · Dwell/Hysteresis · Adaptive Threshold · AMIP
+L3: Trigger Policy ──── Receptivity gate · dwell/hysteresis · adaptive threshold · AMIP
      │
      ▼  TaskContext
-L4: LLM Engine ──────── Schema-Constrained Output · Grounded Explanations · Self-Critique
+L4: LLM Engine ──────── Anthropic SDK (Bedrock / Vertex / direct) · schema-constrained output · grounded explanations · self-critique · rule-based fallback
      │
      ▼  InterventionPlan
-L5: Intervention ────── Recency-Weighted Consent · Single-CTA Execute · Undo Stack · Reward Logging
+L5: Intervention ────── Recency-weighted consent · single-CTA execute · undo stack · reward logging
      │
      ▼
-Store (Redis / In-Memory + policy WAL + nightly causal reports)
+Store (Redis / in-memory + policy WAL + nightly causal reports)
 ```
 
-All layers communicate via FastAPI (port 9472) and WebSocket (port 9473). The desktop shell, VS Code extension, and Chrome/Edge extension are all clients.
+All layers communicate via FastAPI (`:9472`) and WebSocket (`:9473`),
+both bound to `127.0.0.1` and gated by capability token. The desktop
+shell, VS Code extension, and Chrome / Edge extension are all clients.
+
+Deep dives: [How It Works](https://github.com/StevenWang-CY/cortex/wiki/How-It-Works) ·
+[Architecture](https://github.com/StevenWang-CY/cortex/wiki/Architecture) ·
+[API reference](cortex/docs/apis.md) ·
+[Calibration](https://github.com/StevenWang-CY/cortex/wiki/Calibration) ·
+[Privacy](https://github.com/StevenWang-CY/cortex/wiki/Privacy)
 
 ---
 
-## Scientific Foundations
-
-- **rPPG + SQI:** POS/CHROM remain default, with optional ONNX TSCAN backend and explicit SQI veto (`NSQI`, SNR, motion, face-loss) before publishing physiology.
-- **HRV reliability:** 60-second rolling IBI gate for expanded HRV (`RMSSD`, `SDNN`, `pNN50`, `SD1/SD2`, LF/HF via Lomb-Scargle, sample entropy).
-- **Fatigue and vigilance:** Blink pipeline includes PERCLOS and blink-duration variability, not blink rate alone.
-- **Flow psychophysiology:** FLOW signature now targets near-baseline HR/HRV bands plus behavioral stability and sustained dwell (120s), rather than high-HRV-only heuristics.
-- **JITAI rigor:** Triggering adds receptivity gating and AMIP (contextual Thompson sampling with propensity logging and deterministic safety floor).
-- **Intervention ethics:** Consent escalation is recency-weighted and reversible; unsafe/destructive plans are degraded gracefully instead of silently executed.
-
-## How We Know It Works
-
-- Unit and integration regression suite plus new evaluation tests:
-  - AMIP regret smoke (`cortex/tests/eval/test_amip_regret.py`)
-  - IPS unbiasedness (`cortex/tests/eval/test_ips_unbiased.py`)
-  - Safety-floor invariants (`cortex/tests/eval/test_safety_floor.py`)
-  - Classifier calibration/Brier (`cortex/tests/state_engine/test_calibration.py`)
-  - LLM safety degrade-and-ground tests (`cortex/tests/unit/test_llm_safety_refinements.py`)
-- Policy decisions are written to `storage/policy_log/YYYY-MM-DD.jsonl` before posterior updates.
-- Nightly causal reports are written to `storage/reports/causal_YYYY-MM-DD.md` (IPS/SNIPS, excursion-style effect summary, calibration diagnostics).
-
-## Limitations
-
-- Webcam rPPG remains sensitive to lighting, motion, and camera quality; physiology is gated and may be unavailable in degraded conditions.
-- Webcam-derived HRV at 30 FPS should be treated as trend-level guidance, not clinical-grade beat-level measurement.
-- Dataset replay tests for UBFC/PURE are environment-gated and require locally provided preprocessed traces.
-- The optional per-user ML classifier improves with user labels; before sufficient labels, rule-based scoring dominates.
-
----
-
-## What's Inside
-
-| Directory | Description |
-|-----------|-------------|
-| [`cortex/`](cortex/) | Core engine — bio-extraction, state classification, LLM interventions, consent ladder, learning loop, v2.0 detectors, LeetCode mode, activity tracker, smart camera selection |
-| [`cortex/apps/browser_extension/`](cortex/apps/browser_extension/) | Chrome + Edge extension (Plasmo/React) — one-click daemon launch/stop, intervention overlay, ambient feedback, focus sessions, LeetCode observer, activity tracker, resume cards, Pulse Room |
-| [`cortex/apps/vscode_extension/`](cortex/apps/vscode_extension/) | VS Code extension — context provider, code folding, morning briefing, copilot throttle |
-| [`cortex/apps/desktop_shell/`](cortex/apps/desktop_shell/) | PySide6 desktop app — in-process daemon, two-tab dashboard (biometrics + advanced), system tray, onboarding wizard, one-click browser/editor connection |
-| [`cortex/scripts/`](cortex/scripts/) | Daemon entry point, native messaging host, launcher agent, calibration, install scripts, PyInstaller build pipeline |
-
----
-
-## Tech Stack
+## Tech stack
 
 | Layer | Technologies |
 |-------|-------------|
-| **Backend** | Python 3.11+, FastAPI, MediaPipe, OpenCV, pynput, PySide6 |
-| **Browser Extension** | TypeScript, React, Plasmo (Manifest V3), Chrome + Edge |
-| **VS Code Extension** | TypeScript, VS Code Extension API |
-| **LLM** | Anthropic SDK over AWS Bedrock (default), GCP Vertex, or direct Anthropic API; rule-based deterministic fallback |
+| **Backend** | Python 3.11+, FastAPI, MediaPipe, OpenCV, ONNX Runtime, pynput, PySide6 |
+| **Browser extension** | TypeScript, React, Plasmo (Manifest V3) — Chrome + Edge |
+| **VS Code extension** | TypeScript, VS Code Extension API |
+| **LLM** | Anthropic SDK over AWS Bedrock (default), GCP Vertex, or direct Anthropic API; deterministic rule-based fallback |
 | **Storage** | Redis 7+ with automatic in-memory fallback |
-| **Testing** | pytest (120+ test files), mypy (strict), ruff |
+| **Testing** | pytest (124 test files, 1,334 test functions) + vitest (17 specs); mypy `--strict`; ruff |
+| **CI gates** | schema-codegen drift · python (ruff + mypy + pytest) · eval-regression baseline · all required for merge |
 
 ---
 
-## Developer Setup (from source)
+## Why I built this
 
-> Most users should use the **DMG installer** above. This section is for developers who want to modify Cortex.
+<!-- EDIT THIS PARAGRAPH — rewrite in your own voice before publishing -->
+
+Existing focus tools are either dumb timers (Pomodoro doesn't know you
+just hit a deep flow state at minute 24) or anxiety-machines that
+nag you for "task switching" without ever asking your body whether it
+was actually a problem. I wanted a system that read me first and
+nagged me second — one that could see I was thrashing between tabs
+*because my heart rate was climbing* and intervene with something
+specific (close these four tabs, the error is on line 67, you've been
+holding your breath for two minutes), not generic ("Time for a
+break!"). Building it also meant getting my hands dirty in a stack I
+hadn't touched together before: real-time signal processing, on-device
+ML, browser-extension architecture, async + Qt + native macOS,
+adversarial code audits. The version-control history is the project,
+not the binary.
+
+---
+
+## Status
+
+- **What works.** State classification is conservative and well-tuned in testing (no false alarms during caffeinated studying, debugging sessions, deep reading). Biology-driven break timer, LeetCode multi-selector DOM observer, intervention matrix, context-aware LLM fallback, progressive-consent ladder all behave as designed.
+- **Known limits.** Webcam rPPG is sensitive to lighting / motion / camera quality; HRV at 30 FPS is trend-level, not clinical-grade beat-level. UBFC / PURE replay tests are dataset-gated. Intervention copy can be generic early on before the learning loop calibrates.
+- **Not yet.** Linux / Windows support (the whole stack is tied to AVFoundation, TCC, and macOS-specific frameworks). No multi-user / cloud sync — by design (everything stays local).
+
+---
+
+## Install
+
+1. Download **Cortex.dmg** from the [latest release](https://github.com/StevenWang-CY/cortex/releases/latest).
+2. Drag **Cortex.app** to `/Applications`.
+3. Strip quarantine: `xattr -cr /Applications/Cortex.app`.
+4. Open Cortex — follow the 4-step setup wizard (Camera, Accessibility, API key, Extensions).
+
+That's it — no terminal, no Python, no Node.js required. The daemon
+runs in-process inside Cortex.app; the browser extension's
+**Start Cortex** button launches the installed `.app` automatically
+(`open -a Cortex.app`) and reuses its in-process daemon.
+
+---
+
+## Developer setup (from source)
+
+> Most users should use the **DMG installer** above. This section is
+> for developers who want to modify Cortex.
 
 ### Prerequisites
 
 | Requirement | How to install |
 |-------------|----------------|
-| **macOS 13+** | Required (Ventura or later) |
-| **Python 3.11 or 3.12** | `brew install python@3.11` or [python.org](https://www.python.org/downloads/) |
-| **Node.js 18+** | `brew install node` or [nodejs.org](https://nodejs.org/) |
-| **pnpm** | `npm install -g pnpm` (after installing Node.js) |
-| **LLM backend** | One of: AWS Bedrock bearer token (default), GCP Vertex application-default credentials, or direct Anthropic API key. Falls back to a deterministic rule-based plan if every provider is unavailable. |
-| **Redis** (optional) | `brew install redis && brew services start redis` — falls back to in-memory if not running |
+| **macOS 13+** | required (Ventura or later) |
+| **Python 3.11 or 3.12** | `brew install python@3.11` |
+| **Node.js 18+** | `brew install node` |
+| **pnpm** | `npm install -g pnpm` |
+| **LLM backend** | one of: AWS Bedrock bearer token (default), GCP Vertex application-default credentials, or direct Anthropic API key. Falls back to a deterministic rule-based plan if every provider is unavailable. |
+| **Redis** (optional) | `brew install redis && brew services start redis` — falls back to in-memory automatically |
 
-> **Apple Silicon note:** Use native ARM Python, not Rosetta. Verify with: `python3 -c "import platform; print(platform.machine())"` — should print `arm64`.
+> **Apple Silicon:** use native ARM Python, not Rosetta. Verify with `python3 -c "import platform; print(platform.machine())"` — should print `arm64`.
 
-### Step 1: Python Backend
+### One-shot setup
 
 ```bash
 git clone https://github.com/StevenWang-CY/cortex.git
-cd cortex   # this is the repo root (Ralph/)
+cd cortex
 
-# Create virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
+make setup            # creates .venv, installs Python + pnpm deps, seeds storage
+make precommit        # installs pre-commit hook (schema-codegen drift gate)
 
-# Install all dependencies
-pip install -e "./cortex[dev]"
+cp cortex/.env.example .env   # then set CORTEX_LLM__PROVIDER and credentials
+make dev              # start the daemon
 ```
 
-### Step 2: Configuration
+`make help` shows every shortcut.
+
+### Configuring the LLM provider
+
+Cortex talks to Claude exclusively through the Anthropic SDK. Pick
+one transport in `.env`:
 
 ```bash
-# Copy example config
-cp cortex/.env.example .env
+CORTEX_LLM__PROVIDER=bedrock        # default — AWS Bedrock (bearer token in macOS Keychain)
+# CORTEX_LLM__PROVIDER=vertex       # GCP Vertex AI (gcloud auth application-default login)
+# CORTEX_LLM__PROVIDER=direct       # Anthropic API (ANTHROPIC_API_KEY env var)
 ```
 
-Edit `.env` and pick an Anthropic SDK provider via `CORTEX_LLM__PROVIDER`:
+For Bedrock, store the bearer token in macOS Keychain (one-time):
 
-**Option A — AWS Bedrock** (default):
 ```bash
-CORTEX_LLM__PROVIDER=bedrock
-CORTEX_LLM__BEDROCK__AWS_REGION=us-east-2
-# Store the bearer token in Keychain (BYOK), not in .env:
 security add-generic-password -s cortex.bedrock -a bearer_token -w YOUR_BEDROCK_TOKEN
 ```
 
-**Option B — GCP Vertex AI**:
-```bash
-CORTEX_LLM__PROVIDER=vertex
-# Authenticate Vertex with: gcloud auth application-default login
-```
-
-**Option C — Direct Anthropic API**:
-```bash
-CORTEX_LLM__PROVIDER=direct
-export ANTHROPIC_API_KEY=sk-ant-...
-```
-
-If every provider fails, Cortex falls back to a deterministic
-rule-based plan so the daemon keeps working — you just lose
-LLM-generated copy until the provider comes back. Configure the
-fallback explicitly with `CORTEX_LLM__FALLBACK_MODE=rule_based`
-(the default).
+When every provider fails, Cortex falls back to a deterministic
+rule-based plan (`CORTEX_LLM__FALLBACK_MODE=rule_based`, the default)
+so the daemon keeps working.
 
 > **Removed providers (v0.2.0+):** Azure OpenAI, self-hosted Qwen, and
 > local Ollama were dropped when Cortex migrated to the Anthropic SDK.
-> The env vars `CORTEX_LLM__MODE`, `CORTEX_LLM__AZURE__*`,
-> `CORTEX_LLM__REMOTE__*`, `CORTEX_LLM__LOCAL__*`, and
-> `CORTEX_LLM__MODEL_NAME` are no longer read; legacy `.env` files boot
-> cleanly because the validator maps stale values to the rule-based
-> fallback rather than raising.
+> Legacy `.env` files boot cleanly because the validator maps stale
+> values to the rule-based fallback rather than raising.
 
-Then initialize storage directories:
-```bash
-python -m cortex.scripts.seed_config --root .
-```
-
-### Step 3: macOS Permissions
-
-Cortex needs two macOS permissions. Both are prompted automatically on first use:
-
-1. **Camera** — macOS will ask when the daemon first opens the webcam. Click **Allow**.
-2. **Accessibility (Input Monitoring)** — required for keyboard/mouse telemetry. Go to: `System Settings → Privacy & Security → Input Monitoring → add your terminal app (Terminal.app or iTerm)`
-
-### Step 4: Browser Extension
+### Browser extension
 
 ```bash
-cd cortex/apps/browser_extension
-pnpm install
-```
+make ext              # Chrome MV3 production build
+make ext-edge         # Edge MV3 production build
+make ext-dev          # Plasmo hot-reload dev mode
 
-Build for your browser:
-
-| Browser | Build command | Load from |
-|---------|--------------|-----------|
-| **Chrome** | `npx plasmo build` | `chrome://extensions` → Developer mode → Load unpacked → `build/chrome-mv3-prod/` |
-| **Edge** | `npx plasmo build --target=edge-mv3` | `edge://extensions` → Developer mode → Load unpacked → `build/edge-mv3-prod/` |
-
-### Step 5: Native Messaging (enables one-click Start/Stop from browser)
-
-```bash
-cd /path/to/repo-root
+# Install native messaging (one-time, auto-detects all browsers)
 python -m cortex.scripts.install_native_host
+# Then fully restart your browser (Cmd+Q, reopen).
 ```
 
-This automatically:
-- Detects all installed Chromium browsers (Chrome, Edge, Brave, Arc, Vivaldi, Opera)
-- Registers the native messaging host for each
-- No extension ID needed — the extension uses a fixed manifest key
+Then load `cortex/apps/browser_extension/build/chrome-mv3-prod/` (or `edge-mv3-prod/`) at `chrome://extensions` with Developer mode enabled.
 
-**Then fully restart your browser** (Cmd+Q, reopen). Native messaging only loads at browser startup.
-
-The first time you click "Start Cortex" from the extension, macOS will ask: *"Google Chrome (or Edge) wants to control Terminal. Allow?"* — click **Allow** once.
-
-### Step 6: Start Cortex
-
-**From browser** — click **Start Cortex** in the extension popup. A Terminal window opens and the daemon runs there (Terminal has camera permission).
-
-**From terminal** — `source .venv/bin/activate && cortex-dev`
-
-### Step 7: Calibrate (optional but recommended)
-
-Sit relaxed for 2 minutes while Cortex learns your resting heart rate, blink rate, and posture:
+### Tests + quality
 
 ```bash
-cortex-calibrate --duration 120
+make ci               # everything CI runs (lint + typecheck + tests + codegen drift)
+make test             # pytest suite
+make test-eval        # AMIP / IPS / safety-floor / calibration
+make codegen-check    # schema drift gate
 ```
 
----
+### Build a DMG
 
-## What To Expect
-
-Cortex watches you through your webcam while you study — not to record you, but to read your pulse and breathing from subtle color changes in your face (a technique called remote photoplethysmography). It combines those biological signals with what's happening on your screen — which tabs are open, what errors your code is throwing, how fast you're switching between windows — to figure out whether you're in a productive flow, spiraling into overwhelm, or zoning out. When it detects you're struggling, it uses an AI model to figure out *how* to help: closing distraction tabs, surfacing the error fix you need, breaking your task into smaller steps, or just telling you to take a break because your body's stress accumulator says so. It also has a dedicated LeetCode mode that detects panic-coding patterns and tries to get you to slow down before you submit your fifth wrong answer in a row.
-
-What works well today: the state classification system is conservative and well-tuned — in testing, it correctly avoids false alarms for caffeinated studying, debugging sessions, and deep reading. The biological break timer (which replaces arbitrary Pomodoro intervals with actual HRV-based fatigue tracking) is a genuinely novel feature that works as designed. The LeetCode mode's multi-selector DOM strategy is resilient to LeetCode's frequent UI changes, and the intervention matrix covers real failure modes students hit. The context-aware fallback system means you still get useful help even when the AI model is slow or unavailable. The progressive consent system lets Cortex earn your trust gradually — it starts by just observing, and only takes actions after you've approved similar ones multiple times.
-
-Cortex asks for your webcam (for pulse and posture — no video is saved or sent anywhere), broad browser permissions (to read tab titles and URLs for context — the AI model never sees your biometrics), and a 2-minute baseline calibration session where you sit still so it can learn your resting heart rate. It runs a local daemon on your machine that communicates with a Chrome extension and optionally a VS Code extension. The AI model (Claude via AWS Bedrock by default; GCP Vertex or the direct Anthropic API are also supported) sees only workspace context: file paths, error messages, and tab titles. Your physiological data stays on your machine.
-
-Cortex is not a study planner, a to-do app, or a replacement for actually understanding the material. The heart rate signal from a webcam is noisier than a chest strap — in dim lighting or if you move a lot, the biological signals degrade and the system falls back to behavioral-only detection. The HRV measurement at 30 FPS is at the edge of what's physiologically meaningful and works best as a trend indicator over minutes, not a precise beat-by-beat measurement. The AI-generated interventions are sometimes generic or slightly off-target, especially early on before the learning system has calibrated to your preferences. And if you're the kind of student who studies past midnight, you'll want to adjust the wind-down hour from its default — it was set for an earlier bedtime than most college students keep.
-
----
-
-## Troubleshooting
-
-### "Start Cortex" shows "Native host not found"
-- Run `python -m cortex.scripts.install_native_host` and **fully restart your browser** (Cmd+Q, reopen)
-- Native messaging manifests are only loaded at browser startup — reloading the extension is not enough
-
-### Camera opens iPhone instead of MacBook camera
-- Cortex auto-skips Continuity Camera devices (iPhone/iPad) and rejects any camera it cannot verify by name
-- **Restart the daemon** after turning off your iPhone — camera selection only runs at daemon startup
-- If it still picks wrong: set `CORTEX_CAPTURE__DEVICE_ID=0` in `.env` (or try `1`, `2`, etc.)
-
-### Camera permission denied
-- If the daemon was launched from the browser extension, it runs via Terminal.app. Grant camera access to **Terminal.app** (not Chrome) in: `System Settings → Privacy & Security → Camera`
-- If running from terminal directly, grant camera to your terminal app (Terminal.app or iTerm)
-
-### Webcam not detected
 ```bash
-python3 -c "import cv2; [print(f'Device {i}: {cv2.VideoCapture(i).isOpened()}') for i in range(5)]"
+make dmg              # produces dist/Cortex.dmg
 ```
 
-### "Stop Cortex" doesn't stop the camera
-- Click Stop again — the extension uses a multi-layer kill chain (WebSocket → HTTP → native messaging SIGTERM → launcher SIGTERM)
-- If the camera light stays on:
-  - DMG install: `osascript -e 'tell application "Cortex" to quit'`
-  - Dev checkout: `pkill -f "cortex.scripts.run_dev"`
-
-### LLM provider errors
-- Verify `CORTEX_LLM__PROVIDER` is one of `bedrock`, `vertex`, or `direct`
-- For Bedrock: confirm the bearer token is in Keychain (`security find-generic-password -s cortex.bedrock -a bearer_token`) and `CORTEX_LLM__BEDROCK__AWS_REGION` is set
-- For Vertex: re-run `gcloud auth application-default login`
-- For direct: confirm `ANTHROPIC_API_KEY` is exported into the daemon's environment
-- Use `CORTEX_LLM__FALLBACK_MODE=rule_based` (the default) to run with no LLM at all
-
-### MediaPipe import errors on Apple Silicon
-```bash
-pip install --force-reinstall mediapipe
-```
-Ensure you're using native ARM Python (not Rosetta): `python3 -c "import platform; print(platform.machine())"` should print `arm64`.
-
-### Cortex.app bounces in dock then disappears
-- Run `xattr -cr /Applications/Cortex.app` in Terminal to strip quarantine
-
-### Dashboard doesn't appear
-- The app may be running in the background (check system tray). Try quitting and relaunching.
-
-### Accessibility / pynput errors
-Add your terminal app to: `System Settings → Privacy & Security → Input Monitoring`
+For production distribution, set `CORTEX_SIGN_IDENTITY` to your
+Developer ID certificate and `CORTEX_NOTARIZE_PROFILE` to your
+notarytool keychain profile before running `make dmg`.
 
 ---
 
@@ -322,10 +310,23 @@ Add your terminal app to: `System Settings → Privacy & Security → Input Moni
 
 - **No video is ever saved.** Frames are processed in memory and immediately discarded.
 - **No biometrics reach the LLM.** The model sees only workspace context: file paths, error messages, tab titles.
-- **Consent-gated autonomy.** No action executes without earned trust. Users control the maximum autonomy level.
+- **Local-only network surface.** FastAPI, WebSocket, and the launcher agent bind to `127.0.0.1` and require a capability token.
+- **Consent-gated autonomy.** No action executes without earned trust. Users control the maximum autonomy level. Destructive actions are reversible.
+
+See [Privacy](https://github.com/StevenWang-CY/cortex/wiki/Privacy) and [SECURITY.md](SECURITY.md) for the full boundary commitments.
+
+---
+
+## Contributing
+
+Bug reports, ideas, and patches welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md).
+
+For security issues, please use [GitHub Security Advisories](https://github.com/StevenWang-CY/cortex/security/advisories/new) instead of a public issue.
+
+This is a personal portfolio project on best-effort support — see [SUPPORT.md](SUPPORT.md).
 
 ---
 
 ## License
 
-MIT
+[MIT](LICENSE) © 2026 Steven Wang. Third-party attribution in [NOTICE](NOTICE).
