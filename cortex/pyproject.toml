@@ -10,9 +10,23 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 authors = [
-    { name = "Cortex Team" }
+    { name = "Steven Wang", email = "wangchuyue888@gmail.com" }
 ]
-keywords = ["biofeedback", "rppg", "workspace", "cognitive-load", "computer-vision"]
+maintainers = [
+    { name = "Steven Wang", email = "wangchuyue888@gmail.com" }
+]
+keywords = [
+    "biofeedback",
+    "rppg",
+    "workspace",
+    "cognitive-load",
+    "computer-vision",
+    "anthropic",
+    "claude",
+    "mediapipe",
+    "macos",
+    "signal-processing",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -74,6 +88,14 @@ dependencies = [
     # Redis
     "redis[hiredis]>=5.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/StevenWang-CY/cortex"
+Repository = "https://github.com/StevenWang-CY/cortex"
+Documentation = "https://github.com/StevenWang-CY/cortex/wiki"
+Changelog = "https://github.com/StevenWang-CY/cortex/blob/main/CHANGELOG.md"
+Issues = "https://github.com/StevenWang-CY/cortex/issues"
+Releases = "https://github.com/StevenWang-CY/cortex/releases"
 
 [project.optional-dependencies]
 dev = [

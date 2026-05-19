@@ -1,0 +1,123 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.2.1). The tag must already exist."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  ci-gate:
+    name: Pre-release CI gate
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Cortex (dev + codegen)
+        run: pip install -e "./cortex[dev,codegen]"
+
+      - name: Install json2ts
+        run: npm install -g json-schema-to-typescript
+
+      - name: Lint
+        run: ruff check cortex/
+
+      - name: Typecheck
+        run: mypy cortex/ --strict
+
+      - name: Schema codegen drift
+        run: python -m cortex.scripts.generate_ts_schemas --check
+
+      - name: Tests
+        run: pytest cortex/tests/
+
+  build-dmg:
+    name: Build macOS .dmg
+    needs: ci-gate
+    runs-on: macos-14
+    timeout-minutes: 45
+    outputs:
+      dmg-path: ${{ steps.locate.outputs.dmg-path }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Install Cortex (dev)
+        run: pip install -e "./cortex[dev]"
+
+      - name: Install browser-extension deps
+        run: cd cortex/apps/browser_extension && pnpm install
+
+      - name: Build DMG (ad-hoc signed)
+        env:
+          # Production releases should set CORTEX_SIGN_IDENTITY +
+          # CORTEX_NOTARIZE_PROFILE as repo secrets. Without them the
+          # script falls back to ad-hoc signing for portfolio builds.
+          CORTEX_SIGN_IDENTITY: ${{ secrets.CORTEX_SIGN_IDENTITY }}
+          CORTEX_NOTARIZE_PROFILE: ${{ secrets.CORTEX_NOTARIZE_PROFILE }}
+        run: ./cortex/scripts/build_macos_app.sh
+
+      - name: Locate DMG
+        id: locate
+        run: |
+          DMG=$(ls dist/Cortex*.dmg | head -1)
+          echo "dmg-path=$DMG" >> "$GITHUB_OUTPUT"
+          echo "Built: $DMG ($(du -h "$DMG" | awk '{print $1}'))"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cortex-dmg
+          path: ${{ steps.locate.outputs.dmg-path }}
+          retention-days: 14
+
+  attach-to-release:
+    name: Attach DMG to GitHub release
+    needs: build-dmg
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download DMG artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cortex-dmg
+          path: ./artifact
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: ./artifact/*.dmg
+          fail_on_unmatched_files: true
+          generate_release_notes: false
