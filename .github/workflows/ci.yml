@@ -77,6 +77,36 @@ jobs:
       - name: Test (pytest)
         run: pytest cortex/tests/
 
+  eval-regression:
+    name: eval-regression (F41 baseline gate)
+    runs-on: ubuntu-latest
+    # Only run when the change could affect the eval cohort. The
+    # filter mirrors what the audit Phase-F brief named (llm_engine,
+    # state_engine, prompts) plus the harness itself and the
+    # intervention schema.
+    if: |
+      github.event_name == 'push' ||
+      contains(github.event.pull_request.changed_files.*.filename, 'cortex/services/llm_engine/') ||
+      contains(github.event.pull_request.changed_files.*.filename, 'cortex/services/state_engine/') ||
+      contains(github.event.pull_request.changed_files.*.filename, 'cortex/services/eval/') ||
+      contains(github.event.pull_request.changed_files.*.filename, 'cortex/libs/schemas/intervention.py')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e "./cortex[dev]"
+      - name: Run regression harness against committed baseline
+        # Exits 1 on any metric outside its tolerance band. The harness
+        # prints a human-readable report on stdout so the CI log shows
+        # exactly which metric drifted; the developer either fixes the
+        # regression or re-runs locally with --update-baseline.
+        run: python -m cortex.services.eval.regression_harness
+
   extension:
     name: extension (lint + vitest)
     runs-on: ubuntu-latest

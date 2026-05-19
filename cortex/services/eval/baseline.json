@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "seed": 20260519,
+  "metrics": {
+    "oscillation_intervention_rate_per_hr": 1.25,
+    "sustained_overwhelm_pass_rate": 1.0,
+    "flow_negative_trigger_rate": 0.0,
+    "bandit_regret_p95": 0.0
+  }
+}
