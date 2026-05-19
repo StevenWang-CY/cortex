@@ -244,6 +244,29 @@ class InterventionConfig(BaseModel):
     # preferences can override without patching the source.
     breathing_pattern: tuple[int, int, int] = (4, 7, 8)
 
+    # F25 (audit): hysteresis against cooldown/dwell oscillation. The
+    # ``cooldown_seconds`` + ``hyper_dwell_seconds`` pair admits a 90 s
+    # oscillation pattern (HYPER 30 s → trigger → FLOW 25 s → HYPER 30 s
+    # → trigger again) that fires on every cycle. Two additional gates
+    # bound this independently of cost (F20 bounds cost; F25 bounds
+    # user-visible spam):
+    #
+    # 1. ``max_interventions_per_hour`` — sliding-window cap on triggers
+    #    in the trailing 60 minutes. Default 6/hr (one every ten
+    #    minutes); a session sustaining six interventions an hour is
+    #    almost certainly oscillating, not in genuine sustained
+    #    overwhelm.
+    # 2. ``oscillation_window_seconds`` + ``oscillation_max_flips`` +
+    #    ``oscillation_dwell_multiplier`` — when the state has entered
+    #    HYPER more than ``oscillation_max_flips`` times within
+    #    ``oscillation_window_seconds``, multiply the required dwell
+    #    time so genuine sustained overwhelm still passes but jittery
+    #    flickers don't.
+    max_interventions_per_hour: int = 6
+    oscillation_window_seconds: float = 600.0
+    oscillation_max_flips: int = 6
+    oscillation_dwell_multiplier: float = 2.0
+
 
 class HandoverConfig(BaseModel):
     """Handover / shutdown detector configuration."""

@@ -147,6 +147,22 @@ class TriggerPolicy:
         # Cooldown tracking
         self._last_intervention_time: float = 0.0
 
+        # F25 (audit): hysteresis trackers.
+        #   ``_intervention_timestamps`` — sliding window of trigger
+        #     times. ``evaluate`` prunes entries older than 3600 s and
+        #     rejects when ``len(...) >= max_interventions_per_hour``.
+        #   ``_hyper_enter_timestamps`` — sliding window of HYPER-entry
+        #     transitions. When the count within
+        #     ``oscillation_window_seconds`` exceeds
+        #     ``oscillation_max_flips``, the required dwell is
+        #     multiplied so genuine sustained overwhelm still passes
+        #     but jittery flicker does not.
+        #   ``_prev_overwhelmed`` — last observed state-bucket so we
+        #     can detect a False→True transition (and thus a "flip").
+        self._intervention_timestamps: deque[float] = deque(maxlen=128)
+        self._hyper_enter_timestamps: deque[float] = deque(maxlen=128)
+        self._prev_overwhelmed: bool = False
+
         # Dismissal tracking
         self._dismissals: deque[DismissalEvent] = deque(maxlen=100)
         self._threshold_bumps: deque[tuple[float, float]] = deque(maxlen=50)
@@ -223,7 +239,14 @@ class TriggerPolicy:
         Returns:
             TriggerDecision with trigger verdict and explanation.
         """
-        now = current_time or time.monotonic()
+        now = time.monotonic() if current_time is None else current_time
+
+        # F25 (audit): track HYPER-enter transitions BEFORE any gate so
+        # the oscillation tracker stays accurate even when other gates
+        # block the trigger. A "flip" is False→True on
+        # ``is_overwhelmed``; we ignore True→True (still HYPER) and any
+        # transition into a non-HYPER state.
+        self._record_hyper_transition(estimate.is_overwhelmed, now)
 
         # Compute effective threshold (base + dismissal bumps + adaptive feedback).
         effective_threshold = self._compute_effective_threshold(now)
@@ -232,6 +255,16 @@ class TriggerPolicy:
             0.0, self._last_intervention_time + self._config.cooldown_seconds - now
         )
         quiet_active = now < self._quiet_mode_until
+
+        # F25: drop intervention timestamps that fell out of the
+        # trailing-hour window so the count below reflects only the
+        # last 3600 s. ``deque`` is bounded by ``maxlen``, but we still
+        # prune by time to keep the window sharp.
+        self._prune_intervention_window(now)
+        recent_intervention_count = len(self._intervention_timestamps)
+        rate_limit_cap = int(getattr(
+            self._config, "max_interventions_per_hour", 6,
+        ))
 
         # Receptivity gate (don't interrupt high-friction moments).
         if self._config.receptivity_enforced:
@@ -304,6 +337,26 @@ class TriggerPolicy:
                 context_complexity=context_complexity,
             )
 
+        # F25 (audit): hourly cap. A session sustaining more than
+        # ``max_interventions_per_hour`` triggers in the trailing hour
+        # is almost certainly oscillating, not in genuine sustained
+        # overwhelm. This gate is independent of the dismissal-driven
+        # quiet-mode (F26): it protects users who never dismiss but
+        # whose biometrics flutter at the threshold.
+        if rate_limit_cap > 0 and recent_intervention_count >= rate_limit_cap:
+            return TriggerDecision(
+                should_trigger=False,
+                reason=(
+                    f"Hourly intervention cap reached "
+                    f"({recent_intervention_count}/{rate_limit_cap} in last hour)"
+                ),
+                confidence=confidence,
+                cooldown_remaining=cooldown_remaining,
+                quiet_mode_active=False,
+                effective_threshold=effective_threshold,
+                context_complexity=context_complexity,
+            )
+
         # Check state is HYPER
         if not estimate.is_overwhelmed:
             return TriggerDecision(
@@ -365,8 +418,20 @@ class TriggerPolicy:
                     context_complexity=context_complexity,
                 )
 
-        # Check dwell time (must be in HYPER for >= hyper_dwell_seconds)
+        # Check dwell time (must be in HYPER for >= hyper_dwell_seconds).
+        # F25 (audit): when the user's state has been oscillating, the
+        # base dwell is too short to distinguish jitter from genuine
+        # sustained overwhelm. Multiply the required dwell by
+        # ``oscillation_dwell_multiplier`` when recent flip count
+        # exceeds ``oscillation_max_flips``. The multiplier is bounded
+        # by config; values <= 1.0 disable the gate.
         dwell_required = self._hyper_dwell_seconds
+        if self._is_oscillating(now):
+            multiplier = float(getattr(
+                self._config, "oscillation_dwell_multiplier", 2.0,
+            ))
+            if multiplier > 1.0:
+                dwell_required *= multiplier
         if estimate.dwell_seconds < dwell_required:
             return TriggerDecision(
                 should_trigger=False,
@@ -413,10 +478,63 @@ class TriggerPolicy:
 
     def record_intervention(self, timestamp: float | None = None) -> None:
         """Record that an intervention was triggered."""
-        now = timestamp or time.monotonic()
+        now = time.monotonic() if timestamp is None else timestamp
         self._last_intervention_time = now
         self._intervention_count += 1
+        # F25 (audit): append to the sliding-hour window so the next
+        # evaluate() correctly enforces ``max_interventions_per_hour``.
+        # The deque is bounded by ``maxlen``; pruning by time happens
+        # in evaluate().
+        self._intervention_timestamps.append(now)
         logger.info(f"Intervention #{self._intervention_count} triggered")
+
+    # ------------------------------------------------------------------
+    # F25 helpers — hysteresis against cooldown/dwell oscillation.
+    # ------------------------------------------------------------------
+
+    def _prune_intervention_window(self, now: float) -> None:
+        """Remove intervention timestamps older than 3600 s.
+
+        Called from ``evaluate`` before the rate-limit gate so the
+        count reflects only the trailing-hour window.
+        """
+        cutoff = now - 3600.0
+        while self._intervention_timestamps and self._intervention_timestamps[0] < cutoff:
+            self._intervention_timestamps.popleft()
+
+    def _record_hyper_transition(self, is_overwhelmed: bool, now: float) -> None:
+        """Append a timestamp on every False→True transition into HYPER.
+
+        The sliding window is later read by ``_is_oscillating`` to
+        decide whether to escalate the required dwell time.
+        """
+        if is_overwhelmed and not self._prev_overwhelmed:
+            self._hyper_enter_timestamps.append(now)
+        self._prev_overwhelmed = is_overwhelmed
+
+    def _is_oscillating(self, now: float) -> bool:
+        """Return True iff the user's state has flipped into HYPER more
+        than ``oscillation_max_flips`` times in the last
+        ``oscillation_window_seconds``.
+
+        Prunes stale entries as a side effect so the check is O(K) on
+        each call where K is the number of recent flips.
+        """
+        window = float(getattr(
+            self._config, "oscillation_window_seconds", 600.0,
+        ))
+        max_flips = int(getattr(
+            self._config, "oscillation_max_flips", 6,
+        ))
+        if max_flips <= 0 or window <= 0:
+            return False
+        cutoff = now - window
+        while (
+            self._hyper_enter_timestamps
+            and self._hyper_enter_timestamps[0] < cutoff
+        ):
+            self._hyper_enter_timestamps.popleft()
+        return len(self._hyper_enter_timestamps) > max_flips
 
     def record_dismissal(self, timestamp: float | None = None) -> None:
         """
@@ -424,7 +542,7 @@ class TriggerPolicy:
 
         Tracks dismissals for quiet mode and adaptive thresholds.
         """
-        now = timestamp or time.monotonic()
+        now = time.monotonic() if timestamp is None else timestamp
         self._dismissals.append(DismissalEvent(timestamp=now))
         self._dismissals_total += 1
 
@@ -636,7 +754,7 @@ class TriggerPolicy:
         current_time: float | None = None,
     ) -> None:
         """Force quiet mode on for an explicit duration."""
-        now = current_time or time.monotonic()
+        now = time.monotonic() if current_time is None else current_time
         minutes = duration_minutes or self._config.quiet_mode_minutes
         self._quiet_mode_until = now + max(1, minutes) * 60.0
 
