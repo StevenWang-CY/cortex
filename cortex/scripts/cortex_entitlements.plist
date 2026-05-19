@@ -7,5 +7,13 @@
     <true/>
     <key>com.apple.security.automation.apple-events</key>
     <true/>
+    <!-- Audit-2 fix: required for pynput keyboard/mouse capture under
+         a real Developer-ID signed + hardened-runtime build. The
+         daemon's NSInputMonitoringUsageDescription is declared in
+         cortex.spec; without this entitlement, signed builds silently
+         drop typing-burst / mouse-thrashing telemetry. Ad-hoc builds
+         (no hardened runtime) ignore it. -->
+    <key>com.apple.security.device.input-monitoring</key>
+    <true/>
 </dict>
 </plist>

@@ -76,13 +76,50 @@ def _find_python(project_root: str | None = None) -> str:
     # Frozen app OR explicit .app target: do not use sys.executable
     # (bundled binary) and avoid dev-venv coupling.
     if getattr(sys, "frozen", False) or requested_app_bundle:
-        for candidate in ("/usr/bin/python3", "/opt/homebrew/bin/python3", "/usr/local/bin/python3"):
+        # Audit-2 fix: macOS 12.3+ ships ``/usr/bin/python3`` only as a
+        # Command Line Tools shim that prompts to install Xcode when
+        # exec'd. ``os.path.isfile`` passes on the shim — but native
+        # messaging silently fails the first time Chrome tries to run
+        # it. Prefer the bundled framework Python (PyInstaller emits
+        # one under Contents/Frameworks/) before falling back to system
+        # Python, and only use ``/usr/bin/python3`` when we can verify
+        # it executes (not just exists).
+        if requested_app_bundle and project_root:
+            framework_py = os.path.join(
+                project_root,
+                "Contents",
+                "Frameworks",
+                "Python.framework",
+                "Versions",
+                "3.11",
+                "bin",
+                "python3.11",
+            )
+            if os.path.isfile(framework_py) and os.access(framework_py, os.X_OK):
+                return os.path.abspath(framework_py)
+        for candidate in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3"):
             if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
                 return candidate
         found = shutil.which("python3")
         if found:
             return os.path.abspath(found)
-        # Last-resort fallback on macOS.
+        # ``/usr/bin/python3`` is only a CLT installer stub on a fresh
+        # Mac. Only use it after probing that it actually runs.
+        usr_bin = "/usr/bin/python3"
+        if os.path.isfile(usr_bin):
+            try:
+                import subprocess
+
+                subprocess.check_call(
+                    [usr_bin, "-c", "import sys"],
+                    timeout=2.0,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return usr_bin
+            except Exception:
+                # Falls through — caller should surface a setup error.
+                pass
         return "/usr/bin/python3"
 
     # Dev checkout: prefer local venv.

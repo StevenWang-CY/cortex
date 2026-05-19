@@ -114,6 +114,13 @@ class CostTracker:
     # Persistence
     # ------------------------------------------------------------------
 
+    # Audit-2 fix: stamp a schema version onto the persisted ledger so
+    # a future field migration can branch cleanly on load. Without the
+    # version stamp, the only signal was "loaded dict shape looks
+    # weird" which the prior code coerced into an empty ledger
+    # (silently losing the user's running spend history).
+    _LEDGER_SCHEMA_VERSION = 1
+
     def _load(self) -> dict[str, dict[str, Any]]:
         try:
             raw = self._ledger_path.read_text(encoding="utf-8")
@@ -129,6 +136,22 @@ class CostTracker:
             return {}
         if not isinstance(data, dict):
             return {}
+        # Handle the wrapped {version, days} envelope introduced by the
+        # audit-2 schema-version stamp. Legacy ledgers are bare dicts of
+        # day_key → entry and load straight through.
+        if "schema_version" in data and "days" in data:
+            ver = data.get("schema_version")
+            if ver != self._LEDGER_SCHEMA_VERSION:
+                logger.warning(
+                    "cost_tracker: ledger schema_version=%s != expected %s; "
+                    "starting empty (rebuilt on next flush)",
+                    ver,
+                    self._LEDGER_SCHEMA_VERSION,
+                )
+                return {}
+            data = data.get("days", {}) or {}
+            if not isinstance(data, dict):
+                return {}
         # Normalise: drop entries with non-dict values and bound history.
         out: dict[str, dict[str, Any]] = {}
         for k, v in data.items():
@@ -138,7 +161,11 @@ class CostTracker:
 
     def _flush(self) -> None:
         try:
-            atomic_write_json(self._ledger_path, self._days)
+            wrapped = {
+                "schema_version": self._LEDGER_SCHEMA_VERSION,
+                "days": self._days,
+            }
+            atomic_write_json(self._ledger_path, wrapped)
         except OSError as exc:
             logger.warning(
                 "cost_tracker: failed to flush ledger to %s (%s)",

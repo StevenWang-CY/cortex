@@ -209,6 +209,30 @@ class TriggerPolicy:
         self._quiet_mode_history_lock: threading.Lock = threading.Lock()
         self._load_quiet_mode_history()
 
+    def update_thresholds(
+        self,
+        config: InterventionConfig | None = None,
+        *,
+        state_config: StateConfig | None = None,
+        hyper_dwell_seconds: float | None = None,
+    ) -> None:
+        """Live-update thresholds without losing cooldown / dwell state.
+
+        ``apply_settings`` previously re-created ``TriggerPolicy`` on a
+        slider change, resetting every counter (cooldown, dismissal
+        ladder, quiet mode, oscillation window). A user nudging the
+        sensitivity slider during an active session could then re-enable
+        interventions immediately even though they had just dismissed
+        three in a row. This mutator preserves all sliding-window state
+        and only swaps the threshold values.
+        """
+        if config is not None:
+            self._config = config
+        if hyper_dwell_seconds is not None:
+            self._hyper_dwell_seconds = float(hyper_dwell_seconds)
+        elif state_config is not None:
+            self._hyper_dwell_seconds = float(state_config.hyper_dwell_seconds)
+
     @property
     def is_quiet_mode(self) -> bool:
         """Check if quiet mode is currently active."""

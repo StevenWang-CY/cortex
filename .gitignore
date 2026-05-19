@@ -43,6 +43,11 @@ CortexDaemon.app/
 cortex/apps/browser_extension/.plasmo/
 cortex/apps/browser_extension/build/
 
+# Audit-2 hygiene: only ``pnpm-lock.yaml`` is tracked; a developer
+# running ``npm install`` (build script fallback) materialises a
+# ``package-lock.json`` we explicitly don't want to commit.
+cortex/apps/browser_extension/package-lock.json
+
 # VS Code extension build artifacts
 *.vsix
 

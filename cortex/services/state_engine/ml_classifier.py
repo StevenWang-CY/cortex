@@ -123,9 +123,17 @@ class PerUserLogisticClassifier:
         return model
 
     def save(self, path: str | Path) -> None:
+        """Persist the classifier weights.
+
+        Audit-2 fix: atomic write so a SIGKILL mid-write does not leave
+        a truncated weights file that ``load()`` then rejects, costing
+        the user their personalised classifier across a restart.
+        """
+        from cortex.libs.utils.atomic_write import atomic_write_json
+
         payload = self.to_dict()
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        atomic_write_json(Path(path), payload)
 
     @classmethod
     def load(cls, path: str | Path) -> PerUserLogisticClassifier:

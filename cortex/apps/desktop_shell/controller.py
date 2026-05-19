@@ -241,6 +241,11 @@ class CortexAppController:
         # DMG-shipping in-process controller left the button dead.
         if hasattr(self._onboarding, "extensions_requested"):
             self._onboarding.extensions_requested.connect(self._show_connections)
+        # Audit-2 fix: hot-reload the LLM planner credentials when the
+        # user saves a BYOK token in onboarding so the first session
+        # actually uses the real LLM instead of the rule-based fallback.
+        if hasattr(self._onboarding, "byok_token_saved"):
+            self._onboarding.byok_token_saved.connect(self._reload_llm_credentials)
         # E.1 (DMG-path completion): dashboard Stop button and goal input.
         # The bundled controller never owns a WebSocket — its `stop` path is
         # to schedule the in-process daemon's `stop()` coroutine on the
@@ -400,6 +405,15 @@ class CortexAppController:
         self._active_intervention_id = payload.get("intervention_id")
         if self._overlay is not None:
             self._overlay.show_intervention(payload)
+        # Audit-2 fix: bump the Today/Blocked counter so the dashboard
+        # numeric reflects reality instead of staying at the placeholder.
+        if self._dashboard is not None and hasattr(
+            self._dashboard, "record_intervention_seen"
+        ):
+            try:
+                self._dashboard.record_intervention_seen()
+            except Exception:
+                logger.debug("record_intervention_seen failed", exc_info=True)
 
     @Slot(bool)
     def _on_connection_changed(self, connected: bool) -> None:
@@ -584,19 +598,53 @@ class CortexAppController:
         """E.1 (DMG path): forward dashboard goal input to the daemon.
 
         The in-process controller can mutate the daemon directly — no
-        round-trip through WebSocket needed. ``set_current_goal`` updates
-        the context engine's goal hint so the next planner call sees it.
+        round-trip through WebSocket needed. ``set_user_goal`` updates
+        the daemon's ``_user_goal_override`` so the next ``_context_loop``
+        tick injects it into ``context.current_goal_hint``.
         """
         cleaned = (goal or "").strip()
         if not cleaned or self._daemon is None or self._daemon_loop is None:
             return
         try:
-            # Most rabbit-hole/goal logic lives behind the daemon's APIs;
-            # forward by mutating the focus session if exposed.
-            if hasattr(self._daemon, "set_current_goal"):
+            # Audit-2 fix: ``set_user_goal`` is the real daemon API.
+            # Previously called ``set_current_goal`` which never existed
+            # — silently fell through the ``hasattr`` guard.
+            if hasattr(self._daemon, "set_user_goal"):
+                asyncio.run_coroutine_threadsafe(
+                    self._daemon.set_user_goal(cleaned),
+                    self._daemon_loop,
+                )
+            elif hasattr(self._daemon, "set_current_goal"):
                 asyncio.run_coroutine_threadsafe(
                     self._daemon.set_current_goal(cleaned),
                     self._daemon_loop,
                 )
         except Exception:
             logger.debug("Failed to forward goal to daemon", exc_info=True)
+
+    def _reload_llm_credentials(self) -> None:
+        """Audit-2 fix: hot-reload the planner's SDK client after BYOK save.
+
+        Runs on the daemon thread so the SDK rebuild does not race with
+        an in-flight ``generate_intervention_plan`` call.
+        """
+        if self._daemon is None or self._daemon_loop is None:
+            return
+        planner = getattr(self._daemon, "_llm_client", None)
+        if planner is None or not hasattr(planner, "reload_credentials"):
+            return
+
+        def _do_reload() -> None:
+            try:
+                ok = planner.reload_credentials()
+                if ok:
+                    logger.info("LLM planner credentials reloaded after BYOK save")
+                else:
+                    logger.warning("LLM planner credentials reload returned False")
+            except Exception:
+                logger.exception("LLM planner credentials reload raised")
+
+        try:
+            self._daemon_loop.call_soon_threadsafe(_do_reload)
+        except Exception:
+            logger.debug("Failed to schedule reload_credentials", exc_info=True)

@@ -304,6 +304,21 @@ class LauncherHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if self.path == "/launch":
+            # Audit-2 fix (CSRF): require the same capability token as
+            # ``/stop``. With CORS at ``Access-Control-Allow-Origin: *``,
+            # any open browser tab could previously force-launch the
+            # daemon — the daemon then opened the camera and began
+            # capturing biometrics without user consent. The legitimate
+            # extension fetches the token via native messaging (see
+            # ``native_host.py:get_auth_token``) and attaches the
+            # ``X-Cortex-Auth-Token`` header.
+            presented = self.headers.get(_AUTH_TOKEN_HEADER)
+            if not _verify_auth_token(presented):
+                self._send_json(
+                    {"error": "unauthorized", "reason": "missing or invalid auth token"},
+                    401,
+                )
+                return
             result = _launch_daemon()
             self._send_json(result)
         elif self.path == "/stop":

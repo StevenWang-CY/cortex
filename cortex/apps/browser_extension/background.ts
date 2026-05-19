@@ -1472,8 +1472,8 @@ function injectLockoutOverlay(payload: Record<string, unknown>): void {
 <div class="bk" id="bk"></div>
 <div class="pn">
   <div class="hd">Lockout Active</div>
-  <div class="rs">\${esc(reason)}</div>
-  <div class="tm" id="countdown">\${formatCountdown(durationS)}</div>
+  <div class="rs">${esc(reason)}</div>
+  <div class="tm" id="countdown">${formatCountdown(durationS)}</div>
   <button class="sk" id="skip">I need to continue</button>
 </div>
 `;
@@ -2683,7 +2683,11 @@ function checkHealthAlerts(payload: Record<string, unknown>): void {
         lowBlinkStart = 0;
     }
 
-    // Forward lean → posture
+    // Forward lean → posture. Audit-2 fix: ``forward_lean`` is the
+    // 0-1 normalized score the daemon now publishes (rescaled from the
+    // raw 0-45° angle). The 0.6 threshold corresponds to ~27° forward
+    // tilt sustained for 3 min, which is a real slump signal — not the
+    // 5-20° natural sitting range that previously fired on every user.
     const lean = bio.forward_lean;
     if (lean !== null && lean !== undefined && lean > 0.6) {
         if (leaningStart === 0) leaningStart = now;
@@ -2929,7 +2933,13 @@ chrome.runtime.onMessage.addListener(
                     try {
                         authToken = await getAuthToken();
                     } catch (e) {
-                        console.warn(`cortex.auth.token_unavailable err=${String(e)}`);
+                        // Audit-2 fix: gate this with DEBUG so production
+                        // builds don't logspam Chrome's console on every
+                        // stop attempt that lacks a token (the path-2
+                        // native-messaging fallback is correct and silent).
+                        if (DEBUG) {
+                            console.warn(`cortex.auth.token_unavailable err=${String(e)}`);
+                        }
                     }
 
                     // Step 1: Send SHUTDOWN over WebSocket (graceful — triggers daemon stop chain)
@@ -3039,9 +3049,23 @@ chrome.runtime.onMessage.addListener(
                     try {
                         // Path 1: HTTP launcher agent on port 9471
                         try {
+                            // Audit-2 fix: attach the capability token so the
+                            // launcher's /launch CSRF gate (mirror of /stop)
+                            // accepts the request. Without this header the
+                            // launcher returns 401 and the path-2 fallback
+                            // (native messaging) is forced.
+                            let launchAuthToken: string | null = null;
+                            try {
+                                launchAuthToken = await getAuthToken();
+                            } catch {
+                                launchAuthToken = null;
+                            }
                             const resp = await fetch(`${LAUNCHER_HTTP_URL}/launch`, {
                                 method: "POST",
                                 signal: AbortSignal.timeout(12000),
+                                headers: launchAuthToken
+                                    ? { "X-Cortex-Auth-Token": launchAuthToken }
+                                    : undefined,
                             });
                             const data = await resp.json();
                             if (data.status === "starting" || data.status === "already_running") {

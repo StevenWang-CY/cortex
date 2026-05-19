@@ -80,27 +80,40 @@ jobs:
   eval-regression:
     name: eval-regression (F41 baseline gate)
     runs-on: ubuntu-latest
-    # Only run when the change could affect the eval cohort. The
-    # filter mirrors what the audit Phase-F brief named (llm_engine,
-    # state_engine, prompts) plus the harness itself and the
-    # intervention schema.
-    if: |
-      github.event_name == 'push' ||
-      contains(github.event.pull_request.changed_files.*.filename, 'cortex/services/llm_engine/') ||
-      contains(github.event.pull_request.changed_files.*.filename, 'cortex/services/state_engine/') ||
-      contains(github.event.pull_request.changed_files.*.filename, 'cortex/services/eval/') ||
-      contains(github.event.pull_request.changed_files.*.filename, 'cortex/libs/schemas/intervention.py')
+    # Audit-2 fix: the previous ``contains(github.event.pull_request.changed_files.*.filename, ...)``
+    # expression was syntactically broken — ``changed_files`` on
+    # ``pull_request`` is an integer count, not a list, so the filter
+    # always evaluated to false and the job only ran on push. The new
+    # ``dorny/paths-filter`` action correctly inspects the diff.
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Path filter
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            eval:
+              - 'cortex/services/llm_engine/**'
+              - 'cortex/services/state_engine/**'
+              - 'cortex/services/eval/**'
+              - 'cortex/libs/schemas/intervention.py'
+      - name: Skip if no relevant changes
+        if: github.event_name == 'pull_request' && steps.filter.outputs.eval != 'true'
+        run: echo "No eval-relevant changes; skipping regression harness."
       - uses: actions/setup-python@v5
+        if: github.event_name == 'push' || steps.filter.outputs.eval == 'true'
         with:
           python-version: "3.11"
           cache: "pip"
       - name: Install package
+        if: github.event_name == 'push' || steps.filter.outputs.eval == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -e "./cortex[dev]"
       - name: Run regression harness against committed baseline
+        if: github.event_name == 'push' || steps.filter.outputs.eval == 'true'
         # Exits 1 on any metric outside its tolerance band. The harness
         # prints a human-readable report on stdout so the CI log shows
         # exactly which metric drifted; the developer either fixes the

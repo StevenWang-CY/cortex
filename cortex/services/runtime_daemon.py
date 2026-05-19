@@ -12,6 +12,8 @@ import asyncio
 import copy
 import json
 import logging
+import queue
+import threading
 import time
 from collections import deque
 from collections.abc import Callable
@@ -60,7 +62,6 @@ from cortex.services.intervention_engine.planner import prepare_plan
 from cortex.services.intervention_engine.restore import RestoreManager
 from cortex.services.intervention_engine.snapshot import capture_snapshot
 from cortex.services.janitor.retention import (
-    sweep_once as run_retention_sweep,
     sweep_once_async as run_retention_sweep_async,
 )
 from cortex.services.kinematics_engine.blink_detector import BlinkDetector
@@ -192,7 +193,28 @@ _PassiveWorkspaceAdapter = _OptimisticInterventionAdapter
 
 
 class SessionRecorder:
-    """Append-only JSONL recorder for states, plans, and outcomes."""
+    """Append-only JSONL recorder for states, plans, and outcomes.
+
+    Audit-2 fix: serialise writes through a thread-safe queue + dedicated
+    writer thread instead of opening/closing the file synchronously on the
+    asyncio loop. Two consequences of the old design:
+
+    1. ``with open("a"): write()`` is an open + sync write + close
+       sequence the asyncio loop must wait for. On a slow / encrypted FS
+       a single 4 KB intervention plan can stall the broadcast cadence
+       for hundreds of ms.
+    2. ``O_APPEND`` is *not* atomic on macOS APFS for writes exceeding
+       ``PIPE_BUF`` (4 KB). Two concurrent appends (state-loop tick +
+       user-action handler ack) can interleave bytes mid-line, producing
+       malformed JSONL the replay harness rejects.
+
+    The writer thread holds the file open in line-buffered append mode
+    and pulls records off a ``queue.Queue``. Writes are therefore
+    serialised by the queue's consumer (one writer thread) so byte
+    interleave is impossible, and the producer (``append``) returns
+    after only an in-memory put. ``flush()`` drains pending records on
+    shutdown.
+    """
 
     def __init__(self, storage_root: str) -> None:
         root = Path(storage_root)
@@ -200,15 +222,71 @@ class SessionRecorder:
         session_dir = root / "sessions"
         session_dir.mkdir(parents=True, exist_ok=True)
         self._path = session_dir / f"session_{int(time.time())}.jsonl"
+        # Bounded queue so a runaway producer can't exhaust memory; if
+        # the writer thread falls behind by more than 4096 records we
+        # drop the oldest and log so the data loss is observable.
+        self._queue: queue.Queue[tuple[str, dict[str, Any], float] | None] = (
+            queue.Queue(maxsize=4096)
+        )
+        self._stop_event = threading.Event()
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop,
+            name="cortex-session-recorder",
+            daemon=True,
+        )
+        self._writer_thread.start()
 
     def append(self, event_type: str, payload: dict[str, Any]) -> None:
-        record = {
-            "type": event_type,
-            "timestamp": time.time(),
-            "payload": payload,
-        }
-        with self._path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, default=str) + "\n")
+        record = (event_type, payload, time.time())
+        try:
+            self._queue.put_nowait(record)
+        except queue.Full:
+            # Drop oldest to keep producer non-blocking. Surface the
+            # drop as a structured event so the on-call can see backpressure.
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._queue.put_nowait(record)
+            except queue.Full:
+                logger.warning("SessionRecorder backpressure: dropped %s", event_type)
+
+    def _writer_loop(self) -> None:
+        try:
+            with self._path.open("a", encoding="utf-8", buffering=1) as f:
+                while not self._stop_event.is_set():
+                    try:
+                        item = self._queue.get(timeout=0.5)
+                    except queue.Empty:
+                        continue
+                    if item is None:
+                        return
+                    event_type, payload, ts = item
+                    try:
+                        line = json.dumps(
+                            {"type": event_type, "timestamp": ts, "payload": payload},
+                            default=str,
+                        )
+                        f.write(line + "\n")
+                    except Exception:
+                        logger.exception(
+                            "SessionRecorder write failed for %s", event_type
+                        )
+        except Exception:
+            logger.exception("SessionRecorder writer thread crashed")
+
+    def flush(self, timeout: float = 5.0) -> None:
+        """Drain the queue and stop the writer thread. Best-effort."""
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            pass
+        self._stop_event.set()
+        try:
+            self._writer_thread.join(timeout=timeout)
+        except Exception:
+            pass
 
 
 class CortexDaemon:
@@ -363,6 +441,12 @@ class CortexDaemon:
         )
         self._last_physio_update = 0.0
         self._active_intervention_id: str | None = None
+        # Audit-2 fix: user-supplied goal text overrides the auto-inferred
+        # ``current_goal_hint`` from the context assembler. The controller's
+        # in-process ``_on_goal_set`` and the WS-mode ``set_goal:`` USER_ACTION
+        # both land here; prior to this fix the WS-mode path was silently
+        # dropped because the daemon had no method to set the override.
+        self._user_goal_override: str | None = None
         # Dedup set for INTERVENTION_APPLIED acks. Clients can send the
         # same (intervention_id, phase) twice (e.g. retries, multiple
         # browser tabs echoing the ack); the second one would otherwise
@@ -439,6 +523,10 @@ class CortexDaemon:
         # lock required (Python GIL guarantees pointer-replacement atomicity).
         self._latest_estimate: Any = None
         self._latest_biometrics: dict[str, Any] | None = None
+        # Audit-2 fix: paired (estimate, biometrics) snapshot. The pair
+        # write is a single tuple assignment so the broadcast loop never
+        # observes a torn combination of estimate(T+1) + biometrics(T).
+        self._latest_broadcast_snapshot: tuple[Any, dict[str, Any]] | None = None
         self._broadcast_interval_seconds: float = 0.5
 
         # Longitudinal tracker (baseline drift)
@@ -545,7 +633,7 @@ class CortexDaemon:
         *,
         timeout_seconds: float = 30.0,
         correlation_id: str | None = None,
-    ) -> "InterventionApplyResult":
+    ) -> InterventionApplyResult:
         """Register a pending apply-confirmation future and wait for it.
 
         Resolved by ``_handle_intervention_applied`` when the client's
@@ -801,7 +889,7 @@ class CortexDaemon:
             await asyncio.wait_for(
                 self._capture_pipeline.stop(), timeout=5.0
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error(
                 "Capture pipeline stop() exceeded 5s; abandoning graceful "
                 "close — relying on process exit to release the camera",
@@ -871,6 +959,13 @@ class CortexDaemon:
                         exc_info=True,
                     )
         await self._ws_server.stop()
+        # Audit-2 fix: drain the session recorder's writer thread before
+        # we exit so the trailing window of events (last user_action, the
+        # session_report meta-event, etc.) is flushed to disk.
+        try:
+            self._recorder.flush(timeout=5.0)
+        except Exception:
+            logger.debug("Recorder flush failed (non-fatal)", exc_info=True)
         self._uvicorn_server = None
         registry.reset()
         logger.info("Cortex daemon stopped")
@@ -926,7 +1021,39 @@ class CortexDaemon:
             loop="asyncio",
         )
         self._uvicorn_server = uvicorn.Server(config)
-        self._api_task = asyncio.create_task(self._uvicorn_server.serve(), name="cortex-api")
+
+        async def _supervised_serve() -> None:
+            """Audit-2 fix: surface a uvicorn bind-failure to the daemon.
+
+            Previously a stale daemon already holding port 9472 caused
+            ``Server.serve`` to raise inside the create_task; nobody
+            awaited the task or checked ``done_callback``, so the
+            capture loop kept running, the camera stayed open, and the
+            ``/shutdown`` endpoint never bound. With this supervisor
+            the failure is logged at error level and the daemon's
+            ``_shutdown`` event is set so ``run()`` exits cleanly.
+            """
+            try:
+                if self._uvicorn_server is not None:
+                    await self._uvicorn_server.serve()
+            except OSError as exc:
+                logger.error(
+                    "API server bind failed on %s:%s (%s); triggering shutdown",
+                    self.config.api.host,
+                    self.config.api.port,
+                    exc,
+                )
+                self._shutdown.set()
+            except asyncio.CancelledError:
+                # Normal shutdown path.
+                raise
+            except Exception:
+                logger.exception(
+                    "API server crashed unexpectedly; triggering daemon shutdown"
+                )
+                self._shutdown.set()
+
+        self._api_task = asyncio.create_task(_supervised_serve(), name="cortex-api")
 
     def _current_app_name(self) -> str:
         events = self._window_tracker.get_events_in_window(window_seconds=60.0)
@@ -961,9 +1088,25 @@ class CortexDaemon:
                 if not self._capture_available or not self._capture_processing_enabled:
                     await asyncio.sleep(0.5)
                     continue
-                output = await self._capture_pipeline.get_output(timeout=0.5)
+                try:
+                    output = await self._capture_pipeline.get_output(timeout=0.5)
+                except Exception:
+                    # Audit-2 fix: a NaN landmark or an rPPG numerical
+                    # blow-up used to propagate out of the loop and kill
+                    # the task silently. The user then saw zero physio
+                    # updates for the rest of the session with no log
+                    # trace. Log + continue keeps the pipeline alive.
+                    logger.exception("Capture pipeline get_output failed; continuing")
+                    await asyncio.sleep(0.5)
+                    continue
                 if output is not None:
-                    await self._process_capture_output(output)
+                    try:
+                        await self._process_capture_output(output)
+                    except Exception:
+                        # Mediapipe occasionally returns malformed
+                        # landmarks; treat as a transient bad frame and
+                        # keep the loop running.
+                        logger.exception("Capture frame processing failed; skipping frame")
         except asyncio.CancelledError:
             pass
 
@@ -1052,13 +1195,18 @@ class CortexDaemon:
             interval = self._broadcast_interval_seconds
             while True:
                 await asyncio.sleep(interval)
-                estimate = self._latest_estimate
-                if estimate is None:
+                # Audit-2 fix: read the (estimate, biometrics) pair from
+                # the atomic snapshot so the broadcast never ships an
+                # estimate(T+1) paired with biometrics(T). The state
+                # loop writes ``_latest_broadcast_snapshot`` as a single
+                # tuple assignment; the GIL guarantees that pointer swap
+                # is atomic, eliminating the pair-write tearing window.
+                snapshot = self._latest_broadcast_snapshot
+                if snapshot is None:
                     continue
+                estimate, biometrics = snapshot
                 try:
-                    await self._ws_server.broadcast_state(
-                        estimate, self._latest_biometrics
-                    )
+                    await self._ws_server.broadcast_state(estimate, biometrics)
                 except Exception:
                     logger.debug("broadcast_state failed", exc_info=True)
         except asyncio.CancelledError:
@@ -1070,6 +1218,18 @@ class CortexDaemon:
             while True:
                 try:
                     context = await self._context_engine.build_context()
+                    # Audit-2 fix: apply user-supplied goal override so the
+                    # planner sees the intent the user typed into the
+                    # dashboard. We mutate the freshly-built context (no
+                    # external reference yet, no race).
+                    if self._user_goal_override:
+                        try:
+                            context.current_goal_hint = self._user_goal_override
+                        except Exception:
+                            logger.debug(
+                                "Failed to apply user goal override",
+                                exc_info=True,
+                            )
                     self._latest_context = context
                     registry.register("latest_task_context", context)
                     self._terminal_adapter.set_running_command(
@@ -1203,12 +1363,27 @@ class CortexDaemon:
                             )
                     except Exception:
                         logger.debug("session_report record failed", exc_info=True)
+                    # Audit-2 fix: publish ``forward_lean`` as a 0-1 score
+                    # (rescaled from the underlying 0-45° angle). The
+                    # browser extension's posture alert threshold (0.6)
+                    # was previously compared against raw degrees, so
+                    # every user got a posture toast within 3 min of
+                    # session start regardless of actual posture. The
+                    # raw angle is still surfaced as ``forward_lean_angle``
+                    # for any consumer that prefers degrees.
+                    _lean_angle = vector.forward_lean_angle
+                    _lean_score: float | None
+                    if _lean_angle is None:
+                        _lean_score = None
+                    else:
+                        _lean_score = max(0.0, min(1.0, float(_lean_angle) / 45.0))
                     biometrics = {
                         "heart_rate": vector.hr,
                         "hrv_rmssd": vector.hrv_rmssd,
                         "hr_delta": vector.hr_delta,
                         "blink_rate": vector.blink_rate,
-                        "forward_lean": vector.forward_lean_angle,
+                        "forward_lean": _lean_score,
+                        "forward_lean_angle": _lean_angle,
                         "respiration_rate": vector.respiration_rate,
                         "thrashing_score": vector.thrashing_score,
                         "stress_integral": self._stress_tracker.current_load,
@@ -1217,8 +1392,15 @@ class CortexDaemon:
                     # broadcasting inline. Inline broadcasts let LLM/trigger
                     # work stretch the cadence to multi-second; the broadcast
                     # loop reads this cache at a steady 500ms tick.
+                    #
+                    # Audit-2 fix: write the (estimate, biometrics) pair as
+                    # a single tuple assignment. The GIL guarantees pointer
+                    # replacement is atomic, so the broadcast loop sees
+                    # either the old pair or the new pair, never a torn
+                    # combination.
                     self._latest_estimate = estimate
                     self._latest_biometrics = biometrics
+                    self._latest_broadcast_snapshot = (estimate, biometrics)
 
                     if self._state_callback is not None:
                         # F17: stamp a monotonic sequence into the payload so
@@ -1226,16 +1408,35 @@ class CortexDaemon:
                         # ``_seq`` underscore-prefix marks this as a wire
                         # implementation detail, not a domain field.
                         self._state_callback_seq += 1
-                        self._state_callback(copy.deepcopy({
+                        # Audit-2 fix: parity with the WS-mode STATE_UPDATE
+                        # envelope. Previously the in-process callback
+                        # dropped the F18 ``degraded``/``source``/
+                        # ``stress_integral``/``timestamp`` fields, so the
+                        # dashboard's degraded-classifier badge never lit
+                        # up in DMG ``--in-process`` mode.
+                        _scores_dump: dict[str, Any] = (
+                            estimate.scores.model_dump()
+                            if hasattr(estimate.scores, "model_dump")
+                            else {}
+                        )
+                        _payload: dict[str, Any] = {
                             "_seq": self._state_callback_seq,
                             "state": estimate.state,
                             "confidence": estimate.confidence,
-                            "scores": estimate.scores.model_dump() if hasattr(estimate.scores, "model_dump") else {},
+                            "scores": _scores_dump,
                             "signal_quality": estimate.signal_quality.model_dump(),
                             "dwell_seconds": estimate.dwell_seconds,
                             "reasons": estimate.reasons,
                             "biometrics": biometrics,
-                        }))
+                            "timestamp": float(getattr(estimate, "timestamp", timestamp) or timestamp),
+                            "stress_integral": getattr(estimate, "stress_integral", None),
+                            "source": getattr(estimate, "source", "classifier"),
+                            "degraded": bool(getattr(estimate, "degraded", False)),
+                            "calibrated_probabilities": getattr(estimate, "calibrated_probabilities", None),
+                            "classifier_source": getattr(estimate, "classifier_source", None),
+                            "classifier_alpha": getattr(estimate, "classifier_alpha", None),
+                        }
+                        self._state_callback(copy.deepcopy(_payload))
 
                     # v2.0: Copilot throttle on state transitions
                     if estimate.state != self._prev_state:
@@ -1572,6 +1773,14 @@ class CortexDaemon:
         """Trigger a special v2.0 intervention (breathing, active recall, rabbit hole)."""
         if self._active_intervention_id is not None:
             return  # Don't stack interventions
+        # Audit-2 fix: stamp the ``__pending__`` sentinel *before* the
+        # ``await`` so two consecutive state-loop ticks cannot both pass
+        # the guard above and double-spawn. The old code stamped the real
+        # intervention_id *after* the LLM call returned, leaving a 4 s+
+        # window during which a duplicate trigger silently billed tokens
+        # twice and broadcast two plans (only one of which won the
+        # ``_active_intervention_id`` assignment).
+        self._active_intervention_id = "__pending__"
         self._last_policy_decision_id = None
         self._last_policy_arm = None
         self._last_policy_propensity = None
@@ -1588,6 +1797,11 @@ class CortexDaemon:
             await self._ws_server.send_message(ws_type, plan.model_dump(mode="json"))
         except Exception:
             logger.exception("Failed to trigger special intervention (%s)", template_name)
+        finally:
+            # Clear the sentinel if the call failed before assigning the
+            # real id; on success the real id stays.
+            if self._active_intervention_id == "__pending__":
+                self._active_intervention_id = None
 
     @staticmethod
     def _self_critique_plan(plan: InterventionPlan) -> None:
@@ -1655,6 +1869,13 @@ class CortexDaemon:
 
         intervention_id = str(payload.get("intervention_id", ""))
         action = str(payload.get("action", "dismissed"))
+        # Audit-2 fix: WS-mode dashboard sends "set_goal:<text>" with an
+        # empty intervention_id. Route to the goal-override setter before
+        # the intervention-id guard rejects the message.
+        if action.startswith("set_goal:") and not intervention_id:
+            goal_text = action.split(":", 1)[1].strip()
+            await self.set_user_goal(goal_text)
+            return
         if not intervention_id:
             return
         context = self._latest_context
@@ -2241,23 +2462,85 @@ class CortexDaemon:
         except asyncio.CancelledError:
             pass
 
+    async def reload_llm_credentials(self) -> bool:
+        """Audit-2 fix: hot-reload the planner SDK after a BYOK save.
+
+        Called from ``apply_settings({"reload_llm_credentials": True})``
+        and from the in-process controller's ``_reload_llm_credentials``
+        callback. Returns True iff a fresh SDK client was built.
+        """
+        planner = self._llm_client
+        if planner is None or not hasattr(planner, "reload_credentials"):
+            return False
+        try:
+            return bool(planner.reload_credentials())
+        except Exception:
+            logger.exception("reload_llm_credentials failed")
+            return False
+
+    async def set_user_goal(self, goal: str) -> None:
+        """Update the user-supplied goal override.
+
+        Both the in-process controller (DMG path) and the WS-mode
+        desktop shell route the dashboard's goal-input text to this
+        method. The override is applied on the next ``_context_loop``
+        tick so the planner sees the intent.
+        """
+        cleaned = (goal or "").strip()
+        self._user_goal_override = cleaned or None
+        # Apply immediately to the cached context so the next intervention
+        # cycle picks up the override without waiting for the 5 s
+        # ``_context_loop`` tick.
+        ctx = self._latest_context
+        if ctx is not None and self._user_goal_override:
+            try:
+                ctx.current_goal_hint = self._user_goal_override
+            except Exception:
+                logger.debug("Failed to apply goal override to cached context", exc_info=True)
+        logger.info(
+            "User goal override updated (len=%d)",
+            len(self._user_goal_override or ""),
+        )
+
     async def apply_settings(self, settings: dict[str, Any]) -> None:
         """Apply user-facing settings live when possible."""
+        # Audit-2 fix: WS-mode BYOK reload signal. The desktop shell
+        # sends ``{"reload_llm_credentials": True}`` after the user
+        # saves a Bedrock token in onboarding.
+        if settings.get("reload_llm_credentials"):
+            await self.reload_llm_credentials()
         if "entry_threshold" in settings:
             threshold = float(settings["entry_threshold"])
             self.config.state.entry_threshold = threshold
             self.config.intervention.overlay_threshold = threshold
-            self._trigger_policy = TriggerPolicy(
-                self.config.intervention,
-                state_config=self.config.state,
-            )
+            # Audit-2 fix: preserve cooldown / dwell state across a
+            # live settings change. Re-creating ``TriggerPolicy`` reset
+            # every counter and let interventions fire immediately even
+            # if the user had just dismissed three in a row. The new
+            # ``update_thresholds`` mutator keeps the timers intact.
+            if hasattr(self._trigger_policy, "update_thresholds"):
+                self._trigger_policy.update_thresholds(
+                    self.config.intervention,
+                    state_config=self.config.state,
+                )
+            else:
+                self._trigger_policy = TriggerPolicy(
+                    self.config.intervention,
+                    state_config=self.config.state,
+                )
             registry.register("trigger_policy", self._trigger_policy)
         if "cooldown_seconds" in settings:
             self.config.intervention.cooldown_seconds = int(settings["cooldown_seconds"])
-            self._trigger_policy = TriggerPolicy(
-                self.config.intervention,
-                state_config=self.config.state,
-            )
+            if hasattr(self._trigger_policy, "update_thresholds"):
+                self._trigger_policy.update_thresholds(
+                    self.config.intervention,
+                    state_config=self.config.state,
+                )
+            else:
+                self._trigger_policy = TriggerPolicy(
+                    self.config.intervention,
+                    state_config=self.config.state,
+                )
             registry.register("trigger_policy", self._trigger_policy)
         if "webcam_enabled" in settings:
             desired_capture = bool(settings["webcam_enabled"])

@@ -758,6 +758,93 @@ class _ConsumerTab(QWidget):
             self._blk_label, f"{blink:.1f}" if blink is not None else "--"
         )
 
+        # Audit-2 fix: drive the Today panel from accumulated session
+        # stats instead of leaving the placeholder "--" labels. We
+        # accumulate FLOW seconds, count interventions seen, and track
+        # the longest contiguous FLOW streak. Approximation is
+        # acceptable here — these are at-a-glance numerics, not
+        # research data — and is better than dead UI.
+        try:
+            self._accumulate_today_stats(state)
+        except Exception:
+            # Don't let a stats bug crash state rendering.
+            pass
+
+    def _accumulate_today_stats(self, state: str) -> None:
+        import time as _t
+
+        now = _t.monotonic()
+        # Lazy-init counters on first frame (the dashboard widget
+        # constructor doesn't see ``time.monotonic`` to avoid early
+        # import side effects).
+        if not hasattr(self, "_today_last_tick"):
+            self._today_last_tick = now
+            self._today_flow_seconds = 0.0
+            self._today_current_streak = 0.0
+            self._today_best_streak = 0.0
+            self._today_intervention_count = 0
+        dt = max(0.0, min(now - self._today_last_tick, 2.0))
+        self._today_last_tick = now
+        if state == "FLOW":
+            self._today_flow_seconds += dt
+            self._today_current_streak += dt
+            if self._today_current_streak > self._today_best_streak:
+                self._today_best_streak = self._today_current_streak
+        else:
+            self._today_current_streak = 0.0
+        # Format Focus (h:mm) and Best (m:ss / h:mm) compactly.
+        focus_m = int(self._today_flow_seconds // 60)
+        focus_h, focus_m = divmod(focus_m, 60)
+        focus_text = f"{focus_h}h{focus_m:02d}" if focus_h else f"{focus_m}m"
+        best_m = int(self._today_best_streak // 60)
+        best_h, best_m = divmod(best_m, 60)
+        best_text = (
+            f"{best_h}h{best_m:02d}"
+            if best_h
+            else (f"{best_m}m" if best_m else f"{int(self._today_best_streak)}s")
+        )
+        self._set_text_if_changed(self._today_focus, focus_text)
+        self._set_text_if_changed(self._today_sessions, "1")
+        self._set_text_if_changed(self._today_best, best_text)
+        self._set_text_if_changed(
+            self._today_blocked, str(self._today_intervention_count)
+        )
+
+    def record_intervention_seen(self) -> None:
+        """Audit-2 fix: invoked by the parent dashboard when an
+        intervention is broadcast so the Today/Blocked counter advances.
+        """
+        if not hasattr(self, "_today_intervention_count"):
+            self._today_intervention_count = 0
+        self._today_intervention_count += 1
+        try:
+            self._set_text_if_changed(
+                self._today_blocked, str(self._today_intervention_count)
+            )
+        except Exception:
+            pass
+
+    def set_extension_connected(self, name: str, connected: bool) -> None:
+        """Audit-2 fix: update the Chrome / Edge / Editor connection dots.
+
+        ``name`` is matched case-insensitively against the constructed
+        keys ("Chrome", "Edge", "Editor"). Unknown names are ignored.
+        """
+        dot = None
+        for key, widget in self._conn_dots.items():
+            if key.lower() == (name or "").lower():
+                dot = widget
+                break
+        if dot is None:
+            return
+        color = BRAND_ACCENT if connected else _LABEL_TERTIARY
+        try:
+            self._set_style_if_changed(
+                dot, f"background: {color}; border-radius: 3px;"
+            )
+        except Exception:
+            pass
+
     def set_connected(self, connected: bool) -> None:
         if connected:
             self._set_text_if_changed(self._state_label, "Connected")
@@ -1300,6 +1387,23 @@ class DashboardWindow(QWidget):
     def set_connected(self, connected: bool) -> None:
         self._connected = connected
         self._consumer.set_connected(connected)
+
+    def set_extension_connected(self, name: str, connected: bool) -> None:
+        """Audit-2 fix: update the Chrome / Edge / Editor connection
+        indicator dots in the consumer tab. Callers invoke this from
+        controller / main when an extension IDENTIFY arrives."""
+        if self._consumer is not None and hasattr(
+            self._consumer, "set_extension_connected"
+        ):
+            self._consumer.set_extension_connected(name, connected)
+
+    def record_intervention_seen(self) -> None:
+        """Audit-2 fix: forward intervention-broadcast events to the
+        consumer-tab counter so the Today/Blocked numeric advances."""
+        if self._consumer is not None and hasattr(
+            self._consumer, "record_intervention_seen"
+        ):
+            self._consumer.record_intervention_seen()
 
     # F34 -----------------------------------------------------------------
 

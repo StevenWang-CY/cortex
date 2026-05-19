@@ -9,6 +9,46 @@
 
 import * as vscode from "vscode";
 import WebSocket from "ws";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
+
+/**
+ * Audit Debt-2: read the local capability token the daemon mints at
+ * ``<config_dir>/auth.token``. The legitimate VS Code extension can
+ * read this file because it runs as the same user as the daemon.
+ */
+function readCapabilityToken(): string | null {
+    try {
+        let configDir: string;
+        const platform = process.platform;
+        if (platform === "darwin") {
+            configDir = path.join(
+                os.homedir(),
+                "Library",
+                "Application Support",
+                "Cortex",
+            );
+        } else if (platform === "win32") {
+            const appData = process.env.APPDATA;
+            if (!appData) return null;
+            configDir = path.join(appData, "Cortex");
+        } else {
+            const xdg = process.env.XDG_CONFIG_HOME;
+            configDir = xdg
+                ? path.join(xdg, "cortex")
+                : path.join(os.homedir(), ".config", "cortex");
+        }
+        const tokenFile = path.join(configDir, "auth.token");
+        if (!fs.existsSync(tokenFile)) {
+            return null;
+        }
+        const raw = fs.readFileSync(tokenFile, "utf-8").trim();
+        return raw.length >= 32 ? raw : null;
+    } catch {
+        return null;
+    }
+}
 
 /** WebSocket message envelope matching the daemon's WSMessage format. */
 interface WSMessage {
@@ -116,6 +156,29 @@ export class CortexWSClient {
                 this._connected = true;
                 this._reconnectDelay = 3000; // Reset backoff
                 this._notifyConnection(true);
+
+                // Audit Debt-2: AUTH first. The daemon refuses every other
+                // type until this frame validates; without it the server
+                // closes the connection with code 1011 ("auth required")
+                // before any STATE_UPDATE reaches us. We send the cached
+                // capability token synchronously inline so an
+                // unauthenticated socket can't be tricked into emitting
+                // any other frame.
+                const token = readCapabilityToken();
+                if (token && this._ws) {
+                    try {
+                        this._ws.send(
+                            JSON.stringify({
+                                type: "AUTH",
+                                payload: { auth_token: token },
+                                timestamp: Date.now() / 1000,
+                                sequence: ++this._sequence,
+                            }),
+                        );
+                    } catch {
+                        // Will be retried on reconnect
+                    }
+                }
 
                 // Identify as VS Code extension
                 this._send({

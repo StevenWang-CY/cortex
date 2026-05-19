@@ -45,7 +45,6 @@ from pydantic import ValidationError
 # time the planner is asked to mint a Bedrock client. Deferring the
 # import shaves measurable time off daemon startup. The regression
 # guard lives in ``cortex/tests/performance/test_startup_latency.py``.
-
 from cortex.libs.config.settings import LLMConfig
 from cortex.libs.llm.anthropic_client import (
     LogicalModel,
@@ -334,6 +333,64 @@ class AnthropicPlanner:
                 )
                 self._cost_tracker = None
 
+    def reload_credentials(self) -> bool:
+        """Rebuild the SDK client using the latest BYOK token.
+
+        Audit-2 fix: previously the keychain-sourced Bedrock token was
+        read once at planner construction. After the onboarding "save
+        token" step or a Settings "rotate token" action, the running
+        planner kept using the prior cached SDK client (or no client at
+        all for first-run installs), so the very next intervention
+        silently fell through to the rule-based fallback even though
+        the user had just supplied a valid token.
+
+        Returns True if a working SDK client was constructed, False
+        if no token is available or the rebuild raised. Callers can
+        surface a UI toast on failure.
+        """
+        if self._config.provider != "bedrock":
+            # Vertex / Direct providers acquire credentials via Google
+            # ADC / ANTHROPIC_API_KEY env at SDK build; rebuild is still
+            # useful so we honour any env mutation the caller performed.
+            try:
+                self._sdk = build_anthropic_sdk_client(
+                    provider=self._config.provider,
+                    bedrock_region=self._config.bedrock.aws_region,
+                )
+                self._cache.clear()
+                logger.info("Planner SDK rebuilt for provider=%s", self._config.provider)
+                return True
+            except Exception:
+                logger.exception("Planner SDK rebuild failed")
+                return False
+
+        keychain_token = _keychain_get_bedrock_token(self._config)
+        if not keychain_token:
+            logger.warning("reload_credentials: no Bedrock token in keychain")
+            return False
+        prior = os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
+        try:
+            os.environ["AWS_BEARER_TOKEN_BEDROCK"] = keychain_token
+            self._sdk = build_anthropic_sdk_client(
+                provider=self._config.provider,
+                bedrock_region=self._config.bedrock.aws_region,
+            )
+            # Drop any cached plan so the next call hits the fresh SDK.
+            self._cache.clear()
+            # If the breaker was OPEN due to prior auth failures, reset it
+            # so the user gets an immediate retry.
+            self._circuit.record_success()
+            logger.info("Planner SDK rebuilt with refreshed Bedrock token")
+            return True
+        except Exception:
+            logger.exception("Planner SDK rebuild failed")
+            return False
+        finally:
+            if prior is None:
+                os.environ.pop("AWS_BEARER_TOKEN_BEDROCK", None)
+            else:
+                os.environ["AWS_BEARER_TOKEN_BEDROCK"] = prior
+
     def _select_tier(self, template_name: str | None) -> ModelTier:
         if template_name:
             overrides = self._config.template_tier_overrides
@@ -491,6 +548,30 @@ class AnthropicPlanner:
                         raise
             except (RateLimitError, APITimeoutError, APIStatusError) as exc:
                 latency_ms = (time.perf_counter() - t0) * 1000.0
+                # Audit-2 fix: surface 401 / 403 (revoked or invalid
+                # BYOK token) as a distinct, non-retryable failure so the
+                # user gets an immediate signal that their token is bad.
+                # The plain backoff path used to retry 401s up to
+                # ``attempts`` times, then silently fall back to the
+                # rule-based plan — the user never knew their token had
+                # been revoked.
+                status = getattr(exc, "status_code", None)
+                if isinstance(exc, APIStatusError) and status in (401, 403):
+                    logger.error(
+                        "llm.request status=auth_error model=%s template=%s "
+                        "latency_ms=%.0f http=%s err=%s — token may be revoked",
+                        model_id,
+                        template_name,
+                        latency_ms,
+                        status,
+                        type(exc).__name__,
+                    )
+                    self._circuit.record_failure(time.monotonic())
+                    auth_fallback = build_fallback_plan(context)
+                    auth_fallback.metadata["fallback_reason"] = "auth_error"
+                    auth_fallback.metadata["source"] = "fallback"
+                    auth_fallback.metadata["http_status"] = status
+                    return auth_fallback
                 logger.warning(
                     "llm.request status=error model=%s template=%s "
                     "latency_ms=%.0f attempt=%d err=%s",
@@ -503,8 +584,20 @@ class AnthropicPlanner:
                 if attempt == attempts - 1:
                     self._circuit.record_failure(time.monotonic())
                     break
-                # Bounded exponential backoff with jitter.
-                await asyncio.sleep(min(2 ** attempt + random.random(), 8.0))
+                # Bounded exponential backoff with jitter. Wrap in
+                # try/finally so a cancellation during the sleep still
+                # records best-effort cost telemetry for the prior
+                # attempt's billed call (audit-2 fix for F30 retry-loop
+                # gap).
+                try:
+                    await asyncio.sleep(min(2 ** attempt + random.random(), 8.0))
+                except asyncio.CancelledError:
+                    self._record_cost_on_cancellation(
+                        model_id,
+                        response,
+                        estimated_input_tokens,
+                    )
+                    raise
                 continue
             except APIError as exc:
                 latency_ms = (time.perf_counter() - t0) * 1000.0

@@ -144,5 +144,9 @@ def generate_daily_causal_report(storage_root: str, day: str | None = None) -> P
     brier = float(np.mean(brier_terms)) if brier_terms else math.nan
     lines.extend(["", "## Calibration", "", f"- Brier-like score: {brier:.4f}" if not math.isnan(brier) else "- Brier-like score: n/a"])
 
-    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # Audit-2 fix: atomic write so a SIGKILL or disk-full mid-write
+    # does not silently truncate the diagnostic report.
+    from cortex.libs.utils.atomic_write import atomic_write_text
+
+    atomic_write_text(out_path, "\n".join(lines) + "\n")
     return out_path

@@ -166,12 +166,52 @@ const EXCLUDED_URL_PATTERNS = [/\/login/i, /\/signin/i, /\/auth/i, /\/oauth/i];
 const SEARCH_ENGINES = [/google\.\w+\/search/, /bing\.com\/search/, /duckduckgo\.com\//];
 const NEWTAB_PATTERNS = [/chrome:\/\/newtab/, /edge:\/\/newtab/, /about:blank/];
 
+// Audit-2 fix: privacy-sensitive domain blocklist. Activity tracking
+// previously walked DOM text on ANY page (banking, healthcare, Gmail
+// thread bodies, internal SaaS) and shipped 200-char snippets back to
+// the daemon. The path /login filter was insufficient — most sensitive
+// content is on the post-auth pages, not the auth page. We now refuse
+// to extract content from these origins and, separately, from any page
+// whose document contains a focused/visible password input.
+const SENSITIVE_DOMAIN_PATTERNS: RegExp[] = [
+    /(^|\.)(chase|bankofamerica|wellsfargo|citi(bank)?|capitalone)\.com/i,
+    /(^|\.)(paypal|venmo|cash\.app|coinbase|kraken|binance)\.com/i,
+    /(^|\.)(mail\.google|outlook(\.live)?|protonmail)\.com/i,
+    /(^|\.)(1password|bitwarden|lastpass|dashlane|nordpass)\.com/i,
+    /(^|\.)(myhealth|mychart|kp\.org|cigna|aetna|bcbs)\.com/i,
+    /(^|\.)(irs\.gov|ssa\.gov|hmrc\.gov\.uk)/i,
+];
+
+function isSensitiveOrigin(url: string): boolean {
+    try {
+        const host = new URL(url).hostname;
+        return SENSITIVE_DOMAIN_PATTERNS.some((p) => p.test(host));
+    } catch {
+        return false;
+    }
+}
+
 function isExcludedUrl(url: string): boolean {
     if (EXCLUDED_URL_PREFIXES.some(p => url.startsWith(p))) return true;
     if (EXCLUDED_URL_PATTERNS.some(p => p.test(url))) return true;
     if (SEARCH_ENGINES.some(p => p.test(url))) return true;
     if (NEWTAB_PATTERNS.some(p => p.test(url))) return true;
+    if (isSensitiveOrigin(url)) return true;
     return false;
+}
+
+function hasVisiblePasswordField(): boolean {
+    try {
+        const pwd = document.querySelector(
+            'input[type="password"]:not([disabled])',
+        ) as HTMLElement | null;
+        if (!pwd) return false;
+        // Cheap visibility check.
+        const rect = pwd.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+    } catch {
+        return false;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +225,14 @@ function getScrollPct(): number {
 }
 
 function extractContextSnapshot(): string {
+    // Audit-2 fix: refuse to extract page text when a visible password
+    // field is on the document. Even if the URL itself isn't on the
+    // sensitive-domain blocklist, the presence of an active password
+    // input strongly suggests we're on an auth or account page; the
+    // title alone is a safer summary.
+    if (hasVisiblePasswordField()) {
+        return document.title.slice(0, 200);
+    }
     const candidates = document.querySelectorAll("article, main, [role='main']");
     let el: Element | null = candidates[0] || null;
     if (!el) {

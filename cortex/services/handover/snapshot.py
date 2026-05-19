@@ -167,10 +167,14 @@ class HandoverSnapshot:
         sections.append("- [ ] Check git diff for uncommitted work")
         sections.append("- [ ] Continue from the editor context above")
 
-        # Write file
+        # Write file. Audit-2 fix: atomic write so a SIGKILL or disk-full
+        # mid-write does not leave the user with a truncated handover
+        # (which they look at first thing the next morning).
         content = "\n".join(sections)
         output_path = self._handovers_dir / f"{date_str}.md"
-        output_path.write_text(content, encoding="utf-8")
+        from cortex.libs.utils.atomic_write import atomic_write_text
+
+        atomic_write_text(output_path, content)
         logger.info("Handover brief written to %s", output_path)
 
         return output_path

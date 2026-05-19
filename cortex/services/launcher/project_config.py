@@ -39,12 +39,20 @@ class ProjectConfig(BaseModel):
     )
 
     def save(self, storage_dir: Path) -> Path:
-        """Save project config to YAML file."""
+        """Save project config to YAML file.
+
+        Audit-2 fix: atomic write so a SIGKILL or disk-full mid-write
+        does not truncate the user's project YAML. Truncated YAML
+        is silently skipped by ``list_projects`` — the user loses the
+        project entry without any error.
+        """
+        from cortex.libs.utils.atomic_write import atomic_write_text
+
         projects_dir = storage_dir / "projects"
         projects_dir.mkdir(parents=True, exist_ok=True)
         path = projects_dir / f"{self.name.lower().replace(' ', '_')}.yaml"
-        with open(path, "w", encoding="utf-8") as f:
-            yaml.dump(self.model_dump(), f, default_flow_style=False)
+        serialized = yaml.dump(self.model_dump(), default_flow_style=False)
+        atomic_write_text(path, serialized)
         return path
 
     @classmethod

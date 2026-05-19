@@ -23,7 +23,7 @@ import type {
   LeetCodeContext,
   LeetCodeStage,
   SubmissionResult,
-} from "./types/generated/cortex_schemas";
+} from "../types/generated/cortex_schemas";
 
 type Stage = LeetCodeStage;
 

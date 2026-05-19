@@ -117,12 +117,21 @@ class WebSocketBridge(QObject):
         ``_request_shutdown`` → SIGTERM). The previous implementation went
         through USER_ACTION, which the daemon dropped because no
         ``intervention_id`` was attached.
+
+        Audit-2 fix: stamp the capability token into ``payload.auth_token``
+        so the F07 SHUTDOWN gate accepts the message. The Debt-2 AUTH
+        handshake authenticates the connection; SHUTDOWN is double-gated
+        (defense in depth) and the daemon rejects payloads without the
+        token even on an already-authenticated socket.
         """
         if self._loop is None or self._ws is None:
             return
+        payload: dict[str, Any] = {}
+        if self._auth_token:
+            payload["auth_token"] = self._auth_token
         msg = json.dumps({
             "type": "SHUTDOWN",
-            "payload": {},
+            "payload": payload,
             "timestamp": 0,
             "sequence": 0,
         })
@@ -370,6 +379,17 @@ class CortexApp:
         if self._dashboard is not None:
             self._dashboard.stop_requested.connect(self._request_remote_shutdown)
             self._dashboard.goal_set.connect(self._send_goal)
+            # Audit-2 fix: wire the dashboard's Connect button in WS mode.
+            # The DMG ``--in-process`` path already routes through
+            # ``CortexAppController``; the WS path previously left this
+            # control dead (clicking did nothing).
+            try:
+                consumer = getattr(self._dashboard, "_consumer", None)
+                connect_btn = getattr(consumer, "_connect_btn", None) if consumer else None
+                if connect_btn is not None:
+                    connect_btn.clicked.connect(self._show_connections)
+            except Exception:
+                logger.debug("Failed to wire Connect button (non-fatal)", exc_info=True)
 
         # Create WebSocket bridge
         self._bridge = WebSocketBridge(
@@ -396,6 +416,14 @@ class CortexApp:
         self._onboarding.open_settings_requested.connect(self._show_settings)
         self._onboarding.run_calibration_requested.connect(self._run_calibration)
         self._onboarding.completed.connect(self._complete_onboarding)
+        # Audit-2 fix: ask the remote daemon to reload LLM credentials
+        # after a BYOK save. Settings change with reload_llm_credentials=True
+        # is the WS-protocol-friendly way to signal hot-reload.
+        if hasattr(self._onboarding, "byok_token_saved"):
+            self._onboarding.byok_token_saved.connect(
+                lambda: self._bridge.send_settings({"reload_llm_credentials": True})
+                if self._bridge is not None else None,
+            )
         # E.5: step-4 "Open Connections" button.
         if hasattr(self._onboarding, "extensions_requested"):
             self._onboarding.extensions_requested.connect(self._show_connections)
@@ -453,6 +481,15 @@ class CortexApp:
         self._active_intervention_id = payload.get("intervention_id")
         if self._overlay is not None:
             self._overlay.show_intervention(payload)
+        # Audit-2 fix: bump the Today/Blocked counter so the dashboard
+        # numeric reflects reality instead of staying at the "--" placeholder.
+        if self._dashboard is not None and hasattr(
+            self._dashboard, "record_intervention_seen"
+        ):
+            try:
+                self._dashboard.record_intervention_seen()
+            except Exception:
+                logger.debug("record_intervention_seen failed", exc_info=True)
 
     @Slot(bool)
     def _on_connection_changed(self, connected: bool) -> None:

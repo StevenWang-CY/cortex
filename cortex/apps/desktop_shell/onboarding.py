@@ -164,7 +164,7 @@ class OnboardingState:
     completed_steps: set[str] = field(default_factory=set)
 
     @classmethod
-    def load(cls, path: Path | None = None) -> "OnboardingState":
+    def load(cls, path: Path | None = None) -> OnboardingState:
         target = path or onboarding_state_path()
         if not target.exists():
             return cls()
@@ -344,6 +344,11 @@ class OnboardingWindow(QWidget):
     open_settings_requested = Signal()
     run_calibration_requested = Signal()
     extensions_requested = Signal()
+    # Audit-2 fix: emit when the user saves a BYOK token so the running
+    # daemon's planner can hot-reload its SDK client without forcing the
+    # user to restart Cortex. Without this, the first session after
+    # onboarding silently uses the rule-based fallback.
+    byok_token_saved = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1007,11 +1012,18 @@ class OnboardingWindow(QWidget):
                 config.llm.bedrock.aws_region = self._region_combo.currentText()
             except AttributeError:
                 pass
+            # Audit-2 fix: signal the running daemon so its planner
+            # hot-reloads the new token. The user no longer has to
+            # restart Cortex for the first session to use BYOK.
+            try:
+                self.byok_token_saved.emit()
+            except Exception:
+                logger.debug("byok_token_saved emit failed", exc_info=True)
             QMessageBox.information(
                 self,
                 "Saved",
-                "Bedrock bearer token saved to macOS Keychain. Restart "
-                "Cortex (or sign out and back in) to pick it up.",
+                "Bedrock bearer token saved to macOS Keychain. "
+                "Cortex will use it for the next intervention.",
             )
             self._key_input.clear()
         except Exception as e:

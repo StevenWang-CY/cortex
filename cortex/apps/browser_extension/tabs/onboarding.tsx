@@ -16,7 +16,7 @@ const STEPS = [
     {
         title: "Start the Cortex daemon",
         body: "Cortex runs a local daemon that processes your biometric signals. Open a terminal and run:",
-        code: "cortex-dev",
+        code: "python -m cortex.scripts.run_dev",
         hint: "The extension will automatically connect once the daemon is running.",
     },
     {
@@ -277,8 +277,15 @@ const S: Record<string, React.CSSProperties> = {
 };
 
 // --- Mount ---
+//
+// Audit-2 fix: fall back to Plasmo's ``#__plasmo`` wrapper when
+// ``#root`` isn't present (which is the production HTML emitted by
+// Plasmo's codegen). Without this, the onboarding tab loaded with an
+// empty body — the React tree never mounted and first-run users saw
+// nothing.
 
-const root = document.getElementById("root");
+const root =
+    document.getElementById("root") ?? document.getElementById("__plasmo");
 if (root) {
     createRoot(root).render(<Onboarding />);
 }

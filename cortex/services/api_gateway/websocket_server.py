@@ -1157,6 +1157,13 @@ class WebSocketServer:
             payload["error_analysis"] = plan.error_analysis.model_dump()
         if plan.tab_recommendations is not None:
             payload["tab_recommendations"] = plan.tab_recommendations.model_dump()
+        # Audit-2 fix: ship plan.metadata so the F27 fallback hint, F20
+        # budget-killed flag, and F29 truncation telemetry reach the
+        # overlay. Prior to this fix the WS broadcast omitted the field
+        # entirely and only the in-process callback path carried it,
+        # silently disabling these UI surfaces in WS-mode.
+        if plan.metadata:
+            payload["metadata"] = dict(plan.metadata)
         # F16-srv: stamp a deterministic cid per intervention emission so a
         # later USER_ACTION can be matched against the active emission.
         cid = f"iv_{plan.intervention_id}_{self._sequence}"

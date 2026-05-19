@@ -157,28 +157,50 @@ class MessageType(str, Enum):
     """Friction overlay before revealing the editorial / solution."""
 
     LEETCODE_SHOW_SESSION_BRIEFING = "LEETCODE_SHOW_SESSION_BRIEFING"
-    """Daily LeetCode briefing for the popup/newtab."""
+    """Daily LeetCode briefing for the popup/newtab.
+
+    Reserved capability: the adapter advertises this in
+    ``LeetCodeAdapter.capabilities`` but ``InterventionMatrix.select``
+    does not yet emit it. Browser-side handler at
+    ``audit_w2_unhandled_ws_frame.spec.ts`` asserts the silent-drop
+    contract."""
 
     LEETCODE_LOCK_EDITOR = "LEETCODE_LOCK_EDITOR"
-    """Force-focus the LeetCode editor (no other tabs)."""
+    """Force-focus the LeetCode editor (no other tabs).
+
+    Reserved capability — see ``LEETCODE_SHOW_SESSION_BRIEFING``."""
 
     LEETCODE_INTERCEPT_SUBMIT = "LEETCODE_INTERCEPT_SUBMIT"
-    """Intercept the submit button until acknowledgement."""
+    """Intercept the submit button until acknowledgement.
+
+    Reserved capability — see ``LEETCODE_SHOW_SESSION_BRIEFING``."""
 
     LEETCODE_GATE_SOLUTIONS = "LEETCODE_GATE_SOLUTIONS"
-    """Gate the editorial / community-solution tab."""
+    """Gate the editorial / community-solution tab.
+
+    Reserved capability — see ``LEETCODE_SHOW_SESSION_BRIEFING``."""
 
     LEETCODE_AI_RESTATEMENT_CHECK = "LEETCODE_AI_RESTATEMENT_CHECK"
-    """Trigger AI-powered restatement check (paraphrase the problem)."""
+    """Trigger AI-powered restatement check (paraphrase the problem).
+
+    Reserved capability — see ``LEETCODE_SHOW_SESSION_BRIEFING``."""
 
     LEETCODE_AI_COMPREHENSION_CHECK = "LEETCODE_AI_COMPREHENSION_CHECK"
-    """Trigger AI-powered comprehension check (examples / edges)."""
+    """Trigger AI-powered comprehension check (examples / edges).
+
+    Reserved capability — see ``LEETCODE_SHOW_SESSION_BRIEFING``."""
 
     LEETCODE_AI_HYPOTHESIS_CHECK = "LEETCODE_AI_HYPOTHESIS_CHECK"
-    """Trigger AI-powered hypothesis check (approach articulation)."""
+    """Trigger AI-powered hypothesis check (approach articulation).
+
+    Reserved capability — see ``LEETCODE_SHOW_SESSION_BRIEFING``."""
 
     LEETCODE_AI_STUCK_ANALYSIS = "LEETCODE_AI_STUCK_ANALYSIS"
-    """Trigger AI-powered stuck-analysis explanation."""
+    """Trigger AI-powered stuck-analysis explanation.
+
+    Reserved capability — see ``LEETCODE_SHOW_SESSION_BRIEFING``."""
 
     LEETCODE_AI_SESSION_BRIEFING = "LEETCODE_AI_SESSION_BRIEFING"
-    """Trigger AI-powered session-briefing generation."""
+    """Trigger AI-powered session-briefing generation.
+
+    Reserved capability — see ``LEETCODE_SHOW_SESSION_BRIEFING``."""
