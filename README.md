@@ -35,25 +35,19 @@
 
 ## Demo
 
-<!-- TODO(media): replace with real captures. See assets/demo/README.md for capture guidance. -->
-
-<p align="center">
-  <img src="assets/demo/hero.gif" alt="Cortex intervention cycle: detect HYPER → overlay → execute → undo" width="720" />
-</p>
-
 <table>
   <tr>
     <td width="33%" align="center">
-      <img src="assets/demo/dashboard.png" alt="Cortex desktop dashboard showing live biometrics" />
-      <sub><b>Desktop dashboard</b><br/>HR, HRV, blink rate, posture in real time</sub>
+      <img src="assets/demo/dashboard.png" alt="Cortex desktop dashboard showing live biometrics" width="100%" />
+      <sub><b>Desktop dashboard</b><br/>HR, HRV, blink rate, and session stats in real time</sub>
     </td>
     <td width="33%" align="center">
-      <img src="assets/demo/overlay.png" alt="Intervention overlay live on a Chrome tab" />
+      <img src="assets/demo/overlay.png" alt="Intervention overlay live on a Chrome tab" width="100%" />
       <sub><b>Intervention overlay</b><br/>Causal explanation, per-tab recommendations, single-CTA execute, undo</sub>
     </td>
     <td width="33%" align="center">
-      <img src="assets/demo/pulse-room.png" alt="Pulse Room new-tab page pulsing at the user's heart rate" />
-      <sub><b>Pulse Room (new tab)</b><br/>Central orb pulses at your live HR; ambient ECG-style trace</sub>
+      <img src="assets/demo/pulse-room.png" alt="Pulse Room new-tab page pulsing at the user's heart rate" width="100%" />
+      <sub><b>Pulse Room (new tab)</b><br/>Central orb pulses at your live HR; ripple field and ECG-mark motif</sub>
     </td>
   </tr>
 </table>
