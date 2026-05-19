@@ -18,7 +18,6 @@ from __future__ import annotations
 import os
 import sys
 
-
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # Drop any stale PySide6 mocks installed by other test modules.
@@ -47,7 +46,8 @@ def qapp():
 @pytest.fixture()
 def wizard(qapp, monkeypatch):
     """Build an OnboardingWindow without the macOS-only chrome calls."""
-    from cortex.apps.desktop_shell import mac_native, onboarding as onb_mod
+    from cortex.apps.desktop_shell import mac_native
+    from cortex.apps.desktop_shell import onboarding as onb_mod
 
     monkeypatch.setattr(mac_native, "apply_vibrancy", lambda *a, **kw: False)
     monkeypatch.setattr(
@@ -116,7 +116,8 @@ def test_why_copy_is_substantive(wizard):
 def test_continuity_callout_appears_when_iphone_present(qapp, monkeypatch):
     """When AVFoundation lists an iPhone Continuity Camera, the Camera card
     renders the skip callout inline. Without one, the callout is absent."""
-    from cortex.apps.desktop_shell import mac_native, onboarding as onb_mod
+    from cortex.apps.desktop_shell import mac_native
+    from cortex.apps.desktop_shell import onboarding as onb_mod
 
     monkeypatch.setattr(mac_native, "apply_vibrancy", lambda *a, **kw: False)
     monkeypatch.setattr(

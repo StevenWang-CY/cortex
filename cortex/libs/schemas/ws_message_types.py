@@ -40,7 +40,7 @@ from __future__ import annotations
 from enum import Enum
 
 
-class MessageType(str, Enum):
+class MessageType(str, Enum):  # noqa: UP042 — pydantic-to-typescript requires (str, Enum); StrEnum changes JSON output
     """All WS-protocol ``WSMessage.type`` values, daemon ↔ client.
 
     Membership is policy-bounded: this enum names every wire-level

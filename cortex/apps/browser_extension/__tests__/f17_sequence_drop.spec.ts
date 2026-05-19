@@ -22,7 +22,13 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { WSMessage } from "../types/generated/cortex_schemas";
+import type { WSMessage as WSMessageSchema } from "../types/generated/cortex_schemas";
+
+// Mirror background.ts's narrowed shape: payload is always-emitted on the
+// wire even though the JSON Schema marks it optional.
+type WSMessage = Omit<WSMessageSchema, "payload"> & {
+    payload: Record<string, unknown>;
+};
 
 function frame(type: string, seq: number): WSMessage {
     return {

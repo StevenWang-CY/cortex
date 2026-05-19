@@ -27,7 +27,6 @@ from cortex.libs.schemas.intervention import (
 )
 from cortex.services.llm_engine.parser import filter_unsafe_actions
 
-
 # ---------------------------------------------------------------------------
 # Layer 1 — Pydantic validators
 # ---------------------------------------------------------------------------

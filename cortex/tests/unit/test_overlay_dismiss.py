@@ -19,7 +19,6 @@ from __future__ import annotations
 import os
 import sys
 
-
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # Ensure no stale PySide6 mocks remain from other tests in the same session.
@@ -49,7 +48,8 @@ def qapp():
 @pytest.fixture()
 def overlay(qapp, monkeypatch):
     # Stub the macOS-only AppKit calls — offscreen Qt has no real NSWindow.
-    from cortex.apps.desktop_shell import mac_native, overlay as overlay_mod
+    from cortex.apps.desktop_shell import mac_native
+    from cortex.apps.desktop_shell import overlay as overlay_mod
 
     monkeypatch.setattr(mac_native, "apply_vibrancy", lambda *a, **kw: False)
     monkeypatch.setattr(
@@ -117,7 +117,8 @@ def test_widget_destroyed_mid_timer_no_emission(qapp, monkeypatch):
     """Tearing the widget down via closeEvent + deleteLater stops the timer
     and marks the overlay dismissed so the auto-dismiss slot cannot fire
     against a partially-collected Qt object."""
-    from cortex.apps.desktop_shell import mac_native, overlay as overlay_mod
+    from cortex.apps.desktop_shell import mac_native
+    from cortex.apps.desktop_shell import overlay as overlay_mod
 
     monkeypatch.setattr(mac_native, "apply_vibrancy", lambda *a, **kw: False)
     monkeypatch.setattr(

@@ -38,12 +38,10 @@ import pytest
 from cortex.libs.logging.structured import EventType
 from cortex.libs.schemas.intervention import InterventionPlan, UIPlan
 from cortex.services.llm_engine.prompts import (
-    TruncationReport,
     _enforce_token_budget,
     _truncate_section,
     capture_truncation_report,
 )
-
 
 # ---------------------------------------------------------------------------
 # 1. No truncation -> no event, no flag

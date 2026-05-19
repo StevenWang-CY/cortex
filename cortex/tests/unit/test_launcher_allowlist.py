@@ -19,7 +19,6 @@ from cortex.libs.utils.shell_allowlist import DEFAULT_ALLOWLIST, validate_comman
 from cortex.services.launcher.launcher import ProjectLauncher
 from cortex.services.launcher.project_config import ProjectConfig
 
-
 # ---------------------------------------------------------------------------
 # Helper-level cases (the six the audit prompt asks for)
 # ---------------------------------------------------------------------------

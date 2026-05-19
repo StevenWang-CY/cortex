@@ -15,9 +15,6 @@ list). These tests pin that contract.
 from __future__ import annotations
 
 import json
-import os
-
-import pytest
 
 from cortex.libs.schemas.native_messaging import (
     MAX_MESSAGE_BYTES,

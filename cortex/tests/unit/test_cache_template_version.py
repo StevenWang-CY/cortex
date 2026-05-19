@@ -23,7 +23,6 @@ from cortex.services.llm_engine import prompts as prompts_mod
 from cortex.services.llm_engine.cache import LLMCache
 from cortex.services.llm_engine.client import build_fallback_plan
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

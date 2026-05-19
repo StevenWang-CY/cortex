@@ -173,8 +173,10 @@ def test_oscillation_does_not_block_genuine_sustained_overwhelm() -> None:
     t = 0.0
     # Five flips → multiplier active.
     for _ in range(5):
-        p.evaluate(flow, current_time=t); t += 1.0
-        p.evaluate(hyper_short, current_time=t); t += 1.0
+        p.evaluate(flow, current_time=t)
+        t += 1.0
+        p.evaluate(hyper_short, current_time=t)
+        t += 1.0
 
     # Now the user actually sustains HYPER for 90 s (> 20 * 2 = 40).
     sustained = _hyper_estimate(dwell=90.0)
@@ -203,8 +205,10 @@ def test_oscillation_flips_outside_window_are_pruned() -> None:
     # Flip five times around t=0 — way over the cap of 2.
     t = 0.0
     for _ in range(5):
-        p.evaluate(flow, current_time=t); t += 0.5
-        p.evaluate(hyper, current_time=t); t += 0.5
+        p.evaluate(flow, current_time=t)
+        t += 0.5
+        p.evaluate(hyper, current_time=t)
+        t += 0.5
 
     # Wait for the window to pass; all stale flips prune on the
     # next ``_is_oscillating`` call.

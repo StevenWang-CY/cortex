@@ -26,8 +26,6 @@ import subprocess
 import sys
 import textwrap
 
-import pytest
-
 
 def _run_python(snippet: str) -> tuple[int, str, str]:
     """Run a Python snippet in a fresh subprocess. Returns

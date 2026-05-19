@@ -23,8 +23,6 @@ import stat
 import sys
 from pathlib import Path
 
-import pytest
-
 from cortex.libs.auth.local_token import (
     load_or_create_token,
     rotate_token,

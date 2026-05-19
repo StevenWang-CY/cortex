@@ -20,8 +20,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-import pytest
-
 from cortex.libs.config.settings import StorageConfig
 from cortex.services.runtime_daemon import enforce_session_storage_budget
 

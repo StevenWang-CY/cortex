@@ -54,15 +54,6 @@ except ImportError:  # pragma: no cover - lightweight stubs
     QGraphicsOpacityEffect = None  # type: ignore[assignment]
     _ANIMATION_AVAILABLE = False
 
-# Phase J-4: tween constants. Chosen to be "perceptible but never
-# distracting" — the headline scale-in is fast enough to feel
-# responsive (under 300 ms is below the typical user attention
-# threshold) and the causal fade lags by exactly the headline duration
-# so the two animations read as one continuous motion rather than two
-# competing tweens. The Reduce Motion path forces both to 0 ms.
-HEADLINE_SCALE_DURATION_MS: int = 250
-CAUSAL_FADE_DURATION_MS: int = 180
-
 from cortex.apps.desktop_shell import mac_native
 from cortex.apps.desktop_shell.tokens import (
     BRAND_DISPLAY_FONT,
@@ -74,6 +65,7 @@ from cortex.apps.desktop_shell.tokens import (
     HUD_ACCENT,
     RADIUS_BUTTON,
     RADIUS_WINDOW,
+    SP2,
     SP3,
     SP4,
     SP6,
@@ -82,6 +74,15 @@ from cortex.apps.desktop_shell.tokens import (
     TEXT_HUD_SECONDARY,
     TEXT_HUD_TERTIARY,
 )
+
+# Phase J-4: tween constants. Chosen to be "perceptible but never
+# distracting" — the headline scale-in is fast enough to feel
+# responsive (under 300 ms is below the typical user attention
+# threshold) and the causal fade lags by exactly the headline duration
+# so the two animations read as one continuous motion rather than two
+# competing tweens. The Reduce Motion path forces both to 0 ms.
+HEADLINE_SCALE_DURATION_MS: int = 250
+CAUSAL_FADE_DURATION_MS: int = 180
 
 logger = logging.getLogger(__name__)
 

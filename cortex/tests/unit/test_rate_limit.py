@@ -32,7 +32,6 @@ from cortex.services.api_gateway.middleware.rate_limit import (
     RateLimitMiddleware,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------

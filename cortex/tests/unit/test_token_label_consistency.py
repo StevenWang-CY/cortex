@@ -70,9 +70,9 @@ def test_surface_label_tertiary_matches_token(module_name: str) -> None:
     )
 
     module = importlib.import_module(module_name)
-    assert getattr(module, "_LABEL_TERTIARY") == CX_TEXT_TERTIARY, (
+    assert module._LABEL_TERTIARY == CX_TEXT_TERTIARY, (
         f"{module_name}._LABEL_TERTIARY drifted from tokens.CX_TEXT_TERTIARY"
     )
-    assert getattr(module, "_LABEL_SECONDARY") == CX_TEXT_SECONDARY, (
+    assert module._LABEL_SECONDARY == CX_TEXT_SECONDARY, (
         f"{module_name}._LABEL_SECONDARY drifted from tokens.CX_TEXT_SECONDARY"
     )

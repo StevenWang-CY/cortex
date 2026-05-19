@@ -17,7 +17,6 @@ import os
 import sys
 import time
 
-
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # Drop any stale PySide6 mocks installed by other test modules.

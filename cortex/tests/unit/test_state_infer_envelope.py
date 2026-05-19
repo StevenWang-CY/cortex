@@ -43,7 +43,6 @@ from cortex.libs.logging.structured import EventType
 from cortex.services.api_gateway.app import create_app, registry
 from cortex.services.api_gateway.routes import StateInferResponse
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------

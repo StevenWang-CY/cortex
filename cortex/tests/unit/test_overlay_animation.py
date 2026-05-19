@@ -35,7 +35,6 @@ from __future__ import annotations
 import os
 import sys
 
-
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 for _name in list(sys.modules):
@@ -62,7 +61,8 @@ def qapp():
 
 @pytest.fixture()
 def overlay(qapp, monkeypatch):
-    from cortex.apps.desktop_shell import mac_native, overlay as overlay_mod
+    from cortex.apps.desktop_shell import mac_native
+    from cortex.apps.desktop_shell import overlay as overlay_mod
 
     monkeypatch.setattr(mac_native, "apply_vibrancy", lambda *a, **kw: False)
     monkeypatch.setattr(
@@ -113,7 +113,8 @@ def test_reduce_motion_zeroes_both_durations(qapp, monkeypatch):
     the durations recorded in the contract log are 0. The end state is
     applied directly (the test doesn't pin the end-state widget values
     because they are the same as the no-animation pre-fix UI)."""
-    from cortex.apps.desktop_shell import mac_native, overlay as overlay_mod
+    from cortex.apps.desktop_shell import mac_native
+    from cortex.apps.desktop_shell import overlay as overlay_mod
 
     monkeypatch.setattr(mac_native, "apply_vibrancy", lambda *a, **kw: False)
     monkeypatch.setattr(

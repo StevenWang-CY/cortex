@@ -8,6 +8,7 @@
 
 import { describe, expect, it } from "vitest";
 import { synthesizeActions } from "../popup";
+import type { TabRecommendations } from "../types/generated/cortex_schemas";
 
 describe("F52 synthesizeActions dedup", () => {
     it("drops the synthesised action when tab_index is already covered", () => {
@@ -20,7 +21,7 @@ describe("F52 synthesizeActions dedup", () => {
                 label: "Close existing",
             },
         ];
-        const tabRecs = {
+        const tabRecs: TabRecommendations = {
             tabs: [
                 { tab_index: 3, action: "close", tab_title: "Dup tab" },
             ],
@@ -46,7 +47,7 @@ describe("F52 synthesizeActions dedup", () => {
                 label: "Close 1",
             },
         ];
-        const tabRecs = {
+        const tabRecs: TabRecommendations = {
             tabs: [
                 { tab_index: 1, action: "close", tab_title: "Already covered" },
                 { tab_index: 2, action: "close", tab_title: "Uncovered" },
@@ -87,7 +88,7 @@ describe("F52 synthesizeActions dedup", () => {
         const existing = [
             { action_id: "a", action_type: "open_url", category: "recommended" },
         ];
-        const tabRecs = {
+        const tabRecs: TabRecommendations = {
             tabs: [
                 { tab_index: 7, action: "close", tab_title: "X" },
                 { tab_index: 8, action: "close", tab_title: "Y" },

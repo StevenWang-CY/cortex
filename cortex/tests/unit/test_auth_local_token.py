@@ -20,14 +20,12 @@ from pathlib import Path
 import pytest
 
 from cortex.libs.auth.local_token import (
-    auth_token_path,
     load_or_create_token,
     verify_token,
 )
 from cortex.services.api_gateway.websocket_server import (
     WebSocketClient,
     WebSocketServer,
-    WSMessage,
 )
 
 

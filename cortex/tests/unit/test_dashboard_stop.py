@@ -15,7 +15,6 @@ import os
 import sys
 import time
 
-
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # Drop any stale PySide6 mocks installed by other test modules.
@@ -135,7 +134,8 @@ def test_daemon_stopped_reenables(dashboard):
 
 
 def test_tray_quit_disables_during_shutdown(qapp, monkeypatch):
-    from cortex.apps.desktop_shell import mac_native, tray as tray_mod
+    from cortex.apps.desktop_shell import mac_native
+    from cortex.apps.desktop_shell import tray as tray_mod
 
     monkeypatch.setattr(mac_native, "apply_vibrancy", lambda *a, **kw: False)
     monkeypatch.setattr(

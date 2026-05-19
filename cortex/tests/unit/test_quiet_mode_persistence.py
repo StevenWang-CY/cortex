@@ -22,8 +22,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from cortex.libs.config.settings import InterventionConfig
 from cortex.services.state_engine.trigger_policy import (
     QUIET_MODE_HISTORY_VERSION,

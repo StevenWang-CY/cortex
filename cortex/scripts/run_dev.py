@@ -17,7 +17,6 @@ import asyncio
 import logging
 import multiprocessing
 import signal
-import sys
 import time
 from typing import Any
 

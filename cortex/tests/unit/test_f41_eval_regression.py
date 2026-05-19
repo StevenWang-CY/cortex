@@ -12,10 +12,7 @@ so even importing the symbol under test raises ``ModuleNotFoundError``.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-
-import pytest
 
 from cortex.libs.utils.atomic_write import atomic_write_json
 from cortex.services.eval.regression_harness import (
@@ -35,7 +32,6 @@ from cortex.services.eval.regression_harness import (
     run_harness,
     save_baseline,
 )
-
 
 # ---------------------------------------------------------------------------
 # Determinism

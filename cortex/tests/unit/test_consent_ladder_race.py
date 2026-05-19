@@ -22,18 +22,15 @@ Each case fails on ``main`` (``36cc15f``):
 from __future__ import annotations
 
 import asyncio
-import copy
 
 import pytest
 
 from cortex.services.consent.ladder import (
     REVERSIBLE_ACT,
     SUGGEST,
-    AUTONOMOUS_ACT,
     ConsentLadder,
 )
 from cortex.services.consent.policy import ConsentPolicy
-
 
 # ---------------------------------------------------------------------------
 # Case 1: concurrent read + write produce no torn read

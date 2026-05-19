@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Tuple
 
 import pytest
 
@@ -83,14 +82,14 @@ def qapp() -> QApplication:
 # --- contrast helpers --------------------------------------------------------
 
 
-def _hex_to_rgb(hex_code: str) -> Tuple[int, int, int]:
+def _hex_to_rgb(hex_code: str) -> tuple[int, int, int]:
     hex_code = hex_code.lstrip("#")
     if len(hex_code) == 3:
         hex_code = "".join(c * 2 for c in hex_code)
     return tuple(int(hex_code[i : i + 2], 16) for i in (0, 2, 4))  # type: ignore[return-value]
 
 
-def _relative_luminance(rgb: Tuple[int, int, int]) -> float:
+def _relative_luminance(rgb: tuple[int, int, int]) -> float:
     def _channel(c: int) -> float:
         s = c / 255.0
         return s / 12.92 if s <= 0.03928 else ((s + 0.055) / 1.055) ** 2.4

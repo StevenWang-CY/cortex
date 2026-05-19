@@ -14,7 +14,6 @@ import asyncio
 import os
 import sys
 
-
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 for _name in list(sys.modules):
@@ -41,7 +40,8 @@ def qapp():
 
 @pytest.fixture()
 def dialog(qapp, monkeypatch):
-    from cortex.apps.desktop_shell import mac_native, settings as settings_mod
+    from cortex.apps.desktop_shell import mac_native
+    from cortex.apps.desktop_shell import settings as settings_mod
 
     monkeypatch.setattr(mac_native, "apply_vibrancy", lambda *a, **kw: False)
     monkeypatch.setattr(
