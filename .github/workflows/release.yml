@@ -97,7 +97,7 @@ jobs:
           echo "Built: $DMG ($(du -h "$DMG" | awk '{print $1}'))"
 
       - name: Upload DMG artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cortex-dmg
           path: ${{ steps.locate.outputs.dmg-path }}
