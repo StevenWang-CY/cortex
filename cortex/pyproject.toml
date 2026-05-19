@@ -70,7 +70,7 @@ dependencies = [
     # Anthropic SDK — production LLM path (AWS Bedrock primary,
     # direct Anthropic / Vertex as escape hatches behind the same
     # interface, per ADR-0004-style provider routing).
-    "anthropic[bedrock,vertex]>=0.39.0",
+    "anthropic[bedrock,vertex]>=0.102.0",
     "boto3>=1.34.0",
 
     # ML Inference
