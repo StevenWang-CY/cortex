@@ -34,7 +34,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -62,7 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: "pip"
@@ -102,7 +102,7 @@ jobs:
       - name: Skip if no relevant changes
         if: github.event_name == 'pull_request' && steps.filter.outputs.eval != 'true'
         run: echo "No eval-relevant changes; skipping regression harness."
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         if: github.event_name == 'push' || steps.filter.outputs.eval == 'true'
         with:
           python-version: "3.11"
