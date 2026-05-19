@@ -252,6 +252,21 @@ class CortexAppController:
         # actually uses the real LLM instead of the rule-based fallback.
         if hasattr(self._onboarding, "byok_token_saved"):
             self._onboarding.byok_token_saved.connect(self._reload_llm_credentials)
+        # Audit-prod fix (P1-2 + P1-3): wire the previously-orphan
+        # Settings signals. ``settings_save_failed`` surfaces save
+        # errors in the dashboard toast; ``auth_token_rotated`` tells
+        # the in-process daemon to re-read the token file (the
+        # in-process WS server reads ``load_or_create_token`` once at
+        # startup; without this hook a rotation appears successful but
+        # the next session still tries the old token).
+        if hasattr(self._settings, "settings_save_failed"):
+            self._settings.settings_save_failed.connect(
+                self._on_settings_save_failed
+            )
+        if hasattr(self._settings, "auth_token_rotated"):
+            self._settings.auth_token_rotated.connect(
+                self._on_auth_token_rotated
+            )
         # E.1 (DMG-path completion): dashboard Stop button and goal input.
         # The bundled controller never owns a WebSocket — its `stop` path is
         # to schedule the in-process daemon's `stop()` coroutine on the
@@ -498,7 +513,24 @@ class CortexAppController:
         except Exception:
             logger.debug("Native action execution failed", exc_info=True)
 
-        # Always record the engagement on the daemon side so the dismissal
+        # Audit-prod fix: dispatch FIRST so the daemon's liveness check
+        # (intervention_id == _active_intervention_id) succeeds. The
+        # engagement record below calls ``_restore_manager.engage`` which
+        # clears ``_active_intervention_id``; running it before dispatch
+        # would cause every legitimate browser-action click to be
+        # rejected as "stale intervention_id".
+        if not executed_natively:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._daemon.dispatch_action_to_browser(
+                        intervention_id, dict(action),
+                    ),
+                    self._daemon_loop,
+                )
+            except Exception:
+                logger.debug("dispatch_action_to_browser failed", exc_info=True)
+
+        # Record the engagement on the daemon side so the dismissal
         # model + restore manager see the user's intent.
         engage_payload = {
             "action": "engaged",
@@ -511,20 +543,6 @@ class CortexAppController:
             )
         except Exception:
             logger.debug("Engaged USER_ACTION submission failed", exc_info=True)
-
-        # For browser-bound actions, dispatch to the connected extension
-        # so the action actually executes. The daemon-side method is a
-        # no-op if no chrome/edge client is connected.
-        if not executed_natively:
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    self._daemon.dispatch_action_to_browser(
-                        intervention_id, dict(action),
-                    ),
-                    self._daemon_loop,
-                )
-            except Exception:
-                logger.debug("dispatch_action_to_browser failed", exc_info=True)
 
         # Record an action_executed entry so the recorder includes the
         # desktop-originated click in the session log.
@@ -762,6 +780,39 @@ class CortexAppController:
             self._daemon_loop.call_soon_threadsafe(_do_reload)
         except Exception:
             logger.debug("Failed to schedule reload_credentials", exc_info=True)
+
+    def _on_settings_save_failed(self, reason: str) -> None:
+        """Audit-prod fix (P1-2): surface a failed settings save in the
+        dashboard toast so the user sees that their change did not stick.
+        """
+        if self._dashboard is None or not hasattr(self._dashboard, "show_error"):
+            logger.warning("Settings save failed but no dashboard for toast: %s", reason)
+            return
+        try:
+            self._dashboard.show_error(
+                "Settings save failed",
+                str(reason or "Unknown error — see daemon log."),
+                "",
+            )
+        except Exception:
+            logger.debug("show_error for settings_save_failed raised", exc_info=True)
+
+    def _on_auth_token_rotated(self, new_token: str) -> None:
+        """Audit-prod fix (P1-3): in-process daemon already reads the
+        token from disk on every IDENTIFY callback path; a rotation
+        therefore takes effect on the next reconnect. We surface a
+        confirmation toast so the user sees that the rotation succeeded.
+        """
+        if self._dashboard is not None and hasattr(
+            self._dashboard, "show_info_toast"
+        ):
+            try:
+                self._dashboard.show_info_toast(
+                    "Authentication token rotated",
+                    "Cortex will use the new token on next reconnect.",
+                )
+            except Exception:
+                logger.debug("show_info_toast for auth_token_rotated raised", exc_info=True)
 
     def _show_byok_success_toast(self) -> None:
         if self._dashboard is None or not hasattr(self._dashboard, "show_info_toast"):

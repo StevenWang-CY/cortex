@@ -230,6 +230,38 @@ class InterventionRestoreResponse(BaseModel):
 _start_time: float = time.monotonic()
 
 
+# Audit-prod fix (P2-E): memoize the daemon version lookup so /health
+# doesn't pay an ``importlib.metadata`` round-trip on every probe.
+# Resolved exactly once at first /health call; ``None`` is a valid
+# cached value (means: version not discoverable in this environment).
+_DAEMON_VERSION_CACHE: tuple[bool, str | None] = (False, None)
+
+
+def _resolve_daemon_version() -> str | None:
+    global _DAEMON_VERSION_CACHE
+    resolved, cached = _DAEMON_VERSION_CACHE
+    if resolved:
+        return cached
+    version: str | None = None
+    try:
+        from importlib.metadata import PackageNotFoundError
+        from importlib.metadata import version as _pkg_version
+
+        try:
+            version = _pkg_version("cortex")
+        except PackageNotFoundError:
+            try:
+                from cortex import __version__ as _v
+
+                version = _v
+            except (ImportError, AttributeError):
+                version = None
+    except (ImportError, AttributeError):
+        version = None
+    _DAEMON_VERSION_CACHE = (True, version)
+    return version
+
+
 def _get_registry(request: Request) -> Any:
     """Get the service registry from app state."""
     return request.app.state.registry
@@ -279,32 +311,11 @@ async def health_check(request: Request) -> HealthResponse:
 
     overall = "healthy" if reg.healthy else "unhealthy"
 
-    # G2 (audit-prod): include the daemon version so the browser
-    # extension's connectivity diagnostic can flag a version mismatch
-    # (popup currently has a UI state for ``installed_version_mismatch``
-    # but no producer until now).
-    daemon_version: str | None
-    try:
-        from importlib.metadata import PackageNotFoundError
-        from importlib.metadata import version as _pkg_version
-
-        try:
-            daemon_version = _pkg_version("cortex")
-        except PackageNotFoundError:
-            try:
-                from cortex import __version__ as _v
-
-                daemon_version = _v
-            except Exception:
-                daemon_version = None
-    except Exception:
-        daemon_version = None
-
     return HealthResponse(
         status=overall,
         services=services,
         uptime_seconds=time.monotonic() - _start_time,
-        version=daemon_version,
+        version=_resolve_daemon_version(),
     )
 
 
@@ -829,17 +840,53 @@ class LaunchProjectResponse(BaseModel):
 
 @router.post("/api/launch/{project_name}", response_model=LaunchProjectResponse)
 async def launch_project(project_name: str, request: Request) -> LaunchProjectResponse:
-    """Launch a project workspace configuration."""
+    """Launch a project workspace configuration.
+
+    Audit-prod fix (P1-C + P1-E): wrap the launch in a 20 s timeout so
+    a wedged AppleScript / subprocess can't tie up a uvicorn worker
+    indefinitely. Exception messages are mapped to sanitised categories
+    rather than echoed verbatim — the raw text used to leak internal
+    paths from osascript / subprocess errors back to the caller.
+    """
+    import asyncio as _asyncio
+
     reg = _get_registry(request)
     launcher = reg.get("project_launcher")
-    if launcher is not None and hasattr(launcher, "launch"):
-        try:
-            await launcher.launch(project_name)
-            return LaunchProjectResponse(launched=True, project_name=project_name)
-        except Exception as e:
-            return LaunchProjectResponse(
-                launched=False,
-                project_name=project_name,
-                errors=[str(e)],
-            )
-    return LaunchProjectResponse(errors=["No project launcher available"])
+    if launcher is None or not hasattr(launcher, "launch"):
+        return LaunchProjectResponse(
+            launched=False,
+            project_name=project_name,
+            errors=["No project launcher available"],
+        )
+    try:
+        await _asyncio.wait_for(launcher.launch(project_name), timeout=20.0)
+        return LaunchProjectResponse(launched=True, project_name=project_name)
+    except TimeoutError:
+        logger.warning("Project launch timed out: %s", project_name)
+        return LaunchProjectResponse(
+            launched=False,
+            project_name=project_name,
+            errors=["launch_timeout"],
+        )
+    except FileNotFoundError:
+        return LaunchProjectResponse(
+            launched=False,
+            project_name=project_name,
+            errors=["project_not_found"],
+        )
+    except PermissionError:
+        return LaunchProjectResponse(
+            launched=False,
+            project_name=project_name,
+            errors=["permission_denied"],
+        )
+    except Exception:
+        logger.exception("Project launch failed: %s", project_name)
+        # Map every unexpected error to a generic category — the raw
+        # exception text frequently contains absolute paths from
+        # osascript / subprocess that we should not leak to callers.
+        return LaunchProjectResponse(
+            launched=False,
+            project_name=project_name,
+            errors=["launch_failed"],
+        )

@@ -99,15 +99,12 @@ class Toast(QFrame):
         self._current_cid: str = ""
 
         self.setObjectName("CortexToast")
-        # Scope the stylesheet to the objectName so the warm-amber error
-        # background doesn't bleed onto child QLabels.
-        self.setStyleSheet(
-            "QFrame#CortexToast {"
-            "  background: rgba(217, 119, 87, 0.10);"
-            "  border: 0.5px solid rgba(217, 119, 87, 0.45);"
-            f"  border-radius: {RADIUS_CARD}px;"
-            "}"
-        )
+        # Audit-prod fix (P1-1): keep style construction in helpers so
+        # ``show_error`` / ``show_info`` can swap the palette per
+        # invocation. The constructor applies the error palette (the
+        # historical default) so existing call sites unchanged still
+        # render correctly.
+        self._apply_palette("error")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         # Toasts are an interactive surface; keyboard users can tab to
         # the close button. The container itself should not steal focus.
@@ -226,6 +223,14 @@ class Toast(QFrame):
         never invents a cid.
         """
         self._current_cid = cid or ""
+        # Audit-prod fix (P1-1): reset palette + accessible name so a
+        # show_info → show_error transition (e.g. token saved, then
+        # daemon errored) renders the error styling, not stale info.
+        self._apply_palette("error")
+        try:
+            set_accessible_name(self._title_label, "Error title")
+        except Exception:
+            pass
         self._title_label.setText(title or "Error")
         self._body_label.setText(body or "")
         self._cid_label.setText(self._current_cid)
@@ -246,19 +251,47 @@ class Toast(QFrame):
         """B2 (audit-prod): info-toast variant for success / status
         messages (e.g. "Cortex is now using your LLM" after BYOK reload).
 
-        Reuses the same slots as ``show_error`` — only the title/body
-        copy and the absence of a cid distinguish the two. The toast
-        component itself is style-neutral; callers decide the message
-        tone via the title text.
+        Audit-prod fix (P1-1): swap the palette to a calm info tone so
+        users (and screen readers) can tell success apart from error.
         """
         self._current_cid = ""
+        self._apply_palette("info")
         self._title_label.setText(title or "")
         self._body_label.setText(body or "")
         self._cid_label.setText("")
+        # Override the accessible name so VoiceOver announces "Notification"
+        # rather than the constructor-set "Error title".
+        try:
+            set_accessible_name(self._title_label, "Notification title")
+        except Exception:
+            pass
         self._timer.start(self._duration_ms)
         self.show()
         self.raise_()
         logger.info("Toast surfaced (info): %s — %s", title, body)
+
+    def _apply_palette(self, mode: str) -> None:
+        """Swap the QFrame background + border to match the toast's
+        current semantic (error / info). ``mode`` is the literal string
+        ``"error"`` or ``"info"``; unknown modes fall back to error so
+        we never silently lose the warning visual.
+        """
+        if mode == "info":
+            # Calm info tone: brand-accent terracotta at low saturation —
+            # distinct from the error amber so success doesn't read as
+            # warning to a quick glance.
+            bg = "rgba(96, 154, 116, 0.12)"
+            border = "rgba(96, 154, 116, 0.50)"
+        else:
+            bg = "rgba(217, 119, 87, 0.10)"
+            border = "rgba(217, 119, 87, 0.45)"
+        self.setStyleSheet(
+            "QFrame#CortexToast {"
+            f"  background: {bg};"
+            f"  border: 0.5px solid {border};"
+            f"  border-radius: {RADIUS_CARD}px;"
+            "}"
+        )
 
     @property
     def current_cid(self) -> str:

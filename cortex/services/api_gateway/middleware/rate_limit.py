@@ -51,6 +51,14 @@ DEFAULT_LIMITS: dict[str, int] = {
     "/llm/plan": 30,
     "/apply_intervention": 30,
     "/intervention/apply": 30,  # canonical FastAPI path in this repo
+    # Audit-prod fix (P2-B): add caps for mutating routes that previously
+    # had none. ``/api/launch`` spawns subprocesses + AppleScript;
+    # ``/consent/reset`` clears the user's consent ladder; restore is
+    # invoked once per intervention engagement and rarely bursts above
+    # 30/min in legitimate use.
+    "/api/launch": 10,
+    "/consent/reset": 5,
+    "/intervention/restore": 30,
     "/shutdown": 5,
 }
 

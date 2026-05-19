@@ -465,6 +465,14 @@ class CortexApp:
         # toast on the dashboard.
         if hasattr(self._onboarding, "byok_token_saved"):
             self._onboarding.byok_token_saved.connect(self._on_byok_token_saved)
+        # Audit-prod fix (P1-2): wire the previously-orphan
+        # ``settings_save_failed`` Signal so the dashboard surfaces save
+        # errors. ``auth_token_rotated`` is already wired below to
+        # refresh the bridge.
+        if hasattr(self._settings, "settings_save_failed"):
+            self._settings.settings_save_failed.connect(
+                self._on_settings_save_failed
+            )
         # E.5: step-4 "Open Connections" button.
         if hasattr(self._onboarding, "extensions_requested"):
             self._onboarding.extensions_requested.connect(self._show_connections)
@@ -546,6 +554,18 @@ class CortexApp:
         if self._bridge is not None:
             self._bridge.send_user_action("dismissed", intervention_id)
 
+    def _on_settings_save_failed(self, reason: str) -> None:
+        """Audit-prod fix (P1-2): surface failed save in the dashboard."""
+        if self._dashboard is not None and hasattr(self._dashboard, "show_error"):
+            try:
+                self._dashboard.show_error(
+                    "Settings save failed",
+                    str(reason or "Unknown error — see daemon log."),
+                    "",
+                )
+            except Exception:
+                logger.debug("show_error failed", exc_info=True)
+
     def _on_byok_token_saved(self) -> None:
         """B2 (audit-prod): user saved a BYOK token; ask daemon to reload
         AND surface the success toast so the user knows the new token is
@@ -595,14 +615,19 @@ class CortexApp:
         elif action_type == "start_timer":
             executed_natively = True
 
-        # Always record engagement on the daemon (engaged USER_ACTION).
-        self._bridge.send_user_action("engaged", intervention_id)
-        # Send the ACTION_EXECUTE log + dispatch request.
+        # Audit-prod fix: ACTION_EXECUTE (with request_dispatch) must
+        # arrive at the daemon BEFORE the engaged USER_ACTION. The
+        # daemon's engage handler clears ``_active_intervention_id`` to
+        # None as part of recording the outcome; ``dispatch_action_to_browser``
+        # gates on that id being live, so the prior order silently
+        # rejected every legitimate browser-action click.
         self._bridge.send_action_execute(
             intervention_id,
             dict(action),
             request_dispatch=not executed_natively,
         )
+        # Then record engagement on the daemon (engaged USER_ACTION).
+        self._bridge.send_user_action("engaged", intervention_id)
 
     @Slot(dict)
     def _on_settings_changed(self, settings: dict) -> None:

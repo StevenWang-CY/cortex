@@ -472,8 +472,24 @@ class WebSocketServer:
             # Route user ratings through the same callback used for user actions.
             await self._handle_user_action(client, msg)
         elif msg.type == MessageType.IDENTIFY.value:
-            # Client identifying its type
-            client.client_type = msg.payload.get("client_type", "unknown")
+            # Client identifying its type. Audit-prod fix (P1-A): validate
+            # against an explicit allowlist. The catalog of legitimate
+            # client types is small and stable; an unknown literal becomes
+            # ``"unknown"`` so it is filtered from ``connected_client_types``
+            # and never reaches the dashboard's dot map.
+            _ALLOWED_CLIENT_TYPES = frozenset({
+                "chrome", "edge", "vscode", "desktop",
+            })
+            requested = msg.payload.get("client_type")
+            if isinstance(requested, str) and requested in _ALLOWED_CLIENT_TYPES:
+                client.client_type = requested
+            else:
+                logger.warning(
+                    "IDENTIFY: rejecting unknown client_type=%r from %s",
+                    requested,
+                    client.client_id,
+                )
+                client.client_type = "unknown"
             logger.info(
                 f"Client {client.client_id} identified as {client.client_type}"
             )
@@ -646,10 +662,22 @@ class WebSocketServer:
 
         if self._user_action_callback is not None:
             try:
+                # Audit-prod fix (P1-B confused-deputy): stamp the
+                # ``source_client_type`` onto the payload before invoking
+                # the callback. The daemon's request-dispatch branch
+                # (runtime_daemon._handle_user_action) reads this field
+                # and rejects ACTION_DISPATCH requests from anyone other
+                # than the desktop shell — otherwise a compromised
+                # extension could trigger arbitrary action execution on
+                # peer browser clients via the daemon broadcast bus.
+                # Underscore prefix marks it as wire-implementation, not
+                # user data.
+                payload_with_source = dict(msg.payload or {})
+                payload_with_source["_source_client_type"] = client.client_type
                 if asyncio.iscoroutinefunction(self._user_action_callback):
-                    await self._user_action_callback(msg.payload)
+                    await self._user_action_callback(payload_with_source)
                 else:
-                    self._user_action_callback(msg.payload)
+                    self._user_action_callback(payload_with_source)
             except Exception as e:
                 logger.error(f"User action callback error: {e}")
 
@@ -1225,6 +1253,12 @@ class WebSocketServer:
             payload["error_analysis"] = plan.error_analysis.model_dump()
         if plan.tab_recommendations is not None:
             payload["tab_recommendations"] = plan.tab_recommendations.model_dump()
+        # Audit-prod fix (G4 P0): mirror the dashboard's connected-clients
+        # snapshot onto the intervention trigger so the WS-mode overlay's
+        # action buttons gate on the same authoritative list the
+        # STATE_UPDATE flow uses. Without this the WS-mode overlay always
+        # renders browser-bound actions disabled.
+        payload["connected_clients"] = self.connected_client_types()
         # Audit-2 fix: ship plan.metadata so the F27 fallback hint, F20
         # budget-killed flag, and F29 truncation telemetry reach the
         # overlay. Prior to this fix the WS broadcast omitted the field

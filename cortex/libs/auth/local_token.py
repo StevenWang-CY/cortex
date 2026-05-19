@@ -121,18 +121,42 @@ def rotate_token(path: Path | None = None) -> str:
     return token
 
 
+def load_token_or_none(path: Path | None = None) -> str | None:
+    """Read the existing token if present; never mint a new one.
+
+    Audit-prod fix (P1-D): ``verify_token`` previously called
+    ``load_or_create_token`` to fetch the comparand, which provisioned
+    a fresh token to disk whenever the file was absent. A peer probing
+    a daemon mid-rotation (or before first start) could trigger token
+    creation. Verification must be side-effect-free; provisioning is
+    the daemon ``start()`` path's job.
+    """
+    target = path or auth_token_path()
+    try:
+        if not target.exists():
+            return None
+        existing = target.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not existing or len(existing) < 32:
+        return None
+    return existing
+
+
 def verify_token(presented: str | None, *, path: Path | None = None) -> bool:
     """Constant-time compare of ``presented`` against the stored token.
 
     Returns ``False`` for any of: a missing/empty presented value, a
     missing/unreadable token file, or a mismatch. Never raises — auth
     failure must be observable but not exploitable as a probe.
+
+    Audit-prod fix (P1-D): pure read; no token is created on miss. Use
+    :func:`load_or_create_token` only from the daemon boot path.
     """
     if not presented:
         return False
-    try:
-        stored = load_or_create_token(path)
-    except Exception:
+    stored = load_token_or_none(path)
+    if stored is None:
         return False
     try:
         return secrets.compare_digest(stored.strip(), presented.strip())

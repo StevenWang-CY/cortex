@@ -1007,8 +1007,13 @@ class OverlayWindow(QWidget):
         self._dismissed = True
         self._pacer.stop()
         self.hide()
-        self.dismissed.emit(self._intervention_id)
-        logger.info(f"Intervention {self._intervention_id} dismissed by user")
+        dismissed_id = self._intervention_id
+        self.dismissed.emit(dismissed_id)
+        # Audit-prod fix (P2): clear ``_intervention_id`` so a stale
+        # button click after dismiss (Qt repaint tail, animation queue)
+        # cannot emit ``action_invoked`` with the dismissed id.
+        self._intervention_id = ""
+        logger.info(f"Intervention {dismissed_id} dismissed by user")
 
     def _auto_dismiss(self) -> None:
         # F06: idempotent dismiss. First caller wins; subsequent calls no-op.
@@ -1018,10 +1023,10 @@ class OverlayWindow(QWidget):
         self._dismissed = True
         self._pacer.stop()
         self.hide()
-        self.dismissed.emit(self._intervention_id)
-        logger.info(
-            f"Intervention {self._intervention_id} auto-dismissed (timeout)"
-        )
+        dismissed_id = self._intervention_id
+        self.dismissed.emit(dismissed_id)
+        self._intervention_id = ""
+        logger.info(f"Intervention {dismissed_id} auto-dismissed (timeout)")
 
     def closeEvent(self, event: object) -> None:  # noqa: D401 - Qt override
         # F06: ensure the timeout timer never fires after the window closes.

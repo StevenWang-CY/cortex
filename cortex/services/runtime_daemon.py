@@ -1765,6 +1765,20 @@ class CortexDaemon:
                 self._intervention_callback_seq += 1
                 _payload = copy.deepcopy(plan.model_dump(mode="json"))
                 _payload["_seq"] = self._intervention_callback_seq
+                # Audit-prod fix (G4 P0): the overlay's action-buttons gate
+                # browser-bound actions on ``payload.connected_clients``;
+                # without this field every browser button renders disabled
+                # in DMG ``--in-process`` mode. STATE_UPDATE already carries
+                # it; we mirror onto the intervention payload so the
+                # overlay sees the same authoritative truth.
+                try:
+                    _payload["connected_clients"] = (
+                        self._ws_server.connected_client_types()
+                        if hasattr(self._ws_server, "connected_client_types")
+                        else []
+                    )
+                except Exception:
+                    _payload["connected_clients"] = []
                 self._intervention_callback(_payload)
         except TimeoutError:
             logger.warning("Intervention LLM call timed out")
@@ -1867,37 +1881,106 @@ class CortexDaemon:
         """G4 (audit-prod): forward a desktop-overlay action click to the
         browser extension(s) so they actually execute it. Returns the
         count of clients the dispatch reached (0 = no browser client
-        connected).
+        connected, or validation failed).
+
+        Audit-prod fix: validate ``intervention_id`` against the active
+        plan so a stale overlay click (timer race against dismiss) is
+        not forwarded; validate ``action`` against the SuggestedAction
+        Pydantic schema so a malformed action_type / missing action_id
+        is rejected at the daemon boundary instead of confusing the
+        extension's switch-default.
         """
         if not intervention_id or not isinstance(action, dict):
             return 0
+        # Reject stale interventions. ``__pending__`` is the sentinel
+        # used while the LLM call is in flight; once a real id is set
+        # we honour exactly that id and no other.
+        active = self._active_intervention_id
+        if (
+            active is None
+            or active == "__pending__"
+            or active != intervention_id
+        ):
+            logger.warning(
+                "ACTION_DISPATCH dropped: stale intervention_id "
+                "(requested=%s active=%s)",
+                intervention_id,
+                active,
+            )
+            return 0
+        # Validate the action shape against the Pydantic source of truth.
+        # SuggestedAction's validators enforce the action_type Literal,
+        # url scheme allowlist, tab_index bounds, etc.
         try:
-            return await self._ws_server.send_message(
+            from cortex.libs.schemas.intervention import SuggestedAction
+
+            validated = SuggestedAction.model_validate(action).model_dump()
+        except Exception as exc:
+            logger.warning(
+                "ACTION_DISPATCH dropped: action failed validation (%s)",
+                exc,
+            )
+            return 0
+        try:
+            sent = await self._ws_server.send_message(
                 MessageType.ACTION_DISPATCH.value,
-                {"intervention_id": intervention_id, "action": action},
+                {"intervention_id": intervention_id, "action": validated},
                 target_client_types=["chrome", "edge"],
             )
         except Exception:
             logger.exception("ACTION_DISPATCH send failed")
             return 0
+        if sent == 0:
+            logger.info(
+                "ACTION_DISPATCH dropped: no chrome/edge client connected "
+                "(intervention_id=%s action_id=%s)",
+                intervention_id,
+                validated.get("action_id"),
+            )
+        return sent
 
     async def _handle_user_action(self, payload: dict[str, Any]) -> None:
         # Log suggested action executions from the Chrome extension
         if payload.get("action_id") and payload.get("action_type"):
-            self._recorder.append("action_executed", {
-                "intervention_id": payload.get("intervention_id"),
-                "action_id": payload.get("action_id"),
-                "action_type": payload.get("action_type"),
-                "result": payload.get("result"),
-            })
+            source_client = str(payload.get("_source_client_type") or "")
+            # Audit-prod fix (P1-B confused-deputy + P2 double-log):
+            # The ACTION_EXECUTE log flows on TWO paths:
+            #   (a) extension → daemon, AFTER executeAction ran. ``result``
+            #       is populated. This is the canonical "what happened"
+            #       log entry — record it.
+            #   (b) desktop shell → daemon, with ``request_dispatch=True``
+            #       and ``result=None``. This is a REQUEST to dispatch;
+            #       the daemon-side log is redundant because the
+            #       in-process controller already wrote the "engaged"
+            #       record. Skip the duplicate log.
+            # The post-dispatch ACK from the extension (with ``source``
+            # set to ``desktop_overlay_dispatch``) still records because
+            # it carries the actual ``result``.
+            is_dispatch_request = (
+                payload.get("result") is None
+                and payload.get("request_dispatch") is True
+            )
+            if not is_dispatch_request:
+                self._recorder.append("action_executed", {
+                    "intervention_id": payload.get("intervention_id"),
+                    "action_id": payload.get("action_id"),
+                    "action_type": payload.get("action_type"),
+                    "result": payload.get("result"),
+                    "source": payload.get("source") or source_client or None,
+                })
             # G4 (audit-prod): when the request originates from the
             # desktop shell (no ``result`` field; the result only exists
             # on the executed-by-extension reply path), forward to the
             # browser so the action actually runs.
-            if (
-                payload.get("result") is None
-                and payload.get("request_dispatch") is True
-            ):
+            #
+            # P1-B fix: only honour ``request_dispatch`` when the source
+            # is the desktop shell. Otherwise a compromised browser
+            # extension could trigger arbitrary action execution on
+            # peer browser clients via the daemon's broadcast bus.
+            # An empty source string (legacy in-process callback path
+            # that bypasses the WS server) is also honoured because no
+            # peer client could have produced it.
+            if is_dispatch_request and source_client in ("", "desktop"):
                 action = payload.get("action") if isinstance(payload.get("action"), dict) else {
                     "action_id": payload.get("action_id"),
                     "action_type": payload.get("action_type"),
@@ -1909,6 +1992,13 @@ class CortexDaemon:
                 await self.dispatch_action_to_browser(
                     str(payload.get("intervention_id") or ""),
                     action,
+                )
+            elif is_dispatch_request:
+                logger.warning(
+                    "ACTION_DISPATCH refused: non-desktop source %r tried "
+                    "to forward action_id=%s",
+                    source_client,
+                    payload.get("action_id"),
                 )
             return
 
