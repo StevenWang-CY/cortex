@@ -77,7 +77,7 @@ dependencies = [
     "onnxruntime>=1.17.0",
 
     # macOS-specific (optional)
-    "pyobjc-framework-AVFoundation>=10.1; sys_platform == 'darwin'",
+    "pyobjc-framework-AVFoundation>=12.1; sys_platform == 'darwin'",
     "pyobjc-framework-Cocoa>=10.1; sys_platform == 'darwin'",
     "pyobjc-framework-Quartz>=10.1; sys_platform == 'darwin'",
     "pyobjc-framework-CoreAudio>=10.1; sys_platform == 'darwin'",
