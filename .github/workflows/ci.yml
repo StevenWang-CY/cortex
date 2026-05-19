@@ -31,15 +31,15 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
       - name: Set up Node (for json2ts)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "20"
 
@@ -64,8 +64,8 @@ jobs:
     # gate reflects what local ``make ci`` produces.
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: "pip"
@@ -98,12 +98,12 @@ jobs:
     # always evaluated to false and the job only ran on push. The new
     # ``dorny/paths-filter`` action correctly inspects the diff.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - name: Path filter
         id: filter
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@v4
         with:
           filters: |
             eval:
@@ -114,7 +114,7 @@ jobs:
       - name: Skip if no relevant changes
         if: github.event_name == 'pull_request' && steps.filter.outputs.eval != 'true'
         run: echo "No eval-relevant changes; skipping regression harness."
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         if: github.event_name == 'push' || steps.filter.outputs.eval == 'true'
         with:
           python-version: "3.11"
@@ -139,11 +139,11 @@ jobs:
       run:
         working-directory: cortex/apps/browser_extension
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
         with:
           version: 9
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "22"
           cache: "pnpm"
