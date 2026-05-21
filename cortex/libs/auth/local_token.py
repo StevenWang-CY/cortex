@@ -143,6 +143,9 @@ def load_token_or_none(path: Path | None = None) -> str | None:
     return existing
 
 
+_DUMMY_TOKEN = "0" * (_TOKEN_BYTES * 2)
+
+
 def verify_token(presented: str | None, *, path: Path | None = None) -> bool:
     """Constant-time compare of ``presented`` against the stored token.
 
@@ -152,11 +155,23 @@ def verify_token(presented: str | None, *, path: Path | None = None) -> bool:
 
     Audit-prod fix (P1-D): pure read; no token is created on miss. Use
     :func:`load_or_create_token` only from the daemon boot path.
+
+    Constant-time-on-miss: when the token file is absent we still
+    invoke ``compare_digest`` against a dummy comparand so the
+    "no token file" path takes the same wall-clock time as the "wrong
+    token" path. Distinguishing the two via response timing would let
+    a peer probe daemon lifecycle (pre-first-start vs running) without
+    presenting valid credentials.
     """
     if not presented:
+        # Equalise the cost of the empty-presented branch with the
+        # populated-presented branch so a peer cannot distinguish
+        # "client sent nothing" from "client sent wrong" via timing.
+        secrets.compare_digest(_DUMMY_TOKEN, _DUMMY_TOKEN)
         return False
     stored = load_token_or_none(path)
     if stored is None:
+        secrets.compare_digest(_DUMMY_TOKEN, presented.strip())
         return False
     try:
         return secrets.compare_digest(stored.strip(), presented.strip())

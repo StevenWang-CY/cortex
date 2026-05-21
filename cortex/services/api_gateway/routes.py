@@ -234,6 +234,15 @@ _start_time: float = time.monotonic()
 # doesn't pay an ``importlib.metadata`` round-trip on every probe.
 # Resolved exactly once at first /health call; ``None`` is a valid
 # cached value (means: version not discoverable in this environment).
+#
+# Concurrency: writes to ``_DAEMON_VERSION_CACHE`` are not lock-guarded.
+# Two concurrent first-callers may both compute the same value; this is
+# tolerated because ``importlib.metadata.version`` is idempotent and the
+# tuple replacement at the bottom of ``_resolve_daemon_version`` is a
+# single bytecode store (atomic under CPython's GIL). The worst case is
+# one extra resolution, never a torn value. We deliberately skip the
+# Lock — /health is on the hot path and the lock cost would defeat the
+# memoisation.
 _DAEMON_VERSION_CACHE: tuple[bool, str | None] = (False, None)
 
 

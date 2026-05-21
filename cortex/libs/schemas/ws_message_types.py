@@ -33,6 +33,28 @@ Types that are popup-internal (e.g. ``CONNECTION_CHANGED``, broadcast
 only between background.ts and popup.tsx via ``chrome.runtime``) are
 NOT in this catalog — they never cross the WebSocket boundary and are
 properly typed in the extension's own message-channel types.
+
+Convention: leading-underscore payload keys
+-------------------------------------------
+
+A small number of payload keys are reserved for daemon-internal
+bookkeeping and MUST NOT be set or trusted by clients. Their leading
+underscore signals "wire-implementation, not user data":
+
+* ``_seq`` — monotonic in-process bridge sequence number stamped on
+  callbacks (see ``runtime_daemon.CortexDaemon._state_callback_seq``).
+* ``_source_client_type`` — the daemon stamps this onto USER_ACTION
+  payloads from the WS receive path so handlers can gate on
+  origin-of-truth (e.g. ``_handle_user_action`` rejects
+  ``request_dispatch=True`` from anything other than ``"desktop"``).
+  Closes a confused-deputy where a compromised browser could trigger
+  ACTION_DISPATCH against peer browser clients via the daemon
+  broadcast bus.
+
+Underscore-prefixed keys must never appear in outbound broadcast
+payloads — they live only on in-process callback dicts or on inbound
+payloads consumed by daemon handlers. New keys following this
+convention should be documented here.
 """
 
 from __future__ import annotations

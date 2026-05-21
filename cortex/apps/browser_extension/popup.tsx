@@ -1257,14 +1257,19 @@ const S: Record<string, React.CSSProperties> = {
         textDecoration: "underline",
     },
 
-    // Biometrics row
+    // Biometrics row. ``minHeight`` is locked to the populated-state
+    // height so swapping with ``bioStatusBox`` (rendered when no HR is
+    // available) does not reflow the popup card.
     bioRow: {
         display: "flex",
         justifyContent: "space-between",
+        alignItems: "center" as const,
         padding: "16px 8px",
         marginBottom: 16,
         borderTop: `1px solid ${CX.borderDefault}`,
         borderBottom: `1px solid ${CX.borderDefault}`,
+        boxSizing: "border-box" as const,
+        minHeight: 74,
     },
     bioCol: { display: "flex", flexDirection: "column" as const, alignItems: "flex-start", gap: 4 },
     bioLabel: {
@@ -1280,14 +1285,21 @@ const S: Record<string, React.CSSProperties> = {
         color: CX.text,
     },
     // Contextual banner shown in the BPM/HRV/BLK slot when no HR
-    // reading has landed yet. Visual: same border treatment as the
-    // numerics row so the layout doesn't reflow when the first reading
-    // arrives. Italic + secondary color signals "not your data".
+    // reading has landed yet. ``minHeight`` matches ``bioRow`` so the
+    // layout does not reflow when the first reading arrives. Italic +
+    // secondary color signals "not your data". ``display: flex`` +
+    // centering keeps the message vertically aligned regardless of
+    // whether the string wraps to two lines.
     bioStatusBox: {
-        padding: "22px 12px",
+        display: "flex",
+        alignItems: "center" as const,
+        justifyContent: "center" as const,
+        padding: "16px 12px",
         marginBottom: 16,
         borderTop: `1px solid ${CX.borderDefault}`,
         borderBottom: `1px solid ${CX.borderDefault}`,
+        boxSizing: "border-box" as const,
+        minHeight: 74,
         textAlign: "center" as const,
         fontSize: 12,
         fontStyle: "italic" as const,

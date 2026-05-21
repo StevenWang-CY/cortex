@@ -513,52 +513,56 @@ class CortexAppController:
         except Exception:
             logger.debug("Native action execution failed", exc_info=True)
 
-        # Audit-prod fix: dispatch FIRST so the daemon's liveness check
-        # (intervention_id == _active_intervention_id) succeeds. The
-        # engagement record below calls ``_restore_manager.engage`` which
-        # clears ``_active_intervention_id``; running it before dispatch
-        # would cause every legitimate browser-action click to be
-        # rejected as "stale intervention_id".
-        if not executed_natively:
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    self._daemon.dispatch_action_to_browser(
-                        intervention_id, dict(action),
-                    ),
-                    self._daemon_loop,
-                )
-            except Exception:
-                logger.debug("dispatch_action_to_browser failed", exc_info=True)
-
-        # Record the engagement on the daemon side so the dismissal
-        # model + restore manager see the user's intent.
-        engage_payload = {
-            "action": "engaged",
-            "intervention_id": intervention_id,
-        }
-        try:
-            asyncio.run_coroutine_threadsafe(
-                self._daemon._handle_user_action(engage_payload),
-                self._daemon_loop,
-            )
-        except Exception:
-            logger.debug("Engaged USER_ACTION submission failed", exc_info=True)
-
-        # Record an action_executed entry so the recorder includes the
-        # desktop-originated click in the session log.
+        # Audit-prod fix: dispatch + engage + log are composed into a
+        # single coroutine so the ordering invariant ("dispatch BEFORE
+        # engage") is enforced lexically by ``await``, not implicitly by
+        # FIFO scheduling of three separate ``run_coroutine_threadsafe``
+        # calls. The engage handler invokes ``_restore_manager.engage``
+        # which clears ``_active_intervention_id``; the dispatch
+        # liveness gate reads that same field. If the gate ran after
+        # engage, every legitimate browser-action click would be
+        # rejected as stale.
+        action_copy = dict(action)
         log_payload = {
             "action_id": action_id,
             "action_type": action_type,
             "intervention_id": intervention_id,
             "result": {"native": executed_natively, "source": "desktop_overlay"},
         }
+        engage_payload = {
+            "action": "engaged",
+            "intervention_id": intervention_id,
+        }
+
+        async def _dispatch_then_record() -> None:
+            if not executed_natively:
+                try:
+                    await self._daemon.dispatch_action_to_browser(
+                        intervention_id, action_copy,
+                    )
+                except Exception:
+                    logger.debug(
+                        "dispatch_action_to_browser failed", exc_info=True,
+                    )
+            try:
+                await self._daemon._handle_user_action(engage_payload)
+            except Exception:
+                logger.debug(
+                    "Engaged USER_ACTION submission failed", exc_info=True,
+                )
+            try:
+                await self._daemon._handle_user_action(log_payload)
+            except Exception:
+                logger.debug(
+                    "action_executed log submission failed", exc_info=True,
+                )
+
         try:
             asyncio.run_coroutine_threadsafe(
-                self._daemon._handle_user_action(log_payload),
-                self._daemon_loop,
+                _dispatch_then_record(), self._daemon_loop,
             )
         except Exception:
-            logger.debug("action_executed log submission failed", exc_info=True)
+            logger.debug("dispatch/engage scheduling failed", exc_info=True)
 
     def _copy_to_clipboard(self, text: str) -> None:
         """Copy ``text`` to the macOS clipboard via QGuiApplication.

@@ -545,12 +545,17 @@ class _ConsumerTab(QWidget):
 
         # Wrap the numerics row in a container so we can swap it for a
         # status banner ("Reading your pulse…" / "Camera offline" / …)
-        # while the rPPG window fills. The container's preferred height
-        # matches the populated state so the card doesn't reflow when
-        # the first reading lands.
+        # while the rPPG window fills. Both the numerics container and
+        # the status banner share an explicit fixed height so the card
+        # doesn't reflow when the first reading lands. The value (96 px)
+        # matches the natural height of the populated numerics row at
+        # default Mac font sizes (FS_NUMERIC value + FS_CAPTION heading
+        # + bio_row padding).
+        _BIO_SWAP_HEIGHT = 96
         self._bio_numerics = QWidget()
         self._bio_numerics.setStyleSheet("background: transparent;")
         self._bio_numerics.setLayout(bio_row)
+        self._bio_numerics.setFixedHeight(_BIO_SWAP_HEIGHT)
         bio_inner.addWidget(self._bio_numerics)
 
         # Contextual status banner. Shown only when ``heart_rate`` is
@@ -567,14 +572,18 @@ class _ConsumerTab(QWidget):
         self._bio_status_label.setFont(
             mac_native.system_font(FS_CAPTION, "regular")
         )
+        # No vertical padding here — height is pinned via ``setFixedHeight``
+        # below to match ``_bio_numerics`` exactly, with the label's own
+        # ``AlignCenter`` keeping the message vertically centred.
         self._bio_status_label.setStyleSheet(
             "QLabel#CortexBioStatus {"
             f"  color: {_LABEL_SECONDARY};"
             "  background: transparent;"
-            "  padding: 22px 8px 22px 8px;"
+            "  padding: 0 8px;"
             "  font-style: italic;"
             "}"
         )
+        self._bio_status_label.setFixedHeight(_BIO_SWAP_HEIGHT)
         self._bio_status_label.setVisible(False)
         _set_accessible_name(self._bio_status_label, "Biometrics status")
         bio_inner.addWidget(self._bio_status_label)

@@ -703,12 +703,16 @@ class SettingsDialog(QWidget):
         else:
             # Embed the call-to-action as an inline link so VoiceOver
             # announces "link" and clicks deep-link to System Settings.
+            # Underline + trailing chevron because WCAG 1.4.1 forbids
+            # signalling interactivity by colour alone — without the
+            # underline the brand-accent text reads as static caption
+            # to sighted users who can't distinguish accent from body.
             target = row["target"]
             base = row["label_not_granted"]
             label.setText(
                 f'<a href="cortex://open-system-settings/{target}" '
-                f'style="color: {BRAND_ACCENT}; text-decoration: none;">'
-                f"{base}</a>"
+                f'style="color: {BRAND_ACCENT}; text-decoration: underline;">'
+                f"{base} ›</a>"
             )
             label.setStyleSheet(
                 f"color: {CX_TEXT_TERTIARY}; background: transparent;"
