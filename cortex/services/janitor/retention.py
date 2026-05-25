@@ -29,6 +29,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from cortex.libs.config.settings import StorageConfig
@@ -308,3 +309,76 @@ async def sweep_once_async(
                 result.errors,
             )
     return results
+
+
+# ─── P0 §3.2: chronotype/daily/*.json retention ──────────────────────
+#
+# The longitudinal aggregator persists one ``DailyBaseline`` JSON per
+# day under ``storage/chronotype/daily/YYYY-MM-DD.json``. The chronotype
+# model itself looks at the last ``window_days`` of those rows. To keep
+# the directory bounded while preserving enough history for "compare to
+# last month" comparisons, we evict rows older than ``window_days * 3``
+# (so a 90-day model keeps ~270 days of daily rows around).
+#
+# Resilient to malformed filenames: a file whose stem is not a valid
+# ``YYYY-MM-DD`` is skipped (with a single WARNING log), not deleted —
+# we'd rather keep a junk file than silently destroy a user-created one.
+
+
+def enforce_chronotype_retention(
+    chronotype_dir: Path,
+    *,
+    window_days: int,
+    now: datetime | None = None,
+) -> int:
+    """Delete ``chronotype/daily/*.json`` files older than ``window_days * 3``
+    days. Returns the count of files deleted.
+
+    Files whose stem does not parse as ``YYYY-MM-DD`` are skipped and
+    logged once. The chronotype dir / daily subdir may not exist (the
+    aggregator creates them lazily on first write); that's a no-op
+    return of 0.
+    """
+    if window_days <= 0:
+        return 0
+    daily_dir = chronotype_dir / "daily"
+    if not daily_dir.exists() or not daily_dir.is_dir():
+        return 0
+
+    today = (now.astimezone().date() if now is not None else datetime.now().astimezone().date())
+    cutoff: date = today - timedelta(days=window_days * 3)
+
+    deleted = 0
+    try:
+        children = list(daily_dir.iterdir())
+    except OSError as exc:
+        logger.warning("chronotype retention: cannot iterate %s: %s", daily_dir, exc)
+        return 0
+
+    for path in children:
+        if not path.is_file() or path.suffix != ".json":
+            continue
+        stem = path.stem
+        try:
+            file_date = date.fromisoformat(stem)
+        except ValueError:
+            logger.warning(
+                "chronotype retention: skipping malformed filename %s", path.name
+            )
+            continue
+        if file_date >= cutoff:
+            continue
+        try:
+            path.unlink()
+            deleted += 1
+        except OSError as exc:
+            logger.warning(
+                "chronotype retention: cannot unlink %s: %s", path, exc
+            )
+    if deleted > 0:
+        logger.info(
+            "chronotype retention: evicted %d daily file(s) older than %s",
+            deleted,
+            cutoff.isoformat(),
+        )
+    return deleted

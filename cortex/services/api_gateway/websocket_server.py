@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -27,6 +28,11 @@ from cortex.libs.config.settings import APIConfig
 from cortex.libs.logging.correlation import correlation_scope, get_correlation_id
 from cortex.libs.logging.structured import EventType
 from cortex.libs.schemas.intervention import InterventionPlan
+from cortex.libs.schemas.session_history import (
+    SessionDetailResponse,
+    SessionListResponse,
+    TrendsResponse,
+)
 from cortex.libs.schemas.state import StateEstimate
 from cortex.libs.schemas.ws_message import WSMessage as _PydanticWSMessage
 from cortex.libs.schemas.ws_message_types import MessageType
@@ -200,7 +206,24 @@ class WebSocketServer:
         self._intervention_applied_callback: Any = None
         # G1 (audit-prod): fired on IDENTIFY + on identified-client disconnect.
         self._client_identified_callback: Any = None
-
+        # P0 §3.1 / §3.2 / §3.3: handlers for the new history / trends /
+        # recap request types. Each callback returns a Pydantic envelope
+        # (or a plain dict / None) that the dispatcher serialises and
+        # sends back to the requesting client. Typed at the field level
+        # (P0 §3.1 fix #27) so a typo at the call site is a type error
+        # rather than a runtime AttributeError.
+        self._session_list_callback: (
+            Callable[[float | None, int], Awaitable[SessionListResponse]] | None
+        ) = None
+        self._session_detail_callback: (
+            Callable[[str], Awaitable[SessionDetailResponse]] | None
+        ) = None
+        self._trends_callback: (
+            Callable[..., Awaitable[TrendsResponse]] | None
+        ) = None
+        self._session_recap_cache_callback: (
+            Callable[[], dict[str, Any] | None] | None
+        ) = None
         # Latest state for new connections
         self._latest_state: StateEstimate | None = None
         self._pending_context_requests: dict[str, asyncio.Future[dict[str, Any]]] = {}
@@ -297,6 +320,54 @@ class WebSocketServer:
         dot so the user can see when the extension goes away.
         """
         self._client_identified_callback = callback
+
+    # ── P0 §3.1 / §3.2 / §3.3: history / trends / recap callbacks ────
+
+    def set_session_list_callback(
+        self,
+        callback: Callable[[float | None, int], Awaitable[SessionListResponse]] | None,
+    ) -> None:
+        """P0 §3.1: handler for ``REQUEST_SESSION_LIST`` messages.
+
+        Signature: ``async (since: float | None, limit: int) ->
+        SessionListResponse``. The dispatcher serialises the response
+        and routes it back to the requesting client only.
+        """
+        self._session_list_callback = callback
+
+    def set_session_detail_callback(
+        self,
+        callback: Callable[[str], Awaitable[SessionDetailResponse]] | None,
+    ) -> None:
+        """P0 §3.1: handler for ``REQUEST_SESSION_DETAIL`` messages.
+
+        Signature: ``async (session_id: str) -> SessionDetailResponse``.
+        """
+        self._session_detail_callback = callback
+
+    def set_trends_callback(
+        self,
+        callback: Callable[..., Awaitable[TrendsResponse]] | None,
+    ) -> None:
+        """P0 §3.2: handler for ``REQUEST_TRENDS`` messages.
+
+        Signature: ``async (window: str, *, refresh: bool) ->
+        TrendsResponse``.
+        """
+        self._trends_callback = callback
+
+    def set_session_recap_cache_callback(
+        self,
+        callback: Callable[[], dict[str, Any] | None] | None,
+    ) -> None:
+        """P0 §3.3: handler for ``REQUEST_SESSION_RECAP`` messages.
+
+        Signature: ``() -> dict | None``. Returns the most-recent
+        SESSION_RECAP payload emitted this process lifetime so that
+        late-joining clients (e.g. the browser extension popup that
+        opened after a recap broadcast) can still see the recap.
+        """
+        self._session_recap_cache_callback = callback
 
     async def start(self) -> bool:
         """
@@ -542,6 +613,14 @@ class WebSocketServer:
                         self._shutdown_callback()
                 except Exception as exc:
                     logger.error("Shutdown callback error: %s", exc)
+        elif msg.type == MessageType.REQUEST_SESSION_LIST.value:
+            await self._handle_request_session_list(client, msg)
+        elif msg.type == MessageType.REQUEST_SESSION_DETAIL.value:
+            await self._handle_request_session_detail(client, msg)
+        elif msg.type == MessageType.REQUEST_TRENDS.value:
+            await self._handle_request_trends(client, msg)
+        elif msg.type == MessageType.REQUEST_SESSION_RECAP.value:
+            await self._handle_request_session_recap(client, msg)
         else:
             logger.debug(f"Unknown message type from {client.client_id}: {msg.type}")
 
@@ -804,6 +883,194 @@ class WebSocketServer:
                 client.client_id,
                 exc,
             )
+
+    # ── P0 §3.1 / §3.2 / §3.3: history / trends / recap dispatch ─────
+
+    async def _handle_request_session_list(
+        self, client: WebSocketClient, msg: WSMessage,
+    ) -> None:
+        """P0 §3.1: serve a ``REQUEST_SESSION_LIST`` request.
+
+        Payload shape::
+
+            { "since": float | None, "limit": int }
+
+        The daemon's ``list_sessions`` returns a Pydantic
+        ``SessionListResponse`` we then serialise back to the requesting
+        client. ``correlation_id`` is echoed so the client can match the
+        reply to its in-flight request.
+        """
+        cb = self._session_list_callback
+        if cb is None:
+            logger.debug(
+                "REQUEST_SESSION_LIST received but no callback wired; dropping"
+            )
+            return
+        payload = msg.payload or {}
+        since_raw = payload.get("since")
+        try:
+            since = float(since_raw) if since_raw is not None else None
+        except (TypeError, ValueError):
+            since = None
+        try:
+            limit = int(payload.get("limit") or 30)
+        except (TypeError, ValueError):
+            limit = 30
+        try:
+            if asyncio.iscoroutinefunction(cb):
+                resp = await cb(since, limit)
+            else:
+                resp = cb(since, limit)
+        except Exception:
+            logger.exception(
+                "session-list callback raised for client %s", client.client_id,
+            )
+            return
+        if resp is None:
+            return
+        body: dict[str, Any] = (
+            resp.model_dump(mode="json")
+            if hasattr(resp, "model_dump")
+            else dict(resp)
+        )
+        await self.send_message(
+            MessageType.SESSION_LIST.value,
+            body,
+            target_client_types=(
+                [client.client_type] if client.client_type and client.client_type != "unknown" else None
+            ),
+            correlation_id=msg.correlation_id,
+        )
+
+    async def _handle_request_session_detail(
+        self, client: WebSocketClient, msg: WSMessage,
+    ) -> None:
+        """P0 §3.1: serve a ``REQUEST_SESSION_DETAIL`` request.
+
+        Payload: ``{"session_id": str}``. The daemon's ``get_session``
+        validates the id (defense against path traversal) and returns a
+        ``SessionDetailResponse`` with either the report or an error
+        code (``"not_found"`` / ``"unreadable"``).
+        """
+        cb = self._session_detail_callback
+        if cb is None:
+            logger.debug(
+                "REQUEST_SESSION_DETAIL received but no callback wired; dropping"
+            )
+            return
+        payload = msg.payload or {}
+        session_id = payload.get("session_id")
+        if not isinstance(session_id, str):
+            # Reply with an error envelope so the client doesn't hang.
+            await self.send_message(
+                MessageType.SESSION_DETAIL.value,
+                {"report": None, "error": "not_found"},
+                target_client_types=(
+                    [client.client_type] if client.client_type and client.client_type != "unknown" else None
+                ),
+                correlation_id=msg.correlation_id,
+            )
+            return
+        try:
+            if asyncio.iscoroutinefunction(cb):
+                resp = await cb(session_id)
+            else:
+                resp = cb(session_id)
+        except Exception:
+            logger.exception(
+                "session-detail callback raised for client %s", client.client_id,
+            )
+            return
+        if resp is None:
+            return
+        body = (
+            resp.model_dump(mode="json")
+            if hasattr(resp, "model_dump")
+            else dict(resp)
+        )
+        await self.send_message(
+            MessageType.SESSION_DETAIL.value,
+            body,
+            target_client_types=(
+                [client.client_type] if client.client_type and client.client_type != "unknown" else None
+            ),
+            correlation_id=msg.correlation_id,
+        )
+
+    async def _handle_request_trends(
+        self, client: WebSocketClient, msg: WSMessage,
+    ) -> None:
+        """P0 §3.2: serve a ``REQUEST_TRENDS`` request.
+
+        Payload: ``{"window": "week"|"month"|"quarter", "refresh": bool}``.
+        ``window`` defaults to ``"week"`` when missing or invalid; the
+        daemon's ``get_trends`` clamps internally too as defense-in-depth.
+        """
+        cb = self._trends_callback
+        if cb is None:
+            logger.debug(
+                "REQUEST_TRENDS received but no callback wired; dropping"
+            )
+            return
+        payload = msg.payload or {}
+        window = payload.get("window") if isinstance(payload.get("window"), str) else "week"
+        refresh = bool(payload.get("refresh") or False)
+        try:
+            if asyncio.iscoroutinefunction(cb):
+                resp = await cb(window, refresh=refresh)
+            else:
+                resp = cb(window, refresh=refresh)
+        except Exception:
+            logger.exception(
+                "trends callback raised for client %s", client.client_id,
+            )
+            return
+        if resp is None:
+            return
+        body = (
+            resp.model_dump(mode="json")
+            if hasattr(resp, "model_dump")
+            else dict(resp)
+        )
+        await self.send_message(
+            MessageType.TRENDS_PAYLOAD.value,
+            body,
+            target_client_types=(
+                [client.client_type] if client.client_type and client.client_type != "unknown" else None
+            ),
+            correlation_id=msg.correlation_id,
+        )
+
+    async def _handle_request_session_recap(
+        self, client: WebSocketClient, msg: WSMessage,
+    ) -> None:
+        """P0 §3.3: serve a ``REQUEST_SESSION_RECAP`` request.
+
+        Returns the cached most-recent recap payload (or an empty
+        payload if no session has finished this process lifetime).
+        """
+        cb = self._session_recap_cache_callback
+        recap: dict[str, Any] | None = None
+        if cb is not None:
+            try:
+                if asyncio.iscoroutinefunction(cb):
+                    recap = await cb()
+                else:
+                    recap = cb()
+            except Exception:
+                logger.exception(
+                    "session-recap-cache callback raised for client %s",
+                    client.client_id,
+                )
+                recap = None
+        await self.send_message(
+            MessageType.SESSION_RECAP.value,
+            recap or {},
+            target_client_types=(
+                [client.client_type] if client.client_type and client.client_type != "unknown" else None
+            ),
+            correlation_id=msg.correlation_id,
+        )
 
     async def broadcast_state(
         self,
@@ -1268,12 +1535,19 @@ class WebSocketServer:
             "headline": plan.headline,
             "situation_summary": plan.situation_summary,
             "primary_focus": plan.primary_focus,
-            "micro_steps": plan.micro_steps,
+            "micro_steps": list(plan.micro_steps),
             "hide_targets": plan.hide_targets,
             "ui_plan": plan.ui_plan.model_dump(),
             "tone": plan.tone,
             "suggested_actions": [a.model_dump() for a in plan.suggested_actions],
             "causal_explanation": getattr(plan, "causal_explanation", None),
+            # P0 §3.9: structured causal rationale (top 2-3 signals,
+            # primary first). UI's drilldown panel renders these as
+            # sparkline rows with delta pills.
+            "causal_signals": [
+                s.model_dump(mode="json")
+                for s in getattr(plan, "causal_signals", None) or []
+            ],
             "consent_level": getattr(plan, "consent_level", None),
             "plan_warnings": getattr(plan, "plan_warnings", None) or [],
         }

@@ -573,6 +573,30 @@ function connect(): void {
                         timestamp: Date.now() / 1000,
                         sequence: ++sequence,
                     });
+                    // P0 §3.3: ask the daemon to re-broadcast the most
+                    // recent SESSION_RECAP it has cached. If a recap
+                    // fired while the extension was disconnected (e.g.
+                    // service-worker eviction, transient network drop),
+                    // the popup still needs to surface it on next open.
+                    send({
+                        type: "REQUEST_SESSION_RECAP",
+                        payload: {},
+                        timestamp: Date.now() / 1000,
+                        sequence: ++sequence,
+                    });
+                    // P0 §3.2: prime the "Last 7 days" sparkbar strip
+                    // in the popup. We fire on every fresh WS connect
+                    // so a freshly-opened popup immediately has trends
+                    // data to render without waiting on the 30-minute
+                    // refresh timer below. ``refresh: false`` asks the
+                    // daemon to serve the cached aggregator output
+                    // rather than re-running the (expensive) rollup.
+                    send({
+                        type: "REQUEST_TRENDS",
+                        payload: { window: "week", refresh: false },
+                        timestamp: Date.now() / 1000,
+                        sequence: ++sequence,
+                    });
                 } catch {
                     // Token unavailable — let the daemon close us; the
                     // reconnect loop will retry. Silent failure here is
@@ -1120,6 +1144,8 @@ async function handleMessage(raw: string): Promise<void> {
             break;
         }
 
+
+
         case "LEETCODE_SHOW_LOCKOUT": {
             // Inject lockout overlay into the active tab
             try {
@@ -1161,6 +1187,121 @@ async function handleMessage(raw: string): Promise<void> {
             broadcastToPopup({
                 type: "MORNING_BRIEFING",
                 payload: msg.payload,
+            });
+            break;
+        }
+
+        case "SESSION_RECAP": {
+            // P0 §3.3: end-of-session recap landed. Cache the full
+            // SessionReport so the popup can render it on next open
+            // (even if the WS has since disconnected), notify any
+            // currently-open popup so it re-renders immediately, and
+            // light up the toolbar badge as the user-facing signal that
+            // a fresh recap is waiting.
+            //
+            // Phase 4 hardening:
+            //   1. Gate on a non-empty ``session_id``. Phase 4.A made
+            //      the daemon respond to REQUEST_SESSION_RECAP with
+            //      ``{}`` when no recap is cached (rather than silently
+            //      dropping the request). Treat any payload missing a
+            //      string ``session_id`` as "no recap" — do not cache,
+            //      do not badge, do not broadcast — so the empty
+            //      handshake reply cannot resurface a phantom card.
+            //   2. Respect a previously-dismissed session_id. The user
+            //      explicitly clicked "Dismiss" on this recap; the
+            //      daemon may re-broadcast (e.g. on extension reconnect)
+            //      but we honour the dismissal.
+            const recapPayload = msg.payload as Record<string, unknown>;
+            const sessionIdRaw = recapPayload?.session_id;
+            const hasValidSessionId =
+                typeof sessionIdRaw === "string" && sessionIdRaw.length > 0;
+            if (!hasValidSessionId) {
+                if (DEBUG) {
+                    console.debug(
+                        "[cortex.bg] SESSION_RECAP with empty/missing session_id; " +
+                            "skipping cache + badge + broadcast.",
+                    );
+                }
+                break;
+            }
+            const incomingSessionId = sessionIdRaw as string;
+            chrome.storage.local.get(
+                ["cortex.dismissedRecapSessionId"],
+                (data) => {
+                    const dismissedId = data?.[
+                        "cortex.dismissedRecapSessionId"
+                    ] as string | undefined;
+                    if (dismissedId && dismissedId === incomingSessionId) {
+                        if (DEBUG) {
+                            console.debug(
+                                `[cortex.bg] SESSION_RECAP session_id=${incomingSessionId} ` +
+                                    "was already dismissed by user; suppressing.",
+                            );
+                        }
+                        return;
+                    }
+                    const timestamp = Date.now();
+                    try {
+                        chrome.storage.local.set({
+                            "cortex.lastRecap": recapPayload,
+                            "cortex.lastRecapTimestamp": timestamp,
+                        });
+                    } catch (err) {
+                        // storage.local may be unavailable in odd test
+                        // environments — log so a real regression is
+                        // visible rather than silently swallowed.
+                        if (DEBUG) {
+                            console.warn(
+                                "[cortex.bg] SESSION_RECAP storage.local.set failed",
+                                err,
+                            );
+                        }
+                    }
+                    broadcastToPopup({
+                        type: "SESSION_RECAP_READY",
+                        payload: recapPayload,
+                        timestamp,
+                    });
+                    setRecapBadge(true);
+                },
+            );
+            break;
+        }
+
+        case "SESSION_LIST":
+        case "SESSION_DETAIL": {
+            // P0 §3.1: silent forward-compatibility no-op. The desktop
+            // shell consumes these directly; the popup does not render
+            // them yet. A debug log keeps the frame visible to anyone
+            // debugging the wire without surfacing in production.
+            if (DEBUG) {
+                console.debug(
+                    `Cortex: received ${msg.type} (no extension handler — see desktop shell)`,
+                );
+            }
+            break;
+        }
+
+        case "TRENDS_PAYLOAD": {
+            // P0 §3.2: cache the trends rollup so the popup can render
+            // its "Last 7 days" sparkbar strip on next mount even if
+            // the WS has since dropped, then broadcast TRENDS_READY so
+            // any currently-open popup re-renders immediately. Mirrors
+            // the SESSION_RECAP wiring above.
+            const trendsPayload = msg.payload as Record<string, unknown>;
+            const timestamp = Date.now();
+            try {
+                chrome.storage.local.set({
+                    "cortex.lastTrends": trendsPayload,
+                    "cortex.lastTrendsTimestamp": timestamp,
+                });
+            } catch {
+                // storage.local may be unavailable in odd test environments
+            }
+            broadcastToPopup({
+                type: "TRENDS_READY",
+                payload: trendsPayload,
+                timestamp,
             });
             break;
         }
@@ -2395,6 +2536,18 @@ async function executeAction(action: SuggestedAction): Promise<ActionExecuteResu
                 return await executeCopyToClipboard(action);
             case "start_timer":
                 return await executeStartTimer(action);
+                // extension's role is to forward the user's "Take a
+                // break" click through to the daemon, which dispatches
+                // it to the desktop break overlay. Returning a
+                // ``reversible=true, success=true`` keeps the popup CTA
+                // pattern consistent — the actual heavy lifting happens
+                // daemon-side via ``ACTION_DISPATCH``.
+                return {
+                    action_id: action.action_id,
+                    success: true,
+                    message: "Biology break dispatched",
+                    reversible: true,
+                };
             default: {
                 // Compile-time exhaustiveness: ``unhandled`` is ``never``
                 // when the switch covers every union member. Defence in
@@ -2684,6 +2837,8 @@ async function executeStartTimer(action: SuggestedAction): Promise<ActionExecute
     return { action_id: action.action_id, success: true, message: `${minutes}min timer started`, reversible: false };
 }
 
+// ---------------------------------------------------------------------
+
 async function undoAction(actionId: string): Promise<boolean> {
     const idx = undoStack.findIndex((e) => e.action_id === actionId);
     if (idx === -1) return false;
@@ -2927,6 +3082,32 @@ function broadcastToPopup(message: Record<string, unknown>): void {
         });
     } catch {
         // No listener
+    }
+}
+
+/**
+ * P0 §3.3: toggle the toolbar action badge to signal a pending session
+ * recap. ``chrome.action.*`` is MV3-only; we guard the call so the
+ * background script keeps loading cleanly in test harnesses (jsdom)
+ * that omit the API.
+ */
+function setRecapBadge(on: boolean): void {
+    try {
+        const action = (chrome as unknown as {
+            action?: {
+                setBadgeText: (details: { text: string }) => void;
+                setBadgeBackgroundColor: (details: { color: string }) => void;
+            };
+        }).action;
+        if (!action) return;
+        if (on) {
+            action.setBadgeText({ text: "✓" });
+            action.setBadgeBackgroundColor({ color: "#D97757" });
+        } else {
+            action.setBadgeText({ text: "" });
+        }
+    } catch {
+        // action API may be unavailable in some contexts
     }
 }
 
@@ -3347,17 +3528,26 @@ chrome.runtime.onMessage.addListener(
                 break;
 
             case "USER_RATING":
+                // P0 §3.8: relay 👍/👎 ratings. ``context`` is an
+                // optional one-line free-text comment from a 👎 — stays
+                // local on the daemon side; never reaches the LLM.
                 send({
                     type: "USER_RATING",
                     payload: {
                         intervention_id: message.intervention_id,
                         rating: message.rating,
+                        ...(typeof message.context === "string" && message.context.length > 0
+                            ? { context: message.context.slice(0, 200) }
+                            : {}),
                     },
                     timestamp: Date.now() / 1000,
                     sequence: ++sequence,
                 });
                 sendResponse({ ok: true });
                 break;
+
+
+
 
             case "EXECUTE_ACTION":
                 executeAction(message.action as SuggestedAction)
@@ -3473,6 +3663,194 @@ chrome.runtime.onMessage.addListener(
                 }
                 sendResponse({ ok: true });
                 break;
+            }
+
+            case "GET_CACHED_RECAP": {
+                // P0 §3.3: popup-on-mount handshake. Return whatever the
+                // background script has cached so the popup can render
+                // the recap card without waiting for a fresh WS frame.
+                chrome.storage.local.get(
+                    ["cortex.lastRecap", "cortex.lastRecapTimestamp"],
+                    (data) => {
+                        sendResponse({
+                            recap: data?.["cortex.lastRecap"] ?? null,
+                            timestamp:
+                                (data?.["cortex.lastRecapTimestamp"] as
+                                    | number
+                                    | undefined) ?? null,
+                        });
+                    },
+                );
+                return true; // async
+            }
+
+            case "DISMISS_RECAP": {
+                // P0 §3.3 (Phase 4 hardening): user clicked "Dismiss"
+                // in the recap card. Clear the cache and the toolbar
+                // badge so the next popup open does not resurface this
+                // recap, AND remember the dismissed session_id so a
+                // subsequent SESSION_RECAP for the same session (e.g.
+                // a re-broadcast triggered by the on-connect
+                // REQUEST_SESSION_RECAP handshake) is suppressed.
+                chrome.storage.local.get(
+                    [
+                        "cortex.lastRecap",
+                        "cortex.lastRecapTimestamp",
+                    ],
+                    (data) => {
+                        const lastRecap = data?.["cortex.lastRecap"] as
+                            | Record<string, unknown>
+                            | undefined;
+                        const dismissedSessionId =
+                            typeof lastRecap?.session_id === "string"
+                                ? (lastRecap.session_id as string)
+                                : null;
+                        const updates: Record<string, unknown> = {};
+                        if (dismissedSessionId) {
+                            updates["cortex.dismissedRecapSessionId"] =
+                                dismissedSessionId;
+                        }
+                        try {
+                            if (Object.keys(updates).length > 0) {
+                                chrome.storage.local.set(updates);
+                            }
+                            chrome.storage.local.remove([
+                                "cortex.lastRecap",
+                                "cortex.lastRecapTimestamp",
+                            ]);
+                        } catch (err) {
+                            // storage.local unavailable — badge clearing
+                            // still matters; log so a real regression
+                            // surfaces rather than being swallowed.
+                            if (DEBUG) {
+                                console.warn(
+                                    "[cortex.bg] DISMISS_RECAP storage update failed",
+                                    err,
+                                );
+                            }
+                        }
+                        setRecapBadge(false);
+                        sendResponse({ ok: true });
+                    },
+                );
+                return true; // async — sendResponse fires inside the get cb
+            }
+
+            case "RECAP_VIEWED": {
+                // P0 §3.3: popup mounted and is rendering the cached
+                // recap to the user. The badge ("your recap is ready")
+                // has served its purpose; clear it. The cache stays
+                // intact for up to 24h so the popup can re-render it
+                // on subsequent opens.
+                setRecapBadge(false);
+                sendResponse({ ok: true });
+                break;
+            }
+
+            case "GET_CACHED_TRENDS": {
+                // P0 §3.2: popup-on-mount handshake for the "Last 7
+                // days" sparkbar strip. Return whatever rollup the
+                // background script has in chrome.storage.local so the
+                // popup can render bars without waiting for a fresh WS
+                // frame.
+                chrome.storage.local.get(
+                    ["cortex.lastTrends", "cortex.lastTrendsTimestamp"],
+                    (data) => {
+                        sendResponse({
+                            trends: data?.["cortex.lastTrends"] ?? null,
+                            timestamp:
+                                (data?.["cortex.lastTrendsTimestamp"] as
+                                    | number
+                                    | undefined) ?? null,
+                        });
+                    },
+                );
+                return true; // async
+            }
+
+            case "REQUEST_TRENDS": {
+                // P0 §3.2: popup asked us to nudge the daemon for a
+                // fresh trends rollup (typically when the cached one
+                // is older than the popup's 6h staleness window). We
+                // fire the WS request, then synchronously echo back
+                // whatever cached payload we have so the popup can
+                // render stale bars while the fresh ones are in flight.
+                //
+                // Phase 4 hardening: forward the caller's ``window``
+                // (``"week"`` | ``"month"``) and ``refresh`` flag so a
+                // future popup-side "Last 30 days" toggle or pull-to-
+                // refresh gesture isn't silently downgraded to the
+                // weekly cached path. Defaults match the on-connect
+                // priming call so callers that omit them get the same
+                // behaviour as before.
+                const reqWindowRaw = (message as Record<string, unknown>)
+                    .window;
+                const reqWindow =
+                    reqWindowRaw === "month" ? "month" : "week";
+                const reqRefresh =
+                    (message as Record<string, unknown>).refresh === true;
+                if (connected) {
+                    send({
+                        type: "REQUEST_TRENDS",
+                        payload: { window: reqWindow, refresh: reqRefresh },
+                        timestamp: Date.now() / 1000,
+                        sequence: ++sequence,
+                    });
+                }
+                chrome.storage.local.get(
+                    ["cortex.lastTrends", "cortex.lastTrendsTimestamp"],
+                    (data) => {
+                        sendResponse({
+                            trends: data?.["cortex.lastTrends"] ?? null,
+                            timestamp:
+                                (data?.["cortex.lastTrendsTimestamp"] as
+                                    | number
+                                    | undefined) ?? null,
+                        });
+                    },
+                );
+                return true; // async
+            }
+
+            case "OPEN_DASHBOARD_HISTORY": {
+                // P0 §3.1 / §3.3: popup asked to raise the desktop
+                // dashboard's History tab. The extension cannot launch
+                // native apps directly, so we route the request through
+                // the existing native-messaging launcher. If the native
+                // host is not installed (Chrome-only install, no desktop
+                // app), respond ``unavailable`` so the popup can show
+                // "Install desktop app to view history".
+                try {
+                    chrome.runtime.sendNativeMessage(
+                        "com.cortex.launcher",
+                        { command: "raise_dashboard", target: "history" },
+                        (response) => {
+                            if (chrome.runtime.lastError) {
+                                sendResponse({
+                                    status: "unavailable",
+                                    error:
+                                        chrome.runtime.lastError.message ??
+                                        "native_host_unavailable",
+                                });
+                                return;
+                            }
+                            const status =
+                                response &&
+                                typeof (response as Record<string, unknown>)
+                                    .status === "string"
+                                    ? ((response as Record<string, unknown>)
+                                          .status as string)
+                                    : "ok";
+                            sendResponse({ status });
+                        },
+                    );
+                } catch (e) {
+                    sendResponse({
+                        status: "unavailable",
+                        error: e instanceof Error ? e.message : String(e),
+                    });
+                }
+                return true; // async
             }
         }
         return false;
@@ -3617,8 +3995,22 @@ try {
 
 // --- Keepalive alarm (prevents MV3 service worker from going idle) ---
 
+// P0 §3.2: weekly-trends refresh runs through chrome.alarms (NOT
+// setInterval) because MV3 service workers are evicted after ~30s of
+// idle and any in-memory ``setInterval`` handle dies with them. Alarms
+// survive eviction — the next fire wakes the SW back up so the popup's
+// "Last 7 days" sparkbar strip stays warm without the user touching
+// anything. Registered here for the cold-start path and re-registered
+// on both ``onInstalled`` and ``onStartup`` below so reinstalls /
+// browser restarts don't silently drop the schedule.
+const TRENDS_REFRESH_ALARM_NAME = "cortex-trends-refresh";
+const TRENDS_REFRESH_PERIOD_MINUTES = 30;
+
 chrome.alarms.create("cortex-keepalive", { periodInMinutes: 0.4 });
 chrome.alarms.create("cortex-activity-cleanup", { periodInMinutes: 1440 }); // Daily
+chrome.alarms.create(TRENDS_REFRESH_ALARM_NAME, {
+    periodInMinutes: TRENDS_REFRESH_PERIOD_MINUTES,
+});
 
 chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === "cortex-keepalive") {
@@ -3642,6 +4034,20 @@ chrome.alarms.onAlarm.addListener((alarm) => {
             }
             if (changed) await saveActivities(activities);
         });
+    } else if (alarm.name === TRENDS_REFRESH_ALARM_NAME) {
+        // P0 §3.2: keep the popup's "Last 7 days" sparkbar strip warm
+        // without requiring the user to explicitly refresh. The alarm
+        // fires every 30 minutes; when we're connected we ask the
+        // daemon for the latest weekly rollup. ``refresh: false`` keeps
+        // the daemon on its cached aggregator output rather than
+        // re-running the (expensive) rollup pipeline on every alarm.
+        if (!connected) return;
+        send({
+            type: "REQUEST_TRENDS",
+            payload: { window: "week", refresh: false },
+            timestamp: Date.now() / 1000,
+            sequence: ++sequence,
+        });
     }
 });
 
@@ -3649,6 +4055,13 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 chrome.runtime.onInstalled.addListener((details) => {
     chrome.alarms.create("cortex-keepalive", { periodInMinutes: 0.4 });
+    // P0 §3.2: (re-)register the trends-refresh alarm so an extension
+    // update/reinstall doesn't leave the schedule in an indeterminate
+    // state. ``chrome.alarms.create`` with the same name overwrites
+    // the existing schedule, which is the documented MV3 behaviour.
+    chrome.alarms.create(TRENDS_REFRESH_ALARM_NAME, {
+        periodInMinutes: TRENDS_REFRESH_PERIOD_MINUTES,
+    });
     connect();
     // G2 (audit-prod): probe connectivity on install so the popup
     // immediately renders the right four-state UI before any WS attempt.
@@ -3665,6 +4078,13 @@ chrome.runtime.onInstalled.addListener((details) => {
 });
 
 chrome.runtime.onStartup.addListener(() => {
+    // P0 §3.2: re-register the trends-refresh alarm on browser startup.
+    // Alarms persist across SW eviction within a session but not across
+    // browser restarts in all profiles, so this guarantees we always
+    // have the schedule installed once the SW first wakes up.
+    chrome.alarms.create(TRENDS_REFRESH_ALARM_NAME, {
+        periodInMinutes: TRENDS_REFRESH_PERIOD_MINUTES,
+    });
     connect();
     // G2 (audit-prod): same probe on every browser-startup activation.
     void probeConnectivity("startup").catch(() => undefined);
@@ -3675,3 +4095,9 @@ connect();
 // G2 (audit-prod): cold-start probe so a popup opened immediately after
 // service-worker activation has a non-null connectivity diagnostic.
 void probeConnectivity("activation").catch(() => undefined);
+
+// P0 §3.2: the trends-refresh poll lives on ``chrome.alarms`` (see the
+// ``cortex-trends-refresh`` registration above) rather than
+// ``setInterval``. MV3 service workers are evicted after ~30s of idle
+// and any in-memory timer handle dies with them; chrome.alarms is the
+// only persistence-safe scheduler in MV3.

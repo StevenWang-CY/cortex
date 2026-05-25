@@ -49,6 +49,15 @@ class WebSocketBridge(QObject):
     intervention_restored = Signal(dict)
     settings_synced = Signal(dict)
     connection_changed = Signal(bool)
+    # P0 §3.1 / §3.2 / §3.3: history / trends / recap inbound payloads.
+    session_list_received = Signal(dict)
+    session_detail_received = Signal(dict)
+    trends_received = Signal(dict)
+    session_recap_received = Signal(dict)
+    # P0 §3.4: locally-emitted calibration progress (not received over
+    # the WebSocket — the runner is in-process). Lives here so the
+    # CortexApp's wiring sites have a single thread-safe queueing point.
+    calibration_progress = Signal(dict)
 
     def __init__(self, host: str = "127.0.0.1", port: int = 9473) -> None:
         super().__init__()
@@ -167,6 +176,67 @@ class WebSocketBridge(QObject):
         msg = json.dumps({
             "type": "SHUTDOWN",
             "payload": payload,
+            "timestamp": 0,
+            "sequence": 0,
+        })
+        asyncio.run_coroutine_threadsafe(self._send(msg), self._loop)
+
+    def send_request_session_list(self, since: float | None, limit: int) -> None:
+        """P0 §3.1: ask the daemon for a paginated session listing."""
+        if self._loop is None or self._ws is None:
+            return
+        payload: dict[str, Any] = {
+            "since": float(since) if since is not None else None,
+            "limit": int(limit) if limit else 30,
+        }
+        msg = json.dumps({
+            "type": "REQUEST_SESSION_LIST",
+            "payload": payload,
+            "timestamp": 0,
+            "sequence": 0,
+        })
+        asyncio.run_coroutine_threadsafe(self._send(msg), self._loop)
+
+    def send_request_session_detail(self, session_id: str) -> None:
+        """P0 §3.1: ask the daemon for a single ``SessionReport``."""
+        if self._loop is None or self._ws is None or not session_id:
+            return
+        msg = json.dumps({
+            "type": "REQUEST_SESSION_DETAIL",
+            "payload": {"session_id": str(session_id)},
+            "timestamp": 0,
+            "sequence": 0,
+        })
+        asyncio.run_coroutine_threadsafe(self._send(msg), self._loop)
+
+    def send_request_trends(self, window: str, refresh: bool) -> None:
+        """P0 §3.2: ask the daemon for a longitudinal rollup.
+
+        Phase 4.B fix (#18): drop the "quarter" alternative — the
+        schema is ``Literal["week", "month"]``. Anything unexpected
+        degrades to "week" so the request still completes."""
+        if self._loop is None or self._ws is None:
+            return
+        win = window if window in ("week", "month") else "week"
+        msg = json.dumps({
+            "type": "REQUEST_TRENDS",
+            "payload": {"window": win, "refresh": bool(refresh)},
+            "timestamp": 0,
+            "sequence": 0,
+        })
+        asyncio.run_coroutine_threadsafe(self._send(msg), self._loop)
+
+    def send_request_session_recap(self) -> None:
+        """P0 §3.3: ask the daemon for the most-recent cached recap.
+
+        Used by surfaces (e.g. browser popup) that joined after the live
+        broadcast was emitted; the desktop dashboard normally receives
+        the live broadcast directly, so this is here for symmetry."""
+        if self._loop is None or self._ws is None:
+            return
+        msg = json.dumps({
+            "type": "REQUEST_SESSION_RECAP",
+            "payload": {},
             "timestamp": 0,
             "sequence": 0,
         })
@@ -352,6 +422,21 @@ class WebSocketBridge(QObject):
             self.intervention_restored.emit(payload)
         elif msg_type == "SETTINGS_SYNC":
             self.settings_synced.emit(payload)
+        # P0 §3.1 / §3.2 / §3.3: history / trends / recap inbound dispatch.
+        elif msg_type == "SESSION_LIST":
+            self.session_list_received.emit(payload if isinstance(payload, dict) else {})
+        elif msg_type == "SESSION_DETAIL":
+            self.session_detail_received.emit(payload if isinstance(payload, dict) else {})
+        elif msg_type == "TRENDS_PAYLOAD":
+            self.trends_received.emit(payload if isinstance(payload, dict) else {})
+        elif msg_type == "SESSION_RECAP":
+            # Phase 4.B fix (#30): empty payloads ARE meaningful — the
+            # daemon broadcasts ``{}`` for short sessions to tell the
+            # dashboard to finalise its stop flow without opening the
+            # recap sheet. Forward an empty dict in that case; the
+            # dashboard's ``apply_session_recap`` handles the empty
+            # payload as the synthetic short-session signal.
+            self.session_recap_received.emit(payload if isinstance(payload, dict) else {})
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +462,12 @@ class CortexApp:
         self._bridge: WebSocketBridge | None = None
         self._paused = False
         self._active_intervention_id: str | None = None
+        # P0 §3.4: in-flight CalibrationRunner. None when idle.
+        self._calibration_runner: Any = None
+        # P0 §3.4: in-flight CalibrationRunner. None when idle.
+        self._calibration_runner: Any = None
+        # P0 §3.4: in-flight CalibrationRunner. None when idle.
+        self._calibration_runner: Any = None
 
     def run(self) -> int:
         """Run the application. Returns exit code."""
@@ -406,14 +497,49 @@ class CortexApp:
         self._tray.restore_requested.connect(self._restore_workspace)
         self._tray.snooze_requested.connect(self._snooze_fifteen_minutes)
         self._tray.disable_session_requested.connect(self._disable_for_session)
-        self._tray.quit_requested.connect(self._quit)
+        # Phase 4.B fix (#4): tray Quit honours the two-phase recap when
+        # a session is active. See ``_on_user_initiated_quit``.
+        self._tray.quit_requested.connect(self._on_user_initiated_quit)
 
-        # E.1: route dashboard Stop / goal signals to the daemon. Stop
-        # tears down via WebSocket SHUTDOWN; goal_set posts a USER_ACTION
-        # that the daemon resolves to a current goal hint.
+        # E.1 / Phase 4.B fix (#3): route dashboard Stop / goal signals
+        # to the daemon. The two-signal split mirrors the in-process
+        # controller (see ``controller.CortexAppController`` for the
+        # rationale):
+        #
+        # * ``daemon_stop_requested`` — sends the SHUTDOWN WS frame so
+        #   the daemon broadcasts SESSION_RECAP and then exits. Does
+        #   NOT quit Qt.
+        # * ``gui_quit_requested`` — quits Qt after the user has
+        #   consumed the recap (or the watchdog fired).
+        #
+        # The legacy ``stop_requested`` is an alias for daemon-stop;
+        # keeping it wired to the same slot maintains backward compat.
         if self._dashboard is not None:
-            self._dashboard.stop_requested.connect(self._request_remote_shutdown)
+            if hasattr(self._dashboard, "daemon_stop_requested"):
+                self._dashboard.daemon_stop_requested.connect(
+                    self._on_daemon_stop_requested,
+                )
+            if hasattr(self._dashboard, "gui_quit_requested"):
+                self._dashboard.gui_quit_requested.connect(
+                    self._on_gui_quit_requested,
+                )
+            self._dashboard.stop_requested.connect(self._on_daemon_stop_requested)
             self._dashboard.goal_set.connect(self._send_goal)
+            # P0 §3.1 / §3.2: route History tab outgoing requests onto
+            # the WS wire. The dashboard re-emits these from the embedded
+            # HistoryTab; the bridge translates them to typed WS frames.
+            if hasattr(self._dashboard, "history_requested"):
+                self._dashboard.history_requested.connect(
+                    self._on_history_requested,
+                )
+            if hasattr(self._dashboard, "detail_requested"):
+                self._dashboard.detail_requested.connect(
+                    self._on_detail_requested,
+                )
+            if hasattr(self._dashboard, "trends_requested"):
+                self._dashboard.trends_requested.connect(
+                    self._on_trends_requested,
+                )
             # Audit-2 fix: wire the dashboard's Connect button in WS mode.
             # The DMG ``--in-process`` path already routes through
             # ``CortexAppController``; the WS path previously left this
@@ -436,6 +562,39 @@ class CortexApp:
         self._bridge.intervention_restored.connect(self._on_restore)
         self._bridge.settings_synced.connect(self._on_settings_synced)
         self._bridge.connection_changed.connect(self._on_connection_changed)
+        # P0 §3.1 / §3.2 / §3.3: route inbound history / trends / recap
+        # frames from the WS bridge straight to the dashboard. The
+        # dashboard delegates to the HistoryTab and RecapSheet
+        # internally.
+        if self._dashboard is not None:
+            self._bridge.session_list_received.connect(
+                self._dashboard.apply_session_list,
+            )
+            self._bridge.session_detail_received.connect(
+                self._dashboard.apply_session_detail,
+            )
+            self._bridge.trends_received.connect(
+                self._dashboard.apply_trends,
+            )
+            self._bridge.session_recap_received.connect(
+                self._dashboard.apply_session_recap,
+            )
+
+        # P0 §3.4: queue calibration progress onto the Qt main thread so
+        # the onboarding card and dashboard freshness pill stay in sync
+        # with the worker-thread runner.
+        if self._bridge is not None and hasattr(self._bridge, "calibration_progress"):
+            self._bridge.calibration_progress.connect(
+                self._on_calibration_progress
+            )
+
+        # P0 §3.4: queue calibration progress onto the Qt main thread so
+        # the onboarding card and dashboard freshness pill stay in sync
+        # with the worker-thread runner.
+        if self._bridge is not None and hasattr(self._bridge, "calibration_progress"):
+            self._bridge.calibration_progress.connect(
+                self._on_calibration_progress
+            )
 
         # Connect overlay dismiss to user action
         self._overlay.dismissed.connect(self._on_overlay_dismissed)
@@ -458,6 +617,14 @@ class CortexApp:
         self._onboarding.open_settings_requested.connect(self._show_settings)
         self._onboarding.run_calibration_requested.connect(self._run_calibration)
         self._onboarding.completed.connect(self._complete_onboarding)
+        # P0 §3.4: Settings → Sensing → Recalibrate baselines also drives
+        # the same in-process CalibrationRunner code path.
+        if hasattr(self._settings, "recalibrate_requested"):
+            self._settings.recalibrate_requested.connect(self._run_calibration)
+        # P0 §3.4: Settings → Sensing → Recalibrate baselines also drives
+        # the same in-process CalibrationRunner code path.
+        if hasattr(self._settings, "recalibrate_requested"):
+            self._settings.recalibrate_requested.connect(self._run_calibration)
         # Audit-2 fix: ask the remote daemon to reload LLM credentials
         # after a BYOK save. Settings change with reload_llm_credentials=True
         # is the WS-protocol-friendly way to signal hot-reload.
@@ -480,8 +647,17 @@ class CortexApp:
         # Start WebSocket connection
         self._bridge.start()
 
-        # Handle SIGINT gracefully
-        signal.signal(signal.SIGINT, lambda *_: self._quit())
+        # Phase 4.B fix (#4): route Cmd+W on the dashboard (which fires
+        # ``lastWindowClosed`` with our ``setQuitOnLastWindowClosed(False)``
+        # tray-resident config) through the two-phase recap when a
+        # session is active.
+        try:
+            self._app.lastWindowClosed.connect(self._on_user_initiated_quit)
+        except Exception:
+            logger.debug("lastWindowClosed connect failed", exc_info=True)
+        # Handle SIGINT gracefully — route via user-initiated quit so a
+        # Ctrl+C from a dev terminal also gets the recap when applicable.
+        signal.signal(signal.SIGINT, lambda *_: self._on_user_initiated_quit())
         # Timer to allow Python signal handling
         timer = QTimer()
         timer.timeout.connect(lambda: None)
@@ -692,24 +868,176 @@ class CortexApp:
         except Exception:
             logger.warning("Connections panel unavailable", exc_info=True)
 
-    def _request_remote_shutdown(self) -> None:
-        """E.1 / E.4: tear down the daemon when the dashboard Stop button fires.
+    @Slot()
+    def _on_daemon_stop_requested(self) -> None:
+        """Phase 4.B fix (#3): WS-mode equivalent of the in-process
+        controller's daemon-stop slot. Sends the top-level ``SHUTDOWN``
+        WS frame (with the bridge's cached capability token) so the
+        daemon's ``_request_shutdown`` runs → which broadcasts
+        SESSION_RECAP and then exits.
 
-        Sends a top-level ``SHUTDOWN`` WS message (which the daemon's
-        websocket_server handles via ``_request_shutdown`` → SIGTERM) and
-        then quits the shell after the daemon has time to release the
-        camera + WebSocket. The previous implementation used
-        ``send_user_action("shutdown", "")`` which the daemon silently
-        dropped because the action handler requires an intervention_id.
+        Does NOT quit Qt. The dashboard's recap watchdog (or the recap
+        sheet dismissal) will fire ``gui_quit_requested`` once the user
+        has consumed the recap.
         """
-        if self._bridge is not None:
-            try:
-                self._bridge.send_shutdown()
-            except Exception:
-                pass
-        # Give the daemon ~1s to receive and act on SHUTDOWN before the
-        # shell exits (WS close races with the daemon's flush logic).
-        QTimer.singleShot(1000, self._quit)
+        if self._bridge is None:
+            logger.warning(
+                "daemon_stop_requested: no bridge; falling through to quit"
+            )
+            self._on_gui_quit_requested()
+            return
+        try:
+            self._bridge.send_shutdown()
+        except Exception:
+            logger.exception("send_shutdown raised")
+
+    @Slot()
+    def _on_gui_quit_requested(self) -> None:
+        """Phase 4.B fix (#3): WS-mode equivalent of the controller's
+        Qt-quit slot. Runs the regular ``_quit`` path."""
+        logger.info("GUI quit requested — exiting Qt event loop (WS mode)")
+        self._quit()
+
+    def _on_user_initiated_quit(self) -> None:
+        """Phase 4.B fix (#4): tray Quit / Cmd+W / SIGINT entry point.
+
+        Routes through the dashboard's two-phase recap when a session is
+        active so the user always sees their recap before the WS-mode
+        shell exits. Falls through to a direct quit otherwise.
+
+        Unlike the in-process controller we can't introspect the
+        daemon directly — the daemon lives across the WS. We use the
+        bridge's connection state plus the dashboard's stop-state as
+        proxies for "is there an active session?".
+        """
+        bridge = self._bridge
+        dashboard = self._dashboard
+        if dashboard is None:
+            self._on_gui_quit_requested()
+            return
+        consumer = getattr(dashboard, "_consumer", None)
+        if consumer is None:
+            self._on_gui_quit_requested()
+            return
+        if getattr(consumer, "_stopping", False):
+            logger.debug(
+                "user_initiated_quit: stop already armed; ignoring"
+            )
+            return
+        # If we're not connected to the daemon, there's no recap to
+        # wait for — quit directly.
+        if bridge is None or not getattr(bridge, "_running", False):
+            logger.debug(
+                "user_initiated_quit: bridge not running; quitting directly"
+            )
+            self._on_gui_quit_requested()
+            return
+        logger.info(
+            "user_initiated_quit: arming two-phase stop via consumer tab"
+        )
+        try:
+            consumer._arm_stop()
+        except Exception:
+            logger.exception(
+                "Failed to arm two-phase stop from user-initiated quit"
+            )
+            self._on_gui_quit_requested()
+
+    @Slot(object, int)
+    def _on_history_requested(self, since: object, limit: int) -> None:
+        """P0 §3.1: forward a dashboard history request onto the WS wire.
+
+        Phase 4.B fix (#28): on bridge-side failures post an empty error
+        envelope through the bridge so the UI's loading state unsticks.
+        """
+        bridge = self._bridge
+        if bridge is None:
+            self._post_history_error("daemon_unavailable")
+            return
+        try:
+            since_val = float(since) if since is not None else None
+        except (TypeError, ValueError):
+            since_val = None
+        try:
+            bridge.send_request_session_list(since_val, int(limit) if limit else 30)
+        except Exception:
+            logger.exception("send_request_session_list failed")
+            self._post_history_error("send_failed")
+
+    @Slot(str)
+    def _on_detail_requested(self, session_id: str) -> None:
+        """P0 §3.1: forward a dashboard detail request onto the WS wire."""
+        bridge = self._bridge
+        if bridge is None:
+            self._post_detail_error("daemon_unavailable")
+            return
+        if not session_id:
+            self._post_detail_error("missing_session_id")
+            return
+        try:
+            bridge.send_request_session_detail(session_id)
+        except Exception:
+            logger.exception("send_request_session_detail failed")
+            self._post_detail_error("send_failed")
+
+    @Slot(str, bool)
+    def _on_trends_requested(self, window: str, refresh: bool) -> None:
+        """P0 §3.2: forward a dashboard trends request onto the WS wire."""
+        bridge = self._bridge
+        win = window if window in ("week", "month") else "week"
+        if bridge is None:
+            self._post_trends_error(win, "daemon_unavailable")
+            return
+        try:
+            bridge.send_request_trends(win, bool(refresh))
+        except Exception:
+            logger.exception("send_request_trends failed")
+            self._post_trends_error(win, "send_failed")
+
+    def _post_history_error(self, reason: str) -> None:
+        """Phase 4.B fix (#28): emit an empty-list error envelope so the
+        History tab's loading state converts into an error state instead
+        of staying stuck waiting for a SESSION_LIST that will never arrive.
+        """
+        if self._bridge is None:
+            return
+        try:
+            self._bridge.session_list_received.emit({
+                "items": [],
+                "next_cursor": None,
+                "total_known": 0,
+                "error": reason,
+            })
+        except Exception:
+            logger.debug(
+                "history error envelope emit failed", exc_info=True
+            )
+
+    def _post_detail_error(self, reason: str) -> None:
+        if self._bridge is None:
+            return
+        try:
+            self._bridge.session_detail_received.emit({
+                "report": None,
+                "error": reason,
+            })
+        except Exception:
+            logger.debug(
+                "detail error envelope emit failed", exc_info=True
+            )
+
+    def _post_trends_error(self, window: str, reason: str) -> None:
+        if self._bridge is None:
+            return
+        try:
+            self._bridge.trends_received.emit({
+                "window": window,
+                "error": reason,
+            })
+        except Exception:
+            logger.debug(
+                "trends error envelope emit failed", exc_info=True
+            )
 
     def _send_goal(self, goal: str) -> None:
         """Forward the dashboard goal-input text to the daemon."""
@@ -721,11 +1049,100 @@ class CortexApp:
             pass
 
     def _run_calibration(self) -> None:
-        """Kick off calibration in a detached subprocess."""
-        try:
-            subprocess.Popen([sys.executable, "-m", "cortex.scripts.calibrate"])
-        except OSError as exc:
-            logger.error("Failed to launch calibration: %s", exc)
+        """Run calibration in-process on a worker thread.
+
+        P0 §3.4 — replaces the legacy subprocess spawn. The WS-mode
+        CortexApp does not own the daemon's event loop (the daemon is
+        a separate process listening on 9473), so we spin up our own
+        asyncio loop on a Qt worker thread and drive the
+        ``CalibrationRunner`` there. Progress callbacks marshal onto
+        the Qt main thread via the existing ``calibration_progress``
+        signal on the WebSocket bridge.
+        """
+        from cortex.services.capture_service.calibration_runner import (
+            CalibrationRunner,
+        )
+
+        if getattr(self, "_calibration_runner", None) is not None:
+            logger.info("calibration already running; ignoring duplicate request")
+            return
+
+        def _progress_cb(progress: object) -> None:
+            payload = {
+                "elapsed_seconds": float(getattr(progress, "elapsed_seconds", 0.0)),
+                "total_seconds": float(getattr(progress, "total_seconds", 0.0)),
+                "current_hr": getattr(progress, "current_hr", None),
+                "current_hrv": getattr(progress, "current_hrv", None),
+                "current_sqi": getattr(progress, "current_sqi", None),
+                "lighting_ok": bool(getattr(progress, "lighting_ok", False)),
+                "motion_ok": bool(getattr(progress, "motion_ok", False)),
+                "face_ok": bool(getattr(progress, "face_ok", False)),
+                "pct_complete": float(getattr(progress, "pct_complete", 0.0)),
+                "status": str(getattr(progress, "status", "running")),
+            }
+            try:
+                if hasattr(self._bridge, "calibration_progress"):
+                    self._bridge.calibration_progress.emit(payload)
+                if self._onboarding is not None and hasattr(
+                    self._onboarding, "apply_calibration_progress"
+                ):
+                    # In WS-mode the bridge may not carry a progress
+                    # signal; call the slot directly (the runner thread
+                    # is fine here because PySide6 queues cross-thread).
+                    self._onboarding.apply_calibration_progress(**payload)
+            except Exception:
+                logger.debug("calibration progress emit failed", exc_info=True)
+
+        runner = CalibrationRunner()
+        self._calibration_runner = runner
+
+        async def _drive() -> None:
+            try:
+                await runner.start(on_progress=_progress_cb)
+                await runner.finish()
+            except Exception:
+                logger.exception("calibration run failed")
+            finally:
+                self._calibration_runner = None
+
+        def _worker() -> None:
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(_drive())
+            finally:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+
+        threading.Thread(
+            target=_worker,
+            name="cortex-calibration",
+            daemon=True,
+        ).start()
+
+    def _on_calibration_progress(self, payload: dict) -> None:
+        """Queue-connected slot — receives calibration progress on the
+        Qt main thread. Forwards to the onboarding card and, on
+        completion, refreshes the freshness pills on the dashboard and
+        in Settings."""
+        if self._onboarding is not None and hasattr(
+            self._onboarding, "apply_calibration_progress"
+        ):
+            try:
+                self._onboarding.apply_calibration_progress(**payload)
+            except Exception:
+                logger.debug("apply_calibration_progress failed", exc_info=True)
+        if payload.get("status") == "completed":
+            for surface in (self._dashboard, self._settings):
+                if surface is not None and hasattr(
+                    surface, "refresh_baseline_freshness"
+                ):
+                    try:
+                        surface.refresh_baseline_freshness()
+                    except Exception:
+                        logger.debug("freshness refresh failed", exc_info=True)
 
     def _complete_onboarding(self) -> None:
         """Mark onboarding complete for future launches."""

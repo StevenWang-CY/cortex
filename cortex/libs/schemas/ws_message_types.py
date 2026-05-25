@@ -115,6 +115,35 @@ class MessageType(str, Enum):  # noqa: UP042 — pydantic-to-typescript requires
     SHUTDOWN = "SHUTDOWN"
     """Request the daemon shut itself down (gated by capability token)."""
 
+    REQUEST_SESSION_LIST = "REQUEST_SESSION_LIST"
+    """P0 §3.1: client asks for a paginated session-history listing.
+
+    Payload: ``{since: float | None, limit: int}`` where ``since`` is an
+    epoch-seconds cursor returned by the previous ``SESSION_LIST`` reply
+    (``next_cursor``) and ``limit`` is the page size (server clamps to
+    1..100; default 30). Reply: ``SESSION_LIST``."""
+
+    REQUEST_SESSION_DETAIL = "REQUEST_SESSION_DETAIL"
+    """P0 §3.1: client asks for the full ``SessionReport`` for one id.
+
+    Payload: ``{session_id: str}``. Reply: ``SESSION_DETAIL`` (or an
+    empty payload + ``error`` field if the file is missing or corrupt)."""
+
+    REQUEST_TRENDS = "REQUEST_TRENDS"
+    """P0 §3.2: client asks for the longitudinal trend / chronotype rollup.
+
+    Payload: ``{window: "week" | "month" | "quarter", refresh: bool}``.
+    ``refresh`` forces a recompute from disk; default is False (serve the
+    cached ``model.json``). Reply: ``TRENDS_PAYLOAD``."""
+
+    REQUEST_SESSION_RECAP = "REQUEST_SESSION_RECAP"
+    """P0 §3.3: client re-requests the most-recent SESSION_RECAP envelope.
+
+    Sent by surfaces (browser extension popup) that joined after the live
+    broadcast was emitted, so the recap card can be shown on next open.
+    Payload: ``{}``. Reply: ``SESSION_RECAP`` (or empty payload if no
+    recap is cached yet)."""
+
     # ─── Daemon → Client (outbound, made by _make_* helpers) ─────────
 
     AUTH_OK = "AUTH_OK"
@@ -164,6 +193,30 @@ class MessageType(str, Enum):  # noqa: UP042 — pydantic-to-typescript requires
     ``{intervention_id: str, action: SuggestedAction.model_dump()}``.
     The receiver runs ``executeAction(action)`` then sends back the
     standard ``ACTION_EXECUTE`` log message."""
+
+    SESSION_LIST = "SESSION_LIST"
+    """P0 §3.1: paginated session-history listing reply.
+
+    Payload mirrors :class:`SessionListResponse` (items + next_cursor)."""
+
+    SESSION_DETAIL = "SESSION_DETAIL"
+    """P0 §3.1: full ``SessionReport`` reply for the requested id.
+
+    Payload: ``{report: SessionReport | None, error: str | None}``."""
+
+    TRENDS_PAYLOAD = "TRENDS_PAYLOAD"
+    """P0 §3.2: longitudinal rollup reply.
+
+    Payload mirrors :class:`TrendsResponse` (window + daily + chronotype)."""
+
+    SESSION_RECAP = "SESSION_RECAP"
+    """P0 §3.3: end-of-session recap broadcast.
+
+    Emitted after ``SessionReportGenerator.finish()`` completes and the
+    atomic write succeeds but BEFORE the daemon tears the WS server down,
+    so the desktop shell can show its slide-up recap sheet and the
+    browser-extension popup can cache the summary for next open. Payload
+    mirrors :class:`SessionReport` (model_dump(mode='json'))."""
 
     # ─── LeetCode adapter cues (Daemon → Chrome, target_client_types=["chrome"]) ─
     # Emitted by ``LeetCodeAdapter.execute`` via

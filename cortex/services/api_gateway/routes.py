@@ -48,6 +48,11 @@ from cortex.libs.schemas.intervention import (
     InterventionPlan,
     WorkspaceSnapshot,
 )
+from cortex.libs.schemas.session_history import (
+    SessionDetailResponse,
+    SessionListResponse,
+    TrendsResponse,
+)
 from cortex.libs.schemas.state import SignalQuality, StateEstimate, StateScores
 from cortex.services.intervention_engine import capture_snapshot, prepare_plan
 
@@ -899,3 +904,91 @@ async def launch_project(project_name: str, request: Request) -> LaunchProjectRe
             project_name=project_name,
             errors=["launch_failed"],
         )
+
+
+# =============================================================================
+# P0 §3.1 / §3.2: Session history + trends (REST parity with the WS messages)
+# =============================================================================
+#
+# These three routes mirror the WS handlers in ``websocket_server.py``. They
+# are mounted on the authenticated ``router`` so the capability token
+# (``require_capability_token``) is required — identical gating to every
+# other mutating Cortex endpoint. The daemon registers itself in the
+# service registry under ``"daemon"`` (see ``runtime_daemon._register_services``)
+# so we resolve through the same indirection ``/api/launch/<name>`` uses for
+# the project launcher.
+
+
+@router.get("/api/sessions", response_model=SessionListResponse)
+async def get_sessions(
+    request: Request,
+    since: float | None = None,
+    limit: int = 30,
+) -> SessionListResponse:
+    """P0 §3.1: paginated session history listing.
+
+    Query params:
+        since: epoch-seconds cursor returned by the previous reply's
+            ``next_cursor`` (None for the first page).
+        limit: page size; clamped to [1, 100] inside the daemon.
+    """
+    reg = _get_registry(request)
+    daemon = reg.get("daemon")
+    if daemon is None or not hasattr(daemon, "list_sessions"):
+        return SessionListResponse()
+    try:
+        return await daemon.list_sessions(since, limit)
+    except Exception:
+        logger.exception("GET /api/sessions failed")
+        return SessionListResponse()
+
+
+@router.get("/api/sessions/{session_id}", response_model=SessionDetailResponse)
+async def get_session_detail(
+    request: Request,
+    session_id: str,
+) -> SessionDetailResponse:
+    """P0 §3.1: full ``SessionReport`` for one id.
+
+    The daemon validates ``session_id`` against the safe-char regex
+    before constructing any filesystem path (defense vs path
+    traversal). A missing / unparsable file returns
+    ``{report: None, error: "not_found"|"unreadable"}``.
+    """
+    reg = _get_registry(request)
+    daemon = reg.get("daemon")
+    if daemon is None or not hasattr(daemon, "get_session"):
+        return SessionDetailResponse(report=None, error="not_found")
+    try:
+        return await daemon.get_session(session_id)
+    except Exception:
+        logger.exception("GET /api/sessions/{} failed", session_id)
+        return SessionDetailResponse(report=None, error="unreadable")
+
+
+@router.get("/api/trends", response_model=TrendsResponse)
+async def get_trends_route(
+    request: Request,
+    window: Literal["week", "month", "quarter"] = "week",
+    refresh: bool = False,
+) -> TrendsResponse:
+    """P0 §3.2: longitudinal trend / chronotype rollup.
+
+    Query params:
+        window: ``"week"`` (last 7 days), ``"month"`` (last 30), or
+            ``"quarter"`` (last 90).
+        refresh: when True, forces a recompute from disk before
+            returning (slower but always-fresh). Defaults to False
+            so the dashboard serves the cached ``model.json``.
+    """
+    reg = _get_registry(request)
+    daemon = reg.get("daemon")
+    if daemon is None or not hasattr(daemon, "get_trends"):
+        # Empty placeholder so the UI can still render a "no data yet"
+        # state without crashing.
+        return TrendsResponse(window=window)
+    try:
+        return await daemon.get_trends(window, refresh=refresh)
+    except Exception:
+        logger.exception("GET /api/trends failed (window=%s)", window)
+        return TrendsResponse(window=window)

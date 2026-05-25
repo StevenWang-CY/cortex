@@ -63,6 +63,11 @@ def test_message_type_catalog_covers_dispatch_arms() -> None:
         "LEETCODE_CONTEXT_UPDATE",
         "INTERVENTION_APPLIED",
         "SHUTDOWN",
+        # P0 §3.1 / §3.2 / §3.3 — history / trends / recap re-fetch
+        "REQUEST_SESSION_LIST",
+        "REQUEST_SESSION_DETAIL",
+        "REQUEST_TRENDS",
+        "REQUEST_SESSION_RECAP",
     }
     catalog = {m.value for m in MessageType}
     missing = dispatched_inbound - catalog
@@ -84,6 +89,11 @@ def test_message_type_catalog_covers_outbound() -> None:
         "MORNING_BRIEFING",
         "COPILOT_THROTTLE",
         "AMBIENT_STATE_UPDATE",
+        # P0 §3.1 / §3.2 / §3.3 — history / trends / recap broadcast
+        "SESSION_LIST",
+        "SESSION_DETAIL",
+        "TRENDS_PAYLOAD",
+        "SESSION_RECAP",
     }
     catalog = {m.value for m in MessageType}
     missing = outbound - catalog

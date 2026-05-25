@@ -25,6 +25,7 @@ from __future__ import annotations
 import collections
 import logging
 import time
+from typing import Any
 
 from PySide6.QtCore import Qt, QTimer, Signal
 
@@ -147,6 +148,96 @@ from cortex.apps.desktop_shell.tokens import (
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# P0 §3.4 — Baseline freshness helpers (shared with the Settings dialog).
+# ---------------------------------------------------------------------------
+
+
+def _baseline_default_path() -> "object":
+    """Resolve `storage/baselines/default.json` via the active config.
+    Lazy-imported so the dashboard stays importable under test stubs."""
+    from pathlib import Path
+
+    try:
+        from cortex.libs.config.settings import get_config
+
+        return Path(get_config().storage.path) / "baselines" / "default.json"
+    except Exception:
+        return Path("storage") / "baselines" / "default.json"
+
+
+def _baseline_age_days(now: float | None = None) -> float | None:
+    """Age of the default baseline file in days, or None if missing."""
+    target = _baseline_default_path()
+    try:
+        if not target.exists():
+            return None
+        current = now if now is not None else time.time()
+        return max(0.0, (current - target.stat().st_mtime) / 86400.0)
+    except OSError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# P0 §3.4 — Baseline freshness helpers (shared with the Settings dialog).
+# ---------------------------------------------------------------------------
+
+
+def _baseline_default_path() -> "object":
+    """Resolve `storage/baselines/default.json` via the active config.
+    Lazy-imported so the dashboard stays importable under test stubs."""
+    from pathlib import Path
+
+    try:
+        from cortex.libs.config.settings import get_config
+
+        return Path(get_config().storage.path) / "baselines" / "default.json"
+    except Exception:
+        return Path("storage") / "baselines" / "default.json"
+
+
+def _baseline_age_days(now: float | None = None) -> float | None:
+    """Age of the default baseline file in days, or None if missing."""
+    target = _baseline_default_path()
+    try:
+        if not target.exists():
+            return None
+        current = now if now is not None else time.time()
+        return max(0.0, (current - target.stat().st_mtime) / 86400.0)
+    except OSError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# P0 §3.4 — Baseline freshness helpers (shared with the Settings dialog).
+# ---------------------------------------------------------------------------
+
+
+def _baseline_default_path() -> "object":
+    """Resolve `storage/baselines/default.json` via the active config.
+    Lazy-imported so the dashboard stays importable under test stubs."""
+    from pathlib import Path
+
+    try:
+        from cortex.libs.config.settings import get_config
+
+        return Path(get_config().storage.path) / "baselines" / "default.json"
+    except Exception:
+        return Path("storage") / "baselines" / "default.json"
+
+
+def _baseline_age_days(now: float | None = None) -> float | None:
+    """Age of the default baseline file in days, or None if missing."""
+    target = _baseline_default_path()
+    try:
+        if not target.exists():
+            return None
+        current = now if now is not None else time.time()
+        return max(0.0, (current - target.stat().st_mtime) / 86400.0)
+    except OSError:
+        return None
+
 _MAX_HR_HISTORY = 120
 _MAX_TIMELINE_EVENTS = 50
 
@@ -155,6 +246,13 @@ _MAX_TIMELINE_EVENTS = 50
 # the audit-plan budget; controller's ``daemon_stopped`` signal short-circuits
 # this when the daemon actually reports stopped.
 _STOP_SAFETY_TIMEOUT_MS = 10_000
+
+# P0 §3.3 / Phase 4.B (#25): max time we wait for a SESSION_RECAP broadcast
+# after the user clicks Stop. The daemon itself uses a 5 s wait_for around
+# its broadcast; we add 1 s slack so the daemon's broadcast normally wins
+# the race. If neither the recap nor the daemon respond inside this window
+# the dashboard finalises the stop anyway so the Qt app can exit.
+_RECAP_WATCHDOG_MS = 6_000
 
 # Resolved semantic colors. These hex strings are dev-mode fallbacks; on
 # macOS, ``mac_native`` re-tints widgets at runtime when the user toggles
@@ -313,6 +411,29 @@ class _MacSegmentedControl(QWidget):
             b.setChecked(i == index)
         self.selection_changed.emit(index)
 
+    def set_selected(self, index: int) -> None:
+        """Programmatically activate a segment and emit
+        ``selection_changed`` so subscribers (e.g. the QStackedWidget)
+        re-sync.
+
+        Phase 4.B fix (#22): provides a public API for the dashboard's
+        ``_on_recap_view_full`` so it no longer has to reach into the
+        private ``_buttons`` list. Out-of-range indices are clamped
+        defensively; a negative or oversized index becomes a no-op
+        rather than raising. The emitted ``selection_changed`` signal
+        is the same one the user click path emits — listeners cannot
+        tell the difference.
+        """
+        if not self._buttons:
+            return
+        if index < 0 or index >= len(self._buttons):
+            logger.debug(
+                "_MacSegmentedControl.set_selected: index %d out of range",
+                index,
+            )
+            return
+        self._on_clicked(index)
+
 
 # ---------------------------------------------------------------------------
 # Tab 1: Consumer Dashboard
@@ -321,10 +442,26 @@ class _MacSegmentedControl(QWidget):
 class _ConsumerTab(QWidget):
     """Clean biometrics dashboard — native materials, brand identity intact."""
 
-    # E.1: surface user intent for the daemon orchestrator. The shell only
-    # owns the widgets; the parent dashboard re-emits these signals so the
-    # desktop app (in-process or WebSocket mode) can route them to
-    # ``RuntimeDaemon._handle_user_action`` and to ``_shutdown_daemon``.
+    # Phase 4.B fix (#1): split the legacy ``stop_requested`` signal into
+    # two distinct concerns so the DMG-mode stop deadlock is fixed.
+    #
+    # * ``daemon_stop_requested`` — emitted IMMEDIATELY on the Stop click
+    #   (inside ``_arm_stop``). The controller hears this and schedules
+    #   ``daemon.stop()`` so the SESSION_RECAP broadcast pipeline can
+    #   actually run. Without this immediate fan-out the daemon never
+    #   knows the user wants to stop and the recap sheet is unreachable.
+    #
+    # * ``gui_quit_requested`` — emitted ONCE from ``_finalize_stop``
+    #   (after recap dismiss / watchdog / safety expiry). The controller
+    #   hears this and quits the Qt app.
+    #
+    # The legacy ``stop_requested`` signal is preserved as an ALIAS of
+    # ``daemon_stop_requested`` so existing call sites (tests, tray
+    # wiring, WS-mode CortexApp) keep working without modification. The
+    # alias only fires the daemon-stop emit — quit is gated separately
+    # on ``gui_quit_requested``.
+    daemon_stop_requested = Signal()
+    gui_quit_requested = Signal()
     stop_requested = Signal()
     goal_set = Signal(str)
 
@@ -394,7 +531,33 @@ class _ConsumerTab(QWidget):
             f"background: {_GROUPED_BG}; border-radius: {RADIUS_PILL}px;"
         )
         header.addWidget(self._state_badge, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        # P0 §3.4 — baseline freshness pill. Hidden when the baseline
+        # file doesn't exist (so we don't shame the user mid-onboarding)
+        # and quiet when fresh. >30 days old it surfaces a subtle
+        # "Recalibrate?" link.
+        self._baseline_pill = QLabel("")
+        self._baseline_pill.setFont(
+            mac_native.system_font(FS_CAPTION, "medium")
+        )
+        self._baseline_pill.setVisible(False)
+        self._baseline_pill.setStyleSheet(
+            f"color: {_LABEL_TERTIARY}; background: {_GROUPED_BG};"
+            f" border-radius: {RADIUS_PILL}px; padding: 3px 10px;"
+            " margin-left: 8px;"
+        )
+        header.addWidget(
+            self._baseline_pill, alignment=Qt.AlignmentFlag.AlignVCenter
+        )
+
         root.addLayout(header)
+        # Run an initial freshness check so the pill is correct on first
+        # paint. The controller / main app also calls refresh on a
+        # completed calibration.
+        try:
+            self.refresh_baseline_freshness()
+        except Exception:
+            logger.debug("initial baseline freshness check failed", exc_info=True)
 
         # ── Goal input — minimum width, flexible (HIG: avoid fixed sizes) ──
         self._goal_input = QLineEdit()
@@ -763,6 +926,34 @@ class _ConsumerTab(QWidget):
         widget.setStyleSheet(qss)
         return True
 
+    def refresh_baseline_freshness(self) -> None:
+        """P0 §3.4 — refresh the freshness pill next to the state badge.
+
+        Hidden when the baseline file does not exist (don't shame users
+        during onboarding). When >30 days old we surface a quiet
+        "Recalibrate?" prompt; otherwise the pill stays hidden so the
+        dashboard chrome remains uncluttered."""
+        pill = getattr(self, "_baseline_pill", None)
+        if pill is None:
+            return
+        try:
+            age = _baseline_age_days()
+        except Exception:
+            return
+        if age is None:
+            pill.setVisible(False)
+            return
+        if age > 30.0:
+            pill.setText("Stale baseline · Recalibrate?")
+            pill.setStyleSheet(
+                f"color: {BRAND_ACCENT}; background: {_GROUPED_BG};"
+                f" border-radius: {RADIUS_PILL}px; padding: 3px 10px;"
+                " margin-left: 8px;"
+            )
+            pill.setVisible(True)
+        else:
+            pill.setVisible(False)
+
     def update_state(self, payload: dict) -> None:
         # Phase J-3: first frame retires the empty state. The flag is
         # sticky so a transient WS disconnect doesn't collapse the UI
@@ -1001,26 +1192,114 @@ class _ConsumerTab(QWidget):
     # ------------------------------------------------------------------
 
     def _handle_stop_clicked(self) -> None:
-        """Disable the Stop button, swap its text to "Stopping…", arm the
-        safety timer, then emit ``stop_requested`` exactly once. Double-clicks
-        are silently coalesced because the second click lands on a disabled
-        button (the ``clicked`` signal still fires in some Qt versions when a
-        button transitions to disabled mid-event, so we also guard with
-        ``self._stopping``)."""
+        """Thin wrapper preserved for external call sites. Delegates to
+        :meth:`_arm_stop` so the dashboard's two-phase stop flow (P0
+        §3.3) is the single source of truth."""
+        self._arm_stop()
+
+    def _arm_stop(self) -> None:
+        """P0 §3.3 phase 1 — fire the daemon-stop request, disarm the
+        Stop affordance, and *wait* for the SESSION_RECAP broadcast
+        before quitting Qt.
+
+        Phase 4.B fix (#1): the previous implementation did NOT emit
+        any signal here. The daemon therefore never received a stop
+        request, the SESSION_RECAP pipeline never ran, and the recap
+        sheet was unreachable — every click ended in the 6 s watchdog
+        firing followed by a hard quit. The new contract:
+
+        * ``daemon_stop_requested`` fires IMMEDIATELY. The controller
+          schedules ``daemon.stop()`` on its asyncio loop; this kicks
+          off the SESSION_RECAP broadcast pipeline (or short-session
+          synthetic empty-payload broadcast).
+        * The safety + recap watchdogs arm so the GUI doesn't wedge
+          if either the recap or the daemon never report back.
+        * ``gui_quit_requested`` is deferred to :meth:`_finalize_stop`,
+          which fires when the recap is dismissed / the watchdog
+          expires / the safety timer expires.
+
+        Double clicks are coalesced via ``self._stopping``.
+        """
         if getattr(self, "_stopping", False):
             return
         self._stopping = True
         self._stop_btn.setEnabled(False)
         self._stop_btn.setText("Stopping…")
         self._stop_safety_timer.start()
-        self.stop_requested.emit()
+        # Recap-watchdog: if no SESSION_RECAP arrives in
+        # ``_RECAP_WATCHDOG_MS`` ms, proceed with quit anyway. Matches
+        # the daemon's own 5 s broadcast timeout with a small slack so
+        # we lose to the daemon by default, not the other way around.
+        if getattr(self, "_recap_watchdog", None) is None:
+            self._recap_watchdog = QTimer(self)
+            self._recap_watchdog.setSingleShot(True)
+            self._recap_watchdog.setInterval(_RECAP_WATCHDOG_MS)
+            self._recap_watchdog.timeout.connect(self._on_recap_watchdog_expired)
+        self._recap_finalised = False
+        self._recap_watchdog.start()
+        # Phase 4.B fix (#1): emit the daemon-stop request IMMEDIATELY.
+        # Without this, the controller never schedules ``daemon.stop()``
+        # and the SESSION_RECAP pipeline never runs.
+        try:
+            self.daemon_stop_requested.emit()
+        except Exception:
+            logger.debug("daemon_stop_requested.emit raised", exc_info=True)
+        # Preserve the legacy alias so existing call sites (tests, tray
+        # wiring, WS-mode CortexApp) keep working. The legacy contract
+        # now means "ask the daemon to stop" — quit is gated separately
+        # on ``gui_quit_requested``.
+        try:
+            self.stop_requested.emit()
+        except Exception:
+            logger.debug("stop_requested.emit (legacy alias) raised", exc_info=True)
+
+    def _on_recap_watchdog_expired(self) -> None:
+        """Called when the 6 s recap watchdog fires without a recap.
+
+        Short sessions (<90 s) never trigger SESSION_RECAP server-side,
+        so this is the expected path for them. Proceeds straight to
+        :meth:`_finalize_stop`.
+        """
+        logger.info("Recap watchdog expired; finalising stop without recap sheet")
+        self._finalize_stop()
+
+    def _finalize_stop(self) -> None:
+        """P0 §3.3 phase 2 — quit the Qt app now that the recap has been
+        consumed (or its watchdog expired). Idempotent; safe to call
+        from the recap-sheet dismiss handler, the recap-watchdog, the
+        safety timer, or the controller's own shutdown path.
+
+        Phase 4.B fix (#1): emits ``gui_quit_requested`` rather than
+        the legacy ``stop_requested``. The daemon-stop signal was
+        already fired from :meth:`_arm_stop`; this signal is solely
+        about quitting the GUI now that the user has seen the recap.
+        """
+        if getattr(self, "_recap_finalised", False):
+            return
+        self._recap_finalised = True
+        if getattr(self, "_recap_watchdog", None) is not None:
+            try:
+                self._recap_watchdog.stop()
+            except Exception:
+                pass
+        try:
+            self.gui_quit_requested.emit()
+        except Exception:
+            logger.debug("gui_quit_requested.emit raised", exc_info=True)
 
     def _stop_safety_expired(self) -> None:
         """F34 safety net: if the daemon never reports stopped, re-enable
-        the button so the user can try again rather than be wedged."""
+        the button so the user can try again rather than be wedged.
+
+        Also force-finalises the recap flow so a missed SESSION_RECAP
+        cannot wedge the user inside ``_arm_stop`` indefinitely.
+        """
         logger.warning(
             "Stop button safety timeout fired; re-enabling without daemon ack"
         )
+        # Finalise before re-enabling so the daemon does receive the
+        # stop request even on the slow path.
+        self._finalize_stop()
         self.notify_daemon_stopped()
 
     def notify_daemon_stopped(self) -> None:
@@ -1028,7 +1307,13 @@ class _ConsumerTab(QWidget):
         Idempotent — safe to call from both the daemon-ack path and the
         safety-timer path."""
         self._stop_safety_timer.stop()
+        if getattr(self, "_recap_watchdog", None) is not None:
+            try:
+                self._recap_watchdog.stop()
+            except Exception:
+                pass
         self._stopping = False
+        self._recap_finalised = True  # No more emits expected.
         self._stop_btn.setEnabled(True)
         self._stop_btn.setText("Stop Cortex")
 
@@ -1431,9 +1716,26 @@ class DashboardWindow(QWidget):
     macOS convention for two-segment top-level navigation.
     """
 
-    # E.1: re-emit user-intent signals from the consumer tab.
+    # E.1 / Phase 4.B (#1): re-emit user-intent signals from the
+    # consumer tab. The signal split fixes the DMG stop deadlock:
+    #
+    # * ``daemon_stop_requested`` — emitted on Stop click; tells the
+    #   controller to schedule ``daemon.stop()`` (or send the WS
+    #   SHUTDOWN frame). Does NOT quit Qt.
+    # * ``gui_quit_requested`` — emitted after recap dismiss / watchdog;
+    #   tells the controller to quit the Qt app.
+    # * ``stop_requested`` — legacy alias of ``daemon_stop_requested``,
+    #   preserved for tests and existing wiring. Triggers daemon stop
+    #   only — never quit.
+    daemon_stop_requested = Signal()
+    gui_quit_requested = Signal()
     stop_requested = Signal()
     goal_set = Signal(str)
+    # P0 §3.1 / §3.2: re-emit history-tab user intent so the controller
+    # can route them to the daemon via WS (or in-process direct calls).
+    history_requested = Signal(object, int)  # since, limit
+    detail_requested = Signal(str)  # session_id
+    trends_requested = Signal(str, bool)  # window, refresh
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1451,9 +1753,11 @@ class DashboardWindow(QWidget):
         layout.setSpacing(0)
 
         # Segmented control sits at the top under the unified title bar.
+        # P0 §3.1: add a third "History" segment between Dashboard and
+        # Advanced so the user can browse past sessions and trends.
         seg_container = QHBoxLayout()
         seg_container.setContentsMargins(SP6, SP3, SP6, SP3)
-        self._seg = _MacSegmentedControl(["Dashboard", "Advanced"])
+        self._seg = _MacSegmentedControl(["Dashboard", "History", "Advanced"])
         seg_container.addWidget(self._seg, stretch=1)
         layout.addLayout(seg_container)
 
@@ -1475,17 +1779,43 @@ class DashboardWindow(QWidget):
 
         self._stack = QStackedWidget()
         self._consumer = _ConsumerTab()
+        # P0 §3.1 + §3.2: lazy-import the History tab so a degraded test
+        # harness that swaps out PySide6 keeps the dashboard importable.
+        try:
+            from cortex.apps.desktop_shell.history_tab import HistoryTab
+            self._history_tab: Any = HistoryTab()
+        except Exception:  # pragma: no cover - test stubs / partial Qt
+            logger.debug("HistoryTab unavailable; skipping", exc_info=True)
+            self._history_tab = None
         self._advanced = _AdvancedTab()
         self._timeline_events = self._advanced._timeline_events
         self._stack.addWidget(self._consumer)
+        if self._history_tab is not None:
+            self._stack.addWidget(self._history_tab)
         self._stack.addWidget(self._advanced)
         layout.addWidget(self._stack, stretch=1)
 
         self._seg.selection_changed.connect(self._stack.setCurrentIndex)
 
-        # E.1: forward consumer-tab signals to outer subscribers.
+        # E.1 / Phase 4.B (#1): forward both halves of the consumer tab's
+        # stop flow so the controller can wire them independently.
+        # ``daemon_stop_requested`` (and its legacy alias
+        # ``stop_requested``) tells the controller to ask the daemon to
+        # stop; ``gui_quit_requested`` tells it to quit Qt.
+        self._consumer.daemon_stop_requested.connect(self.daemon_stop_requested.emit)
+        self._consumer.gui_quit_requested.connect(self.gui_quit_requested.emit)
         self._consumer.stop_requested.connect(self.stop_requested.emit)
         self._consumer.goal_set.connect(self.goal_set.emit)
+
+        # P0 §3.1 + §3.2: forward history-tab outgoing signals so the
+        # controller can route them to the daemon via WS or direct call.
+        if self._history_tab is not None:
+            self._history_tab.history_requested.connect(self.history_requested.emit)
+            self._history_tab.detail_requested.connect(self.detail_requested.emit)
+            self._history_tab.trends_requested.connect(self.trends_requested.emit)
+
+        # P0 §3.3: recap sheet — lazy-created on first SESSION_RECAP.
+        self._recap_sheet: Any = None
 
     # -- Lifecycle hook for native chrome --------------------------------
 
@@ -1521,6 +1851,17 @@ class DashboardWindow(QWidget):
         self._consumer.update_state(payload)
         self._advanced.update_state(payload)
 
+    def refresh_baseline_freshness(self) -> None:
+        """P0 §3.4 — proxy down to the consumer tab's pill. Called by
+        the controller after a successful calibration run."""
+        if self._consumer is not None and hasattr(
+            self._consumer, "refresh_baseline_freshness"
+        ):
+            try:
+                self._consumer.refresh_baseline_freshness()
+            except Exception:
+                logger.debug("baseline freshness refresh failed", exc_info=True)
+
     def set_connected(self, connected: bool) -> None:
         self._connected = connected
         self._consumer.set_connected(connected)
@@ -1555,6 +1896,197 @@ class DashboardWindow(QWidget):
         budget. ``_STOP_SAFETY_TIMEOUT_MS`` is the production default."""
         if self._consumer is not None:
             self._consumer._stop_safety_timer.setInterval(int(ms))
+
+    # ------------------------------------------------------------------
+    # P0 §3.1 / §3.2 / §3.3 — public apply slots for incoming WS frames.
+    # ------------------------------------------------------------------
+
+    def apply_session_list(self, payload: dict) -> None:
+        """Route a ``SESSION_LIST`` payload to the History tab."""
+        if self._history_tab is not None:
+            try:
+                self._history_tab.apply_session_list(payload)
+            except Exception:
+                logger.debug("apply_session_list failed", exc_info=True)
+
+    def apply_session_detail(self, payload: dict) -> None:
+        """Route a ``SESSION_DETAIL`` payload to the History tab."""
+        if self._history_tab is not None:
+            try:
+                self._history_tab.apply_session_detail(payload)
+            except Exception:
+                logger.debug("apply_session_detail failed", exc_info=True)
+
+    def apply_trends(self, payload: dict) -> None:
+        """Route a ``TRENDS_PAYLOAD`` payload to the History tab."""
+        if self._history_tab is not None:
+            try:
+                self._history_tab.apply_trends(payload)
+            except Exception:
+                logger.debug("apply_trends failed", exc_info=True)
+
+    def apply_session_recap(self, payload: dict) -> None:
+        """P0 §3.3 — surface the slide-up recap sheet on SESSION_RECAP.
+
+        Lazy-constructs the sheet on first call, then asks it to render
+        the payload. Connects its lifecycle signals to the consumer
+        tab's two-phase stop flow so the daemon shutdown only completes
+        after the user dismisses (or the autohide fires).
+
+        Phase 4.B fix (#16): an empty payload ``{}`` is the synthetic
+        short-session signal from the daemon (Phase 4.A #34). Treat it
+        as an instant finalise — do NOT open the recap sheet for
+        sessions that produced no report.
+
+        Phase 4.B fix (#23): only open the sheet when the consumer tab
+        is mid-stop. A SESSION_RECAP arriving outside the stop flow
+        (e.g. from a Chrome popup's REQUEST_SESSION_RECAP) must not
+        surprise the desktop user with an unexpected slide-up sheet.
+
+        Phase 4.B fix (#24): cancel the consumer tab's recap watchdog
+        on recap arrival so the daemon's 5 s broadcast and the UI's
+        6 s watchdog don't race.
+        """
+        if not isinstance(payload, dict):
+            logger.debug(
+                "apply_session_recap: payload was %s; ignoring", type(payload)
+            )
+            return
+        is_stopping = bool(
+            self._consumer is not None and getattr(self._consumer, "_stopping", False)
+        )
+        # Empty payload = short-session synthetic recap. Finalise the
+        # stop flow directly without opening the sheet. Outside the
+        # stop flow this is just a no-op (nothing to surface).
+        if not payload.get("session_id"):
+            if is_stopping and self._consumer is not None:
+                try:
+                    self._consumer._finalize_stop()
+                except Exception:
+                    logger.debug(
+                        "short-session finalize_stop failed", exc_info=True
+                    )
+            return
+        # Late SESSION_RECAP outside the stop flow (e.g. popup-driven
+        # REQUEST_SESSION_RECAP): drop on the floor for the desktop
+        # shell; the dashboard's History tab is the canonical surface
+        # for past sessions.
+        if not is_stopping:
+            logger.debug(
+                "apply_session_recap: not stopping; ignoring late recap "
+                "for session_id=%s",
+                payload.get("session_id"),
+            )
+            return
+        # Cancel the 6 s recap watchdog now that we know the recap is
+        # about to render. Prevents a race where the watchdog fires
+        # right as the sheet starts animating in.
+        if self._consumer is not None:
+            watchdog = getattr(self._consumer, "_recap_watchdog", None)
+            if watchdog is not None:
+                try:
+                    watchdog.stop()
+                except Exception:
+                    logger.debug(
+                        "recap watchdog stop on recap arrival failed",
+                        exc_info=True,
+                    )
+        if self._recap_sheet is None:
+            try:
+                from cortex.apps.desktop_shell.recap_sheet import RecapSheet
+                self._recap_sheet = RecapSheet(self)
+                self._recap_sheet.dismissed.connect(self._on_recap_dismissed)
+                self._recap_sheet.view_full_report.connect(
+                    self._on_recap_view_full,
+                )
+            except Exception:
+                logger.debug("Failed to construct RecapSheet", exc_info=True)
+                self._recap_sheet = None
+                # Without the sheet, we can't honour the recap contract;
+                # just finalise the stop so the daemon proceeds.
+                if self._consumer is not None:
+                    try:
+                        self._consumer._finalize_stop()
+                    except Exception:
+                        logger.debug("fallback finalize_stop failed", exc_info=True)
+                return
+        try:
+            self._recap_sheet.show_report(payload)
+        except Exception:
+            logger.debug("show_report failed", exc_info=True)
+            if self._consumer is not None:
+                try:
+                    self._consumer._finalize_stop()
+                except Exception:
+                    logger.debug("fallback finalize_stop failed", exc_info=True)
+        # Phase 4.B fix (#17): a successful recap means a new session
+        # row is now on disk. Force the History tab to drop its
+        # auto-request memo so the next visit re-fetches and the user
+        # sees the just-finished session at the top.
+        if self._history_tab is not None and hasattr(
+            self._history_tab, "force_refresh"
+        ):
+            try:
+                self._history_tab.force_refresh()
+            except Exception:
+                logger.debug(
+                    "history force_refresh on recap arrival failed",
+                    exc_info=True,
+                )
+
+    def _on_recap_dismissed(self) -> None:
+        """RecapSheet was closed (manual / autohide) — proceed with the
+        actual daemon shutdown emit. The consumer tab's ``_finalize_stop``
+        is idempotent so calling it from both this path and the
+        watchdog is safe."""
+        if self._consumer is not None:
+            try:
+                self._consumer._finalize_stop()
+            except Exception:
+                logger.debug("finalize_stop on dismiss failed", exc_info=True)
+
+    def _on_recap_view_full(self, session_id: str) -> None:
+        """User clicked ``View full report →``. Switch to the History
+        tab, request the detail, then continue with the shutdown like
+        a normal dismiss.
+
+        Phase 4.B fix (#22): uses the public
+        ``_MacSegmentedControl.set_selected`` API rather than reaching
+        into the private ``_buttons`` list. The set_selected call
+        emits ``selection_changed`` itself, which drives the
+        ``QStackedWidget``'s ``setCurrentIndex`` via the existing
+        connection — so we no longer need a separate manual switch.
+        """
+        # Compute the History tab index defensively because the
+        # ``HistoryTab`` may be absent in degraded mock harnesses.
+        history_index = 1 if self._history_tab is not None else -1
+        if history_index >= 0:
+            # Prefer the public set_selected API; fall back to the
+            # private stack-index path if the segmented control is a
+            # mock stub without set_selected.
+            if hasattr(self._seg, "set_selected"):
+                try:
+                    self._seg.set_selected(history_index)
+                except Exception:
+                    logger.debug(
+                        "_MacSegmentedControl.set_selected failed",
+                        exc_info=True,
+                    )
+            else:
+                try:
+                    self._stack.setCurrentIndex(history_index)
+                except Exception:
+                    logger.debug("switch to History tab failed", exc_info=True)
+            try:
+                self._history_tab.open_detail(session_id)
+            except Exception:
+                logger.debug("HistoryTab.open_detail failed", exc_info=True)
+        # Continue with the shutdown — user already consumed the recap.
+        if self._consumer is not None:
+            try:
+                self._consumer._finalize_stop()
+            except Exception:
+                logger.debug("finalize_stop on view_full failed", exc_info=True)
 
     # Phase J-2 ----------------------------------------------------------
 

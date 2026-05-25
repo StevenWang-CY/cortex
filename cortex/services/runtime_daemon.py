@@ -31,6 +31,11 @@ from cortex.libs.schemas.intervention import (
     InterventionPlan,
 )
 from cortex.libs.schemas.leetcode import LeetCodeContext
+from cortex.libs.schemas.session_history import (
+    SessionDetailResponse,
+    SessionListResponse,
+    TrendsResponse,
+)
 from cortex.libs.schemas.state import UserBaselines
 from cortex.libs.schemas.ws_message_types import MessageType
 
@@ -63,6 +68,9 @@ from cortex.services.intervention_engine.planner import prepare_plan
 from cortex.services.intervention_engine.restore import RestoreManager
 from cortex.services.intervention_engine.snapshot import capture_snapshot
 from cortex.services.janitor.retention import (
+    enforce_chronotype_retention,
+)
+from cortex.services.janitor.retention import (
     sweep_once_async as run_retention_sweep_async,
 )
 from cortex.services.kinematics_engine.blink_detector import BlinkDetector
@@ -75,6 +83,9 @@ from cortex.services.physio_engine.pulse_estimator import PulseEstimator
 from cortex.services.physio_engine.roi_extractor import RoiExtractor
 from cortex.services.physio_engine.rppg import extract_bvp
 from cortex.services.session_report.generator import SessionReportGenerator
+from cortex.services.session_report.longitudinal import LongitudinalAggregator
+from cortex.services.session_report.reader import SessionReader
+from cortex.services.session_report.scheduler import MidnightScheduler
 from cortex.services.state_engine import FeatureFusion, RuleScorer, ScoreSmoother
 from cortex.services.state_engine.amygdala_hijack import AmygdalaHijackDetector
 from cortex.services.state_engine.destructive_struggle import DestructiveStruggleDetector
@@ -92,6 +103,15 @@ from cortex.services.telemetry_engine.window_tracker import WindowTracker
 from cortex.services.throttle.copilot_throttle import CopilotThrottle
 
 logger = logging.getLogger(__name__)
+
+# P0 §3.3: bound on the SESSION_RECAP broadcast inside ``stop()`` so a
+# stuck WS client (e.g. a dead browser tab that never reads its frame)
+# cannot deadlock the daemon shutdown.
+_SESSION_RECAP_BROADCAST_TIMEOUT_S: float = 5.0
+# P0 §3.2: rolling chronotype window (days) the janitor enforces on the
+# nightly tick. Daily baselines older than this are pruned from
+# ``storage/chronotype/daily/*.json``.
+_CHRONOTYPE_WINDOW_DAYS: int = 90
 
 
 def enforce_session_storage_budget(
@@ -593,6 +613,34 @@ class CortexDaemon:
         self._session_report = SessionReportGenerator()
         self._session_report_started = False
 
+        # P0 §3.1: paginated session-history reader (mtime-cached projection).
+        self._session_reader = SessionReader(
+            Path(self.config.storage.path).expanduser() / "sessions",
+        )
+        # P0 §3.2: longitudinal aggregator + midnight scheduler. The
+        # aggregator owns the on-disk chronotype rollups under
+        # ``storage/chronotype/{daily,model}.json``; the scheduler fires
+        # ``_midnight_tick`` at 00:05 local time daily.
+        self._session_aggregator = LongitudinalAggregator(
+            sessions_dir=Path(self.config.storage.path).expanduser() / "sessions",
+            chronotype_dir=Path(self.config.storage.path).expanduser() / "chronotype",
+        )
+        self._midnight_scheduler: MidnightScheduler | None = None
+        # P0 §3.3: cache the most-recently broadcast SESSION_RECAP payload
+        # so a late-joining client (browser popup reconnect) can re-fetch
+        # via REQUEST_SESSION_RECAP without missing the user's recap.
+        self._latest_session_recap: dict[str, Any] | None = None
+
+        # P0 §3.1: serve REQUEST_SESSION_LIST / REQUEST_SESSION_DETAIL
+        self._ws_server.set_session_list_callback(self.list_sessions)
+        self._ws_server.set_session_detail_callback(self.get_session)
+        # P0 §3.2: serve REQUEST_TRENDS
+        self._ws_server.set_trends_callback(self.get_trends)
+        # P0 §3.3: serve REQUEST_SESSION_RECAP from the cached payload
+        self._ws_server.set_session_recap_cache_callback(
+            self.latest_session_recap,
+        )
+
     def set_state_callback(self, fn: Callable[[dict], None]) -> None:
         """Register a callback invoked on every state update.
 
@@ -771,6 +819,17 @@ class CortexDaemon:
             asyncio.create_task(self._retention_sweep_loop(), name="cortex-retention-loop")
         )
 
+        # P0 §3.2: kick off chronotype backfill on a worker thread so
+        # cold-start doesn't block the daemon loop. The aggregator is
+        # idempotent — repeated calls are no-ops if the model is fresh.
+        asyncio.create_task(
+            asyncio.to_thread(self._session_aggregator.backfill_if_needed),
+            name="cortex-chronotype-backfill",
+        )
+        # P0 §3.2: start the nightly aggregation scheduler.
+        self._midnight_scheduler = MidnightScheduler(self._midnight_tick)
+        self._midnight_scheduler.start()
+
         # v2.0: Check for morning briefing on startup
         await self._check_morning_briefing()
 
@@ -926,6 +985,48 @@ class CortexDaemon:
                 )
                 report = None
             if report is not None:
+                # P0 §3.3: broadcast SESSION_RECAP BEFORE persist so the
+                # user sees the recap even if disk write fails. The 5s
+                # broadcast timeout keeps shutdown non-blocking.
+                duration_seconds = float(getattr(report, "duration_seconds", 0.0))
+                if duration_seconds >= 90.0:
+                    recap_payload = report.model_dump(mode="json")
+                    self._latest_session_recap = recap_payload
+                    try:
+                        await asyncio.wait_for(
+                            self._ws_server.send_message(
+                                MessageType.SESSION_RECAP.value,
+                                recap_payload,
+                                correlation_id=None,
+                            ),
+                            timeout=_SESSION_RECAP_BROADCAST_TIMEOUT_S,
+                        )
+                    except TimeoutError:
+                        logger.warning(
+                            "SESSION_RECAP broadcast timed out after %.1fs; proceeding with shutdown",
+                            _SESSION_RECAP_BROADCAST_TIMEOUT_S,
+                        )
+                    except Exception:
+                        logger.exception("SESSION_RECAP broadcast failed (non-fatal)")
+                else:
+                    # P0 §3.3: short session — broadcast an empty payload so
+                    # the dashboard's recap watchdog can short-circuit to
+                    # ``_finalize_stop`` instead of waiting the full 6s.
+                    try:
+                        await asyncio.wait_for(
+                            self._ws_server.send_message(
+                                MessageType.SESSION_RECAP.value,
+                                {},
+                                correlation_id=None,
+                            ),
+                            timeout=1.0,
+                        )
+                    except (TimeoutError, Exception):
+                        logger.debug(
+                            "synthetic empty SESSION_RECAP broadcast failed (non-fatal)"
+                        )
+
+                # Persist after broadcast — even if this fails, the user got their recap.
                 try:
                     from cortex.libs.utils.atomic_write import atomic_write_json
 
@@ -952,10 +1053,12 @@ class CortexDaemon:
                     # writes to <path>.tmp, fsyncs, then ``os.replace``s.
                     atomic_write_json(session_path, payload)
                     logger.info("Wrote session report to %s", session_path)
+                    # P0 §3.1: invalidate the reader's mtime cache so the
+                    # new session appears in the next REQUEST_SESSION_LIST.
+                    self._session_reader.invalidate(report.session_id)
                 except OSError as exc:
                     logger.error(
-                        "Failed to persist session report at shutdown "
-                        "(session_id=%s err=%s); prior file preserved",
+                        "Failed to persist session report (session_id=%s err=%s); recap was already broadcast",
                         getattr(report, "session_id", "?"),
                         exc,
                     )
@@ -964,6 +1067,15 @@ class CortexDaemon:
                         "Unexpected failure persisting session report",
                         exc_info=True,
                     )
+        # P0 §3.2: stop the midnight scheduler cleanly before the WS server
+        # tears down so we don't await a callback that needs a WS broadcast.
+        if self._midnight_scheduler is not None:
+            try:
+                await self._midnight_scheduler.stop()
+            except Exception:
+                logger.debug("midnight scheduler stop raised (non-fatal)", exc_info=True)
+            self._midnight_scheduler = None
+
         await self._ws_server.stop()
         # Audit-2 fix: drain the session recorder's writer thread before
         # we exit so the trailing window of events (last user_action, the
@@ -2785,3 +2897,77 @@ class CortexDaemon:
             int(self.config.intervention.url_dismiss_cooldown_ms),
         )
         await self._ws_server.broadcast_settings(applied)
+
+    # ------------------------------------------------------------------
+    # P0 §3.1 / §3.2 / §3.3: session history + trends + recap cache
+    # ------------------------------------------------------------------
+
+    async def list_sessions(
+        self,
+        since: float | None,
+        limit: int,
+    ) -> SessionListResponse:
+        """P0 §3.1: paginated history listing.
+
+        Offloaded onto a thread because the underlying directory walk
+        is sync. Server-side clamp on ``limit`` to [1, 100]; default 30.
+        """
+        clamped = max(1, min(100, int(limit) if limit is not None else 30))
+        return await asyncio.to_thread(
+            self._session_reader.list_sessions, since, clamped,
+        )
+
+    async def get_session(self, session_id: str) -> SessionDetailResponse:
+        """P0 §3.1: single-report lookup (validated session_id)."""
+        return await asyncio.to_thread(
+            self._session_reader.read_session, session_id,
+        )
+
+    async def get_trends(
+        self,
+        window: str,
+        *,
+        refresh: bool = False,
+    ) -> TrendsResponse:
+        """P0 §3.2: longitudinal trend rollup.
+
+        ``window`` is clamped to ``{"week","month"}``; an unknown value
+        logs a WARNING and falls back to ``"week"``.
+        """
+        if window not in ("week", "month"):
+            logger.warning(
+                "get_trends: unknown window=%r; falling back to 'week'", window
+            )
+            window = "week"
+        return await asyncio.to_thread(
+            self._session_aggregator.get_trends, window, refresh=refresh,
+        )
+
+    def latest_session_recap(self) -> dict[str, Any] | None:
+        """P0 §3.3: serve the cached SESSION_RECAP payload to late joiners.
+
+        Returns ``None`` until the first long session (>=90s) finishes.
+        The browser-extension popup gates on ``session_id`` presence
+        before caching/badging, so an empty dict reply is harmless.
+        """
+        return self._latest_session_recap
+
+    async def _midnight_tick(self) -> None:
+        """P0 §3.2: nightly aggregation + chronotype retention sweep.
+
+        Called by :class:`MidnightScheduler` at 00:05 local time daily.
+        Non-fatal — any exception is logged so the scheduler's loop
+        survives a single bad tick.
+        """
+        try:
+            await asyncio.to_thread(self._session_aggregator.nightly_tick)
+        except Exception:
+            logger.exception("midnight tick: nightly aggregation failed")
+        try:
+            await asyncio.to_thread(
+                enforce_chronotype_retention,
+                Path(self.config.storage.path).expanduser() / "chronotype",
+                window_days=_CHRONOTYPE_WINDOW_DAYS,
+            )
+        except Exception:
+            logger.exception("midnight tick: chronotype retention sweep failed")

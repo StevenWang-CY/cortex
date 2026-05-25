@@ -39,10 +39,28 @@ function sendWithCid(
 // the popup; they drifted from the Python side. The import is the
 // only canonical source; CI fails if it goes stale.
 import type {
+    DailyBaseline,
+    SessionReport,
     SuggestedAction,
     TabRecommendation,
     TabRecommendations,
+    TrendsResponse,
 } from "./types/generated/cortex_schemas";
+
+/**
+ * P0 §3.3: 24-hour TTL for the cached session recap. After this window
+ * the popup hides the recap card even if the daemon never explicitly
+ * dismissed it, so stale recaps don't loiter forever in the UI.
+ */
+const RECAP_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * P0 §3.2: if the cached "Last 7 days" trends payload is older than
+ * this, mounting the popup nudges the background script to ask the
+ * daemon for a fresh rollup. The background script's 30-minute timer
+ * also keeps the cache warm; this is the on-demand belt-and-braces.
+ */
+const TRENDS_STALENESS_MS = 6 * 60 * 60 * 1000;
 
 const CortexLogo = () => (
     <svg width="22" height="22" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ flexShrink: 0 }}>
@@ -115,6 +133,7 @@ interface MorningBriefing {
  * exists, drop the synthesised action so the tab card alone carries
  * the close button.
  */
+
 export function synthesizeActions(
     actions: Record<string, unknown>[],
     tabRecs: TabRecommendations | null,
@@ -229,6 +248,269 @@ export function classifyConnectivity(input: {
     return "installed_no_daemon";
 }
 
+// --- "Last 7 days" sparkbar strip (P0 §3.2) ---
+
+/**
+ * Format a YYYY-MM-DD ``record_date`` as a 3-letter weekday for the
+ * hover tooltip. Parsing it as ``Date(`${ymd}T00:00:00`)`` keeps the
+ * weekday stable regardless of the host's UTC offset (a bare
+ * ``new Date(ymd)`` shifts a day backward for users west of UTC).
+ */
+function weekdayShort(recordDate: string): string {
+    try {
+        const d = new Date(`${recordDate}T00:00:00`);
+        if (Number.isNaN(d.getTime())) return recordDate;
+        return d.toLocaleDateString(undefined, { weekday: "short" });
+    } catch {
+        return recordDate;
+    }
+}
+
+/**
+ * P0 §3.2: compact 7-sparkbar mini-row that sits between the Today
+ * footer and the View history link. Each bar = ``DailyBaseline``;
+ * height is proportional to ``total_flow_minutes`` over the week's
+ * max; top-25-percentile bars take the terracotta accent so the
+ * "best day" reads at a glance.
+ *
+ * Mount-time data flow:
+ *   1. Ask background for the cached payload (``GET_CACHED_TRENDS``).
+ *   2. Nudge a fresh fetch (``REQUEST_TRENDS``) — this also
+ *      synchronously echoes back the cached payload so two race-paths
+ *      converge on the same source of truth.
+ *   3. Subscribe to ``TRENDS_READY`` broadcasts so a fresh WS frame
+ *      that lands while the popup is open updates the bars live.
+ */
+function TrendsMiniStrip(): React.ReactElement {
+    const [trends, setTrends] = useState<TrendsResponse | null>(null);
+    // P0 §3.2 hardening: render a dedicated "temporarily unavailable"
+    // copy when the background script's chrome.runtime.sendMessage
+    // callback throws (port disconnected, SW evicted mid-flight, etc.)
+    // rather than the generic empty state which implies "no data yet".
+    // Reset to ``false`` whenever a subsequent call resolves so a
+    // transient failure doesn't sticky the error UI.
+    const [loadFailed, setLoadFailed] = useState(false);
+
+    useEffect(() => {
+        // 1) hydrate from cache
+        try {
+            chrome.runtime.sendMessage(
+                { type: "GET_CACHED_TRENDS" },
+                (raw: unknown) => {
+                    // ``chrome.runtime.lastError`` populates inside the
+                    // callback when the background SW disconnected mid-
+                    // call; treat that the same as a thrown error.
+                    const lastErr = (chrome as unknown as {
+                        runtime?: { lastError?: { message?: string } };
+                    }).runtime?.lastError;
+                    if (lastErr) {
+                        console.warn(
+                            "[cortex.popup] GET_CACHED_TRENDS lastError",
+                            lastErr.message,
+                        );
+                        setLoadFailed(true);
+                        return;
+                    }
+                    // Successful response — clear any prior failure
+                    // state so the next render swaps the error copy
+                    // back out for bars or the empty state.
+                    setLoadFailed(false);
+                    const resp = raw as
+                        | { trends: TrendsResponse | null; timestamp: number | null }
+                        | undefined;
+                    if (resp?.trends) {
+                        setTrends(resp.trends);
+                    }
+                    // 2) nudge a refresh if the cached payload is stale
+                    // (or absent). The background script echoes back
+                    // whatever it already has, so this also acts as a
+                    // second hydration path for popups opened before
+                    // the first GET_CACHED_TRENDS callback resolves.
+                    //
+                    // Phase 4 hardening: use a nullable timestamp
+                    // rather than collapsing missing-cache to epoch 0.
+                    // ``ts === 0`` previously short-circuited the
+                    // staleness check on a 1970-vintage cache (which
+                    // can never occur on a real wall-clock) but also
+                    // hid the "no cache at all" case behind the same
+                    // branch. Splitting them keeps the staleness math
+                    // purely about wall-clock age.
+                    const ts: number | null = resp?.timestamp ?? null;
+                    const stale =
+                        !resp?.trends ||
+                        ts === null ||
+                        Date.now() - ts > TRENDS_STALENESS_MS;
+                    if (stale) {
+                        try {
+                            chrome.runtime.sendMessage(
+                                { type: "REQUEST_TRENDS" },
+                                (raw2: unknown) => {
+                                    const lastErr2 = (chrome as unknown as {
+                                        runtime?: {
+                                            lastError?: { message?: string };
+                                        };
+                                    }).runtime?.lastError;
+                                    if (lastErr2) {
+                                        console.warn(
+                                            "[cortex.popup] REQUEST_TRENDS lastError",
+                                            lastErr2.message,
+                                        );
+                                        setLoadFailed(true);
+                                        return;
+                                    }
+                                    setLoadFailed(false);
+                                    const resp2 = raw2 as
+                                        | { trends: TrendsResponse | null; timestamp: number | null }
+                                        | undefined;
+                                    if (resp2?.trends) setTrends(resp2.trends);
+                                },
+                            );
+                        } catch (err) {
+                            // sendMessage may throw in odd contexts —
+                            // surface as the error UI rather than the
+                            // (misleading) empty-state copy.
+                            console.warn(
+                                "[cortex.popup] REQUEST_TRENDS threw",
+                                err,
+                            );
+                            setLoadFailed(true);
+                        }
+                    }
+                },
+            );
+        } catch (err) {
+            // chrome.runtime unavailable; render the error UI rather
+            // than the (misleading) empty-state copy.
+            console.warn(
+                "[cortex.popup] GET_CACHED_TRENDS threw",
+                err,
+            );
+            setLoadFailed(true);
+        }
+    }, []);
+
+    // 3) live updates from the background script.
+    const trendsListener = useCallback((msg: Record<string, unknown>) => {
+        if (msg.type !== "TRENDS_READY") return;
+        const payload = msg.payload as TrendsResponse | undefined;
+        if (payload) {
+            // A live update is implicit proof that the runtime port is
+            // healthy — clear any lingering loadFailed flag so the
+            // strip swaps the error copy for fresh bars.
+            setLoadFailed(false);
+            setTrends(payload);
+        }
+    }, []);
+
+    useEffect(() => {
+        chrome.runtime.onMessage.addListener(trendsListener);
+        return () => chrome.runtime.onMessage.removeListener(trendsListener);
+    }, [trendsListener]);
+
+    // P0 §3.2 hardening: if the background script could not be reached
+    // and we have nothing cached locally to fall back on, show the
+    // error copy in place of the (misleading) empty-state guidance.
+    // If we DO have cached data, prefer to render it over the error
+    // copy — stale bars are more useful than no bars.
+    if (loadFailed && !trends) {
+        return (
+            <div style={S.trendsStrip} data-testid="trends-strip">
+                <div style={S.trendsHeader}>
+                    <span style={S.trendsTitle}>Last 7 days</span>
+                </div>
+                <div
+                    style={S.trendsEmpty}
+                    data-testid="trends-error"
+                    role="status"
+                    aria-live="polite"
+                >
+                    Trends temporarily unavailable
+                </div>
+            </div>
+        );
+    }
+
+    // Slice to the trailing 7 days so a daemon that returns more than
+    // a week (e.g. ``window=month`` snuck in by a bug) still renders
+    // exactly 7 bars without overflowing the strip.
+    const daily: DailyBaseline[] = (trends?.daily ?? []).slice(-7);
+    const minutes = daily.map((d) => Math.max(0, Math.round(d.total_flow_minutes ?? 0)));
+    const maxMin = minutes.reduce((m, v) => (v > m ? v : m), 0);
+    const totalMin = minutes.reduce((s, v) => s + v, 0);
+    const avgMin = daily.length > 0 ? Math.round(totalMin / daily.length) : 0;
+
+    // Empty state: render guidance copy when we have no rows or every
+    // row is zero minutes. The tertiary label colour keeps it from
+    // competing with the Today footer numbers above.
+    const isEmpty = daily.length === 0 || maxMin === 0;
+    if (isEmpty) {
+        return (
+            <div style={S.trendsStrip} data-testid="trends-strip">
+                <div style={S.trendsHeader}>
+                    <span style={S.trendsTitle}>Last 7 days</span>
+                </div>
+                <div style={S.trendsEmpty} data-testid="trends-empty">
+                    Not enough data yet. Run a few sessions.
+                </div>
+            </div>
+        );
+    }
+
+    // Top-quartile threshold: if we have fewer than 4 days every bar
+    // is hot (the "quartile" concept is meaningless with <4 samples
+    // and demoting them all to grey would hide the only signal we
+    // have). Otherwise compute the 75th percentile on the sorted
+    // ascending minutes list and compare strictly greater than.
+    let hotThreshold = -1;
+    if (daily.length >= 4) {
+        const sorted = [...minutes].sort((a, b) => a - b);
+        const idx = Math.floor(sorted.length * 0.75);
+        hotThreshold = sorted[Math.min(idx, sorted.length - 1)];
+    }
+
+    return (
+        <div style={S.trendsStrip} data-testid="trends-strip">
+            <div style={S.trendsHeader}>
+                <span style={S.trendsTitle}>Last 7 days</span>
+                <span style={S.trendsAvg} data-testid="trends-avg">
+                    {avgMin} min avg/day
+                </span>
+            </div>
+            <div style={S.trendsBars} role="img" aria-label={`Last ${daily.length} days of focus minutes per day`}>
+                {daily.map((d, i) => {
+                    const v = minutes[i];
+                    const isHot = daily.length < 4 ? true : v > hotThreshold;
+                    // Bars always render at least 2px tall when v>0 so
+                    // a non-zero-but-tiny day is still visible; 0-min
+                    // days render at 2px in the tertiary colour as a
+                    // "we tried" marker so the strip's gap doesn't
+                    // imply missing data.
+                    const heightPx =
+                        v === 0
+                            ? 2
+                            : Math.max(2, Math.round((v / maxMin) * 16));
+                    const color = isHot && v > 0 ? CX.accent : CX.textTertiary;
+                    return (
+                        <div
+                            key={d.record_date ?? `d${i}`}
+                            data-testid={`trends-bar-${i}`}
+                            data-hot={isHot && v > 0 ? "true" : "false"}
+                            title={`${weekdayShort(d.record_date ?? "")}: ${v} min`}
+                            style={{
+                                width: 6,
+                                height: heightPx,
+                                background: color,
+                                borderRadius: 1,
+                                alignSelf: "flex-end",
+                            }}
+                        />
+                    );
+                })}
+            </div>
+        </div>
+    );
+}
+
 // --- Main ---
 
 function CortexPopup(): React.ReactElement {
@@ -253,6 +535,40 @@ function CortexPopup(): React.ReactElement {
     const [launching, setLaunching] = useState(false);
     const [launchError, setLaunchError] = useState(false);
     const [tabsExpanded, setTabsExpanded] = useState(false);
+    // P0 §3.8: rating state. ``rating`` is the user's current 👍/👎
+    // selection on the active intervention; null when not rated.
+    // ``ratingTextOpen`` toggles the inline one-line input on 👎.
+    const [rating, setRating] = useState<"thumbs_up" | "thumbs_down" | null>(null);
+    const [ratingTextOpen, setRatingTextOpen] = useState<boolean>(false);
+    const [ratingText, setRatingText] = useState<string>("");
+    // P0 §3.9: structured causal signals + the "Why?" expander state.
+    // ``causalSignals`` is the array pushed by INTERVENTION_TRIGGER or
+    // fetched on demand via WHY_DETAIL_REQUEST.
+    const [causalSignals, setCausalSignals] = useState<
+        { name: string; current_value: number; baseline_value: number | null;
+          unit: string; delta_pct: number | null; samples_60s: number[];
+          severity: "primary" | "secondary" | "tertiary"; }[]
+    >([]);
+    const [whyOpen, setWhyOpen] = useState<boolean>(false);
+    // P0 §3.7: BREAK_RECOMMENDATION pulse from the daemon. When set we
+    // render a soft pill above the intervention card with a one-click
+    // "Take a 4-minute break" CTA.
+    const [breakRec, setBreakRec] = useState<{
+        reason: string;
+        urgency: "low" | "medium" | "high";
+        stress_load: number;
+        threshold: number;
+        duration_seconds: number;
+        breathing_pattern: "box" | "4-7-8" | "coherent";
+    } | null>(null);
+    // P0 §3.3: end-of-session recap card. ``recap`` is the cached
+    // SessionReport; ``recapTimestamp`` is when the background script
+    // wrote it. ``historyStatus`` carries the response from
+    // OPEN_DASHBOARD_HISTORY when the native host is unavailable so we
+    // can render a one-line install hint.
+    const [recap, setRecap] = useState<SessionReport | null>(null);
+    const [recapTimestamp, setRecapTimestamp] = useState<number | null>(null);
+    const [historyStatus, setHistoryStatus] = useState<string>("");
 
     // Inject fonts + keyframes (single injection point)
     useEffect(() => {
@@ -356,6 +672,20 @@ function CortexPopup(): React.ReactElement {
         // connectivity probe so the popup renders a fresh diagnostic
         // (native-host / daemon-version / handshake) at open time.
         chrome.runtime.sendMessage({ type: "REQUEST_CONNECTIVITY_DIAGNOSTIC" });
+        // P0 §3.3: pull the cached recap so we can render the card
+        // immediately. Only adopt it if it's still inside the 24h TTL.
+        chrome.runtime.sendMessage({ type: "GET_CACHED_RECAP" }, (raw) => {
+            const resp = raw as
+                | { recap: SessionReport | null; timestamp: number | null }
+                | undefined;
+            if (!resp || !resp.recap) return;
+            const ts = resp.timestamp ?? 0;
+            if (ts > 0 && Date.now() - ts > RECAP_TTL_MS) return;
+            setRecap(resp.recap);
+            setRecapTimestamp(ts);
+            // Card is now visible to the user — clear the toolbar badge.
+            chrome.runtime.sendMessage({ type: "RECAP_VIEWED" });
+        });
     }, []);
 
     // F50: stable listener identity so addListener/removeListener
@@ -398,6 +728,32 @@ function CortexPopup(): React.ReactElement {
                 setErrAnalysis((p.error_analysis as Record<string, string>) || null);
                 setInterventionId(String(p.intervention_id || ""));
                 setCausalExplanation(String(p.causal_explanation || ""));
+                // P0 §3.9: adopt structured causal signals from the
+                // intervention trigger payload (top 2-3 ranked drivers).
+                const signals = (p.causal_signals as unknown[]) || [];
+                setCausalSignals(
+                    signals
+                        .filter((s): s is Record<string, unknown> => typeof s === "object" && s !== null)
+                        .map((s) => ({
+                            name: String(s.name ?? ""),
+                            current_value: Number(s.current_value ?? 0),
+                            baseline_value: s.baseline_value == null ? null : Number(s.baseline_value),
+                            unit: String(s.unit ?? ""),
+                            delta_pct: s.delta_pct == null ? null : Number(s.delta_pct),
+                            samples_60s: Array.isArray(s.samples_60s)
+                                ? (s.samples_60s as number[]).map((v) => Number(v))
+                                : [],
+                            severity:
+                                s.severity === "primary" || s.severity === "tertiary"
+                                    ? (s.severity as "primary" | "tertiary")
+                                    : ("secondary" as const),
+                        })),
+                );
+                // P0 §3.8: reset rating state when a new intervention arrives.
+                setRating(null);
+                setRatingTextOpen(false);
+                setRatingText("");
+                setWhyOpen(false);
                 setApplied(false);
                 break;
             }
@@ -406,8 +762,60 @@ function CortexPopup(): React.ReactElement {
                 setTabRecs(null);
                 setErrAnalysis(null);
                 setCausalExplanation("");
+                setCausalSignals([]);
+                setRating(null);
+                setRatingTextOpen(false);
+                setRatingText("");
+                setWhyOpen(false);
                 setApplied(false);
                 break;
+            case "BREAK_RECOMMENDATION": {
+                // P0 §3.7: BREAK_RECOMMENDATION pulse relayed from
+                // background.ts. Adopt as a soft pill above the
+                // intervention card.
+                const p = msg.payload as Record<string, unknown>;
+                setBreakRec({
+                    reason: String(p.reason ?? "stress_integral_crossed_threshold"),
+                    urgency:
+                        p.urgency === "high" || p.urgency === "low"
+                            ? (p.urgency as "low" | "high")
+                            : "medium",
+                    stress_load: Number(p.stress_load ?? 0),
+                    threshold: Number(p.threshold ?? 0),
+                    duration_seconds: Number(p.duration_seconds ?? 240),
+                    breathing_pattern:
+                        p.breathing_pattern === "4-7-8" ||
+                        p.breathing_pattern === "coherent"
+                            ? (p.breathing_pattern as "4-7-8" | "coherent")
+                            : "box",
+                });
+                break;
+            }
+            case "WHY_DETAIL": {
+                // P0 §3.9: on-demand reply to WHY_DETAIL_REQUEST.
+                const p = msg.payload as Record<string, unknown>;
+                const sigs = (p.causal_signals as unknown[]) || [];
+                setCausalSignals(
+                    sigs
+                        .filter((s): s is Record<string, unknown> => typeof s === "object" && s !== null)
+                        .map((s) => ({
+                            name: String(s.name ?? ""),
+                            current_value: Number(s.current_value ?? 0),
+                            baseline_value: s.baseline_value == null ? null : Number(s.baseline_value),
+                            unit: String(s.unit ?? ""),
+                            delta_pct: s.delta_pct == null ? null : Number(s.delta_pct),
+                            samples_60s: Array.isArray(s.samples_60s)
+                                ? (s.samples_60s as number[]).map((v) => Number(v))
+                                : [],
+                            severity:
+                                s.severity === "primary" || s.severity === "tertiary"
+                                    ? (s.severity as "primary" | "tertiary")
+                                    : ("secondary" as const),
+                        })),
+                );
+                setWhyOpen(true);
+                break;
+            }
             case "SETTINGS_SYNC": {
                 const settings = msg.payload as Record<string, unknown>;
                 if (typeof settings.quiet_mode === "boolean") {
@@ -437,6 +845,21 @@ function CortexPopup(): React.ReactElement {
                 if (d.handshake_error === null) setHandshakeError(null);
                 break;
             }
+            case "SESSION_RECAP_READY": {
+                // P0 §3.3: background script just received a fresh recap
+                // over WS. Adopt it immediately so a popup that was
+                // already open re-renders without waiting for the next
+                // mount, then clear the badge — the user is looking.
+                const next = msg.payload as SessionReport;
+                const ts =
+                    typeof msg.timestamp === "number"
+                        ? (msg.timestamp as number)
+                        : Date.now();
+                setRecap(next);
+                setRecapTimestamp(ts);
+                chrome.runtime.sendMessage({ type: "RECAP_VIEWED" });
+                break;
+            }
         }
     }, []);
 
@@ -448,6 +871,59 @@ function CortexPopup(): React.ReactElement {
     const handleConnect = useCallback(() => {
         sendWithCid({ type: "CONNECT" });
     }, []);
+
+    // P0 §3.1 / §3.3: route the popup's "View history" click through the
+    // background script, which raises the desktop dashboard's History
+    // tab via native messaging. If the native host is unavailable we
+    // surface a single-line install hint right under the link.
+    const handleOpenDashboardHistory = useCallback(() => {
+        setHistoryStatus("");
+        chrome.runtime.sendMessage(
+            { type: "OPEN_DASHBOARD_HISTORY" },
+            (raw) => {
+                const resp = raw as { status?: string } | undefined;
+                if (resp?.status === "unavailable") {
+                    setHistoryStatus(
+                        "Install the Cortex desktop app to view history.",
+                    );
+                    // Hide the hint after a beat so it doesn't loiter.
+                    setTimeout(() => setHistoryStatus(""), 8000);
+                } else {
+                    setHistoryStatus("");
+                }
+            },
+        );
+    }, []);
+
+    // P0 §3.3: clear the cached recap and badge, then drop the card
+    // locally so the user gets immediate feedback.
+    const handleDismissRecap = useCallback(() => {
+        chrome.runtime.sendMessage({ type: "DISMISS_RECAP" });
+        setRecap(null);
+        setRecapTimestamp(null);
+    }, []);
+
+    // P0 §3.3 hardening: the recap card's 24h TTL check at render time
+    // hides a stale card on the next paint, but if the popup is left
+    // open for >24h (uncommon but possible on a pinned tab / dev
+    // window) the card lingers because nothing re-renders. Arm a
+    // setTimeout the moment we adopt a recap so it auto-dismisses
+    // exactly when the TTL crosses. ``handleDismissRecap`` is stable
+    // via useCallback([]), so this effect re-arms only when the
+    // recap timestamp actually changes.
+    useEffect(() => {
+        if (recap == null || recapTimestamp == null) return;
+        const elapsed = Date.now() - recapTimestamp;
+        const remaining = RECAP_TTL_MS - elapsed;
+        if (remaining <= 0) {
+            // Already past TTL — dismiss synchronously rather than
+            // arming a zero-delay timer.
+            handleDismissRecap();
+            return;
+        }
+        const handle = setTimeout(handleDismissRecap, remaining);
+        return () => clearTimeout(handle);
+    }, [recap, recapTimestamp, handleDismissRecap]);
 
     const [stopping, setStopping] = useState(false);
     const handleStopCortex = useCallback(async () => {
@@ -566,6 +1042,70 @@ function CortexPopup(): React.ReactElement {
                     </div>
                 )}
             </div>
+
+            {/* P0 §3.3: end-of-session recap card. Sits at the top of
+                the popup body so it's the first thing the user sees on
+                their next open. ``recapValid`` enforces the 24h TTL —
+                a recap older than that is hidden even if it lingers in
+                chrome.storage.local. */}
+            {recap && (recapTimestamp == null || Date.now() - recapTimestamp <= RECAP_TTL_MS) && (() => {
+                const r = recap;
+                const durationMin = Math.round((r.duration_seconds ?? 0) / 60);
+                const flowPct = Math.round(r.flow_percentage ?? 0);
+                const breaks = r.breaks_taken ?? 0;
+                // P0 §3.3 hardening: renamed from ``streakMin`` so it
+                // doesn't shadow the outer focus-session ``streakMin``
+                // (declared above for the live STREAK stat). Two
+                // distinct concepts — the recap card's longest flow
+                // streak vs. the running session's current streak —
+                // should not share a name inside the same render scope.
+                const recapStreakMin = Math.round(
+                    (r.longest_flow_streak_seconds ?? 0) / 60,
+                );
+                const hr = r.avg_hr_bpm;
+                return (
+                    <div style={S.recapCard} data-testid="recap-card">
+                        <div style={S.recapHeaderRow}>
+                            <div style={S.recapHeadline}>
+                                Session ended {"·"} {durationMin}m
+                            </div>
+                            <button
+                                aria-label="Dismiss recap"
+                                style={S.recapDismissIcon}
+                                onClick={handleDismissRecap}
+                            >{"×"}</button>
+                        </div>
+                        <div style={S.recapBody}>
+                            {flowPct}% in flow {"·"} {breaks} break
+                            {breaks === 1 ? "" : "s"} {"·"} longest
+                            streak {recapStreakMin}m
+                        </div>
+                        {hr != null && (
+                            // P0 §3.3 hardening: the schema field is
+                            // ``avg_hr_bpm`` (mean across the session,
+                            // not peak). The previous "Peak HR" copy
+                            // misrepresented the number; "Avg HR"
+                            // matches the recap_sheet.py relabel in
+                            // the desktop shell.
+                            <div style={S.recapStat}>
+                                Avg HR {Math.round(hr)} bpm
+                            </div>
+                        )}
+                        <div style={S.recapButtonRow}>
+                            <button
+                                style={S.recapPrimaryBtn}
+                                onClick={handleOpenDashboardHistory}
+                                data-testid="recap-view-on-desktop"
+                            >View on desktop {"→"}</button>
+                            <button
+                                style={S.recapGhostBtn}
+                                onClick={handleDismissRecap}
+                                data-testid="recap-dismiss"
+                            >Dismiss</button>
+                        </div>
+                    </div>
+                );
+            })()}
 
             {/* Morning briefing — below header, before session card */}
             {briefing && (
@@ -767,12 +1307,182 @@ function CortexPopup(): React.ReactElement {
                 </div>
             )}
 
+            {/* P0 §3.7: BREAK_RECOMMENDATION pill. Surfaces above the
+                intervention card whenever the daemon's stress integral
+                crosses threshold. Single CTA dispatches the bound
+                ``take_biology_break`` action through the EXECUTE_ACTION
+                channel. */}
+            {breakRec && (
+                <div
+                    data-testid="break-recommendation-pill"
+                    style={{
+                        background: "rgba(217, 119, 87, 0.10)",
+                        border: `1px solid ${CX.accent}55`,
+                        borderRadius: CX.radiusMd,
+                        padding: "10px 12px",
+                        marginBottom: 10,
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 10,
+                        fontFamily: CX.font,
+                    }}
+                >
+                    <div style={{ flex: 1, fontSize: 12, color: CX.text }}>
+                        Your HRV has been suppressed — take a {Math.round(breakRec.duration_seconds / 60)}-minute break?
+                    </div>
+                    <button
+                        style={{
+                            padding: "6px 12px",
+                            border: "none",
+                            borderRadius: CX.radiusSm,
+                            background: CX.accent,
+                            color: "white",
+                            fontSize: 11,
+                            fontWeight: 600,
+                            cursor: "pointer",
+                            fontFamily: CX.font,
+                        }}
+                        data-testid="break-recommendation-cta"
+                        onClick={() => {
+                            chrome.runtime.sendMessage({
+                                type: "EXECUTE_ACTION",
+                                action: {
+                                    action_id: `bk_${Date.now()}`,
+                                    action_type: "take_biology_break",
+                                    label: "Take a break",
+                                    target: "",
+                                    metadata: {
+                                        duration_seconds: breakRec.duration_seconds,
+                                        breathing_pattern: breakRec.breathing_pattern,
+                                        audio_cue: true,
+                                        reason: breakRec.reason,
+                                    },
+                                },
+                                intervention_id: interventionId || `break_${Date.now()}`,
+                            });
+                            setBreakRec(null);
+                        }}
+                    >
+                        Take {Math.round(breakRec.duration_seconds / 60)} min
+                    </button>
+                    <button
+                        aria-label="Dismiss break recommendation"
+                        style={{
+                            border: "none",
+                            background: "transparent",
+                            color: CX.textSecondary,
+                            cursor: "pointer",
+                            fontSize: 14,
+                        }}
+                        onClick={() => setBreakRec(null)}
+                    >
+                        {"×"}
+                    </button>
+                </div>
+            )}
+
             {/* Intervention preview */}
             {hasIntervention && (
                 <div style={S.interventionCard}>
                     {/* Causal explanation */}
                     {realCausal && (
                         <div style={S.causalText}>{realCausal}</div>
+                    )}
+
+                    {/* P0 §3.9: "Why?" drilldown. Shows the structured
+                        causal signals (top 2-3) as sparkline rows on
+                        expansion. The drilldown is opt-in — collapsed
+                        by default behind a small chevron link. */}
+                    {(causalSignals.length > 0 || realCausal) && (
+                        <div
+                            style={{ marginBottom: 10 }}
+                            data-testid="why-drilldown"
+                        >
+                            <button
+                                aria-label="Show structured causal rationale"
+                                onClick={() => {
+                                    if (!whyOpen && causalSignals.length === 0 && interventionId) {
+                                        chrome.runtime.sendMessage({
+                                            type: "WHY_DETAIL_REQUEST",
+                                            intervention_id: interventionId,
+                                        });
+                                    }
+                                    setWhyOpen(!whyOpen);
+                                }}
+                                style={{
+                                    background: "none",
+                                    border: "none",
+                                    color: CX.textSecondary,
+                                    fontSize: 10,
+                                    fontFamily: CX.font,
+                                    cursor: "pointer",
+                                    padding: 0,
+                                    textDecoration: "underline",
+                                }}
+                                data-testid="why-toggle"
+                            >
+                                {whyOpen ? "Hide why" : "Why?"}
+                            </button>
+                            {whyOpen && causalSignals.length > 0 && (
+                                <div
+                                    style={{
+                                        marginTop: 6,
+                                        padding: "8px 10px",
+                                        background: "rgba(255, 255, 255, 0.03)",
+                                        borderRadius: CX.radiusSm,
+                                    }}
+                                    data-testid="why-rows"
+                                >
+                                    {causalSignals.map((sig, idx) => {
+                                        const isPrimary = sig.severity === "primary";
+                                        const delta = sig.delta_pct;
+                                        const arrow = delta == null ? "" : delta < 0 ? "↓" : "↑";
+                                        return (
+                                            <div
+                                                key={`${sig.name}-${idx}`}
+                                                style={{
+                                                    display: "flex",
+                                                    alignItems: "center",
+                                                    gap: 8,
+                                                    padding: "4px 0",
+                                                    fontSize: 11,
+                                                    color: CX.text,
+                                                    fontFamily: CX.font,
+                                                }}
+                                            >
+                                                <span
+                                                    style={{
+                                                        fontWeight: isPrimary ? 600 : 500,
+                                                        minWidth: 80,
+                                                    }}
+                                                >
+                                                    {sig.name}
+                                                </span>
+                                                <span style={{ flex: 1, color: CX.textSecondary }}>
+                                                    {sig.current_value.toFixed(1)}{sig.unit}
+                                                    {sig.baseline_value != null && (
+                                                        <span style={{ marginLeft: 4 }}>
+                                                            (baseline {sig.baseline_value.toFixed(1)}{sig.unit})
+                                                        </span>
+                                                    )}
+                                                </span>
+                                                {delta != null && (
+                                                    <span
+                                                        style={{
+                                                            color: delta < 0 ? "#E47A6E" : CX.accent,
+                                                            fontWeight: 600,
+                                                            fontSize: 10,
+                                                        }}
+                                                    >
+                                                        {arrow}{Math.abs(delta).toFixed(0)}%
+                                                    </span>
+                                                )}
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            )}
+                        </div>
                     )}
 
                     {visibleCloseTabs.length > 0 && (
@@ -985,6 +1695,33 @@ function CortexPopup(): React.ReactElement {
                     </div>
                 </div>
             )}
+
+            {/* P0 §3.2: "Last 7 days" sparkbar mini-row. Sits between
+                the Today footer (today's numbers) and the live state
+                pill region (View history link below it), extending the
+                at-a-glance summary into the past week without
+                cluttering the real-time area. */}
+            <TrendsMiniStrip />
+
+            {/* P0 §3.1 / §3.3: View history footer. Terracotta-accented
+                link that routes through the background script to raise
+                the desktop dashboard's History tab. ``historyStatus``
+                renders a one-line install hint if the native host is
+                unavailable. */}
+            <div style={S.historyFooter}>
+                <button
+                    style={S.historyLink}
+                    onClick={handleOpenDashboardHistory}
+                    data-testid="view-history-link"
+                    aria-label="Open History tab in desktop dashboard"
+                >View history <span aria-hidden="true">{"→"}</span></button>
+                {historyStatus !== "" && (
+                    <div
+                        style={S.historyStatusLine}
+                        data-testid="view-history-status"
+                    >{historyStatus}</div>
+                )}
+            </div>
         </div>
     );
 }
@@ -1355,6 +2092,149 @@ const S: Record<string, React.CSSProperties> = {
     todayCol: { display: "flex", flexDirection: "column" as const, alignItems: "flex-start", gap: 4 },
     todayVal: { fontSize: 16, fontFamily: CX.fontSerif, color: CX.text },
     todayLabel: { fontSize: 11, color: CX.textTertiary, textTransform: "uppercase" },
+
+    // P0 §3.2: "Last 7 days" sparkbar mini-row.
+    trendsStrip: {
+        display: "flex",
+        flexDirection: "column" as const,
+        gap: 6,
+        padding: "12px 8px 0 8px",
+    },
+    trendsHeader: {
+        display: "flex",
+        alignItems: "baseline",
+        justifyContent: "space-between",
+        gap: 8,
+    },
+    trendsTitle: {
+        fontSize: 11,
+        color: CX.textTertiary,
+        textTransform: "uppercase" as const,
+        letterSpacing: "0.04em",
+        fontFamily: CX.font,
+    },
+    trendsAvg: {
+        fontSize: 11,
+        color: CX.textTertiary,
+        fontFamily: CX.mono,
+    },
+    trendsBars: {
+        display: "flex",
+        alignItems: "flex-end" as const,
+        gap: 4,
+        height: 16,
+    },
+    trendsEmpty: {
+        fontSize: 11,
+        color: CX.textTertiary,
+        fontFamily: CX.font,
+        lineHeight: 1.4,
+    },
+
+    // P0 §3.3: end-of-session recap card. Terracotta left edge keeps
+    // it visually distinct from the white intervention card; warm
+    // surface + small shadow match the existing popup aesthetic.
+    recapCard: {
+        background: CX.surface,
+        borderRadius: CX.radiusMd,
+        padding: 16,
+        marginBottom: 16,
+        border: `1px solid ${CX.borderDefault}`,
+        borderLeft: `3px solid ${CX.accent}`,
+        boxShadow: CX.shadowFloat,
+    },
+    recapHeaderRow: {
+        display: "flex",
+        alignItems: "baseline",
+        justifyContent: "space-between",
+        gap: 8,
+        marginBottom: 6,
+    },
+    recapHeadline: {
+        fontSize: 15,
+        fontWeight: 600,
+        color: CX.text,
+        fontFamily: CX.fontSerif,
+        lineHeight: 1.3,
+    },
+    recapDismissIcon: {
+        background: "none",
+        border: "none",
+        color: CX.textTertiary,
+        cursor: "pointer",
+        fontSize: 16,
+        padding: 0,
+        fontFamily: CX.font,
+        lineHeight: 1,
+        flexShrink: 0,
+    },
+    recapBody: {
+        fontSize: 13,
+        color: CX.textSecondary,
+        lineHeight: 1.5,
+    },
+    recapStat: {
+        fontSize: 12,
+        color: CX.textTertiary,
+        marginTop: 4,
+        fontFamily: CX.mono,
+    },
+    recapButtonRow: {
+        display: "flex",
+        gap: 8,
+        marginTop: 12,
+    },
+    recapPrimaryBtn: {
+        flex: 1,
+        height: 32,
+        padding: "0 12px",
+        border: `1px solid ${CX.accent}`,
+        borderRadius: CX.radiusFull,
+        background: CX.accent,
+        color: CX.textInverse,
+        fontSize: 12,
+        fontWeight: 500,
+        fontFamily: CX.font,
+        cursor: "pointer",
+    },
+    recapGhostBtn: {
+        flex: 1,
+        height: 32,
+        padding: "0 12px",
+        border: `1px solid ${CX.borderDefault}`,
+        borderRadius: CX.radiusFull,
+        background: "transparent",
+        color: CX.textSecondary,
+        fontSize: 12,
+        fontWeight: 500,
+        fontFamily: CX.font,
+        cursor: "pointer",
+    },
+
+    // P0 §3.1 / §3.3: View history footer.
+    historyFooter: {
+        display: "flex",
+        flexDirection: "column" as const,
+        alignItems: "center",
+        gap: 4,
+        padding: "16px 8px 4px 8px",
+    },
+    historyLink: {
+        background: "none",
+        border: "none",
+        color: CX.accent,
+        cursor: "pointer",
+        fontSize: 12,
+        fontWeight: 500,
+        fontFamily: CX.font,
+        padding: 0,
+    },
+    historyStatusLine: {
+        fontSize: 11,
+        color: CX.textTertiary,
+        fontFamily: CX.font,
+        textAlign: "center" as const,
+    },
 };
 
 export default CortexPopup;

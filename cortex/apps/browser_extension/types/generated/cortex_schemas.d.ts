@@ -21,6 +21,10 @@ export type MessageType =
   | "LEETCODE_CONTEXT_UPDATE"
   | "INTERVENTION_APPLIED"
   | "SHUTDOWN"
+  | "REQUEST_SESSION_LIST"
+  | "REQUEST_SESSION_DETAIL"
+  | "REQUEST_TRENDS"
+  | "REQUEST_SESSION_RECAP"
   | "AUTH_OK"
   | "STATE_UPDATE"
   | "INTERVENTION_TRIGGER"
@@ -33,6 +37,10 @@ export type MessageType =
   | "COPILOT_THROTTLE"
   | "AMBIENT_STATE_UPDATE"
   | "ACTION_DISPATCH"
+  | "SESSION_LIST"
+  | "SESSION_DETAIL"
+  | "TRENDS_PAYLOAD"
+  | "SESSION_RECAP"
   | "LEETCODE_SHOW_SCRATCHPAD"
   | "LEETCODE_SHOW_PATTERN_LADDER"
   | "LEETCODE_SHOW_LOCKOUT"
@@ -109,6 +117,17 @@ export interface ActionConsentState {
    * When last rejected
    */
   last_rejection?: string | null;
+}
+/**
+ * Summary of a single activity during the session.
+ */
+export interface ActivitySummary {
+  title: string;
+  tab_type?: string;
+  dwell_seconds?: number;
+  state_breakdown?: {
+    [k: string]: number;
+  };
 }
 /**
  * Persisted weights for the LinUCB contextual bandit.
@@ -229,6 +248,9 @@ export interface TabInfo {
  * Longitudinal model tracking how baselines drift over weeks.
  */
 export interface ChronotypeModel {
+  /**
+   * Internal aggregator state — UI must read ``TrendsResponse.daily`` instead. The chronotype model stores the full window the aggregator considered (e.g. 90 days) while ``TrendsResponse.daily`` is windowed to the caller's requested span (week/month). Cross-reading from ``baselines`` will show entries outside the requested window and break the dashboard's date-bar math.
+   */
   baselines?: DailyBaseline[];
   /**
    * Overall HRV trend direction
@@ -345,6 +367,14 @@ export interface TaskOverloadPattern {
    * Whether this pattern triggers or aids recovery
    */
   correlation?: "trigger" | "recovery" | "neutral";
+}
+/**
+ * Comparison to 7-day rolling averages.
+ */
+export interface ComparisonStats {
+  focus_delta?: number;
+  stress_delta?: number;
+  duration_delta?: number;
 }
 /**
  * Result of a consent check.
@@ -1199,6 +1229,129 @@ export interface PhysioFeatures {
   valid: boolean;
 }
 /**
+ * Reply envelope for ``REQUEST_SESSION_DETAIL`` / ``REQUEST_SESSION_RECAP``.
+ */
+export interface SessionDetailResponse {
+  /**
+   * Full report when found; None when the file is missing or unparsable (see 'error').
+   */
+  report?: SessionReport | null;
+  /**
+   * Error code when report is None. 'not_found' = no such session_id on disk; 'unreadable' = file present but JSON malformed; 'invalid_id' = id failed the safe-char regex; 'internal' = callback raised; 'daemon_unavailable' = no daemon registered.
+   */
+  error?: ("not_found" | "unreadable" | "invalid_id" | "internal" | "daemon_unavailable") | null;
+}
+/**
+ * Biometric study session report.
+ */
+export interface SessionReport {
+  session_id: string;
+  start_time: string;
+  end_time: string;
+  duration_seconds: number;
+  time_in_flow_seconds?: number;
+  time_in_hyper_seconds?: number;
+  time_in_hypo_seconds?: number;
+  time_in_recovery_seconds?: number;
+  flow_percentage?: number;
+  longest_flow_streak_seconds?: number;
+  peak_stress_integral?: number;
+  breaks_taken?: number;
+  breaks_recommended?: number;
+  state_transitions?: StateTransition[];
+  top_activities?: ActivitySummary[];
+  top_distraction_domains?: string[];
+  golden_hour_start?: number | null;
+  golden_hour_end?: number | null;
+  avg_hr_bpm?: number | null;
+  avg_hrv_rmssd?: number | null;
+  comparison_to_7day?: ComparisonStats | null;
+}
+/**
+ * A single state transition event.
+ */
+export interface StateTransition {
+  from_state: string;
+  to_state: string;
+  timestamp: string;
+}
+/**
+ * Reply envelope for ``REQUEST_SESSION_LIST``.
+ *
+ * Pagination is forward-only via ``next_cursor`` (epoch-seconds of the
+ * last row in this page). Clients send the cursor back as ``since`` on
+ * the next request. ``None`` means "no more rows after this page."
+ *
+ * ``cursor_session_id`` is the canonical tie-breaker for entries that
+ * share the same ``start_time``: a client passes it back alongside
+ * ``since`` so the daemon can resume after the exact row the previous
+ * page ended on (see ``reader.list_sessions``).
+ */
+export interface SessionListResponse {
+  /**
+   * @maxItems 100
+   */
+  items?: SessionSummary[];
+  /**
+   * Epoch seconds of the oldest row in this page; pass as 'since' to request the next page. None when there is no more history.
+   */
+  next_cursor?: number | null;
+  /**
+   * Session id of the oldest row in this page. When two rows share the same ``start_time`` the daemon resumes after this id on the next page so no row is skipped on ties (P0 §3.1 fix #10).
+   */
+  cursor_session_id?: string | null;
+  /**
+   * Total number of session files the daemon currently knows about (for the 'Sessions · last N' header).
+   */
+  total_known?: number;
+  /**
+   * Set when the daemon cannot fulfil the request. Known values: 'internal' | 'daemon_unavailable' | 'no_cache' | 'invalid_request' | None (success).
+   */
+  error?: string | null;
+}
+/**
+ * One row in the History listing.
+ *
+ * Projected from the persisted :class:`SessionReport` header at list
+ * time (``cortex/services/session_report/reader.py::list_sessions``)
+ * so the dashboard can render hundreds of rows without re-parsing
+ * every nested ``StateTransition`` / ``ActivitySummary`` list.
+ */
+export interface SessionSummary {
+  /**
+   * UUID matching the on-disk session_<id>.json filename
+   */
+  session_id: string;
+  /**
+   * Session start (timezone-aware where present)
+   */
+  start_time: string;
+  /**
+   * Session end (timezone-aware where present)
+   */
+  end_time: string;
+  /**
+   * end_time - start_time in seconds
+   */
+  duration_seconds: number;
+  /**
+   * Biometrically-verified focus / wall-clock
+   */
+  flow_percentage?: number;
+  /**
+   * Max cumulative HRV-suppression integral observed
+   */
+  peak_stress_integral?: number;
+  /**
+   * Most-visited distraction hostname during the session (RFC 1035 FQDN ≤253).
+   */
+  top_distraction_domain?: string | null;
+  /**
+   * Count of state_transitions whose to_state is HYPER (proxy for interventions fired)
+   */
+  intervention_count?: number;
+}
+/**
  * Signal quality metrics for each feature channel.
  */
 export interface SignalQuality {
@@ -1363,7 +1516,7 @@ export interface StateScores1 {
 /**
  * Record of a state transition event.
  */
-export interface StateTransition {
+export interface StateTransition1 {
   /**
    * When transition occurred
    */
@@ -1536,6 +1689,84 @@ export interface TelemetryFeatures {
    * Upward reread scroll bursts per minute
    */
   scroll_back_rate_per_min?: number | null;
+}
+/**
+ * Documented envelope for ``REQUEST_TRENDS`` payloads.
+ *
+ * The WS dispatch arm (``_handle_request_trends``) currently parses
+ * raw payload dicts; this schema documents the contract so clients
+ * and the REST route (``GET /api/trends``) share one definition.
+ * Adding it here is required for the Debt-1 codegen pipeline to
+ * emit a typed TypeScript surface for the extension.
+ */
+export interface TrendsRequest {
+  /**
+   * Aggregation window: 'week' = last 7 days, 'month' = last 30.
+   */
+  window?: "week" | "month";
+  /**
+   * When True, force the daemon to recompute the chronotype model from disk before replying. Defaults to False so the cached model.json is served.
+   */
+  refresh?: boolean;
+}
+/**
+ * Reply envelope for ``REQUEST_TRENDS``.
+ *
+ * Combines the per-day ``DailyBaseline`` rows (the bars) with the
+ * aggregated :class:`ChronotypeModel` (golden hour stripe, trend pill,
+ * top task / hour patterns).
+ */
+export interface TrendsResponse {
+  /**
+   * The window the daily rows cover. Week=last 7 days, month=last 30.
+   */
+  window?: "week" | "month";
+  /**
+   * One DailyBaseline row per day in the window, chronologically ascending. UI must read this — never iterate ``chronotype.baselines`` directly.
+   */
+  daily?: DailyBaseline[];
+  chronotype?: ChronotypeModel1;
+  /**
+   * When the cached aggregator last ran (mirrors chronotype.last_updated for convenience).
+   */
+  last_aggregated?: string | null;
+  /**
+   * Set when the daemon cannot fulfil the request. Known values: 'internal' | 'daemon_unavailable' | 'no_cache' | 'invalid_window' | None (success).
+   */
+  error?: string | null;
+}
+/**
+ * Aggregated model — trend_direction, sensitivity_multiplier, hourly_patterns, task_patterns.
+ */
+export interface ChronotypeModel1 {
+  /**
+   * Internal aggregator state — UI must read ``TrendsResponse.daily`` instead. The chronotype model stores the full window the aggregator considered (e.g. 90 days) while ``TrendsResponse.daily`` is windowed to the caller's requested span (week/month). Cross-reading from ``baselines`` will show entries outside the requested window and break the dashboard's date-bar math.
+   */
+  baselines?: DailyBaseline[];
+  /**
+   * Overall HRV trend direction
+   */
+  trend_direction?: "improving" | "stable" | "declining";
+  /**
+   * Dynamic multiplier for stress integral threshold
+   */
+  sensitivity_multiplier?: number;
+  /**
+   * Per-hour overload patterns
+   */
+  hourly_patterns?: HourlyOverloadRate[];
+  /**
+   * Per-task/repo overload patterns
+   */
+  task_patterns?: TaskOverloadPattern[];
+  /**
+   * When model was last updated
+   */
+  last_updated?: string | null;
+  /**
+   * Number of days in analysis window
+   */
+  window_days?: number;
 }
 /**
  * UI manipulation plan from LLM.
@@ -1714,9 +1945,30 @@ export interface WorkspaceSnapshot {
   terminal_scroll_position?: number | null;
 }
 /**
+ * Daily activity timeline — aggregated from browser extension syncs.
+ */
+export interface ActivityTimeline {
+  /**
+   * Date string YYYY-MM-DD
+   */
+  date: string;
+  /**
+   * Activities for this date
+   */
+  activities?: ActivitySummary1[];
+  /**
+   * Total learning seconds for the day
+   */
+  total_learning_s?: number;
+  /**
+   * Most frequent topic tags
+   */
+  dominant_topics?: string[];
+}
+/**
  * Summary of a single learning activity from the browser.
  */
-export interface ActivitySummary {
+export interface ActivitySummary1 {
   /**
    * Canonical URL identifier
    */
@@ -1761,27 +2013,6 @@ export interface ActivitySummary {
    * ~200 chars of visible text when leaving
    */
   context_snapshot?: string;
-}
-/**
- * Daily activity timeline — aggregated from browser extension syncs.
- */
-export interface ActivityTimeline {
-  /**
-   * Date string YYYY-MM-DD
-   */
-  date: string;
-  /**
-   * Activities for this date
-   */
-  activities?: ActivitySummary[];
-  /**
-   * Total learning seconds for the day
-   */
-  total_learning_s?: number;
-  /**
-   * Most frequent topic tags
-   */
-  dominant_topics?: string[];
 }
 /**
  * F05: client-confirmed outcome of an intervention apply.

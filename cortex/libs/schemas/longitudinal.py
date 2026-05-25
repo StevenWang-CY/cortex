@@ -50,7 +50,18 @@ class DailyBaseline(BaseModel):
 
 class ChronotypeModel(BaseModel):
     """Longitudinal model tracking how baselines drift over weeks."""
-    baselines: list[DailyBaseline] = Field(default_factory=list)
+    baselines: list[DailyBaseline] = Field(
+        default_factory=list,
+        description=(
+            "Internal aggregator state — UI must read "
+            "``TrendsResponse.daily`` instead. The chronotype model "
+            "stores the full window the aggregator considered (e.g. 90 "
+            "days) while ``TrendsResponse.daily`` is windowed to the "
+            "caller's requested span (week/month). Cross-reading from "
+            "``baselines`` will show entries outside the requested "
+            "window and break the dashboard's date-bar math."
+        ),
+    )
     trend_direction: Literal["improving", "stable", "declining"] = Field(
         "stable", description="Overall HRV trend direction"
     )
