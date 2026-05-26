@@ -26,6 +26,7 @@ export type MessageType =
   | "REQUEST_TRENDS"
   | "REQUEST_SESSION_RECAP"
   | "MICRO_STEP_TOGGLED"
+  | "WHY_DETAIL_REQUEST"
   | "AUTH_OK"
   | "STATE_UPDATE"
   | "INTERVENTION_TRIGGER"
@@ -42,6 +43,8 @@ export type MessageType =
   | "SESSION_DETAIL"
   | "TRENDS_PAYLOAD"
   | "SESSION_RECAP"
+  | "WHY_DETAIL"
+  | "BREAK_RECOMMENDATION"
   | "LEETCODE_SHOW_SCRATCHPAD"
   | "LEETCODE_SHOW_PATTERN_LADDER"
   | "LEETCODE_SHOW_LOCKOUT"
@@ -922,6 +925,12 @@ export interface InterventionPlan {
    */
   causal_explanation?: string;
   /**
+   * 2-3 dominant signals behind the trigger; first is primary
+   *
+   * @maxItems 3
+   */
+  causal_signals?: [] | [CausalSignal] | [CausalSignal, CausalSignal] | [CausalSignal, CausalSignal, CausalSignal];
+  /**
    * Consent ladder level for this intervention
    */
   consent_level?: "observe" | "suggest" | "preview" | "reversible_act" | "autonomous_act";
@@ -1009,7 +1018,8 @@ export interface SuggestedAction {
     | "start_timer"
     | "resume_last_active_file"
     | "prompt_micro_commit"
-    | "suggest_movement_break";
+    | "suggest_movement_break"
+    | "take_biology_break";
   /**
    * Integer index referencing the tab list from context (primary ID for tab actions)
    */
@@ -1136,6 +1146,52 @@ export interface TabRecommendation {
    * Group name if action is 'group'
    */
   group_name?: string | null;
+}
+/**
+ * P0 §3.9: one ranked driver behind the current state transition.
+ *
+ * The daemon emits a list of these (top 2-3) alongside each
+ * :class:`InterventionPlan` so the UI can render a structured "Why?"
+ * drilldown — name, current value, baseline, percent change, and a
+ * 60-sample 1-Hz sparkline buffer. Unlike the legacy free-text
+ * ``causal_explanation`` string this payload is engine-computed, not
+ * LLM-composed, and is therefore safe to compare against observable
+ * values in the F09 verifier.
+ *
+ * Privacy: ``samples_60s`` is the most recent 60 seconds of 1-Hz
+ * aggregates only; raw frame data never enters this buffer.
+ */
+export interface CausalSignal {
+  /**
+   * Signal label (e.g. 'HRV', 'Tab switches')
+   */
+  name: string;
+  /**
+   * Latest 1-Hz aggregate observed by the daemon
+   */
+  current_value: number;
+  /**
+   * User's personal baseline for this signal (None if unknown)
+   */
+  baseline_value?: number | null;
+  /**
+   * Display unit (ms, bpm, /min, °, …)
+   */
+  unit: string;
+  /**
+   * Percent change vs baseline; sign carries direction
+   */
+  delta_pct?: number | null;
+  /**
+   * Last 60 1-Hz samples for sparkline rendering
+   *
+   * @maxItems 60
+   */
+  samples_60s?: number[];
+  /**
+   * Rank of this signal within the explanation (primary first)
+   */
+  severity?: "primary" | "secondary" | "tertiary";
 }
 /**
  * Kinematic features from face mesh and pose estimation.
@@ -1287,6 +1343,7 @@ export interface SessionReport {
   peak_stress_integral?: number;
   breaks_taken?: number;
   breaks_recommended?: number;
+  break_records?: BreakRecord[];
   state_transitions?: StateTransition[];
   top_activities?: ActivitySummary[];
   top_distraction_domains?: string[];
@@ -1295,6 +1352,55 @@ export interface SessionReport {
   avg_hr_bpm?: number | null;
   avg_hrv_rmssd?: number | null;
   comparison_to_7day?: ComparisonStats | null;
+}
+/**
+ * P0 §3.7: a single biology-driven break event.
+ *
+ * Captured by :class:`cortex.services.intervention_engine.break_overlay.BiologyBreakController`
+ * when a guided breathing session starts; ``pre_hrv`` is the most
+ * recent HRV reading before the overlay shows, ``post_hrv`` is the
+ * reading captured on exit (natural completion or early termination),
+ * and ``recovery_delta = post_hrv - pre_hrv``. ``completed`` is True
+ * only when the breathing pattern ran the full ``duration_seconds``;
+ * early termination still preserves the record for the reward signal.
+ */
+export interface BreakRecord {
+  /**
+   * UTC timestamp when the break began
+   */
+  started_at: string;
+  /**
+   * Wall-clock seconds the break ran (≤ requested)
+   */
+  duration_seconds: number;
+  /**
+   * Breathing pattern that paced the session
+   */
+  pattern: "box" | "4-7-8" | "coherent";
+  /**
+   * HRV (RMSSD) immediately before the break began
+   */
+  pre_hrv?: number | null;
+  /**
+   * HRV (RMSSD) immediately after the break ended
+   */
+  post_hrv?: number | null;
+  /**
+   * post_hrv - pre_hrv (positive = recovery)
+   */
+  recovery_delta?: number | null;
+  /**
+   * True if the breathing pattern ran the full duration
+   */
+  completed?: boolean;
+  /**
+   * Whether the audio chime accompanied the breathing
+   */
+  audio_cue?: boolean;
+  /**
+   * Why the break was recommended
+   */
+  reason?: string;
 }
 /**
  * A single state transition event.

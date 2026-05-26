@@ -76,6 +76,15 @@ datas = [
     (str(CORTEX / "models" / "face_landmarker.task"),
      "cortex/models"),
 
+    # P0 §3.7: bundled audio loops for the biology break overlay. The
+    # ``BreakOverlayWindow`` resolves these via ``_audio_root()`` which
+    # walks two parents up from ``cortex/apps/desktop_shell/break_overlay.py``
+    # to ``cortex/assets/audio/``. Without this datas entry the frozen
+    # app silently runs the break without sound (QSoundEffect cannot
+    # locate ``box_4s.wav`` etc. inside MEIPASS).
+    (str(CORTEX / "assets" / "audio"),
+     "cortex/assets/audio"),
+
     # Fonts
     (str(CORTEX / "apps" / "browser_extension" / "assets" / "fonts"),
      "fonts"),

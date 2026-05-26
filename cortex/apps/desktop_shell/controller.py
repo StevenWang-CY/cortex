@@ -19,12 +19,13 @@ import signal
 import sys
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
 from PySide6.QtWidgets import QApplication
 
 from cortex.apps.desktop_shell import mac_native
+from cortex.apps.desktop_shell.break_overlay import BreakOverlayWindow
 from cortex.apps.desktop_shell.connections import ConnectionsPanel
 from cortex.apps.desktop_shell.dashboard import DashboardWindow
 from cortex.apps.desktop_shell.onboarding import OnboardingWindow, onboarding_marker_path
@@ -262,6 +263,11 @@ class CortexAppController:
         self._dashboard = DashboardWindow()
         self._connections = ConnectionsPanel()
         self._overlay = OverlayWindow()
+        # P0 §3.7: lazy — full-screen break overlay lives in its own
+        # frameless window. Instantiated on first use so headless test
+        # harnesses that never trigger a break don't pay the QSoundEffect
+        # boot cost.
+        self._break_overlay: BreakOverlayWindow | None = None
         self._settings = SettingsDialog()
         self._onboarding = OnboardingWindow()
 
@@ -318,6 +324,16 @@ class CortexAppController:
         # so peer surfaces re-render the strikethrough.
         if hasattr(self._overlay, "micro_step_toggled"):
             self._overlay.micro_step_toggled.connect(self._on_micro_step_toggled)
+        # P0 §3.8: rating button round-trip — the overlay emits
+        # ``rating_invoked(intervention_id, rating, text_feedback)``;
+        # the controller forwards via USER_RATING to the daemon.
+        if hasattr(self._overlay, "rating_invoked"):
+            self._overlay.rating_invoked.connect(self._on_rating_invoked)
+        # P0 §3.9: "Why?" chevron — when expanded the first time we
+        # send WHY_DETAIL_REQUEST and pipe the resulting structured
+        # signals back into the overlay's panel.
+        if hasattr(self._overlay, "why_requested"):
+            self._overlay.why_requested.connect(self._on_why_requested)
         self._settings.settings_changed.connect(self._on_settings_changed)
         self._settings.back_requested.connect(self._show_dashboard)
         self._connections.back_requested.connect(self._show_dashboard)
@@ -493,6 +509,12 @@ class CortexAppController:
         self._daemon = CortexDaemon(config=self._config)
         self._daemon.set_state_callback(self._bridge.on_state)
         self._daemon.set_intervention_callback(self._bridge.on_intervention)
+        # P0 §3.7: hand the desktop shell's full-screen break overlay to
+        # the daemon. The handler is async because the controller has
+        # to marshal back onto the Qt thread; the daemon owns the
+        # asyncio loop and the BiologyBreakController calls our handler
+        # whenever the user takes a break.
+        self._daemon.set_break_overlay_ui_handler(self._run_break_overlay)
         # P0 §3.3: subscribe to SESSION_RECAP broadcasts.
         # The daemon emits SESSION_RECAP exclusively via
         # ``_ws_server.send_message`` (see runtime_daemon.stop()'s 90 s
@@ -994,6 +1016,122 @@ class CortexAppController:
             logger.debug(
                 "toggle_micro_step scheduling failed", exc_info=True
             )
+
+    @Slot(str, str, str)
+    def _on_rating_invoked(
+        self, intervention_id: str, rating: str, text_feedback: str,
+    ) -> None:
+        """P0 §3.8: forward 👍/👎 to the daemon via USER_RATING handler."""
+        if self._daemon is None or self._daemon_loop is None:
+            return
+        payload = {
+            "intervention_id": str(intervention_id),
+            "rating": str(rating),
+        }
+        if text_feedback:
+            payload["context"] = str(text_feedback)[:200]
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._daemon._handle_user_action(payload),
+                self._daemon_loop,
+            )
+        except Exception:
+            logger.debug("rating_invoked scheduling failed", exc_info=True)
+
+    @Slot(str)
+    def _on_why_requested(self, intervention_id: str) -> None:
+        """P0 §3.9: resolve a WHY_DETAIL_REQUEST locally and apply the
+        signals to the overlay's drilldown panel.
+        """
+        if self._daemon is None or self._daemon_loop is None:
+            return
+
+        async def _fetch_and_apply() -> None:
+            try:
+                signals = await self._daemon.get_causal_signals(
+                    str(intervention_id),
+                )
+            except Exception:
+                logger.debug("get_causal_signals failed", exc_info=True)
+                signals = None
+            if signals is None:
+                signals = []
+            # Marshal back onto the Qt thread.
+            from PySide6.QtCore import QTimer as _QTimer
+
+            def _apply() -> None:
+                if self._overlay is not None and hasattr(
+                    self._overlay, "apply_causal_signals"
+                ):
+                    try:
+                        self._overlay.apply_causal_signals(list(signals))
+                    except Exception:
+                        logger.debug("apply_causal_signals failed", exc_info=True)
+
+            _QTimer.singleShot(0, _apply)
+
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _fetch_and_apply(), self._daemon_loop,
+            )
+        except Exception:
+            logger.debug("why_requested scheduling failed", exc_info=True)
+
+    async def _run_break_overlay(
+        self,
+        duration_seconds: float,
+        breathing_pattern: str,
+        audio_cue: bool,
+    ) -> tuple[float, bool]:
+        """P0 §3.7: drive the full-screen Qt break overlay from asyncio.
+
+        The daemon owns the asyncio loop; the Qt overlay needs the Qt
+        thread. We marshal across the boundary by scheduling the
+        ``BreakOverlayWindow.run`` call on the Qt main thread (via the
+        Qt event loop) and awaiting its completion through a
+        ``concurrent.futures.Future`` that the Qt side resolves once
+        ``run`` returns.
+
+        The contract returned to the controller — ``(elapsed_seconds,
+        completed)`` — feeds the daemon's BiologyBreakController which
+        in turn computes ``recovery_delta`` and persists the BreakRecord.
+        """
+        import concurrent.futures
+
+        from PySide6.QtCore import QTimer as _QTimer
+
+        future: concurrent.futures.Future[tuple[float, bool]] = (
+            concurrent.futures.Future()
+        )
+        pattern: Literal["box", "4-7-8", "coherent"]
+        if breathing_pattern in ("box", "4-7-8", "coherent"):
+            pattern = breathing_pattern  # type: ignore[assignment]
+        else:
+            pattern = "box"
+
+        def _on_qt_thread() -> None:
+            try:
+                if self._break_overlay is None:
+                    self._break_overlay = BreakOverlayWindow()
+                # NB: BreakOverlayWindow.run blocks on a local QEventLoop
+                # so it is safe to call directly from the Qt thread.
+                elapsed, completed = self._break_overlay.run(
+                    duration_seconds=float(duration_seconds),
+                    pattern=pattern,
+                    audio_cue=bool(audio_cue),
+                )
+            except Exception as exc:  # pragma: no cover - exercised in manual QA
+                logger.exception("BreakOverlayWindow.run failed")
+                future.set_exception(exc)
+                return
+            future.set_result((elapsed, completed))
+
+        # QTimer.singleShot is the canonical way to schedule a callable on
+        # the Qt main thread from any thread.
+        _QTimer.singleShot(0, _on_qt_thread)
+        # asyncio.wrap_future bridges the concurrent.futures.Future into
+        # the asyncio loop so the caller can ``await`` it.
+        return await asyncio.wrap_future(future)
 
     def _copy_to_clipboard(self, text: str) -> None:
         """Copy ``text`` to the macOS clipboard via QGuiApplication.

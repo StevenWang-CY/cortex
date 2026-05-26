@@ -12,9 +12,15 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# P0 §3.8: 200-character cap on the optional 👎 free-text feedback so
+# the helpfulness store never balloons even under adversarial input.
+# The text never reaches the LLM — it is stored locally only.
+_MAX_TEXT_FEEDBACK_CHARS = 200
 
 # Reward computation weights
 _RECOVERY_WEIGHT = 0.40   # Did user return to FLOW?
@@ -74,6 +80,10 @@ class _TrackedIntervention:
         self.was_engaged: bool = False
         self.user_rating: str | None = None  # "thumbs_up" or "thumbs_down"
         self.user_action: str = "dismissed"
+        # P0 §3.8: optional one-line free-text feedback that the user
+        # typed on a 👎. Stored locally for offline causal analysis;
+        # NEVER sent to the LLM.
+        self.text_feedback: str | None = None
 
 
 class HelpfulnessTracker:
@@ -95,6 +105,12 @@ class HelpfulnessTracker:
         self._active: dict[str, _TrackedIntervention] = {}
         self._recent_rewards: list[float] = []
         self._recent_engaged: list[bool] = []
+        # P0 §3.8: rolling timestamps of recent thumbs_down events so
+        # the daemon can detect a frustration spiral (5 downvotes in
+        # 30 s → trigger Quiet Mode for 30 min). The deque is bounded
+        # at 32 entries — large enough that the 30 s window is reliably
+        # observable even under rapid clicking.
+        self._recent_downvotes: deque[float] = deque(maxlen=32)
 
     def start_tracking(
         self,
@@ -159,11 +175,55 @@ class HelpfulnessTracker:
         if tracked:
             tracked.was_undone = True
 
-    def record_rating(self, intervention_id: str, rating: str) -> None:
-        """Record explicit user rating (thumbs_up/thumbs_down)."""
+    def record_rating(
+        self,
+        intervention_id: str,
+        rating: str,
+        *,
+        text_feedback: str | None = None,
+    ) -> None:
+        """Record explicit user rating (thumbs_up/thumbs_down).
+
+        P0 §3.8: ``text_feedback`` is an optional one-line free-text
+        comment the user typed on 👎. It is stored locally on the
+        tracker record and NEVER routed to the LLM. The string is
+        clipped to :data:`_MAX_TEXT_FEEDBACK_CHARS` and stripped before
+        store. Downvotes are timestamped on
+        :attr:`_recent_downvotes` so :meth:`downvote_count_within` can
+        gate the frustration-spiral throttle.
+        """
+        if rating not in ("thumbs_up", "thumbs_down"):
+            return
         tracked = self._active.get(intervention_id)
-        if tracked and rating in ("thumbs_up", "thumbs_down"):
-            tracked.user_rating = rating
+        if tracked is None:
+            # We still want to count the downvote for the throttle even
+            # if the intervention has already ended (tracker.pop on
+            # end_tracking) — a user who downvotes the dismissal toast
+            # of a stale intervention shouldn't be silently lost.
+            if rating == "thumbs_down":
+                self._recent_downvotes.append(time.monotonic())
+            return
+        tracked.user_rating = rating
+        if text_feedback is not None:
+            cleaned = text_feedback.strip()[:_MAX_TEXT_FEEDBACK_CHARS]
+            tracked.text_feedback = cleaned or None
+        if rating == "thumbs_down":
+            self._recent_downvotes.append(time.monotonic())
+
+    def downvote_count_within(self, window_seconds: float) -> int:
+        """Count thumbs_down events within the last ``window_seconds``."""
+        if window_seconds <= 0:
+            return 0
+        cutoff = time.monotonic() - float(window_seconds)
+        # Drop entries that fall outside the window so the deque doesn't
+        # accumulate stale timestamps forever.
+        while self._recent_downvotes and self._recent_downvotes[0] < cutoff:
+            self._recent_downvotes.popleft()
+        return len(self._recent_downvotes)
+
+    def reset_downvote_window(self) -> None:
+        """Clear the downvote ring buffer (e.g. after entering Quiet Mode)."""
+        self._recent_downvotes.clear()
 
     async def end_tracking(
         self,
@@ -220,6 +280,7 @@ class HelpfulnessTracker:
             "was_engaged": tracked.was_engaged,
             "user_rating": tracked.user_rating,
             "user_action": tracked.user_action,
+            "text_feedback": tracked.text_feedback,
             "reward_signal": reward,
             "decision_id": tracked.decision_id,
             "policy_arm": tracked.policy_arm,

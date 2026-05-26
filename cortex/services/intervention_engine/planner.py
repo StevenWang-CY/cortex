@@ -8,8 +8,13 @@ maps hide_targets to concrete adapter commands.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
-from cortex.libs.schemas.intervention import InterventionPlan
+from cortex.libs.schemas.intervention import (
+    InterventionPlan,
+    SuggestedAction,
+    UIPlan,
+)
 
 # ---------------------------------------------------------------------------
 # Adapter command types
@@ -216,6 +221,76 @@ def map_hide_targets(plan: InterventionPlan) -> list[AdapterCommand]:
             )
 
     return commands
+
+
+def promote_biology_break(
+    plan: InterventionPlan,
+    *,
+    duration_seconds: int = 240,
+    breathing_pattern: Literal["box", "4-7-8", "coherent"] | None = None,
+    audio_cue: bool = True,
+    reason: str = "stress_integral_crossed_threshold",
+) -> InterventionPlan:
+    """Mutate ``plan`` so ``take_biology_break`` is the primary action.
+
+    Called by the daemon when :meth:`StressIntegralTracker.should_break`
+    is True. The function:
+
+    * prepends a ``take_biology_break`` :class:`SuggestedAction` with
+      the configured metadata (the desktop shell reads
+      ``metadata.duration_seconds`` etc. to drive the overlay),
+    * downgrades any peer ``recommended`` actions to ``optional`` so
+      the UI's single-CTA preview→confirm→execute path elevates the
+      break,
+    * forces ``ui_plan.intervention_type = "overlay_only"`` so the
+      desktop shell renders the break overlay rather than the
+      simplified workspace,
+    * rewrites the headline / primary_focus to a deterministic
+      copy (the LLM is free to keep its own text in the situation
+      summary).
+
+    The plan object is mutated in place and also returned for
+    composability with planner pipelines.
+    """
+    metadata: dict[str, object] = {
+        "duration_seconds": int(duration_seconds),
+        "breathing_pattern": breathing_pattern or "auto",
+        "audio_cue": bool(audio_cue),
+        "reason": str(reason)[:120],
+    }
+    break_action = SuggestedAction(
+        action_type="take_biology_break",
+        target="",
+        label=f"Take a {max(1, duration_seconds // 60)}-minute break",
+        reason="Your HRV has been suppressed long enough that the daemon "
+               "recommends a guided breathing reset.",
+        category="recommended",
+        reversible=True,
+        metadata=metadata,
+    )
+
+    # Demote peer recommended actions so the single-CTA UI surfaces the
+    # break, not e.g. a tab-close as the primary action.
+    for action in plan.suggested_actions:
+        if action.category == "recommended":
+            action.category = "optional"
+    plan.suggested_actions = [break_action, *plan.suggested_actions]
+
+    # Force overlay-only — the simplified_workspace path would hide tabs
+    # while the breathing overlay runs, which is jarring.
+    plan.ui_plan = UIPlan(
+        dim_background=True,
+        show_overlay=True,
+        fold_unrelated_code=False,
+        intervention_type="overlay_only",
+        max_visible_lines=plan.ui_plan.max_visible_lines,
+    )
+    plan.level = "overlay_only"
+    plan.headline = f"Take a {max(1, duration_seconds // 60)}-minute break."
+    plan.primary_focus = "Your breath"
+    plan.tone = "supportive"
+    plan.consent_level = "suggest"
+    return plan
 
 
 def prepare_plan(

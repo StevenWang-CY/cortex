@@ -17,12 +17,13 @@ from __future__ import annotations
 import logging
 
 from PySide6.QtCore import QRect, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QPainter
+from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -65,6 +66,7 @@ from cortex.apps.desktop_shell.tokens import (
     HUD_ACCENT,
     RADIUS_BUTTON,
     RADIUS_WINDOW,
+    SP1,
     SP2,
     SP3,
     SP4,
@@ -263,6 +265,49 @@ class BreathingPacer(QWidget):
         painter.end()
 
 
+class _SparklineWidget(QWidget):
+    """P0 §3.9: 60×24 px sparkline for one causal signal's 60-sample buffer."""
+
+    def __init__(
+        self,
+        samples: list[float],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._samples = [float(v) for v in samples if isinstance(v, (int, float))]
+        self.setFixedSize(60, 24)
+        self.setStyleSheet("background: transparent;")
+
+    def paintEvent(self, _event: object) -> None:  # noqa: N802
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.fillRect(self.rect(), QColor(255, 255, 255, 8))
+            samples = self._samples
+            if len(samples) < 2:
+                return
+            lo = min(samples)
+            hi = max(samples)
+            if hi <= lo:
+                lo = lo - 1.0
+                hi = lo + 2.0
+            w = self.width() - 2
+            h = self.height() - 4
+            step = w / (len(samples) - 1)
+            pen = QPen(QColor(217, 119, 87, 220))
+            pen.setWidth(1)
+            painter.setPen(pen)
+            prev_x = 1.0
+            prev_y = self.height() - 2 - (samples[0] - lo) / (hi - lo) * h
+            for i in range(1, len(samples)):
+                x = 1.0 + i * step
+                y = self.height() - 2 - (samples[i] - lo) / (hi - lo) * h
+                painter.drawLine(int(prev_x), int(prev_y), int(x), int(y))
+                prev_x, prev_y = x, y
+        finally:
+            painter.end()
+
+
 class OverlayWindow(QWidget):
     """Frameless always-on-top intervention overlay backed by HUD vibrancy."""
 
@@ -281,6 +326,15 @@ class OverlayWindow(QWidget):
     # so peer surfaces (extension popup, VS Code panel) render the
     # strikethrough.
     micro_step_toggled = Signal(str, int, str)
+    # P0 §3.8: emitted when the user clicks 👍 / 👎 on the active
+    # intervention. Payload: ``(intervention_id, rating, text_feedback)``;
+    # ``rating`` ∈ {"thumbs_up", "thumbs_down"}. ``text_feedback`` is
+    # the empty string when no text was provided.
+    rating_invoked = Signal(str, str, str)
+    # P0 §3.9: emitted when the user requests the structured causal
+    # rationale (clicks the "Why?" chevron). Payload is the active
+    # intervention id; the controller fans out to a WHY_DETAIL_REQUEST.
+    why_requested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -298,6 +352,11 @@ class OverlayWindow(QWidget):
         # Idempotency guard: once dismissed (auto or user), subsequent dismiss
         # calls are no-ops. First emitter wins. See F06.
         self._dismissed: bool = False
+        # P0 §3.8 audit fix: per-intervention rating-row gate. ``True``
+        # for guided_mode + simplified_workspace; ``False`` for
+        # overlay_only minimal-tone interventions. Set in
+        # ``show_intervention`` and consulted by ``_reveal_feedback_row``.
+        self._wants_rating: bool = False
 
         # Frameless + always-on-top. Translucent background lets the
         # NSVisualEffectView under the window show through.
@@ -565,6 +624,108 @@ class OverlayWindow(QWidget):
             self._dismiss_btn, alignment=Qt.AlignmentFlag.AlignCenter
         )
 
+        # P0 §3.8: feedback row — 👍 / 👎 buttons rendered after any
+        # action click OR 30 s after the overlay shows, whichever comes
+        # first. ``_feedback_row`` is hidden by default; the timer
+        # below reveals it.
+        self._feedback_row = QFrame()
+        self._feedback_row.setObjectName("CortexOverlayFeedbackRow")
+        self._feedback_row.setStyleSheet(
+            "QFrame#CortexOverlayFeedbackRow { background: transparent; }"
+        )
+        feedback_layout = QHBoxLayout(self._feedback_row)
+        feedback_layout.setContentsMargins(0, 0, 0, 0)
+        feedback_layout.setSpacing(SP3)
+        feedback_layout.addStretch()
+        self._thumbs_up_btn = QPushButton("👍")
+        _set_accessible_name(self._thumbs_up_btn, "Mark helpful")
+        self._thumbs_up_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._thumbs_up_btn.setStyleSheet(self._feedback_btn_stylesheet())
+        self._thumbs_up_btn.clicked.connect(self._on_thumbs_up)
+        feedback_layout.addWidget(self._thumbs_up_btn)
+        self._thumbs_down_btn = QPushButton("👎")
+        _set_accessible_name(self._thumbs_down_btn, "Mark unhelpful")
+        self._thumbs_down_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._thumbs_down_btn.setStyleSheet(self._feedback_btn_stylesheet())
+        self._thumbs_down_btn.clicked.connect(self._on_thumbs_down)
+        feedback_layout.addWidget(self._thumbs_down_btn)
+        feedback_layout.addStretch()
+        self._feedback_row.hide()
+        card_layout.addWidget(self._feedback_row)
+
+        # P0 §3.8: optional one-line text input shown after 👎. Enter
+        # commits, Esc skips. Hidden by default; revealed in
+        # ``_on_thumbs_down``.
+        self._feedback_text = QLineEdit()
+        self._feedback_text.setObjectName("CortexOverlayFeedbackText")
+        self._feedback_text.setPlaceholderText(
+            "What would have helped? (Enter to send, Esc to skip)"
+        )
+        self._feedback_text.setStyleSheet(
+            "QLineEdit#CortexOverlayFeedbackText {"
+            "  background: rgba(255, 255, 255, 0.05);"
+            "  color: rgba(232, 222, 207, 0.92);"
+            f"  border: 1px solid {_ACCENT.name()}55;"
+            f"  border-radius: {RADIUS_BUTTON}px;"
+            "  padding: 6px 10px;"
+            f"  font-size: {FS_CAPTION}px;"
+            "}"
+        )
+        self._feedback_text.returnPressed.connect(self._commit_feedback_text)
+        self._feedback_text.hide()
+        card_layout.addWidget(self._feedback_text)
+
+        # P0 §3.8: schedule a one-shot reveal of the feedback row 30 s
+        # after the overlay shows. The action_invoked handler also
+        # reveals the row immediately so the user gets the affordance
+        # right after engagement.
+        self._feedback_reveal_timer = QTimer(self)
+        self._feedback_reveal_timer.setSingleShot(True)
+        self._feedback_reveal_timer.setInterval(30 * 1000)
+        self._feedback_reveal_timer.timeout.connect(self._reveal_feedback_row)
+
+        # P0 §3.9: "Why?" chevron + drilldown panel. Renders a row per
+        # causal signal with a tiny sparkline and a delta pill. Hidden
+        # by default; the chevron toggles visibility.
+        self._why_row = QHBoxLayout()
+        self._why_row.setSpacing(SP2)
+        self._why_toggle = QPushButton("Why?")
+        _set_accessible_name(self._why_toggle, "Show structured causal rationale")
+        self._why_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._why_toggle.setStyleSheet(
+            "QPushButton {"
+            f"  color: {_TEXT_SECONDARY.name()};"
+            "  background: transparent;"
+            "  border: none;"
+            f"  font-size: {FS_CAPTION}px;"
+            "  text-decoration: underline;"
+            "  padding: 0;"
+            "}"
+            "QPushButton:hover { color: white; }"
+        )
+        self._why_toggle.clicked.connect(self._on_why_toggle_clicked)
+        self._why_row.addWidget(self._why_toggle)
+        self._why_row.addStretch()
+        card_layout.addLayout(self._why_row)
+        self._why_panel = QFrame()
+        self._why_panel.setObjectName("CortexOverlayWhyPanel")
+        self._why_panel.setStyleSheet(
+            "QFrame#CortexOverlayWhyPanel {"
+            "  background-color: rgba(255, 255, 255, 0.03);"
+            f"  border-radius: {RADIUS_BUTTON}px;"
+            "  padding: 6px;"
+            "}"
+        )
+        self._why_panel_layout = QVBoxLayout(self._why_panel)
+        self._why_panel_layout.setContentsMargins(8, 6, 8, 6)
+        self._why_panel_layout.setSpacing(SP1)
+        self._why_panel.hide()
+        card_layout.addWidget(self._why_panel)
+        self._causal_signals_cache: list[dict] = []
+        self._why_open: bool = False
+        # Hide the Why row entirely until the daemon supplies signals.
+        self._why_toggle.hide()
+
         self._main_layout.addWidget(self._card)
 
         # F55: explicit tab-order chain. Without setTabOrder, Qt falls
@@ -691,6 +852,34 @@ class OverlayWindow(QWidget):
             )
 
         self._timeout_timer.start()
+
+        # P0 §3.8: reset and re-schedule the feedback reveal timer.
+        # Rendering hidden by default; reveals after 30 s or an action click.
+        # P0 §3.8 audit fix (spec line 710): only schedule the reveal
+        # on guided_mode + simplified_workspace overlays. Minimal-tone
+        # overlay_only interventions stay ambient and never solicit
+        # ratings. The instance flag is read again from
+        # ``_reveal_feedback_row`` so a tail action click can't surface
+        # the row either.
+        level = str(payload.get("level") or "")
+        self._wants_rating = level in ("guided_mode", "simplified_workspace")
+        try:
+            self._feedback_reveal_timer.stop()
+            self._feedback_row.hide()
+            self._feedback_text.hide()
+            self._feedback_text.clear()
+            if self._wants_rating:
+                self._feedback_reveal_timer.start()
+        except Exception:
+            logger.debug("feedback reset failed", exc_info=True)
+
+        # P0 §3.9: ingest structured causal signals (idempotent; empty
+        # list collapses the Why? affordance entirely).
+        try:
+            signals = payload.get("causal_signals") or []
+            self.apply_causal_signals(signals if isinstance(signals, list) else [])
+        except Exception:
+            logger.debug("apply_causal_signals failed", exc_info=True)
 
         self.show()
         self.raise_()
@@ -1187,12 +1376,203 @@ class OverlayWindow(QWidget):
             self.action_invoked.emit(self._intervention_id, dict(action))
         except Exception:
             logger.debug("action_invoked emit failed", exc_info=True)
+        # P0 §3.8: reveal the rating row immediately after engagement.
+        self._reveal_feedback_row()
+
+    # ─────────────────────────────────────────────────────────────────
+    # P0 §3.8: rating + frustration-spiral helpers
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _feedback_btn_stylesheet() -> str:
+        """Shared style for 👍 / 👎 buttons."""
+        return (
+            "QPushButton {"
+            "  background-color: rgba(255, 255, 255, 0.06);"
+            "  color: white;"
+            "  border: 0.5px solid rgba(255, 255, 255, 0.14);"
+            f"  border-radius: {RADIUS_BUTTON}px;"
+            "  padding: 6px 16px;"
+            "  font-size: 16px;"
+            "}"
+            "QPushButton:hover {"
+            "  background-color: rgba(255, 255, 255, 0.12);"
+            "}"
+            "QPushButton:checked, QPushButton:pressed {"
+            f"  background-color: {_ACCENT.name()};"
+            "}"
+        )
+
+    def _reveal_feedback_row(self) -> None:
+        """Show the 👍/👎 row once.
+
+        P0 §3.8 audit fix (spec line 710): respect ``_wants_rating``
+        so a tail action click on a minimal-tone (overlay_only)
+        intervention does not surface the rating row. ``_wants_rating``
+        is set in ``show_intervention`` from the plan's ``level``.
+        """
+        try:
+            self._feedback_reveal_timer.stop()
+        except Exception:
+            pass
+        if not getattr(self, "_wants_rating", False):
+            return
+        if not self._feedback_row.isVisible():
+            self._feedback_row.show()
+
+    def _on_thumbs_up(self) -> None:
+        if not self._intervention_id:
+            return
+        try:
+            self.rating_invoked.emit(
+                self._intervention_id, "thumbs_up", "",
+            )
+        except Exception:
+            logger.debug("rating_invoked(thumbs_up) failed", exc_info=True)
+        # Once rated, collapse the overlay — the rating completes the
+        # interaction (consent: implicit "I'm done").
+        QTimer.singleShot(180, self._auto_dismiss)
+
+    def _on_thumbs_down(self) -> None:
+        if not self._intervention_id:
+            return
+        # Reveal the optional one-line text input. The user can press
+        # Enter to send, or skip with Esc / by clicking dismiss.
+        self._feedback_text.show()
+        self._feedback_text.setFocus(Qt.FocusReason.OtherFocusReason)
+        try:
+            self.rating_invoked.emit(
+                self._intervention_id, "thumbs_down", "",
+            )
+        except Exception:
+            logger.debug("rating_invoked(thumbs_down) failed", exc_info=True)
+
+    def _commit_feedback_text(self) -> None:
+        """Enter key on the one-line text input — emit + collapse."""
+        text = self._feedback_text.text().strip()[:200]
+        if not self._intervention_id:
+            return
+        if text:
+            try:
+                # Re-emit thumbs_down with the text payload so the
+                # daemon's helpfulness tracker stashes the comment on
+                # the same record.
+                self.rating_invoked.emit(
+                    self._intervention_id, "thumbs_down", text,
+                )
+            except Exception:
+                logger.debug(
+                    "rating_invoked(thumbs_down,text) failed",
+                    exc_info=True,
+                )
+        self._feedback_text.clear()
+        self._feedback_text.hide()
+        QTimer.singleShot(120, self._auto_dismiss)
+
+    # ─────────────────────────────────────────────────────────────────
+    # P0 §3.9: structured "Why?" drilldown
+    # ─────────────────────────────────────────────────────────────────
+
+    def _on_why_toggle_clicked(self) -> None:
+        self._why_open = not self._why_open
+        if self._why_open:
+            self._why_toggle.setText("Hide why")
+            self._why_panel.show()
+            if not self._causal_signals_cache and self._intervention_id:
+                try:
+                    self.why_requested.emit(self._intervention_id)
+                except Exception:
+                    logger.debug("why_requested.emit failed", exc_info=True)
+        else:
+            self._why_toggle.setText("Why?")
+            self._why_panel.hide()
+
+    def apply_causal_signals(self, signals: list[dict]) -> None:
+        """Public slot: ingest structured signals and rebuild the panel.
+
+        Called from ``show_intervention`` (initial trigger payload) and
+        from the controller's ``WHY_DETAIL`` listener. Idempotent.
+        """
+        if not isinstance(signals, list):
+            signals = []
+        self._causal_signals_cache = list(signals)
+        # Tear down prior rows.
+        while self._why_panel_layout.count():
+            item = self._why_panel_layout.takeAt(0)
+            widget = item.widget() if item is not None else None
+            if widget is not None:
+                widget.deleteLater()
+        for sig in self._causal_signals_cache:
+            row = self._render_why_row(sig)
+            if row is not None:
+                self._why_panel_layout.addWidget(row)
+        if self._causal_signals_cache:
+            self._why_toggle.show()
+        else:
+            self._why_toggle.hide()
+            self._why_panel.hide()
+            self._why_open = False
+            self._why_toggle.setText("Why?")
+
+    def _render_why_row(self, sig: dict) -> QFrame | None:
+        try:
+            name = str(sig.get("name") or "")
+            unit = str(sig.get("unit") or "")
+            current = float(sig.get("current_value") or 0.0)
+            baseline = sig.get("baseline_value")
+            delta_pct = sig.get("delta_pct")
+            severity = sig.get("severity") or "secondary"
+            samples = sig.get("samples_60s") or []
+            if not isinstance(samples, list):
+                samples = []
+        except Exception:
+            logger.debug("malformed causal signal", exc_info=True)
+            return None
+        row = QFrame()
+        row.setStyleSheet("QFrame { background: transparent; }")
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 2, 0, 2)
+        layout.setSpacing(SP3)
+        weight = "semibold" if severity == "primary" else "regular"
+        name_label = QLabel(name)
+        name_label.setFont(mac_native.system_font(FS_CAPTION, weight))
+        name_label.setStyleSheet(
+            f"color: {_TEXT_PRIMARY.name()}; background: transparent;"
+        )
+        name_label.setMinimumWidth(96)
+        layout.addWidget(name_label)
+        value_text = f"{current:.1f}{unit}"
+        if isinstance(baseline, (int, float)):
+            value_text += f"  (baseline {float(baseline):.1f}{unit})"
+        value_label = QLabel(value_text)
+        value_label.setFont(mac_native.system_font(FS_CAPTION, "regular"))
+        value_label.setStyleSheet(
+            f"color: {_TEXT_SECONDARY.name()}; background: transparent;"
+        )
+        layout.addWidget(value_label, stretch=1)
+        spark = _SparklineWidget(samples)
+        layout.addWidget(spark)
+        if isinstance(delta_pct, (int, float)):
+            arrow = "↓" if delta_pct < 0 else "↑"
+            pill = QLabel(f"{arrow}{abs(float(delta_pct)):.0f}%")
+            pill.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
+            pill_color = "#E47A6E" if delta_pct < 0 else _ACCENT.name()
+            pill.setStyleSheet(
+                f"color: {pill_color}; background: transparent;"
+            )
+            layout.addWidget(pill)
+        return row
 
     def _user_dismiss(self) -> None:
         # F06: idempotent dismiss. First caller wins; subsequent calls no-op.
         # Always stop the timeout timer, even if already dismissed, so that
         # a stale timer cannot re-trigger on a hidden widget.
         self._timeout_timer.stop()
+        # P0 §3.8 audit fix: tear down the feedback reveal timer + row so
+        # a late-firing 30 s singleShot cannot surface the 👍/👎 row on a
+        # dismissed intervention (which would emit USER_RATING against a
+        # stale intervention_id).
+        self._stop_feedback_reveal_timer()
         if self._dismissed:
             return
         self._dismissed = True
@@ -1209,6 +1589,7 @@ class OverlayWindow(QWidget):
     def _auto_dismiss(self) -> None:
         # F06: idempotent dismiss. First caller wins; subsequent calls no-op.
         self._timeout_timer.stop()
+        self._stop_feedback_reveal_timer()
         if self._dismissed:
             return
         self._dismissed = True
@@ -1218,6 +1599,25 @@ class OverlayWindow(QWidget):
         self.dismissed.emit(dismissed_id)
         self._intervention_id = ""
         logger.info(f"Intervention {dismissed_id} auto-dismissed (timeout)")
+
+    def _stop_feedback_reveal_timer(self) -> None:
+        """P0 §3.8 audit fix: tear down the rating row reveal timer.
+
+        Called by every dismiss path so a Qt single-shot timer queued
+        before ``show_intervention`` cannot surface the 👍/👎 row on an
+        already-collapsed overlay. Also collapses the optional text
+        input so the next intervention starts from a clean slate.
+        """
+        try:
+            self._feedback_reveal_timer.stop()
+        except Exception:
+            logger.debug("feedback_reveal_timer.stop failed", exc_info=True)
+        try:
+            self._feedback_row.hide()
+            self._feedback_text.hide()
+            self._feedback_text.clear()
+        except Exception:
+            logger.debug("feedback row teardown failed", exc_info=True)
 
     def closeEvent(self, event: object) -> None:  # noqa: D401 - Qt override
         # F06: ensure the timeout timer never fires after the window closes.

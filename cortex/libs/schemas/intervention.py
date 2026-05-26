@@ -33,6 +33,7 @@ _TARGET_MAX_LEN: dict[str, int] = {
     "resume_last_active_file": 300,
     "prompt_micro_commit": 80,
     "suggest_movement_break": 32,
+    "take_biology_break": 32,
 }
 
 
@@ -65,6 +66,11 @@ class SuggestedAction(BaseModel):
         "resume_last_active_file",
         "prompt_micro_commit",
         "suggest_movement_break",
+        # P0 §3.7: biology-driven break action — launches the full-screen
+        # breathing overlay on the desktop shell. Reversible only in the
+        # sense that the user can end the session early; nothing
+        # destructive happens to the workspace.
+        "take_biology_break",
     ] = Field(..., description="Type of executable action")
     tab_index: int | None = Field(
         None,
@@ -193,6 +199,49 @@ class ErrorAnalysis(BaseModel):
     )
     minimal_edit: str = Field(
         "", max_length=1000, description="Smallest code change that fixes the issue"
+    )
+
+
+class CausalSignal(BaseModel):
+    """P0 §3.9: one ranked driver behind the current state transition.
+
+    The daemon emits a list of these (top 2-3) alongside each
+    :class:`InterventionPlan` so the UI can render a structured "Why?"
+    drilldown — name, current value, baseline, percent change, and a
+    60-sample 1-Hz sparkline buffer. Unlike the legacy free-text
+    ``causal_explanation`` string this payload is engine-computed, not
+    LLM-composed, and is therefore safe to compare against observable
+    values in the F09 verifier.
+
+    Privacy: ``samples_60s`` is the most recent 60 seconds of 1-Hz
+    aggregates only; raw frame data never enters this buffer.
+    """
+
+    name: str = Field(
+        ..., max_length=40, description="Signal label (e.g. 'HRV', 'Tab switches')"
+    )
+    current_value: float = Field(
+        ...,
+        description="Latest 1-Hz aggregate observed by the daemon",
+    )
+    baseline_value: float | None = Field(
+        None,
+        description="User's personal baseline for this signal (None if unknown)",
+    )
+    unit: str = Field(
+        ..., max_length=10, description="Display unit (ms, bpm, /min, °, …)"
+    )
+    delta_pct: float | None = Field(
+        None, description="Percent change vs baseline; sign carries direction"
+    )
+    samples_60s: list[float] = Field(
+        default_factory=list,
+        max_length=60,
+        description="Last 60 1-Hz samples for sparkline rendering",
+    )
+    severity: Literal["primary", "secondary", "tertiary"] = Field(
+        "secondary",
+        description="Rank of this signal within the explanation (primary first)",
     )
 
 
@@ -342,6 +391,16 @@ class InterventionPlan(BaseModel):
     )
     causal_explanation: str = Field(
         "", max_length=500, description="Why Cortex triggered this intervention, referencing specific signals"
+    )
+    # P0 §3.9: structured rationale companion to ``causal_explanation``.
+    # Maximum three entries (primary + secondary + tertiary), ranked by
+    # |z-score| against the user's baselines. Surfaces in the "Why?"
+    # drilldown on every surface. Empty when the daemon could not
+    # attribute the trigger (cold-start baselines, missing features).
+    causal_signals: list[CausalSignal] = Field(
+        default_factory=list,
+        max_length=3,
+        description="2-3 dominant signals behind the trigger; first is primary",
     )
     consent_level: Literal[
         "observe", "suggest", "preview", "reversible_act", "autonomous_act"

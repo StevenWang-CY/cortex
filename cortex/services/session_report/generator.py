@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 
 from cortex.services.session_report.models import (
     ActivitySummary,
+    BreakRecord,
     ComparisonStats,
     SessionReport,
     StateTransition,
@@ -50,6 +51,11 @@ class SessionReportGenerator:
         self._distraction_domains: list[str] = []
         self._hourly_flow: dict[int, float] = defaultdict(float)
         self._hourly_total: dict[int, float] = defaultdict(float)
+        # P0 §3.7: per-break audit trail. Populated by the
+        # BiologyBreakController on session end so the recap card can
+        # show "+24 HRV recovery during break" without re-reading
+        # storage.
+        self._break_records: list[BreakRecord] = []
 
     def start(self) -> None:
         """Mark session start."""
@@ -99,11 +105,27 @@ class SessionReportGenerator:
         """Record peak stress integral."""
         self._peak_stress = max(self._peak_stress, stress_integral)
 
-    def record_break(self, *, recommended: bool = False) -> None:
-        """Record a break event."""
-        self._breaks_taken += 1
+    def record_break(
+        self,
+        *,
+        recommended: bool = False,
+        taken: bool = True,
+        record: BreakRecord | None = None,
+    ) -> None:
+        """Record a break event.
+
+        P0 §3.7 extension: ``recommended`` reflects whether the daemon
+        nudged the user via :attr:`BREAK_RECOMMENDATION`; ``taken``
+        reflects whether the user actually started the breathing
+        session. When ``record`` is provided it is appended to the
+        per-session audit trail (one entry per guided session).
+        """
+        if taken:
+            self._breaks_taken += 1
         if recommended:
             self._breaks_recommended += 1
+        if record is not None:
+            self._break_records.append(record)
 
     def record_activity(
         self, title: str, tab_type: str = "other", dwell_s: float = 0.0,
@@ -194,6 +216,7 @@ class SessionReportGenerator:
             peak_stress_integral=self._peak_stress,
             breaks_taken=self._breaks_taken,
             breaks_recommended=self._breaks_recommended,
+            break_records=list(self._break_records),
             state_transitions=self._state_transitions,
             top_activities=sorted_activities,
             top_distraction_domains=top_distractions,

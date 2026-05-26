@@ -231,6 +231,13 @@ class WebSocketServer:
         # invoking; the daemon's ``toggle_micro_step`` does the active-
         # plan lookup and rebroadcast.
         self._micro_step_toggled_callback: Any = None
+        # P0 §3.9: callback that resolves a WHY_DETAIL_REQUEST into a
+        # list of CausalSignal dicts. Signature:
+        # ``async (intervention_id: str) -> list[dict] | None``.
+        # ``None`` means "no signals available" — the server still
+        # replies with WHY_DETAIL so the client clears its loading
+        # state.
+        self._why_detail_callback: Any = None
         # Latest state for new connections
         self._latest_state: StateEstimate | None = None
         self._pending_context_requests: dict[str, asyncio.Future[dict[str, Any]]] = {}
@@ -373,6 +380,19 @@ class WebSocketServer:
         rebroadcast.
         """
         self._micro_step_toggled_callback = callback
+
+    def set_why_detail_callback(
+        self,
+        callback: Callable[[str], Awaitable[list[dict[str, Any]] | None]] | None,
+    ) -> None:
+        """P0 §3.9: handler for ``WHY_DETAIL_REQUEST`` messages.
+
+        Signature: ``async (intervention_id: str) -> list[dict] |
+        None``. The dispatcher serialises the response as a
+        ``WHY_DETAIL`` frame and routes it back to the requesting
+        client only.
+        """
+        self._why_detail_callback = callback
 
     def set_session_recap_cache_callback(
         self,
@@ -639,6 +659,8 @@ class WebSocketServer:
             await self._handle_request_trends(client, msg)
         elif msg.type == MessageType.REQUEST_SESSION_RECAP.value:
             await self._handle_request_session_recap(client, msg)
+        elif msg.type == MessageType.WHY_DETAIL_REQUEST.value:
+            await self._handle_why_detail_request(client, msg)
         elif msg.type == MessageType.MICRO_STEP_TOGGLED.value:
             # P0 §3.6: a peer surface (browser popup, VS Code panel,
             # WS-mode overlay) clicked a micro-step checkbox. Validate
@@ -916,6 +938,55 @@ class WebSocketServer:
                 client.client_id,
                 exc,
             )
+
+    async def _handle_why_detail_request(
+        self, client: WebSocketClient, msg: WSMessage,
+    ) -> None:
+        """P0 §3.9: resolve a WHY_DETAIL_REQUEST into a WHY_DETAIL reply.
+
+        The daemon callback returns a list of ``CausalSignal.model_dump``
+        dicts (or None if no signals are available for the
+        intervention id). The reply is routed back to the requesting
+        client only — broadcasting would leak per-client UI state.
+        """
+        callback = self._why_detail_callback
+        payload = msg.payload or {}
+        intervention_id = payload.get("intervention_id")
+        if not isinstance(intervention_id, str) or not intervention_id:
+            logger.warning(
+                "WHY_DETAIL_REQUEST from %s: missing/invalid intervention_id=%r",
+                client.client_id,
+                intervention_id,
+            )
+            return
+        signals: list[dict[str, Any]] = []
+        if callback is not None:
+            try:
+                if asyncio.iscoroutinefunction(callback):
+                    result = await callback(intervention_id)
+                else:
+                    result = callback(intervention_id)
+                if result:
+                    signals = [s for s in result if isinstance(s, dict)]
+            except Exception as exc:
+                logger.error(
+                    "why_detail callback error from %s: %s",
+                    client.client_id,
+                    exc,
+                )
+        await self.send_message(
+            MessageType.WHY_DETAIL.value,
+            {
+                "intervention_id": intervention_id,
+                "causal_signals": signals,
+            },
+            target_client_types=(
+                [client.client_type]
+                if client.client_type and client.client_type != "unknown"
+                else None
+            ),
+            correlation_id=msg.correlation_id,
+        )
 
     async def _handle_leetcode_context_update(
         self, client: WebSocketClient, msg: WSMessage,

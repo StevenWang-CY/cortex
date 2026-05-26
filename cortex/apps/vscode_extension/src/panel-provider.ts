@@ -96,6 +96,38 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
     }
 
     /**
+     * P0 §3.9: route a WHY_DETAIL response into the webview so the
+     * "Why?" drilldown panel can render the structured causal signals.
+     */
+    public applyWhyDetail(payload: Record<string, unknown>): void {
+        if (!this._view) return;
+        try {
+            this._view.webview.postMessage({
+                type: 'whyDetail',
+                payload,
+            });
+        } catch {
+            // webview may be tearing down
+        }
+    }
+
+    /**
+     * P0 §3.7: route a BREAK_RECOMMENDATION pulse into the webview so
+     * the panel can render a soft pill above the intervention card.
+     */
+    public applyBreakRecommendation(payload: Record<string, unknown>): void {
+        if (!this._view) return;
+        try {
+            this._view.webview.postMessage({
+                type: 'breakRecommendation',
+                payload,
+            });
+        } catch {
+            // webview may be tearing down
+        }
+    }
+
+    /**
      * Clear the current intervention display.
      */
     clearIntervention(): void {
@@ -126,6 +158,32 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                     );
                 }
                 break;
+
+            case "userRating": {
+                // P0 §3.8: forward 👍/👎 to the daemon via the WS client.
+                if (!this._currentPayload) break;
+                const interventionId = this._currentPayload.intervention_id as string;
+                if (!interventionId) break;
+                const ratingRaw = String(message.rating || "");
+                if (ratingRaw !== "thumbs_up" && ratingRaw !== "thumbs_down") break;
+                const ctxRaw = message.context;
+                const context = typeof ctxRaw === "string" ? ctxRaw.slice(0, 200) : undefined;
+                this._wsClient.sendUserRating(
+                    interventionId,
+                    ratingRaw,
+                    context,
+                );
+                break;
+            }
+
+            case "whyDetailRequest": {
+                // P0 §3.9: forward the "Why?" expansion to the daemon.
+                if (!this._currentPayload) break;
+                const interventionId = this._currentPayload.intervention_id as string;
+                if (!interventionId) break;
+                this._wsClient.sendWhyDetailRequest(interventionId);
+                break;
+            }
 
             case "microStepToggled": {
                 // P0 §3.6: forward the webview's micro-step toggle to
@@ -258,6 +316,14 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                 (payload.causal_explanation as string) ?? "",
             );
 
+            // P0 §3.9: serialise structured causal signals (initial
+            // payload) so the panel can render the drilldown rows on
+            // first paint without waiting for the on-demand WHY_DETAIL.
+            const causalSignalsRaw = Array.isArray(payload.causal_signals)
+                ? (payload.causal_signals as Record<string, unknown>[])
+                : [];
+            const causalSignalsJson = JSON.stringify(causalSignalsRaw);
+
             interventionHtml = `
                 <div class="intervention">
                     <h2 class="headline">${headline}</h2>
@@ -265,6 +331,21 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                     <div class="causal" style="font-size:11px;color:#71717a;margin-top:6px;cursor:pointer;" onclick="this.querySelector('.causal-body').style.display = this.querySelector('.causal-body').style.display === 'none' ? 'block' : 'none'">
                         <span style="font-weight:500;">Why this?</span> ›
                         <div class="causal-body" style="display:none;margin-top:4px;line-height:1.5;">${causalExplanation}</div>
+                    </div>
+                    <!-- P0 §3.7: BREAK_RECOMMENDATION pill — hidden by
+                         default; populated when the daemon emits the
+                         pulse. The CTA fires the desktop-side break. -->
+                    <div id="break-recommendation" class="break-rec" style="display:none;">
+                        <span class="break-rec-text"></span>
+                        <button class="break-rec-cta" type="button">Take 4 min</button>
+                    </div>
+                    <!-- P0 §3.9: structured rationale drilldown. The
+                         "Why?" link expands the panel; when no
+                         signals were attached the panel issues a
+                         WHY_DETAIL_REQUEST to populate them on demand. -->
+                    <div class="why-block">
+                        <button id="why-toggle" type="button" class="why-toggle">Why?</button>
+                        <div id="why-panel" class="why-panel" style="display:none;"></div>
                     </div>
                     <div class="focus">
                         <strong>Focus:</strong> ${focus}
@@ -277,8 +358,17 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                         <div id="pacer-label">Inhale</div>
                         <div id="pacer-timer">4s</div>
                     </div>
+                    <!-- P0 §3.8: 👍 / 👎 row + optional text input. -->
+                    <div class="rating-row">
+                        <button id="thumbs-up" type="button" class="rating-btn" aria-label="Mark helpful">👍</button>
+                        <button id="thumbs-down" type="button" class="rating-btn" aria-label="Mark unhelpful">👎</button>
+                    </div>
+                    <input id="rating-text" type="text" maxlength="200" placeholder="What would have helped? (Enter to send, Esc to skip)" class="rating-text" style="display:none;" />
                     <button class="dismiss-btn" id="dismiss-btn">Dismiss</button>
-                </div>`;
+                </div>
+                <script>
+                    window.__CORTEX_INITIAL_CAUSAL_SIGNALS__ = ${causalSignalsJson};
+                </script>`;
         }
 
         return `<!DOCTYPE html>
@@ -457,6 +547,101 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             padding: 24px 12px;
             color: var(--cx-text-secondary);
         }
+
+        /* P0 §3.7: BREAK_RECOMMENDATION pill */
+        .break-rec {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin: 8px 0 12px;
+            padding: 8px 10px;
+            border-radius: 6px;
+            background: rgba(217, 119, 87, 0.10);
+            border: 1px solid rgba(217, 119, 87, 0.45);
+            font-size: var(--fs-caption);
+        }
+
+        .break-rec-text { flex: 1; color: var(--cx-text); }
+
+        .break-rec-cta {
+            background: var(--cx-accent);
+            color: white;
+            border: none;
+            border-radius: 5px;
+            padding: 4px 10px;
+            cursor: pointer;
+            font-size: var(--fs-caption);
+            font-weight: 600;
+        }
+
+        /* P0 §3.8: rating row */
+        .rating-row {
+            display: flex;
+            gap: 8px;
+            justify-content: center;
+            margin: 8px 0;
+        }
+
+        .rating-btn {
+            background: rgba(255, 255, 255, 0.06);
+            color: var(--cx-text);
+            border: 0.5px solid var(--cx-separator);
+            border-radius: 6px;
+            padding: 4px 12px;
+            font-size: 14px;
+            cursor: pointer;
+        }
+
+        .rating-btn:hover { background: rgba(255, 255, 255, 0.12); }
+        .rating-btn.selected { background: var(--cx-accent); color: white; }
+
+        .rating-text {
+            width: 100%;
+            margin-top: 6px;
+            padding: 6px 10px;
+            background: rgba(255, 255, 255, 0.04);
+            color: var(--cx-text);
+            border: 1px solid rgba(217, 119, 87, 0.40);
+            border-radius: 5px;
+            box-sizing: border-box;
+            font-size: var(--fs-caption);
+        }
+
+        /* P0 §3.9: Why? drilldown */
+        .why-block { margin: 6px 0; }
+
+        .why-toggle {
+            background: none;
+            color: var(--cx-text-secondary);
+            border: none;
+            padding: 2px 0;
+            font-size: var(--fs-caption);
+            text-decoration: underline;
+            cursor: pointer;
+        }
+
+        .why-toggle:hover { color: var(--cx-text); }
+
+        .why-panel {
+            margin-top: 4px;
+            padding: 6px 10px;
+            border-radius: 6px;
+            background: rgba(255, 255, 255, 0.03);
+        }
+
+        .why-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 3px 0;
+            font-size: var(--fs-caption);
+        }
+
+        .why-name { font-weight: 600; min-width: 96px; }
+        .why-value { flex: 1; color: var(--cx-text-secondary); }
+        .why-spark { width: 60px; height: 24px; }
+        .why-delta-down { color: #E47A6E; font-weight: 600; }
+        .why-delta-up { color: var(--cx-accent); font-weight: 600; }
     </style>
 </head>
 <body>
@@ -497,6 +682,166 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                 vscode.postMessage({ command: 'dismiss' });
             });
         }
+
+        // P0 §3.8: rating buttons
+        const thumbsUpBtn = document.getElementById('thumbs-up');
+        const thumbsDownBtn = document.getElementById('thumbs-down');
+        const ratingTextEl = document.getElementById('rating-text');
+        if (thumbsUpBtn) {
+            thumbsUpBtn.addEventListener('click', () => {
+                thumbsUpBtn.classList.add('selected');
+                if (thumbsDownBtn) thumbsDownBtn.classList.remove('selected');
+                vscode.postMessage({ command: 'userRating', rating: 'thumbs_up' });
+            });
+        }
+        if (thumbsDownBtn) {
+            thumbsDownBtn.addEventListener('click', () => {
+                thumbsDownBtn.classList.add('selected');
+                if (thumbsUpBtn) thumbsUpBtn.classList.remove('selected');
+                vscode.postMessage({ command: 'userRating', rating: 'thumbs_down' });
+                if (ratingTextEl) {
+                    ratingTextEl.style.display = 'block';
+                    ratingTextEl.focus();
+                }
+            });
+        }
+        if (ratingTextEl) {
+            ratingTextEl.addEventListener('keydown', (ev) => {
+                if (ev.key === 'Enter') {
+                    const text = (ratingTextEl.value || '').trim();
+                    if (text) {
+                        vscode.postMessage({
+                            command: 'userRating',
+                            rating: 'thumbs_down',
+                            context: text.slice(0, 200),
+                        });
+                    }
+                    ratingTextEl.value = '';
+                    ratingTextEl.style.display = 'none';
+                } else if (ev.key === 'Escape') {
+                    ratingTextEl.value = '';
+                    ratingTextEl.style.display = 'none';
+                }
+            });
+        }
+
+        // P0 §3.9: Why? toggle + drilldown render
+        const whyToggle = document.getElementById('why-toggle');
+        const whyPanel = document.getElementById('why-panel');
+        let whyOpen = false;
+
+        function renderCausalSignals(signals) {
+            if (!whyPanel) return;
+            whyPanel.innerHTML = '';
+            if (!Array.isArray(signals) || signals.length === 0) {
+                whyPanel.textContent = 'No structured signals available.';
+                return;
+            }
+            for (const sig of signals) {
+                if (!sig || typeof sig !== 'object') continue;
+                const row = document.createElement('div');
+                row.className = 'why-row';
+                const nameEl = document.createElement('span');
+                nameEl.className = 'why-name';
+                nameEl.textContent = String(sig.name || '');
+                row.appendChild(nameEl);
+                const valEl = document.createElement('span');
+                valEl.className = 'why-value';
+                const unit = String(sig.unit || '');
+                let vtext = (Number(sig.current_value) || 0).toFixed(1) + unit;
+                if (sig.baseline_value != null && !Number.isNaN(Number(sig.baseline_value))) {
+                    vtext += ' (baseline ' + Number(sig.baseline_value).toFixed(1) + unit + ')';
+                }
+                valEl.textContent = vtext;
+                row.appendChild(valEl);
+                // sparkline
+                const canvas = document.createElement('canvas');
+                canvas.className = 'why-spark';
+                canvas.width = 60;
+                canvas.height = 24;
+                const samples = Array.isArray(sig.samples_60s) ? sig.samples_60s : [];
+                const cx2 = canvas.getContext('2d');
+                if (cx2 && samples.length > 1) {
+                    cx2.strokeStyle = 'rgba(217, 119, 87, 0.86)';
+                    cx2.lineWidth = 1;
+                    let lo = Infinity, hi = -Infinity;
+                    for (const v of samples) { if (v < lo) lo = v; if (v > hi) hi = v; }
+                    if (hi <= lo) { hi = lo + 1; }
+                    const w = canvas.width - 2;
+                    const h = canvas.height - 4;
+                    const step = w / (samples.length - 1);
+                    cx2.beginPath();
+                    for (let i = 0; i < samples.length; i++) {
+                        const x = 1 + i * step;
+                        const y = canvas.height - 2 - ((samples[i] - lo) / (hi - lo)) * h;
+                        if (i === 0) cx2.moveTo(x, y); else cx2.lineTo(x, y);
+                    }
+                    cx2.stroke();
+                }
+                row.appendChild(canvas);
+                if (sig.delta_pct != null && !Number.isNaN(Number(sig.delta_pct))) {
+                    const delta = Number(sig.delta_pct);
+                    const pill = document.createElement('span');
+                    pill.className = delta < 0 ? 'why-delta-down' : 'why-delta-up';
+                    const arrow = delta < 0 ? '↓' : '↑';
+                    pill.textContent = arrow + Math.abs(delta).toFixed(0) + '%';
+                    row.appendChild(pill);
+                }
+                whyPanel.appendChild(row);
+            }
+        }
+
+        // Initial signals shipped with the trigger payload (if any).
+        try {
+            renderCausalSignals(window.__CORTEX_INITIAL_CAUSAL_SIGNALS__ || []);
+        } catch { /* empty payload */ }
+
+        if (whyToggle) {
+            whyToggle.addEventListener('click', () => {
+                whyOpen = !whyOpen;
+                if (whyPanel) whyPanel.style.display = whyOpen ? 'block' : 'none';
+                whyToggle.textContent = whyOpen ? 'Hide why' : 'Why?';
+                // If we have no signals cached, ask the daemon for them.
+                if (whyOpen && whyPanel && whyPanel.children.length === 0) {
+                    vscode.postMessage({ command: 'whyDetailRequest' });
+                }
+            });
+        }
+
+        // P0 §3.7: BREAK_RECOMMENDATION pill listener.
+        window.addEventListener('message', (event) => {
+            const m = event.data || {};
+            if (m.type === 'whyDetail') {
+                const sigs = (m.payload && m.payload.causal_signals) || [];
+                renderCausalSignals(sigs);
+                if (whyPanel) whyPanel.style.display = 'block';
+                whyOpen = true;
+                if (whyToggle) whyToggle.textContent = 'Hide why';
+                return;
+            }
+            if (m.type === 'breakRecommendation') {
+                const p = m.payload || {};
+                const durationS = Number(p.duration_seconds || 240);
+                const mins = Math.max(1, Math.round(durationS / 60));
+                const pill = document.getElementById('break-recommendation');
+                if (pill) {
+                    pill.style.display = 'flex';
+                    const txt = pill.querySelector('.break-rec-text');
+                    if (txt) txt.textContent = 'Your HRV has been suppressed — take a ' + mins + '-minute break?';
+                    const cta = pill.querySelector('.break-rec-cta');
+                    if (cta) {
+                        cta.textContent = 'Take ' + mins + ' min';
+                        cta.onclick = () => {
+                            vscode.postMessage({
+                                command: 'userRating',
+                                rating: 'thumbs_up',
+                            });
+                            pill.style.display = 'none';
+                        };
+                    }
+                }
+            }
+        });
 
         // P0 §3.6: micro-step checkbox toggle. Each click posts a
         // ``microStepToggled`` message to the extension, which forwards

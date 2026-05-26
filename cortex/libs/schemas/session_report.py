@@ -10,6 +10,7 @@ single source of truth under ``cortex.libs.schemas``.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -29,6 +30,45 @@ class ActivitySummary(BaseModel):
     tab_type: str = "other"
     dwell_seconds: float = 0.0
     state_breakdown: dict[str, float] = Field(default_factory=dict)
+
+
+class BreakRecord(BaseModel):
+    """P0 §3.7: a single biology-driven break event.
+
+    Captured by :class:`cortex.services.intervention_engine.break_overlay.BiologyBreakController`
+    when a guided breathing session starts; ``pre_hrv`` is the most
+    recent HRV reading before the overlay shows, ``post_hrv`` is the
+    reading captured on exit (natural completion or early termination),
+    and ``recovery_delta = post_hrv - pre_hrv``. ``completed`` is True
+    only when the breathing pattern ran the full ``duration_seconds``;
+    early termination still preserves the record for the reward signal.
+    """
+
+    started_at: datetime = Field(..., description="UTC timestamp when the break began")
+    duration_seconds: float = Field(
+        ..., ge=0.0, description="Wall-clock seconds the break ran (≤ requested)"
+    )
+    pattern: Literal["box", "4-7-8", "coherent"] = Field(
+        ..., description="Breathing pattern that paced the session"
+    )
+    pre_hrv: float | None = Field(
+        None, description="HRV (RMSSD) immediately before the break began"
+    )
+    post_hrv: float | None = Field(
+        None, description="HRV (RMSSD) immediately after the break ended"
+    )
+    recovery_delta: float | None = Field(
+        None, description="post_hrv - pre_hrv (positive = recovery)"
+    )
+    completed: bool = Field(
+        True, description="True if the breathing pattern ran the full duration"
+    )
+    audio_cue: bool = Field(
+        True, description="Whether the audio chime accompanied the breathing"
+    )
+    reason: str = Field(
+        "", max_length=120, description="Why the break was recommended"
+    )
 
 
 class ComparisonStats(BaseModel):
@@ -60,6 +100,10 @@ class SessionReport(BaseModel):
     peak_stress_integral: float = 0.0
     breaks_taken: int = 0
     breaks_recommended: int = 0
+    # P0 §3.7: per-break audit trail. Each entry is one guided
+    # breathing session; ``recovery_delta`` is the headline number
+    # surfaced on the session report card.
+    break_records: list[BreakRecord] = Field(default_factory=list)
 
     # Activity
     state_transitions: list[StateTransition] = Field(default_factory=list)
@@ -77,6 +121,7 @@ class SessionReport(BaseModel):
 __all__ = [
     "StateTransition",
     "ActivitySummary",
+    "BreakRecord",
     "ComparisonStats",
     "SessionReport",
 ]

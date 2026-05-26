@@ -1191,6 +1191,31 @@ async function handleMessage(raw: string): Promise<void> {
             break;
         }
 
+        case "BREAK_RECOMMENDATION": {
+            // P0 §3.7: relay the soft "take a break" pulse to the popup.
+            // The popup renders a terracotta pill above the intervention
+            // card with a single CTA; the daemon already deduplicates
+            // per ``should_break`` False→True transition.
+            broadcastToPopup({
+                type: "BREAK_RECOMMENDATION",
+                payload: msg.payload,
+            });
+            break;
+        }
+
+        case "WHY_DETAIL": {
+            // P0 §3.9: response to a WHY_DETAIL_REQUEST issued from the
+            // popup. The daemon resolved the structured causal signals
+            // against the per-intervention cache (or the live feature
+            // vector as fallback); pipe them into the popup so the
+            // drilldown can render without an extra round-trip.
+            broadcastToPopup({
+                type: "WHY_DETAIL",
+                payload: msg.payload,
+            });
+            break;
+        }
+
         case "SESSION_RECAP": {
             // P0 §3.3: end-of-session recap landed. Cache the full
             // SessionReport so the popup can render it on next open
@@ -2542,6 +2567,19 @@ async function executeAction(action: SuggestedAction): Promise<ActionExecuteResu
                 return await executeSuggestMovementBreak(action);
             case "prompt_micro_commit":
                 return await executePromptMicroCommit(action);
+            case "take_biology_break":
+                // P0 §3.7: biology break runs on the desktop shell's
+                // full-screen Qt overlay — the browser has nothing to
+                // do locally. Return a pass-through result so the
+                // popup card collapses; the accompanying ACTION_EXECUTE
+                // log frame already carries the action to the daemon,
+                // which routes it to the BiologyBreakController.
+                return {
+                    action_id: action.action_id,
+                    success: true,
+                    message: "Break started on desktop",
+                    reversible: true,
+                };
             default: {
                 // Compile-time exhaustiveness: ``unhandled`` is ``never``
                 // when the switch covers every union member. Defence in
@@ -3714,6 +3752,23 @@ chrome.runtime.onMessage.addListener(
                         intervention_id: message.intervention_id,
                         step_index: message.step_index,
                         new_status: message.new_status,
+                    },
+                    timestamp: Date.now() / 1000,
+                    sequence: ++sequence,
+                });
+                sendResponse({ ok: true });
+                break;
+
+            case "WHY_DETAIL_REQUEST":
+                // P0 §3.9: relay the popup/webview's "Why?" expansion
+                // to the daemon. The daemon resolves the structured
+                // causal signals (cached per intervention, or computed
+                // live from the most recent FeatureVector + baselines)
+                // and replies with a WHY_DETAIL frame.
+                send({
+                    type: "WHY_DETAIL_REQUEST",
+                    payload: {
+                        intervention_id: message.intervention_id,
                     },
                     timestamp: Date.now() / 1000,
                     sequence: ++sequence,

@@ -297,6 +297,91 @@ export class CortexWSClient {
     }
 
     /**
+     * P0 §3.8: send a USER_RATING message to the daemon.
+     *
+     * @param interventionId - id of the active intervention
+     * @param rating - "thumbs_up" | "thumbs_down"
+     * @param context - optional one-line free-text comment (≤200 chars)
+     */
+    sendUserRating(
+        interventionId: string,
+        rating: "thumbs_up" | "thumbs_down",
+        context?: string,
+    ): void {
+        const payload: Record<string, unknown> = {
+            intervention_id: interventionId,
+            rating,
+        };
+        if (context && context.length > 0) {
+            payload.context = context.slice(0, 200);
+        }
+        this._send({
+            type: "USER_RATING",
+            payload,
+            timestamp: Date.now() / 1000,
+            sequence: ++this._sequence,
+        });
+    }
+
+    /**
+     * P0 §3.9: request the structured causal rationale.
+     *
+     * @param interventionId - id of the active intervention
+     */
+    sendWhyDetailRequest(interventionId: string): void {
+        this._send({
+            type: "WHY_DETAIL_REQUEST",
+            payload: {
+                intervention_id: interventionId,
+            },
+            timestamp: Date.now() / 1000,
+            sequence: ++this._sequence,
+        });
+    }
+
+    /**
+     * P0 §3.7: ask the daemon to dispatch a biology break.
+     *
+     * The action runs entirely on the desktop shell (full-screen Qt
+     * overlay) — the editor has nothing to do locally, so we send the
+     * ACTION_EXECUTE frame with ``request_dispatch=true`` and a fully
+     * populated ``action.metadata`` block mirroring the popup CTA
+     * shape. The daemon's ``_handle_user_action`` matches on
+     * ``action_type == "take_biology_break"`` and routes to the
+     * ``BiologyBreakController`` regardless of source client.
+     */
+    sendBiologyBreakRequest(
+        interventionId: string,
+        metadata: {
+            duration_seconds: number;
+            breathing_pattern: string;
+            audio_cue: boolean;
+            reason: string;
+        },
+    ): void {
+        const actionId = `bk_${Date.now()}`;
+        const mins = Math.max(1, Math.round(metadata.duration_seconds / 60));
+        this._send({
+            type: "ACTION_EXECUTE",
+            payload: {
+                intervention_id: interventionId,
+                action_id: actionId,
+                action_type: "take_biology_break",
+                request_dispatch: true,
+                action: {
+                    action_id: actionId,
+                    action_type: "take_biology_break",
+                    label: `Take ${mins} min`,
+                    target: "",
+                    metadata,
+                },
+            },
+            timestamp: Date.now() / 1000,
+            sequence: ++this._sequence,
+        });
+    }
+
+    /**
      * Notify the daemon that an intervention was applied (or restored).
      *
      * B.2: the daemon's in-process executor runs an

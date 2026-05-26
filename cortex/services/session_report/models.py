@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from cortex.libs.schemas.session_report import (
     ActivitySummary,
+    BreakRecord,
     ComparisonStats,
     SessionReport,
     StateTransition,
@@ -21,6 +22,7 @@ from cortex.libs.schemas.session_report import (
 
 __all__ = [
     "ActivitySummary",
+    "BreakRecord",
     "ComparisonStats",
     "SessionReport",
     "StateTransition",

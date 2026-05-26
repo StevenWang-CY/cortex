@@ -19,7 +19,7 @@ from collections import deque
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import uvicorn
@@ -63,9 +63,16 @@ from cortex.services.eval.tab_relevance import TabRelevanceTracker
 from cortex.services.handover.briefing import MorningBriefing
 from cortex.services.handover.detector import ShutdownDetector
 from cortex.services.handover.snapshot import HandoverSnapshot
+from cortex.services.intervention_engine.break_overlay import (
+    BiologyBreakController,
+    BreakUIHandler,
+)
 from cortex.services.intervention_engine.executor import InterventionExecutor
 from cortex.services.intervention_engine.leetcode_interventions import InterventionMatrix
-from cortex.services.intervention_engine.planner import prepare_plan
+from cortex.services.intervention_engine.planner import (
+    prepare_plan,
+    promote_biology_break,
+)
 from cortex.services.intervention_engine.restore import RestoreManager
 from cortex.services.intervention_engine.snapshot import capture_snapshot
 from cortex.services.janitor.retention import (
@@ -89,6 +96,7 @@ from cortex.services.session_report.reader import SessionReader
 from cortex.services.session_report.scheduler import MidnightScheduler
 from cortex.services.state_engine import FeatureFusion, RuleScorer, ScoreSmoother
 from cortex.services.state_engine.amygdala_hijack import AmygdalaHijackDetector
+from cortex.services.state_engine.causal_attribution import CausalAttributor
 from cortex.services.state_engine.destructive_struggle import DestructiveStruggleDetector
 from cortex.services.state_engine.leetcode_mode_resolver import LeetCodeModeResolver
 from cortex.services.state_engine.longitudinal import LongitudinalTracker
@@ -593,6 +601,41 @@ class CortexDaemon:
         # Helpfulness tracker
         self._helpfulness = HelpfulnessTracker(store=self._store)
 
+        # P0 §3.9: per-signal causal attributor — fed by ``_state_loop``
+        # at the same cadence the state estimate runs and queried when
+        # the daemon constructs an intervention plan.
+        self._causal_attributor = CausalAttributor()
+        # P0 §3.9: cache the most-recent CausalSignal list per
+        # intervention id so a late-arriving WHY_DETAIL_REQUEST can
+        # resolve without re-running attribution against stale features.
+        self._causal_signals_by_intervention: dict[str, list[dict[str, Any]]] = {}
+
+        # P0 §3.7: latched so each ``should_break`` False→True
+        # transition broadcasts exactly one BREAK_RECOMMENDATION pulse.
+        # Reset to False on every ``StressIntegralTracker.reset``.
+        self._break_recommendation_sent: bool = False
+        # Flipped by ``_set_break_suppression`` for the duration of a
+        # break overlay so the state loop skips trigger evaluation.
+        self._break_active: bool = False
+        # The biology break controller is instantiated after
+        # ``_session_report`` is created (a few lines below); keep a
+        # forward-declared attribute so type checkers don't trip.
+        self._break_controller: BiologyBreakController | None = None
+        # P0 §3.7 audit fix (mic_active audio gate, spec line 643):
+        # ``last_mic_active_at`` is the monotonic timestamp of the
+        # most-recent positive ``receptivity.is_microphone_in_use``
+        # reading. The break controller flips ``audio_cue=False`` for
+        # any break whose start falls within
+        # ``InterventionConfig.biology_break_audio_mute_after_mic_seconds``
+        # of this timestamp so users on a call don't get blindsided
+        # by a chime.
+        self._last_mic_active_at: float = 0.0
+        # P0 §3.8 audit fix: latches the in-flight quiet-mode
+        # activation so a burst of downvotes in the same 30 s window
+        # cannot re-trigger ``activate_quiet_mode`` repeatedly. Cleared
+        # once the deque has drained past the throttle window.
+        self._quiet_mode_throttle_latched_at: float = 0.0
+
         # Tab relevance learning
         self._tab_relevance = TabRelevanceTracker(store=self._store)
         self._per_tab_feedback_ids: deque[str] = deque(maxlen=50)  # intervention IDs with per-tab feedback
@@ -659,6 +702,21 @@ class CortexDaemon:
         self._ws_server.set_session_recap_cache_callback(
             self.latest_session_recap,
         )
+
+        # P0 §3.7: biology-driven break controller. Built after
+        # ``_session_report`` and ``_stress_tracker`` so we can pass
+        # them directly. The desktop shell binds its full-screen
+        # overlay handler via :meth:`set_break_overlay_ui_handler`.
+        self._break_controller = BiologyBreakController(
+            hrv_sampler=self._sample_hrv_for_break,
+            session_report=self._session_report,
+            suppress_interventions=self._set_break_suppression,
+            stress_tracker=self._stress_tracker,
+        )
+
+        # P0 §3.9: serve WHY_DETAIL_REQUEST from the per-intervention
+        # causal-signal cache. Returns a list[dict] or None.
+        self._ws_server.set_why_detail_callback(self.get_causal_signals)
 
     def set_state_callback(self, fn: Callable[[dict], None]) -> None:
         """Register a callback invoked on every state update.
@@ -1471,6 +1529,35 @@ class CortexDaemon:
                     if vector.hrv_rmssd is not None:
                         self._stress_tracker.update(vector.hrv_rmssd, timestamp)
                         estimate.stress_integral = self._stress_tracker.current_load
+                        # P0 §3.7 audit fix: re-arm BREAK_RECOMMENDATION
+                        # when the stress integral drops back below the
+                        # warning threshold (80% of the break threshold).
+                        # Without this the latch stayed True after a
+                        # dismissed recommendation, so the user only got
+                        # one pulse per session even after their HRV
+                        # recovered and re-degraded.
+                        if (
+                            self._break_recommendation_sent
+                            and self._stress_tracker.load_ratio < 0.8
+                        ):
+                            logger.info(
+                                "Stress integral recovered to %.0f%% — "
+                                "re-arming BREAK_RECOMMENDATION",
+                                self._stress_tracker.load_ratio * 100,
+                            )
+                            self._break_recommendation_sent = False
+
+                    # P0 §3.9: feed the causal attributor at the same
+                    # cadence so the per-signal sparkline buffers fill
+                    # smoothly. Also stash the live feature vector so
+                    # ``get_causal_signals`` can fall back to live
+                    # attribution when the per-intervention cache is
+                    # cold.
+                    try:
+                        self._causal_attributor.record_feature_vector(vector)
+                        registry.register("latest_feature_vector", vector)
+                    except Exception:
+                        logger.debug("causal attributor feed failed", exc_info=True)
 
                     # v2.0: Feed longitudinal tracker per-sample data
                     self._longitudinal.accumulate(
@@ -1615,6 +1702,12 @@ class CortexDaemon:
                         # the policy still functions, matching legacy semantics.
                         mic_state = receptivity.is_microphone_in_use()
                         fs_state = receptivity.is_app_fullscreen()
+                        # P0 §3.7 audit fix: track the most-recent
+                        # mic_active timestamp so the biology break
+                        # controller can suppress audio when the user
+                        # is on a call.
+                        if mic_state:
+                            self._last_mic_active_at = time.monotonic()
                         decision = self._trigger_policy.evaluate(
                             estimate,
                             context_complexity=context.complexity_score,
@@ -1663,13 +1756,65 @@ class CortexDaemon:
                                 )
 
                         # v2.0: Check stress integral — break at 100% (priority), warn at 80%
+                        # P0 §3.7 audit fix: feature flag gates the
+                        # *biology-break* augmentations (BREAK_RECOMMENDATION
+                        # pulse + planner promotion) without disturbing the
+                        # legacy breathing_overlay special intervention,
+                        # which always fires on threshold crossing.
+                        biology_break_enabled = bool(
+                            getattr(
+                                self.config.intervention,
+                                "enable_biology_break",
+                                True,
+                            )
+                        )
                         if self._stress_tracker.should_break():
                             logger.info("Stress integral threshold — biological break")
+                            # P0 §3.7: emit BREAK_RECOMMENDATION once
+                            # per False→True transition. The pulse
+                            # surfaces a soft pill on every UI even
+                            # when no overlay is active.
+                            if biology_break_enabled and not self._break_recommendation_sent:
+                                try:
+                                    pre_hrv_snapshot = (
+                                        float(vector.hrv_rmssd)
+                                        if vector.hrv_rmssd is not None
+                                        else None
+                                    )
+                                    suggested_pattern = self._suggest_break_pattern(pre_hrv_snapshot)
+                                    urgency = self._classify_break_urgency()
+                                    await self._ws_server.send_message(
+                                        MessageType.BREAK_RECOMMENDATION.value,
+                                        {
+                                            "reason": "stress_integral_crossed_threshold",
+                                            "urgency": urgency,
+                                            "stress_load": float(
+                                                self._stress_tracker.current_load
+                                            ),
+                                            "threshold": float(
+                                                self._stress_tracker.threshold
+                                            ),
+                                            "duration_seconds": 240,
+                                            "breathing_pattern": suggested_pattern,
+                                        },
+                                    )
+                                    self._break_recommendation_sent = True
+                                except Exception:
+                                    logger.debug(
+                                        "BREAK_RECOMMENDATION send failed",
+                                        exc_info=True,
+                                    )
                             await self._trigger_special_intervention(
                                 context, estimate, template_name="breathing_overlay",
                                 ws_type="BREATHING_OVERLAY",
                             )
-                            self._stress_tracker.reset()
+                            # NB: do NOT reset the integral here — the
+                            # break controller decides whether to reset
+                            # (natural completion) or apply a partial
+                            # recovery credit (early termination). The
+                            # legacy reset() was too eager — it cleared
+                            # the integral even if the user dismissed
+                            # the BREATHING_OVERLAY toast outright.
                         elif self._stress_tracker.should_warn():
                             logger.info("Stress integral at 80%% — pre-break warning")
                             await self._trigger_special_intervention(
@@ -1818,6 +1963,55 @@ class CortexDaemon:
                             logger.info("Suppressing stale intervention: >50%% tab references invalid")
                             self._active_intervention_id = None
                             return
+
+            # P0 §3.7: if the stress integral has crossed threshold
+            # (latched by ``_break_recommendation_sent`` so we don't
+            # re-flip the should_break() one-shot), promote
+            # ``take_biology_break`` to the primary action. The biology
+            # break is always the right intervention when the user's
+            # HRV has been suppressed long enough to flag — downstream
+            # LLM plans get rewritten in place rather than competing
+            # for the single-CTA slot. Gated on the feature flag so
+            # operators can disable the entire promotion path without
+            # disabling the legacy breathing_overlay.
+            biology_break_enabled = bool(
+                getattr(self.config.intervention, "enable_biology_break", True)
+            )
+            if biology_break_enabled and self._break_recommendation_sent:
+                try:
+                    pattern_hint = self._suggest_break_pattern(
+                        self._sample_hrv_for_break(),
+                    )
+                    plan = promote_biology_break(
+                        plan,
+                        duration_seconds=240,
+                        breathing_pattern=(
+                            pattern_hint
+                            if pattern_hint in ("box", "4-7-8", "coherent")
+                            else None
+                        ),
+                        audio_cue=True,
+                        reason="stress_integral_crossed_threshold",
+                    )
+                except Exception:
+                    logger.debug("promote_biology_break failed", exc_info=True)
+
+            # P0 §3.9: attach structured causal signals to every plan
+            # so each surface's "Why?" drilldown renders without an
+            # extra round-trip. The cache is keyed by intervention_id
+            # so WHY_DETAIL_REQUEST can resolve even if the surface
+            # joined late.
+            try:
+                latest_features = registry.get("latest_feature_vector")
+                if latest_features is not None:
+                    plan.causal_signals = self._causal_attributor.attribute_top_signals(
+                        latest_features, self._scorer.baselines,
+                    )
+                    self._causal_signals_by_intervention[plan.intervention_id] = [
+                        s.model_dump(mode="json") for s in plan.causal_signals
+                    ]
+            except Exception:
+                logger.debug("causal_signals attach failed", exc_info=True)
 
             tab_count = None
             if hasattr(context, "browser_context") and context.browser_context is not None:
@@ -2099,6 +2293,154 @@ class CortexDaemon:
             )
         return sent
 
+    # ─── P0 §3.7: biology-driven break orchestration ─────────────────
+
+    @staticmethod
+    def _suggest_break_pattern(hrv_rmssd: float | None) -> str:
+        """Map HRV → breathing pattern name (matches break_overlay.select_pattern)."""
+        from cortex.services.intervention_engine.break_overlay import select_pattern
+
+        return select_pattern(hrv_rmssd)
+
+    def _classify_break_urgency(self) -> str:
+        """Map load_ratio → BREAK_RECOMMENDATION urgency string."""
+        ratio = float(self._stress_tracker.load_ratio)
+        if ratio >= 1.3:
+            return "high"
+        if ratio >= 1.05:
+            return "medium"
+        return "low"
+
+    def _sample_hrv_for_break(self) -> float | None:
+        """Return the most recent HRV reading for the break controller."""
+        physio = getattr(self, "_latest_physio", None)
+        if physio is None:
+            return None
+        # Prefer the explicit RMSSD proxy when populated; fall back to
+        # the variability proxy field used in some legacy code paths.
+        for attr in ("hrv_rmssd", "pulse_variability_proxy"):
+            v = getattr(physio, attr, None)
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    def _set_break_suppression(self, active: bool) -> None:
+        """Toggle the global break-suppression flag.
+
+        Called by :class:`BiologyBreakController` around the overlay
+        lifecycle so peer adapters skip trigger evaluation while the
+        breathing session runs.
+        """
+        self._break_active = bool(active)
+
+    def set_break_overlay_ui_handler(
+        self, handler: BreakUIHandler | None,
+    ) -> None:
+        """Bind the desktop shell's full-screen break overlay handler.
+
+        Signature: ``async (duration_seconds, breathing_pattern,
+        audio_cue) -> (elapsed_seconds, completed)``. The handler is
+        invoked from the asyncio event loop; the desktop controller
+        bridges to the Qt thread internally.
+        """
+        if self._break_controller is None:
+            return
+        self._break_controller.set_ui_handler(handler)
+
+    async def start_biology_break(
+        self,
+        *,
+        intervention_id: str | None = None,
+        duration_seconds: int = 240,
+        breathing_pattern: str | None = None,
+        audio_cue: bool = True,
+        reason: str = "stress_integral_crossed_threshold",
+    ) -> dict[str, Any] | None:
+        """Run one guided breathing session and return a BreakRecord dict."""
+        if self._break_controller is None:
+            return None
+        pattern_arg: Literal["box", "4-7-8", "coherent"] | None
+        if breathing_pattern in ("box", "4-7-8", "coherent"):
+            pattern_arg = breathing_pattern  # type: ignore[assignment]
+        else:
+            pattern_arg = None
+        # P0 §3.7 audit fix (spec line 643): default audio off when the
+        # microphone was active recently. ``last_mic_active_at`` is the
+        # most-recent positive ``receptivity.is_microphone_in_use``
+        # timestamp recorded by the state loop; configurable mute
+        # window defaults to 5 min per the spec risk mitigation.
+        if audio_cue:
+            mute_window = float(
+                getattr(
+                    self.config.intervention,
+                    "biology_break_audio_mute_after_mic_seconds",
+                    300.0,
+                )
+            )
+            if (
+                mute_window > 0
+                and self._last_mic_active_at > 0
+                and time.monotonic() - self._last_mic_active_at < mute_window
+            ):
+                logger.info(
+                    "Biology break: muting audio_cue — microphone "
+                    "was active in the last %.0fs",
+                    mute_window,
+                )
+                audio_cue = False
+        record = await self._break_controller.start(
+            duration_seconds=int(duration_seconds),
+            breathing_pattern=pattern_arg,
+            audio_cue=bool(audio_cue),
+            reason=reason,
+        )
+        if record is None:
+            return None
+        # Latch the recommendation flag back to False so the next
+        # threshold crossing can re-emit BREAK_RECOMMENDATION.
+        self._break_recommendation_sent = False
+        payload = record.model_dump(mode="json")
+        if intervention_id:
+            self._recorder.append("biology_break", {
+                "intervention_id": intervention_id,
+                **payload,
+            })
+        return payload
+
+    # ─── P0 §3.9: causal rationale resolution ────────────────────────
+
+    async def get_causal_signals(
+        self, intervention_id: str,
+    ) -> list[dict[str, Any]] | None:
+        """Return the cached CausalSignal list for an intervention.
+
+        When the daemon constructs an intervention plan the engine
+        attaches the top-3 causal signals; we cache the dumped form
+        keyed by intervention id so a WHY_DETAIL_REQUEST arriving even
+        after the popup connection bounced still resolves cleanly.
+        """
+        if not intervention_id:
+            return None
+        cached = self._causal_signals_by_intervention.get(intervention_id)
+        if cached:
+            return list(cached)
+        # Fall back to live attribution against the most recent feature
+        # vector + baselines if available.
+        try:
+            latest_features = registry.get("latest_feature_vector")
+            if latest_features is None:
+                return None
+            signals = self._causal_attributor.attribute_top_signals(
+                latest_features, self._scorer.baselines,
+            )
+        except Exception:
+            logger.debug("get_causal_signals fallback failed", exc_info=True)
+            return None
+        return [s.model_dump(mode="json") for s in signals]
+
     async def toggle_micro_step(
         self,
         intervention_id: str,
@@ -2292,18 +2634,63 @@ class CortexDaemon:
             # An empty source string (legacy in-process callback path
             # that bypasses the WS server) is also honoured because no
             # peer client could have produced it.
+            # P0 §3.7: ``take_biology_break`` is always desktop-local
+            # (full-screen Qt overlay). Run it directly here regardless
+            # of source — any authenticated surface may request a
+            # break and the daemon is the only place with the HRV
+            # context to drive the breathing controller correctly.
+            action_dict_raw = payload.get("action") if isinstance(payload.get("action"), dict) else None
+            current_action_type = str(
+                payload.get("action_type")
+                or (action_dict_raw or {}).get("action_type")
+                or ""
+            )
+            if current_action_type == "take_biology_break":
+                metadata = {}
+                if isinstance(action_dict_raw, dict):
+                    md = action_dict_raw.get("metadata")
+                    if isinstance(md, dict):
+                        metadata = md
+                if not metadata and isinstance(payload.get("metadata"), dict):
+                    metadata = payload["metadata"]
+                duration = int(metadata.get("duration_seconds", 240) or 240)
+                pattern_arg = metadata.get("breathing_pattern")
+                audio_cue = bool(metadata.get("audio_cue", True))
+                reason = str(
+                    metadata.get("reason", "user_requested_break")
+                )[:120]
+                iid = str(payload.get("intervention_id") or "")
+                # Run in background — the controller blocks for
+                # ``duration_seconds`` and we don't want to stall the
+                # WS message dispatch loop. The recorder gets the
+                # outcome via ``start_biology_break``.
+                self._spawn_background_task(
+                    self.start_biology_break(
+                        intervention_id=iid,
+                        duration_seconds=duration,
+                        breathing_pattern=pattern_arg if isinstance(pattern_arg, str) else None,
+                        audio_cue=audio_cue,
+                        reason=reason,
+                    ),
+                    name="cortex-biology-break",
+                )
+                return
             if is_dispatch_request and source_client in ("", "desktop"):
-                action = payload.get("action") if isinstance(payload.get("action"), dict) else {
-                    "action_id": payload.get("action_id"),
-                    "action_type": payload.get("action_type"),
-                    "label": payload.get("label", ""),
-                    "reason": payload.get("reason", ""),
-                    "target": payload.get("target"),
-                    "tab_index": payload.get("tab_index"),
-                }
+                action_dict = (
+                    payload.get("action")
+                    if isinstance(payload.get("action"), dict)
+                    else {
+                        "action_id": payload.get("action_id"),
+                        "action_type": payload.get("action_type"),
+                        "label": payload.get("label", ""),
+                        "reason": payload.get("reason", ""),
+                        "target": payload.get("target"),
+                        "tab_index": payload.get("tab_index"),
+                    }
+                )
                 await self.dispatch_action_to_browser(
                     str(payload.get("intervention_id") or ""),
-                    action,
+                    action_dict,
                 )
             elif is_dispatch_request:
                 logger.warning(
@@ -2318,12 +2705,69 @@ class CortexDaemon:
         if "rating" in payload and "intervention_id" in payload:
             iid = str(payload.get("intervention_id", ""))
             rating = str(payload.get("rating", ""))
+            # P0 §3.8: optional one-line free-text comment routed in via
+            # the ``context`` payload key. Never leaves the helpfulness
+            # store — never sent to the LLM. Hard cap at 200 chars.
+            text_feedback_raw = payload.get("context") or payload.get("text_feedback")
+            text_feedback: str | None = (
+                str(text_feedback_raw)[:200]
+                if isinstance(text_feedback_raw, str) and text_feedback_raw
+                else None
+            )
             if iid and rating:
-                self._helpfulness.record_rating(iid, rating)
+                self._helpfulness.record_rating(
+                    iid, rating, text_feedback=text_feedback,
+                )
                 self._recorder.append("helpfulness", {
                     "intervention_id": iid,
                     "user_rating": rating,
+                    "text_feedback": text_feedback,
                 })
+                # P0 §3.8: frustration-spiral throttle — 5 thumbs_down in
+                # 30 s escalates the daemon into Quiet Mode for 30 min.
+                if rating == "thumbs_down":
+                    try:
+                        recent = self._helpfulness.downvote_count_within(30.0)
+                        # P0 §3.8 audit fix: idempotency latch. A burst
+                        # of downvotes (e.g. accidental rapid click)
+                        # could fire ``activate_quiet_mode`` more than
+                        # once within the same 30 s window, repeatedly
+                        # broadcasting SETTINGS_SYNC and resetting the
+                        # quiet-mode timer. The latch records the last
+                        # activation timestamp; subsequent crossings
+                        # are no-ops until the window clears.
+                        now = time.monotonic()
+                        already_latched = (
+                            now - self._quiet_mode_throttle_latched_at < 30.0
+                        )
+                        if recent >= 5 and not already_latched:
+                            logger.info(
+                                "Frustration spiral detected (%d downvotes in 30s) "
+                                "— activating Quiet Mode for 30 min",
+                                recent,
+                            )
+                            self._trigger_policy.activate_quiet_mode(
+                                duration_minutes=30,
+                            )
+                            self._helpfulness.reset_downvote_window()
+                            self._quiet_mode_throttle_latched_at = now
+                            # Broadcast the new quiet-mode state so the
+                            # popup / VS Code surfaces reflect it.
+                            try:
+                                await self._ws_server.send_message(
+                                    MessageType.SETTINGS_SYNC.value,
+                                    {"quiet_mode": True, "duration_minutes": 30},
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "SETTINGS_SYNC broadcast failed",
+                                    exc_info=True,
+                                )
+                    except Exception:
+                        logger.debug(
+                            "downvote throttle evaluation failed",
+                            exc_info=True,
+                        )
             return
 
         intervention_id = str(payload.get("intervention_id", ""))

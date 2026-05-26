@@ -112,6 +112,70 @@ export function activate(context: vscode.ExtensionContext): void {
         }
     });
 
+    // --- P0 §3.9: WHY_DETAIL response → forward to panel ---
+    wsClient.onMessage((msg) => {
+        if (msg.type === 'WHY_DETAIL') {
+            const payload = msg.payload as Record<string, unknown> | undefined;
+            if (panelProvider && payload) {
+                panelProvider.applyWhyDetail(payload);
+            }
+        }
+    });
+
+    // --- P0 §3.7: BREAK_RECOMMENDATION → status bar pulse + notification ---
+    wsClient.onMessage((msg) => {
+        if (msg.type === 'BREAK_RECOMMENDATION') {
+            const payload = msg.payload as Record<string, unknown> | undefined;
+            const reason = (payload?.reason as string | undefined) ?? 'stress_integral_crossed_threshold';
+            const urgency = (payload?.urgency as string | undefined) ?? 'medium';
+            const durationS = Number(payload?.duration_seconds ?? 240);
+            const breathingPattern = (() => {
+                const raw = payload?.breathing_pattern;
+                return raw === '4-7-8' || raw === 'coherent' || raw === 'box'
+                    ? (raw as 'box' | '4-7-8' | 'coherent')
+                    : 'box';
+            })();
+            const mins = Math.max(1, Math.round(durationS / 60));
+            try {
+                if (statusBarItem) {
+                    statusBarItem.text = `$(pulse) Cortex — take ${mins} min`;
+                    statusBarItem.tooltip = `Biology break suggested (${urgency} urgency)`;
+                    setTimeout(() => {
+                        if (statusBarItem) {
+                            statusBarItem.text = '$(pulse) Cortex';
+                            statusBarItem.tooltip = 'Cortex active';
+                        }
+                    }, 60 * 1000);
+                }
+            } catch {/* statusBar may be torn down during reload */ }
+            vscode.window.showInformationMessage(
+                `Your HRV has been suppressed — take a ${mins}-minute break?`,
+                `Take ${mins} min`,
+                'Snooze',
+            ).then((choice) => {
+                if (choice !== `Take ${mins} min`) return;
+                // P0 §3.7 audit fix: instead of fabricating a synthetic
+                // intervention_id and posting USER_ACTION (which the
+                // daemon's helpfulness tracker cannot correlate back to
+                // any real intervention), dispatch a proper
+                // ``take_biology_break`` ACTION_EXECUTE with the real
+                // recommendation's metadata. The daemon routes it
+                // through the BiologyBreakController.
+                const interventionId = (payload?.intervention_id as string | undefined)
+                    || `break_${Date.now()}`;
+                wsClient?.sendBiologyBreakRequest(interventionId, {
+                    duration_seconds: durationS,
+                    breathing_pattern: breathingPattern,
+                    audio_cue: true,
+                    reason,
+                });
+            });
+            if (panelProvider) {
+                panelProvider.applyBreakRecommendation(payload || {});
+            }
+        }
+    });
+
     // --- v2.0: MORNING_BRIEFING via generic handler ---
     wsClient.onMessage((msg) => {
         if (msg.type === 'MORNING_BRIEFING') {

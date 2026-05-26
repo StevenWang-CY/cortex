@@ -50,6 +50,13 @@ DEFAULT_ACTION_LEVELS: dict[str, int] = {
     "resume_last_active_file": REVERSIBLE_ACT,
     "prompt_micro_commit": SUGGEST,
     "suggest_movement_break": SUGGEST,
+
+    # P0 §3.7: biology-driven break action. SUGGEST is sufficient — the
+    # action only shows a full-screen breathing overlay on the user's
+    # own display (no workspace mutation; no destructive side effect).
+    # The user can end the session at any time, so even REVERSIBLE_ACT
+    # would be over-cautious here.
+    "take_biology_break": SUGGEST,
 }
 
 

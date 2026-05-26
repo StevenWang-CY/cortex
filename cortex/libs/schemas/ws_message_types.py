@@ -151,6 +151,15 @@ class MessageType(str, Enum):  # noqa: UP042 — pydantic-to-typescript requires
     Daemon updates the active intervention's micro_step status with timestamps and
     broadcasts the updated INTERVENTION_TRIGGER envelope to all clients."""
 
+    WHY_DETAIL_REQUEST = "WHY_DETAIL_REQUEST"
+    """P0 §3.9: client requests the structured causal rationale for an
+    intervention. Used when the popup / VS Code panel surface only
+    received the headline (e.g. joined late, or wants to refresh the
+    sparkline buffers).
+
+    Payload: ``{intervention_id: str}``. Reply: :attr:`WHY_DETAIL` with
+    the most recent ``CausalSignal`` list for that intervention."""
+
     # ─── Daemon → Client (outbound, made by _make_* helpers) ─────────
 
     AUTH_OK = "AUTH_OK"
@@ -224,6 +233,26 @@ class MessageType(str, Enum):  # noqa: UP042 — pydantic-to-typescript requires
     so the desktop shell can show its slide-up recap sheet and the
     browser-extension popup can cache the summary for next open. Payload
     mirrors :class:`SessionReport` (model_dump(mode='json'))."""
+
+    WHY_DETAIL = "WHY_DETAIL"
+    """P0 §3.9: reply to :attr:`WHY_DETAIL_REQUEST`.
+
+    Carries the structured causal rationale (top 2-3 signals, primary
+    first) plus the originating ``intervention_id`` so the requesting
+    client can match the response to its prompt.
+    Payload: ``{intervention_id: str, causal_signals: list[CausalSignal]}``."""
+
+    BREAK_RECOMMENDATION = "BREAK_RECOMMENDATION"
+    """P0 §3.7: daemon nudges the user to take a biology-driven break.
+
+    Emitted exactly once per ``StressIntegralTracker.should_break()``
+    transition (False → True). The popup / desktop overlay surfaces a
+    soft pill with a single CTA that fires ``take_biology_break`` via
+    ``EXECUTE_ACTION``. Payload mirrors the contract documented next to
+    the ``_break_recommendation_sent`` flag in
+    :class:`cortex.services.runtime_daemon.CortexDaemon`:
+    ``{reason: str, urgency: "low"|"medium"|"high", stress_load: float,
+    threshold: float, duration_seconds: int, breathing_pattern: str}``."""
 
     # ─── LeetCode adapter cues (Daemon → Chrome, target_client_types=["chrome"]) ─
     # Emitted by ``LeetCodeAdapter.execute`` via

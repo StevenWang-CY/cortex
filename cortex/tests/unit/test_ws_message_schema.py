@@ -70,6 +70,8 @@ def test_message_type_catalog_covers_dispatch_arms() -> None:
         "REQUEST_SESSION_RECAP",
         # P0 §3.6 — micro-step toggle
         "MICRO_STEP_TOGGLED",
+        # P0 §3.9 — structured causal rationale on-demand
+        "WHY_DETAIL_REQUEST",
     }
     catalog = {m.value for m in MessageType}
     missing = dispatched_inbound - catalog
@@ -96,6 +98,10 @@ def test_message_type_catalog_covers_outbound() -> None:
         "SESSION_DETAIL",
         "TRENDS_PAYLOAD",
         "SESSION_RECAP",
+        # P0 §3.7 — biology-driven break recommendation
+        "BREAK_RECOMMENDATION",
+        # P0 §3.9 — structured causal rationale reply
+        "WHY_DETAIL",
     }
     catalog = {m.value for m in MessageType}
     missing = outbound - catalog

@@ -580,6 +580,13 @@ function CortexPopup(): React.ReactElement {
     const [rating, setRating] = useState<"thumbs_up" | "thumbs_down" | null>(null);
     const [ratingTextOpen, setRatingTextOpen] = useState<boolean>(false);
     const [ratingText, setRatingText] = useState<string>("");
+    // P0 §3.8 audit fix: track the current intervention level so the
+    // rating row only renders on guided_mode + simplified_workspace
+    // overlays (minimal-tone overlay_only interventions should stay
+    // ambient per spec line 710).
+    const [interventionLevel, setInterventionLevel] = useState<
+        "overlay_only" | "simplified_workspace" | "guided_mode"
+    >("overlay_only");
     // P0 §3.9: structured causal signals + the "Why?" expander state.
     // ``causalSignals`` is the array pushed by INTERVENTION_TRIGGER or
     // fetched on demand via WHY_DETAIL_REQUEST.
@@ -768,6 +775,16 @@ function CortexPopup(): React.ReactElement {
                 setErrAnalysis((p.error_analysis as Record<string, string>) || null);
                 setInterventionId(String(p.intervention_id || ""));
                 setCausalExplanation(String(p.causal_explanation || ""));
+                // P0 §3.8 audit fix (spec line 710): only show the
+                // rating row on guided_mode + simplified_workspace
+                // overlays — minimal-tone overlay_only interventions
+                // should stay ambient and not solicit ratings.
+                const level = String(p.level || "");
+                setInterventionLevel(
+                    level === "guided_mode" || level === "simplified_workspace"
+                        ? level
+                        : "overlay_only",
+                );
                 // P0 §3.6: ingest the new ``micro_steps`` shape so the
                 // popup's controlled checklist re-renders strikethrough
                 // styling when another surface (overlay / VS Code panel)
@@ -814,6 +831,13 @@ function CortexPopup(): React.ReactElement {
                 setRatingText("");
                 setWhyOpen(false);
                 setApplied(false);
+                // P0 §3.7 audit fix: when the underlying intervention
+                // ends (dismiss / engage / restore), the standalone
+                // BREAK_RECOMMENDATION pill must clear too. Without
+                // this, a stale pill from the prior intervention
+                // remained on screen and clicking its CTA dispatched
+                // EXECUTE_ACTION with a dangling intervention_id.
+                setBreakRec(null);
                 break;
             case "BREAK_RECOMMENDATION": {
                 // P0 §3.7: BREAK_RECOMMENDATION pulse relayed from
@@ -1691,6 +1715,125 @@ function CortexPopup(): React.ReactElement {
                                 </div>
                             )}
                         </>
+                    )}
+
+                    {/* P0 §3.8: rating row — surfaces after action click
+                        or 30 s, whichever comes first. 👎 reveals an
+                        optional one-line text input the user can skip
+                        with Enter. Rating + text are routed via
+                        background.ts → USER_RATING WS frame.
+                        Spec line 710: only show on guided_mode +
+                        simplified_workspace to keep minimal-tone
+                        overlays ambient. */}
+                    {(interventionLevel === "guided_mode"
+                        || interventionLevel === "simplified_workspace")
+                        && (applied || rating !== null || ratingTextOpen) && (
+                        <div
+                            data-testid="rating-row"
+                            style={{
+                                marginTop: 12,
+                                display: "flex",
+                                alignItems: "center",
+                                gap: 8,
+                                justifyContent: "center",
+                            }}
+                        >
+                            <button
+                                data-testid="rating-thumbs-up"
+                                aria-label="Mark helpful"
+                                aria-pressed={rating === "thumbs_up"}
+                                onClick={() => {
+                                    if (!interventionId) return;
+                                    setRating("thumbs_up");
+                                    chrome.runtime.sendMessage({
+                                        type: "USER_RATING",
+                                        intervention_id: interventionId,
+                                        rating: "thumbs_up",
+                                    });
+                                }}
+                                style={{
+                                    background: rating === "thumbs_up"
+                                        ? CX.accent
+                                        : "rgba(255,255,255,0.06)",
+                                    color: rating === "thumbs_up"
+                                        ? "white"
+                                        : CX.textSecondary,
+                                    border: "none",
+                                    borderRadius: CX.radiusSm,
+                                    padding: "6px 12px",
+                                    cursor: "pointer",
+                                    fontSize: 14,
+                                }}
+                            >👍</button>
+                            <button
+                                data-testid="rating-thumbs-down"
+                                aria-label="Mark unhelpful"
+                                aria-pressed={rating === "thumbs_down"}
+                                onClick={() => {
+                                    if (!interventionId) return;
+                                    setRating("thumbs_down");
+                                    setRatingTextOpen(true);
+                                    chrome.runtime.sendMessage({
+                                        type: "USER_RATING",
+                                        intervention_id: interventionId,
+                                        rating: "thumbs_down",
+                                    });
+                                }}
+                                style={{
+                                    background: rating === "thumbs_down"
+                                        ? "#E47A6E"
+                                        : "rgba(255,255,255,0.06)",
+                                    color: rating === "thumbs_down"
+                                        ? "white"
+                                        : CX.textSecondary,
+                                    border: "none",
+                                    borderRadius: CX.radiusSm,
+                                    padding: "6px 12px",
+                                    cursor: "pointer",
+                                    fontSize: 14,
+                                }}
+                            >👎</button>
+                        </div>
+                    )}
+
+                    {ratingTextOpen && (
+                        <input
+                            data-testid="rating-text-input"
+                            type="text"
+                            maxLength={200}
+                            placeholder="What would have helped? (Enter to send, Esc to skip)"
+                            value={ratingText}
+                            onChange={(e) => setRatingText(e.target.value)}
+                            onKeyDown={(e) => {
+                                if (e.key === "Enter") {
+                                    if (interventionId && ratingText.trim()) {
+                                        chrome.runtime.sendMessage({
+                                            type: "USER_RATING",
+                                            intervention_id: interventionId,
+                                            rating: "thumbs_down",
+                                            context: ratingText.trim().slice(0, 200),
+                                        });
+                                    }
+                                    setRatingText("");
+                                    setRatingTextOpen(false);
+                                } else if (e.key === "Escape") {
+                                    setRatingText("");
+                                    setRatingTextOpen(false);
+                                }
+                            }}
+                            style={{
+                                marginTop: 8,
+                                width: "100%",
+                                padding: "6px 10px",
+                                fontSize: 11,
+                                background: "rgba(255,255,255,0.04)",
+                                color: CX.text,
+                                border: `1px solid ${CX.accent}55`,
+                                borderRadius: CX.radiusSm,
+                                fontFamily: CX.font,
+                                boxSizing: "border-box",
+                            }}
+                        />
                     )}
                 </div>
             )}

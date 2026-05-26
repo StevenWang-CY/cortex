@@ -274,6 +274,22 @@ class InterventionConfig(BaseModel):
     # avoids any early all-in on a not-yet-trained reward signal.
     enable_hypo_recovery_interventions: bool = False
 
+    # P0 §3.7: biology-driven break feature flag. When True, a
+    # ``StressIntegralTracker.should_break`` False→True transition
+    # emits ``BREAK_RECOMMENDATION`` and the planner promotes
+    # ``take_biology_break`` to the primary action. Disabled in
+    # contexts where the biology-break overlay would interfere
+    # (e.g. CI smoke tests). Maps to env var
+    # ``CORTEX_INTERVENTION__ENABLE_BIOLOGY_BREAK``.
+    enable_biology_break: bool = True
+
+    # P0 §3.7 risk mitigation (spec line 643): the spec calls for
+    # audio to default off when ``mic_active`` was detected in the
+    # last 5 minutes (user is on a call). The runtime daemon honours
+    # this window by tracking the most recent mic_active timestamp;
+    # the controller flips ``audio_cue=False`` for the duration.
+    biology_break_audio_mute_after_mic_seconds: float = 300.0
+
 
 class HandoverConfig(BaseModel):
     """Handover / shutdown detector configuration."""
