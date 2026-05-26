@@ -382,6 +382,51 @@ export class CortexWSClient {
     }
 
     /**
+     * P0 §3.11 / §3.12: send a SNOOZE_REQUEST for an intervention.
+     *
+     * VS Code uses this from the OS-notification fallback path when
+     * the desktop dashboard isn't focused and the user clicks the
+     * "Snooze" toast button. The daemon unifies snooze requests
+     * (regardless of source) through ``set_quiet_mode`` and
+     * broadcasts QUIET_MODE_STATE so every surface mirrors.
+     */
+    sendSnoozeRequest(interventionId: string, durationMinutes: number = 15): void {
+        this._send({
+            type: "SNOOZE_REQUEST",
+            payload: {
+                intervention_id: interventionId,
+                duration_minutes: durationMinutes,
+                source: "vscode",
+            },
+            timestamp: Date.now() / 1000,
+            sequence: ++this._sequence,
+        });
+    }
+
+    /**
+     * P0 §3.11: send a QUIET_MODE_TOGGLE for the kind specified.
+     * Kinds: "snooze_15" | "quiet_session" | "pause" | "off".
+     */
+    sendQuietModeToggle(
+        kind: "snooze_15" | "quiet_session" | "pause" | "off",
+        durationMinutes?: number,
+    ): void {
+        this._send({
+            type: "QUIET_MODE_TOGGLE",
+            payload: {
+                kind,
+                duration_minutes:
+                    typeof durationMinutes === "number"
+                        ? durationMinutes
+                        : null,
+                source: "vscode",
+            },
+            timestamp: Date.now() / 1000,
+            sequence: ++this._sequence,
+        });
+    }
+
+    /**
      * Notify the daemon that an intervention was applied (or restored).
      *
      * B.2: the daemon's in-process executor runs an

@@ -43,7 +43,8 @@
       "alarms",
       "bookmarks",
       "webNavigation",
-      "nativeMessaging"
+      "nativeMessaging",
+      "notifications"
     ],
     "host_permissions": [
       "<all_urls>"

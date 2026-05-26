@@ -95,6 +95,10 @@ class CortexTrayIcon(QSystemTrayIcon):
     snooze_requested = Signal()
     disable_session_requested = Signal()
     quit_requested = Signal()
+    # P0 §3.11: emitted when the user picks a kind from the tray's
+    # quiet-mode submenu. Payload mirrors the dashboard signal
+    # (kind, duration_minutes_or_zero).
+    quiet_mode_requested = Signal(str, int)
 
     def __init__(self, app: QApplication) -> None:
         super().__init__(app)
@@ -105,6 +109,9 @@ class CortexTrayIcon(QSystemTrayIcon):
         self._paused = False
         # F34: tray-side mirror of the dashboard stop-button state machine.
         self._stopping: bool = False
+        # P0 §3.11: cached quiet-mode kind so the tray menu can mark
+        # the active row with a checkmark when rebuilt.
+        self._quiet_mode_kind: str = "off"
 
         self.setIcon(_make_heart_icon(DISCONNECTED_COLOR))
         self.setToolTip("Cortex — Disconnected")
@@ -225,7 +232,26 @@ class CortexTrayIcon(QSystemTrayIcon):
 
         snooze_action = QAction("Snooze 15 min", self._menu)
         snooze_action.triggered.connect(self.snooze_requested.emit)
+        try:
+            snooze_action.setCheckable(True)
+            snooze_action.setChecked(self._quiet_mode_kind == "snooze_15")
+        except Exception:
+            pass
         self._menu.addAction(snooze_action)
+        self._snooze_action = snooze_action
+
+        # P0 §3.11: full quiet-mode kind set under a checkmark menu.
+        quiet_session_action = QAction("Quiet for session", self._menu)
+        try:
+            quiet_session_action.setCheckable(True)
+            quiet_session_action.setChecked(self._quiet_mode_kind == "quiet_session")
+        except Exception:
+            pass
+        quiet_session_action.triggered.connect(
+            lambda _checked=False: self.quiet_mode_requested.emit("quiet_session", 0),
+        )
+        self._menu.addAction(quiet_session_action)
+        self._quiet_session_action = quiet_session_action
 
         disable_action = QAction("Turn Off This Session", self._menu)
         disable_action.triggered.connect(self.disable_session_requested.emit)
@@ -282,6 +308,40 @@ class CortexTrayIcon(QSystemTrayIcon):
         self._pause_action.setText("Resume" if paused else "Pause")
         if paused:
             self.setToolTip(f"Cortex — {self._state} [Paused]")
+        # Pause is one of the quiet-mode kinds — keep the menu in sync.
+        try:
+            self._pause_action.setCheckable(True)
+            self._pause_action.setChecked(paused)
+        except Exception:
+            pass
+
+    def set_quiet_mode_kind(self, kind: str) -> None:
+        """P0 §3.11: surface the active quiet-mode kind in the menu so
+        the user sees a checkmark next to the matching item.
+        Accepts ``"off"`` / ``"snooze_15"`` / ``"quiet_session"`` /
+        ``"pause"``.
+        """
+        self._quiet_mode_kind = kind if kind in (
+            "off", "snooze_15", "quiet_session", "pause",
+        ) else "off"
+        for attr, match in (
+            ("_snooze_action", "snooze_15"),
+            ("_quiet_session_action", "quiet_session"),
+        ):
+            action = getattr(self, attr, None)
+            if action is None:
+                continue
+            try:
+                action.setCheckable(True)
+                action.setChecked(self._quiet_mode_kind == match)
+            except Exception:
+                continue
+        # The pause action's checkmark mirrors set_paused; force-sync.
+        try:
+            self._pause_action.setCheckable(True)
+            self._pause_action.setChecked(self._quiet_mode_kind == "pause")
+        except Exception:
+            pass
 
     def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:

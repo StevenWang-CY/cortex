@@ -130,6 +130,16 @@ export interface ChromeFake {
         update: ReturnType<typeof vi.fn>;
         query: ReturnType<typeof vi.fn>;
     };
+    notifications: {
+        create: ReturnType<typeof vi.fn>;
+        clear: ReturnType<typeof vi.fn>;
+        onClicked: ReturnType<typeof makeEvent>;
+        onButtonClicked: ReturnType<typeof makeEvent>;
+    };
+    action: {
+        setBadgeText: ReturnType<typeof vi.fn>;
+        setBadgeBackgroundColor: ReturnType<typeof vi.fn>;
+    };
 }
 
 export function buildChromeFake(): ChromeFake {
@@ -192,6 +202,16 @@ export function buildChromeFake(): ChromeFake {
             update: vi.fn(() => Promise.resolve()),
             query: vi.fn(() => Promise.resolve([])),
         },
+        notifications: {
+            create: vi.fn(),
+            clear: vi.fn(),
+            onClicked: makeEvent(),
+            onButtonClicked: makeEvent(),
+        },
+        action: {
+            setBadgeText: vi.fn(),
+            setBadgeBackgroundColor: vi.fn(),
+        },
     };
 }
 
@@ -234,4 +254,10 @@ export function resetChromeFake(fake: ChromeFake): void {
     fake.bookmarks.create.mockClear();
     fake.tabGroups.update.mockClear();
     fake.tabGroups.query.mockClear();
+    fake.notifications.create.mockClear();
+    fake.notifications.clear.mockClear();
+    fake.notifications.onClicked.__clear();
+    fake.notifications.onButtonClicked.__clear();
+    fake.action.setBadgeText.mockClear();
+    fake.action.setBadgeBackgroundColor.mockClear();
 }

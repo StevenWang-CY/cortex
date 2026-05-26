@@ -57,6 +57,16 @@ DEFAULT_ACTION_LEVELS: dict[str, int] = {
     # The user can end the session at any time, so even REVERSIBLE_ACT
     # would be over-cautious here.
     "take_biology_break": SUGGEST,
+
+    # P0 §3.10: distraction blocking as an action class.
+    # Default REVERSIBLE_ACT — the user can disarm in one click any
+    # time. The user-visible "Auto-arm in HYPER" toggle in Settings
+    # → Focus protection sets the level to AUTONOMOUS_ACT, so the
+    # daemon's HYPER → START_FOCUS_AUTO path only fires for users
+    # who explicitly opted in. The minimum bar is REVERSIBLE_ACT
+    # rather than PREVIEW because no destructive mutation happens —
+    # the interstitial is non-destructive and one click bypasses it.
+    "distraction_block": REVERSIBLE_ACT,
 }
 
 

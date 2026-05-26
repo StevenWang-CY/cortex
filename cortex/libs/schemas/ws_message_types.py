@@ -160,6 +160,25 @@ class MessageType(str, Enum):  # noqa: UP042 — pydantic-to-typescript requires
     Payload: ``{intervention_id: str}``. Reply: :attr:`WHY_DETAIL` with
     the most recent ``CausalSignal`` list for that intervention."""
 
+    QUIET_MODE_TOGGLE = "QUIET_MODE_TOGGLE"
+    """P0 §3.11: client requests entering or leaving a quiet/pause mode.
+
+    Payload: ``{kind: "snooze_15" | "quiet_session" | "pause" | "off",
+    duration_minutes: int | None}``. ``"off"`` is a sentinel that clears
+    any active mode; the daemon broadcasts the resulting
+    :attr:`QUIET_MODE_STATE` so every surface (dashboard, overlay, tray,
+    browser popup, VS Code status bar) reflects the same truth."""
+
+    SNOOZE_REQUEST = "SNOOZE_REQUEST"
+    """P0 §3.11: alias for a brief, overlay-only suppression.
+
+    Sent by the overlay's "Snooze 15" footer button as a shorthand for
+    ``QUIET_MODE_TOGGLE`` with ``kind="snooze_15"``. Carried as a
+    separate type so the daemon can record the source affordance (an
+    overlay click vs. a dashboard menu pick) without bloating the
+    QUIET_MODE_TOGGLE payload. Payload:
+    ``{duration_minutes: int | None}`` — defaults to 15."""
+
     # ─── Daemon → Client (outbound, made by _make_* helpers) ─────────
 
     AUTH_OK = "AUTH_OK"
@@ -253,6 +272,38 @@ class MessageType(str, Enum):  # noqa: UP042 — pydantic-to-typescript requires
     :class:`cortex.services.runtime_daemon.CortexDaemon`:
     ``{reason: str, urgency: "low"|"medium"|"high", stress_load: float,
     threshold: float, duration_seconds: int, breathing_pattern: str}``."""
+
+    QUIET_MODE_STATE = "QUIET_MODE_STATE"
+    """P0 §3.11: broadcast of the active quiet / pause mode (or its clear).
+
+    Emitted whenever ``RuntimeDaemon.set_quiet_mode`` runs (whether
+    armed by the dashboard menu, the overlay footer, the global
+    keyboard shortcut, or the existing F26 frustration-spiral path).
+    Payload: ``{kind: "snooze_15" | "quiet_session" | "pause" | "off",
+    duration_minutes: int | None, ends_at: float | None, source: str}``
+    where ``ends_at`` is a unix timestamp (seconds) and ``source``
+    identifies the originator (``"dashboard"`` / ``"overlay"`` /
+    ``"tray"`` / ``"shortcut"`` / ``"daemon"``)."""
+
+    START_FOCUS_AUTO = "START_FOCUS_AUTO"
+    """P0 §3.10: daemon-armed focus session start directive.
+
+    Emitted to the browser extension when the user has opted in to
+    ``CORTEX_INTERVENTION__ENABLE_AUTO_DISTRACTION_BLOCK`` AND the live
+    state is HYPER with confidence above the gate. The browser
+    extension reuses the existing focus-session start path; the daemon
+    broadcasts a paired :attr:`STOP_FOCUS_AUTO` when the user exits
+    HYPER. Payload: ``{duration_minutes: int, reason: str,
+    preset: "developer"|"student"|"writer"|"custom",
+    custom_domains: list[str]}``."""
+
+    STOP_FOCUS_AUTO = "STOP_FOCUS_AUTO"
+    """P0 §3.10: daemon-armed focus session stop directive.
+
+    Sent after sustained non-HYPER state (FLOW ≥ 5 min) OR an explicit
+    user disarm; the browser extension calls ``stopFocusSession`` only
+    if the daemon was the one that armed the current session. Payload:
+    ``{reason: str}``."""
 
     # ─── LeetCode adapter cues (Daemon → Chrome, target_client_types=["chrome"]) ─
     # Emitted by ``LeetCodeAdapter.execute`` via

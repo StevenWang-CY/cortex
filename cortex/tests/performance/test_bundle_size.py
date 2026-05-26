@@ -40,8 +40,14 @@ _EXTENSION_ROOT = (
 # a feature change that doubles a file's size will fail this test.
 _SOURCE_BUDGETS: dict[str, int] = {
     # Entry points (Plasmo discovers these by filename).
-    "background.ts": 200_000,
-    "popup.tsx": 80_000,
+    # P0 §3.1-§3.12 expanded the extension surface considerably (session
+    # history, trends rollup, recap card, micro-step toggle, why
+    # drilldown, rating row, biology break, auto-armed focus session,
+    # OS notification routing, quiet-mode kind picker). The budgets
+    # below are sized for the *post-P0* footprint + ~10-15% headroom
+    # so ordinary follow-up feature work does not need to bump them.
+    "background.ts": 240_000,
+    "popup.tsx": 130_000,
     "newtab.tsx": 80_000,
     "tab-manager.ts": 60_000,
     "activity-tracker.ts": 40_000,

@@ -84,6 +84,10 @@ class DaemonBridge(QObject):
     session_detail_received = Signal(dict)
     trends_received = Signal(dict)
     session_recap_received = Signal(dict)
+    # P0 §3.11: daemon broadcast of the active quiet/pause mode.
+    quiet_mode_state_received = Signal(dict)
+    # P0 §3.10: daemon-armed focus session arm/disarm broadcast.
+    auto_focus_armed_changed = Signal(bool, str)  # armed, preset
     # P0 §3.4: pushed at ~2 Hz from the CalibrationRunner so the
     # onboarding wizard's ECG trace, status pills, numerics, and bar all
     # stay in sync with the running capture loop. Payload is a plain
@@ -192,6 +196,31 @@ class DaemonBridge(QObject):
         except Exception:
             logger.debug("session_recap_received emit failed", exc_info=True)
 
+    def on_quiet_mode_state(self, payload: dict) -> None:
+        """P0 §3.11: queue an inbound QUIET_MODE_STATE payload."""
+        try:
+            self.quiet_mode_state_received.emit(dict(payload) if payload else {})
+        except Exception:
+            logger.debug("quiet_mode_state_received emit failed", exc_info=True)
+
+    def on_start_focus_auto(self, payload: dict) -> None:
+        """P0 §3.10: daemon armed an auto focus session — show the
+        focus-protection pill on the dashboard."""
+        try:
+            preset = ""
+            if isinstance(payload, dict):
+                preset = str(payload.get("preset") or "")
+            self.auto_focus_armed_changed.emit(True, preset)
+        except Exception:
+            logger.debug("on_start_focus_auto emit failed", exc_info=True)
+
+    def on_stop_focus_auto(self, _payload: dict) -> None:
+        """P0 §3.10: daemon disarmed the auto focus session — hide pill."""
+        try:
+            self.auto_focus_armed_changed.emit(False, "")
+        except Exception:
+            logger.debug("on_stop_focus_auto emit failed", exc_info=True)
+
     def on_error(self, title: str, body: str, cid: str = "") -> None:
         """Phase J-2: surface a daemon error in the dashboard toast.
 
@@ -258,6 +287,15 @@ class CortexAppController:
         self._app.setApplicationName("Cortex")
         self._app.setOrganizationName("Cortex")
         self._app.setQuitOnLastWindowClosed(False)
+        # Phase-3 P0-6 / P1-N1: cached focus state read by the
+        # daemon-thread probe ``_desktop_is_focused_probe``. Initialised
+        # to True so an early intervention doesn't OS-notify before the
+        # first focusWindowChanged signal arrives.
+        self._dashboard_is_focused: bool = True
+        try:
+            self._app.focusWindowChanged.connect(self._refresh_focus_cache)
+        except Exception:
+            logger.debug("focusWindowChanged signal wire failed", exc_info=True)
 
         # -- UI components ----------------------------------------------------
         self._dashboard = DashboardWindow()
@@ -279,6 +317,11 @@ class CortexAppController:
         self._tray.restore_requested.connect(self._restore_workspace)
         self._tray.snooze_requested.connect(self._snooze_fifteen_minutes)
         self._tray.disable_session_requested.connect(self._disable_for_session)
+        # P0 §3.11: extra tray quiet-mode kinds (Quiet for session).
+        if hasattr(self._tray, "quiet_mode_requested"):
+            self._tray.quiet_mode_requested.connect(
+                self._on_tray_quiet_mode_requested,
+            )
         # Phase 4.B fix (#4): the tray Quit action (and Cmd+Q via the
         # native app menu) must honour the two-phase recap when a
         # session is active so the user always sees their recap before
@@ -309,6 +352,21 @@ class CortexAppController:
         self._bridge.session_detail_received.connect(self._dashboard.apply_session_detail)
         self._bridge.trends_received.connect(self._dashboard.apply_trends)
         self._bridge.session_recap_received.connect(self._dashboard.apply_session_recap)
+        # P0 §3.11 / §3.10: pipe QUIET_MODE_STATE + auto-focus broadcasts
+        # into the dashboard's pause capsule + focus-protection pill.
+        if hasattr(self._dashboard, "apply_quiet_mode_state"):
+            self._bridge.quiet_mode_state_received.connect(
+                self._dashboard.apply_quiet_mode_state,
+            )
+        if hasattr(self._dashboard, "apply_auto_focus_state"):
+            self._bridge.auto_focus_armed_changed.connect(
+                self._dashboard.apply_auto_focus_state,
+            )
+        # P0 §3.11: also fan QUIET_MODE_STATE into the tray menu so the
+        # active kind shows a checkmark.
+        self._bridge.quiet_mode_state_received.connect(
+            self._on_quiet_mode_state_to_tray,
+        )
 
         self._overlay.dismissed.connect(self._on_overlay_dismissed)
         # G4 (audit-prod): overlay action buttons emit ``action_invoked``;
@@ -334,6 +392,12 @@ class CortexAppController:
         # signals back into the overlay's panel.
         if hasattr(self._overlay, "why_requested"):
             self._overlay.why_requested.connect(self._on_why_requested)
+        # P0 §3.11: overlay footer snooze / quiet buttons. The overlay
+        # has already triggered its own dismiss flow; we additionally
+        # forward the kind to the daemon's set_quiet_mode so every
+        # surface picks up the new QUIET_MODE_STATE broadcast.
+        if hasattr(self._overlay, "quiet_requested"):
+            self._overlay.quiet_requested.connect(self._on_quiet_requested)
         self._settings.settings_changed.connect(self._on_settings_changed)
         self._settings.back_requested.connect(self._show_dashboard)
         self._connections.back_requested.connect(self._show_dashboard)
@@ -416,6 +480,16 @@ class CortexAppController:
             self._dashboard.detail_requested.connect(self._on_detail_requested)
         if hasattr(self._dashboard, "trends_requested"):
             self._dashboard.trends_requested.connect(self._on_trends_requested)
+        # P0 §3.11: dashboard pause/quiet menu picks → daemon.
+        if hasattr(self._dashboard, "quiet_mode_requested"):
+            self._dashboard.quiet_mode_requested.connect(
+                self._on_dashboard_quiet_requested,
+            )
+        # P0 §3.10: auto-focus "Turn off" toast click → daemon.
+        if hasattr(self._dashboard, "auto_focus_disarm_requested"):
+            self._dashboard.auto_focus_disarm_requested.connect(
+                self._on_auto_focus_disarm_requested,
+            )
 
         # -- Start daemon in background thread --------------------------------
         self._start_daemon()
@@ -515,6 +589,12 @@ class CortexAppController:
         # asyncio loop and the BiologyBreakController calls our handler
         # whenever the user takes a break.
         self._daemon.set_break_overlay_ui_handler(self._run_break_overlay)
+        # P0 §3.12: register the desktop-focus probe so the daemon
+        # knows when to dispatch OS-level notification fallbacks.
+        try:
+            self._daemon.set_desktop_focus_probe(self._desktop_is_focused_probe)
+        except Exception:
+            logger.debug("set_desktop_focus_probe failed", exc_info=True)
         # P0 §3.3: subscribe to SESSION_RECAP broadcasts.
         # The daemon emits SESSION_RECAP exclusively via
         # ``_ws_server.send_message`` (see runtime_daemon.stop()'s 90 s
@@ -588,6 +668,13 @@ class CortexAppController:
                 MessageType.SESSION_DETAIL.value: bridge.on_session_detail,
                 MessageType.TRENDS_PAYLOAD.value: bridge.on_trends,
                 MessageType.SESSION_RECAP.value: bridge.on_session_recap,
+                # P0 §3.11 / §3.10: route quiet-mode + auto-focus
+                # broadcasts to the bridge so the dashboard reflects
+                # them in DMG mode (the WS-client path picks them up
+                # via the WebSocketBridge separately).
+                MessageType.QUIET_MODE_STATE.value: bridge.on_quiet_mode_state,
+                MessageType.START_FOCUS_AUTO.value: bridge.on_start_focus_auto,
+                MessageType.STOP_FOCUS_AUTO.value: bridge.on_stop_focus_auto,
             }
         except Exception:
             logger.debug("MessageType import failed; broadcast observer disabled", exc_info=True)
@@ -852,6 +939,17 @@ class CortexAppController:
         if self._paused:
             return
         self._active_intervention_id = payload.get("intervention_id")
+        # Phase-3 P0-DF-12.2 (dual-fire de-dup): when the daemon
+        # already stamped ``desktop_not_focused`` we KNOW the OS-level
+        # notification path is firing. Surface the cue *only* via the
+        # notification — popping the overlay on a hidden / cross-Space
+        # window flashes nothing visible but does keep the dashboard
+        # "armed" with a pending intervention that the user can't see.
+        # When the user comes back, the standard re-mount path on
+        # ``handleIntervention`` (via stored ``activeIntervention``)
+        # restores the overlay; here we just skip the immediate show.
+        if payload.get("desktop_not_focused") is True:
+            return
         if self._overlay is not None:
             self._overlay.show_intervention(payload)
         # Audit-2 fix: bump the Today/Blocked counter so the dashboard
@@ -1076,6 +1174,151 @@ class CortexAppController:
             )
         except Exception:
             logger.debug("why_requested scheduling failed", exc_info=True)
+
+    def _on_tray_quiet_mode_requested(
+        self, kind: str, duration_minutes: int,
+    ) -> None:
+        """Tray submenu quiet-mode pick → daemon.set_quiet_mode."""
+        minutes: int | None = (
+            int(duration_minutes) if duration_minutes and duration_minutes > 0 else None
+        )
+        self.request_quiet_mode(kind, duration_minutes=minutes, source="tray")
+
+    def _on_quiet_mode_state_to_tray(self, payload: dict) -> None:
+        """Mirror QUIET_MODE_STATE onto the tray menu's checkable items."""
+        if self._tray is None or not isinstance(payload, dict):
+            return
+        kind = str(payload.get("kind", "off"))
+        try:
+            self._tray.set_quiet_mode_kind(kind)
+        except Exception:
+            logger.debug("tray.set_quiet_mode_kind failed", exc_info=True)
+
+    def _on_dashboard_quiet_requested(
+        self, kind: str, duration_minutes: int,
+    ) -> None:
+        """Dashboard pause/quiet menu pick → daemon.set_quiet_mode."""
+        self.request_quiet_mode(
+            kind,
+            duration_minutes=(
+                int(duration_minutes) if duration_minutes and duration_minutes > 0 else None
+            ),
+            source="dashboard",
+        )
+
+    def _on_auto_focus_disarm_requested(self) -> None:
+        """Dashboard auto-focus "Turn off" toast → daemon.disarm_auto_focus."""
+        if self._daemon is None or self._daemon_loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._daemon.disarm_auto_focus(), self._daemon_loop,
+            )
+        except Exception:
+            logger.debug("disarm_auto_focus scheduling failed", exc_info=True)
+
+    def _on_quiet_requested(self, kind: str, duration_minutes: int) -> None:
+        """P0 §3.11: overlay (or dashboard menu / shortcut) asked the
+        daemon to enter a quiet / pause mode.
+
+        Forward to ``RuntimeDaemon.set_quiet_mode`` so the unified
+        QUIET_MODE_STATE broadcast updates every surface.
+        """
+        if self._daemon is None or self._daemon_loop is None:
+            return
+        minutes: int | None = (
+            int(duration_minutes) if duration_minutes and duration_minutes > 0 else None
+        )
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._daemon.set_quiet_mode(
+                    str(kind), duration_minutes=minutes, source="overlay",
+                ),
+                self._daemon_loop,
+            )
+        except Exception:
+            logger.debug("quiet_requested scheduling failed", exc_info=True)
+
+    def request_quiet_mode(
+        self,
+        kind: str,
+        *,
+        duration_minutes: int | None = None,
+        source: str = "dashboard",
+    ) -> None:
+        """Public entry point used by the dashboard's pause capsule
+        menu, the tray menu, and the Cmd+Shift+/ shortcut. Schedules
+        ``set_quiet_mode`` on the daemon loop."""
+        if self._daemon is None or self._daemon_loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._daemon.set_quiet_mode(
+                    str(kind),
+                    duration_minutes=duration_minutes,
+                    source=source,
+                ),
+                self._daemon_loop,
+            )
+        except Exception:
+            logger.debug("request_quiet_mode scheduling failed", exc_info=True)
+
+    def _desktop_is_focused_probe(self) -> bool:
+        """P0 §3.12: returns True iff a Cortex window has keyboard focus.
+
+        Phase-3 P0-6 / P1-N1: ``QApplication.focusWindow()`` and
+        ``QWidget.windowHandle()`` are **not** thread-safe. The probe
+        is called from the daemon's asyncio thread; touching Qt
+        objects directly from there can SIGSEGV under load. Instead,
+        we maintain a cached boolean updated on the Qt main thread via
+        the ``focusWindowChanged`` signal (wired in ``_start_daemon``)
+        and the probe just reads the atomic.
+        """
+        return bool(getattr(self, "_dashboard_is_focused", False))
+
+    def _refresh_focus_cache(self, focus_window: object | None = None) -> None:
+        """Slot invoked on the Qt main thread when the focused window
+        changes. Walks Cortex's owned top-level windows and caches a
+        boolean for ``_desktop_is_focused_probe`` to read.
+
+        Safe to call from anywhere on the Qt thread; the daemon thread
+        only ever reads the cached boolean (Python attribute access is
+        atomic for refcount-1 booleans on CPython).
+        """
+        try:
+            if focus_window is None:
+                from PySide6.QtWidgets import QApplication
+                app = QApplication.instance()
+                if app is None:
+                    self._dashboard_is_focused = False
+                    return
+                focus_window = app.focusWindow()
+            if focus_window is None:
+                # Backgrounded entirely — fire OS notifications.
+                self._dashboard_is_focused = False
+                return
+            owned_widgets = (
+                self._dashboard,
+                getattr(self, "_settings", None),
+                getattr(self, "_connections", None),
+                getattr(self, "_overlay", None),
+                getattr(self, "_onboarding", None),
+            )
+            for w in owned_widgets:
+                if w is None:
+                    continue
+                try:
+                    handle = w.windowHandle()
+                except Exception:
+                    handle = None
+                if handle is not None and handle is focus_window:
+                    self._dashboard_is_focused = True
+                    return
+            self._dashboard_is_focused = False
+        except Exception:
+            # On any error, treat as focused so OS notifications stay
+            # quiet (least-surprising behaviour for a broken probe).
+            self._dashboard_is_focused = True
 
     async def _run_break_overlay(
         self,
@@ -1334,6 +1577,13 @@ class CortexAppController:
             self._tray.set_paused(self._paused)
         if self._paused and self._overlay is not None:
             self._overlay.hide()
+        # P0 §3.11: route through ``set_quiet_mode`` so QUIET_MODE_STATE
+        # broadcasts back to every surface (overlay capsule, popup
+        # pill, VS Code status bar). The legacy local ``_paused`` flag
+        # stays for ``_on_overlay_dismissed`` etc., but the daemon is
+        # the source of truth now.
+        kind = "pause" if self._paused else "off"
+        self.request_quiet_mode(kind, source="tray")
 
     def _restore_workspace(self) -> None:
         if self._active_intervention_id and self._daemon and self._daemon_loop:
@@ -1346,14 +1596,11 @@ class CortexAppController:
             )
 
     def _snooze_fifteen_minutes(self) -> None:
-        if self._daemon is not None and self._daemon_loop is not None:
-            asyncio.run_coroutine_threadsafe(
-                self._daemon.apply_settings({
-                    "quiet_mode": True,
-                    "quiet_duration_minutes": 15,
-                }),
-                self._daemon_loop,
-            )
+        # P0 §3.11: route through the unified ``set_quiet_mode`` path so
+        # the QUIET_MODE_STATE broadcast updates every surface.
+        self.request_quiet_mode(
+            "snooze_15", duration_minutes=15, source="tray",
+        )
 
     def _disable_for_session(self) -> None:
         if self._daemon is not None and self._daemon_loop is not None:

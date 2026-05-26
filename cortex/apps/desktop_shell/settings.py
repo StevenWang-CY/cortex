@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QPlainTextEdit,
     QPushButton,
     QSlider,
     QSpinBox,
@@ -485,6 +486,112 @@ class SettingsDialog(QWidget):
 
         layout.addWidget(int_card)
 
+        # ── Focus Protection (P0 §3.10) ──────────────────────────────
+        fp_label = QLabel("Focus protection")
+        fp_label.setStyleSheet(_SECTION_HEADING_QSS)
+        layout.addWidget(fp_label)
+
+        fp_card = self._make_card()
+        fp_inner = QVBoxLayout(fp_card)
+        fp_inner.setContentsMargins(SP4, SP4, SP4, SP4)
+        fp_inner.setSpacing(SP3)
+
+        self._auto_distraction_block = QCheckBox(
+            "Auto-arm focus session when overwhelmed",
+        )
+        self._auto_distraction_block.setChecked(False)
+        self._auto_distraction_block.setStyleSheet(_CHECKBOX_QSS)
+        fp_inner.addWidget(self._auto_distraction_block)
+
+        fp_help = QLabel(
+            "When Cortex detects sustained overwhelm (HYPER state), "
+            "block known-distracting sites for a focus session. You "
+            "can disarm at any time."
+        )
+        fp_help.setFont(mac_native.system_font(FS_CAPTION, "regular"))
+        fp_help.setWordWrap(True)
+        fp_help.setStyleSheet(
+            f"color: {_LABEL_SECONDARY}; background: transparent;"
+        )
+        fp_inner.addWidget(fp_help)
+
+        preset_row = QHBoxLayout()
+        preset_label = QLabel("Blocklist preset")
+        preset_label.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
+        preset_label.setStyleSheet(f"color: {_LABEL}; background: transparent;")
+        preset_row.addWidget(preset_label)
+        preset_row.addStretch()
+        self._distraction_preset = QComboBox()
+        self._distraction_preset.addItems([
+            "Developer",
+            "Student",
+            "Writer",
+            "Custom",
+        ])
+        self._distraction_preset.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
+        self._distraction_preset.setStyleSheet(_COMBO_QSS)
+        preset_row.addWidget(self._distraction_preset)
+        fp_inner.addLayout(preset_row)
+
+        custom_label = QLabel("Custom domains (one per line)")
+        custom_label.setFont(mac_native.system_font(FS_CAPTION, "regular"))
+        custom_label.setStyleSheet(
+            f"color: {_LABEL_SECONDARY}; background: transparent;"
+        )
+        fp_inner.addWidget(custom_label)
+
+        self._distraction_custom_domains = QPlainTextEdit()
+        self._distraction_custom_domains.setPlaceholderText(
+            "example.com\nanother-distraction.com"
+        )
+        self._distraction_custom_domains.setFont(
+            mac_native.system_font(FS_CAPTION, "regular"),
+        )
+        self._distraction_custom_domains.setMaximumHeight(90)
+        self._distraction_custom_domains.setStyleSheet(
+            "QPlainTextEdit {"
+            f"  background: {_CONTROL_BG};"
+            f"  border: 0.5px solid {_SEPARATOR};"
+            f"  border-radius: {RADIUS_BUTTON}px;"
+            f"  color: {_LABEL};"
+            "  padding: 6px;"
+            "}"
+        )
+        fp_inner.addWidget(self._distraction_custom_domains)
+
+        layout.addWidget(fp_card)
+
+        # ── Notifications (P0 §3.12) ────────────────────────────────
+        notif_label = QLabel("Notifications")
+        notif_label.setStyleSheet(_SECTION_HEADING_QSS)
+        layout.addWidget(notif_label)
+
+        notif_card = self._make_card()
+        notif_inner = QVBoxLayout(notif_card)
+        notif_inner.setContentsMargins(SP4, SP4, SP4, SP4)
+        notif_inner.setSpacing(SP2)
+
+        self._os_notifications = QCheckBox(
+            "Send macOS notifications when Cortex is in the background",
+        )
+        self._os_notifications.setChecked(True)
+        self._os_notifications.setStyleSheet(_CHECKBOX_QSS)
+        notif_inner.addWidget(self._os_notifications)
+
+        notif_help = QLabel(
+            "When the dashboard isn't your active window, route "
+            "interventions through macOS Notification Center so you "
+            "don't miss them from another Space or fullscreen app."
+        )
+        notif_help.setFont(mac_native.system_font(FS_CAPTION, "regular"))
+        notif_help.setWordWrap(True)
+        notif_help.setStyleSheet(
+            f"color: {_LABEL_SECONDARY}; background: transparent;"
+        )
+        notif_inner.addWidget(notif_help)
+
+        layout.addWidget(notif_card)
+
         # ── LLM Backend ──────────────────────────────────────────────
         llm_label = QLabel("LLM backend")
         llm_label.setStyleSheet(_SECTION_HEADING_QSS)
@@ -673,6 +780,8 @@ class SettingsDialog(QWidget):
         set_accessible_name(close_btn, "Close settings")
         set_accessible_name(apply_btn, "Apply settings")
 
+        # Phase-3 / Audit-1.2 F5: include the new P0 §3.10 / §3.12
+        # controls in the tab order so keyboard users can reach them.
         chain_tab_order(
             back_btn,
             self._webcam_enabled,
@@ -682,6 +791,10 @@ class SettingsDialog(QWidget):
             self._cooldown_spin,
             self._quiet_mode,
             self._quiet_duration,
+            self._auto_distraction_block,
+            self._distraction_preset,
+            self._distraction_custom_domains,
+            self._os_notifications,
             self._llm_backend,
             self._debug_capture,
             self._debug_rppg,
@@ -689,6 +802,26 @@ class SettingsDialog(QWidget):
             self._debug_llm,
             close_btn,
             apply_btn,
+        )
+        # Accessible names for the new widgets so VoiceOver announces
+        # them by purpose rather than "checkbox" / "combo box".
+        set_accessible_name(
+            self._auto_distraction_block,
+            "Auto-arm focus session when overwhelmed",
+        )
+        set_accessible_description(
+            self._auto_distraction_block,
+            "When Cortex detects sustained overwhelm (HYPER state), "
+            "block known-distracting sites for a focus session.",
+        )
+        set_accessible_name(self._distraction_preset, "Blocklist preset")
+        set_accessible_name(
+            self._distraction_custom_domains,
+            "Custom distraction domains, one per line",
+        )
+        set_accessible_name(
+            self._os_notifications,
+            "Send macOS notifications when Cortex is in the background",
         )
 
     def _make_card(self) -> QFrame:
@@ -884,6 +1017,16 @@ class SettingsDialog(QWidget):
         llm_modes = ["bedrock", "vertex", "direct", "rule_based"]
         llm_mode = llm_modes[self._llm_backend.currentIndex()]
 
+        preset_idx = self._distraction_preset.currentIndex()
+        preset_values = ["developer", "student", "writer", "custom"]
+        distraction_preset = preset_values[preset_idx] if 0 <= preset_idx < len(preset_values) else "developer"
+        custom_text = self._distraction_custom_domains.toPlainText() or ""
+        custom_domains = [
+            line.strip().lower()
+            for line in custom_text.splitlines()
+            if line.strip()
+        ]
+
         return {
             "webcam_enabled": self._webcam_enabled.isChecked(),
             "input_telemetry_enabled": self._input_telemetry_enabled.isChecked(),
@@ -898,6 +1041,12 @@ class SettingsDialog(QWidget):
             "debug_rppg": self._debug_rppg.isChecked(),
             "debug_state": self._debug_state.isChecked(),
             "debug_llm": self._debug_llm.isChecked(),
+            # P0 §3.10: focus protection (auto-armed distraction block)
+            "enable_auto_distraction_block": self._auto_distraction_block.isChecked(),
+            "auto_distraction_block_preset": distraction_preset,
+            "auto_distraction_block_custom_domains": custom_domains,
+            # P0 §3.12: OS-level notification routing
+            "enable_os_notifications": self._os_notifications.isChecked(),
         }
 
     def _apply_settings(self) -> None:
@@ -1078,11 +1227,56 @@ class SettingsDialog(QWidget):
             self._debug_rppg.setChecked(_get_bool("debug_rppg", False))
             self._debug_state.setChecked(_get_bool("debug_state", False))
             self._debug_llm.setChecked(_get_bool("debug_llm", False))
+            # P0 §3.10 — focus protection controls.
+            self._auto_distraction_block.setChecked(
+                _get_bool("enable_auto_distraction_block", False),
+            )
+            preset = str(self._qs.value("auto_distraction_block_preset", "developer"))
+            _preset_index = {
+                "developer": 0, "student": 1, "writer": 2, "custom": 3,
+            }
+            if preset in _preset_index:
+                self._distraction_preset.setCurrentIndex(_preset_index[preset])
+            raw_domains = self._qs.value(
+                "auto_distraction_block_custom_domains", [],
+            )
+            # Phase-3 P2-3: QSettings can round-trip an empty list as
+            # ``None`` or a scalar string on some Qt builds — coerce to
+            # ``list[str]`` defensively.
+            if raw_domains is None:
+                domains_list: list[str] = []
+            elif isinstance(raw_domains, str):
+                domains_list = [raw_domains] if raw_domains.strip() else []
+            elif isinstance(raw_domains, (list, tuple)):
+                domains_list = [
+                    str(d).strip()
+                    for d in raw_domains
+                    if isinstance(d, (str,)) and str(d).strip()
+                ]
+            else:
+                domains_list = []
+            self._distraction_custom_domains.setPlainText(
+                "\n".join(domains_list),
+            )
+            # P0 §3.12 — OS notifications.
+            self._os_notifications.setChecked(
+                _get_bool("enable_os_notifications", True),
+            )
         except Exception:
             logger.debug("Failed to restore persisted settings", exc_info=True)
 
     def apply_payload(self, payload: dict) -> None:
-        """Apply a ``SETTINGS_SYNC`` payload arriving from the daemon."""
+        """Apply a ``SETTINGS_SYNC`` payload arriving from the daemon.
+
+        Phase-3 P0-2 / Audit-1.5 P0-2: previously only the legacy
+        quiet_mode / sensitivity / webcam / interventions keys were
+        echoed back; the new P0 fields (focus protection toggle, preset,
+        custom domains, OS notifications) silently drifted between the
+        local UI and the daemon's authoritative state. Now every
+        post-P0 field round-trips so a second app instance / another
+        surface flipping a toggle flows back into the dashboard
+        widgets without requiring the user to click Apply locally.
+        """
         if not isinstance(payload, dict):
             return
         try:
@@ -1104,6 +1298,37 @@ class SettingsDialog(QWidget):
                 )
             if "webcam_enabled" in payload:
                 self._webcam_enabled.setChecked(bool(payload["webcam_enabled"]))
+            # P0 §3.10 — Focus protection controls.
+            if "enable_auto_distraction_block" in payload:
+                self._auto_distraction_block.setChecked(
+                    bool(payload["enable_auto_distraction_block"]),
+                )
+            if "auto_distraction_block_preset" in payload:
+                preset = str(payload["auto_distraction_block_preset"] or "")
+                _preset_index = {
+                    "developer": 0,
+                    "student": 1,
+                    "writer": 2,
+                    "custom": 3,
+                }
+                if preset in _preset_index:
+                    self._distraction_preset.setCurrentIndex(_preset_index[preset])
+            if "auto_distraction_block_custom_domains" in payload:
+                raw = payload["auto_distraction_block_custom_domains"]
+                if isinstance(raw, list):
+                    cleaned = [
+                        str(d).strip().lower()
+                        for d in raw
+                        if isinstance(d, str) and d.strip()
+                    ]
+                    self._distraction_custom_domains.setPlainText(
+                        "\n".join(cleaned),
+                    )
+            # P0 §3.12 — OS notifications toggle.
+            if "enable_os_notifications" in payload:
+                self._os_notifications.setChecked(
+                    bool(payload["enable_os_notifications"]),
+                )
         except Exception:
             logger.debug("Failed to apply SETTINGS_SYNC payload", exc_info=True)
         self._persist_settings(self.get_settings())

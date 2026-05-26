@@ -96,6 +96,13 @@ interface FocusSnapshot {
     longestStreakMin: number;
     currentStreakMs: number;
     goal: string;
+    // P0 §3.10 / Phase-3 P0-N? + Audit-1.2 F3: daemon-armed focus
+    // sessions carry an auto-arm flag + preset name so the popup
+    // surfaces a distinct "Auto-armed · developer" pill instead of
+    // the generic focus chip.
+    autoArmed?: boolean;
+    preset?: string;
+    endsAt?: number | null;
 }
 
 interface DailyStats {
@@ -571,6 +578,30 @@ function CortexPopup(): React.ReactElement {
     const [briefing, setBriefing] = useState<MorningBriefing | null>(null);
     const [tabCloseDisabled, setTabCloseDisabled] = useState(false);
     const [quietMode, setQuietMode] = useState(false);
+    // P0 §3.11: surface the active quiet/pause kind + countdown so the
+    // popup pill says "Snoozed · 12m" instead of just "Quiet".
+    const [quietModeKind, setQuietModeKind] = useState<string>("off");
+    const [quietModeEndsAt, setQuietModeEndsAt] = useState<number | null>(null);
+    // Phase-3 P0-3 + Audit-1.2 F4: derive remaining minutes live from
+    // ``quietModeEndsAt`` so the countdown ticks down without waiting
+    // on a daemon re-broadcast. ``quietModeDurationMin`` is now a
+    // ``useState`` only for the initial-paint value; the useEffect
+    // below replaces it with a tick-on-every-second update.
+    const [quietModeDurationMin, setQuietModeDurationMin] = useState<number | null>(null);
+    useEffect(() => {
+        if (quietModeEndsAt === null) return;
+        const tick = () => {
+            const remainingMs = quietModeEndsAt - Date.now();
+            if (remainingMs <= 0) {
+                setQuietModeDurationMin(0);
+                return;
+            }
+            setQuietModeDurationMin(Math.max(0, Math.round(remainingMs / 60000)));
+        };
+        tick();
+        const handle = setInterval(tick, 30_000); // 30s is plenty for minute-grain countdown
+        return () => clearInterval(handle);
+    }, [quietModeEndsAt]);
     const [launching, setLaunching] = useState(false);
     const [launchError, setLaunchError] = useState(false);
     const [tabsExpanded, setTabsExpanded] = useState(false);
@@ -643,11 +674,31 @@ function CortexPopup(): React.ReactElement {
                 setTabCloseDisabled(true);
             }
         });
-        chrome.storage.session.get("quietMode", (result) => {
-            if (result.quietMode === true) {
-                setQuietMode(true);
-            }
-        });
+        // Phase-3 P0-2 + Audit-1.2 F2: rehydrate the full quiet-mode
+        // envelope on mount so the pill doesn't lie before the daemon's
+        // first QUIET_MODE_STATE broadcast lands. Background.ts
+        // persists ``cortex_quiet_state`` on every QUIET_MODE_STATE
+        // it forwards to the popup.
+        chrome.storage.session.get(
+            ["quietMode", "cortex_quiet_state"],
+            (result) => {
+                if (result.quietMode === true) setQuietMode(true);
+                const cached = result.cortex_quiet_state as
+                    | Record<string, unknown>
+                    | undefined;
+                if (cached && typeof cached.kind === "string") {
+                    const kind = cached.kind as string;
+                    setQuietModeKind(kind);
+                    setQuietMode(kind !== "off");
+                    if (typeof cached.ends_at === "number") {
+                        setQuietModeEndsAt(cached.ends_at as number);
+                    }
+                    if (typeof cached.duration_minutes === "number") {
+                        setQuietModeDurationMin(cached.duration_minutes as number);
+                    }
+                }
+            },
+        );
     }, []);
 
     const handleTabCloseToggle = useCallback(() => {
@@ -659,8 +710,33 @@ function CortexPopup(): React.ReactElement {
     const handleQuietModeToggle = useCallback(() => {
         const newValue = !quietMode;
         setQuietMode(newValue);
+        // Legacy wire — kept for back-compat with older daemons that
+        // only know the boolean toggle. New daemons mirror SETTINGS_SYNC
+        // from the canonical QUIET_MODE_TOGGLE path below.
         sendWithCid({ type: "TOGGLE_QUIET_MODE", quiet: newValue });
+        // P0 §3.11: also emit the canonical QUIET_MODE_TOGGLE so the
+        // daemon broadcasts the unified QUIET_MODE_STATE back.
+        sendWithCid({
+            type: "QUIET_MODE_TOGGLE",
+            kind: newValue ? "quiet_session" : "off",
+            duration_minutes: null,
+        });
     }, [quietMode]);
+
+    const handleQuietModeKind = useCallback(
+        (kind: "snooze_15" | "quiet_session" | "pause" | "off") => {
+            // Optimistic local update — the daemon's QUIET_MODE_STATE
+            // broadcast will reconcile within a few hundred ms.
+            setQuietModeKind(kind);
+            setQuietMode(kind !== "off");
+            sendWithCid({
+                type: "QUIET_MODE_TOGGLE",
+                kind,
+                duration_minutes: kind === "snooze_15" ? 15 : null,
+            });
+        },
+        [],
+    );
 
     const [launchStatus, setLaunchStatus] = useState("");
 
@@ -750,8 +826,36 @@ function CortexPopup(): React.ReactElement {
                 setState(msg.payload as CortexState);
                 if (msg.focusSession) setFocus(msg.focusSession as FocusSnapshot);
                 break;
-            case "FOCUS_SESSION_STARTED":
+            case "FOCUS_SESSION_STARTED": {
+                // Phase-3 / Audit-1.2 F3: spec calls for a distinct
+                // popup pill when the daemon (not the user) armed the
+                // focus session. Background broadcasts ``autoArmed``,
+                // ``preset``, ``endsAt`` — adopt them into local state
+                // so the FocusPill component can branch on the kind.
+                const goal = typeof msg.goal === "string"
+                    ? (msg.goal as string)
+                    : "Focus session";
+                const autoArmed = msg.autoArmed === true;
+                const preset = typeof msg.preset === "string"
+                    ? (msg.preset as string)
+                    : undefined;
+                const endsAt = typeof msg.endsAt === "number"
+                    ? (msg.endsAt as number)
+                    : null;
+                setFocus({
+                    elapsedMs: 0,
+                    focusMs: 0,
+                    focusPct: 0,
+                    distractionsBlocked: 0,
+                    longestStreakMin: 0,
+                    currentStreakMs: 0,
+                    goal,
+                    autoArmed,
+                    preset,
+                    endsAt,
+                });
                 break;
+            }
             case "FOCUS_SESSION_ENDED":
                 setFocus(null);
                 chrome.runtime.sendMessage({ type: "GET_DAILY_STATS" }, (stats) => {
@@ -891,6 +995,24 @@ function CortexPopup(): React.ReactElement {
                 if (typeof settings.quiet_mode === "boolean") {
                     setQuietMode(settings.quiet_mode);
                 }
+                break;
+            }
+            case "QUIET_MODE_STATE": {
+                // P0 §3.11: daemon broadcast of the active quiet/pause
+                // mode. Mirror onto local state so the toolbar pill
+                // surfaces ("Snoozed · 12m") and the toggle reflects.
+                const state = msg.payload as Record<string, unknown>;
+                const kind = typeof state.kind === "string" ? state.kind : "off";
+                setQuietModeKind(kind);
+                setQuietMode(kind !== "off");
+                setQuietModeEndsAt(
+                    typeof state.ends_at === "number" ? (state.ends_at as number) : null,
+                );
+                setQuietModeDurationMin(
+                    typeof state.duration_minutes === "number"
+                        ? (state.duration_minutes as number)
+                        : null,
+                );
                 break;
             }
             case "MORNING_BRIEFING": {
@@ -1360,6 +1482,36 @@ function CortexPopup(): React.ReactElement {
                         </div>
                         <button style={S.endBtn} onClick={handleStopFocus}>End</button>
                     </div>
+                    {/* Phase-3 / Audit-1.2 F3: auto-armed indicator pill */}
+                    {focus.autoArmed && (
+                        <div
+                            role="status"
+                            style={{
+                                display: "inline-flex",
+                                alignItems: "center",
+                                gap: 6,
+                                marginTop: 6,
+                                padding: "3px 10px",
+                                fontSize: 11,
+                                fontFamily: CX.font,
+                                fontWeight: 500,
+                                color: CX.accent,
+                                background: "rgba(217,119,87,0.16)",
+                                border: "1px solid rgba(217,119,87,0.36)",
+                                borderRadius: CX.radiusMd,
+                                width: "fit-content",
+                            }}
+                            aria-label={"Auto-armed focus protection, preset " + (focus.preset || "developer")}
+                        >
+                            <span aria-hidden="true">{"\u25cf"}</span>
+                            {" Auto-armed"}
+                            {focus.preset && (
+                                <span style={{ opacity: 0.78 }}>
+                                    {" \u00b7 " + focus.preset}
+                                </span>
+                            )}
+                        </div>
+                    )}
 
                     {/* Big number + percentage on same baseline */}
                     <div style={S.bigRow}>
@@ -1900,6 +2052,90 @@ function CortexPopup(): React.ReactElement {
                         }} />
                     </button>
                 </div>
+
+                {/* P0 §3.11: kind selector + active-mode pill. The
+                    daemon's QUIET_MODE_STATE broadcast is the source
+                    of truth; clicking any pill emits the canonical
+                    QUIET_MODE_TOGGLE wire frame. */}
+                <div
+                    style={{
+                        display: "flex",
+                        gap: 6,
+                        marginTop: 8,
+                        flexWrap: "wrap",
+                    }}
+                    role="group"
+                    aria-label="Quiet mode kind"
+                >
+                    {([
+                        { kind: "snooze_15", label: "Snooze 15m" },
+                        { kind: "quiet_session", label: "Quiet" },
+                        { kind: "pause", label: "Pause" },
+                    ] as const).map((opt) => {
+                        const active = quietModeKind === opt.kind;
+                        return (
+                            <button
+                                key={opt.kind}
+                                onClick={() => handleQuietModeKind(opt.kind)}
+                                aria-pressed={active}
+                                style={{
+                                    flex: 1,
+                                    padding: "6px 10px",
+                                    fontSize: 11,
+                                    fontFamily: CX.font,
+                                    fontWeight: 500,
+                                    color: active ? CX.accent : "rgba(255,255,255,0.72)",
+                                    background: active
+                                        ? "rgba(217,119,87,0.16)"
+                                        : "rgba(255,255,255,0.04)",
+                                    border: active
+                                        ? `1px solid ${CX.accent}`
+                                        : "1px solid rgba(255,255,255,0.06)",
+                                    borderRadius: CX.radiusMd,
+                                    cursor: "pointer",
+                                    transition: `background ${CX.durationFast} ${CX.easeDefault}`,
+                                }}
+                            >
+                                {opt.label}
+                            </button>
+                        );
+                    })}
+                </div>
+                {quietModeKind !== "off" && (
+                    <div
+                        role="status"
+                        style={{
+                            marginTop: 8,
+                            fontSize: 11,
+                            color: CX.accent,
+                            fontFamily: CX.font,
+                        }}
+                    >
+                        {quietModeKind === "snooze_15" && "Snoozed"}
+                        {quietModeKind === "quiet_session" && "Quiet for session"}
+                        {quietModeKind === "pause" && "Paused"}
+                        {quietModeDurationMin !== null && quietModeDurationMin > 0 && (
+                            <span> · {quietModeDurationMin}m remaining</span>
+                        )}
+                        <button
+                            onClick={() => handleQuietModeKind("off")}
+                            style={{
+                                marginLeft: 10,
+                                background: "transparent",
+                                border: "none",
+                                color: CX.accent,
+                                textDecoration: "underline",
+                                cursor: "pointer",
+                                fontSize: 11,
+                                fontFamily: CX.font,
+                                padding: 0,
+                            }}
+                            aria-label="Turn off quiet mode"
+                        >
+                            turn off
+                        </button>
+                    </div>
+                )}
 
                 <button
                     style={{

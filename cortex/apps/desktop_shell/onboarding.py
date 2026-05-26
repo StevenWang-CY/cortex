@@ -117,6 +117,12 @@ _WHY_COPY: dict[str, str] = {
         "The browser + VS Code extensions are how Cortex sees what "
         "you're working on and offers one-click interventions."
     ),
+    "macos_notifications": (
+        "When you're focused in another app, Cortex sends a quick "
+        "macOS notification so you don't miss an important "
+        "intervention. You can disable this in Settings → "
+        "Notifications anytime."
+    ),
 }
 
 
@@ -159,6 +165,13 @@ ONBOARDING_STEPS: tuple[str, ...] = (
     "llm_backend",
     "calibration",
     "extensions",
+    # P0 §3.12 — final lightweight step. macOS prompts for notification
+    # permission on first ``UNUserNotificationCenter.requestAuthorization``
+    # call, so we surface the rationale + a "Try it" button here so the
+    # user grants consciously rather than dismissing a surprise prompt
+    # at intervention time. Skippable; OS notifications also remain
+    # toggleable from Settings → Notifications.
+    "macos_notifications",
 )
 
 
@@ -637,8 +650,9 @@ class OnboardingWindow(QWidget):
         layout.addSpacing(SP3)
 
         # ── Progress strip ────────────────────────────────────────────
-        # P0 §3.4: 5 dots now (camera, accessibility, LLM, calibration, extensions).
-        self._progress = _ProgressStrip(5)
+        # P0 §3.4: 5 dots — extended to 6 in P0 §3.12 to cover the
+        # macOS notifications step.
+        self._progress = _ProgressStrip(6)
         layout.addWidget(self._progress)
         layout.addSpacing(SP3)
 
@@ -715,6 +729,49 @@ class OnboardingWindow(QWidget):
         ext_layout.addWidget(connect_btn)
         layout.addWidget(ext_frame)
 
+        # ── Step 6: macOS Notifications (P0 §3.12) ───────────────────
+        notif_frame = self._make_section(
+            "6", "macOS notifications",
+            step_id="macos_notifications",
+        )
+        self._notifications_step = notif_frame
+        notif_layout = notif_frame.layout()
+        notif_hint = QLabel(
+            "Allow Cortex to send macOS notifications so you see "
+            "important interventions even when you're in another app "
+            "or full-screen mode. You can change this in System "
+            "Settings anytime."
+        )
+        notif_hint.setWordWrap(True)
+        notif_hint.setFont(mac_native.system_font(FS_CAPTION, "regular"))
+        notif_hint.setStyleSheet(
+            f"color: {_LABEL_SECONDARY}; border: none;"
+        )
+        notif_layout.addWidget(notif_hint)
+
+        notif_btn = QPushButton("Enable notifications")
+        notif_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        notif_btn.setMinimumHeight(34)
+        notif_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
+        notif_btn.setStyleSheet(
+            "QPushButton {"
+            "  padding: 6px 16px;"
+            f"  border-radius: {RADIUS_BUTTON}px;"
+            f"  background: {BRAND_ACCENT};"
+            "  color: #FFF; border: none;"
+            "}"
+            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
+        )
+        notif_btn.clicked.connect(self._on_request_notifications)
+        set_accessible_name(notif_btn, "Enable macOS notifications")
+        set_accessible_description(
+            notif_btn,
+            "Triggers the macOS notification permission prompt.",
+        )
+        self._notif_btn_ref = notif_btn
+        notif_layout.addWidget(notif_btn)
+        layout.addWidget(notif_frame)
+
         layout.addStretch()
 
         # ── Finish bar ────────────────────────────────────────────────
@@ -765,6 +822,39 @@ class OnboardingWindow(QWidget):
     # ------------------------------------------------------------------
     # F49: completion-marker hooks
     # ------------------------------------------------------------------
+
+    def _on_request_notifications(self) -> None:
+        """P0 §3.12: trigger the macOS notification permission prompt.
+
+        Sends a single welcoming notification through
+        ``send_intervention_notification``; the helper internally calls
+        ``requestAuthorization`` if the user hasn't granted yet, and
+        the welcome notification surfaces once permission is granted.
+        On non-mac / missing PyObjC the call is a no-op — we still
+        mark the step complete because the underlying capability isn't
+        available anyway.
+        """
+        try:
+            from cortex.libs.utils.macos_notifications import (
+                send_intervention_notification,
+            )
+            send_intervention_notification(
+                title="Cortex notifications enabled",
+                body="You'll see interventions here when the dashboard isn't active.",
+                intervention_id="cortex_welcome",
+            )
+        except Exception:
+            logger.debug(
+                "send_intervention_notification welcome failed", exc_info=True,
+            )
+        self.mark_step_complete("macos_notifications")
+        # Visually mark the section as complete.
+        if hasattr(self, "_notif_btn_ref"):
+            try:
+                self._notif_btn_ref.setText("Notifications enabled ✓")
+                self._notif_btn_ref.setEnabled(False)
+            except Exception:
+                pass
 
     def _on_finish(self) -> None:
         """Click handler for the Get Started button. Persists every step

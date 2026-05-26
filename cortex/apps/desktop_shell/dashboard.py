@@ -38,6 +38,23 @@ try:
 except ImportError:  # pragma: no cover - compatibility for lightweight test mocks
     from PySide6.QtGui import QColor, QFont, QPainter, QPen
 
+try:
+    from PySide6.QtGui import QKeySequence, QShortcut
+except ImportError:  # pragma: no cover - compatibility for lightweight test mocks
+    class QKeySequence:  # type: ignore[override]
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            return
+
+    class QShortcut:  # type: ignore[override]
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            class _S:
+                def connect(self, *_a: object, **_k: object) -> None:
+                    return
+            self.activated = _S()
+
+        def setContext(self, *_args: object, **_kwargs: object) -> None:
+            return
+
     class QPainterPath:  # type: ignore[override]
         def addRoundedRect(self, *_args: object, **_kwargs: object) -> None:
             return
@@ -55,6 +72,7 @@ try:
         QHBoxLayout,
         QLabel,
         QLineEdit,
+        QMenu,
         QProgressBar,
         QPushButton,
         QScrollArea,
@@ -74,6 +92,21 @@ except ImportError:  # pragma: no cover - compatibility for lightweight test moc
         QVBoxLayout,
         QWidget,
     )
+
+    class QMenu(QWidget):  # type: ignore[override]
+        """Lightweight stub: tests don't exercise the menu surface."""
+
+        def addAction(self, *_args: object, **_kwargs: object) -> object:
+            class _A:
+                def setShortcut(self, *_a: object, **_k: object) -> None:
+                    return
+
+                def triggered(self) -> None:
+                    return
+            return _A()
+
+        def exec(self, *_args: object, **_kwargs: object) -> None:
+            return
 
     class QButtonGroup:  # type: ignore[override]
         def __init__(self, *_args: object, **_kwargs: object) -> None:
@@ -464,6 +497,12 @@ class _ConsumerTab(QWidget):
     gui_quit_requested = Signal()
     stop_requested = Signal()
     goal_set = Signal(str)
+    # P0 §3.11: bubble quiet-mode menu picks up to the DashboardWindow
+    # so the controller forwards them to the daemon's set_quiet_mode.
+    quiet_mode_requested = Signal(str, int)
+    # P0 §3.10: bubble the "Turn off" auto-focus toast click up to the
+    # DashboardWindow so the controller can call disarm_auto_focus.
+    auto_focus_disarm_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -473,6 +512,10 @@ class _ConsumerTab(QWidget):
         # on first click and back to False on ``notify_daemon_stopped`` (or
         # the safety-timer expiry). Coalesces double-clicks at the slot level.
         self._stopping: bool = False
+        # P0 §3.11: cached quiet-mode state envelope. Mirrors the
+        # daemon's QUIET_MODE_STATE broadcast so the capsule re-renders
+        # without round-trips.
+        self._quiet_mode_state: dict[str, object] = {"kind": "off"}
         # F31: per-widget cache of last applied text + stylesheet so the
         # 2 Hz state broadcast loop does not push identical values through
         # Qt's restyle / paint chain when the user's state is unchanged.
@@ -531,6 +574,105 @@ class _ConsumerTab(QWidget):
             f"background: {_GROUPED_BG}; border-radius: {RADIUS_PILL}px;"
         )
         header.addWidget(self._state_badge, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        # P0 §3.11: Pause/Quiet capsule — one-click access to the three
+        # quiet modes (Snooze 15, Quiet for session, Pause) plus an
+        # Off entry to clear any active mode. Lives next to the state
+        # badge so the user can disarm in a single gesture. The
+        # capsule's label mirrors the active mode (e.g. "Quiet · 28m")
+        # so the user always sees what's on.
+        self._quiet_capsule = QPushButton("Pause")
+        try:
+            self._quiet_capsule.setCursor(Qt.CursorShape.PointingHandCursor)
+        except Exception:
+            pass
+        self._quiet_capsule.setFont(
+            mac_native.system_font(FS_FOOTNOTE - 1, "medium")
+        )
+        try:
+            self._quiet_capsule.setFlat(True)
+        except Exception:
+            pass
+        self._quiet_capsule.setStyleSheet(
+            "QPushButton {"
+            f"  background: {_GROUPED_BG};"
+            f"  color: {_LABEL_SECONDARY};"
+            f"  border-radius: {RADIUS_PILL}px;"
+            "  padding: 3px 12px;"
+            "  margin-left: 8px;"
+            "  border: none;"
+            "}"
+            f"QPushButton:hover {{ background: rgba(0,0,0,0.05); color: {_LABEL}; }}"
+        )
+        try:
+            _set_accessible_name(
+                self._quiet_capsule, "Pause or quiet Cortex",
+            )
+            _set_accessible_description(
+                self._quiet_capsule,
+                "Opens a menu to snooze, quiet, or pause Cortex. "
+                "Shortcut: Command + Shift + Slash.",
+            )
+        except Exception:
+            pass
+        self._quiet_capsule.clicked.connect(self._on_quiet_capsule_clicked)
+        header.addWidget(
+            self._quiet_capsule, alignment=Qt.AlignmentFlag.AlignVCenter,
+        )
+
+        # P0 §3.11: ⌘⇧/ keyboard shortcut. The shortcut opens the same
+        # menu the capsule does so muscle-memory power users can
+        # disarm without leaving their keyboard.
+        try:
+            self._quiet_shortcut = QShortcut(
+                QKeySequence("Ctrl+Shift+/"), self,
+            )
+            try:
+                self._quiet_shortcut.setContext(
+                    Qt.ShortcutContext.ApplicationShortcut,
+                )
+            except Exception:
+                pass
+            self._quiet_shortcut.activated.connect(
+                self._on_quiet_capsule_clicked,
+            )
+        except Exception:
+            logger.debug("QShortcut setup failed", exc_info=True)
+
+        # P0 §3.10: auto-armed focus protection toast. Hidden by
+        # default; revealed via :meth:`apply_quiet_mode_state` when
+        # the daemon emits START_FOCUS_AUTO (or QUIET_MODE_STATE with
+        # an auto-armed kind). Click → emits
+        # ``auto_focus_disarm_requested``.
+        self._focus_protection_pill = QPushButton("")
+        try:
+            self._focus_protection_pill.setCursor(
+                Qt.CursorShape.PointingHandCursor,
+            )
+        except Exception:
+            pass
+        self._focus_protection_pill.setFont(
+            mac_native.system_font(FS_CAPTION, "medium")
+        )
+        self._focus_protection_pill.setStyleSheet(
+            "QPushButton {"
+            f"  background: {BRAND_ACCENT}1A;"
+            f"  color: {BRAND_ACCENT};"
+            f"  border-radius: {RADIUS_PILL}px;"
+            "  padding: 3px 10px;"
+            "  margin-left: 8px;"
+            "  border: none;"
+            "}"
+            "QPushButton:hover { background: rgba(217,119,87,0.20); }"
+        )
+        self._focus_protection_pill.setVisible(False)
+        self._focus_protection_pill.clicked.connect(
+            self.auto_focus_disarm_requested.emit,
+        )
+        header.addWidget(
+            self._focus_protection_pill,
+            alignment=Qt.AlignmentFlag.AlignVCenter,
+        )
 
         # P0 §3.4 — baseline freshness pill. Hidden when the baseline
         # file doesn't exist (so we don't shame the user mid-onboarding)
@@ -953,6 +1095,127 @@ class _ConsumerTab(QWidget):
             pill.setVisible(True)
         else:
             pill.setVisible(False)
+
+    # ── P0 §3.11 / §3.10: quiet-mode + auto-focus surfaces ──────────
+
+    def _on_quiet_capsule_clicked(self) -> None:
+        """Open the Pause/Quiet menu at the capsule's anchor point.
+
+        Three actions:
+          1. Snooze 15 min — overlay-only suppression for 15 min.
+          2. Quiet for session — overlay-only suppression for the
+             daemon's default ``quiet_mode_minutes`` (typically 30).
+          3. Pause all sensing — releases the camera, indefinite.
+
+        When any mode is already active, an extra "Off" item appears
+        first so the user can disarm without leaving the menu.
+        """
+        try:
+            menu = QMenu(self)
+        except Exception:
+            logger.debug("QMenu construction failed", exc_info=True)
+            return
+        active = (self._quiet_mode_state or {}).get("kind", "off")
+
+        def _add(label: str, kind: str, minutes: int = 0) -> None:
+            try:
+                action = menu.addAction(label)
+                if action is not None and hasattr(action, "triggered"):
+                    action.triggered.connect(
+                        lambda _checked=False, k=kind, m=minutes:
+                            self.quiet_mode_requested.emit(k, m),
+                    )
+            except Exception:
+                logger.debug("menu action wiring failed", exc_info=True)
+
+        if active != "off":
+            _add("Turn off (resume)", "off", 0)
+            try:
+                menu.addSeparator()
+            except Exception:
+                pass
+
+        _add("Snooze 15 min", "snooze_15", 15)
+        _add("Quiet for session", "quiet_session", 0)
+        _add("Pause all sensing", "pause", 0)
+
+        try:
+            from PySide6.QtCore import QPoint  # local import for test stubs
+
+            anchor = self._quiet_capsule.mapToGlobal(
+                QPoint(0, self._quiet_capsule.height()),
+            )
+            menu.exec(anchor)
+        except Exception:
+            # In the lightweight test stub QMenu.exec is a no-op.
+            logger.debug("quiet menu exec failed", exc_info=True)
+
+    def apply_quiet_mode_state(self, payload: dict) -> None:
+        """P0 §3.11: render the pause capsule (label + colour) from
+        the daemon's QUIET_MODE_STATE broadcast.
+        """
+        if not isinstance(payload, dict):
+            return
+        self._quiet_mode_state = dict(payload)
+        kind = str(payload.get("kind", "off"))
+        duration = payload.get("duration_minutes")
+        labels = {
+            "off": "Pause",
+            "snooze_15": "Snoozed",
+            "quiet_session": "Quiet",
+            "pause": "Paused",
+        }
+        label = labels.get(kind, "Pause")
+        if kind != "off" and isinstance(duration, int) and duration > 0:
+            label = f"{label} · {duration}m"
+        try:
+            self._quiet_capsule.setText(label)
+        except Exception:
+            logger.debug("quiet capsule label update failed", exc_info=True)
+        if kind != "off":
+            try:
+                self._quiet_capsule.setStyleSheet(
+                    "QPushButton {"
+                    f"  background: {BRAND_ACCENT}22;"
+                    f"  color: {BRAND_ACCENT};"
+                    f"  border-radius: {RADIUS_PILL}px;"
+                    "  padding: 3px 12px;"
+                    "  margin-left: 8px;"
+                    "  border: none;"
+                    "}"
+                    "QPushButton:hover { background: rgba(217,119,87,0.28); }"
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                self._quiet_capsule.setStyleSheet(
+                    "QPushButton {"
+                    f"  background: {_GROUPED_BG};"
+                    f"  color: {_LABEL_SECONDARY};"
+                    f"  border-radius: {RADIUS_PILL}px;"
+                    "  padding: 3px 12px;"
+                    "  margin-left: 8px;"
+                    "  border: none;"
+                    "}"
+                    f"QPushButton:hover {{ background: rgba(0,0,0,0.05); color: {_LABEL}; }}"
+                )
+            except Exception:
+                pass
+
+    def apply_auto_focus_state(self, armed: bool, preset: str = "") -> None:
+        """P0 §3.10: show / hide the focus-protection toast pill."""
+        try:
+            if armed:
+                label_preset = preset.capitalize() if preset else "Auto-armed"
+                self._focus_protection_pill.setText(
+                    f"Focus protected · {label_preset} · Turn off"
+                )
+                self._focus_protection_pill.setVisible(True)
+            else:
+                self._focus_protection_pill.setVisible(False)
+        except Exception:
+            logger.debug("focus protection pill update failed", exc_info=True)
 
     def update_state(self, payload: dict) -> None:
         # Phase J-3: first frame retires the empty state. The flag is
@@ -1736,6 +1999,15 @@ class DashboardWindow(QWidget):
     history_requested = Signal(object, int)  # since, limit
     detail_requested = Signal(str)  # session_id
     trends_requested = Signal(str, bool)  # window, refresh
+    # P0 §3.11: emitted when the user clicks an item in the Pause/Quiet
+    # menu (next to the state badge) OR triggers ⌘⇧/. Payload is the
+    # kind ("snooze_15"/"quiet_session"/"pause"/"off") and an optional
+    # duration override in minutes (0 = use daemon default).
+    quiet_mode_requested = Signal(str, int)
+    # P0 §3.10: emitted when the user clicks the "Turn off" link on
+    # the daemon-armed focus protection toast. Cleared in the daemon
+    # via ``disarm_auto_focus``.
+    auto_focus_disarm_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1806,6 +2078,15 @@ class DashboardWindow(QWidget):
         self._consumer.gui_quit_requested.connect(self.gui_quit_requested.emit)
         self._consumer.stop_requested.connect(self.stop_requested.emit)
         self._consumer.goal_set.connect(self.goal_set.emit)
+        # P0 §3.11 / §3.10: bubble pause/quiet menu + auto-focus disarm
+        # picks to the controller so the daemon's set_quiet_mode /
+        # disarm_auto_focus are invoked.
+        self._consumer.quiet_mode_requested.connect(
+            self.quiet_mode_requested.emit,
+        )
+        self._consumer.auto_focus_disarm_requested.connect(
+            self.auto_focus_disarm_requested.emit,
+        )
 
         # P0 §3.1 + §3.2: forward history-tab outgoing signals so the
         # controller can route them to the daemon via WS or direct call.
@@ -2032,6 +2313,34 @@ class DashboardWindow(QWidget):
                 logger.debug(
                     "history force_refresh on recap arrival failed",
                     exc_info=True,
+                )
+
+    # ── P0 §3.11 / §3.10: quiet-mode + auto-focus surfaces ──────────
+
+    def apply_quiet_mode_state(self, payload: dict) -> None:
+        """P0 §3.11: forward QUIET_MODE_STATE payload to the consumer
+        tab's capsule + the dashboard-level surfaces. The consumer
+        owns the actual UI; the dashboard delegates."""
+        if self._consumer is not None and hasattr(
+            self._consumer, "apply_quiet_mode_state",
+        ):
+            try:
+                self._consumer.apply_quiet_mode_state(payload)
+            except Exception:
+                logger.debug(
+                    "consumer apply_quiet_mode_state failed", exc_info=True,
+                )
+
+    def apply_auto_focus_state(self, armed: bool, preset: str = "") -> None:
+        """P0 §3.10: forward to the consumer tab's focus-protection pill."""
+        if self._consumer is not None and hasattr(
+            self._consumer, "apply_auto_focus_state",
+        ):
+            try:
+                self._consumer.apply_auto_focus_state(armed, preset)
+            except Exception:
+                logger.debug(
+                    "consumer apply_auto_focus_state failed", exc_info=True,
                 )
 
     def _on_recap_dismissed(self) -> None:

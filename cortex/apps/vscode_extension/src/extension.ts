@@ -17,6 +17,9 @@ let contextProvider: ContextProvider | undefined;
 let foldController: FoldController | undefined;
 let panelProvider: CortexPanelProvider | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
+// Phase-3 P1-N4 / Audit-1.2 F10: cached pulse timeout cleared on
+// deactivate so the closure doesn't outlive the disposed status bar.
+let osNotifPulseTimeout: ReturnType<typeof setTimeout> | undefined;
 
 /**
  * Extension activation — called once on startup.
@@ -110,6 +113,95 @@ export function activate(context: vscode.ExtensionContext): void {
         if (statusBarItem && quietMode) {
             statusBarItem.tooltip = "Cortex — Quiet mode enabled";
         }
+    });
+
+    // --- P0 §3.11: QUIET_MODE_STATE — surface mode in status bar ---
+    wsClient.onMessage((msg) => {
+        if (msg.type !== 'QUIET_MODE_STATE') return;
+        const payload = msg.payload as Record<string, unknown> | undefined;
+        if (!statusBarItem || !payload) return;
+        const kind = (payload.kind as string | undefined) || "off";
+        const labels: Record<string, string> = {
+            off: "Cortex",
+            snooze_15: "Cortex · Snoozed",
+            quiet_session: "Cortex · Quiet",
+            pause: "Cortex · Paused",
+        };
+        const label = labels[kind] || "Cortex";
+        statusBarItem.text = kind === "off"
+            ? "$(pulse) Cortex"
+            : `$(circle-slash) ${label}`;
+        const endsAt = payload.ends_at as number | undefined;
+        if (kind !== "off" && typeof endsAt === "number") {
+            const remainingMin = Math.max(
+                0,
+                Math.round((endsAt * 1000 - Date.now()) / 60000),
+            );
+            statusBarItem.tooltip = remainingMin > 0
+                ? `${label} for ${remainingMin} more min`
+                : label;
+        } else if (kind === "off") {
+            statusBarItem.tooltip = "Cortex — Active";
+        }
+    });
+
+    // --- P0 §3.12: pulse status bar when desktop not focused ---
+    // Phase-3 P1-N4 / Audit-1.2 F10: cache the pulse timeout +
+    // dispose it on deactivate, and de-dup ``showInformationMessage``
+    // so a burst of interventions within 10s doesn't stack toasts
+    // the user has to dismiss one-by-one.
+    osNotifPulseTimeout = undefined;
+    let lastOsNotifShownHeadline = "";
+    let lastOsNotifShownAt = 0;
+    wsClient.onMessage((msg) => {
+        if (msg.type !== 'INTERVENTION_TRIGGER') return;
+        const payload = msg.payload as Record<string, unknown> | undefined;
+        if (!payload || payload.desktop_not_focused !== true) return;
+        if (!statusBarItem) return;
+        const headline = String(payload.headline || 'Cortex');
+        statusBarItem.text = `$(pulse) Cortex — ${headline}`.slice(0, 64);
+        statusBarItem.backgroundColor = new vscode.ThemeColor(
+            "statusBarItem.warningBackground",
+        );
+        if (osNotifPulseTimeout) clearTimeout(osNotifPulseTimeout);
+        osNotifPulseTimeout = setTimeout(() => {
+            if (statusBarItem) {
+                statusBarItem.text = '$(pulse) Cortex';
+                statusBarItem.backgroundColor = undefined;
+            }
+            osNotifPulseTimeout = undefined;
+        }, 5000);
+        // De-dup the toast: same headline within 10s collapses to the
+        // original popup (the user hasn't dismissed it yet).
+        const now = Date.now();
+        if (
+            headline === lastOsNotifShownHeadline
+            && now - lastOsNotifShownAt < 10_000
+        ) {
+            return;
+        }
+        lastOsNotifShownHeadline = headline;
+        lastOsNotifShownAt = now;
+        const interventionId = String(payload.intervention_id || '');
+        vscode.window.showInformationMessage(
+            `Cortex · ${headline}`,
+            'Open Dashboard',
+            'Snooze',
+        ).then((choice) => {
+            if (choice === 'Open Dashboard') {
+                panelProvider?.showPanel();
+            } else if (choice === 'Snooze') {
+                // Phase-3 / Audit-1.2 F11: surface a warning instead
+                // of silently dropping when wsClient is undefined.
+                if (!wsClient) {
+                    void vscode.window.showWarningMessage(
+                        "Cortex not connected — open Cortex to snooze.",
+                    );
+                    return;
+                }
+                wsClient.sendSnoozeRequest(interventionId, 15);
+            }
+        });
     });
 
     // --- P0 §3.9: WHY_DETAIL response → forward to panel ---
@@ -375,6 +467,15 @@ export function activate(context: vscode.ExtensionContext): void {
  * Extension deactivation — cleanup.
  */
 export function deactivate(): void {
+    // Phase-3 P1-N4 / Audit-1.2 F10: pulse timeout outlives the
+    // disposed status bar via the activate-scope closure if not
+    // cleared here — the timer fires, the closure tries to mutate a
+    // disposed object and VS Code logs an "object has been disposed"
+    // warning. Clear it explicitly.
+    if (osNotifPulseTimeout) {
+        clearTimeout(osNotifPulseTimeout);
+        osNotifPulseTimeout = undefined;
+    }
     wsClient?.disconnect();
     wsClient = undefined;
     contextProvider = undefined;

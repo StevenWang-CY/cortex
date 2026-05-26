@@ -290,6 +290,49 @@ class InterventionConfig(BaseModel):
     # the controller flips ``audio_cue=False`` for the duration.
     biology_break_audio_mute_after_mic_seconds: float = 300.0
 
+    # P0 §3.10: auto-armed distraction blocking on HYPER. Defaults OFF —
+    # the principle of least surprise wins for any autonomous action
+    # that could surface a full-screen interstitial. Users opt in from
+    # Settings → Focus protection. Maps to env var
+    # ``CORTEX_INTERVENTION__ENABLE_AUTO_DISTRACTION_BLOCK``.
+    enable_auto_distraction_block: bool = False
+
+    # P0 §3.10: confidence + dwell gates on the auto-arm path. The
+    # spec calls for ``confidence > 0.85 AND dwell > 30s`` so the
+    # F25 sliding-window oscillation pattern is bounded. Both knobs
+    # are exposed so a forensic user can dial in conservative gates
+    # without patching code.
+    auto_distraction_block_confidence: float = 0.85
+    auto_distraction_block_dwell_seconds: float = 30.0
+    # Auto-armed sessions exit after sustained non-HYPER (FLOW or
+    # RECOVERY) for this many seconds (5 min = 300 s). The browser
+    # extension's manual focus session has no auto-exit; the daemon
+    # owns this gate so the user is never silently kept in focus
+    # mode after they've genuinely recovered.
+    auto_distraction_block_exit_seconds: float = 300.0
+    # Default session duration the daemon proposes when arming. 20 min
+    # matches the typical Pomodoro upper bound + the spec example.
+    auto_distraction_block_session_minutes: int = 20
+    # Default preset for the merged blocklist. Browser extension owns
+    # the per-preset domain map. ``custom`` reads ``custom_domains``.
+    auto_distraction_block_preset: Literal[
+        "developer", "student", "writer", "custom",
+    ] = "developer"
+    # User-editable extra domains layered on top of the preset (or the
+    # exclusive set when ``preset == "custom"``).
+    auto_distraction_block_custom_domains: list[str] = Field(
+        default_factory=list,
+    )
+
+    # P0 §3.12: OS-level notification routing. When True and the
+    # desktop dashboard is NOT the foreground window at the moment an
+    # ``INTERVENTION_TRIGGER`` is broadcast, the daemon also dispatches
+    # a UNUserNotification (macOS), Chrome action badge bump, and VS
+    # Code status-bar pulse so the user actually sees the cue from
+    # other Spaces / fullscreen apps. Maps to env var
+    # ``CORTEX_INTERVENTION__ENABLE_OS_NOTIFICATIONS``.
+    enable_os_notifications: bool = True
+
 
 class HandoverConfig(BaseModel):
     """Handover / shutdown detector configuration."""

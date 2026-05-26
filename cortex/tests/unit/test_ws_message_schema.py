@@ -72,6 +72,9 @@ def test_message_type_catalog_covers_dispatch_arms() -> None:
         "MICRO_STEP_TOGGLED",
         # P0 §3.9 — structured causal rationale on-demand
         "WHY_DETAIL_REQUEST",
+        # P0 §3.11 — one-touch pause / quiet mode
+        "QUIET_MODE_TOGGLE",
+        "SNOOZE_REQUEST",
     }
     catalog = {m.value for m in MessageType}
     missing = dispatched_inbound - catalog
@@ -102,6 +105,11 @@ def test_message_type_catalog_covers_outbound() -> None:
         "BREAK_RECOMMENDATION",
         # P0 §3.9 — structured causal rationale reply
         "WHY_DETAIL",
+        # P0 §3.10 — daemon-armed focus session directives
+        "START_FOCUS_AUTO",
+        "STOP_FOCUS_AUTO",
+        # P0 §3.11 — quiet/pause mode state broadcast
+        "QUIET_MODE_STATE",
     }
     catalog = {m.value for m in MessageType}
     missing = outbound - catalog

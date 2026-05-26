@@ -238,6 +238,16 @@ class WebSocketServer:
         # replies with WHY_DETAIL so the client clears its loading
         # state.
         self._why_detail_callback: Any = None
+        # P0 §3.11: callback fired when a peer surface (dashboard menu,
+        # overlay footer, tray menu, browser popup, VS Code panel)
+        # asks the daemon to enter / leave a quiet or pause mode.
+        # Signature:
+        #   ``async (kind: str, duration_minutes: int | None,
+        #            source: str) -> None``
+        # The daemon serializes the resulting state through
+        # :attr:`MessageType.QUIET_MODE_STATE` so every surface
+        # reflects the same truth.
+        self._quiet_mode_toggle_callback: Any = None
         # Latest state for new connections
         self._latest_state: StateEstimate | None = None
         self._pending_context_requests: dict[str, asyncio.Future[dict[str, Any]]] = {}
@@ -406,6 +416,18 @@ class WebSocketServer:
         opened after a recap broadcast) can still see the recap.
         """
         self._session_recap_cache_callback = callback
+
+    def set_quiet_mode_toggle_callback(self, callback: Any) -> None:
+        """P0 §3.11: handler for ``QUIET_MODE_TOGGLE`` / ``SNOOZE_REQUEST``.
+
+        Signature: ``async (kind: str, duration_minutes: int | None,
+        source: str) -> None``. The dispatcher validates payload
+        shape + value bounds before invoking; the daemon's
+        :meth:`set_quiet_mode` does the activation and broadcasts the
+        resulting :attr:`MessageType.QUIET_MODE_STATE` so every surface
+        re-renders consistently.
+        """
+        self._quiet_mode_toggle_callback = callback
 
     async def start(self) -> bool:
         """
@@ -670,6 +692,19 @@ class WebSocketServer:
             # logged and dropped without closing the socket so a
             # buggy/older client does not bounce itself off.
             await self._handle_micro_step_toggled(client, msg)
+        elif msg.type == MessageType.QUIET_MODE_TOGGLE.value:
+            # P0 §3.11: the dashboard menu, overlay footer, tray
+            # checkmark, or VS Code/browser surface asked the daemon
+            # to enter or leave a quiet/pause mode. Validate at the
+            # boundary so an older client cannot smuggle an invalid
+            # ``kind`` into the trigger policy or the pause path.
+            await self._handle_quiet_mode_toggle(client, msg)
+        elif msg.type == MessageType.SNOOZE_REQUEST.value:
+            # P0 §3.11: alias for ``QUIET_MODE_TOGGLE`` with kind=
+            # ``"snooze_15"``. Carried separately so the source-of-
+            # truth in the helpfulness log can attribute "overlay
+            # snooze click" vs. "dashboard menu pick" later.
+            await self._handle_snooze_request(client, msg)
         else:
             logger.debug(f"Unknown message type from {client.client_id}: {msg.type}")
 
@@ -937,6 +972,127 @@ class WebSocketServer:
                 "micro_step_toggled callback error from %s: %s",
                 client.client_id,
                 exc,
+            )
+
+    async def _handle_quiet_mode_toggle(
+        self, client: WebSocketClient, msg: WSMessage,
+    ) -> None:
+        """P0 §3.11: validate + forward a ``QUIET_MODE_TOGGLE`` frame.
+
+        Payload:
+          * ``kind``: ``"snooze_15"`` | ``"quiet_session"`` | ``"pause"`` | ``"off"``
+          * ``duration_minutes``: int | None (only meaningful for
+            ``"snooze_15"`` / ``"quiet_session"`` — server clamps to
+            [1, 240])
+          * ``source``: ``"dashboard"`` | ``"overlay"`` | ``"tray"`` |
+            ``"shortcut"`` | ``"popup"`` | ``"vscode"`` — best-effort
+            attribution; ``"unknown"`` when omitted.
+
+        Any validation failure is logged and dropped — we never close
+        the socket here for the same reason as MICRO_STEP_TOGGLED.
+        """
+        callback = self._quiet_mode_toggle_callback
+        if callback is None:
+            return
+        payload = msg.payload or {}
+        kind = payload.get("kind")
+        if kind not in ("snooze_15", "quiet_session", "pause", "off"):
+            logger.warning(
+                "QUIET_MODE_TOGGLE from %s: invalid kind=%r",
+                client.client_id, kind,
+            )
+            return
+        raw_duration = payload.get("duration_minutes")
+        duration_minutes: int | None
+        if raw_duration is None:
+            duration_minutes = None
+        else:
+            try:
+                duration_int = int(raw_duration)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "QUIET_MODE_TOGGLE from %s: invalid duration_minutes=%r",
+                    client.client_id, raw_duration,
+                )
+                return
+            # Phase-3 P1-1 / Audit-1.5 P1-1: the dashboard contract is
+            # ``0 == use daemon default``. Don't coerce 0 → 1 minute or
+            # the user's "Quiet for session" pick collapses to a 60 s
+            # window when sent over the wire.
+            if duration_int <= 0:
+                duration_minutes = None
+            else:
+                duration_minutes = max(1, min(240, duration_int))
+        source = payload.get("source")
+        # Phase-3 P1-2 / Audit-1.5 P1-2: validate against the documented
+        # enum. Unknown sources fall back to the client's identified
+        # type so analytics never see attacker-controlled junk strings
+        # (the wire still accepts them gracefully through ``extra="ignore"``
+        # at the envelope layer).
+        _ALLOWED_SOURCES = frozenset({
+            "dashboard", "overlay", "tray", "shortcut", "popup",
+            "vscode", "os_notification", "settings_sync", "daemon",
+            "daemon_decay",
+        })
+        if not isinstance(source, str) or source not in _ALLOWED_SOURCES:
+            source = client.client_type or "unknown"
+        try:
+            if asyncio.iscoroutinefunction(callback):
+                await callback(kind, duration_minutes, source)
+            else:
+                callback(kind, duration_minutes, source)
+        except Exception as exc:
+            logger.error(
+                "quiet_mode_toggle callback error from %s: %s",
+                client.client_id, exc,
+            )
+
+    async def _handle_snooze_request(
+        self, client: WebSocketClient, msg: WSMessage,
+    ) -> None:
+        """P0 §3.11: shorthand for a "Snooze 15" overlay click.
+
+        Effectively delegates to :meth:`_handle_quiet_mode_toggle` with
+        ``kind="snooze_15"``; carried as a separate message type so
+        downstream analytics can attribute the source. The duration
+        defaults to 15 minutes when the client omits it.
+        """
+        callback = self._quiet_mode_toggle_callback
+        if callback is None:
+            return
+        payload = msg.payload or {}
+        raw_duration = payload.get("duration_minutes")
+        duration_minutes: int = 15
+        if raw_duration is not None:
+            try:
+                duration_int = int(raw_duration)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "SNOOZE_REQUEST from %s: invalid duration_minutes=%r",
+                    client.client_id, raw_duration,
+                )
+                return
+            # 0 / negative collapse to the default 15-minute snooze.
+            duration_minutes = (
+                max(1, min(240, duration_int)) if duration_int > 0 else 15
+            )
+        source = payload.get("source")
+        _ALLOWED_SOURCES = frozenset({
+            "dashboard", "overlay", "tray", "shortcut", "popup",
+            "vscode", "os_notification", "settings_sync", "daemon",
+            "daemon_decay",
+        })
+        if not isinstance(source, str) or source not in _ALLOWED_SOURCES:
+            source = client.client_type or "overlay"
+        try:
+            if asyncio.iscoroutinefunction(callback):
+                await callback("snooze_15", duration_minutes, source)
+            else:
+                callback("snooze_15", duration_minutes, source)
+        except Exception as exc:
+            logger.error(
+                "snooze_request callback error from %s: %s",
+                client.client_id, exc,
             )
 
     async def _handle_why_detail_request(
@@ -1246,17 +1402,29 @@ class WebSocketServer:
         msg = self._make_state_update(estimate, biometrics)
         return await self._broadcast(msg)
 
-    async def send_intervention(self, plan: InterventionPlan) -> int:
+    async def send_intervention(
+        self,
+        plan: InterventionPlan,
+        *,
+        desktop_focused: bool | None = None,
+    ) -> int:
         """
         Send INTERVENTION_TRIGGER to all connected clients.
 
         Args:
             plan: Intervention plan from LLM.
+            desktop_focused: P0 §3.12 — when ``False``, every receiver
+                stamps the payload with ``desktop_not_focused: True``.
+                Browser extension fires ``chrome.notifications.create``
+                and bumps the action badge; VS Code pulses its status
+                bar item; the macOS dispatcher fires a
+                UNUserNotification. ``None`` means "unknown" — the flag
+                is not stamped at all (forward-compatible silent default).
 
         Returns:
             Number of clients successfully sent to.
         """
-        msg = self._make_intervention_trigger(plan)
+        msg = self._make_intervention_trigger(plan, desktop_focused=desktop_focused)
         return await self._broadcast(msg)
 
     async def send_restore(self, intervention_id: str, *, user_action: str) -> int:
@@ -1674,7 +1842,10 @@ class WebSocketServer:
         )
 
     def _make_intervention_trigger(
-        self, plan: InterventionPlan,
+        self,
+        plan: InterventionPlan,
+        *,
+        desktop_focused: bool | None = None,
     ) -> WSMessage:
         """Create an INTERVENTION_TRIGGER message.
 
@@ -1682,6 +1853,11 @@ class WebSocketServer:
         and the popup transparency section can render the grounded
         rationale), ``consent_level`` (the consent gate that produced this
         plan), and ``plan_warnings`` (degradations the planner applied).
+
+        P0 §3.12: when ``desktop_focused`` is False, stamps
+        ``desktop_not_focused: True`` so receivers know to surface the
+        cue via OS-level channels (chrome.notifications, VS Code status
+        bar pulse) instead of relying on the dashboard's overlay.
         """
         self._sequence += 1
         payload: dict[str, Any] = {
@@ -1723,6 +1899,12 @@ class WebSocketServer:
         # silently disabling these UI surfaces in WS-mode.
         if plan.metadata:
             payload["metadata"] = dict(plan.metadata)
+        # P0 §3.12: stamp the focus state when known so receivers can
+        # surface OS-level notification cues for users on another Space
+        # or in fullscreen. ``None`` means "unknown"; only stamp the
+        # flag when we explicitly observed unfocused.
+        if desktop_focused is False:
+            payload["desktop_not_focused"] = True
         # F16-srv: stamp a deterministic cid per intervention emission so a
         # later USER_ACTION can be matched against the active emission.
         cid = f"iv_{plan.intervention_id}_{self._sequence}"

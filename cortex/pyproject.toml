@@ -81,6 +81,9 @@ dependencies = [
     "pyobjc-framework-Cocoa>=10.1; sys_platform == 'darwin'",
     "pyobjc-framework-Quartz>=10.1; sys_platform == 'darwin'",
     "pyobjc-framework-CoreAudio>=10.1; sys_platform == 'darwin'",
+    # P0 §3.12: UNUserNotificationCenter for OS-level intervention
+    # banners when the desktop dashboard is not the key window.
+    "pyobjc-framework-UserNotifications>=10.1; sys_platform == 'darwin'",
 
     # Structured Logging
     "structlog>=24.1.0",

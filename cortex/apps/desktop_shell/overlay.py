@@ -335,6 +335,13 @@ class OverlayWindow(QWidget):
     # rationale (clicks the "Why?" chevron). Payload is the active
     # intervention id; the controller fans out to a WHY_DETAIL_REQUEST.
     why_requested = Signal(str)
+    # P0 §3.11: emitted when the user clicks the overlay's quiet/pause
+    # footer buttons. Payload: ``(kind, duration_minutes_or_zero)``
+    # where ``kind`` ∈ {"snooze_15", "quiet_session"} (Pause is
+    # handled by the dashboard / tray surfaces, not the overlay
+    # footer). The controller forwards to the daemon's
+    # ``set_quiet_mode`` so QUIET_MODE_STATE re-broadcasts.
+    quiet_requested = Signal(str, int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -600,29 +607,61 @@ class OverlayWindow(QWidget):
         pacer_layout.addStretch()
         card_layout.addLayout(pacer_layout)
 
+        # P0 §3.11: three-button footer row — Dismiss, Snooze 15,
+        # Quiet rest of session. The dashboard owns the Pause
+        # affordance (it must release the camera and orchestrate
+        # cross-surface state); the overlay focuses on the moment-of-
+        # intervention escape valves.
+        footer_row = QHBoxLayout()
+        footer_row.setContentsMargins(0, 0, 0, 0)
+        footer_row.setSpacing(SP3)
+        footer_row.addStretch()
+
         # Dismiss button — HUD-style capsule.
         self._dismiss_btn = QPushButton("Dismiss (Esc)")
         self._dismiss_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         # F55: accessible name for VoiceOver.
         _set_accessible_name(self._dismiss_btn, "Dismiss intervention")
         self._dismiss_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
-        self._dismiss_btn.setStyleSheet(
-            "QPushButton {"
-            "  background-color: rgba(255, 255, 255, 0.08);"
-            "  color: rgba(255, 255, 255, 0.85);"
-            "  border: 0.5px solid rgba(255, 255, 255, 0.14);"
-            f"  border-radius: {RADIUS_BUTTON}px;"
-            "  padding: 8px 22px;"
-            "}"
-            "QPushButton:hover {"
-            "  background-color: rgba(255, 255, 255, 0.16);"
-            "  color: white;"
-            "}"
-        )
+        self._dismiss_btn.setStyleSheet(self._footer_btn_stylesheet())
         self._dismiss_btn.clicked.connect(self._user_dismiss)
-        card_layout.addWidget(
-            self._dismiss_btn, alignment=Qt.AlignmentFlag.AlignCenter
+        footer_row.addWidget(self._dismiss_btn)
+
+        # P0 §3.11: "Snooze 15" — overlay-only 15 min suppression. The
+        # daemon keeps sensing but no new overlays fire during the
+        # window. Reused across the spec where the spec says "snooze".
+        # Phase-3 / Audit-1.2 F7: in-label accelerator hint + Qt
+        # shortcut so keyboard-only users can reach the snooze action.
+        self._snooze_btn = QPushButton("Snooze 15 (S)")
+        self._snooze_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        _set_accessible_name(self._snooze_btn, "Snooze interventions for 15 minutes")
+        self._snooze_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
+        self._snooze_btn.setStyleSheet(self._footer_btn_stylesheet())
+        self._snooze_btn.clicked.connect(self._on_snooze_clicked)
+        try:
+            self._snooze_btn.setShortcut("S")
+        except Exception:
+            pass
+        footer_row.addWidget(self._snooze_btn)
+
+        # P0 §3.11: "Quiet for session" — overlay-only suppression
+        # until the user explicitly clears it (or until daemon stop).
+        self._quiet_session_btn = QPushButton("Quiet for session (Q)")
+        self._quiet_session_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        _set_accessible_name(
+            self._quiet_session_btn,
+            "Quiet interventions for the rest of this session",
         )
+        self._quiet_session_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
+        self._quiet_session_btn.setStyleSheet(self._footer_btn_stylesheet())
+        self._quiet_session_btn.clicked.connect(self._on_quiet_session_clicked)
+        try:
+            self._quiet_session_btn.setShortcut("Q")
+        except Exception:
+            pass
+        footer_row.addWidget(self._quiet_session_btn)
+        footer_row.addStretch()
+        card_layout.addLayout(footer_row)
 
         # P0 §3.8: feedback row — 👍 / 👎 buttons rendered after any
         # action click OR 30 s after the overlay shows, whichever comes
@@ -1382,6 +1421,45 @@ class OverlayWindow(QWidget):
     # ─────────────────────────────────────────────────────────────────
     # P0 §3.8: rating + frustration-spiral helpers
     # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _footer_btn_stylesheet() -> str:
+        """Shared style for the three footer pills (Dismiss, Snooze 15,
+        Quiet for session). HUD-flavoured capsule that picks up the
+        terracotta accent only on hover."""
+        return (
+            "QPushButton {"
+            "  background-color: rgba(255, 255, 255, 0.08);"
+            "  color: rgba(255, 255, 255, 0.85);"
+            "  border: 0.5px solid rgba(255, 255, 255, 0.14);"
+            f"  border-radius: {RADIUS_BUTTON}px;"
+            "  padding: 8px 18px;"
+            "}"
+            "QPushButton:hover {"
+            "  background-color: rgba(255, 255, 255, 0.16);"
+            "  color: white;"
+            "}"
+        )
+
+    def _on_snooze_clicked(self) -> None:
+        """P0 §3.11: emit a 15-min snooze + dismiss the overlay."""
+        try:
+            self.quiet_requested.emit("snooze_15", 15)
+        except Exception:
+            logger.debug("quiet_requested(snooze_15) emit failed", exc_info=True)
+        self._user_dismiss()
+
+    def _on_quiet_session_clicked(self) -> None:
+        """P0 §3.11: emit a quiet-for-session toggle + dismiss the overlay."""
+        try:
+            # ``0`` here means "use the daemon's default
+            # quiet_mode_minutes". The daemon clamps to [1, 240].
+            self.quiet_requested.emit("quiet_session", 0)
+        except Exception:
+            logger.debug(
+                "quiet_requested(quiet_session) emit failed", exc_info=True,
+            )
+        self._user_dismiss()
 
     @staticmethod
     def _feedback_btn_stylesheet() -> str:

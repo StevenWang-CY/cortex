@@ -48,7 +48,11 @@ from cortex.services.api_gateway.app import create_app, registry
 from cortex.services.api_gateway.websocket_server import WebSocketServer
 from cortex.services.capture_service.pipeline import CapturePipeline, PipelineOutput
 from cortex.services.consent.ladder import ConsentLadder
-from cortex.services.consent.policy import ConsentPolicy
+from cortex.services.consent.policy import (
+    AUTONOMOUS_ACT,
+    REVERSIBLE_ACT,
+    ConsentPolicy,
+)
 from cortex.services.context_engine import (
     BrowserAdapter,
     ContextAssembler,
@@ -597,6 +601,15 @@ class CortexDaemon:
         # Consent ladder
         self._consent_policy = ConsentPolicy()
         self._consent_ladder = ConsentLadder(store=self._store, policy=self._consent_policy)
+        # Phase-3 P0 + Audit-1.1 P0-1: consent policy overrides must
+        # survive a daemon restart. Without persistence, the user's
+        # opt-in to ``distraction_block`` at AUTONOMOUS_ACT silently
+        # reverts to REVERSIBLE_ACT on reboot — the toggle in Settings
+        # stays "on" but the HYPER auto-arm gate never opens.
+        self._consent_overrides_path: Path = (
+            Path(self.config.storage.path).expanduser() / "consent_overrides.json"
+        )
+        self._load_consent_overrides()
 
         # Helpfulness tracker
         self._helpfulness = HelpfulnessTracker(store=self._store)
@@ -717,6 +730,57 @@ class CortexDaemon:
         # P0 §3.9: serve WHY_DETAIL_REQUEST from the per-intervention
         # causal-signal cache. Returns a list[dict] or None.
         self._ws_server.set_why_detail_callback(self.get_causal_signals)
+
+        # P0 §3.11: serve QUIET_MODE_TOGGLE / SNOOZE_REQUEST. Routed
+        # through :meth:`set_quiet_mode` which centralises the
+        # quiet/pause primitives and broadcasts QUIET_MODE_STATE so
+        # every surface (dashboard, overlay, tray, browser popup, VS
+        # Code) reflects the same truth.
+        self._ws_server.set_quiet_mode_toggle_callback(self.set_quiet_mode)
+
+        # P0 §3.10: auto-armed focus session bookkeeping. ``_auto_focus_armed``
+        # is True only when the daemon (not the user) opened the focus
+        # session via START_FOCUS_AUTO; the symmetric STOP_FOCUS_AUTO
+        # only fires when this flag is True so we never tear down a
+        # session the user manually started. ``_hyper_dwell_started_at``
+        # times the spec-mandated 30 s confidence dwell before arming;
+        # ``_non_hyper_dwell_started_at`` times the 5 min sustained
+        # non-HYPER window before STOP_FOCUS_AUTO fires.
+        self._auto_focus_armed: bool = False
+        self._auto_focus_dwell_started_at: float = 0.0
+        self._auto_focus_recovery_started_at: float = 0.0
+        # P0 §3.11: source-of-truth for the active quiet/pause mode.
+        # ``_quiet_mode_kind`` is one of "off" / "snooze_15" /
+        # "quiet_session" / "pause"; ``_quiet_mode_ends_at`` is a unix
+        # timestamp (seconds since epoch) or None for indefinite (e.g.
+        # ``pause`` lasts until the user resumes).
+        self._quiet_mode_kind: str = "off"
+        self._quiet_mode_ends_at: float | None = None
+        self._quiet_mode_source: str = "daemon"
+        # Phase-3 P0: serialise concurrent ``set_quiet_mode`` calls
+        # (dashboard menu, tray, overlay footer, WS dispatch, F26
+        # spiral path can all fire simultaneously). Without the lock,
+        # the capture-pause state machine can drop the resume flag.
+        self._quiet_mode_lock: asyncio.Lock = asyncio.Lock()
+        # Auto-decay broadcast task — cancelled and rescheduled on
+        # every ``set_quiet_mode`` call so the popup countdown
+        # reconciles when the window expires.
+        self._quiet_mode_decay_task: asyncio.Task[None] | None = None
+        # P0 §3.11: pause toggles capture on/off. A paused capture
+        # releases the camera handle so the user can take a call /
+        # show their face on Zoom; resuming re-opens it.
+        self._pause_was_capturing: bool = False
+        # Initialise the latch-bool sentinels that ``_evaluate_auto_
+        # distraction_block`` reads via getattr — keeping them on
+        # ``self`` makes the renames typo-safe (audit 1.1 P1-7).
+        self._auto_focus_dwell_started: bool = False
+        self._auto_focus_recovery_started: bool = False
+        # P0 §3.12: focus detection callback registered by the desktop
+        # shell controller. ``None`` means we cannot detect focus
+        # (headless / non-mac); in that case OS notifications are
+        # disabled to avoid spamming when the user IS looking at the
+        # dashboard.
+        self._desktop_focused_probe: Callable[[], bool] | None = None
 
     def set_state_callback(self, fn: Callable[[dict], None]) -> None:
         """Register a callback invoked on every state update.
@@ -975,6 +1039,19 @@ class CortexDaemon:
     async def stop(self) -> None:
         """Gracefully stop all runtime services."""
         self._shutdown.set()
+        # Phase-3 P0-N5: a daemon stop while an auto-armed focus
+        # session is live would leave the browser blocking sites
+        # indefinitely (the extension's chrome.alarm is the only
+        # fallback, and even that can be missed if the browser is
+        # restarted across the window). Emit STOP_FOCUS_AUTO best-
+        # effort BEFORE we tear the WS server down.
+        if getattr(self, "_auto_focus_armed", False):
+            try:
+                await self.disarm_auto_focus()
+            except Exception:
+                logger.debug(
+                    "disarm_auto_focus during stop failed", exc_info=True,
+                )
         if self._uvicorn_server is not None:
             self._uvicorn_server.should_exit = True
         for task in self._tasks:
@@ -1678,6 +1755,20 @@ class CortexDaemon:
                         )
                         self._prev_state = estimate.state
 
+                    # P0 §3.10: auto-armed distraction blocking on
+                    # sustained HYPER. Runs every state tick so the
+                    # symmetric STOP_FOCUS_AUTO fires even when the
+                    # user dwells in HYPER without state transitions.
+                    try:
+                        await self._evaluate_auto_distraction_block(
+                            estimate, timestamp,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "auto-distraction evaluation failed",
+                            exc_info=True,
+                        )
+
                     await self._maybe_trigger_leetcode_interventions(
                         estimate, vector, timestamp,
                     )
@@ -2010,6 +2101,13 @@ class CortexDaemon:
                     self._causal_signals_by_intervention[plan.intervention_id] = [
                         s.model_dump(mode="json") for s in plan.causal_signals
                     ]
+                    # Phase-3 P1-N3: bound the cache. Each entry is a
+                    # 3-signal × 60-sample list (~180 floats) — small,
+                    # but unbounded growth across a multi-day session
+                    # is real. Keep the most recent 64 interventions.
+                    if len(self._causal_signals_by_intervention) > 64:
+                        oldest = next(iter(self._causal_signals_by_intervention))
+                        self._causal_signals_by_intervention.pop(oldest, None)
             except Exception:
                 logger.debug("causal_signals attach failed", exc_info=True)
 
@@ -2096,7 +2194,36 @@ class CortexDaemon:
                     list(bandit_features), int(bandit_arm_index)
                 )
 
-            await self._ws_server.send_intervention(plan)
+            # P0 §3.12: dispatch through OS-level channels when the
+            # desktop dashboard is not the active window. The flag is
+            # forwarded on the wire so the browser extension fires
+            # ``chrome.notifications`` + sets its action badge, and VS
+            # Code pulses its status bar item.
+            os_notifications_enabled = bool(
+                getattr(
+                    self.config.intervention,
+                    "enable_os_notifications",
+                    True,
+                )
+            )
+            desktop_focused: bool | None
+            if os_notifications_enabled:
+                desktop_focused = self._desktop_is_focused()
+            else:
+                desktop_focused = None
+            await self._ws_server.send_intervention(
+                plan, desktop_focused=desktop_focused,
+            )
+            # Fire the macOS UNUserNotification path when the desktop
+            # dashboard isn't focused — the WS broadcast covers Chrome /
+            # VS Code; the helper covers Spaces-other-than-the-desktop.
+            if os_notifications_enabled and desktop_focused is False:
+                try:
+                    await self._dispatch_os_notification(plan)
+                except Exception:
+                    logger.debug(
+                        "OS notification dispatch failed", exc_info=True,
+                    )
 
             if self._intervention_callback is not None:
                 # F17: stamp a monotonic sequence so the in-process bridge
@@ -2120,6 +2247,12 @@ class CortexDaemon:
                     )
                 except Exception:
                     _payload["connected_clients"] = []
+                # Phase-3 P0-N? + Audit-1.1 P0-7: stamp the focus state
+                # on the in-process callback payload so the dashboard
+                # overlay can suppress itself when the OS notification
+                # path is taking over (dual-fire de-dup).
+                if desktop_focused is False:
+                    _payload["desktop_not_focused"] = True
                 self._intervention_callback(_payload)
         except TimeoutError:
             logger.warning("Intervention LLM call timed out")
@@ -2441,6 +2574,556 @@ class CortexDaemon:
             return None
         return [s.model_dump(mode="json") for s in signals]
 
+    # ------------------------------------------------------------------
+    # P0 §3.11: one-touch pause / quiet mode primitives
+    # ------------------------------------------------------------------
+
+    def get_quiet_mode_state(self) -> dict[str, Any]:
+        """Return the live quiet-mode state envelope (matches
+        :attr:`MessageType.QUIET_MODE_STATE` payload).
+        """
+        kind = self._quiet_mode_kind
+        ends_at = self._quiet_mode_ends_at
+        if kind == "off" or (
+            ends_at is not None and time.time() >= ends_at
+        ):
+            # Stale window — re-normalise so the broadcast is honest.
+            kind = "off"
+            ends_at = None
+            self._quiet_mode_kind = "off"
+            self._quiet_mode_ends_at = None
+        duration_minutes: int | None = None
+        if ends_at is not None:
+            duration_minutes = max(0, int(round((ends_at - time.time()) / 60.0)))
+        return {
+            "kind": kind,
+            "duration_minutes": duration_minutes,
+            "ends_at": ends_at,
+            "source": self._quiet_mode_source,
+        }
+
+    async def _broadcast_quiet_mode_state(self) -> None:
+        """Push the current quiet-mode state to every connected surface."""
+        try:
+            await self._ws_server.send_message(
+                MessageType.QUIET_MODE_STATE.value,
+                self.get_quiet_mode_state(),
+            )
+        except Exception:
+            logger.debug("QUIET_MODE_STATE broadcast failed", exc_info=True)
+
+    async def set_quiet_mode(
+        self,
+        kind: str,
+        duration_minutes: int | None = None,
+        source: str = "daemon",
+    ) -> None:
+        """P0 §3.11: enter / leave a quiet or pause mode.
+
+        ``kind``:
+          * ``"snooze_15"`` — overlay-only suppression for
+            ``duration_minutes`` (default 15). Sensing continues, the
+            camera stays on, but no new overlay fires.
+          * ``"quiet_session"`` — same as snooze but for the rest of
+            the session (default 240 min cap so we cannot pin the
+            machine in a half-paused state if the user walks away).
+          * ``"pause"`` — full sensing pause; releases the camera so
+            the user can run another camera app. Indefinite. Also
+            disarms any active auto-distraction-block focus session
+            (Phase-3 P0-N4 — pause means "let me go", not "keep
+            blocking my browser while I'm not even here").
+          * ``"off"`` — clear any active mode immediately, resume
+            capture if it was paused.
+
+        Broadcasts ``QUIET_MODE_STATE`` (every surface) plus
+        ``SETTINGS_SYNC`` (legacy clients) atomically under the
+        ``_quiet_mode_lock`` so concurrent dashboard / overlay / tray /
+        WS dispatch can never corrupt the pause-was-capturing latch.
+        """
+        if kind not in ("snooze_15", "quiet_session", "pause", "off"):
+            logger.warning(
+                "set_quiet_mode: unknown kind=%r (treating as 'off')", kind,
+            )
+            kind = "off"
+        # ``duration_minutes == 0`` is the documented "use daemon
+        # default" sentinel for snooze/quiet_session (matches the
+        # dashboard menu's ``request_quiet_mode(... duration_minutes=0)``
+        # contract). Negative values are coerced to the same fallback.
+        # The WS-side validator also collapses 0 → None.
+        if duration_minutes is not None and duration_minutes <= 0:
+            duration_minutes = None
+        # ── Resolve duration (where meaningful) ─────────────────────
+        if kind == "snooze_15":
+            minutes = max(1, min(240, int(duration_minutes or 15)))
+        elif kind == "quiet_session":
+            minutes = max(1, min(240, int(
+                duration_minutes
+                or self.config.intervention.quiet_mode_minutes
+            )))
+        else:
+            minutes = 0  # pause / off carry no countdown
+        ends_at: float | None = (
+            time.time() + minutes * 60.0 if minutes > 0 else None
+        )
+
+        # Serialise under the lock so two surfaces flipping kinds
+        # simultaneously can't drop the pause-was-capturing latch.
+        async with self._quiet_mode_lock:
+            prev_kind = self._quiet_mode_kind
+
+            # Resume-from-pause helper. Called when leaving the pause
+            # kind under any new kind (off / snooze / quiet_session).
+            async def _resume_if_was_paused() -> None:
+                if prev_kind != "pause":
+                    return
+                if not self._pause_was_capturing:
+                    return
+                try:
+                    await self._capture_pipeline.start()
+                    self._capture_available = True
+                    self._capture_processing_enabled = True
+                except Exception:
+                    logger.exception("set_quiet_mode: resume capture failed")
+                self._pause_was_capturing = False
+
+            if kind == "off":
+                # Clear quiet/snooze. If we were paused, resume capture.
+                self._trigger_policy.clear_quiet_mode()
+                await _resume_if_was_paused()
+            elif kind in ("snooze_15", "quiet_session"):
+                self._trigger_policy.activate_quiet_mode(
+                    duration_minutes=minutes,
+                )
+                # Snooze/quiet leave capture running so HRV recovery is
+                # still observable; only ``pause`` releases the camera.
+                await _resume_if_was_paused()
+            elif kind == "pause":
+                # Long quiet window so dwell logic still suppresses
+                # triggers even if capture briefly resumes.
+                self._trigger_policy.activate_quiet_mode(duration_minutes=240)
+                # Phase-3 P0-N4: pause should also disarm any
+                # auto-armed focus session so the browser doesn't keep
+                # blocking sites while the user is on a call / away.
+                if self._auto_focus_armed:
+                    try:
+                        self._auto_focus_armed = False
+                        self._auto_focus_dwell_started_at = 0.0
+                        self._auto_focus_recovery_started_at = 0.0
+                        self._auto_focus_dwell_started = False
+                        self._auto_focus_recovery_started = False
+                        await self._emit_stop_focus_auto(reason="paused")
+                    except Exception:
+                        logger.debug(
+                            "auto-focus disarm on pause failed",
+                            exc_info=True,
+                        )
+                # Only stamp ``_pause_was_capturing`` when transitioning
+                # INTO pause from a non-pause state (Phase-3 P1-DF-11.5
+                # — second pause-click clobbered the latch).
+                if prev_kind != "pause":
+                    was_running = bool(getattr(
+                        self._capture_pipeline, "is_running", False,
+                    ))
+                    self._pause_was_capturing = was_running
+                    if was_running:
+                        try:
+                            await self._capture_pipeline.stop()
+                            self._capture_available = False
+                            self._capture_processing_enabled = False
+                        except Exception:
+                            logger.exception(
+                                "set_quiet_mode: pause stop_capture failed",
+                            )
+
+            # Record state under the same lock to keep readers consistent.
+            self._quiet_mode_kind = kind
+            self._quiet_mode_ends_at = ends_at
+            self._quiet_mode_source = str(source or "daemon")
+
+            # (Re)schedule the auto-decay broadcaster. When the window
+            # expires, broadcast a synthetic "off" state so every
+            # surface (popup countdown, tray checkmark, dashboard pill)
+            # stays honest (Phase-1 P1-DF-11.3).
+            existing = self._quiet_mode_decay_task
+            if existing is not None and not existing.done():
+                existing.cancel()
+            self._quiet_mode_decay_task = None
+            if ends_at is not None and minutes > 0:
+                self._quiet_mode_decay_task = self._spawn_background_task(
+                    self._decay_quiet_mode_after(minutes * 60.0, kind),
+                    name="cortex-quiet-decay",
+                )
+
+        # ── Broadcasts (outside the lock so a slow WS send can't
+        # serialise the next click) ─────────────────────────────────
+        await self._broadcast_quiet_mode_state()
+        # Back-compat: push SETTINGS_SYNC so older clients that only
+        # watch the legacy quiet_mode flag still observe the change.
+        try:
+            await self._ws_server.send_message(
+                MessageType.SETTINGS_SYNC.value,
+                {
+                    "quiet_mode": kind != "off",
+                    "quiet_mode_kind": kind,
+                    "quiet_duration_minutes": minutes if minutes > 0 else 0,
+                },
+            )
+        except Exception:
+            # Phase-3 P1-DF-11.2: bump from debug to warning so a real
+            # broadcast failure is visible in ops logs.
+            logger.warning(
+                "set_quiet_mode SETTINGS_SYNC broadcast failed",
+                exc_info=True,
+            )
+        logger.info(
+            "Quiet mode set to %s (duration=%s min, source=%s)",
+            kind, minutes if minutes > 0 else "-", source,
+        )
+
+    async def _decay_quiet_mode_after(
+        self, delay_seconds: float, expected_kind: str,
+    ) -> None:
+        """Sleep ``delay_seconds`` then broadcast an "off" state IF the
+        mode hasn't already transitioned away from ``expected_kind``.
+        Cancellable via ``self._quiet_mode_decay_task.cancel()``.
+        """
+        try:
+            await asyncio.sleep(delay_seconds)
+        except asyncio.CancelledError:
+            return
+        async with self._quiet_mode_lock:
+            if self._quiet_mode_kind != expected_kind:
+                return
+            self._quiet_mode_kind = "off"
+            self._quiet_mode_ends_at = None
+            self._quiet_mode_source = "daemon_decay"
+            self._trigger_policy.clear_quiet_mode()
+        try:
+            await self._broadcast_quiet_mode_state()
+            await self._ws_server.send_message(
+                MessageType.SETTINGS_SYNC.value,
+                {
+                    "quiet_mode": False,
+                    "quiet_mode_kind": "off",
+                    "quiet_duration_minutes": 0,
+                },
+            )
+        except Exception:
+            logger.debug("auto-decay broadcast failed", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # P0 §3.12: desktop focus probe registration
+    # ------------------------------------------------------------------
+
+    def set_desktop_focus_probe(
+        self,
+        probe: Callable[[], bool] | None,
+    ) -> None:
+        """Register a no-arg callable that returns True iff the desktop
+        dashboard is currently the foreground key window. Called from
+        the daemon thread; the probe MUST be thread-safe or it must
+        marshal to the GUI thread internally.
+
+        Set to ``None`` to disable the probe (e.g. headless test
+        harness). When ``None``, the daemon treats the desktop as
+        focused, so OS notifications stay quiet.
+        """
+        self._desktop_focused_probe = probe
+
+    def _desktop_is_focused(self) -> bool:
+        """Best-effort check: True when the desktop dashboard is the
+        active window. Falls back to ``True`` (= treat as focused) on
+        any error so the OS notification path stays quiet."""
+        probe = self._desktop_focused_probe
+        if probe is None:
+            return True
+        try:
+            return bool(probe())
+        except Exception:
+            logger.debug("desktop focus probe raised", exc_info=True)
+            return True
+
+    async def _dispatch_os_notification(self, plan: InterventionPlan) -> None:
+        """P0 §3.12: fire a macOS UNUserNotification for an intervention.
+
+        Only the LLM-generated ``headline`` reaches the notification
+        body — never biometric values (which would leak even if the
+        receiver were screenshotted). When the OS notification path
+        is unavailable (non-mac, missing PyObjC, permission denied)
+        the helper short-circuits silently; the Chrome / VS Code
+        fallbacks still fire via the wire flag.
+        """
+        try:
+            from cortex.libs.utils.macos_notifications import (
+                send_intervention_notification,
+            )
+        except ImportError:
+            logger.debug("macOS notification helper unavailable")
+            return
+        headline = (getattr(plan, "headline", "") or "Cortex").strip()
+        primary_focus = (
+            getattr(plan, "primary_focus", "") or ""
+        ).strip()
+        # F09 sanitisation: explicit allowlist — no biometric numerics.
+        body_parts: list[str] = []
+        if primary_focus:
+            body_parts.append(primary_focus)
+        body = " — ".join(body_parts) or "Cortex has a suggestion"
+        try:
+            await asyncio.to_thread(
+                send_intervention_notification,
+                title=headline,
+                body=body,
+                intervention_id=getattr(plan, "intervention_id", "") or "",
+            )
+        except Exception:
+            logger.debug(
+                "send_intervention_notification raised", exc_info=True,
+            )
+
+    # ------------------------------------------------------------------
+    # P0 §3.10: auto-armed distraction blocking on HYPER
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Consent overrides persistence (Phase-3 P0 / Audit-1.1 P0-1)
+    # ------------------------------------------------------------------
+
+    def _load_consent_overrides(self) -> None:
+        """Rehydrate ``ConsentPolicy.set_level`` overrides from disk so
+        the user's autonomous-act opt-ins (e.g. distraction_block)
+        survive a daemon restart. Missing or corrupt file → start with
+        the default policy (REVERSIBLE_ACT for distraction_block, etc.).
+        """
+        path = self._consent_overrides_path
+        if not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.warning(
+                "consent_overrides.json unreadable; starting from defaults",
+                exc_info=True,
+            )
+            return
+        levels = payload.get("levels") if isinstance(payload, dict) else None
+        if not isinstance(levels, dict):
+            return
+        for action_type, raw_level in levels.items():
+            if not isinstance(action_type, str):
+                continue
+            try:
+                self._consent_policy.set_level(
+                    action_type, int(raw_level),
+                )
+            except Exception:
+                logger.debug(
+                    "skipping malformed consent override %r=%r",
+                    action_type, raw_level,
+                )
+        logger.info(
+            "Restored %d consent overrides from %s",
+            len(levels), path,
+        )
+
+    def _persist_consent_overrides(self) -> None:
+        """Atomically write the current ``ConsentPolicy`` overrides to
+        disk. Called from every ``set_level`` mutation path so a crash
+        between the in-memory flip and the next planned write doesn't
+        lose the user's choice."""
+        from cortex.libs.utils.atomic_write import atomic_write_json
+
+        path = self._consent_overrides_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(path, self._consent_policy.to_dict())
+        except Exception:
+            logger.warning(
+                "consent_overrides persist failed", exc_info=True,
+            )
+
+    def _reset_auto_focus_timers(self) -> None:
+        """Phase-3 P1-N3 + Audit-1.1 P1-7: shared reset of every
+        latch sentinel that controls the auto-arm timing state machine.
+        Centralised so renames keep timing logic consistent."""
+        self._auto_focus_dwell_started_at = 0.0
+        self._auto_focus_recovery_started_at = 0.0
+        self._auto_focus_dwell_started = False
+        self._auto_focus_recovery_started = False
+
+    async def _evaluate_auto_distraction_block(
+        self,
+        estimate: Any,
+        timestamp: float,
+    ) -> None:
+        """Arm / disarm the daemon-driven focus session.
+
+        Gating rules (spec §3.10, hardened per Phase-3 P1-X.2 + P0-N4):
+          1. ``CORTEX_INTERVENTION__ENABLE_AUTO_DISTRACTION_BLOCK`` is
+             True (default False).
+          2. Mid-break (``_break_active``) auto-arm is suppressed so
+             the focus interstitial doesn't layer on top of the
+             breathing overlay.
+          3. The user has approved the ``distraction_block`` consent
+             class at ``AUTONOMOUS_ACT`` (default ``REVERSIBLE_ACT``;
+             the upshift is explicit, from Settings → Focus protection).
+          4. State is HYPER, confidence ≥ confidence_gate, and the
+             HYPER dwell has met dwell_gate.
+          5. Symmetric exit on sustained FLOW/RECOVERY for exit_gate.
+          6. When the flag flips OFF / consent downgrades while
+             ``_auto_focus_armed`` is True, broadcast STOP_FOCUS_AUTO
+             so the browser doesn't keep blocking sites (Phase-3 P0-N4).
+        """
+        cfg = self.config.intervention
+
+        # Phase-3 P1-X.2: during a biology break, suppress auto-arm.
+        if getattr(self, "_break_active", False):
+            self._reset_auto_focus_timers()
+            return
+
+        if not bool(getattr(cfg, "enable_auto_distraction_block", False)):
+            # Off entirely — emit STOP if we were armed; reset timers.
+            if self._auto_focus_armed:
+                self._auto_focus_armed = False
+                await self._emit_stop_focus_auto(reason="feature_disabled")
+            self._reset_auto_focus_timers()
+            return
+
+        # Consent gate. We only arm autonomously when the user has
+        # explicitly upgraded ``distraction_block`` to AUTONOMOUS_ACT.
+        try:
+            required_level = self._consent_policy.get_minimum_level(
+                "distraction_block",
+            )
+        except Exception:
+            required_level = REVERSIBLE_ACT  # conservative on error
+        if int(required_level) < int(AUTONOMOUS_ACT):
+            # Not opted-in. If we were armed (e.g. user just toggled
+            # off mid-session), emit STOP so the browser tears down.
+            if self._auto_focus_armed:
+                self._auto_focus_armed = False
+                await self._emit_stop_focus_auto(reason="consent_downgrade")
+            self._reset_auto_focus_timers()
+            return
+
+        state = getattr(estimate, "state", "")
+        confidence = float(getattr(estimate, "confidence", 0.0) or 0.0)
+        confidence_gate = float(
+            getattr(cfg, "auto_distraction_block_confidence", 0.85)
+        )
+        dwell_gate = float(
+            getattr(cfg, "auto_distraction_block_dwell_seconds", 30.0)
+        )
+        exit_gate = float(
+            getattr(cfg, "auto_distraction_block_exit_seconds", 300.0)
+        )
+
+        if state == "HYPER" and confidence >= confidence_gate:
+            # Active dwell — clear the recovery countdown so we don't
+            # disarm mid-HYPER on a transient FLOW reading.
+            self._auto_focus_recovery_started_at = 0.0
+            self._auto_focus_recovery_started = False
+            if not self._auto_focus_dwell_started:
+                self._auto_focus_dwell_started_at = timestamp
+                self._auto_focus_dwell_started = True
+            dwelled = timestamp - self._auto_focus_dwell_started_at
+            if not self._auto_focus_armed and dwelled >= dwell_gate:
+                # Phase-3 P1-2 (Audit-1.1): only flip the armed flag
+                # after the broadcast lands. ``_emit_start_focus_auto``
+                # returns True on success.
+                ok = await self._emit_start_focus_auto(
+                    reason="biometric_hyper",
+                )
+                if ok:
+                    self._auto_focus_armed = True
+        elif self._auto_focus_armed and state in ("FLOW", "RECOVERY"):
+            if not self._auto_focus_recovery_started:
+                self._auto_focus_recovery_started_at = timestamp
+                self._auto_focus_recovery_started = True
+            recovered_for = timestamp - self._auto_focus_recovery_started_at
+            if recovered_for >= exit_gate:
+                await self._emit_stop_focus_auto(reason="sustained_recovery")
+                self._auto_focus_armed = False
+                self._auto_focus_recovery_started_at = 0.0
+                self._auto_focus_recovery_started = False
+        else:
+            # Any other state — keep armed state but reset dwell so we
+            # don't arm on a flicker.
+            if state != "HYPER":
+                self._auto_focus_dwell_started_at = 0.0
+                self._auto_focus_dwell_started = False
+            else:
+                # Sub-gate confidence HYPER — keep dwell intact (so a
+                # one-tick dip doesn't restart the timer) but clear
+                # the recovery countdown if armed.
+                self._auto_focus_recovery_started_at = 0.0
+                self._auto_focus_recovery_started = False
+
+    async def _emit_start_focus_auto(self, *, reason: str) -> bool:
+        """Broadcast ``START_FOCUS_AUTO`` to the browser extension.
+
+        Returns True only when the WS send succeeded so the caller can
+        defer flipping ``_auto_focus_armed`` until the wire confirms
+        (Phase-3 P1-2 / Audit-1.1 P1-2).
+        """
+        cfg = self.config.intervention
+        preset = str(getattr(
+            cfg, "auto_distraction_block_preset", "developer",
+        ))
+        duration_minutes = int(getattr(
+            cfg, "auto_distraction_block_session_minutes", 20,
+        ))
+        custom_domains = list(getattr(
+            cfg, "auto_distraction_block_custom_domains", [],
+        ))
+        try:
+            await self._ws_server.send_message(
+                MessageType.START_FOCUS_AUTO.value,
+                {
+                    "duration_minutes": duration_minutes,
+                    "reason": reason,
+                    "preset": preset,
+                    "custom_domains": custom_domains,
+                },
+                target_client_types=["chrome", "edge"],
+            )
+            logger.info(
+                "START_FOCUS_AUTO emitted (preset=%s, %d min, reason=%s)",
+                preset, duration_minutes, reason,
+            )
+            return True
+        except Exception:
+            logger.exception("START_FOCUS_AUTO broadcast failed")
+            return False
+
+    async def _emit_stop_focus_auto(self, *, reason: str) -> bool:
+        """Broadcast ``STOP_FOCUS_AUTO`` to the browser extension.
+        Returns True on a successful WS send."""
+        try:
+            await self._ws_server.send_message(
+                MessageType.STOP_FOCUS_AUTO.value,
+                {"reason": reason},
+                target_client_types=["chrome", "edge"],
+            )
+            logger.info("STOP_FOCUS_AUTO emitted (reason=%s)", reason)
+            return True
+        except Exception:
+            logger.exception("STOP_FOCUS_AUTO broadcast failed")
+            return False
+
+    async def disarm_auto_focus(self) -> None:
+        """Externally called (by the desktop shell's "Turn off" toast,
+        by the browser extension's manual focus-session stop, or by
+        ``daemon.stop()``) to clear the auto-armed flag and broadcast
+        STOP_FOCUS_AUTO. Callers in another thread should use
+        ``asyncio.run_coroutine_threadsafe`` against the daemon loop.
+        """
+        if not self._auto_focus_armed:
+            return
+        self._auto_focus_armed = False
+        self._reset_auto_focus_timers()
+        await self._emit_stop_focus_auto(reason="user_disarm")
+
     async def toggle_micro_step(
         self,
         intervention_id: str,
@@ -2746,21 +3429,25 @@ class CortexDaemon:
                                 "— activating Quiet Mode for 30 min",
                                 recent,
                             )
-                            self._trigger_policy.activate_quiet_mode(
-                                duration_minutes=30,
-                            )
                             self._helpfulness.reset_downvote_window()
                             self._quiet_mode_throttle_latched_at = now
-                            # Broadcast the new quiet-mode state so the
-                            # popup / VS Code surfaces reflect it.
+                            # Route through ``set_quiet_mode`` so the
+                            # unified QUIET_MODE_STATE broadcast (P0
+                            # §3.11) fires alongside the legacy
+                            # SETTINGS_SYNC frame. ``quiet_session``
+                            # with 30 min duration matches the prior
+                            # F26 semantics; ``source="daemon"`` so
+                            # the UI can distinguish this case from
+                            # a user-clicked quiet toggle.
                             try:
-                                await self._ws_server.send_message(
-                                    MessageType.SETTINGS_SYNC.value,
-                                    {"quiet_mode": True, "duration_minutes": 30},
+                                await self.set_quiet_mode(
+                                    "quiet_session",
+                                    duration_minutes=30,
+                                    source="daemon",
                                 )
                             except Exception:
                                 logger.debug(
-                                    "SETTINGS_SYNC broadcast failed",
+                                    "set_quiet_mode broadcast failed",
                                     exc_info=True,
                                 )
                     except Exception:
@@ -3509,13 +4196,76 @@ class CortexDaemon:
                         outcome.intervention_id,
                         user_action=outcome.user_action,
                     )
+        # Phase-3 P0-DF-11.1 + Audit-1.1 P1-4: a legacy
+        # ``SETTINGS_SYNC {quiet_mode: false}`` must NOT bypass
+        # ``set_quiet_mode``, or the pause-capture state machine
+        # de-syncs (kind stays "pause" while trigger policy is cleared,
+        # capture stays released). Route through the unified setter.
         if "quiet_mode" in settings:
-            if bool(settings["quiet_mode"]):
-                self._trigger_policy.activate_quiet_mode(
-                    duration_minutes=int(settings.get("quiet_duration_minutes", 15))
+            requested_on = bool(settings["quiet_mode"])
+            duration = int(settings.get("quiet_duration_minutes") or 0)
+            if requested_on:
+                # Honour an explicit duration; otherwise leave at the
+                # default for snooze_15.
+                await self.set_quiet_mode(
+                    "snooze_15",
+                    duration_minutes=duration if duration > 0 else None,
+                    source=str(settings.get("source") or "settings_sync"),
                 )
             else:
-                self._trigger_policy.clear_quiet_mode()
+                await self.set_quiet_mode(
+                    "off",
+                    source=str(settings.get("source") or "settings_sync"),
+                )
+
+        # ── P0 §3.10: focus protection knobs (auto-armed blocking) ──
+        if "enable_auto_distraction_block" in settings:
+            new_value = bool(settings["enable_auto_distraction_block"])
+            self.config.intervention.enable_auto_distraction_block = new_value
+            # Upgrade / downgrade the consent class to match the toggle.
+            # When the user opts in, the ``distraction_block`` class is
+            # promoted to ``AUTONOMOUS_ACT`` so the HYPER auto-arm path
+            # actually fires. When opting out, drop back to
+            # ``REVERSIBLE_ACT`` so the user can still manually arm a
+            # focus session without daemon involvement.
+            try:
+                self._consent_policy.set_level(
+                    "distraction_block",
+                    AUTONOMOUS_ACT if new_value else REVERSIBLE_ACT,
+                )
+                self._persist_consent_overrides()
+            except Exception:
+                logger.debug(
+                    "distraction_block consent flip failed", exc_info=True,
+                )
+            # Phase-3 P0-N4 + Audit-1.1 P0-2: if the user opted OUT
+            # while a focus session is daemon-armed, disarm it so the
+            # browser tears down the blocker immediately. Without this
+            # the user can untick the toggle and still find sites
+            # blocked until the next state-loop transition.
+            if not new_value and self._auto_focus_armed:
+                try:
+                    await self.disarm_auto_focus()
+                except Exception:
+                    logger.debug(
+                        "disarm_auto_focus on opt-out failed", exc_info=True,
+                    )
+        if "auto_distraction_block_preset" in settings:
+            preset = str(settings["auto_distraction_block_preset"])
+            if preset in ("developer", "student", "writer", "custom"):
+                self.config.intervention.auto_distraction_block_preset = preset  # type: ignore[assignment]
+        if "auto_distraction_block_custom_domains" in settings:
+            raw = settings["auto_distraction_block_custom_domains"]
+            if isinstance(raw, list):
+                self.config.intervention.auto_distraction_block_custom_domains = [
+                    str(d).strip().lower() for d in raw if isinstance(d, str) and d.strip()
+                ][:100]
+
+        # ── P0 §3.12: OS notification toggle ────────────────────────
+        if "enable_os_notifications" in settings:
+            self.config.intervention.enable_os_notifications = bool(
+                settings["enable_os_notifications"]
+            )
         # B.4 fix: accept both "llm_provider" (canonical, new clients) and
         # "llm_mode" (legacy from the SettingsDialog) so the dropdown in
         # the desktop settings actually rebuilds the client.

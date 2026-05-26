@@ -91,13 +91,15 @@ def test_onboarding_steps_includes_calibration() -> None:
 
     assert "calibration" in ONBOARDING_STEPS
     # Order matters — the wizard renders in this exact sequence and the
-    # ProgressStrip dot count depends on the cardinality.
+    # ProgressStrip dot count depends on the cardinality. P0 §3.12 added
+    # a sixth ``macos_notifications`` step at the tail.
     assert ONBOARDING_STEPS == (
         "camera",
         "accessibility",
         "llm_backend",
         "calibration",
         "extensions",
+        "macos_notifications",
     )
 
 
@@ -159,8 +161,9 @@ def test_calibration_step_card_exists(wizard) -> None:
 
 
 def test_progress_strip_has_five_dots(wizard) -> None:
-    """P0 §3.4 increased the wizard from 4 to 5 steps."""
-    assert wizard._progress._count == 5
+    """P0 §3.4 increased the wizard from 4 to 5 steps; P0 §3.12 added
+    a sixth ``macos_notifications`` step at the tail."""
+    assert wizard._progress._count == 6
 
 
 def test_apply_progress_updates_numerics(wizard) -> None:

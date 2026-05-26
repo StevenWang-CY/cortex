@@ -114,6 +114,11 @@ hiddenimports = [
     "CoreFoundation",
     "Foundation",
     "ApplicationServices",
+    # P0 §3.12: UNUserNotificationCenter access for OS-level
+    # intervention banners. PyInstaller cannot infer this from
+    # ``import UserNotifications`` because PyObjC frameworks are
+    # resolved through the dynamic ``objc.loadBundle`` machinery.
+    "UserNotifications",
 
     # MediaPipe
     "mediapipe",

@@ -196,6 +196,42 @@ interface DailyStats {
 
 let focusSession: FocusSession | null = null;
 
+// P0 §3.10: track whether the daemon armed the active focus session so
+// the symmetric STOP_FOCUS_AUTO knows whether to tear down. The
+// session goal carries the human-readable reason for popup display.
+let autoFocusArmed: boolean = false;
+let autoFocusEndsAt: number | null = null;
+let autoFocusAlarmName: string | null = null;
+// P0 §3.10: domain blocklist presets. Reduces the per-tick query to a
+// stable preset → patterns map. The browser extension is the source
+// of truth for the per-preset list; the daemon ships only the preset
+// name + any user custom_domains.
+const FOCUS_PRESET_DOMAINS: Record<string, RegExp[]> = {
+    developer: [
+        /reddit\.com/i, /twitter\.com/i, /x\.com/i, /facebook\.com/i,
+        /instagram\.com/i, /tiktok\.com/i, /youtube\.com/i, /netflix\.com/i,
+        /9gag\.com/i, /buzzfeed\.com/i, /tumblr\.com/i, /twitch\.tv/i,
+    ],
+    student: [
+        /instagram\.com/i, /tiktok\.com/i, /youtube\.com/i, /reddit\.com/i,
+        /twitter\.com/i, /x\.com/i, /netflix\.com/i, /twitch\.tv/i,
+        /facebook\.com/i, /snapchat\.com/i,
+    ],
+    writer: [
+        /twitter\.com/i, /x\.com/i, /reddit\.com/i, /facebook\.com/i,
+        /instagram\.com/i, /tiktok\.com/i, /youtube\.com/i, /netflix\.com/i,
+        /hacker-news\.firebaseio\.com/i, /news\.ycombinator\.com/i,
+    ],
+    custom: [],
+};
+
+let activeFocusPresetPatterns: RegExp[] = [];
+let activeFocusCustomDomains: string[] = [];
+// Phase-3 P1-DF-10.4: persisted preset name so the SW can rebuild
+// ``activeFocusPresetPatterns`` after eviction (regex literals don't
+// survive chrome.storage round-trips, but the string preset name does).
+let _activeFocusPresetName: string = "developer";
+
 // Two-tier distraction detection
 const ALWAYS_DISTRACTION = [
     /instagram\.com/i, /tiktok\.com/i, /netflix\.com/i,
@@ -225,7 +261,15 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // --- State Persistence (survives MV3 service worker restarts) ---
 
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
-const PERSIST_KEYS = ["focusSession", "undoStack", "dismissedInterventions", "dismissedUrlPatterns", "quietMode", "tabLastActivated"] as const;
+// Phase-3 P1-DF-10.4: auto-focus state must survive MV3 SW eviction
+// or ``isDistractionUrl`` falls back to an empty blocklist while the
+// daemon still believes the session is armed.
+const PERSIST_KEYS = [
+    "focusSession", "undoStack", "dismissedInterventions",
+    "dismissedUrlPatterns", "quietMode", "tabLastActivated",
+    "autoFocusArmed", "autoFocusEndsAt", "autoFocusPreset",
+    "autoFocusCustomDomains",
+] as const;
 
 function schedulePersist(): void {
     if (persistTimer) clearTimeout(persistTimer);
@@ -237,6 +281,11 @@ function schedulePersist(): void {
             dismissedUrlPatterns: [...dismissedUrlPatterns.entries()],
             quietMode,
             tabLastActivated: [...tabLastActivated.entries()],
+            // Phase-3 P1-DF-10.4: auto-focus session bookkeeping.
+            autoFocusArmed,
+            autoFocusEndsAt,
+            autoFocusPreset: _activeFocusPresetName,
+            autoFocusCustomDomains: activeFocusCustomDomains,
         });
     }, 500);
 }
@@ -259,6 +308,27 @@ async function restoreState(): Promise<void> {
     if (data.tabLastActivated) {
         tabLastActivated.clear();
         for (const [k, v] of data.tabLastActivated) tabLastActivated.set(k, v);
+    }
+    // Phase-3 P1-DF-10.4: rehydrate auto-focus state so isDistractionUrl
+    // keeps blocking even across MV3 SW eviction.
+    if (data.autoFocusArmed !== undefined) {
+        autoFocusArmed = Boolean(data.autoFocusArmed);
+    }
+    if (typeof data.autoFocusEndsAt === "number") {
+        autoFocusEndsAt = data.autoFocusEndsAt;
+    }
+    if (typeof data.autoFocusPreset === "string") {
+        _activeFocusPresetName = data.autoFocusPreset;
+        activeFocusPresetPatterns = FOCUS_PRESET_DOMAINS[_activeFocusPresetName]
+            || FOCUS_PRESET_DOMAINS.developer;
+    }
+    if (Array.isArray(data.autoFocusCustomDomains)) {
+        activeFocusCustomDomains = data.autoFocusCustomDomains
+            .filter((d: unknown): d is string => typeof d === "string");
+    }
+    // Auto-expire if a stale auto-armed session outlived its window.
+    if (autoFocusArmed && autoFocusEndsAt !== null && Date.now() > autoFocusEndsAt) {
+        stopAutoFocusSession("duration_elapsed_post_restore");
     }
 }
 
@@ -1043,6 +1113,85 @@ async function handleMessage(raw: string): Promise<void> {
                 });
             } catch {}
             handleIntervention(msg.payload);
+            // P0 §3.12: when the desktop dashboard isn't focused the
+            // daemon stamps ``desktop_not_focused: true`` on the wire.
+            // Bump the toolbar badge + fire ``chrome.notifications`` so
+            // the user notices the intervention from another Space /
+            // fullscreen app. The notification body is the
+            // LLM-generated headline only (already F09-sanitised).
+            // Phase-3 P2-DF-12.5: respect quiet mode — if the user
+            // has snoozed or paused, the OS notification fall-through
+            // is just another surrogate overlay and should also be
+            // suppressed.
+            if (msg.payload.desktop_not_focused === true && !quietMode) {
+                try {
+                    surfaceInterventionOSNotification(msg.payload, inboundCid);
+                } catch {
+                    // chrome.notifications may not be available in odd
+                    // test environments; never crash the dispatcher.
+                }
+            }
+            break;
+        }
+
+        case "START_FOCUS_AUTO": {
+            // P0 §3.10: daemon detected sustained HYPER + user opted
+            // in. Arm a focus session with the daemon-provided preset
+            // and duration. The session is marked auto-armed so the
+            // symmetric STOP_FOCUS_AUTO can tear down only when WE
+            // armed (never tear down a manually-started session).
+            const preset = (msg.payload.preset as string | undefined) || "developer";
+            const customDomains = (msg.payload.custom_domains as string[] | undefined) || [];
+            const durationMinutes = typeof msg.payload.duration_minutes === "number"
+                ? msg.payload.duration_minutes
+                : 20;
+            const reason = (msg.payload.reason as string | undefined) || "biometric_hyper";
+            try {
+                startAutoFocusSession({
+                    preset,
+                    customDomains,
+                    durationMinutes,
+                    reason,
+                });
+            } catch (e) {
+                console.warn("Cortex: failed to arm auto focus session", e);
+            }
+            break;
+        }
+
+        case "STOP_FOCUS_AUTO": {
+            // P0 §3.10: daemon detected sustained recovery (or the
+            // user disarmed). Only tear down if WE armed the session.
+            const reason = (msg.payload.reason as string | undefined) || "sustained_recovery";
+            try {
+                stopAutoFocusSession(reason);
+            } catch (e) {
+                console.warn("Cortex: failed to stop auto focus session", e);
+            }
+            break;
+        }
+
+        case "QUIET_MODE_STATE": {
+            // P0 §3.11: keep the popup pill in sync with the daemon's
+            // active quiet/pause mode. The popup mirrors quietMode for
+            // its existing display logic; the new ``quietModeKind``
+            // surface lets future popup builds show the specific kind
+            // ("paused"/"snoozed") without a separate WS hop.
+            const kind = (msg.payload.kind as string | undefined) || "off";
+            quietMode = kind !== "off";
+            schedulePersist();
+            // Phase-3 P0-2: cache the full envelope so a popup
+            // mounted AFTER the broadcast (or after SW eviction)
+            // sees the right kind / countdown / source on first paint.
+            try {
+                chrome.storage.session.set({
+                    cortex_quiet_state: msg.payload,
+                });
+            } catch { /* session storage unavailable */ }
+            broadcastToPopup({
+                type: "QUIET_MODE_STATE",
+                payload: msg.payload,
+            });
             break;
         }
 
@@ -2174,6 +2323,113 @@ function extractPageText(): string {
     return chunks.join(" ");
 }
 
+// --- Daemon launch helper ---
+
+interface LaunchResult {
+    ok: boolean;
+    status: string;
+    error?: string;
+}
+
+/**
+ * Phase-3 P0-N3: factored out of the LAUNCH_CORTEX message handler
+ * so notification onClicked / onButtonClicked can invoke it directly.
+ * ``chrome.runtime.sendMessage`` from a service worker does NOT
+ * dispatch to the same SW's onMessage listener, so the previous
+ * "Open" button was a no-op.
+ */
+async function runLaunchCortex(): Promise<LaunchResult> {
+    let lastError = "";
+
+    const waitAndEnableCamera = async (maxAttempts: number): Promise<boolean> => {
+        if (!connected) connect();
+        let attempts = 0;
+        while (!connected && attempts < maxAttempts) {
+            await new Promise((r) => setTimeout(r, 500));
+            attempts++;
+        }
+        if (connected && ws) {
+            send({
+                type: "SETTINGS_SYNC",
+                payload: { webcam_enabled: true },
+                timestamp: Date.now() / 1000,
+                sequence: ++sequence,
+            });
+            return true;
+        }
+        return false;
+    };
+
+    try {
+        // Path 1: HTTP launcher agent on port 9471
+        try {
+            let launchAuthToken: string | null = null;
+            try {
+                launchAuthToken = await getAuthToken();
+            } catch {
+                launchAuthToken = null;
+            }
+            const resp = await fetch(`${LAUNCHER_HTTP_URL}/launch`, {
+                method: "POST",
+                signal: AbortSignal.timeout(12000),
+                headers: launchAuthToken
+                    ? { "X-Cortex-Auth-Token": launchAuthToken }
+                    : undefined,
+            });
+            const data = await resp.json();
+            if (data.status === "starting" || data.status === "already_running") {
+                if (await waitAndEnableCamera(16)) {
+                    return { ok: true, status: "camera_enabled" };
+                }
+                lastError = "Daemon started via launcher but WebSocket not connected";
+            }
+        } catch {
+            // Launcher not running — try next path
+        }
+
+        // Path 2: Native messaging
+        const nativeResult = await new Promise<Record<string, string>>((resolve) => {
+            try {
+                chrome.runtime.sendNativeMessage(
+                    "com.cortex.launcher",
+                    { command: "launch" },
+                    (response) => {
+                        if (chrome.runtime.lastError) {
+                            resolve({ status: "native_error", error: chrome.runtime.lastError.message || "Native messaging failed" });
+                        } else {
+                            resolve(response || { status: "no_response" });
+                        }
+                    },
+                );
+            } catch {
+                resolve({ status: "native_unavailable", error: "Native messaging not available" });
+            }
+        });
+
+        if (nativeResult.status === "launched" || nativeResult.status === "already_running") {
+            if (await waitAndEnableCamera(10)) {
+                return { ok: true, status: "camera_enabled" };
+            }
+            lastError = "Daemon started via native messaging but WebSocket not connected";
+        } else {
+            lastError = nativeResult.error || "Native messaging failed";
+        }
+
+        // Path 3: Direct WebSocket — daemon may already be running
+        if (await waitAndEnableCamera(4)) {
+            return { ok: true, status: "camera_enabled" };
+        }
+
+        return {
+            ok: false,
+            status: "not_connected",
+            error: lastError || "Could not start daemon. Run in terminal: python -m cortex.scripts.run_dev",
+        };
+    } catch (e) {
+        return { ok: false, status: "error", error: String(e) };
+    }
+}
+
 // --- Focus Session Logic ---
 
 function startFocusSession(goal: string): void {
@@ -2198,9 +2454,122 @@ function stopFocusSession(): FocusSession | null {
     // Save to daily stats
     saveToDailyStats(session);
     focusSession = null;
+    autoFocusArmed = false;
+    autoFocusEndsAt = null;
+    activeFocusPresetPatterns = [];
+    activeFocusCustomDomains = [];
+    _activeFocusPresetName = "developer";
+    if (autoFocusAlarmName) {
+        try {
+            chrome.alarms.clear(autoFocusAlarmName);
+        } catch { /* alarms API may be unavailable */ }
+        autoFocusAlarmName = null;
+    }
     schedulePersist();
     broadcastToPopup({ type: "FOCUS_SESSION_ENDED", session });
     return session;
+}
+
+/**
+ * P0 §3.10: daemon-armed focus-session arming.
+ *
+ * Distinct from {@link startFocusSession} so the symmetric
+ * STOP_FOCUS_AUTO knows whether the tear-down is legitimate. The
+ * session goal is set to a synthetic value so the existing popup +
+ * dashboard surfaces can render meaningful copy without modification.
+ */
+function startAutoFocusSession(opts: {
+    preset: string;
+    customDomains: string[];
+    durationMinutes: number;
+    reason: string;
+}): void {
+    const now = Date.now();
+    // If a manual session is already running, do NOT override it — the
+    // user's explicit intent wins. The daemon retries after the next
+    // tick if HYPER persists.
+    if (focusSession && !autoFocusArmed) {
+        if (DEBUG) {
+            console.log("Cortex: skipping auto-arm — manual focus session active");
+        }
+        return;
+    }
+    focusSession = {
+        startTime: now,
+        totalFocusMs: 0,
+        distractionsBlocked: 0,
+        lastFocusCheck: now,
+        lastStateWasFocus: false,
+        longestStreakMs: 0,
+        currentStreakStart: 0,
+        goal: `Auto-focus (${opts.reason})`,
+    };
+    autoFocusArmed = true;
+    autoFocusEndsAt = now + opts.durationMinutes * 60_000;
+    _activeFocusPresetName = opts.preset;
+    activeFocusPresetPatterns =
+        FOCUS_PRESET_DOMAINS[opts.preset] || FOCUS_PRESET_DOMAINS.developer;
+    activeFocusCustomDomains = opts.customDomains.slice(0, 100);
+    // Schedule a chrome.alarm to terminate the session after duration
+    // — survives MV3 service-worker restarts (a setTimeout would not).
+    autoFocusAlarmName = `cortex_auto_focus_${now}`;
+    try {
+        chrome.alarms.create(autoFocusAlarmName, {
+            when: autoFocusEndsAt,
+        });
+    } catch { /* alarms API may be unavailable in test harnesses */ }
+    schedulePersist();
+    broadcastToPopup({
+        type: "FOCUS_SESSION_STARTED",
+        goal: focusSession.goal,
+        autoArmed: true,
+        preset: opts.preset,
+        endsAt: autoFocusEndsAt,
+    });
+    if (DEBUG) {
+        console.log(
+            `Cortex: auto-armed focus session (preset=${opts.preset}, ${opts.durationMinutes} min)`,
+        );
+    }
+}
+
+/**
+ * P0 §3.10: tear down only an auto-armed focus session. A manual
+ * session is left untouched. Phase-3 P0-DF-10.1: notify the daemon
+ * when WE initiated the stop (duration_elapsed / post_restore) so
+ * its ``_auto_focus_armed`` flag clears in lockstep with ours;
+ * without this round-trip the daemon believes the session is still
+ * armed and skips re-arming on the next HYPER episode.
+ */
+function stopAutoFocusSession(reason: string): FocusSession | null {
+    if (!focusSession || !autoFocusArmed) return null;
+    const result = stopFocusSession();
+    // Only the extension's local tear-down paths (alarm timeout /
+    // post-restore expiry) need to inform the daemon; receipt of a
+    // daemon-emitted STOP_FOCUS_AUTO has the daemon already cleared.
+    const isExtensionInitiated =
+        reason === "duration_elapsed"
+        || reason === "duration_elapsed_post_restore"
+        || reason === "user_disarm_local";
+    if (isExtensionInitiated && connected && ws) {
+        try {
+            send({
+                type: "USER_ACTION",
+                payload: {
+                    action: "auto_focus_stopped",
+                    reason,
+                    source: "browser_extension",
+                    timestamp: Date.now() / 1000,
+                },
+                timestamp: Date.now() / 1000,
+                sequence: ++sequence,
+            });
+        } catch {
+            // WS may be mid-reconnect; daemon will reconcile on next
+            // STATE_UPDATE tick since exit_gate is symmetric.
+        }
+    }
+    return result;
 }
 
 function updateFocusSession(payload: Record<string, unknown>): void {
@@ -2286,6 +2655,18 @@ function extractGoalKeywords(goal: string): string[] {
 }
 
 function isDistractionUrl(url: string, title?: string): boolean {
+    // P0 §3.10: when the daemon (or the user) armed a focus session
+    // with a preset / custom blocklist, treat any matching domain as
+    // a distraction regardless of the conditional rules below.
+    if (focusSession) {
+        if (activeFocusPresetPatterns.some((p) => p.test(url))) return true;
+        if (activeFocusCustomDomains.length > 0) {
+            const lowered = url.toLowerCase();
+            if (activeFocusCustomDomains.some((d) => lowered.includes(d.toLowerCase()))) {
+                return true;
+            }
+        }
+    }
     if (ALWAYS_DISTRACTION.some((p) => p.test(url))) return true;
     if (AI_ASSISTANT_URL_PATTERN.test(url)) return false;
     if (VIDEO_PLATFORM_URL_PATTERN.test(url)) {
@@ -3280,6 +3661,96 @@ function broadcastToPopup(message: Record<string, unknown>): void {
 }
 
 /**
+ * P0 §3.12: surface an INTERVENTION_TRIGGER via OS-level cues when the
+ * desktop dashboard isn't the active window.
+ *
+ * Two surfaces in parallel:
+ *   1. ``chrome.action.setBadgeText`` bumps the toolbar badge to "1"
+ *      so users glancing at the toolbar see the pending cue.
+ *   2. ``chrome.notifications.create`` fires a system notification
+ *      with two buttons: Open (focuses the dashboard via
+ *      ``LAUNCH_CORTEX``) and Snooze (sends SNOOZE_REQUEST).
+ *
+ * Privacy invariant: the body shows only the LLM-generated headline
+ * (already F09-sanitised). No biometric values cross the boundary.
+ */
+function surfaceInterventionOSNotification(
+    payload: Record<string, unknown>,
+    correlationId: string,
+): void {
+    const headline = String(payload.headline || "Cortex");
+    const focusHint = String(payload.primary_focus || "");
+    const interventionId = String(payload.intervention_id || "");
+
+    // 1) Badge bump — visible in any tab.
+    try {
+        const action = (chrome as unknown as {
+            action?: { setBadgeText: (d: { text: string }) => void;
+                setBadgeBackgroundColor: (d: { color: string }) => void; };
+        }).action;
+        if (action) {
+            action.setBadgeText({ text: "1" });
+            action.setBadgeBackgroundColor({ color: "#D97757" });
+        }
+    } catch { /* badge unavailable */ }
+
+    // 2) System notification with action buttons.
+    try {
+        const notifications = (chrome as unknown as {
+            notifications?: {
+                create: (
+                    id: string,
+                    opts: Record<string, unknown>,
+                    cb?: (id: string) => void,
+                ) => void;
+            };
+        }).notifications;
+        if (!notifications || typeof notifications.create !== "function") {
+            return;
+        }
+        const notificationId = `cortex_intervention_${interventionId || correlationId}`;
+        // Phase-3 P0-N1: ``assets/icon128.png`` does not exist in the
+        // Plasmo build output (the manifest's per-size icons are
+        // emitted with content hashes that change every build). The
+        // only stable, packaged asset is ``assets/icon.png`` (512x512),
+        // resolved here via ``chrome.runtime.getURL`` which gives an
+        // absolute ``chrome-extension://`` URL that chrome.notifications
+        // can fetch. Without this fix the OS notification path is
+        // silently broken in every signed production build.
+        const iconUrl = chrome.runtime.getURL("assets/icon.png");
+        const body = focusHint
+            ? `${focusHint}`
+            : "Cortex has a suggestion for you.";
+        notifications.create(notificationId, {
+            type: "basic",
+            title: `Cortex · ${headline}`.slice(0, 96),
+            message: body.slice(0, 240),
+            iconUrl,
+            priority: 1,
+            requireInteraction: false,
+            buttons: [
+                { title: "Open" },
+                { title: "Snooze" },
+            ],
+        }, (createdId?: string) => {
+            // Phase-3 P0-N1: surface the lastError so a future
+            // missing-asset regression fails loudly in logs instead
+            // of silently dropping the notification.
+            if (chrome.runtime.lastError) {
+                console.warn(
+                    "cortex.bg notifications.create lastError",
+                    chrome.runtime.lastError.message,
+                );
+            } else if (!createdId) {
+                console.debug("cortex.bg notifications.create returned no id");
+            }
+        });
+    } catch {
+        // notifications unavailable
+    }
+}
+
+/**
  * P0 §3.3: toggle the toolbar action badge to signal a pending session
  * recap. ``chrome.action.*`` is MV3-only; we guard the call so the
  * background script keeps loading cleanly in test harnesses (jsdom)
@@ -3529,113 +4000,60 @@ chrome.runtime.onMessage.addListener(
                 sendResponse({ ok: true, quietMode });
                 break;
 
+            case "QUIET_MODE_TOGGLE":
+                // P0 §3.11: the popup surfaces the three-kind quiet
+                // menu (Snooze 15 / Quiet rest of session / Pause).
+                // Relay the kind + optional duration to the daemon so
+                // QUIET_MODE_STATE broadcasts back the unified state.
+                if (connected && ws) {
+                    send({
+                        type: "QUIET_MODE_TOGGLE",
+                        payload: {
+                            kind: (message.kind as string | undefined) || "off",
+                            duration_minutes:
+                                typeof message.duration_minutes === "number"
+                                    ? message.duration_minutes
+                                    : null,
+                            source: "popup",
+                        },
+                        timestamp: Date.now() / 1000,
+                        sequence: ++sequence,
+                    });
+                }
+                sendResponse({ ok: true });
+                break;
+
+            case "SNOOZE_REQUEST":
+                // P0 §3.11: relay a popup snooze click as the canonical
+                // SNOOZE_REQUEST wire type so the daemon's source
+                // attribution stays accurate.
+                if (connected && ws) {
+                    send({
+                        type: "SNOOZE_REQUEST",
+                        payload: {
+                            duration_minutes:
+                                typeof message.duration_minutes === "number"
+                                    ? message.duration_minutes
+                                    : 15,
+                            source: "popup",
+                        },
+                        timestamp: Date.now() / 1000,
+                        sequence: ++sequence,
+                    });
+                }
+                sendResponse({ ok: true });
+                break;
+
             case "LAUNCH_CORTEX":
                 // Try three launch paths in order:
                 // 1. HTTP launcher agent (port 9471) — works if user started launcher manually
                 // 2. Native messaging — Chrome invokes native_host.py directly
                 // 3. Direct WebSocket — daemon may already be running
-                (async () => {
-                    let lastError = "";
-
-                    // Helper: wait for WebSocket connection and enable camera
-                    const waitAndEnableCamera = async (maxAttempts: number): Promise<boolean> => {
-                        if (!connected) connect();
-                        let attempts = 0;
-                        while (!connected && attempts < maxAttempts) {
-                            await new Promise((r) => setTimeout(r, 500));
-                            attempts++;
-                        }
-                        if (connected && ws) {
-                            send({
-                                type: "SETTINGS_SYNC",
-                                payload: { webcam_enabled: true },
-                                timestamp: Date.now() / 1000,
-                                sequence: ++sequence,
-                            });
-                            return true;
-                        }
-                        return false;
-                    };
-
+                runLaunchCortex().then((result) => {
                     try {
-                        // Path 1: HTTP launcher agent on port 9471
-                        try {
-                            // Audit-2 fix: attach the capability token so the
-                            // launcher's /launch CSRF gate (mirror of /stop)
-                            // accepts the request. Without this header the
-                            // launcher returns 401 and the path-2 fallback
-                            // (native messaging) is forced.
-                            let launchAuthToken: string | null = null;
-                            try {
-                                launchAuthToken = await getAuthToken();
-                            } catch {
-                                launchAuthToken = null;
-                            }
-                            const resp = await fetch(`${LAUNCHER_HTTP_URL}/launch`, {
-                                method: "POST",
-                                signal: AbortSignal.timeout(12000),
-                                headers: launchAuthToken
-                                    ? { "X-Cortex-Auth-Token": launchAuthToken }
-                                    : undefined,
-                            });
-                            const data = await resp.json();
-                            if (data.status === "starting" || data.status === "already_running") {
-                                // Daemon spawned/running — wait for WebSocket
-                                if (await waitAndEnableCamera(16)) {
-                                    sendResponse({ ok: true, status: "camera_enabled" });
-                                    return;
-                                }
-                                lastError = "Daemon started via launcher but WebSocket not connected";
-                            }
-                        } catch {
-                            // Launcher not running — try next path
-                        }
-
-                        // Path 2: Native messaging
-                        const nativeResult = await new Promise<Record<string, string>>((resolve) => {
-                            try {
-                                chrome.runtime.sendNativeMessage(
-                                    "com.cortex.launcher",
-                                    { command: "launch" },
-                                    (response) => {
-                                        if (chrome.runtime.lastError) {
-                                            resolve({ status: "native_error", error: chrome.runtime.lastError.message || "Native messaging failed" });
-                                        } else {
-                                            resolve(response || { status: "no_response" });
-                                        }
-                                    }
-                                );
-                            } catch {
-                                resolve({ status: "native_unavailable", error: "Native messaging not available" });
-                            }
-                        });
-
-                        if (nativeResult.status === "launched" || nativeResult.status === "already_running") {
-                            if (await waitAndEnableCamera(10)) {
-                                sendResponse({ ok: true, status: "camera_enabled" });
-                                return;
-                            }
-                            lastError = "Daemon started via native messaging but WebSocket not connected";
-                        } else {
-                            lastError = nativeResult.error || "Native messaging failed";
-                        }
-
-                        // Path 3: Direct WebSocket — daemon may already be running
-                        if (await waitAndEnableCamera(4)) {
-                            sendResponse({ ok: true, status: "camera_enabled" });
-                            return;
-                        }
-
-                        // All paths failed
-                        sendResponse({
-                            ok: false,
-                            status: "not_connected",
-                            error: lastError || "Could not start daemon. Run in terminal: python -m cortex.scripts.run_dev",
-                        });
-                    } catch (e) {
-                        sendResponse({ ok: false, status: "error", error: String(e) });
-                    }
-                })();
+                        sendResponse(result);
+                    } catch { /* response port may be closed */ }
+                });
                 return true; // async
 
             case "USER_ACTION": {
@@ -4261,6 +4679,13 @@ chrome.alarms.onAlarm.addListener((alarm) => {
             }
             if (changed) await saveActivities(activities);
         });
+    } else if (alarm.name && alarm.name.startsWith("cortex_auto_focus_")) {
+        // P0 §3.10: auto-focus session timed out. Tear down cleanly so
+        // the user isn't permanently kept in focus mode after a HYPER
+        // episode that didn't recover within the configured window.
+        if (autoFocusArmed) {
+            stopAutoFocusSession("duration_elapsed");
+        }
     } else if (alarm.name === TRENDS_REFRESH_ALARM_NAME) {
         // P0 §3.2: keep the popup's "Last 7 days" sparkbar strip warm
         // without requiring the user to explicitly refresh. The alarm
@@ -4322,6 +4747,128 @@ connect();
 // G2 (audit-prod): cold-start probe so a popup opened immediately after
 // service-worker activation has a non-null connectivity diagnostic.
 void probeConnectivity("activation").catch(() => undefined);
+
+// P0 §3.12: notification button click handlers. The OS-notification
+// path (``surfaceInterventionOSNotification``) emits notifications with
+// id ``cortex_intervention_<id>`` and two buttons: 0 = "Open", 1 = "Snooze".
+// Cancel the notification after click so it doesn't linger in the
+// Notification Center.
+try {
+    const notifications = (chrome as unknown as {
+        notifications?: {
+            onButtonClicked?: {
+                addListener: (
+                    cb: (notificationId: string, buttonIndex: number) => void,
+                ) => void;
+            };
+            onClicked?: {
+                addListener: (cb: (notificationId: string) => void) => void;
+            };
+            clear?: (id: string, cb?: (wasCleared: boolean) => void) => void;
+        };
+    }).notifications;
+    if (notifications && notifications.onButtonClicked) {
+        notifications.onButtonClicked.addListener(
+            (notificationId: string, buttonIndex: number) => {
+                if (!notificationId.startsWith("cortex_intervention_")) return;
+                const interventionId = notificationId.replace(
+                    "cortex_intervention_",
+                    "",
+                );
+                if (buttonIndex === 0) {
+                    // Phase-3 P0-N3: ``chrome.runtime.sendMessage``
+                    // from the SW does NOT dispatch to the same SW's
+                    // ``onMessage`` listener — call the launch path
+                    // directly. We also record the engagement as a
+                    // USER_ACTION so the helpfulness tracker can
+                    // attribute "user opened from notification" vs
+                    // "user ignored it".
+                    if (connected && ws && interventionId) {
+                        send({
+                            type: "USER_ACTION",
+                            payload: {
+                                action: "os_notification_opened",
+                                intervention_id: interventionId,
+                                source: "os_notification",
+                                timestamp: Date.now() / 1000,
+                            },
+                            timestamp: Date.now() / 1000,
+                            sequence: ++sequence,
+                        });
+                    }
+                    void runLaunchCortex().catch((e) => {
+                        console.warn("cortex.bg LAUNCH from notification failed", e);
+                    });
+                } else if (buttonIndex === 1) {
+                    // Snooze → SNOOZE_REQUEST for 15 min. The daemon
+                    // unifies into QUIET_MODE_STATE so every surface
+                    // mirrors.
+                    if (connected && ws) {
+                        send({
+                            type: "SNOOZE_REQUEST",
+                            payload: {
+                                intervention_id: interventionId,
+                                duration_minutes: 15,
+                                source: "os_notification",
+                            },
+                            timestamp: Date.now() / 1000,
+                            sequence: ++sequence,
+                        });
+                    }
+                }
+                if (notifications.clear) {
+                    try {
+                        notifications.clear(notificationId);
+                    } catch { /* clear unavailable */ }
+                }
+                // Drop the action badge once the user dealt with the notification.
+                try {
+                    const action = (chrome as unknown as {
+                        action?: { setBadgeText: (d: { text: string }) => void };
+                    }).action;
+                    if (action) action.setBadgeText({ text: "" });
+                } catch { /* badge unavailable */ }
+            },
+        );
+    }
+    if (notifications && notifications.onClicked) {
+        notifications.onClicked.addListener((notificationId: string) => {
+            if (!notificationId.startsWith("cortex_intervention_")) return;
+            const interventionId = notificationId.replace(
+                "cortex_intervention_", "",
+            );
+            if (connected && ws && interventionId) {
+                send({
+                    type: "USER_ACTION",
+                    payload: {
+                        action: "os_notification_opened",
+                        intervention_id: interventionId,
+                        source: "os_notification",
+                        timestamp: Date.now() / 1000,
+                    },
+                    timestamp: Date.now() / 1000,
+                    sequence: ++sequence,
+                });
+            }
+            void runLaunchCortex().catch((e) => {
+                console.warn("cortex.bg LAUNCH from notification failed", e);
+            });
+            if (notifications.clear) {
+                try {
+                    notifications.clear(notificationId);
+                } catch { /* clear unavailable */ }
+            }
+            try {
+                const action = (chrome as unknown as {
+                    action?: { setBadgeText: (d: { text: string }) => void };
+                }).action;
+                if (action) action.setBadgeText({ text: "" });
+            } catch { /* badge unavailable */ }
+        });
+    }
+} catch {
+    // notifications API may be unavailable in test harness; safe to ignore.
+}
 
 // P0 §3.2: the trends-refresh poll lives on ``chrome.alarms`` (see the
 // ``cortex-trends-refresh`` registration above) rather than
