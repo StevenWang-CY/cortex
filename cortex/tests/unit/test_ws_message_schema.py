@@ -68,6 +68,8 @@ def test_message_type_catalog_covers_dispatch_arms() -> None:
         "REQUEST_SESSION_DETAIL",
         "REQUEST_TRENDS",
         "REQUEST_SESSION_RECAP",
+        # P0 §3.6 — micro-step toggle
+        "MICRO_STEP_TOGGLED",
     }
     catalog = {m.value for m in MessageType}
     missing = dispatched_inbound - catalog

@@ -302,7 +302,7 @@ class TestBlocklist:
         enriched = enrich_plan_with_context(plan, ctx)
         # Only the specific step should survive
         assert len(enriched.micro_steps) == 1
-        assert "NameError" in enriched.micro_steps[0]
+        assert "NameError" in enriched.micro_steps[0].text
 
 
 # =========================================================================

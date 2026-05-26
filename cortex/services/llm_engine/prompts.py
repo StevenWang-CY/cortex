@@ -585,6 +585,79 @@ Complexity: {complexity:.2f}
 """
 
 # ---------------------------------------------------------------------------
+# P0 §3.5 — HYPO / RECOVERY templates
+# ---------------------------------------------------------------------------
+
+_RE_ENGAGE_PLANNER = """\
+The user is DISENGAGED (state=HYPO). Sustained low keystroke + low scroll \
+activity correlated with sub-baseline heart rate indicates they have drifted \
+away from their task. They are NOT overwhelmed — they are simply no longer \
+acting on the workspace. Your job is to GENTLY pull them back, not to alarm \
+them or scold them.
+
+Generate ONE concrete re-engagement nudge. Prefer, in order:
+
+1. ``resume_last_active_file`` — if the workspace context names the user's \
+   most recent code symbol or file (target format: "file_path:line"). This \
+   is the single highest-impact action: they have a specific place to land. \
+   Set ``intervention_type="overlay_only"`` and ``tone="supportive"``.
+2. ``prompt_micro_commit`` — if the editor context shows unstaged changes, \
+   offering "you have N+ unstaged changes — consider a draft commit" is a \
+   low-friction restart cue.
+3. ``suggest_movement_break`` — if neither file-resume nor commit data is \
+   available. Target is a duration string like "2" (minutes).
+
+Rules:
+- Tone must be GENTLE NUDGE — never alarm. The user feels fine; they just \
+  drifted.
+- micro_steps should be exactly ONE step in HYPO ("Open the file you were \
+  editing"), not three.
+- causal_explanation must reference observable behaviour ("You haven't \
+  typed in N minutes" / "Your last edit was M minutes ago"), NOT raw \
+  biometric numbers.
+- headline under 15 words, casual ("Pick up where you left off?", \
+  "Resume auth.py at line 67?", "Short break?").
+- DO NOT generate ``close_tab`` / ``group_tabs`` / ``bookmark_and_close`` \
+  actions for HYPO — those are HYPER tools.
+
+Focus goal: {goal_hint}
+
+{context}
+
+State: {state} (confidence {confidence:.0%}, dwelling {dwell:.0f}s)
+Complexity: {complexity:.2f}
+{constraints_text}
+{extra_context}
+"""
+
+_RECOVERY_REINFORCER = """\
+The user just emerged from HYPER (overwhelm). They are in the RECOVERY \
+window — fragile but back on track. DO NOT propose new tasks, DO NOT open \
+files, DO NOT close anything. Your only job is a brief acknowledgement.
+
+Generate a MINIMAL plan:
+- Exactly ONE micro_step — a single-line affirmation like \
+  "Stay with the thread you're on for the next 5 minutes".
+- headline: a single line under 12 words, e.g. "You're back in flow — keep \
+  going" or "Nice — back on track".
+- intervention_type MUST be "overlay_only".
+- tone MUST be "minimal".
+- DO NOT emit suggested_actions. DO NOT emit error_analysis. DO NOT emit \
+  tab_recommendations. The overlay's only job is the headline.
+- causal_explanation: 1 sentence noting they recently re-stabilised; never \
+  cite biometrics.
+
+Focus goal: {goal_hint}
+
+{context}
+
+State: {state} (confidence {confidence:.0%}, dwelling {dwell:.0f}s)
+Complexity: {complexity:.2f}
+{constraints_text}
+{extra_context}
+"""
+
+# ---------------------------------------------------------------------------
 # Template registry
 # ---------------------------------------------------------------------------
 
@@ -601,7 +674,25 @@ PROMPT_TEMPLATES: dict[str, str] = {
     "rabbit_hole": _RABBIT_HOLE_PROMPT,
     "alignment_summary": _ALIGNMENT_SUMMARY,
     "deep_bottleneck_diagnosis": _DEEP_BOTTLENECK_DIAGNOSIS,
+    # P0 §3.5 — state-dispatched templates
+    "re_engage_planner": _RE_ENGAGE_PLANNER,
+    "recovery_reinforcer": _RECOVERY_REINFORCER,
 }
+
+
+def _dispatch_by_state(state: str) -> str | None:
+    """P0 §3.5: pick a template purely from the user state.
+
+    Returns ``"re_engage_planner"`` for HYPO, ``"recovery_reinforcer"``
+    for RECOVERY, or ``None`` to fall through to the mode-based
+    selector. Kept module-level so :func:`select_prompt_template` can
+    consult it before applying the legacy HYPER/FLOW logic.
+    """
+    if state == "HYPO":
+        return "re_engage_planner"
+    if state == "RECOVERY":
+        return "recovery_reinforcer"
+    return None
 
 
 def _compute_prompt_template_version() -> str:
@@ -633,18 +724,35 @@ def _compute_prompt_template_version() -> str:
 PROMPT_TEMPLATE_VERSION: str = _compute_prompt_template_version()
 
 
-def select_prompt_template(context: TaskContext) -> str:
+def select_prompt_template(
+    context: TaskContext,
+    state: str | None = None,
+) -> str:
     """
     Select the best prompt template based on workspace mode and context.
 
     Selection logic:
+    - P0 §3.5: ``state="HYPO"``      → re_engage_planner
+    - P0 §3.5: ``state="RECOVERY"``  → recovery_reinforcer
     - terminal_errors → debug_error_summary
     - coding_debugging with many errors → debug_error_summary
     - coding_debugging otherwise → code_focus_reduction
     - browsing with many tabs → browser_tab_reduction
     - reading_docs → calm_overlay_writer (mild intervention)
     - mixed / fallback → micro_step_planner
+
+    Args:
+        context: Workspace context (mode, tab count, etc.).
+        state: Optional user state. When ``"HYPO"`` or ``"RECOVERY"``,
+            short-circuits the mode-based logic and returns the
+            state-specific template. ``None`` (default) preserves the
+            legacy mode-only behaviour for backwards compatibility.
     """
+    if state is not None:
+        state_template = _dispatch_by_state(state)
+        if state_template is not None:
+            return state_template
+
     mode = context.mode
 
     if mode == "terminal_errors":
@@ -691,7 +799,10 @@ def build_user_prompt(
         Formatted user prompt string.
     """
     if template_name is None:
-        template_name = select_prompt_template(context)
+        # P0 §3.5: pass the live user state so HYPO/RECOVERY can claim
+        # their state-specific templates ahead of the mode-based logic.
+        state_literal = state.state if hasattr(state, "state") else None
+        template_name = select_prompt_template(context, state_literal)
 
     template = PROMPT_TEMPLATES[template_name]
 

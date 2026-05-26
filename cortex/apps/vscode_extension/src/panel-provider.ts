@@ -105,8 +105,9 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
 
     // --- Internal ---
 
-    private _handleWebviewMessage(message: Record<string, string>): void {
-        switch (message.command) {
+    private _handleWebviewMessage(message: Record<string, unknown>): void {
+        const command = String(message.command || "");
+        switch (command) {
             case "dismiss":
                 if (this._currentPayload) {
                     this._wsClient.sendUserAction(
@@ -125,6 +126,29 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                     );
                 }
                 break;
+
+            case "microStepToggled": {
+                // P0 §3.6: forward the webview's micro-step toggle to
+                // the daemon via the existing WS client. The daemon
+                // mutates the active plan and rebroadcasts
+                // INTERVENTION_TRIGGER so peer surfaces sync.
+                if (!this._currentPayload) break;
+                const interventionId = this._currentPayload.intervention_id as string;
+                if (!interventionId) break;
+                const stepIndex = Number(message.step_index);
+                const rawStatus = String(message.new_status || "");
+                if (!Number.isFinite(stepIndex) || stepIndex < 0) break;
+                const newStatus: "pending" | "done" | "skipped" =
+                    rawStatus === "done" || rawStatus === "skipped" || rawStatus === "pending"
+                        ? rawStatus
+                        : "pending";
+                this._wsClient.sendMicroStepToggled(
+                    interventionId,
+                    stepIndex,
+                    newStatus,
+                );
+                break;
+            }
         }
     }
 
@@ -195,20 +219,38 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             const focus = this._escapeHtml(
                 (payload.primary_focus as string) ?? "",
             );
-            // Guard against malformed payloads (non-array, mixed types):
-            // an unchecked cast would let a stray number/object reach _escapeHtml
-            // and stringify into the rendered HTML.
-            const steps = Array.isArray(payload.micro_steps)
-                ? payload.micro_steps.filter((s): s is string => typeof s === "string")
-                : [];
+            // P0 §3.6: micro_steps may carry either the legacy ``string[]``
+            // shape OR the new ``{text, status, …}[]`` shape. Coerce both
+            // into a uniform ``{text, status}`` tuple list so the
+            // strikethrough styling reflects daemon-authoritative state.
+            const stepsRaw = Array.isArray(payload.micro_steps) ? payload.micro_steps : [];
+            type StepRow = { text: string; status: "pending" | "done" | "skipped" };
+            const steps: StepRow[] = [];
+            for (const entry of stepsRaw) {
+                if (typeof entry === "string" && entry.length > 0) {
+                    steps.push({ text: entry, status: "pending" });
+                } else if (entry && typeof entry === "object") {
+                    const e = entry as Record<string, unknown>;
+                    const text = typeof e.text === "string" ? e.text : "";
+                    const rawStatus = typeof e.status === "string" ? e.status : "pending";
+                    const status: "pending" | "done" | "skipped" =
+                        rawStatus === "done" || rawStatus === "skipped" ? rawStatus : "pending";
+                    if (text.length > 0) steps.push({ text, status });
+                }
+            }
 
             let stepsHtml = "";
             for (let i = 0; i < steps.length; i++) {
-                const step = this._escapeHtml(steps[i]);
+                const step = this._escapeHtml(steps[i].text);
+                const isDone = steps[i].status === "done";
+                const checkedAttr = isDone ? " checked" : "";
+                const struckStyle = isDone
+                    ? ' style="text-decoration: line-through; opacity: 0.7;"'
+                    : "";
                 stepsHtml += `
                     <label class="step">
-                        <input type="checkbox" id="step-${i}" />
-                        <span>${step}</span>
+                        <input type="checkbox" id="step-${i}" data-step-index="${i}"${checkedAttr} />
+                        <span${struckStyle}>${step}</span>
                     </label>`;
             }
 
@@ -456,10 +498,33 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             });
         }
 
-        // Checkbox engagement tracking
+        // P0 §3.6: micro-step checkbox toggle. Each click posts a
+        // ``microStepToggled`` message to the extension, which forwards
+        // it as MICRO_STEP_TOGGLED via the WS client. The daemon
+        // rebroadcasts INTERVENTION_TRIGGER so the strikethrough state
+        // converges across every connected surface.
         document.querySelectorAll('.step input').forEach(cb => {
-            cb.addEventListener('change', () => {
-                vscode.postMessage({ command: 'engage' });
+            cb.addEventListener('change', (ev) => {
+                const target = ev.target;
+                const index = parseInt(target.getAttribute('data-step-index') || '-1', 10);
+                if (!Number.isFinite(index) || index < 0) return;
+                const newStatus = target.checked ? 'done' : 'pending';
+                // Optimistic local strikethrough — daemon will reconcile.
+                const span = target.parentElement && target.parentElement.querySelector('span');
+                if (span) {
+                    if (newStatus === 'done') {
+                        span.style.textDecoration = 'line-through';
+                        span.style.opacity = '0.7';
+                    } else {
+                        span.style.textDecoration = 'none';
+                        span.style.opacity = '1';
+                    }
+                }
+                vscode.postMessage({
+                    command: 'microStepToggled',
+                    step_index: index,
+                    new_status: newStatus,
+                });
             });
         });
 

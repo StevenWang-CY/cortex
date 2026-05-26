@@ -224,3 +224,61 @@ def test_filter_is_idempotent() -> None:
     once = filter_unsafe_actions(plan, tab_count=5)
     twice = filter_unsafe_actions(once, tab_count=5)
     assert [a.tab_index for a in twice.suggested_actions] == [0]
+
+
+# ---------------------------------------------------------------------------
+# P0 §3.5 — new HYPO / RECOVERY action types
+# ---------------------------------------------------------------------------
+
+
+def test_resume_last_active_file_in_action_type_union() -> None:
+    """Schema must accept resume_last_active_file with a file_path:line target."""
+    action = SuggestedAction(
+        action_type="resume_last_active_file",
+        target="/home/user/auth.py:67",
+        label="Resume auth.py",
+    )
+    assert action.action_type == "resume_last_active_file"
+    assert action.target.endswith(":67")
+
+
+def test_suggest_movement_break_in_action_type_union() -> None:
+    action = SuggestedAction(
+        action_type="suggest_movement_break",
+        target="2",
+        label="2-min stretch",
+    )
+    assert action.action_type == "suggest_movement_break"
+
+
+def test_prompt_micro_commit_in_action_type_union() -> None:
+    action = SuggestedAction(
+        action_type="prompt_micro_commit",
+        target="",
+        label="Save a checkpoint",
+    )
+    assert action.action_type == "prompt_micro_commit"
+
+
+def test_consent_levels_for_new_action_types() -> None:
+    """resume_last_active_file = REVERSIBLE_ACT; others = SUGGEST (P0 §3.5)."""
+    from cortex.services.consent.policy import (
+        DEFAULT_ACTION_LEVELS,
+        REVERSIBLE_ACT,
+        SUGGEST,
+    )
+
+    assert DEFAULT_ACTION_LEVELS["resume_last_active_file"] == REVERSIBLE_ACT
+    assert DEFAULT_ACTION_LEVELS["prompt_micro_commit"] == SUGGEST
+    assert DEFAULT_ACTION_LEVELS["suggest_movement_break"] == SUGGEST
+
+
+def test_resume_last_active_file_target_length_cap() -> None:
+    """_TARGET_MAX_LEN for resume_last_active_file = 300 (see intervention.py)."""
+    with pytest.raises(ValidationError) as exc:
+        SuggestedAction(
+            action_type="resume_last_active_file",
+            target="x" * 301,
+            label="too long",
+        )
+    assert "too long" in str(exc.value)

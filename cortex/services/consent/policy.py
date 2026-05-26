@@ -45,6 +45,11 @@ DEFAULT_ACTION_LEVELS: dict[str, int] = {
     "shutdown_workspace": AUTONOMOUS_ACT,
     "launch_project": AUTONOMOUS_ACT,
     "hide_distraction_apps": AUTONOMOUS_ACT,
+
+    # P0 §3.5/§3.6: re-engage + micro-step actions
+    "resume_last_active_file": REVERSIBLE_ACT,
+    "prompt_micro_commit": SUGGEST,
+    "suggest_movement_break": SUGGEST,
 }
 
 

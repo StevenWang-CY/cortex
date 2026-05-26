@@ -12,11 +12,53 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 
-from cortex.libs.schemas.intervention import InterventionOutcome, WorkspaceSnapshot
+from cortex.libs.schemas.intervention import (
+    InterventionOutcome,
+    MicroStep,
+    WorkspaceSnapshot,
+)
 from cortex.libs.schemas.state import StateEstimate
 from cortex.services.intervention_engine.executor import InterventionExecutor
 
 logger = logging.getLogger(__name__)
+
+
+def merge_micro_steps(
+    old: list[MicroStep],
+    new: list[MicroStep],
+) -> list[MicroStep]:
+    """P0 §3.6: F16 intervention-swap step-state preservation.
+
+    When a new intervention payload arrives carrying the same
+    ``intervention_id`` (a F16 atomic swap rather than a brand-new
+    intervention), the user's existing checkbox state on the overlay
+    MUST survive. The naive ``plan.micro_steps = new`` assignment
+    would wipe every ``status="done"`` set by the user since the
+    previous emission.
+
+    Rules:
+      * If ``old`` and ``new`` have the same length AND the texts
+        match at each index, preserve the OLD entry verbatim (its
+        ``status``, ``started_at``, ``completed_at`` win).
+      * If the lengths differ, use ``new`` verbatim — the LLM has
+        clearly produced a structurally different plan.
+      * If the lengths match but a text differs at an index, prefer
+        the NEW entry at that index (the LLM rewrote the step;
+        resetting to ``"pending"`` is correct since the instruction
+        the user ticked off no longer exists).
+
+    The two lists are short (1-3 entries by schema constraint) so a
+    simple per-index scan is fast and intent-revealing.
+    """
+    if len(old) != len(new):
+        return list(new)
+    merged: list[MicroStep] = []
+    for old_step, new_step in zip(old, new):
+        if old_step.text == new_step.text:
+            merged.append(old_step)
+        else:
+            merged.append(new_step)
+    return merged
 
 
 @dataclass

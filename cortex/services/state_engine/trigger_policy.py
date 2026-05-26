@@ -27,6 +27,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
@@ -34,6 +35,17 @@ from cortex.libs.config.settings import InterventionConfig, StateConfig
 from cortex.libs.schemas.state import StateEstimate
 from cortex.libs.utils.atomic_write import atomic_write_json
 from cortex.libs.utils.platform import get_config_dir
+from cortex.services.state_engine.hypo_detector import (
+    DEFAULT_HYPO_DWELL_SECONDS,
+    HypoGateConfig,
+    is_disengaged,
+)
+from cortex.services.state_engine.recovery_detector import (
+    DEFAULT_RECOVERY_WINDOW_SECONDS,
+    RecoveryGateConfig,
+    RecoveryReinforcer,
+    in_recovery_window,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +143,8 @@ class TriggerPolicy:
         state_config: StateConfig | None = None,
         *,
         hyper_dwell_seconds: float | None = None,
+        hypo_dwell_seconds: float | None = None,
+        recovery_window_seconds: float | None = None,
         dismissal_model_path: Path | None = None,
         quiet_mode_history_path: Path | None = None,
     ) -> None:
@@ -143,6 +157,37 @@ class TriggerPolicy:
             self._hyper_dwell_seconds = float(
                 (state_config or StateConfig()).hyper_dwell_seconds
             )
+
+        # P0 §3.5: HYPO/RECOVERY gates. Defaults come from the
+        # hypo_detector / recovery_detector modules so a single tuning
+        # knob in settings.py can override them later. Tests inject
+        # short values to fast-forward the gates.
+        self._hypo_dwell_seconds = float(
+            hypo_dwell_seconds
+            if hypo_dwell_seconds is not None
+            else DEFAULT_HYPO_DWELL_SECONDS
+        )
+        self._recovery_window_seconds = float(
+            recovery_window_seconds
+            if recovery_window_seconds is not None
+            else DEFAULT_RECOVERY_WINDOW_SECONDS
+        )
+        # Build per-policy gate configs so we don't share global state
+        # with other policy instances (tests may run several in parallel).
+        self._hypo_gate_config = HypoGateConfig(dwell_seconds=self._hypo_dwell_seconds)
+        self._recovery_gate_config = RecoveryGateConfig(
+            window_seconds=self._recovery_window_seconds,
+            reinforce_cooldown_seconds=self._recovery_window_seconds,
+        )
+        self._recovery_reinforcer = RecoveryReinforcer(self._recovery_gate_config)
+
+        # Tracks the last time we observed a HYPER -> non-HYPER transition
+        # so the RECOVERY detector can age out the window. ``None`` means
+        # the user has never been in HYPER during this session.
+        self._last_hyper_exit_time: float | None = None
+        # Last observed state literal — used to detect HYPER->X exits and
+        # X->HYPER re-entries (the latter resets the reinforcer).
+        self._prev_state: str | None = None
 
         # Cooldown tracking
         self._last_intervention_time: float = 0.0
@@ -252,6 +297,10 @@ class TriggerPolicy:
         typing_burst_seconds: float = 0.0,
         within_work_hours: bool = True,
         current_time: float | None = None,
+        keystroke_rate: float = 0.0,
+        scroll_rate: float = 0.0,
+        hr_delta_pct: float | None = None,
+        enable_hypo_recovery_interventions: bool | None = None,
     ) -> TriggerDecision:
         """
         Evaluate whether an intervention should be triggered.
@@ -259,6 +308,20 @@ class TriggerPolicy:
         Args:
             estimate: Current state estimate from the smoother.
             current_time: Reference time. Defaults to now.
+            keystroke_rate: Keystrokes/minute over the last ~60s. Used by
+                the P0 §3.5 HYPO behavioural-conjunction gate. Default
+                0.0 keeps legacy callers' behaviour identical for HYPER.
+            scroll_rate: Scroll events/minute over the last ~60s. Same
+                discipline as ``keystroke_rate``.
+            hr_delta_pct: HR delta from baseline as a fraction
+                (``-0.10`` = 10 % below baseline). ``None`` (default)
+                means HR not currently measurable; the HYPO HR gate is
+                skipped rather than failed-closed.
+            enable_hypo_recovery_interventions: Optional gate override.
+                When ``None`` (default) the value is read from
+                :class:`InterventionConfig.enable_hypo_recovery_interventions`.
+                When ``False``, HYPO and RECOVERY arms are short-circuited
+                (legacy HYPER-only behaviour preserved exactly).
 
         Returns:
             TriggerDecision with trigger verdict and explanation.
@@ -271,6 +334,17 @@ class TriggerPolicy:
         # ``is_overwhelmed``; we ignore True→True (still HYPER) and any
         # transition into a non-HYPER state.
         self._record_hyper_transition(estimate.is_overwhelmed, now)
+
+        # P0 §3.5: detect HYPER -> non-HYPER transitions for the RECOVERY
+        # reinforcement window, and reset the reinforcer on the inverse
+        # transition so the next post-HYPER window can fire again.
+        if self._prev_state == "HYPER" and estimate.state != "HYPER":
+            self._last_hyper_exit_time = now
+            self._recovery_reinforcer.reset_window()
+        elif self._prev_state != "HYPER" and estimate.state == "HYPER":
+            # User went back into overwhelm — invalidate any stale window.
+            self._recovery_reinforcer.reset_window()
+        self._prev_state = estimate.state
 
         # Compute effective threshold (base + dismissal bumps + adaptive feedback).
         effective_threshold = self._compute_effective_threshold(now)
@@ -381,17 +455,74 @@ class TriggerPolicy:
                 context_complexity=context_complexity,
             )
 
-        # Check state is HYPER
-        if not estimate.is_overwhelmed:
-            return TriggerDecision(
-                should_trigger=False,
-                reason=f"State is {estimate.state}, not HYPER",
-                confidence=confidence,
-                cooldown_remaining=0.0,
-                quiet_mode_active=False,
-                effective_threshold=effective_threshold,
-                context_complexity=context_complexity,
+        # ------------------------------------------------------------------
+        # P0 §3.5: state-dispatch.
+        #
+        # The shared gates above (receptivity, quiet mode, cooldown, hourly
+        # cap) run BEFORE the dispatch so they uniformly apply to every
+        # state arm. The state-specific gate decides whether *this state*
+        # warrants a trigger, returning a fully-formed TriggerDecision.
+        # ------------------------------------------------------------------
+        if enable_hypo_recovery_interventions is None:
+            enable_hypo_recovery_interventions = bool(
+                getattr(
+                    self._config,
+                    "enable_hypo_recovery_interventions",
+                    False,
+                )
             )
+
+        # ``dismiss_prob`` is computed here so every arm can stamp it on
+        # its TriggerDecision uniformly (preserves the F-series telemetry).
+        dismiss_prob = self._predict_dismiss_probability(
+            confidence=confidence,
+            context_complexity=context_complexity or 0.0,
+            typing_burst_seconds=typing_burst_seconds,
+        )
+
+        STATE_GATES: dict[str, Callable[..., TriggerDecision]] = {
+            "HYPER": self._check_hyper_gates,
+            "HYPO": self._check_hypo_gates,
+            "RECOVERY": self._check_recovery_gates,
+            "FLOW": self._reject_flow_state,
+        }
+        gate = STATE_GATES.get(estimate.state, self._reject_flow_state)
+        return gate(
+            estimate,
+            now=now,
+            effective_threshold=effective_threshold,
+            context_complexity=context_complexity,
+            dismiss_prob=dismiss_prob,
+            keystroke_rate=keystroke_rate,
+            scroll_rate=scroll_rate,
+            hr_delta_pct=hr_delta_pct,
+            enable_hypo_recovery_interventions=enable_hypo_recovery_interventions,
+        )
+
+    # ------------------------------------------------------------------
+    # State-arm gates (P0 §3.5).
+    #
+    # Each gate is invoked from ``evaluate`` AFTER the shared
+    # receptivity / quiet-mode / cooldown / hourly-cap gates have already
+    # passed. The gate decides whether *this state* warrants triggering
+    # and returns a fully-formed TriggerDecision.
+    # ------------------------------------------------------------------
+
+    def _check_hyper_gates(
+        self,
+        estimate: StateEstimate,
+        *,
+        now: float,
+        effective_threshold: float,
+        context_complexity: float | None,
+        dismiss_prob: float,
+        keystroke_rate: float,  # unused for HYPER but accepted uniformly
+        scroll_rate: float,
+        hr_delta_pct: float | None,
+        enable_hypo_recovery_interventions: bool,
+    ) -> TriggerDecision:
+        """HYPER (overwhelm) gate. Identical to the pre-refactor logic."""
+        confidence = estimate.confidence
 
         # Check confidence exceeds effective threshold
         if confidence < effective_threshold:
@@ -464,14 +595,9 @@ class TriggerPolicy:
                 cooldown_remaining=0.0,
                 quiet_mode_active=False,
                 effective_threshold=effective_threshold,
-                    context_complexity=context_complexity,
-                )
+                context_complexity=context_complexity,
+            )
 
-        dismiss_prob = self._predict_dismiss_probability(
-            confidence=confidence,
-            context_complexity=context_complexity or 0.0,
-            typing_burst_seconds=typing_burst_seconds,
-        )
         if (
             self._config.dismissal_model_enabled
             and self._dismissal_outcomes >= 10
@@ -498,6 +624,201 @@ class TriggerPolicy:
             effective_threshold=effective_threshold,
             context_complexity=context_complexity,
             dismissal_probability=dismiss_prob,
+        )
+
+    def _check_hypo_gates(
+        self,
+        estimate: StateEstimate,
+        *,
+        now: float,
+        effective_threshold: float,
+        context_complexity: float | None,
+        dismiss_prob: float,
+        keystroke_rate: float,
+        scroll_rate: float,
+        hr_delta_pct: float | None,
+        enable_hypo_recovery_interventions: bool,
+    ) -> TriggerDecision:
+        """HYPO (disengaged) re-engagement gate (P0 §3.5).
+
+        Conservative by design: same confidence floor as HYPER, and a
+        behavioural conjunction (keystroke + scroll, optional HR-below-
+        baseline) on top.
+        """
+        confidence = estimate.confidence
+
+        if not enable_hypo_recovery_interventions:
+            return TriggerDecision(
+                should_trigger=False,
+                reason="HYPO interventions disabled (opt-in)",
+                confidence=confidence,
+                cooldown_remaining=0.0,
+                quiet_mode_active=False,
+                effective_threshold=effective_threshold,
+                context_complexity=context_complexity,
+            )
+
+        # Same confidence floor as HYPER — see P0 §3.5 design contract.
+        if confidence < effective_threshold:
+            return TriggerDecision(
+                should_trigger=False,
+                reason=f"HYPO confidence {confidence:.2f} below threshold {effective_threshold:.2f}",
+                confidence=confidence,
+                cooldown_remaining=0.0,
+                quiet_mode_active=False,
+                effective_threshold=effective_threshold,
+                context_complexity=context_complexity,
+            )
+
+        # Signal quality gate (telemetry fallback as for HYPER).
+        if not estimate.signal_quality.acceptable:
+            telemetry_fallback = (
+                estimate.signal_quality.telemetry >= 0.7
+                and confidence >= min(0.95, effective_threshold + 0.10)
+            )
+            if not telemetry_fallback:
+                return TriggerDecision(
+                    should_trigger=False,
+                    reason=f"HYPO signal quality too low ({estimate.signal_quality.overall:.2f})",
+                    confidence=confidence,
+                    cooldown_remaining=0.0,
+                    quiet_mode_active=False,
+                    effective_threshold=effective_threshold,
+                    context_complexity=context_complexity,
+                )
+
+        should_fire, reason = is_disengaged(
+            None,
+            estimate.dwell_seconds,
+            None,
+            keystroke_rate=keystroke_rate,
+            scroll_rate=scroll_rate,
+            hr_delta_pct=hr_delta_pct,
+            config=self._hypo_gate_config,
+        )
+        if not should_fire:
+            return TriggerDecision(
+                should_trigger=False,
+                reason=f"HYPO behavioural gate: {reason}",
+                confidence=confidence,
+                cooldown_remaining=0.0,
+                quiet_mode_active=False,
+                effective_threshold=effective_threshold,
+                context_complexity=context_complexity,
+            )
+
+        return TriggerDecision(
+            should_trigger=True,
+            reason=f"HYPO re-engagement: {reason}",
+            confidence=confidence,
+            cooldown_remaining=0.0,
+            quiet_mode_active=False,
+            effective_threshold=effective_threshold,
+            context_complexity=context_complexity,
+            dismissal_probability=dismiss_prob,
+        )
+
+    def _check_recovery_gates(
+        self,
+        estimate: StateEstimate,
+        *,
+        now: float,
+        effective_threshold: float,
+        context_complexity: float | None,
+        dismiss_prob: float,
+        keystroke_rate: float,
+        scroll_rate: float,
+        hr_delta_pct: float | None,
+        enable_hypo_recovery_interventions: bool,
+    ) -> TriggerDecision:
+        """RECOVERY reinforcement gate (P0 §3.5).
+
+        Fires at most once per post-HYPER window. The plan emitted by
+        the downstream prompt is ``intervention_type="overlay_only"``
+        with ``tone="minimal"`` — must not block input.
+        """
+        confidence = estimate.confidence
+
+        if not enable_hypo_recovery_interventions:
+            return TriggerDecision(
+                should_trigger=False,
+                reason="RECOVERY interventions disabled (opt-in)",
+                confidence=confidence,
+                cooldown_remaining=0.0,
+                quiet_mode_active=False,
+                effective_threshold=effective_threshold,
+                context_complexity=context_complexity,
+            )
+
+        just_exited = self._last_hyper_exit_time is not None
+        seconds_since_exit = (
+            now - self._last_hyper_exit_time
+            if self._last_hyper_exit_time is not None
+            else float("inf")
+        )
+        in_window, reason = in_recovery_window(
+            None,
+            just_exited_hyper=just_exited,
+            seconds_since_exit=seconds_since_exit,
+            config=self._recovery_gate_config,
+        )
+        if not in_window:
+            return TriggerDecision(
+                should_trigger=False,
+                reason=f"RECOVERY gate: {reason}",
+                confidence=confidence,
+                cooldown_remaining=0.0,
+                quiet_mode_active=False,
+                effective_threshold=effective_threshold,
+                context_complexity=context_complexity,
+            )
+
+        if not self._recovery_reinforcer.should_reinforce(
+            dwell_seconds=estimate.dwell_seconds,
+        ):
+            return TriggerDecision(
+                should_trigger=False,
+                reason="RECOVERY reinforcement already delivered this window",
+                confidence=confidence,
+                cooldown_remaining=0.0,
+                quiet_mode_active=False,
+                effective_threshold=effective_threshold,
+                context_complexity=context_complexity,
+            )
+
+        return TriggerDecision(
+            should_trigger=True,
+            reason="RECOVERY reinforcement",
+            confidence=confidence,
+            cooldown_remaining=0.0,
+            quiet_mode_active=False,
+            effective_threshold=effective_threshold,
+            context_complexity=context_complexity,
+            dismissal_probability=dismiss_prob,
+        )
+
+    def _reject_flow_state(
+        self,
+        estimate: StateEstimate,
+        *,
+        now: float,
+        effective_threshold: float,
+        context_complexity: float | None,
+        dismiss_prob: float,
+        keystroke_rate: float,
+        scroll_rate: float,
+        hr_delta_pct: float | None,
+        enable_hypo_recovery_interventions: bool,
+    ) -> TriggerDecision:
+        """FLOW (or any unrecognised state): never intervene."""
+        return TriggerDecision(
+            should_trigger=False,
+            reason="State is FLOW, no intervention needed",
+            confidence=estimate.confidence,
+            cooldown_remaining=0.0,
+            quiet_mode_active=False,
+            effective_threshold=effective_threshold,
+            context_complexity=context_complexity,
         )
 
     def record_intervention(self, timestamp: float | None = None) -> None:

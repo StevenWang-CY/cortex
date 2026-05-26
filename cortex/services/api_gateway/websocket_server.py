@@ -224,6 +224,13 @@ class WebSocketServer:
         self._session_recap_cache_callback: (
             Callable[[], dict[str, Any] | None] | None
         ) = None
+        # P0 §3.6: callback fired when a peer surface toggles a
+        # micro-step checkbox. Signature:
+        # ``async (intervention_id: str, step_index: int, new_status: str)``.
+        # The dispatcher validates payload shape + value bounds before
+        # invoking; the daemon's ``toggle_micro_step`` does the active-
+        # plan lookup and rebroadcast.
+        self._micro_step_toggled_callback: Any = None
         # Latest state for new connections
         self._latest_state: StateEstimate | None = None
         self._pending_context_requests: dict[str, asyncio.Future[dict[str, Any]]] = {}
@@ -355,6 +362,17 @@ class WebSocketServer:
         TrendsResponse``.
         """
         self._trends_callback = callback
+
+    def set_micro_step_toggled_callback(self, callback: Any) -> None:
+        """P0 §3.6: handler for ``MICRO_STEP_TOGGLED`` messages.
+
+        Signature: ``async (intervention_id: str, step_index: int,
+        new_status: str)``. The dispatcher validates the payload
+        shape + value bounds before invoking; the daemon's
+        ``toggle_micro_step`` does the active-plan lookup and
+        rebroadcast.
+        """
+        self._micro_step_toggled_callback = callback
 
     def set_session_recap_cache_callback(
         self,
@@ -621,6 +639,15 @@ class WebSocketServer:
             await self._handle_request_trends(client, msg)
         elif msg.type == MessageType.REQUEST_SESSION_RECAP.value:
             await self._handle_request_session_recap(client, msg)
+        elif msg.type == MessageType.MICRO_STEP_TOGGLED.value:
+            # P0 §3.6: a peer surface (browser popup, VS Code panel,
+            # WS-mode overlay) clicked a micro-step checkbox. Validate
+            # the payload at the daemon boundary and forward to the
+            # daemon's ``toggle_micro_step`` via the same callback
+            # pipeline used for USER_ACTION; a malformed frame is
+            # logged and dropped without closing the socket so a
+            # buggy/older client does not bounce itself off.
+            await self._handle_micro_step_toggled(client, msg)
         else:
             logger.debug(f"Unknown message type from {client.client_id}: {msg.type}")
 
@@ -832,6 +859,63 @@ class WebSocketServer:
                 callback(msg.payload)
         except Exception as exc:
             logger.error("Tab relevance feedback error from %s: %s", client.client_id, exc)
+
+    async def _handle_micro_step_toggled(
+        self, client: WebSocketClient, msg: WSMessage,
+    ) -> None:
+        """P0 §3.6: forward a MICRO_STEP_TOGGLED frame to the daemon.
+
+        Validation:
+          * ``intervention_id`` must be a non-empty string.
+          * ``step_index`` must be an int in ``[0, 2]`` (the schema
+            constrains ``InterventionPlan.micro_steps`` to ``max_length=3``).
+          * ``new_status`` must be one of ``"pending"`` / ``"done"`` /
+            ``"skipped"``.
+
+        Any validation failure is logged and dropped — we do NOT
+        close the socket, because a buggy or stale client should not
+        be able to disconnect itself; the daemon's
+        ``toggle_micro_step`` is itself idempotent under stale ids.
+        """
+        callback = self._micro_step_toggled_callback
+        if callback is None:
+            return
+        payload = msg.payload or {}
+        intervention_id = payload.get("intervention_id")
+        step_index = payload.get("step_index")
+        new_status = payload.get("new_status")
+        if not isinstance(intervention_id, str) or not intervention_id:
+            logger.warning(
+                "MICRO_STEP_TOGGLED from %s: missing/invalid intervention_id=%r",
+                client.client_id,
+                intervention_id,
+            )
+            return
+        if not isinstance(step_index, int) or not (0 <= step_index <= 2):
+            logger.warning(
+                "MICRO_STEP_TOGGLED from %s: invalid step_index=%r",
+                client.client_id,
+                step_index,
+            )
+            return
+        if new_status not in ("pending", "done", "skipped"):
+            logger.warning(
+                "MICRO_STEP_TOGGLED from %s: invalid new_status=%r",
+                client.client_id,
+                new_status,
+            )
+            return
+        try:
+            if asyncio.iscoroutinefunction(callback):
+                await callback(intervention_id, step_index, new_status)
+            else:
+                callback(intervention_id, step_index, new_status)
+        except Exception as exc:
+            logger.error(
+                "micro_step_toggled callback error from %s: %s",
+                client.client_id,
+                exc,
+            )
 
     async def _handle_leetcode_context_update(
         self, client: WebSocketClient, msg: WSMessage,
@@ -1535,7 +1619,7 @@ class WebSocketServer:
             "headline": plan.headline,
             "situation_summary": plan.situation_summary,
             "primary_focus": plan.primary_focus,
-            "micro_steps": list(plan.micro_steps),
+            "micro_steps": [s.model_dump(mode="json") for s in plan.micro_steps],
             "hide_targets": plan.hide_targets,
             "ui_plan": plan.ui_plan.model_dump(),
             "tone": plan.tone,

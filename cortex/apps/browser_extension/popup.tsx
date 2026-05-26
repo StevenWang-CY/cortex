@@ -134,6 +134,36 @@ interface MorningBriefing {
  * the close button.
  */
 
+/**
+ * P0 §3.6: normalise the wire-format ``micro_steps`` payload into the
+ * popup's controlled-list shape. The daemon currently emits the dict
+ * form on every INTERVENTION_TRIGGER (a backwards-compat coercer
+ * promotes any LLM-emitted strings to ``{text, status: "pending"}``);
+ * however older daemons or future test fixtures may still ship the
+ * raw ``string[]`` shape, so we accept both.
+ */
+export function normaliseMicroSteps(
+    raw: unknown,
+): Array<{ text: string; status: "pending" | "done" | "skipped" }> {
+    if (!Array.isArray(raw)) return [];
+    const out: Array<{ text: string; status: "pending" | "done" | "skipped" }> = [];
+    for (const entry of raw) {
+        if (typeof entry === "string") {
+            if (entry.length > 0) out.push({ text: entry, status: "pending" });
+            continue;
+        }
+        if (entry && typeof entry === "object") {
+            const e = entry as Record<string, unknown>;
+            const text = typeof e.text === "string" ? e.text : "";
+            const rawStatus = typeof e.status === "string" ? e.status : "pending";
+            const status: "pending" | "done" | "skipped" =
+                rawStatus === "done" || rawStatus === "skipped" ? rawStatus : "pending";
+            if (text.length > 0) out.push({ text, status });
+        }
+    }
+    return out;
+}
+
 export function synthesizeActions(
     actions: Record<string, unknown>[],
     tabRecs: TabRecommendations | null,
@@ -529,6 +559,15 @@ function CortexPopup(): React.ReactElement {
     const [interventionId, setInterventionId] = useState<string>("");
     const [applied, setApplied] = useState(false);
     const [causalExplanation, setCausalExplanation] = useState<string>("");
+    // P0 §3.6: micro-step checklist. The wire payload may carry either
+    // the legacy ``string[]`` shape or the new ``{text, status, …}[]``
+    // shape; we normalise on ingest so the render stays simple. The
+    // status round-trips to the daemon via MICRO_STEP_TOGGLED so a tick
+    // here mutates the active plan and rebroadcasts strikethrough
+    // styling to every connected surface.
+    const [microSteps, setMicroSteps] = useState<
+        Array<{ text: string; status: "pending" | "done" | "skipped" }>
+    >([]);
     const [briefing, setBriefing] = useState<MorningBriefing | null>(null);
     const [tabCloseDisabled, setTabCloseDisabled] = useState(false);
     const [quietMode, setQuietMode] = useState(false);
@@ -662,6 +701,7 @@ function CortexPopup(): React.ReactElement {
                 setTabRecs(recs);
                 setErrAnalysis((p.error_analysis as Record<string, string>) || null);
                 setInterventionId(String(p.intervention_id || ""));
+                setMicroSteps(normaliseMicroSteps(p.micro_steps));
                 setApplied(false);
             }
         });
@@ -728,6 +768,11 @@ function CortexPopup(): React.ReactElement {
                 setErrAnalysis((p.error_analysis as Record<string, string>) || null);
                 setInterventionId(String(p.intervention_id || ""));
                 setCausalExplanation(String(p.causal_explanation || ""));
+                // P0 §3.6: ingest the new ``micro_steps`` shape so the
+                // popup's controlled checklist re-renders strikethrough
+                // styling when another surface (overlay / VS Code panel)
+                // ticks a step.
+                setMicroSteps(normaliseMicroSteps(p.micro_steps));
                 // P0 §3.9: adopt structured causal signals from the
                 // intervention trigger payload (top 2-3 ranked drivers).
                 const signals = (p.causal_signals as unknown[]) || [];
@@ -762,6 +807,7 @@ function CortexPopup(): React.ReactElement {
                 setTabRecs(null);
                 setErrAnalysis(null);
                 setCausalExplanation("");
+                setMicroSteps([]);
                 setCausalSignals([]);
                 setRating(null);
                 setRatingTextOpen(false);
@@ -1009,7 +1055,26 @@ function CortexPopup(): React.ReactElement {
     const realCausal = causalExplanation && causalExplanation.length > 20
         && /\d/.test(causalExplanation) ? causalExplanation : "";
 
-    const hasIntervention = activeActions.length > 0 || tabRecs || realErrAnalysis;
+    const hasIntervention = activeActions.length > 0 || tabRecs || realErrAnalysis || microSteps.length > 0;
+
+    // P0 §3.6: optimistic-toggle handler. The handler updates local
+    // state immediately so the user sees the strikethrough flip without
+    // waiting for the daemon round-trip, then dispatches the relay
+    // message; the daemon's rebroadcast will reconcile the authoritative
+    // status into ``microSteps`` on the next INTERVENTION_TRIGGER.
+    const handleMicroStepToggle = (idx: number, checked: boolean) => {
+        if (!interventionId) return;
+        const newStatus: "pending" | "done" = checked ? "done" : "pending";
+        setMicroSteps(prev => prev.map(
+            (s, i) => i === idx ? { ...s, status: newStatus } : s
+        ));
+        chrome.runtime.sendMessage({
+            type: "MICRO_STEP_TOGGLED",
+            intervention_id: interventionId,
+            step_index: idx,
+            new_status: newStatus,
+        });
+    };
 
     return (
         <div style={S.root}>
@@ -1482,6 +1547,48 @@ function CortexPopup(): React.ReactElement {
                                     })}
                                 </div>
                             )}
+                        </div>
+                    )}
+
+                    {/* P0 §3.6: micro-step checklist. Each click sends
+                        MICRO_STEP_TOGGLED via background.ts → daemon WS.
+                        The daemon mutates the active plan and rebroadcasts
+                        INTERVENTION_TRIGGER with the new status. */}
+                    {microSteps.length > 0 && (
+                        <div
+                            data-testid="micro-step-list"
+                            style={{ marginBottom: 12 }}
+                        >
+                            {microSteps.map((step, idx) => {
+                                const isDone = step.status === "done";
+                                return (
+                                    <label
+                                        key={`ms-${idx}`}
+                                        data-testid={`micro-step-row-${idx}`}
+                                        style={{
+                                            display: "flex",
+                                            alignItems: "center",
+                                            gap: 8,
+                                            padding: "4px 0",
+                                            cursor: "pointer",
+                                            fontSize: 12,
+                                            color: isDone ? CX.textSecondary : CX.text,
+                                            fontFamily: CX.font,
+                                            textDecoration: isDone ? "line-through" : "none",
+                                            opacity: isDone ? 0.7 : 1,
+                                        }}
+                                    >
+                                        <input
+                                            type="checkbox"
+                                            data-testid={`micro-step-checkbox-${idx}`}
+                                            checked={isDone}
+                                            onChange={(e) => handleMicroStepToggle(idx, e.target.checked)}
+                                            style={{ accentColor: CX.accent, width: 14, height: 14 }}
+                                        />
+                                        <span>{step.text}</span>
+                                    </label>
+                                );
+                            })}
                         </div>
                     )}
 

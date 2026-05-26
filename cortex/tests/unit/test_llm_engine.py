@@ -310,11 +310,16 @@ class TestPromptSelection(unittest.TestCase):
         assert select_prompt_template(ctx) == "micro_step_planner"
 
     def test_all_templates_exist(self):
-        assert len(PROMPT_TEMPLATES) == 11
-        for name in ["debug_error_summary", "code_focus_reduction", "browser_tab_reduction",
-                      "micro_step_planner", "calm_overlay_writer",
-                      "breathing_overlay", "active_recall", "rabbit_hole",
-                      "alignment_summary", "deep_bottleneck_diagnosis"]:
+        # P0 §3.5 added "re_engage_planner" + "recovery_reinforcer";
+        # check membership of every name we depend on rather than an
+        # exact count so future additions don't keep breaking this test.
+        for name in [
+            "debug_error_summary", "code_focus_reduction", "browser_tab_reduction",
+            "micro_step_planner", "calm_overlay_writer",
+            "breathing_overlay", "active_recall", "rabbit_hole",
+            "alignment_summary", "deep_bottleneck_diagnosis",
+            "re_engage_planner", "recovery_reinforcer",
+        ]:
             assert name in PROMPT_TEMPLATES
 
 
@@ -530,7 +535,11 @@ class TestImports(unittest.TestCase):
             select_prompt_template,
         )
 
-        assert len(PROMPT_TEMPLATES) == 11
+        # P0 §3.5 raised the template count from 11 to 13
+        # (added re_engage_planner + recovery_reinforcer). Assert a
+        # lower bound so we don't regress on the floor without taking
+        # an explicit deletion decision.
+        assert len(PROMPT_TEMPLATES) >= 13
         assert SYSTEM_PROMPT is not None
         assert callable(build_messages)
         assert callable(build_user_prompt)

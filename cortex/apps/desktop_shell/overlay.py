@@ -273,10 +273,28 @@ class OverlayWindow(QWidget):
     # either a native handler (clipboard, timer) or the WS
     # ``ACTION_EXECUTE`` channel for browser-bound actions.
     action_invoked = Signal(str, dict)
+    # P0 §3.6: emitted when the user toggles a micro-step checkbox.
+    # Payload is ``(intervention_id, step_index, new_status)`` where
+    # ``new_status`` ∈ {"pending", "done"}. The desktop controller
+    # forwards this to ``RuntimeDaemon.toggle_micro_step`` which
+    # mutates the active plan and rebroadcasts ``INTERVENTION_TRIGGER``
+    # so peer surfaces (extension popup, VS Code panel) render the
+    # strikethrough.
+    micro_step_toggled = Signal(str, int, str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._intervention_id = ""
+        # P0 §3.6: per-intervention checkbox cache. Keyed by
+        # ``intervention_id``; value is the list of ``QCheckBox``
+        # widgets currently in the steps_container. When a re-render
+        # arrives for the SAME intervention_id, we sync ``status``
+        # onto the existing checkboxes instead of destroying them, so
+        # the user's tick survives F16 atomic-swap re-emissions.
+        # When a fresh intervention_id arrives, the prior list is
+        # torn down (new plan = fresh steps).
+        self._step_intervention_id: str = ""
+        self._step_status_cache: list[str] = []
         # Idempotency guard: once dismissed (auto or user), subsequent dismiss
         # calls are no-ops. First emitter wins. See F06.
         self._dismissed: bool = False
@@ -597,10 +615,18 @@ class OverlayWindow(QWidget):
             self._fallback_hint.clear()
             self._fallback_hint.hide()
 
-        for cb in self._step_widgets:
-            self._steps_container.removeWidget(cb)
-            cb.deleteLater()
-        self._step_widgets.clear()
+        # P0 §3.6: only tear down the existing checkboxes when this is
+        # a fundamentally new intervention. F16 atomic-swap re-emissions
+        # (same intervention_id, possibly mutated step list) are handled
+        # by ``_render_micro_steps`` below, which reuses existing widgets
+        # so the user's checked state survives.
+        if self._step_intervention_id != self._intervention_id:
+            for cb in self._step_widgets:
+                self._steps_container.removeWidget(cb)
+                cb.deleteLater()
+            self._step_widgets.clear()
+            self._step_status_cache = []
+            self._step_intervention_id = self._intervention_id
 
         causal = str(payload.get("causal_explanation") or "").strip()
         # F51: only surface causal explanations with substantive content;
@@ -628,19 +654,12 @@ class OverlayWindow(QWidget):
             self._context_truncation_label.setText("")
             self._context_truncation_label.hide()
 
-        for step in payload.get("micro_steps", []):
-            cb = QCheckBox(step)
-            cb.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
-            cb.setStyleSheet(
-                "QCheckBox {"
-                f"  color: {_TEXT_PRIMARY.name()};"
-                "  spacing: 10px;"
-                "  background: transparent;"
-                "}"
-                "QCheckBox::indicator { width: 16px; height: 16px; }"
-            )
-            self._steps_container.addWidget(cb)
-            self._step_widgets.append(cb)
+        # P0 §3.6: render micro-steps with state preservation across
+        # F16 atomic-swap re-emissions. ``_render_micro_steps`` consumes
+        # both legacy ``list[str]`` and the new ``list[dict]`` shape
+        # (``{text, status, started_at, completed_at}``) and wires each
+        # checkbox's ``toggled`` signal to the daemon.
+        self._render_micro_steps(payload.get("micro_steps", []) or [])
 
         # G4 (audit-prod): render the suggested_actions as clickable
         # buttons. ``_render_actions`` clears the prior list, builds new
@@ -887,6 +906,178 @@ class OverlayWindow(QWidget):
         "highlight_tab",
         "save_session",
     })
+
+    # ------------------------------------------------------------------
+    # P0 §3.6: micro-step rendering with state preservation
+    # ------------------------------------------------------------------
+
+    def _step_text_of(self, step: object) -> str:
+        """Coerce a wire-format micro-step entry into its display text.
+
+        The payload may carry either:
+          * legacy ``list[str]`` — each entry is the text directly, or
+          * ``list[dict]`` — each entry is
+            ``{"text": str, "status": "pending"|"done"|"skipped", …}``.
+        """
+        if isinstance(step, dict):
+            return str(step.get("text") or "")
+        return str(step)
+
+    def _step_status_of(self, step: object) -> str:
+        """Coerce a wire-format micro-step entry into its status string.
+
+        Legacy ``list[str]`` payloads always render as ``"pending"``.
+        Dict payloads carry the user-driven status verbatim.
+        """
+        if isinstance(step, dict):
+            status = str(step.get("status") or "pending")
+            return status if status in ("pending", "done", "skipped") else "pending"
+        return "pending"
+
+    def _apply_step_visual_state(self, cb: QCheckBox, status: str) -> None:
+        """Style a step checkbox according to its current ``status``.
+
+        ``"done"`` adds a strikethrough on the label text and dims the
+        colour to the secondary token so the eye reads it as completed
+        without losing the legibility needed to confirm what was done.
+        ``"pending"`` restores the primary colour and removes the
+        strikethrough. ``"skipped"`` mirrors ``"done"`` visually (the
+        checkbox is unchecked but the label is dimmed + struck through)
+        — we don't currently surface the skip path in the desktop UI
+        but the styling exists for symmetry with the wire schema.
+        """
+        if status == "done":
+            cb.setChecked(True)
+            cb.setStyleSheet(
+                "QCheckBox {"
+                f"  color: {_TEXT_SECONDARY.name()};"
+                "  spacing: 10px;"
+                "  background: transparent;"
+                "  text-decoration: line-through;"
+                "}"
+                "QCheckBox::indicator { width: 16px; height: 16px; }"
+            )
+        elif status == "skipped":
+            cb.setChecked(False)
+            cb.setStyleSheet(
+                "QCheckBox {"
+                f"  color: {_TEXT_TERTIARY.name()};"
+                "  spacing: 10px;"
+                "  background: transparent;"
+                "  text-decoration: line-through;"
+                "}"
+                "QCheckBox::indicator { width: 16px; height: 16px; }"
+            )
+        else:
+            cb.setChecked(False)
+            cb.setStyleSheet(
+                "QCheckBox {"
+                f"  color: {_TEXT_PRIMARY.name()};"
+                "  spacing: 10px;"
+                "  background: transparent;"
+                "}"
+                "QCheckBox::indicator { width: 16px; height: 16px; }"
+            )
+
+    def _render_micro_steps(self, steps: list[object]) -> None:
+        """Render the micro-step checklist, preserving widget identity
+        across F16 atomic-swap re-emissions of the same intervention.
+
+        If the number of steps matches the prior render AND we're still
+        on the same ``intervention_id``, the existing ``QCheckBox``
+        widgets are updated in place (text + visual state + cached
+        status). Otherwise the prior widgets are torn down (handled
+        upstream in ``show_intervention``) and a fresh list is built.
+        """
+        same_intervention = self._step_intervention_id == self._intervention_id
+        reuse = (
+            same_intervention
+            and len(self._step_widgets) == len(steps)
+            and len(steps) > 0
+        )
+        if reuse:
+            new_cache: list[str] = []
+            for idx, step in enumerate(steps):
+                text = self._step_text_of(step)
+                status = self._step_status_of(step)
+                # Server is authoritative: if the daemon's status differs
+                # from the optimistic local cache (e.g. another surface
+                # toggled the step), sync the widget. Block the toggled
+                # signal during the setChecked call so we don't bounce
+                # the change back to the daemon as a fake user click.
+                cb = self._step_widgets[idx]
+                cb.blockSignals(True)
+                try:
+                    cb.setText(text)
+                    self._apply_step_visual_state(cb, status)
+                finally:
+                    cb.blockSignals(False)
+                new_cache.append(status)
+            self._step_status_cache = new_cache
+            return
+
+        # Fresh build path: clear any survivors (defensive — upstream
+        # has usually already done this) and rebuild.
+        for cb in self._step_widgets:
+            self._steps_container.removeWidget(cb)
+            cb.deleteLater()
+        self._step_widgets.clear()
+        self._step_status_cache = []
+        self._step_intervention_id = self._intervention_id
+
+        for idx, step in enumerate(steps):
+            text = self._step_text_of(step)
+            status = self._step_status_of(step)
+            cb = QCheckBox(text)
+            cb.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
+            self._apply_step_visual_state(cb, status)
+            # Bind ``idx`` at definition time so back-to-back renders
+            # don't capture the final loop variable. ``toggled``
+            # carries the bool checked state directly.
+            try:
+                cb.toggled.connect(
+                    lambda checked, i=idx: self._on_step_toggled(i, checked)
+                )
+            except Exception:
+                logger.debug(
+                    "micro-step toggled.connect failed", exc_info=True
+                )
+            self._steps_container.addWidget(cb)
+            self._step_widgets.append(cb)
+            self._step_status_cache.append(status)
+
+    def _on_step_toggled(self, step_index: int, checked: bool) -> None:
+        """Handler for a micro-step checkbox toggle. Emits
+        ``micro_step_toggled(intervention_id, step_index, new_status)``
+        with the new status string so the controller can forward to
+        the daemon.
+
+        Optimistically updates the local visual state so the user
+        sees immediate feedback; the daemon will re-broadcast
+        ``INTERVENTION_TRIGGER`` shortly after with the authoritative
+        status, which is reconciled on the next render.
+        """
+        if not self._intervention_id:
+            return
+        new_status = "done" if checked else "pending"
+        # Sync local cache + visuals immediately.
+        if 0 <= step_index < len(self._step_widgets):
+            cb = self._step_widgets[step_index]
+            cb.blockSignals(True)
+            try:
+                self._apply_step_visual_state(cb, new_status)
+            finally:
+                cb.blockSignals(False)
+        if 0 <= step_index < len(self._step_status_cache):
+            self._step_status_cache[step_index] = new_status
+        try:
+            self.micro_step_toggled.emit(
+                self._intervention_id, int(step_index), new_status
+            )
+        except Exception:
+            logger.debug(
+                "micro_step_toggled.emit failed", exc_info=True
+            )
 
     def _render_actions(
         self,

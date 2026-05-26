@@ -17,6 +17,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -422,6 +423,10 @@ class CortexDaemon:
         self._ws_server.set_shutdown_callback(self._request_shutdown)
         self._ws_server.set_leetcode_context_callback(self._handle_leetcode_context_update)
         self._ws_server.set_intervention_applied_callback(self._handle_intervention_applied)
+        # P0 §3.6: route MICRO_STEP_TOGGLED frames into ``toggle_micro_step``
+        # so peer surfaces (popup, VS Code panel, WS-mode overlay) can
+        # toggle steps without the in-process Qt overlay path.
+        self._ws_server.set_micro_step_toggled_callback(self.toggle_micro_step)
         # G1 (audit-prod): caller registers via set_client_identified_callback
         # to bridge connection events to the desktop shell. Default is a
         # noop list so the daemon can still run headless.
@@ -467,6 +472,20 @@ class CortexDaemon:
         )
         self._last_physio_update = 0.0
         self._active_intervention_id: str | None = None
+        # P0 §3.6: cache the most recently broadcast InterventionPlan
+        # keyed by its ``intervention_id`` so the daemon can mutate
+        # per-step state on ``MICRO_STEP_TOGGLED`` and rebroadcast the
+        # updated payload. Only the plan whose id matches
+        # ``_active_intervention_id`` is honoured by ``toggle_micro_step``;
+        # stale ids (drag from an already-dismissed intervention) are
+        # silently dropped to keep the click path idempotent.
+        self._active_plan: InterventionPlan | None = None
+        # P0 §3.6: once every micro-step has been ticked, the daemon
+        # fires ``RestoreManager.engage`` exactly once and then sets
+        # this flag so trailing toggles (animation tail-clicks, stale
+        # peer surfaces) are no-ops. Cleared when a new intervention
+        # starts.
+        self._micro_step_recovery_fired: bool = False
         # Audit-2 fix: user-supplied goal text overrides the auto-inferred
         # ``current_goal_hint`` from the context assembler. The controller's
         # in-process ``_on_goal_set`` and the WS-mode ``set_goal:`` USER_ACTION
@@ -1828,6 +1847,22 @@ class CortexDaemon:
             self._restore_manager.start_intervention(plan.intervention_id, snapshot)
             self._trigger_policy.record_intervention()
             self._active_intervention_id = plan.intervention_id
+            # P0 §3.6: cache the live plan so MICRO_STEP_TOGGLED can
+            # mutate its ``micro_steps`` and rebroadcast the trigger.
+            # If a previous intervention shares this id (F16 swap),
+            # preserve user-driven step status across the swap.
+            if (
+                self._active_plan is not None
+                and self._active_plan.intervention_id == plan.intervention_id
+            ):
+                from cortex.services.intervention_engine.restore import (
+                    merge_micro_steps,
+                )
+                plan.micro_steps = merge_micro_steps(
+                    self._active_plan.micro_steps, plan.micro_steps
+                )
+            self._active_plan = plan
+            self._micro_step_recovery_fired = False
             registry.register(f"workspace_snapshot:{plan.intervention_id}", snapshot)
             self._recorder.append("intervention_plan", plan.model_dump(mode="json"))
 
@@ -1934,6 +1969,19 @@ class CortexDaemon:
             )
             plan = enrich_plan_with_context(plan, context)
             self._active_intervention_id = plan.intervention_id
+            # P0 §3.6: cache the live plan + merge prior step state on F16 swap.
+            if (
+                self._active_plan is not None
+                and self._active_plan.intervention_id == plan.intervention_id
+            ):
+                from cortex.services.intervention_engine.restore import (
+                    merge_micro_steps,
+                )
+                plan.micro_steps = merge_micro_steps(
+                    self._active_plan.micro_steps, plan.micro_steps
+                )
+            self._active_plan = plan
+            self._micro_step_recovery_fired = False
             self._recorder.append("intervention_plan", plan.model_dump(mode="json"))
             await self._ws_server.send_message(ws_type, plan.model_dump(mode="json"))
         except Exception:
@@ -1962,7 +2010,7 @@ class CortexDaemon:
         plan.suggested_actions = sanitized_actions
         plan.micro_steps = [
             step for step in plan.micro_steps
-            if not any(tok in step.lower() for tok in blocked_tokens)
+            if not any(tok in step.text.lower() for tok in blocked_tokens)
         ] or plan.micro_steps[:1]
 
     async def _handle_restore_updates(self, estimate: Any, timestamp: float) -> None:
@@ -2050,6 +2098,158 @@ class CortexDaemon:
                 validated.get("action_id"),
             )
         return sent
+
+    async def toggle_micro_step(
+        self,
+        intervention_id: str,
+        step_index: int,
+        new_status: str,
+    ) -> None:
+        """P0 §3.6: mutate a micro-step's ``status`` on the active plan
+        and rebroadcast ``INTERVENTION_TRIGGER`` so peer surfaces
+        re-render with the new strikethrough state.
+
+        Stale clicks (``intervention_id`` does not match the active
+        plan) are silently dropped — the user may have already
+        dismissed the intervention on another surface.
+
+        When every step has reached ``"done"``, the daemon fires
+        ``RestoreManager.engage`` exactly once (latched by
+        ``_micro_step_recovery_fired``) so a tail-click does not
+        re-engage an already-closed intervention. The natural
+        recovery path feeds AMIP via the same helpfulness tracker
+        used by the dismiss/engage actions.
+        """
+        # ---- validate inputs ---------------------------------------
+        if new_status not in ("pending", "done", "skipped"):
+            logger.warning(
+                "toggle_micro_step: rejecting invalid new_status=%r",
+                new_status,
+            )
+            return
+        if not isinstance(intervention_id, str) or not intervention_id:
+            logger.warning("toggle_micro_step: missing intervention_id")
+            return
+        if not isinstance(step_index, int) or step_index < 0:
+            logger.warning(
+                "toggle_micro_step: invalid step_index=%r", step_index
+            )
+            return
+
+        # ---- locate the live plan ---------------------------------
+        plan = self._active_plan
+        if (
+            plan is None
+            or plan.intervention_id != intervention_id
+            or self._active_intervention_id != intervention_id
+        ):
+            logger.info(
+                "toggle_micro_step: dropping stale toggle "
+                "(requested=%s active=%s)",
+                intervention_id,
+                self._active_intervention_id,
+            )
+            return
+
+        if step_index >= len(plan.micro_steps):
+            logger.warning(
+                "toggle_micro_step: step_index=%d out of range "
+                "(len=%d) for intervention=%s",
+                step_index,
+                len(plan.micro_steps),
+                intervention_id,
+            )
+            return
+
+        # ---- mutate the step --------------------------------------
+        step = plan.micro_steps[step_index]
+        now = datetime.now()
+        prior_status = step.status
+        step.status = new_status  # type: ignore[assignment]
+        # Stamp lifecycle timestamps. ``started_at`` is set the first
+        # time the step leaves ``pending``; ``completed_at`` is set
+        # the moment it reaches ``done``.
+        if prior_status == "pending" and new_status != "pending":
+            if step.started_at is None:
+                step.started_at = now
+        if new_status == "done":
+            step.completed_at = now
+        elif new_status == "pending":
+            # Un-checking a previously-done step clears completed_at
+            # but preserves started_at — the user did begin it.
+            step.completed_at = None
+
+        # ---- rebroadcast the updated trigger ----------------------
+        try:
+            await self._ws_server.send_message(
+                MessageType.INTERVENTION_TRIGGER.value,
+                plan.model_dump(mode="json"),
+            )
+        except Exception:
+            logger.debug(
+                "MICRO_STEP_TOGGLED rebroadcast failed", exc_info=True
+            )
+
+        # Persist via the recorder so the session report sees the
+        # ``done`` history per step.
+        try:
+            self._recorder.append("micro_step_toggled", {
+                "intervention_id": intervention_id,
+                "step_index": step_index,
+                "new_status": new_status,
+                "text": step.text,
+            })
+        except Exception:
+            logger.debug("micro_step_toggled append failed", exc_info=True)
+
+        # ---- all-done auto-recovery -------------------------------
+        all_done = all(s.status == "done" for s in plan.micro_steps)
+        if all_done and not self._micro_step_recovery_fired:
+            self._micro_step_recovery_fired = True
+            logger.info(
+                "toggle_micro_step: all steps done for %s — firing natural_recovery",
+                intervention_id,
+            )
+            try:
+                outcome = await self._restore_manager.engage(intervention_id)
+            except Exception:
+                logger.exception(
+                    "toggle_micro_step: engage() raised for %s",
+                    intervention_id,
+                )
+                outcome = None
+            if outcome is not None:
+                # Mirror the bookkeeping path that ``_handle_user_action``
+                # performs for the explicit engage/dismiss flow so the
+                # bandit / helpfulness ledger sees a consistent close.
+                self._active_intervention_id = None
+                self._active_plan = None
+                try:
+                    self._recorder.append(
+                        "intervention_outcome", outcome.model_dump(mode="json"),
+                    )
+                except Exception:
+                    logger.debug(
+                        "intervention_outcome append failed", exc_info=True
+                    )
+                try:
+                    await self._ws_server.send_restore(
+                        intervention_id, user_action="natural_recovery",
+                    )
+                except Exception:
+                    logger.debug(
+                        "send_restore on natural_recovery failed",
+                        exc_info=True,
+                    )
+                try:
+                    self._helpfulness.record_user_action(
+                        intervention_id, "natural_recovery",
+                    )
+                except Exception:
+                    logger.debug(
+                        "record_user_action(natural_recovery) failed",
+                        exc_info=True,
+                    )
 
     async def _handle_user_action(self, payload: dict[str, Any]) -> None:
         # Log suggested action executions from the Chrome extension
@@ -2169,6 +2369,13 @@ class CortexDaemon:
             return
 
         self._active_intervention_id = None
+        # P0 §3.6: clear the cached plan + recovery latch when the
+        # intervention closes through the user_action path. Trailing
+        # MICRO_STEP_TOGGLED frames from a peer surface are then
+        # silently dropped instead of re-firing engage().
+        if self._active_plan is not None and self._active_plan.intervention_id == intervention_id:
+            self._active_plan = None
+        self._micro_step_recovery_fired = False
         self._recorder.append("intervention_outcome", outcome.model_dump(mode="json"))
         await self._ws_server.send_restore(intervention_id, user_action=action)
 

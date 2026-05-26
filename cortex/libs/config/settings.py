@@ -267,6 +267,13 @@ class InterventionConfig(BaseModel):
     oscillation_max_flips: int = 6
     oscillation_dwell_multiplier: float = 2.0
 
+    # P0 §3.5: HYPO / RECOVERY intervention catalog. Opt-in for the
+    # first release — the new arms (re-engagement nudge, recovery
+    # reinforcement) are only evaluated when this flag is True.
+    # AMIP starts cold for these arms, so leaving the default at False
+    # avoids any early all-in on a not-yet-trained reward signal.
+    enable_hypo_recovery_interventions: bool = False
+
 
 class HandoverConfig(BaseModel):
     """Handover / shutdown detector configuration."""

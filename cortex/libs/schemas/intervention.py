@@ -30,6 +30,9 @@ _TARGET_MAX_LEN: dict[str, int] = {
     "copy_to_clipboard": 500,
     "save_session": 200,
     "start_timer": 32,
+    "resume_last_active_file": 300,
+    "prompt_micro_commit": 80,
+    "suggest_movement_break": 32,
 }
 
 
@@ -59,6 +62,9 @@ class SuggestedAction(BaseModel):
         "save_session",
         "copy_to_clipboard",
         "start_timer",
+        "resume_last_active_file",
+        "prompt_micro_commit",
+        "suggest_movement_break",
     ] = Field(..., description="Type of executable action")
     tab_index: int | None = Field(
         None,
@@ -190,6 +196,34 @@ class ErrorAnalysis(BaseModel):
     )
 
 
+class MicroStep(BaseModel):
+    """P0 §3.6: a single micro-step with toggleable completion status.
+
+    Tracks the lifecycle of an intervention's individual next-actions so
+    the daemon can persist progress across reconnects and the surfaces
+    can render check/strike-through state idempotently.
+    """
+
+    text: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="Human-readable step text shown to the user",
+    )
+    status: Literal["pending", "done", "skipped"] = Field(
+        "pending",
+        description="Current completion status",
+    )
+    started_at: datetime | None = Field(
+        None,
+        description="When the user first acted on this step (toggled non-pending)",
+    )
+    completed_at: datetime | None = Field(
+        None,
+        description="When the user marked this step done or skipped",
+    )
+
+
 class TabRecommendation(BaseModel):
     """LLM recommendation for a single tab."""
 
@@ -287,7 +321,7 @@ class InterventionPlan(BaseModel):
     primary_focus: str = Field(
         ..., max_length=200, description="The one thing to focus on"
     )
-    micro_steps: list[str] = Field(
+    micro_steps: list[MicroStep] = Field(
         ..., min_length=1, max_length=3, description="1-3 concrete next steps"
     )
     hide_targets: list[str] = Field(
@@ -343,6 +377,20 @@ class InterventionPlan(BaseModel):
             "purely an observability hint."
         ),
     )
+
+    @field_validator("micro_steps", mode="before")
+    @classmethod
+    def _coerce_micro_step_strings(cls, v: Any) -> Any:
+        """P0 §3.6: accept legacy list[str] payloads for backward compat.
+
+        Older callers (rule-based fallback planner, LLM JSON responses,
+        cached SESSION_RECAP envelopes) emit plain strings. Coerce them
+        into MicroStep objects with status='pending' so the same shape
+        works for both wire-level and storage-level deserialisation.
+        """
+        if isinstance(v, list) and v and all(isinstance(item, str) for item in v):
+            return [{"text": item, "status": "pending"} for item in v]
+        return v
 
     @property
     def is_valid(self) -> bool:

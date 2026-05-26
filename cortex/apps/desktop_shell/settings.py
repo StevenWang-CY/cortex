@@ -18,6 +18,8 @@ Public API preserved verbatim: ``settings_changed(dict)`` Signal,
 from __future__ import annotations
 
 import logging
+import time
+from pathlib import Path
 
 from PySide6.QtCore import QMutex, QSettings, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
@@ -138,6 +140,58 @@ _SECTION_HEADING_QSS = (
 )
 
 
+def _baseline_default_path() -> Path:
+    """Return the path to `storage/baselines/default.json`.
+
+    Lazy-imported config so the settings dialog stays importable even
+    when the config layer is mocked out by the test harness.
+    """
+    try:
+        from cortex.libs.config.settings import get_config
+
+        return Path(get_config().storage.path) / "baselines" / "default.json"
+    except Exception:
+        return Path("storage") / "baselines" / "default.json"
+
+
+def _format_relative_time(mtime: float, now: float | None = None) -> str:
+    """Human-readable "N days ago" / "2 hours ago" formatter — matches
+    the dashboard's freshness pill so the two surfaces stay consistent."""
+    if mtime <= 0:
+        return "never"
+    current = now if now is not None else time.time()
+    delta = max(0.0, current - mtime)
+    minute = 60.0
+    hour = 60.0 * minute
+    day = 24.0 * hour
+    if delta < minute:
+        return "just now"
+    if delta < hour:
+        n = int(delta // minute)
+        return f"{n} minute ago" if n == 1 else f"{n} minutes ago"
+    if delta < day:
+        n = int(delta // hour)
+        return f"{n} hour ago" if n == 1 else f"{n} hours ago"
+    n = int(delta // day)
+    return f"{n} day ago" if n == 1 else f"{n} days ago"
+
+
+def _format_baseline_freshness_label(path: Path | None = None) -> str:
+    """Label text used by the Sensing section's recalibrate row.
+
+    Returns "Last calibrated: <relative time>" when a baseline file is
+    present, or a softer prompt to calibrate when it isn't.
+    """
+    target = path or _baseline_default_path()
+    try:
+        if not target.exists():
+            return "Last calibrated: never · calibrate for personal baselines"
+        mtime = target.stat().st_mtime
+        return f"Last calibrated: {_format_relative_time(mtime)}"
+    except OSError:
+        return "Last calibrated: unknown"
+
+
 class SettingsDialog(QWidget):
     """Settings dialog. Emits ``settings_changed(dict)`` on Apply."""
 
@@ -153,6 +207,10 @@ class SettingsDialog(QWidget):
     # to refresh ``WebSocketBridge._auth_token`` and to surface a
     # confirmation toast.
     auth_token_rotated = Signal(str)
+    # P0 §3.4: emitted when the user clicks "Recalibrate baselines" in
+    # the Sensing section. Controller routes to the same in-process
+    # CalibrationRunner code path as the onboarding wizard.
+    recalibrate_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -206,6 +264,12 @@ class SettingsDialog(QWidget):
             self._refresh_permission_states()
         except Exception:
             logger.debug("permission poll resume failed", exc_info=True)
+        # P0 §3.4: also refresh the baseline freshness label so a
+        # recalibration completed elsewhere reflects on re-open.
+        try:
+            self.refresh_baseline_freshness()
+        except Exception:
+            logger.debug("freshness refresh on show failed", exc_info=True)
 
     def hideEvent(self, event: object) -> None:  # noqa: D401 - Qt override
         # Stop polling when the dialog is not visible — saves ~40 syscalls/
@@ -281,6 +345,49 @@ class SettingsDialog(QWidget):
             target="accessibility",
         )
         sensing_inner.addLayout(self._accessibility_perm_row["layout"])
+
+        # P0 §3.4: Recalibrate baselines row. Shows "Last calibrated:
+        # <relative time>" next to a brand-accent button. Clicking
+        # emits ``recalibrate_requested`` which the controller routes
+        # to the same in-process CalibrationRunner the onboarding
+        # wizard drives.
+        recal_row = QHBoxLayout()
+        recal_row.setSpacing(SP3)
+        self._baseline_freshness_label = QLabel(
+            _format_baseline_freshness_label()
+        )
+        self._baseline_freshness_label.setFont(
+            mac_native.system_font(FS_CAPTION, "regular")
+        )
+        self._baseline_freshness_label.setStyleSheet(
+            f"color: {_LABEL_SECONDARY}; background: transparent; border: none;"
+        )
+        recal_row.addWidget(self._baseline_freshness_label)
+        recal_row.addStretch()
+
+        self._recalibrate_btn = QPushButton("Recalibrate baselines")
+        self._recalibrate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._recalibrate_btn.setMinimumHeight(28)
+        self._recalibrate_btn.setFont(
+            mac_native.system_font(FS_CAPTION, "semibold")
+        )
+        self._recalibrate_btn.setStyleSheet(
+            "QPushButton {"
+            "  padding: 4px 14px;"
+            f"  border-radius: {RADIUS_BUTTON}px;"
+            f"  background: {BRAND_ACCENT};"
+            "  color: #FFF; border: none;"
+            "}"
+            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
+        )
+        self._recalibrate_btn.clicked.connect(self.recalibrate_requested.emit)
+        set_accessible_name(self._recalibrate_btn, "Recalibrate baselines")
+        set_accessible_description(
+            self._recalibrate_btn,
+            "Re-run the 2-minute calibration capture to refresh your personal baselines.",
+        )
+        recal_row.addWidget(self._recalibrate_btn)
+        sensing_inner.addLayout(recal_row)
 
         layout.addWidget(sensing_card)
 
@@ -650,6 +757,19 @@ class SettingsDialog(QWidget):
             "target": target,
             "granted": False,
         }
+
+    def refresh_baseline_freshness(self) -> None:
+        """Re-read the baseline file's mtime and update the Sensing row
+        label. P0 §3.4 — called by the controller after a successful
+        calibration run completes so the user sees the new timestamp
+        without re-opening the dialog."""
+        label = getattr(self, "_baseline_freshness_label", None)
+        if label is None:
+            return
+        try:
+            label.setText(_format_baseline_freshness_label())
+        except Exception:
+            logger.debug("freshness label update failed", exc_info=True)
 
     def _refresh_permission_states(self) -> None:
         """Poll macOS TCC + AX for the current grant state and update

@@ -144,6 +144,13 @@ class MessageType(str, Enum):  # noqa: UP042 — pydantic-to-typescript requires
     Payload: ``{}``. Reply: ``SESSION_RECAP`` (or empty payload if no
     recap is cached yet)."""
 
+    MICRO_STEP_TOGGLED = "MICRO_STEP_TOGGLED"
+    """P0 §3.6: client toggles a micro-step's completion state.
+
+    Payload: ``{intervention_id: str, step_index: int, status: "done"|"skipped"|"pending"}``.
+    Daemon updates the active intervention's micro_step status with timestamps and
+    broadcasts the updated INTERVENTION_TRIGGER envelope to all clients."""
+
     # ─── Daemon → Client (outbound, made by _make_* helpers) ─────────
 
     AUTH_OK = "AUTH_OK"

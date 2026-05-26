@@ -133,6 +133,76 @@ export function activate(context: vscode.ExtensionContext): void {
         }
     });
 
+    // --- P0 §3.5: EXECUTE_ACTION (HYPO / RECOVERY catalog) ---
+    // The daemon dispatches discrete executable actions to the editor
+    // via an ``EXECUTE_ACTION`` message. Today we only need to handle
+    // ``resume_last_active_file`` (re-engagement nudge). The browser
+    // extension handles the other two (suggest_movement_break and
+    // prompt_micro_commit) natively.
+    wsClient.onMessage((msg) => {
+        if (msg.type !== 'EXECUTE_ACTION') return;
+        const payload = msg.payload || {};
+        const actionType = (payload.action_type as string | undefined) || '';
+        if (actionType !== 'resume_last_active_file') return;
+
+        const target = String(payload.target || '').trim();
+        const actionId = (payload.action_id as string | undefined) || '';
+        const interventionId = (payload.intervention_id as string | undefined) || '';
+
+        // Parse "file_path:line"; the line is optional and falls back to 1.
+        const lastColon = target.lastIndexOf(':');
+        let filePath = target;
+        let line = 1;
+        if (lastColon > 0) {
+            const maybeLine = parseInt(target.slice(lastColon + 1), 10);
+            if (!Number.isNaN(maybeLine) && maybeLine > 0) {
+                filePath = target.slice(0, lastColon);
+                line = maybeLine;
+            }
+        }
+
+        if (!filePath) {
+            try {
+                wsClient?.sendInterventionApplied(
+                    interventionId,
+                    'execute_action',
+                    false,
+                    [],
+                    [`resume_last_active_file: empty target`],
+                );
+            } catch { /* ws may not be ready */ }
+            return;
+        }
+
+        // Best-effort open with a 0-based selection on the requested line.
+        const uri = vscode.Uri.file(filePath);
+        const sel = new vscode.Range(line - 1, 0, line - 1, 0);
+        vscode.window.showTextDocument(uri, { selection: sel }).then(
+            () => {
+                try {
+                    wsClient?.sendInterventionApplied(
+                        interventionId,
+                        'execute_action',
+                        true,
+                        [`resume_last_active_file:${actionId}`],
+                        [],
+                    );
+                } catch { /* ws may not be ready */ }
+            },
+            (err: unknown) => {
+                try {
+                    wsClient?.sendInterventionApplied(
+                        interventionId,
+                        'execute_action',
+                        false,
+                        [],
+                        [`resume_last_active_file: ${String(err)}`],
+                    );
+                } catch { /* ws may not be ready */ }
+            },
+        );
+    });
+
     // B1 (audit-prod): explicit COPILOT_THROTTLE registration.
     // The dedicated dispatch arm in ws-client guarantees the throttle
     // command runs even if generic-handler registration order ever

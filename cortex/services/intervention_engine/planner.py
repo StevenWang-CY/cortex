@@ -198,7 +198,7 @@ def map_hide_targets(plan: InterventionPlan) -> list[AdapterCommand]:
                 action="show_overlay",
                 params={
                     "headline": plan.headline,
-                    "micro_steps": plan.micro_steps,
+                    "micro_steps": [s.model_dump(mode="json") for s in plan.micro_steps],
                     "situation_summary": plan.situation_summary,
                     "tone": plan.tone,
                 },

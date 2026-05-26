@@ -318,29 +318,12 @@ class CortexAppController:
         # so peer surfaces re-render the strikethrough.
         if hasattr(self._overlay, "micro_step_toggled"):
             self._overlay.micro_step_toggled.connect(self._on_micro_step_toggled)
-        # P0 §3.6: micro-step checkbox round-trip. The overlay emits
-        # ``micro_step_toggled(intervention_id, step_index, new_status)``
-        # for every checkbox click; we forward to the daemon which
-        # mutates the active plan and rebroadcasts ``INTERVENTION_TRIGGER``
-        # so peer surfaces re-render the strikethrough.
-        if hasattr(self._overlay, "micro_step_toggled"):
-            self._overlay.micro_step_toggled.connect(self._on_micro_step_toggled)
         self._settings.settings_changed.connect(self._on_settings_changed)
         self._settings.back_requested.connect(self._show_dashboard)
         self._connections.back_requested.connect(self._show_dashboard)
         self._onboarding.open_settings_requested.connect(self._show_settings)
         self._onboarding.run_calibration_requested.connect(self._run_calibration)
         self._onboarding.completed.connect(self._complete_onboarding)
-        # P0 §3.4: route calibration progress callbacks from the runner
-        # (emitted on the daemon thread) back to the onboarding card's
-        # apply_calibration_progress slot. Queued connection by default —
-        # Qt marshals the dict payload onto the Qt main thread.
-        self._bridge.calibration_progress.connect(self._on_calibration_progress)
-        # P0 §3.4: Settings → Sensing → Recalibrate baselines. Re-uses
-        # the same _run_calibration path as onboarding so both surfaces
-        # drive one CalibrationRunner.
-        if hasattr(self._settings, "recalibrate_requested"):
-            self._settings.recalibrate_requested.connect(self._run_calibration)
         # P0 §3.4: route calibration progress callbacks from the runner
         # (emitted on the daemon thread) back to the onboarding card's
         # apply_calibration_progress slot. Queued connection by default —
@@ -986,31 +969,6 @@ class CortexAppController:
             )
         except Exception:
             logger.debug("dispatch/engage scheduling failed", exc_info=True)
-
-    @Slot(str, int, str)
-    def _on_micro_step_toggled(
-        self, intervention_id: str, step_index: int, new_status: str,
-    ) -> None:
-        """P0 §3.6: forward a desktop-overlay micro-step toggle to the
-        daemon. The daemon mutates the active plan, rebroadcasts
-        ``INTERVENTION_TRIGGER`` so peer surfaces re-render, and fires
-        ``natural_recovery`` once every step is ``"done"``.
-        """
-        if self._daemon is None or self._daemon_loop is None:
-            return
-        try:
-            asyncio.run_coroutine_threadsafe(
-                self._daemon.toggle_micro_step(
-                    str(intervention_id),
-                    int(step_index),
-                    str(new_status),
-                ),
-                self._daemon_loop,
-            )
-        except Exception:
-            logger.debug(
-                "toggle_micro_step scheduling failed", exc_info=True
-            )
 
     @Slot(str, int, str)
     def _on_micro_step_toggled(

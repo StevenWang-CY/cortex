@@ -337,7 +337,7 @@ def enrich_plan_with_context(
     if plan.micro_steps:
         filtered = [
             step for step in plan.micro_steps
-            if not any(phrase in step.lower() for phrase in _GENERIC_STEP_PHRASES)
+            if not any(phrase in step.text.lower() for phrase in _GENERIC_STEP_PHRASES)
         ]
         if filtered:
             plan.micro_steps = filtered

@@ -25,6 +25,7 @@ export type MessageType =
   | "REQUEST_SESSION_DETAIL"
   | "REQUEST_TRENDS"
   | "REQUEST_SESSION_RECAP"
+  | "MICRO_STEP_TOGGLED"
   | "AUTH_OK"
   | "STATE_UPDATE"
   | "INTERVENTION_TRIGGER"
@@ -894,7 +895,7 @@ export interface InterventionPlan {
    * @minItems 1
    * @maxItems 3
    */
-  micro_steps: [string] | [string, string] | [string, string, string];
+  micro_steps: [MicroStep] | [MicroStep, MicroStep] | [MicroStep, MicroStep, MicroStep];
   /**
    * Elements to hide/fold
    */
@@ -934,6 +935,31 @@ export interface InterventionPlan {
   metadata?: {
     [k: string]: unknown;
   };
+}
+/**
+ * P0 §3.6: a single micro-step with toggleable completion status.
+ *
+ * Tracks the lifecycle of an intervention's individual next-actions so
+ * the daemon can persist progress across reconnects and the surfaces
+ * can render check/strike-through state idempotently.
+ */
+export interface MicroStep {
+  /**
+   * Human-readable step text shown to the user
+   */
+  text: string;
+  /**
+   * Current completion status
+   */
+  status?: "pending" | "done" | "skipped";
+  /**
+   * When the user first acted on this step (toggled non-pending)
+   */
+  started_at?: string | null;
+  /**
+   * When the user marked this step done or skipped
+   */
+  completed_at?: string | null;
 }
 /**
  * UI manipulation instructions
@@ -980,7 +1006,10 @@ export interface SuggestedAction {
     | "highlight_tab"
     | "save_session"
     | "copy_to_clipboard"
-    | "start_timer";
+    | "start_timer"
+    | "resume_last_active_file"
+    | "prompt_micro_commit"
+    | "suggest_movement_break";
   /**
    * Integer index referencing the tab list from context (primary ID for tab actions)
    */

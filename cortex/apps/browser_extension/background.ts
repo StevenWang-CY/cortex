@@ -2536,18 +2536,12 @@ async function executeAction(action: SuggestedAction): Promise<ActionExecuteResu
                 return await executeCopyToClipboard(action);
             case "start_timer":
                 return await executeStartTimer(action);
-                // extension's role is to forward the user's "Take a
-                // break" click through to the daemon, which dispatches
-                // it to the desktop break overlay. Returning a
-                // ``reversible=true, success=true`` keeps the popup CTA
-                // pattern consistent — the actual heavy lifting happens
-                // daemon-side via ``ACTION_DISPATCH``.
-                return {
-                    action_id: action.action_id,
-                    success: true,
-                    message: "Biology break dispatched",
-                    reversible: true,
-                };
+            case "resume_last_active_file":
+                return await executeResumeLastActiveFile(action);
+            case "suggest_movement_break":
+                return await executeSuggestMovementBreak(action);
+            case "prompt_micro_commit":
+                return await executePromptMicroCommit(action);
             default: {
                 // Compile-time exhaustiveness: ``unhandled`` is ``never``
                 // when the switch covers every union member. Defence in
@@ -2835,6 +2829,168 @@ async function executeStartTimer(action: SuggestedAction): Promise<ActionExecute
     await chrome.alarms.create("cortex-break-timer", { delayInMinutes: minutes });
     injectToast("Break timer started", `Timer set for ${minutes} minutes. We'll remind you when it's done.`);
     return { action_id: action.action_id, success: true, message: `${minutes}min timer started`, reversible: false };
+}
+
+// ---------------------------------------------------------------------
+// P0 §3.5 — HYPO / RECOVERY action handlers
+// ---------------------------------------------------------------------
+
+/**
+ * Relay a "resume the user's last active file" request to a connected
+ * VS Code editor via the daemon's WS bridge. The daemon owns the editor
+ * connection; the browser extension cannot open files directly. If no
+ * editor is connected, we degrade to a soft popup toast so the user
+ * still sees the suggestion.
+ *
+ * ``action.target`` is "file_path:line" (validated server-side by
+ * SuggestedAction's _TARGET_MAX_LEN cap).
+ */
+async function executeResumeLastActiveFile(
+    action: SuggestedAction,
+): Promise<ActionExecuteResult> {
+    const aid = action.action_id || `resume_${Date.now()}`;
+    const target = (action.target || "").trim();
+    if (!target) {
+        return {
+            action_id: aid,
+            success: false,
+            message: "No file_path:line provided",
+            reversible: false,
+        };
+    }
+
+    // Best-effort: ask the daemon to relay the action to its connected
+    // VS Code (or fallback editor) client. The daemon is the single
+    // owner of editor WS sessions; we never address the editor directly.
+    try {
+        send({
+            type: "USER_ACTION",
+            payload: {
+                action: "execute_action",
+                action_type: "resume_last_active_file",
+                target,
+                action_id: aid,
+                intervention_id:
+                    typeof activeIntervention?.plan.intervention_id === "string"
+                        ? (activeIntervention.plan.intervention_id as string)
+                        : undefined,
+                timestamp: Date.now() / 1000,
+            },
+            timestamp: Date.now() / 1000,
+            sequence: ++sequence,
+            correlation_id: activeIntervention?.correlation_id,
+        });
+    } catch {
+        // Daemon may be offline — fall through to the soft toast.
+    }
+
+    // Always show a soft toast so the user gets feedback even when no
+    // editor is connected. The toast is informational, not a replacement
+    // for the editor jump.
+    const [filePath, lineStr] = target.split(":");
+    const line = lineStr ? parseInt(lineStr, 10) : NaN;
+    const label = !Number.isNaN(line)
+        ? `Open ${filePath} at line ${line}`
+        : `Open ${filePath}`;
+    injectToast("Resume where you left off", label);
+
+    return {
+        action_id: aid,
+        success: true,
+        message: `Relayed resume to editor: ${label}`,
+        reversible: true,
+    };
+}
+
+/**
+ * Surface a non-blocking "time to stretch" suggestion. Uses
+ * chrome.notifications when the permission is granted; otherwise falls
+ * back to an injected toast in the active tab so the user still sees it.
+ *
+ * ``action.target`` may be a duration string (minutes) — defaults to 2.
+ */
+async function executeSuggestMovementBreak(
+    action: SuggestedAction,
+): Promise<ActionExecuteResult> {
+    const aid = action.action_id || `movement_${Date.now()}`;
+    const rawMinutes = parseInt((action.target || "").trim(), 10);
+    const minutes = Number.isFinite(rawMinutes) && rawMinutes > 0 ? rawMinutes : 2;
+    const title = "Time for a 2-minute stand & stretch";
+    const body = `Step away for ${minutes} minute${minutes === 1 ? "" : "s"}. Your back will thank you.`;
+
+    // Prefer chrome.notifications if available + permitted. We never block
+    // on it — a missing permission silently falls through to the toast.
+    let notificationShown = false;
+    try {
+        if (chrome.notifications && typeof chrome.notifications.create === "function") {
+            await new Promise<void>((resolve) => {
+                try {
+                    chrome.notifications.create(
+                        `cortex-movement-${aid}`,
+                        {
+                            type: "basic",
+                            iconUrl: chrome.runtime.getURL("assets/icon.png"),
+                            title,
+                            message: body,
+                            priority: 0,
+                        },
+                        () => {
+                            notificationShown = !chrome.runtime.lastError;
+                            resolve();
+                        },
+                    );
+                } catch {
+                    resolve();
+                }
+            });
+        }
+    } catch {
+        // chrome.notifications missing or rejected — fall through.
+    }
+
+    if (!notificationShown) {
+        injectToast(title, body);
+    }
+
+    return {
+        action_id: aid,
+        success: true,
+        message: `Movement break suggested (${minutes} min)`,
+        reversible: false,
+    };
+}
+
+/**
+ * Surface a "you have N+ unstaged changes — consider a draft commit"
+ * popup toast. Informational only; we never run ``git commit`` for the
+ * user. The unstaged count is read from action.metadata.unstaged_count
+ * when present, otherwise the toast omits the number.
+ */
+async function executePromptMicroCommit(
+    action: SuggestedAction,
+): Promise<ActionExecuteResult> {
+    const aid = action.action_id || `commit_${Date.now()}`;
+    const meta = (action.metadata || {}) as Record<string, unknown>;
+    const rawCount = meta.unstaged_count;
+    const count = typeof rawCount === "number" && rawCount > 0
+        ? Math.floor(rawCount)
+        : null;
+
+    const title = "Consider a draft commit";
+    const body = count !== null
+        ? `You have ${count}+ unstaged changes — saving a checkpoint takes 10 seconds.`
+        : "You have unstaged changes — saving a checkpoint takes 10 seconds.";
+
+    injectToast(title, body);
+
+    return {
+        action_id: aid,
+        success: true,
+        message: count !== null
+            ? `Micro-commit nudge surfaced (${count} unstaged)`
+            : "Micro-commit nudge surfaced",
+        reversible: false,
+    };
 }
 
 // ---------------------------------------------------------------------
@@ -3546,8 +3702,24 @@ chrome.runtime.onMessage.addListener(
                 sendResponse({ ok: true });
                 break;
 
-
-
+            case "MICRO_STEP_TOGGLED":
+                // P0 §3.6: relay the popup/webview's micro-step toggle to
+                // the daemon. Mirrors the USER_RATING relay above — the
+                // wire envelope's payload carries the three fields the
+                // daemon's _handle_micro_step_toggled validates
+                // (intervention_id, step_index, new_status).
+                send({
+                    type: "MICRO_STEP_TOGGLED",
+                    payload: {
+                        intervention_id: message.intervention_id,
+                        step_index: message.step_index,
+                        new_status: message.new_status,
+                    },
+                    timestamp: Date.now() / 1000,
+                    sequence: ++sequence,
+                });
+                sendResponse({ ok: true });
+                break;
 
             case "EXECUTE_ACTION":
                 executeAction(message.action as SuggestedAction)

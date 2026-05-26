@@ -22,13 +22,26 @@ and is the authoritative resume signal on next app launch.
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+try:
+    from PySide6.QtCore import QRectF
+except ImportError:  # pragma: no cover - older Qt fallback
+    from PySide6.QtCore import QRect as QRectF  # type: ignore[assignment]
+
 from PySide6.QtCore import Qt, QTimer, Signal
+
+try:
+    from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
+except ImportError:  # pragma: no cover - test stubs
+    from PySide6.QtGui import QColor, QPainter, QPen  # type: ignore[assignment]
+
+    QPainterPath = None  # type: ignore[assignment,misc]
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -36,6 +49,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -94,6 +108,11 @@ _WHY_COPY: dict[str, str] = {
         "Your Bedrock token stays in the macOS Keychain. Cortex reads "
         "it once at launch and never persists it elsewhere."
     ),
+    "calibration": (
+        "Cortex compares each frame against YOUR resting baseline. "
+        "Without calibration we fall back to population averages and "
+        "miss the personal subtleties."
+    ),
     "extensions": (
         "The browser + VS Code extensions are how Cortex sees what "
         "you're working on and offers one-click interventions."
@@ -129,12 +148,16 @@ def _detect_continuity_camera() -> bool:
         logger.debug("Continuity Camera detection failed", exc_info=True)
     return False
 
-# F49: canonical step identifiers used by ``OnboardingState``. Order
-# matches the four cards rendered in ``OnboardingWindow``.
+# F49 / P0 §3.4: canonical step identifiers used by ``OnboardingState``.
+# Order matches the cards rendered in ``OnboardingWindow``. Step 4
+# ("calibration") was added in P0 §3.4 — it sits between LLM backend
+# and Extensions so the new user finishes the wizard with personal
+# baselines on disk rather than relying on population averages.
 ONBOARDING_STEPS: tuple[str, ...] = (
     "camera",
     "accessibility",
     "llm_backend",
+    "calibration",
     "extensions",
 )
 
@@ -279,7 +302,123 @@ def request_accessibility_permission() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Native progress strip — 4 dots connected by hairlines
+# P0 §3.4 — Calibration card subwidgets
+# ---------------------------------------------------------------------------
+
+
+class _StatusPill(QLabel):
+    """Tiny capsule label that flips between a good (terracotta-dim
+    success tint) and a poor (neutral) appearance based on a boolean.
+    Used by the calibration card to surface lighting / motion / face
+    quality at a glance."""
+
+    def __init__(self, label: str, parent: QWidget | None = None) -> None:
+        super().__init__(label, parent)
+        self._label = label
+        self.setFont(mac_native.system_font(FS_CAPTION, "medium"))
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setFixedHeight(20)
+        self.set_ok(False)
+
+    def set_ok(self, ok: bool) -> None:
+        if ok:
+            self.setText(f"✓ {self._label}")
+            self.setStyleSheet(
+                f"color: {_SUCCESS}; background: {_SUCCESS_DIM};"
+                f" border: none; border-radius: {RADIUS_BUTTON}px;"
+                "  padding: 2px 10px;"
+            )
+        else:
+            self.setText(f"○ {self._label}")
+            self.setStyleSheet(
+                f"color: {_LABEL_TERTIARY}; background: rgba(0,0,0,0.04);"
+                f" border: none; border-radius: {RADIUS_BUTTON}px;"
+                "  padding: 2px 10px;"
+            )
+
+
+class _ECGTrace(QWidget):
+    """Tiny ECG-style live trace of recent HR samples.
+
+    Renders a horizontal hairline baseline (no data yet) or a smoothed
+    polyline through the most recent ~60 samples scaled to the widget
+    height. Designed to feel calm — a thin terracotta line on the
+    grouped background — rather than a debug oscilloscope.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._samples: collections.deque[float] = collections.deque(maxlen=60)
+        self.setMinimumHeight(80)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(
+            f"background: {_GROUPED_BG}; border-radius: {RADIUS_CARD}px;"
+        )
+
+    def push_sample(self, value: float) -> None:
+        if value <= 0 or value != value:  # NaN guard
+            return
+        self._samples.append(value)
+        try:
+            self.update()
+        except Exception:
+            pass
+
+    def paintEvent(self, _event: object) -> None:  # noqa: D401 - Qt override
+        try:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        except Exception:
+            return
+
+        rect = self.rect()
+        w = rect.width()
+        h = rect.height()
+        pad = SP3
+
+        if not self._samples or len(self._samples) < 2:
+            # Flat baseline
+            pen = QPen(QColor(_LABEL_TERTIARY))
+            pen.setWidthF(1.0)
+            painter.setPen(pen)
+            mid = h // 2
+            painter.drawLine(pad, mid, w - pad, mid)
+            painter.end()
+            return
+
+        samples = list(self._samples)
+        smin = min(samples)
+        smax = max(samples)
+        span = max(1.0, smax - smin)
+        n = len(samples)
+        step = (w - 2 * pad) / max(1, n - 1)
+
+        pen = QPen(QColor(BRAND_ACCENT))
+        pen.setWidthF(1.6)
+        painter.setPen(pen)
+        if QPainterPath is None:
+            # Fallback for old Qt — draw a series of line segments.
+            for i in range(n - 1):
+                x1 = pad + i * step
+                y1 = h - pad - ((samples[i] - smin) / span) * (h - 2 * pad)
+                x2 = pad + (i + 1) * step
+                y2 = h - pad - ((samples[i + 1] - smin) / span) * (h - 2 * pad)
+                painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+        else:
+            path = QPainterPath()
+            for i, v in enumerate(samples):
+                x = pad + i * step
+                y = h - pad - ((v - smin) / span) * (h - 2 * pad)
+                if i == 0:
+                    path.moveTo(x, y)
+                else:
+                    path.lineTo(x, y)
+            painter.drawPath(path)
+        painter.end()
+
+
+# ---------------------------------------------------------------------------
+# Native progress strip — dots connected by hairlines
 # ---------------------------------------------------------------------------
 
 class _ProgressStrip(QWidget):
@@ -498,7 +637,8 @@ class OnboardingWindow(QWidget):
         layout.addSpacing(SP3)
 
         # ── Progress strip ────────────────────────────────────────────
-        self._progress = _ProgressStrip(4)
+        # P0 §3.4: 5 dots now (camera, accessibility, LLM, calibration, extensions).
+        self._progress = _ProgressStrip(5)
         layout.addWidget(self._progress)
         layout.addSpacing(SP3)
 
@@ -530,8 +670,14 @@ class OnboardingWindow(QWidget):
         self._llm_step = self._make_llm_step()
         layout.addWidget(self._llm_step)
 
-        # ── Step 4: Connect Extensions ────────────────────────────────
-        ext_frame = self._make_section("4", "Connect extensions", step_id="extensions")
+        # ── Step 4: Calibration ───────────────────────────────────────
+        # P0 §3.4 — new wizard step. Emits ``run_calibration_requested``
+        # which the controller routes to ``CalibrationRunner.start(...)``.
+        self._calibration_step = self._make_calibration_step()
+        layout.addWidget(self._calibration_step)
+
+        # ── Step 5: Connect Extensions ────────────────────────────────
+        ext_frame = self._make_section("5", "Connect extensions", step_id="extensions")
         self._extensions_step = ext_frame
         ext_layout = ext_frame.layout()
         hint = QLabel(
@@ -608,6 +754,7 @@ class OnboardingWindow(QWidget):
                 getattr(self, "_region_combo", None),
                 getattr(self, "_key_input", None),
                 getattr(self, "_save_key_btn", None),
+                getattr(self, "_begin_calibration_btn", None),
                 connect_btn,
                 finish_btn,
             )
@@ -866,6 +1013,232 @@ class OnboardingWindow(QWidget):
         # call it without re-resolving widgets by index.
         frame._cortex_set_state = _set_state  # type: ignore[attr-defined]
         return frame
+
+    # ------------------------------------------------------------------
+    # P0 §3.4 — Calibration step
+    # ------------------------------------------------------------------
+
+    def _make_calibration_step(self) -> QFrame:
+        """Build the calibration card (step 4 of 5).
+
+        The card hosts:
+
+        * ECG-style live trace (`_ECGTrace`) at the top.
+        * Three good/poor status pills (lighting, motion, face).
+        * Live HR / HRV / SQI numerics.
+        * A primary Begin button that emits ``run_calibration_requested``.
+        * A horizontal progress bar that fills over the 120 s.
+        * A subtle "Skip — use generic baselines" link.
+
+        On successful completion the controller calls
+        :meth:`apply_calibration_progress` with status ``completed``;
+        we then mark the step complete and swap the Begin button for a
+        success label.
+        """
+        frame = self._make_section("4", "Calibration", step_id="calibration")
+        layout = frame.layout()
+
+        desc = QLabel(
+            "Sit calmly for 2 minutes while Cortex learns your resting baseline."
+        )
+        desc.setWordWrap(True)
+        desc.setFont(mac_native.system_font(FS_CAPTION, "regular"))
+        desc.setStyleSheet(f"color: {_LABEL_SECONDARY}; border: none;")
+        layout.addWidget(desc)
+
+        # ECG trace — gives the user something to look at and signals
+        # liveness once HR samples arrive.
+        self._ecg_trace = _ECGTrace()
+        self._ecg_trace.setFixedHeight(120)
+        self._ecg_trace.setMinimumWidth(420)
+        layout.addWidget(self._ecg_trace)
+
+        # Three status pills (lighting / motion / face).
+        pill_row = QHBoxLayout()
+        pill_row.setSpacing(SP2)
+        self._cal_lighting_pill = _StatusPill("Lighting")
+        self._cal_motion_pill = _StatusPill("Motion")
+        self._cal_face_pill = _StatusPill("Face")
+        pill_row.addWidget(self._cal_lighting_pill)
+        pill_row.addWidget(self._cal_motion_pill)
+        pill_row.addWidget(self._cal_face_pill)
+        pill_row.addStretch()
+        layout.addLayout(pill_row)
+
+        # Live numerics line.
+        self._cal_numerics = QLabel("HR: — bpm  ·  HRV: — ms  ·  SQI: —")
+        self._cal_numerics.setFont(mac_native.system_font(FS_CAPTION, "medium"))
+        self._cal_numerics.setStyleSheet(
+            f"color: {_LABEL_SECONDARY}; border: none; background: transparent;"
+        )
+        layout.addWidget(self._cal_numerics)
+
+        # Progress bar.
+        self._cal_progress_bar = QProgressBar()
+        self._cal_progress_bar.setRange(0, 100)
+        self._cal_progress_bar.setValue(0)
+        self._cal_progress_bar.setTextVisible(False)
+        self._cal_progress_bar.setFixedHeight(6)
+        self._cal_progress_bar.setStyleSheet(
+            "QProgressBar {"
+            f"  background: {_GROUPED_BG};"
+            "  border: none;"
+            "  border-radius: 3px;"
+            "}"
+            "QProgressBar::chunk {"
+            f"  background: {BRAND_ACCENT};"
+            "  border-radius: 3px;"
+            "}"
+        )
+        layout.addWidget(self._cal_progress_bar)
+
+        # Action row — Begin button + Skip link.
+        action_row = QHBoxLayout()
+        begin_btn = QPushButton("Begin")
+        begin_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        begin_btn.setMinimumHeight(32)
+        begin_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
+        begin_btn.setStyleSheet(
+            "QPushButton {"
+            "  padding: 6px 20px;"
+            f"  border-radius: {RADIUS_BUTTON}px;"
+            f"  background: {BRAND_ACCENT};"
+            "  color: #FFF; border: none;"
+            "}"
+            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
+            "QPushButton:disabled { background: rgba(0,0,0,0.10); color: rgba(0,0,0,0.30); }"
+        )
+        begin_btn.clicked.connect(self._on_begin_calibration)
+        set_accessible_name(begin_btn, "Begin calibration")
+        set_accessible_description(
+            begin_btn,
+            "Start the 2-minute calibration capture. Cortex will read your resting baseline.",
+        )
+        self._begin_calibration_btn = begin_btn
+        action_row.addWidget(begin_btn)
+
+        skip_btn = QPushButton("Skip — use generic baselines")
+        skip_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        skip_btn.setFlat(True)
+        skip_btn.setFont(mac_native.system_font(FS_CAPTION, "regular"))
+        skip_btn.setStyleSheet(
+            "QPushButton {"
+            "  background: transparent; border: none;"
+            f"  color: {_LABEL_TERTIARY};"
+            "  text-decoration: underline;"
+            "  padding: 4px 8px;"
+            "}"
+            f"QPushButton:hover {{ color: {_LABEL_SECONDARY}; }}"
+        )
+        skip_btn.clicked.connect(self._on_skip_calibration)
+        set_accessible_name(skip_btn, "Skip calibration")
+        set_accessible_description(
+            skip_btn,
+            "Skip calibration and use generic baselines. You can recalibrate later from Settings.",
+        )
+        self._skip_calibration_btn = skip_btn
+        action_row.addStretch()
+        action_row.addWidget(skip_btn)
+        layout.addLayout(action_row)
+
+        # Success label — hidden until completion.
+        self._cal_success_label = QLabel("✓ Recalibrated · baselines saved")
+        self._cal_success_label.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
+        self._cal_success_label.setStyleSheet(
+            f"color: {_SUCCESS}; background: {_SUCCESS_DIM};"
+            f" border: none; border-radius: {RADIUS_BUTTON}px;"
+            "  padding: 4px 10px;"
+        )
+        self._cal_success_label.setVisible(False)
+        layout.addWidget(self._cal_success_label)
+
+        return frame
+
+    def _on_begin_calibration(self) -> None:
+        """Click handler for the Begin button. Disables itself and emits
+        the dormant ``run_calibration_requested`` signal so the
+        controller can spin up a ``CalibrationRunner``."""
+        try:
+            self._begin_calibration_btn.setEnabled(False)
+            self._cal_progress_bar.setValue(1)
+            self._cal_numerics.setText("HR: — bpm  ·  HRV: — ms  ·  SQI: starting…")
+        except AttributeError:
+            pass
+        self.run_calibration_requested.emit()
+
+    def _on_skip_calibration(self) -> None:
+        """User opted out of calibration. We don't write a baseline, but
+        we do mark the step complete so the wizard can finish — the
+        dashboard will surface a yellow 'Calibrate now' prompt later."""
+        self.mark_step_complete("calibration")
+        try:
+            self._begin_calibration_btn.setVisible(False)
+            self._skip_calibration_btn.setVisible(False)
+            self._cal_progress_bar.setVisible(False)
+            self._cal_success_label.setText("Skipped — using generic baselines")
+            self._cal_success_label.setVisible(True)
+        except AttributeError:
+            pass
+
+    def apply_calibration_progress(
+        self,
+        *,
+        elapsed_seconds: float,
+        total_seconds: float,
+        current_hr: float | None,
+        current_hrv: float | None,
+        current_sqi: float | None,
+        lighting_ok: bool,
+        motion_ok: bool,
+        face_ok: bool,
+        pct_complete: float,
+        status: str,
+    ) -> None:
+        """Slot wired by the controller to the calibration progress
+        callback. Updates the live trace, pills, numerics, and bar.
+
+        Marshalled onto the Qt main thread by the controller before
+        this is invoked.
+        """
+        try:
+            self._cal_progress_bar.setValue(int(round(pct_complete)))
+        except AttributeError:
+            pass
+        try:
+            hr_text = f"{current_hr:.0f}" if current_hr is not None else "—"
+            hrv_text = f"{current_hrv:.0f}" if current_hrv is not None else "—"
+            sqi_text = f"{current_sqi:.2f}" if current_sqi is not None else "—"
+            self._cal_numerics.setText(
+                f"HR: {hr_text} bpm  ·  HRV: {hrv_text} ms  ·  SQI: {sqi_text}"
+            )
+        except AttributeError:
+            pass
+        try:
+            self._cal_lighting_pill.set_ok(lighting_ok)
+            self._cal_motion_pill.set_ok(motion_ok)
+            self._cal_face_pill.set_ok(face_ok)
+        except AttributeError:
+            pass
+        try:
+            if current_hr is not None:
+                self._ecg_trace.push_sample(float(current_hr))
+        except AttributeError:
+            pass
+
+        if status == "completed":
+            self.mark_step_complete("calibration")
+            try:
+                self._cal_progress_bar.setValue(100)
+                self._begin_calibration_btn.setVisible(False)
+                self._skip_calibration_btn.setVisible(False)
+                self._cal_success_label.setVisible(True)
+            except AttributeError:
+                pass
+        elif status in ("aborted", "failed"):
+            try:
+                self._begin_calibration_btn.setEnabled(True)
+            except AttributeError:
+                pass
 
     def _make_llm_step(self) -> QFrame:
         frame = self._make_section("3", "AWS Bedrock bearer token", step_id="llm_backend")

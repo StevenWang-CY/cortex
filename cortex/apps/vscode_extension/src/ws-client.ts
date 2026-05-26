@@ -273,6 +273,30 @@ export class CortexWSClient {
     }
 
     /**
+     * P0 §3.6: send a MICRO_STEP_TOGGLED message to the daemon.
+     *
+     * @param interventionId - id of the active intervention
+     * @param stepIndex - zero-based index into ``micro_steps``
+     * @param newStatus - "pending" | "done" | "skipped"
+     */
+    sendMicroStepToggled(
+        interventionId: string,
+        stepIndex: number,
+        newStatus: "pending" | "done" | "skipped",
+    ): void {
+        this._send({
+            type: "MICRO_STEP_TOGGLED",
+            payload: {
+                intervention_id: interventionId,
+                step_index: stepIndex,
+                new_status: newStatus,
+            },
+            timestamp: Date.now() / 1000,
+            sequence: ++this._sequence,
+        });
+    }
+
+    /**
      * Notify the daemon that an intervention was applied (or restored).
      *
      * B.2: the daemon's in-process executor runs an
