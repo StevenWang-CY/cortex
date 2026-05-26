@@ -25,6 +25,7 @@ export type MessageType =
   | "REQUEST_SESSION_DETAIL"
   | "REQUEST_TRENDS"
   | "REQUEST_SESSION_RECAP"
+  | "SESSION_RECAP_ACKNOWLEDGED"
   | "MICRO_STEP_TOGGLED"
   | "WHY_DETAIL_REQUEST"
   | "QUIET_MODE_TOGGLE"
@@ -1841,9 +1842,9 @@ export interface TelemetryFeatures {
  */
 export interface TrendsRequest {
   /**
-   * Aggregation window: 'week' = last 7 days, 'month' = last 30.
+   * Aggregation window: 'week' = last 7 days, 'month' = last 30, 'quarter' = last 90.
    */
-  window?: "week" | "month";
+  window?: "week" | "month" | "quarter";
   /**
    * When True, force the daemon to recompute the chronotype model from disk before replying. Defaults to False so the cached model.json is served.
    */
@@ -1858,9 +1859,9 @@ export interface TrendsRequest {
  */
 export interface TrendsResponse {
   /**
-   * The window the daily rows cover. Week=last 7 days, month=last 30.
+   * The window the daily rows cover. Week=last 7 days, month=last 30, quarter=last 90.
    */
-  window?: "week" | "month";
+  window?: "week" | "month" | "quarter";
   /**
    * One DailyBaseline row per day in the window, chronologically ascending. UI must read this — never iterate ``chronotype.baselines`` directly.
    */

@@ -144,6 +144,16 @@ class MessageType(str, Enum):  # noqa: UP042 — pydantic-to-typescript requires
     Payload: ``{}``. Reply: ``SESSION_RECAP`` (or empty payload if no
     recap is cached yet)."""
 
+    SESSION_RECAP_ACKNOWLEDGED = "SESSION_RECAP_ACKNOWLEDGED"
+    """P0 §3.3 (Wave-2 P1): UI confirms the user dismissed the recap card.
+
+    Sent by the desktop shell's recap sheet (and any peer surface that
+    rendered the recap) after the user clicks Close or the autohide
+    fires. The daemon's ``stop()`` awaits this acknowledgement (or a
+    5 s timeout) before tearing down the WS server so a fast UI hide
+    doesn't race the shutdown. Payload: ``{session_id: str | None}``
+    (the id is informational; the daemon's wait is unconditional)."""
+
     MICRO_STEP_TOGGLED = "MICRO_STEP_TOGGLED"
     """P0 §3.6: client toggles a micro-step's completion state.
 

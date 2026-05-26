@@ -248,6 +248,53 @@ def test_refresh_chronotype_too_few_points_returns_stable(dirs, monkeypatch) -> 
     assert model.trend_direction == "stable"
 
 
+def test_refresh_chronotype_low_hrv_floor_forces_stable(dirs, monkeypatch) -> None:
+    """When the mean of the recent HRV observations falls below
+    ``_HRV_TREND_MEAN_FLOOR`` the slope is forced to ``"stable"`` — a
+    tiny absolute drift on a near-zero mean would otherwise amplify
+    into a false "improving" / "declining" trend on a noisy signal
+    (P0 audit fix #4.B-2).
+
+    We monkeypatch the floor *up* (to 15.0) so the DailyBaseline
+    schema's hard ``ge=10.0`` floor (which would otherwise reject any
+    constructed value < 10) is still respected — the values written
+    here are 12+ ms RMSSD with a +0.5/day drift that, without the
+    floor, would otherwise classify as "improving" via the relative
+    threshold path.
+    """
+    sessions_dir, chronotype_dir = dirs
+    today = date(2026, 5, 20)
+    for i in range(7):
+        d = today - timedelta(days=6 - i)
+        _write_session_at(
+            sessions_dir,
+            f"s{i}",
+            start=_utc_noon(d),
+            avg_hrv_rmssd=12.0 + i * 0.5,
+        )
+    from cortex.services.session_report import longitudinal as L
+
+    monkeypatch.setattr(L, "_HRV_TREND_MEAN_FLOOR", 15.0)
+    monkeypatch.setattr(
+        L, "datetime", _PatchedDatetime(L.datetime, fixed_now=_utc_noon(today))
+    )
+    agg = LongitudinalAggregator(sessions_dir, chronotype_dir)
+    model = agg.refresh_chronotype(window_days=7)
+    # Mean of the recent HRV values is ~13.5 — below the patched floor
+    # of 15.0, so trend_direction MUST stay "stable" regardless of the
+    # underlying linear slope.
+    assert model.trend_direction == "stable"
+
+
+def test_hrv_trend_floor_default_is_physiologically_sane() -> None:
+    """The shipped floor must be >= 5 ms RMSSD — values under that are
+    almost always sensor noise rather than real cardiac signal, and a
+    relative-slope classification against them is meaningless."""
+    from cortex.services.session_report import longitudinal as L
+
+    assert L._HRV_TREND_MEAN_FLOOR >= 5.0
+
+
 # ─── get_trends ───────────────────────────────────────────────────────
 
 
@@ -270,8 +317,40 @@ def test_get_trends_returns_only_requested_window_rows(dirs, monkeypatch) -> Non
     quarter = agg.get_trends("quarter")
     assert week.window == "week"
     assert len(week.daily) == 7
+    assert month.window == "month"
     assert len(month.daily) == 30
+    # P0 §3.2 contract: ``quarter`` must NOT be silently downgraded.
+    assert quarter.window == "quarter"
     assert len(quarter.daily) == 30  # ≤90, only 30 available
+
+
+def test_get_trends_quarter_returns_90_days_when_available(
+    dirs, monkeypatch,
+) -> None:
+    """P0 §3.2 contract: ``get_trends('quarter')`` returns 90 daily rows
+    when 90+ days of session data exist on disk."""
+    sessions_dir, chronotype_dir = dirs
+    today = date(2026, 5, 20)
+    # Stage exactly 90 days of sessions so the quarter window is fully
+    # populated. (One session per day; the aggregate doesn't care about
+    # the daily HR/HRV values for the row-count assertion.)
+    for i in range(90):
+        d = today - timedelta(days=89 - i)
+        _write_session_at(sessions_dir, f"q{i:02d}", start=_utc_noon(d))
+    from cortex.services.session_report import longitudinal as L
+
+    monkeypatch.setattr(
+        L, "datetime", _PatchedDatetime(L.datetime, fixed_now=_utc_noon(today))
+    )
+    agg = LongitudinalAggregator(sessions_dir, chronotype_dir)
+    agg.refresh_chronotype(window_days=90)
+
+    quarter = agg.get_trends("quarter")
+    assert quarter.window == "quarter"
+    assert len(quarter.daily) == 90
+    # Sanity: rows are chronologically ascending, oldest first.
+    assert quarter.daily[0].record_date == today - timedelta(days=89)
+    assert quarter.daily[-1].record_date == today
 
 
 def test_get_trends_caches_unless_refresh(dirs, monkeypatch) -> None:

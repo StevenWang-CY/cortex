@@ -89,15 +89,22 @@ _CHRONOTYPE_WINDOW_DAYS: int = 90
 # (P0 §3.2 fix #15).
 _HRV_TREND_REL_THRESHOLD: float = 0.05
 
-# Mean-HRV floor below which the slope is forced to "stable" (1 ms RMSSD
-# is biologically implausible; serves as a sanity guard against divide-
-# by-zero in the relative slope computation).
-_HRV_TREND_MEAN_FLOOR: float = 1e-3
+# Mean-HRV floor (ms RMSSD) below which the slope is forced to
+# "stable". Physiologically plausible adult resting HRV (RMSSD) sits
+# in roughly the 20–80 ms range; values under ~5 ms almost always
+# indicate sensor-quality issues (heavy motion, poor illumination,
+# user off-camera) rather than a real cardiac signal. Computing a
+# relative slope against a mean of, say, 1.5 ms turns a +0.1 ms/day
+# absolute drift into a +6 %/day "improving" trend — pure noise
+# amplification. Forcing "stable" below 5 ms keeps the dashboard
+# honest until the user produces signal-quality observations
+# (P0 audit fix #4.B-2). Also guards against divide-by-zero in the
+# relative slope computation.
+_HRV_TREND_MEAN_FLOOR: float = 5.0
 
-# Default window sizes for the trends rollup. ``quarter`` was dropped
-# at the wire-schema level (P0 §3.2 fix #5); the dict is kept tolerant
-# so a daemon receiving a stale "quarter" payload still returns rows
-# rather than 500ing — the WS / REST dispatch layer is the strict gate.
+# Default window sizes for the trends rollup. All three values are
+# part of the public ``TrendsRequest`` / ``TrendsResponse`` literal
+# (P0 §3.2): week=last 7 days, month=last 30, quarter=last 90.
 _WINDOWS: dict[str, int] = {"week": 7, "month": 30, "quarter": 90}
 
 
@@ -478,20 +485,21 @@ class LongitudinalAggregator:
         :data:`_MODEL_FRESHNESS_HOURS`, recomputes and atomic-writes
         first. Otherwise serves the cached model + per-day rows.
 
-        ``quarter`` is accepted (90 days) for backward compat with
-        callers built against the pre-fix wire schema, but the public
-        ``TrendsResponse.window`` is now constrained to ``week|month``
-        — so quarter requests are downgraded to ``"month"`` before the
-        envelope is constructed.
+        ``window`` is part of the public ``TrendsResponse`` literal —
+        ``week`` (7d) / ``month`` (30d) / ``quarter`` (90d) — and is
+        passed straight through to the wire envelope. Unknown values
+        fall back to ``"week"`` for defense-in-depth (the schema layer
+        is the strict gate; the WS / REST dispatch layers also clamp).
         """
-        days = _WINDOWS.get(window, 7)
+        if window not in _WINDOWS:
+            wire_window: Literal["week", "month", "quarter"] = "week"
+        else:
+            wire_window = window  # type: ignore[assignment]
+        days = _WINDOWS.get(wire_window, 7)
         model = self._load_or_refresh_model(
             refresh=refresh, window_days=_CHRONOTYPE_WINDOW_DAYS,
         )
         daily = self._load_daily_window(days)
-        wire_window: Literal["week", "month"] = (
-            "month" if window in ("month", "quarter") else "week"
-        )
         return TrendsResponse(
             window=wire_window,
             daily=daily,

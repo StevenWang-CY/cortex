@@ -31,6 +31,7 @@ from cortex.libs.schemas.session_history import (
     SessionDetailResponse,
     SessionListResponse,
     SessionSummary,
+    TrendsRequest,
     TrendsResponse,
 )
 from cortex.services.session_report.models import SessionReport, StateTransition
@@ -266,6 +267,38 @@ def test_trends_response_rejects_invalid_window() -> None:
     """``Literal['week','month','quarter']`` rejects other strings."""
     with pytest.raises(ValidationError):
         TrendsResponse(window="year")  # type: ignore[arg-type]
+
+
+def test_trends_response_accepts_quarter_window() -> None:
+    """P0 §3.2 contract: ``window='quarter'`` must round-trip cleanly."""
+    envelope = TrendsResponse(window="quarter")
+    dumped = envelope.model_dump(mode="json")
+    assert dumped["window"] == "quarter"
+    restored = TrendsResponse.model_validate(dumped)
+    assert restored.window == "quarter"
+
+
+def test_trends_request_accepts_all_three_windows() -> None:
+    """P0 §3.2 contract: TrendsRequest accepts week / month / quarter."""
+    for window in ("week", "month", "quarter"):
+        req = TrendsRequest(window=window)  # type: ignore[arg-type]
+        assert req.window == window
+        dumped = req.model_dump(mode="json")
+        assert dumped["window"] == window
+        assert TrendsRequest.model_validate(dumped).window == window
+
+
+def test_trends_request_rejects_invalid_window() -> None:
+    """TrendsRequest must reject windows outside the literal union."""
+    with pytest.raises(ValidationError):
+        TrendsRequest(window="year")  # type: ignore[arg-type]
+
+
+def test_trends_request_defaults() -> None:
+    """Default TrendsRequest is week, refresh=False."""
+    req = TrendsRequest()
+    assert req.window == "week"
+    assert req.refresh is False
 
 
 def test_trends_response_ignores_unknown_fields() -> None:

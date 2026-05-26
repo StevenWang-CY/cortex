@@ -2008,6 +2008,12 @@ class DashboardWindow(QWidget):
     # the daemon-armed focus protection toast. Cleared in the daemon
     # via ``disarm_auto_focus``.
     auto_focus_disarm_requested = Signal()
+    # P0 §3.3 (Wave-2 P1): emitted when the user dismisses the recap
+    # card OR the in-process recap watchdog fires. The controller
+    # forwards this to ``daemon.acknowledge_session_recap()`` which
+    # releases the daemon's stop() wait — without this, the daemon's
+    # 5 s recap-dismiss timeout fires unnecessarily on every stop.
+    recap_dismissed_ack = Signal(str)  # session_id (may be empty)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -2347,7 +2353,29 @@ class DashboardWindow(QWidget):
         """RecapSheet was closed (manual / autohide) — proceed with the
         actual daemon shutdown emit. The consumer tab's ``_finalize_stop``
         is idempotent so calling it from both this path and the
-        watchdog is safe."""
+        watchdog is safe.
+
+        Wave-2 P1 (P0 §3.3): also bubble a ``recap_dismissed_ack``
+        signal so the controller can call
+        ``daemon.acknowledge_session_recap()`` — that releases the
+        daemon's ``stop()`` wait early instead of letting the 5 s
+        dismissal-ACK timeout fire on every shutdown.
+        """
+        # Echo the session id from the currently-displayed recap sheet
+        # if available; the daemon's ack flips its event
+        # unconditionally so a missing id is harmless.
+        session_id: str = ""
+        try:
+            if self._recap_sheet is not None and hasattr(
+                self._recap_sheet, "current_session_id"
+            ):
+                session_id = str(self._recap_sheet.current_session_id() or "")
+        except Exception:
+            logger.debug("recap_sheet.current_session_id raised", exc_info=True)
+        try:
+            self.recap_dismissed_ack.emit(session_id)
+        except Exception:
+            logger.debug("recap_dismissed_ack.emit raised", exc_info=True)
         if self._consumer is not None:
             try:
                 self._consumer._finalize_stop()

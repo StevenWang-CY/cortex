@@ -394,6 +394,13 @@ class RecapSheet(QWidget):
         decides to bail). Emits ``dismissed`` exactly once."""
         self._on_close_clicked()
 
+    def current_session_id(self) -> str:
+        """P0 §3.3 (Wave-2 P1): expose the currently-displayed
+        session id so the dashboard can include it in the
+        ``recap_dismissed_ack`` signal payload. Returns ``""`` when
+        no report has been shown yet."""
+        return self._session_id
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------

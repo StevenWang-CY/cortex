@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -330,3 +331,94 @@ def test_top_distraction_domain_is_none_when_empty(sessions_dir: Path) -> None:
     reader = SessionReader(sessions_dir)
     page = reader.list_sessions(since=None, limit=30)
     assert page.items[0].top_distraction_domain is None
+
+
+# ─── Wave-2 P1: strict skip on missing required fields ───────────────
+
+
+def test_list_sessions_skips_missing_duration_seconds(
+    sessions_dir: Path, caplog: Any
+) -> None:
+    """A session JSON missing ``duration_seconds`` is treated as malformed:
+    the row is skipped (NOT silently zeroed) and a WARNING naming the file
+    path is emitted. Adjacent valid sessions still list normally.
+    """
+    import logging
+
+    base = datetime(2026, 5, 24, 9, 0, tzinfo=UTC)
+    _write_session(sessions_dir, "good", start_time=base)
+
+    # Materialise a session JSON missing ``duration_seconds`` entirely.
+    bad_path = sessions_dir / "session_bad.json"
+    bad_path.write_text(
+        json.dumps({
+            "session_id": "bad",
+            "start_time": base.isoformat(),
+            "end_time": (base + timedelta(seconds=600)).isoformat(),
+            # duration_seconds intentionally omitted.
+            "flow_percentage": 50.0,
+        }),
+        encoding="utf-8",
+    )
+
+    reader = SessionReader(sessions_dir)
+    with caplog.at_level(logging.WARNING, logger="cortex.services.session_report.reader"):
+        resp = reader.list_sessions(since=None, limit=30)
+
+    ids = [item.session_id for item in resp.items]
+    assert ids == ["good"], f"expected only 'good'; got {ids}"
+    # Warning must name the path so the operator can find the bad file.
+    warned = [r for r in caplog.records if "session_bad.json" in r.getMessage()]
+    assert warned, "expected a WARNING naming the malformed session file"
+    assert any("duration_seconds" in r.getMessage() for r in warned)
+
+
+def test_list_sessions_skips_missing_flow_percentage(
+    sessions_dir: Path, caplog: Any
+) -> None:
+    """``flow_percentage`` is required (its 0.0 default would mask corruption)."""
+    import logging
+
+    base = datetime(2026, 5, 24, 9, 0, tzinfo=UTC)
+    bad_path = sessions_dir / "session_noflow.json"
+    bad_path.write_text(
+        json.dumps({
+            "session_id": "noflow",
+            "start_time": base.isoformat(),
+            "end_time": (base + timedelta(seconds=600)).isoformat(),
+            "duration_seconds": 600.0,
+            # flow_percentage intentionally omitted.
+        }),
+        encoding="utf-8",
+    )
+    reader = SessionReader(sessions_dir)
+    with caplog.at_level(logging.WARNING, logger="cortex.services.session_report.reader"):
+        resp = reader.list_sessions(since=None, limit=30)
+    assert resp.items == []
+    assert any(
+        "session_noflow.json" in r.getMessage() and "flow_percentage" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_list_sessions_allows_missing_peak_stress_integral(
+    sessions_dir: Path,
+) -> None:
+    """``peak_stress_integral`` is genuinely optional (defaults to 0.0)."""
+    base = datetime(2026, 5, 24, 9, 0, tzinfo=UTC)
+    path = sessions_dir / "session_nopeak.json"
+    path.write_text(
+        json.dumps({
+            "session_id": "nopeak",
+            "start_time": base.isoformat(),
+            "end_time": (base + timedelta(seconds=600)).isoformat(),
+            "duration_seconds": 600.0,
+            "flow_percentage": 70.0,
+            # peak_stress_integral intentionally omitted.
+        }),
+        encoding="utf-8",
+    )
+    reader = SessionReader(sessions_dir)
+    resp = reader.list_sessions(since=None, limit=30)
+    assert [item.session_id for item in resp.items] == ["nopeak"]
+    assert resp.items[0].peak_stress_integral == 0.0

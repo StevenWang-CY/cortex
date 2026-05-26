@@ -76,6 +76,7 @@ def _make_fake_daemon(plan: InterventionPlan) -> SimpleNamespace:
     recorder = MagicMock()
     recorder.append = MagicMock()
 
+    import asyncio as _asyncio
     fake = SimpleNamespace(
         _ws_server=ws_server,
         _restore_manager=restore_manager,
@@ -84,6 +85,11 @@ def _make_fake_daemon(plan: InterventionPlan) -> SimpleNamespace:
         _active_plan=plan,
         _active_intervention_id=plan.intervention_id,
         _micro_step_recovery_fired=False,
+        # Wave-2 P1: serialise toggle vs. F16 plan-swap. The lock
+        # lives on the production daemon; the fake needs one too so
+        # the ``async with self._micro_step_lock`` body inside
+        # ``toggle_micro_step`` doesn't AttributeError.
+        _micro_step_lock=_asyncio.Lock(),
     )
     return fake
 

@@ -175,12 +175,18 @@ class CausalAttributor:
         """Return the top-N causal signals ranked by |z-score|.
 
         When no signal exceeds the :data:`_MIN_ABS_Z` floor (e.g. the
-        user is well within their personal envelope) the method
-        synthesises a single ``CausalSignal`` named "Baseline" so the
-        "Why?" drilldown UI can render a meaningful explanation
-        instead of a blank panel. This closes the audit gap where the
-        empty-list response looked like a bug rather than a healthy
-        baseline reading.
+        user is well within their personal envelope, or feature
+        extraction failed for every signal) the method returns an
+        empty list. The UI is responsible for rendering the
+        "no explanation available" empty state for an empty
+        ``causal_signals`` payload — see ``popup.tsx``'s
+        ``causalSignals.length === 0`` branch.
+
+        Returning a synthetic placeholder (e.g. "HRV (baseline)") here
+        was misleading: it showed a real biometric value next to a
+        label the user couldn't act on, making a healthy baseline read
+        look like a half-broken explanation. The empty-state branch
+        in the UI now communicates "explanation pending" clearly.
         """
         scored: list[tuple[float, CausalSignal]] = []
         for key, cfg in _SIGNAL_CONFIG.items():
@@ -219,34 +225,6 @@ class CausalAttributor:
             else:
                 severity = "tertiary"
             ranked.append(sig.model_copy(update={"severity": severity}))
-
-        # P0 §3.9 audit fix: empty result → synthetic baseline signal.
-        # Without this the UI shows a blank "Why?" panel which reads
-        # like a bug. Surface the HRV reading (or, failing that, HR)
-        # as a neutral baseline so the user sees "All signals within
-        # normal range" instead of nothing.
-        if not ranked:
-            for key in ("hrv", "hr"):
-                cfg = _SIGNAL_CONFIG[key]
-                value = self._extract(features, cfg.feature_attr)
-                if value is None:
-                    continue
-                baseline, _sigma = self._baseline_for(cfg, baselines)
-                samples = list(self._buffers[key])
-                ranked.append(
-                    CausalSignal(
-                        name=f"{cfg.label} (baseline)",
-                        current_value=float(value),
-                        baseline_value=(
-                            float(baseline) if baseline is not None else None
-                        ),
-                        unit=cfg.unit,
-                        delta_pct=None,
-                        samples_60s=samples,
-                        severity="primary",
-                    )
-                )
-                break
         return ranked
 
     @staticmethod

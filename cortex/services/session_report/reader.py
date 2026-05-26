@@ -150,18 +150,56 @@ def _project_header(path: Path, mtime: float) -> _ListingCacheEntry | None:
         )
         return None
 
+    # Wave-2 P1 (audit §3.1): the schema declares ``duration_seconds`` as
+    # required and ``flow_percentage`` defaults to 0.0 only for legitimately
+    # zero-flow short sessions. A *missing* key on disk is storage
+    # corruption, not zero flow — log a WARNING with the path and skip
+    # the row so the History tab surfaces the gap rather than rendering
+    # a deceptive 0.00-flow tile that masks the malformed write.
+    if "duration_seconds" not in data or data.get("duration_seconds") is None:
+        logger.warning(
+            "session-reader: skipping %s (required field 'duration_seconds' missing/None)",
+            path,
+        )
+        return None
+    if "flow_percentage" not in data or data.get("flow_percentage") is None:
+        logger.warning(
+            "session-reader: skipping %s (required field 'flow_percentage' missing/None)",
+            path,
+        )
+        return None
+
     try:
-        duration_seconds = float(data.get("duration_seconds") or 0.0)
+        duration_seconds = float(data["duration_seconds"])
     except (TypeError, ValueError):
-        duration_seconds = 0.0
+        logger.warning(
+            "session-reader: skipping %s (duration_seconds=%r not coercible to float)",
+            path,
+            data.get("duration_seconds"),
+        )
+        return None
     try:
-        flow_percentage = float(data.get("flow_percentage") or 0.0)
+        flow_percentage = float(data["flow_percentage"])
     except (TypeError, ValueError):
-        flow_percentage = 0.0
+        logger.warning(
+            "session-reader: skipping %s (flow_percentage=%r not coercible to float)",
+            path,
+            data.get("flow_percentage"),
+        )
+        return None
+    # ``peak_stress_integral`` is allowed to default — the schema
+    # carries ``0.0`` as a legitimate value for sessions that never
+    # crossed a HYPER peak. Missing key → 0.0 is fine; a malformed
+    # type is still grounds to skip (defense vs. partial writes).
     try:
         peak_stress_integral = float(data.get("peak_stress_integral") or 0.0)
     except (TypeError, ValueError):
-        peak_stress_integral = 0.0
+        logger.warning(
+            "session-reader: skipping %s (peak_stress_integral=%r not coercible to float)",
+            path,
+            data.get("peak_stress_integral"),
+        )
+        return None
 
     domains = data.get("top_distraction_domains") or []
     top_distraction_domain: str | None = None

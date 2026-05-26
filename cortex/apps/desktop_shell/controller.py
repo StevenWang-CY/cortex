@@ -490,6 +490,14 @@ class CortexAppController:
             self._dashboard.auto_focus_disarm_requested.connect(
                 self._on_auto_focus_disarm_requested,
             )
+        # P0 §3.3 (Wave-2 P1): recap dismiss → daemon ACK. The daemon's
+        # ``stop()`` waits up to 5 s on ``acknowledge_session_recap`` so
+        # the WS teardown can't race a fast UI hide. Without this
+        # bridge, every in-process shutdown eats the full 5 s timeout.
+        if hasattr(self._dashboard, "recap_dismissed_ack"):
+            self._dashboard.recap_dismissed_ack.connect(
+                self._on_recap_dismissed_ack,
+            )
 
         # -- Start daemon in background thread --------------------------------
         self._start_daemon()
@@ -1216,6 +1224,31 @@ class CortexAppController:
             )
         except Exception:
             logger.debug("disarm_auto_focus scheduling failed", exc_info=True)
+
+    @Slot(str)
+    def _on_recap_dismissed_ack(self, session_id: str) -> None:
+        """P0 §3.3 (Wave-2 P1): forward the recap dismiss ack to the daemon.
+
+        ``daemon.stop()`` waits up to 5 s on
+        ``acknowledge_session_recap`` before tearing down the WS server
+        so a fast UI hide doesn't race the shutdown. The in-process
+        recap sheet emits ``recap_dismissed_ack`` straight after the
+        user clicks Close (or the autohide fires); the controller
+        forwards it onto the daemon's loop here.
+        """
+        if self._daemon is None or self._daemon_loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._daemon.acknowledge_session_recap(
+                    str(session_id) if session_id else None,
+                ),
+                self._daemon_loop,
+            )
+        except Exception:
+            logger.debug(
+                "acknowledge_session_recap scheduling failed", exc_info=True
+            )
 
     def _on_quiet_requested(self, kind: str, duration_minutes: int) -> None:
         """P0 §3.11: overlay (or dashboard menu / shortcut) asked the

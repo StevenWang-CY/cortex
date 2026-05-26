@@ -107,6 +107,9 @@ class _MinimalDaemon:
         self._auto_focus_recovery_started_at = 0.0
         self._auto_focus_dwell_started = False
         self._auto_focus_recovery_started = False
+        # Wave-2 P1: rapid-cycle debounce timestamps tracked on the daemon.
+        self._last_focus_auto_arm_ts = 0.0
+        self._last_focus_auto_disarm_ts = 0.0
         self._break_active = False
         self._consent_policy = ConsentPolicy()
         self.config = _FakeConfig()

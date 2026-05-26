@@ -68,6 +68,8 @@ def test_message_type_catalog_covers_dispatch_arms() -> None:
         "REQUEST_SESSION_DETAIL",
         "REQUEST_TRENDS",
         "REQUEST_SESSION_RECAP",
+        # P0 §3.3 (Wave-2 P1) — recap dismiss acknowledgement
+        "SESSION_RECAP_ACKNOWLEDGED",
         # P0 §3.6 — micro-step toggle
         "MICRO_STEP_TOGGLED",
         # P0 §3.9 — structured causal rationale on-demand
@@ -348,3 +350,61 @@ def test_unknown_keys_are_ignored() -> None:
     msg = WSMessage.from_json(raw)
     # Pydantic ConfigDict(extra="ignore") drops the unknown field silently.
     assert not hasattr(msg, "future_field")
+
+
+# ─── Wave-2 P1 (audit-cross-pipeline): missing-callback ERROR reply ──
+
+
+import asyncio  # noqa: E402
+
+import pytest  # noqa: E402
+
+from cortex.services.api_gateway.websocket_server import (  # noqa: E402
+    WebSocketClient,
+    WebSocketServer,
+)
+
+
+class _MockSocket:
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def send(self, raw: str) -> None:
+        self.sent.append(raw)
+
+
+def _make_authenticated_client(server: WebSocketServer) -> _MockSocket:
+    socket = _MockSocket()
+    server._clients["c1"] = WebSocketClient(
+        client_id="c1",
+        websocket=socket,
+        client_type="desktop",
+        authenticated=True,
+    )
+    return socket
+
+
+@pytest.mark.asyncio
+async def test_request_session_list_without_callback_sends_error_reply() -> None:
+    """When no session-list callback is wired, the handler must NOT drop
+    silently — it must reply with a SESSION_LIST envelope carrying
+    ``error="handler_not_registered"`` so clients don't hang.
+    """
+    server = WebSocketServer()
+    socket = _make_authenticated_client(server)
+    # Explicitly leave the callback unset (the default).
+    assert server._session_list_callback is None
+
+    msg = WSMessage(
+        type=MessageType.REQUEST_SESSION_LIST,
+        payload={"since": None, "limit": 30},
+        correlation_id="cid-list-1",
+    )
+    await server._handle_request_session_list(server._clients["c1"], msg)
+
+    assert socket.sent, "expected a reply frame; got nothing"
+    reply = json.loads(socket.sent[-1])
+    assert reply["type"] == MessageType.SESSION_LIST.value
+    assert reply["correlation_id"] == "cid-list-1"
+    assert reply["payload"].get("error") == "handler_not_registered"
+    assert reply["payload"].get("items") == []

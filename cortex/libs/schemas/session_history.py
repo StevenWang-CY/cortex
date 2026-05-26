@@ -17,7 +17,7 @@ Three envelopes, one per use-case:
 * :class:`SessionDetailResponse` — single-report reply for
   ``REQUEST_SESSION_DETAIL`` (also used by the recap sheet when a stale
   popup re-asks via ``REQUEST_SESSION_RECAP``).
-* :class:`TrendsResponse` — week / month rollup reply for ``REQUEST_TRENDS``.
+* :class:`TrendsResponse` — week / month / quarter rollup reply for ``REQUEST_TRENDS``.
 * :class:`TrendsRequest` — documented request envelope for ``REQUEST_TRENDS``.
 
 Privacy invariants (P0 §3.1 "Privacy / safety invariants"):
@@ -170,9 +170,12 @@ class TrendsRequest(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    window: Literal["week", "month"] = Field(
+    window: Literal["week", "month", "quarter"] = Field(
         "week",
-        description="Aggregation window: 'week' = last 7 days, 'month' = last 30.",
+        description=(
+            "Aggregation window: 'week' = last 7 days, 'month' = last 30, "
+            "'quarter' = last 90."
+        ),
     )
     refresh: bool = Field(
         False,
@@ -194,9 +197,12 @@ class TrendsResponse(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    window: Literal["week", "month"] = Field(
+    window: Literal["week", "month", "quarter"] = Field(
         "week",
-        description="The window the daily rows cover. Week=last 7 days, month=last 30.",
+        description=(
+            "The window the daily rows cover. Week=last 7 days, "
+            "month=last 30, quarter=last 90."
+        ),
     )
     daily: list[DailyBaseline] = Field(
         default_factory=list,

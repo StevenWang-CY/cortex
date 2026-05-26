@@ -224,6 +224,12 @@ class WebSocketServer:
         self._session_recap_cache_callback: (
             Callable[[], dict[str, Any] | None] | None
         ) = None
+        # P0 §3.3 (Wave-2 P1): callback fired when the UI confirms the
+        # user dismissed the SESSION_RECAP card. Signature:
+        # ``async (session_id: str | None) -> None``. The daemon's
+        # ``stop()`` awaits an event this callback sets so the WS
+        # server is not torn down mid-recap.
+        self._session_recap_acknowledged_callback: Any = None
         # P0 §3.6: callback fired when a peer surface toggles a
         # micro-step checkbox. Signature:
         # ``async (intervention_id: str, step_index: int, new_status: str)``.
@@ -416,6 +422,15 @@ class WebSocketServer:
         opened after a recap broadcast) can still see the recap.
         """
         self._session_recap_cache_callback = callback
+
+    def set_session_recap_acknowledged_callback(self, callback: Any) -> None:
+        """P0 §3.3 (Wave-2 P1): handler for ``SESSION_RECAP_ACKNOWLEDGED``.
+
+        Signature: ``async (session_id: str | None) -> None``. The
+        daemon's ``stop()`` awaits an :class:`asyncio.Event` this
+        callback flips so a fast UI hide doesn't race the WS teardown.
+        """
+        self._session_recap_acknowledged_callback = callback
 
     def set_quiet_mode_toggle_callback(self, callback: Any) -> None:
         """P0 §3.11: handler for ``QUIET_MODE_TOGGLE`` / ``SNOOZE_REQUEST``.
@@ -681,6 +696,11 @@ class WebSocketServer:
             await self._handle_request_trends(client, msg)
         elif msg.type == MessageType.REQUEST_SESSION_RECAP.value:
             await self._handle_request_session_recap(client, msg)
+        elif msg.type == MessageType.SESSION_RECAP_ACKNOWLEDGED.value:
+            # P0 §3.3 (Wave-2 P1): the UI confirmed the user dismissed
+            # the recap card. The daemon's ``stop()`` is awaiting this
+            # acknowledgement (or its 5 s timeout) before tearing down.
+            await self._handle_session_recap_acknowledged(client, msg)
         elif msg.type == MessageType.WHY_DETAIL_REQUEST.value:
             await self._handle_why_detail_request(client, msg)
         elif msg.type == MessageType.MICRO_STEP_TOGGLED.value:
@@ -936,6 +956,15 @@ class WebSocketServer:
         """
         callback = self._micro_step_toggled_callback
         if callback is None:
+            # Wave-2 P1 (audit-cross-pipeline): MICRO_STEP_TOGGLED is
+            # fire-and-forget — the client doesn't wait on a typed
+            # reply, but the rebroadcast loop (INTERVENTION_TRIGGER
+            # echoes back the mutated plan) will never fire so the
+            # checkbox UI stays optimistic forever. Log loudly so
+            # operators see the broken wiring.
+            logger.warning(
+                "MICRO_STEP_TOGGLED received but no callback wired (handler_not_registered)",
+            )
             return
         payload = msg.payload or {}
         intervention_id = payload.get("intervention_id")
@@ -993,6 +1022,12 @@ class WebSocketServer:
         """
         callback = self._quiet_mode_toggle_callback
         if callback is None:
+            # Wave-2 P1: clients expect a QUIET_MODE_STATE broadcast in
+            # response; missing callback means it never arrives. Warn
+            # loudly so operators catch the unwired daemon.
+            logger.warning(
+                "QUIET_MODE_TOGGLE received but no callback wired (handler_not_registered)",
+            )
             return
         payload = msg.payload or {}
         kind = payload.get("kind")
@@ -1059,6 +1094,10 @@ class WebSocketServer:
         """
         callback = self._quiet_mode_toggle_callback
         if callback is None:
+            # Wave-2 P1: see _handle_quiet_mode_toggle.
+            logger.warning(
+                "SNOOZE_REQUEST received but no callback wired (handler_not_registered)",
+            )
             return
         payload = msg.payload or {}
         raw_duration = payload.get("duration_minutes")
@@ -1116,7 +1155,19 @@ class WebSocketServer:
             )
             return
         signals: list[dict[str, Any]] = []
-        if callback is not None:
+        # Wave-2 P1 (audit-cross-pipeline): when no callback is wired
+        # surface ``error="handler_not_registered"`` alongside the empty
+        # signals list so the requesting surface (popup, VS Code panel)
+        # can distinguish "no causal data" from "daemon never wired the
+        # handler" — empty list alone is ambiguous.
+        reply_error: str | None = None
+        if callback is None:
+            logger.warning(
+                "WHY_DETAIL_REQUEST received but no callback wired; "
+                "replying with handler_not_registered",
+            )
+            reply_error = "handler_not_registered"
+        else:
             try:
                 if asyncio.iscoroutinefunction(callback):
                     result = await callback(intervention_id)
@@ -1130,12 +1181,15 @@ class WebSocketServer:
                     client.client_id,
                     exc,
                 )
+        reply_payload: dict[str, Any] = {
+            "intervention_id": intervention_id,
+            "causal_signals": signals,
+        }
+        if reply_error is not None:
+            reply_payload["error"] = reply_error
         await self.send_message(
             MessageType.WHY_DETAIL.value,
-            {
-                "intervention_id": intervention_id,
-                "causal_signals": signals,
-            },
+            reply_payload,
             target_client_types=(
                 [client.client_type]
                 if client.client_type and client.client_type != "unknown"
@@ -1213,8 +1267,29 @@ class WebSocketServer:
         """
         cb = self._session_list_callback
         if cb is None:
-            logger.debug(
-                "REQUEST_SESSION_LIST received but no callback wired; dropping"
+            # Wave-2 P1 (audit-cross-pipeline): clients (popup, history
+            # tab) wait synchronously on this reply; silently dropping
+            # leaves their loading spinners pinned forever. Echo back a
+            # well-formed SESSION_LIST envelope with empty items + an
+            # ``error`` field naming the failure mode so the client can
+            # surface "history unavailable" instead of hanging.
+            logger.warning(
+                "REQUEST_SESSION_LIST received but no callback wired; "
+                "replying with handler_not_registered",
+            )
+            await self.send_message(
+                MessageType.SESSION_LIST.value,
+                {
+                    "items": [],
+                    "next_cursor": None,
+                    "cursor_session_id": None,
+                    "total_known": 0,
+                    "error": "handler_not_registered",
+                },
+                target_client_types=(
+                    [client.client_type] if client.client_type and client.client_type != "unknown" else None
+                ),
+                correlation_id=msg.correlation_id,
             )
             return
         payload = msg.payload or {}
@@ -1265,8 +1340,20 @@ class WebSocketServer:
         """
         cb = self._session_detail_callback
         if cb is None:
-            logger.debug(
-                "REQUEST_SESSION_DETAIL received but no callback wired; dropping"
+            # Wave-2 P1 (audit-cross-pipeline): mirror the existing
+            # ``{report: None, error: ...}`` envelope (used for bad
+            # input) so the client always gets a typed reply.
+            logger.warning(
+                "REQUEST_SESSION_DETAIL received but no callback wired; "
+                "replying with handler_not_registered",
+            )
+            await self.send_message(
+                MessageType.SESSION_DETAIL.value,
+                {"report": None, "error": "handler_not_registered"},
+                target_client_types=(
+                    [client.client_type] if client.client_type and client.client_type != "unknown" else None
+                ),
+                correlation_id=msg.correlation_id,
             )
             return
         payload = msg.payload or {}
@@ -1319,8 +1406,25 @@ class WebSocketServer:
         """
         cb = self._trends_callback
         if cb is None:
-            logger.debug(
-                "REQUEST_TRENDS received but no callback wired; dropping"
+            # Wave-2 P1: the dashboard trends pane waits on the reply.
+            # Send a minimal envelope with the error field set so the
+            # client can show "trends unavailable" instead of spinning.
+            logger.warning(
+                "REQUEST_TRENDS received but no callback wired; "
+                "replying with handler_not_registered",
+            )
+            await self.send_message(
+                MessageType.TRENDS_PAYLOAD.value,
+                {
+                    "window": "week",
+                    "daily": [],
+                    "chronotype": None,
+                    "error": "handler_not_registered",
+                },
+                target_client_types=(
+                    [client.client_type] if client.client_type and client.client_type != "unknown" else None
+                ),
+                correlation_id=msg.correlation_id,
             )
             return
         payload = msg.payload or {}
@@ -1382,6 +1486,39 @@ class WebSocketServer:
             ),
             correlation_id=msg.correlation_id,
         )
+
+    async def _handle_session_recap_acknowledged(
+        self, client: WebSocketClient, msg: WSMessage,
+    ) -> None:
+        """P0 §3.3 (Wave-2 P1): forward a ``SESSION_RECAP_ACKNOWLEDGED``
+        frame to the daemon so its ``stop()`` can stop waiting.
+
+        Payload is informational (``{session_id: str | None}``); the
+        daemon flips an :class:`asyncio.Event` unconditionally so a
+        slightly mismatched id (the daemon already moved on to a new
+        session) still releases the wait.
+        """
+        callback = self._session_recap_acknowledged_callback
+        if callback is None:
+            logger.debug(
+                "SESSION_RECAP_ACKNOWLEDGED received but no callback wired; dropping",
+            )
+            return
+        payload = msg.payload or {}
+        session_id = payload.get("session_id")
+        if session_id is not None and not isinstance(session_id, str):
+            session_id = None
+        try:
+            if asyncio.iscoroutinefunction(callback):
+                await callback(session_id)
+            else:
+                callback(session_id)
+        except Exception as exc:
+            logger.error(
+                "session_recap_acknowledged callback error from %s: %s",
+                client.client_id,
+                exc,
+            )
 
     async def broadcast_state(
         self,

@@ -96,6 +96,15 @@ _CATEGORY_ID = "cortex_intervention"
 _ACTION_OPEN = "cortex_open"
 _ACTION_SNOOZE = "cortex_snooze"
 
+# Shutdown guard (audit P1): once the daemon flips this Event, any
+# in-flight Cocoa notification callback must short-circuit BEFORE it
+# invokes the registered handler — otherwise the click reaches a
+# half-torn-down daemon (cancelled tasks, closed asyncio loop) and can
+# crash the process. Cocoa callbacks fire on the AppKit main thread
+# while daemon shutdown runs on the asyncio thread; ``threading.Event``
+# gives us a lock-free, thread-safe boolean visible from both.
+_shutdown_event = threading.Event()
+
 
 def set_user_action_handler(handler: Callable[[str, str], None] | None) -> None:
     """Register a callback for notification action clicks.
@@ -107,6 +116,30 @@ def set_user_action_handler(handler: Callable[[str, str], None] | None) -> None:
     """
     global _user_action_handler
     _user_action_handler = handler
+
+
+def mark_shutting_down() -> None:
+    """Tell the notification delegate the daemon is tearing down.
+
+    After this is called, in-flight notification action callbacks
+    invoke their completion handler and return without dispatching to
+    the registered ``_user_action_handler``. Safe to call from any
+    thread — the underlying ``threading.Event`` is lock-free.
+
+    Idempotent: callable multiple times during a shutdown sequence
+    (e.g. cooperative stop, then forced stop).
+    """
+    _shutdown_event.set()
+
+
+def is_shutting_down() -> bool:
+    """Query the shutdown guard (test/debug helper)."""
+    return _shutdown_event.is_set()
+
+
+def reset_shutdown_state_for_tests() -> None:
+    """Test-only: clear the shutdown latch between cases."""
+    _shutdown_event.clear()
 
 
 def _on_main_thread(callable_obj) -> None:  # type: ignore[no-untyped-def]
@@ -140,6 +173,17 @@ def _build_delegate(un):  # type: ignore[no-untyped-def]
             def userNotificationCenter_didReceiveNotificationResponse_withCompletionHandler_(  # noqa: D401
                 self, _center, response, completion_handler,
             ):
+                # Audit P1 shutdown guard: if the daemon is tearing
+                # down, complete the OS contract (call the completion
+                # handler) but DO NOT dispatch into the daemon — its
+                # asyncio tasks may already be cancelled and the
+                # callback could crash on a half-torn-down state.
+                if _shutdown_event.is_set():
+                    try:
+                        completion_handler()
+                    except Exception:
+                        pass
+                    return
                 try:
                     action_id_raw = str(response.actionIdentifier())
                     request = response.notification().request()
@@ -159,7 +203,10 @@ def _build_delegate(un):  # type: ignore[no-untyped-def]
                 if notif_id.startswith(prefix):
                     intervention_id = notif_id[len(prefix):]
                 handler = _user_action_handler
-                if handler is not None:
+                # Re-check the guard right before dispatch — shutdown
+                # can flip between the top-of-callback check and here
+                # (different threads).
+                if handler is not None and not _shutdown_event.is_set():
                     try:
                         handler(intervention_id, action_id)
                     except Exception:
@@ -177,6 +224,15 @@ def _build_delegate(un):  # type: ignore[no-untyped-def]
             def userNotificationCenter_willPresentNotification_withCompletionHandler_(  # noqa: D401
                 self, _center, _notification, completion_handler,
             ):
+                # Audit P1 shutdown guard: suppress the banner if we
+                # are tearing down so the user isn't left with a click
+                # target that routes into a dead daemon.
+                if _shutdown_event.is_set():
+                    try:
+                        completion_handler(0)  # UNNotificationPresentationOptionNone
+                    except Exception:
+                        pass
+                    return
                 try:
                     # 0x07 = Banner + List + Sound (UNNotificationPresentationOption*).
                     completion_handler(7)

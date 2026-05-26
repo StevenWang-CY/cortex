@@ -121,6 +121,18 @@ logger = logging.getLogger(__name__)
 # stuck WS client (e.g. a dead browser tab that never reads its frame)
 # cannot deadlock the daemon shutdown.
 _SESSION_RECAP_BROADCAST_TIMEOUT_S: float = 5.0
+# P0 §3.3 (Wave-2 P1): how long ``stop()`` waits for a UI to confirm
+# the recap was dismissed before tearing down the WS server. Matches
+# the spec — long enough for a human to register the card slide-up,
+# short enough that a dead UI doesn't deadlock the shutdown.
+_SESSION_RECAP_DISMISSAL_TIMEOUT_S: float = 5.0
+# P0 §3.10 (Wave-2 P1): debounce window guarding rapid
+# HYPER → RECOVERY → HYPER cycles from spamming the browser extension
+# with START_FOCUS_AUTO / STOP_FOCUS_AUTO frames. ``_auto_focus_armed``
+# must hold for at least ``_AUTO_FOCUS_DEBOUNCE_S`` before
+# STOP_FOCUS_AUTO is allowed to fire (minimum-hold), and once it
+# disarms the daemon waits the same window before re-arming (cooldown).
+_AUTO_FOCUS_DEBOUNCE_S: float = 30.0
 # P0 §3.2: rolling chronotype window (days) the janitor enforces on the
 # nightly tick. Daily baselines older than this are pruned from
 # ``storage/chronotype/daily/*.json``.
@@ -705,6 +717,13 @@ class CortexDaemon:
         # so a late-joining client (browser popup reconnect) can re-fetch
         # via REQUEST_SESSION_RECAP without missing the user's recap.
         self._latest_session_recap: dict[str, Any] | None = None
+        # P0 §3.3 (Wave-2 P1): flipped by ``acknowledge_session_recap``
+        # when any surface (desktop recap sheet, browser popup, etc.)
+        # confirms the user dismissed the recap card. ``stop()`` awaits
+        # this event with a 5 s timeout so a fast UI hide can't race
+        # the WS server teardown — but the daemon never blocks
+        # indefinitely on a surface that crashed.
+        self._recap_dismissed_event: asyncio.Event = asyncio.Event()
 
         # P0 §3.1: serve REQUEST_SESSION_LIST / REQUEST_SESSION_DETAIL
         self._ws_server.set_session_list_callback(self.list_sessions)
@@ -714,6 +733,11 @@ class CortexDaemon:
         # P0 §3.3: serve REQUEST_SESSION_RECAP from the cached payload
         self._ws_server.set_session_recap_cache_callback(
             self.latest_session_recap,
+        )
+        # P0 §3.3 (Wave-2 P1): consume SESSION_RECAP_ACKNOWLEDGED
+        # frames; flips ``_recap_dismissed_event`` to release ``stop()``.
+        self._ws_server.set_session_recap_acknowledged_callback(
+            self.acknowledge_session_recap,
         )
 
         # P0 §3.7: biology-driven break controller. Built after
@@ -749,6 +773,20 @@ class CortexDaemon:
         self._auto_focus_armed: bool = False
         self._auto_focus_dwell_started_at: float = 0.0
         self._auto_focus_recovery_started_at: float = 0.0
+        # P0 §3.10 (Wave-2 P1): debounce timestamps. Without these, a
+        # HYPER → RECOVERY → HYPER bounce within seconds emits a
+        # START_FOCUS_AUTO / STOP_FOCUS_AUTO / START_FOCUS_AUTO storm
+        # that spams the browser extension and confuses the focus-
+        # session UX. Track the last arm/disarm wall-clock (the same
+        # ``timestamp`` arg used by ``_evaluate_auto_distraction_block``,
+        # so unit tests can exercise the debounce deterministically)
+        # and enforce two windows:
+        #   * minimum hold time of 30 s before STOP_FOCUS_AUTO may fire
+        #     after a START_FOCUS_AUTO,
+        #   * minimum cool-down of 30 s before START_FOCUS_AUTO may
+        #     fire again after a STOP_FOCUS_AUTO.
+        self._last_focus_auto_arm_ts: float = 0.0
+        self._last_focus_auto_disarm_ts: float = 0.0
         # P0 §3.11: source-of-truth for the active quiet/pause mode.
         # ``_quiet_mode_kind`` is one of "off" / "snooze_15" /
         # "quiet_session" / "pause"; ``_quiet_mode_ends_at`` is a unix
@@ -762,6 +800,17 @@ class CortexDaemon:
         # spiral path can all fire simultaneously). Without the lock,
         # the capture-pause state machine can drop the resume flag.
         self._quiet_mode_lock: asyncio.Lock = asyncio.Lock()
+        # P0 §3.6 (Wave-2 P1): serialise ``toggle_micro_step`` against
+        # the F16 plan-swap path inside ``_trigger_intervention`` and
+        # ``_trigger_special_intervention``. Without this lock the
+        # sequence
+        #   1. toggle reads ``self._active_plan`` (snapshot A)
+        #   2. plan-swap rebinds ``self._active_plan`` (snapshot B)
+        #   3. toggle mutates A.micro_steps[step_index] and broadcasts A
+        # produces a stale rebroadcast that overwrites the swap. The
+        # lock is non-reentrant; neither the swap nor toggle re-enters
+        # itself, and the swap never calls ``toggle_micro_step``.
+        self._micro_step_lock: asyncio.Lock = asyncio.Lock()
         # Auto-decay broadcast task — cancelled and rescheduled on
         # every ``set_quiet_mode`` call so the popup countdown
         # reconciles when the window expires.
@@ -967,8 +1016,16 @@ class CortexDaemon:
             asyncio.to_thread(self._session_aggregator.backfill_if_needed),
             name="cortex-chronotype-backfill",
         )
-        # P0 §3.2: start the nightly aggregation scheduler.
-        self._midnight_scheduler = MidnightScheduler(self._midnight_tick)
+        # P0 §3.2: start the nightly aggregation scheduler. The state
+        # dir is the chronotype storage path so ``scheduler_state.json``
+        # lives alongside ``model.json`` / ``daily/`` — persisting the
+        # last-fired-date survives daemon restarts and prevents a crash
+        # between firing and the next start from double-aggregating
+        # yesterday's DailyBaseline (P0 audit fix #4.B-1).
+        self._midnight_scheduler = MidnightScheduler(
+            self._midnight_tick,
+            state_dir=Path(self.config.storage.path).expanduser() / "chronotype",
+        )
         self._midnight_scheduler.start()
 
         # v2.0: Check for morning briefing on startup
@@ -1039,6 +1096,19 @@ class CortexDaemon:
     async def stop(self) -> None:
         """Gracefully stop all runtime services."""
         self._shutdown.set()
+        # Audit P1: tell the macOS notification delegate to refuse new
+        # callback dispatches BEFORE we cancel asyncio tasks. A user
+        # click arriving mid-shutdown would otherwise reach a half-
+        # torn-down daemon (cancelled tasks, closed loop) and can
+        # crash on the route. The helper is import-safe and a no-op on
+        # non-mac / when PyObjC isn't installed.
+        try:
+            from cortex.libs.utils import macos_notifications as _mn
+            _mn.mark_shutting_down()
+        except Exception:
+            logger.debug(
+                "macos_notifications.mark_shutting_down failed", exc_info=True,
+            )
         # Phase-3 P0-N5: a daemon stop while an auto-armed focus
         # session is live would leave the browser blocking sites
         # indefinitely (the extension's chrome.alarm is the only
@@ -1162,6 +1232,31 @@ class CortexDaemon:
                         )
                     except Exception:
                         logger.exception("SESSION_RECAP broadcast failed (non-fatal)")
+                    # P0 §3.3 (Wave-2 P1): wait for the UI to ACK the
+                    # recap so a fast hide doesn't race the WS server
+                    # teardown. The event is set by:
+                    #   * desktop_shell controller calling
+                    #     ``acknowledge_session_recap`` on the
+                    #     RecapSheet ``dismissed`` signal (in-process)
+                    #   * the WS dispatch arm for
+                    #     ``SESSION_RECAP_ACKNOWLEDGED`` (browser popup,
+                    #     VS Code panel, any peer surface)
+                    # Either path releases shutdown immediately; the
+                    # 5 s timeout is the failsafe for a crashed UI.
+                    try:
+                        await asyncio.wait_for(
+                            self._recap_dismissed_event.wait(),
+                            timeout=_SESSION_RECAP_DISMISSAL_TIMEOUT_S,
+                        )
+                        logger.info(
+                            "SESSION_RECAP acknowledged by UI; proceeding with shutdown"
+                        )
+                    except TimeoutError:
+                        logger.warning(
+                            "SESSION_RECAP dismissal ACK not received within %.1fs; "
+                            "proceeding with shutdown",
+                            _SESSION_RECAP_DISMISSAL_TIMEOUT_S,
+                        )
                 else:
                     # P0 §3.3: short session — broadcast an empty payload so
                     # the dashboard's recap watchdog can short-circuit to
@@ -2143,18 +2238,23 @@ class CortexDaemon:
             # mutate its ``micro_steps`` and rebroadcast the trigger.
             # If a previous intervention shares this id (F16 swap),
             # preserve user-driven step status across the swap.
-            if (
-                self._active_plan is not None
-                and self._active_plan.intervention_id == plan.intervention_id
-            ):
-                from cortex.services.intervention_engine.restore import (
-                    merge_micro_steps,
-                )
-                plan.micro_steps = merge_micro_steps(
-                    self._active_plan.micro_steps, plan.micro_steps
-                )
-            self._active_plan = plan
-            self._micro_step_recovery_fired = False
+            # Wave-2 P1: serialise the merge+rebind against any
+            # concurrent ``toggle_micro_step`` so the toggle can't
+            # rebroadcast a stale plan snapshot it captured before the
+            # swap completed.
+            async with self._micro_step_lock:
+                if (
+                    self._active_plan is not None
+                    and self._active_plan.intervention_id == plan.intervention_id
+                ):
+                    from cortex.services.intervention_engine.restore import (
+                        merge_micro_steps,
+                    )
+                    plan.micro_steps = merge_micro_steps(
+                        self._active_plan.micro_steps, plan.micro_steps
+                    )
+                self._active_plan = plan
+                self._micro_step_recovery_fired = False
             registry.register(f"workspace_snapshot:{plan.intervention_id}", snapshot)
             self._recorder.append("intervention_plan", plan.model_dump(mode="json"))
 
@@ -2297,18 +2397,21 @@ class CortexDaemon:
             plan = enrich_plan_with_context(plan, context)
             self._active_intervention_id = plan.intervention_id
             # P0 §3.6: cache the live plan + merge prior step state on F16 swap.
-            if (
-                self._active_plan is not None
-                and self._active_plan.intervention_id == plan.intervention_id
-            ):
-                from cortex.services.intervention_engine.restore import (
-                    merge_micro_steps,
-                )
-                plan.micro_steps = merge_micro_steps(
-                    self._active_plan.micro_steps, plan.micro_steps
-                )
-            self._active_plan = plan
-            self._micro_step_recovery_fired = False
+            # Wave-2 P1: serialise against ``toggle_micro_step`` (same
+            # rationale as ``_trigger_intervention``'s swap block).
+            async with self._micro_step_lock:
+                if (
+                    self._active_plan is not None
+                    and self._active_plan.intervention_id == plan.intervention_id
+                ):
+                    from cortex.services.intervention_engine.restore import (
+                        merge_micro_steps,
+                    )
+                    plan.micro_steps = merge_micro_steps(
+                        self._active_plan.micro_steps, plan.micro_steps
+                    )
+                self._active_plan = plan
+                self._micro_step_recovery_fired = False
             self._recorder.append("intervention_plan", plan.model_dump(mode="json"))
             await self._ws_server.send_message(ws_type, plan.model_dump(mode="json"))
         except Exception:
@@ -3028,24 +3131,65 @@ class CortexDaemon:
                 self._auto_focus_dwell_started = True
             dwelled = timestamp - self._auto_focus_dwell_started_at
             if not self._auto_focus_armed and dwelled >= dwell_gate:
-                # Phase-3 P1-2 (Audit-1.1): only flip the armed flag
-                # after the broadcast lands. ``_emit_start_focus_auto``
-                # returns True on success.
-                ok = await self._emit_start_focus_auto(
-                    reason="biometric_hyper",
+                # Wave-2 P1 debounce: suppress START_FOCUS_AUTO when
+                # the daemon disarmed less than ``_AUTO_FOCUS_DEBOUNCE_S``
+                # ago. A rapid HYPER → RECOVERY → HYPER cycle (e.g. a
+                # nervous user clicking around during a brief calm
+                # window) would otherwise emit a START / STOP / START
+                # storm that confuses the browser focus-session UI.
+                cooldown_elapsed = (
+                    timestamp - self._last_focus_auto_disarm_ts
+                    if self._last_focus_auto_disarm_ts > 0.0
+                    else float("inf")
                 )
-                if ok:
-                    self._auto_focus_armed = True
+                if cooldown_elapsed < _AUTO_FOCUS_DEBOUNCE_S:
+                    logger.debug(
+                        "auto-arm suppressed by debounce (cooldown %.1fs < %.1fs)",
+                        cooldown_elapsed, _AUTO_FOCUS_DEBOUNCE_S,
+                    )
+                else:
+                    # Phase-3 P1-2 (Audit-1.1): only flip the armed flag
+                    # after the broadcast lands. ``_emit_start_focus_auto``
+                    # returns True on success.
+                    ok = await self._emit_start_focus_auto(
+                        reason="biometric_hyper",
+                    )
+                    if ok:
+                        self._auto_focus_armed = True
+                        # Stamp the arm timestamp so the minimum-hold
+                        # gate below knows when STOP is allowed again.
+                        self._last_focus_auto_arm_ts = timestamp
         elif self._auto_focus_armed and state in ("FLOW", "RECOVERY"):
             if not self._auto_focus_recovery_started:
                 self._auto_focus_recovery_started_at = timestamp
                 self._auto_focus_recovery_started = True
             recovered_for = timestamp - self._auto_focus_recovery_started_at
             if recovered_for >= exit_gate:
-                await self._emit_stop_focus_auto(reason="sustained_recovery")
-                self._auto_focus_armed = False
-                self._auto_focus_recovery_started_at = 0.0
-                self._auto_focus_recovery_started = False
+                # Wave-2 P1 debounce: enforce a minimum-hold window
+                # before STOP_FOCUS_AUTO may fire. With ``exit_gate``
+                # already set to 300 s in production this is normally a
+                # no-op, but tests / aggressive configs can push
+                # ``auto_distraction_block_exit_seconds`` low; the
+                # debounce keeps the START → STOP gap above 30 s even
+                # then.
+                held_for = (
+                    timestamp - self._last_focus_auto_arm_ts
+                    if self._last_focus_auto_arm_ts > 0.0
+                    else float("inf")
+                )
+                if held_for < _AUTO_FOCUS_DEBOUNCE_S:
+                    logger.debug(
+                        "auto-disarm suppressed by debounce (held %.1fs < %.1fs)",
+                        held_for, _AUTO_FOCUS_DEBOUNCE_S,
+                    )
+                else:
+                    await self._emit_stop_focus_auto(reason="sustained_recovery")
+                    self._auto_focus_armed = False
+                    self._auto_focus_recovery_started_at = 0.0
+                    self._auto_focus_recovery_started = False
+                    # Stamp disarm timestamp so the cooldown above knows
+                    # when re-arming is allowed.
+                    self._last_focus_auto_disarm_ts = timestamp
         else:
             # Any other state — keep armed state but reset dwell so we
             # don't arm on a flicker.
@@ -3145,136 +3289,142 @@ class CortexDaemon:
         recovery path feeds AMIP via the same helpfulness tracker
         used by the dismiss/engage actions.
         """
-        # ---- validate inputs ---------------------------------------
-        if new_status not in ("pending", "done", "skipped"):
-            logger.warning(
-                "toggle_micro_step: rejecting invalid new_status=%r",
-                new_status,
-            )
-            return
-        if not isinstance(intervention_id, str) or not intervention_id:
-            logger.warning("toggle_micro_step: missing intervention_id")
-            return
-        if not isinstance(step_index, int) or step_index < 0:
-            logger.warning(
-                "toggle_micro_step: invalid step_index=%r", step_index
-            )
-            return
+        # Wave-2 P1: serialise against the F16 plan-swap path so a
+        # concurrent ``_trigger_intervention`` / ``_trigger_special_
+        # intervention`` cannot replace ``self._active_plan`` between
+        # the read of ``plan`` and the rebroadcast below. The swap
+        # acquires the same lock around its merge-and-rebind sequence.
+        async with self._micro_step_lock:
+            # ---- validate inputs ---------------------------------------
+            if new_status not in ("pending", "done", "skipped"):
+                logger.warning(
+                    "toggle_micro_step: rejecting invalid new_status=%r",
+                    new_status,
+                )
+                return
+            if not isinstance(intervention_id, str) or not intervention_id:
+                logger.warning("toggle_micro_step: missing intervention_id")
+                return
+            if not isinstance(step_index, int) or step_index < 0:
+                logger.warning(
+                    "toggle_micro_step: invalid step_index=%r", step_index
+                )
+                return
 
-        # ---- locate the live plan ---------------------------------
-        plan = self._active_plan
-        if (
-            plan is None
-            or plan.intervention_id != intervention_id
-            or self._active_intervention_id != intervention_id
-        ):
-            logger.info(
-                "toggle_micro_step: dropping stale toggle "
-                "(requested=%s active=%s)",
-                intervention_id,
-                self._active_intervention_id,
-            )
-            return
+            # ---- locate the live plan ---------------------------------
+            plan = self._active_plan
+            if (
+                plan is None
+                or plan.intervention_id != intervention_id
+                or self._active_intervention_id != intervention_id
+            ):
+                logger.info(
+                    "toggle_micro_step: dropping stale toggle "
+                    "(requested=%s active=%s)",
+                    intervention_id,
+                    self._active_intervention_id,
+                )
+                return
 
-        if step_index >= len(plan.micro_steps):
-            logger.warning(
-                "toggle_micro_step: step_index=%d out of range "
-                "(len=%d) for intervention=%s",
-                step_index,
-                len(plan.micro_steps),
-                intervention_id,
-            )
-            return
-
-        # ---- mutate the step --------------------------------------
-        step = plan.micro_steps[step_index]
-        now = datetime.now()
-        prior_status = step.status
-        step.status = new_status  # type: ignore[assignment]
-        # Stamp lifecycle timestamps. ``started_at`` is set the first
-        # time the step leaves ``pending``; ``completed_at`` is set
-        # the moment it reaches ``done``.
-        if prior_status == "pending" and new_status != "pending":
-            if step.started_at is None:
-                step.started_at = now
-        if new_status == "done":
-            step.completed_at = now
-        elif new_status == "pending":
-            # Un-checking a previously-done step clears completed_at
-            # but preserves started_at — the user did begin it.
-            step.completed_at = None
-
-        # ---- rebroadcast the updated trigger ----------------------
-        try:
-            await self._ws_server.send_message(
-                MessageType.INTERVENTION_TRIGGER.value,
-                plan.model_dump(mode="json"),
-            )
-        except Exception:
-            logger.debug(
-                "MICRO_STEP_TOGGLED rebroadcast failed", exc_info=True
-            )
-
-        # Persist via the recorder so the session report sees the
-        # ``done`` history per step.
-        try:
-            self._recorder.append("micro_step_toggled", {
-                "intervention_id": intervention_id,
-                "step_index": step_index,
-                "new_status": new_status,
-                "text": step.text,
-            })
-        except Exception:
-            logger.debug("micro_step_toggled append failed", exc_info=True)
-
-        # ---- all-done auto-recovery -------------------------------
-        all_done = all(s.status == "done" for s in plan.micro_steps)
-        if all_done and not self._micro_step_recovery_fired:
-            self._micro_step_recovery_fired = True
-            logger.info(
-                "toggle_micro_step: all steps done for %s — firing natural_recovery",
-                intervention_id,
-            )
-            try:
-                outcome = await self._restore_manager.engage(intervention_id)
-            except Exception:
-                logger.exception(
-                    "toggle_micro_step: engage() raised for %s",
+            if step_index >= len(plan.micro_steps):
+                logger.warning(
+                    "toggle_micro_step: step_index=%d out of range "
+                    "(len=%d) for intervention=%s",
+                    step_index,
+                    len(plan.micro_steps),
                     intervention_id,
                 )
-                outcome = None
-            if outcome is not None:
-                # Mirror the bookkeeping path that ``_handle_user_action``
-                # performs for the explicit engage/dismiss flow so the
-                # bandit / helpfulness ledger sees a consistent close.
-                self._active_intervention_id = None
-                self._active_plan = None
+                return
+
+            # ---- mutate the step --------------------------------------
+            step = plan.micro_steps[step_index]
+            now = datetime.now()
+            prior_status = step.status
+            step.status = new_status  # type: ignore[assignment]
+            # Stamp lifecycle timestamps. ``started_at`` is set the first
+            # time the step leaves ``pending``; ``completed_at`` is set
+            # the moment it reaches ``done``.
+            if prior_status == "pending" and new_status != "pending":
+                if step.started_at is None:
+                    step.started_at = now
+            if new_status == "done":
+                step.completed_at = now
+            elif new_status == "pending":
+                # Un-checking a previously-done step clears completed_at
+                # but preserves started_at — the user did begin it.
+                step.completed_at = None
+
+            # ---- rebroadcast the updated trigger ----------------------
+            try:
+                await self._ws_server.send_message(
+                    MessageType.INTERVENTION_TRIGGER.value,
+                    plan.model_dump(mode="json"),
+                )
+            except Exception:
+                logger.debug(
+                    "MICRO_STEP_TOGGLED rebroadcast failed", exc_info=True
+                )
+
+            # Persist via the recorder so the session report sees the
+            # ``done`` history per step.
+            try:
+                self._recorder.append("micro_step_toggled", {
+                    "intervention_id": intervention_id,
+                    "step_index": step_index,
+                    "new_status": new_status,
+                    "text": step.text,
+                })
+            except Exception:
+                logger.debug("micro_step_toggled append failed", exc_info=True)
+
+            # ---- all-done auto-recovery -------------------------------
+            all_done = all(s.status == "done" for s in plan.micro_steps)
+            if all_done and not self._micro_step_recovery_fired:
+                self._micro_step_recovery_fired = True
+                logger.info(
+                    "toggle_micro_step: all steps done for %s — firing natural_recovery",
+                    intervention_id,
+                )
                 try:
-                    self._recorder.append(
-                        "intervention_outcome", outcome.model_dump(mode="json"),
-                    )
+                    outcome = await self._restore_manager.engage(intervention_id)
                 except Exception:
-                    logger.debug(
-                        "intervention_outcome append failed", exc_info=True
+                    logger.exception(
+                        "toggle_micro_step: engage() raised for %s",
+                        intervention_id,
                     )
-                try:
-                    await self._ws_server.send_restore(
-                        intervention_id, user_action="natural_recovery",
-                    )
-                except Exception:
-                    logger.debug(
-                        "send_restore on natural_recovery failed",
-                        exc_info=True,
-                    )
-                try:
-                    self._helpfulness.record_user_action(
-                        intervention_id, "natural_recovery",
-                    )
-                except Exception:
-                    logger.debug(
-                        "record_user_action(natural_recovery) failed",
-                        exc_info=True,
-                    )
+                    outcome = None
+                if outcome is not None:
+                    # Mirror the bookkeeping path that ``_handle_user_action``
+                    # performs for the explicit engage/dismiss flow so the
+                    # bandit / helpfulness ledger sees a consistent close.
+                    self._active_intervention_id = None
+                    self._active_plan = None
+                    try:
+                        self._recorder.append(
+                            "intervention_outcome", outcome.model_dump(mode="json"),
+                        )
+                    except Exception:
+                        logger.debug(
+                            "intervention_outcome append failed", exc_info=True
+                        )
+                    try:
+                        await self._ws_server.send_restore(
+                            intervention_id, user_action="natural_recovery",
+                        )
+                    except Exception:
+                        logger.debug(
+                            "send_restore on natural_recovery failed",
+                            exc_info=True,
+                        )
+                    try:
+                        self._helpfulness.record_user_action(
+                            intervention_id, "natural_recovery",
+                        )
+                    except Exception:
+                        logger.debug(
+                            "record_user_action(natural_recovery) failed",
+                            exc_info=True,
+                        )
 
     async def _handle_user_action(self, payload: dict[str, Any]) -> None:
         # Log suggested action executions from the Chrome extension
@@ -4332,10 +4482,11 @@ class CortexDaemon:
     ) -> TrendsResponse:
         """P0 §3.2: longitudinal trend rollup.
 
-        ``window`` is clamped to ``{"week","month"}``; an unknown value
-        logs a WARNING and falls back to ``"week"``.
+        ``window`` is clamped to ``{"week","month","quarter"}``; an
+        unknown value logs a WARNING and falls back to ``"week"``.
+        ``quarter`` returns the last 90 days of ``DailyBaseline`` rows.
         """
-        if window not in ("week", "month"):
+        if window not in ("week", "month", "quarter"):
             logger.warning(
                 "get_trends: unknown window=%r; falling back to 'week'", window
             )
@@ -4352,6 +4503,33 @@ class CortexDaemon:
         before caching/badging, so an empty dict reply is harmless.
         """
         return self._latest_session_recap
+
+    async def acknowledge_session_recap(
+        self, session_id: str | None = None,
+    ) -> None:
+        """P0 §3.3 (Wave-2 P1): release the ``stop()`` wait on recap dismissal.
+
+        Called from two paths:
+          * The WebSocket ``SESSION_RECAP_ACKNOWLEDGED`` dispatch arm
+            (a browser popup or peer surface clicked Close).
+          * The desktop_shell controller, when the in-process
+            :class:`RecapSheet` emits its ``dismissed`` signal — the
+            in-process path can't round-trip through the WS server, so
+            the controller calls this method directly.
+
+        ``session_id`` is informational only; we flip the event
+        unconditionally so a slightly mismatched id still releases the
+        wait. The event is one-shot per ``stop()`` call.
+        """
+        try:
+            self._recap_dismissed_event.set()
+        except Exception:
+            logger.debug(
+                "acknowledge_session_recap: failed to set event "
+                "(session_id=%r)",
+                session_id,
+                exc_info=True,
+            )
 
     async def _midnight_tick(self) -> None:
         """P0 §3.2: nightly aggregation + chronotype retention sweep.

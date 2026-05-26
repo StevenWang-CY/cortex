@@ -88,24 +88,22 @@ def test_empty_features_returns_empty_list() -> None:
     features = FeatureVector(timestamp=0.0)
     # No baseline crossings (everything is None) — nothing to attribute.
     signals = attribute_top_signals(features, UserBaselines())
-    # P0 §3.9 audit fix: when no signal exceeds the |z| floor AND no
-    # HRV/HR value is available to synthesise a baseline reading, the
-    # function returns an empty list. With everything None we have
-    # no HRV/HR, so the synthetic-baseline fallback also produces
-    # nothing.
+    # Audit fix: when feature extraction fails for every signal,
+    # return an empty list. The UI renders an "explanation pending"
+    # empty state for causal_signals.length === 0.
     assert signals == []
 
 
-def test_within_baseline_returns_synthetic_baseline_signal() -> None:
-    """P0 §3.9 audit fix: empty-result → synthetic baseline CausalSignal.
-
-    A user well within their personal envelope used to get a blank
-    "Why?" panel; we now surface a single neutral signal so the UI
-    reads as "all good" instead of looking broken.
+def test_within_baseline_returns_empty_list() -> None:
+    """Audit fix: a user well within their envelope yields no
+    causal signals — the previous synthetic "HRV (baseline)" placeholder
+    showed a real biometric value next to a label the user couldn't act
+    on. The UI's empty-state ("explanation pending") communicates the
+    healthy baseline more honestly.
     """
     baselines = UserBaselines(hrv_baseline=50.0)
-    # All signals at baseline — every z-score is 0, no signal exceeds
-    # the floor, so the synthetic-baseline branch kicks in.
+    # All signals at baseline — every z-score is 0, nothing exceeds
+    # the floor, so we get an empty list.
     features = FeatureVector(
         timestamp=0.0,
         hr=72.0,
@@ -115,10 +113,26 @@ def test_within_baseline_returns_synthetic_baseline_signal() -> None:
         forward_lean_angle=4.0,
     )
     signals = attribute_top_signals(features, baselines)
+    assert signals == []
+
+
+def test_real_signal_never_mixes_with_synthetic_fallback() -> None:
+    """When at least one real anomalous signal is present, the result
+    contains only that real signal — no synthetic baseline-style
+    placeholder is appended.
+    """
+    baselines = UserBaselines(
+        hrv_baseline=50.0,
+        hr_baseline=72.0,
+        metric_distributions={"hrv_rmssd": {"mu": 50.0, "sigma": 5.0}},
+    )
+    # Only HRV deviates; HR is at baseline so it should not appear.
+    features = _make_features(hrv_rmssd=28.0)
+    signals = attribute_top_signals(features, baselines, max_signals=3)
     assert len(signals) == 1
-    assert signals[0].name.lower().startswith("hrv")
-    assert signals[0].severity == "primary"
-    assert signals[0].current_value == 50.0
+    assert signals[0].name == "HRV"
+    # No baseline-style synthetic label anywhere in the result.
+    assert not any("baseline" in s.name.lower() for s in signals)
 
 
 def test_attributor_reset_clears_buffers() -> None:

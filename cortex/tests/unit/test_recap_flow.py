@@ -202,3 +202,70 @@ async def test_broadcast_failure_is_non_fatal(daemon) -> None:
         pass
     assert daemon.latest_session_recap() is not None
     assert daemon.latest_session_recap()["session_id"] == "recap-test"
+
+
+# ─── Wave-2 P1: SESSION_RECAP dismissal ACK ──────────────────────────
+
+
+async def test_acknowledge_session_recap_sets_event(daemon) -> None:
+    """``acknowledge_session_recap`` flips the wait-event so ``stop()``
+    no longer blocks on the recap dismissal timeout.
+
+    Daemon path: stop() awaits ``_recap_dismissed_event.wait()`` with a
+    5 s timeout. The desktop_shell controller calls
+    ``acknowledge_session_recap`` on the RecapSheet's ``dismissed``
+    signal; the WS dispatch arm calls it on ``SESSION_RECAP_ACKNOWLEDGED``.
+    Either path must release the wait immediately.
+    """
+    # Pre-condition: event not yet set on a fresh daemon.
+    assert not daemon._recap_dismissed_event.is_set()
+    await daemon.acknowledge_session_recap("recap-test")
+    assert daemon._recap_dismissed_event.is_set()
+    # A second call is a no-op — Event.set() is idempotent.
+    await daemon.acknowledge_session_recap(None)
+    assert daemon._recap_dismissed_event.is_set()
+
+
+async def test_recap_wait_releases_on_ack(daemon) -> None:
+    """``stop()``'s ``wait_for(_recap_dismissed_event.wait(), timeout=5)``
+    completes promptly (well before 5 s) when an ACK arrives.
+    """
+    # Ensure the event starts un-set.
+    daemon._recap_dismissed_event.clear()
+
+    async def _ack_after_short_delay() -> None:
+        await asyncio.sleep(0.05)
+        await daemon.acknowledge_session_recap("recap-test")
+
+    loop = asyncio.get_event_loop()
+    t0 = loop.time()
+    ack_task = asyncio.create_task(_ack_after_short_delay())
+    await asyncio.wait_for(
+        daemon._recap_dismissed_event.wait(), timeout=5.0,
+    )
+    elapsed = loop.time() - t0
+    await ack_task
+    # Should release in ~50ms; allow generous CI slack but well under 5s.
+    assert elapsed < 1.0, f"expected fast release; got {elapsed:.2f}s"
+
+
+async def test_recap_wait_times_out_without_ack(daemon) -> None:
+    """If the UI never sends an ACK, the daemon's ``wait_for`` raises
+    TimeoutError after its 5 s budget — which ``stop()`` catches and
+    treats as 'proceed with shutdown'. We exercise the same primitive
+    with a short timeout so the test runs fast.
+    """
+    daemon._recap_dismissed_event.clear()
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            daemon._recap_dismissed_event.wait(), timeout=0.1,
+        )
+
+
+def test_ws_recap_ack_callback_wired(daemon) -> None:
+    """The WS server's SESSION_RECAP_ACKNOWLEDGED dispatch arm is wired
+    to ``daemon.acknowledge_session_recap`` at daemon construction.
+    """
+    cb = daemon._ws_server._session_recap_acknowledged_callback
+    assert cb is not None
+    assert cb == daemon.acknowledge_session_recap
