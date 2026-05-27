@@ -25,9 +25,9 @@ import logging
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 import numpy as np
 
@@ -254,6 +254,75 @@ class TriggerPolicy:
         self._quiet_mode_history_lock: threading.Lock = threading.Lock()
         self._load_quiet_mode_history()
 
+        # P0 §3.20: weekly schedule cache. Keys are lowercase
+        # day-of-week → list of 4 slot strings (``on``/``quiet``/
+        # ``off``) for morning / midday / afternoon / evening. Empty
+        # dict means "no schedule armed" and every slot is implicitly
+        # ``on``.
+        self._weekly_schedule: dict[str, list[str]] = {}
+
+    # ──────────────────────────────────────────────────────────────────
+    # P0 §3.20: weekly schedule
+    # ──────────────────────────────────────────────────────────────────
+
+    _SCHEDULE_DAYS: tuple[str, ...] = (
+        "monday", "tuesday", "wednesday",
+        "thursday", "friday", "saturday", "sunday",
+    )
+    _SCHEDULE_SLOT_HOURS: tuple[tuple[int, int], ...] = (
+        (6, 12),   # morning  06:00–11:59
+        (12, 14),  # midday   12:00–13:59
+        (14, 18),  # afternoon 14:00–17:59
+        (18, 24),  # evening  18:00–23:59
+    )
+
+    def set_weekly_schedule(self, schedule: dict[str, list[str]] | None) -> None:
+        """P0 §3.20: install a user-edited weekly schedule.
+
+        Invalid input (non-dict, wrong day keys, wrong slot count) clears
+        the schedule so a misconfigured client cannot silently suppress
+        every intervention.
+        """
+        if not isinstance(schedule, dict):
+            self._weekly_schedule = {}
+            return
+        cleaned: dict[str, list[str]] = {}
+        for day, slots in schedule.items():
+            if not isinstance(day, str) or not isinstance(slots, list):
+                continue
+            key = day.lower().strip()
+            if key not in set(self._SCHEDULE_DAYS):
+                continue
+            normed = [str(s).lower().strip() for s in slots[:4]]
+            while len(normed) < 4:
+                normed.append("on")
+            cleaned[key] = normed
+        self._weekly_schedule = cleaned
+
+    def lookup_schedule_slot(
+        self, *, when: float | None = None,
+    ) -> str | None:
+        """Return the schedule slot value for the current wall-clock time.
+
+        ``None`` means "no schedule armed" (legacy behaviour, every
+        intervention permitted). Returns one of ``"on" | "quiet" | "off"``.
+        The wall-clock time is used (not ``time.monotonic``) so the
+        schedule honours actual day-of-week.
+        """
+        if not self._weekly_schedule:
+            return None
+        import datetime as _dt
+        ts = _dt.datetime.now() if when is None else _dt.datetime.fromtimestamp(when)
+        day = self._SCHEDULE_DAYS[ts.weekday()]
+        slots = self._weekly_schedule.get(day)
+        if not slots:
+            return None
+        hour = ts.hour
+        for idx, (lo, hi) in enumerate(self._SCHEDULE_SLOT_HOURS):
+            if lo <= hour < hi and idx < len(slots):
+                return slots[idx]
+        return None
+
     def update_thresholds(
         self,
         config: InterventionConfig | None = None,
@@ -423,6 +492,22 @@ class TriggerPolicy:
                 context_complexity=context_complexity,
             )
 
+        # P0 §3.20: weekly schedule. ``off`` slots block every
+        # intervention outright; ``quiet`` slots are honoured by upstream
+        # PREVIEW-only callers (the receptivity gate already passed). A
+        # ``None`` slot (no schedule armed) preserves legacy behaviour.
+        slot_value = self.lookup_schedule_slot(when=current_time)
+        if slot_value == "off":
+            return TriggerDecision(
+                should_trigger=False,
+                reason="weekly_schedule_off",
+                confidence=confidence,
+                cooldown_remaining=cooldown_remaining,
+                quiet_mode_active=False,
+                effective_threshold=effective_threshold,
+                context_complexity=context_complexity,
+            )
+
         # Check cooldown
         if cooldown_remaining > 0:
             return TriggerDecision(
@@ -545,6 +630,36 @@ class TriggerPolicy:
                 reason=(
                     f"Workspace complexity {context_complexity:.2f} below "
                     f"{self._config.complexity_threshold:.2f}"
+                ),
+                confidence=confidence,
+                cooldown_remaining=0.0,
+                quiet_mode_active=False,
+                effective_threshold=effective_threshold,
+                context_complexity=context_complexity,
+            )
+
+        # P1 Pipeline A: HYPER-specific signal-quality floor. Overall
+        # ``acceptable`` is a 0.3 weighted blend that can pass even when
+        # physio and kinematics are both near zero (e.g. webcam blocked
+        # at night). HYPER requires either a usable physio channel
+        # (physio >= 0.3) or at least mid-quality kinematics (>= 0.5)
+        # before we let the trigger fire — otherwise the overwhelm
+        # estimate is driven entirely by telemetry and is too noisy to
+        # justify interrupting the user.
+        sq = estimate.signal_quality
+        if not (sq.physio >= 0.3 or sq.kinematics >= 0.5):
+            logger.info(
+                "HYPER trigger deferred — insufficient physio signal quality "
+                "(physio=%.2f, kinematics=%.2f, telemetry=%.2f)",
+                sq.physio,
+                sq.kinematics,
+                sq.telemetry,
+            )
+            return TriggerDecision(
+                should_trigger=False,
+                reason=(
+                    f"Insufficient physio signal quality "
+                    f"(physio={sq.physio:.2f}, kinematics={sq.kinematics:.2f})"
                 ),
                 confidence=confidence,
                 cooldown_remaining=0.0,

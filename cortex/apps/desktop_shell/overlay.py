@@ -72,6 +72,8 @@ from cortex.apps.desktop_shell.tokens import (
     SP4,
     SP6,
     SP8,
+    STATE_COLORS,
+    STATE_LABELS,
     TEXT_HUD_PRIMARY,
     TEXT_HUD_SECONDARY,
     TEXT_HUD_TERTIARY,
@@ -443,6 +445,33 @@ class OverlayWindow(QWidget):
         self._headline.setAlignment(Qt.AlignmentFlag.AlignCenter)
         card_layout.addWidget(self._headline)
 
+        # P0 §3.5: cognitive-state pill — small label below the headline
+        # that picks up the FLOW/HYPER/HYPO/RECOVERY palette + label.
+        # Hidden by default; ``show_intervention`` sets visibility based on
+        # ``payload["state"]`` / ``payload["cognitive_state"]``.
+        state_pill_row = QHBoxLayout()
+        state_pill_row.setContentsMargins(0, 0, 0, 0)
+        state_pill_row.setSpacing(SP2)
+        state_pill_row.addStretch(1)
+        self._state_pill = QLabel("")
+        self._state_pill.setFont(
+            mac_native.system_font(FS_CAPTION, "semibold")
+        )
+        self._state_pill.setObjectName("CortexOverlayStatePill")
+        self._state_pill.hide()
+        self._state_pill.setStyleSheet(
+            "QLabel#CortexOverlayStatePill {"
+            "  padding: 2px 10px;"
+            f"  border-radius: {RADIUS_BUTTON}px;"
+            f"  color: {_TEXT_PRIMARY.name()};"
+            "  background: rgba(255,255,255,0.08);"
+            "  border: 1px solid rgba(255,255,255,0.18);"
+            "}"
+        )
+        state_pill_row.addWidget(self._state_pill)
+        state_pill_row.addStretch(1)
+        card_layout.addLayout(state_pill_row)
+
         # F27 (audit): fallback / offline-mode hint. Shown only when the
         # plan was produced by the rule-based fallback path (LLM circuit
         # open, retries exhausted, or daily budget killed). Placed
@@ -520,6 +549,17 @@ class OverlayWindow(QWidget):
         self._actions_caption.hide()
         card_layout.addLayout(self._actions_container)
         card_layout.addWidget(self._actions_caption)
+
+        # P0 §3.5: container for inline-revealed widgets (micro-commit
+        # text input, movement-break countdown card). Hidden until an
+        # action with ``action_type in _INLINE_WIDGET_ACTIONS`` is
+        # clicked; teardown happens on dismiss or fresh intervention.
+        self._inline_container = QVBoxLayout()
+        self._inline_container.setSpacing(SP3)
+        self._inline_widgets: list[QWidget] = []
+        self._inline_movement_timer: QTimer | None = None
+        self._inline_movement_remaining: int = 0
+        card_layout.addLayout(self._inline_container)
 
         # "Why this?" causal explanation — surfaces only when supplied.
         # F51: long explanations are truncated to a one-line preview with
@@ -777,6 +817,65 @@ class OverlayWindow(QWidget):
     # Public API (preserved byte-identical)
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # P0 §3.5: cognitive-state visual distinction
+    # ------------------------------------------------------------------
+
+    # Friendly label for the small text next to the state pill. Falls back
+    # to the title-cased upper-case state name if the lookup misses.
+    _STATE_FRIENDLY_LABEL: dict[str, str] = {
+        "HYPO": "Idle",
+        "RECOVERY": "Recovering",
+        "HYPER": "Elevated",
+        "FLOW": "Flow",
+    }
+    # Tiny glyph next to each state. Picked from the unicode set so we
+    # don't ship a vector asset just for four pills.
+    _STATE_GLYPH: dict[str, str] = {
+        "HYPO": "·",
+        "RECOVERY": "↻",
+        "HYPER": "▲",
+        "FLOW": "◇",
+    }
+
+    def _apply_state_visual(self, payload: dict) -> None:
+        """Read the cognitive state off ``payload`` and update the pill.
+
+        The state is the canonical upper-case key (FLOW / HYPER / HYPO /
+        RECOVERY); we accept either ``payload["state"]`` (matches the
+        STATE_UPDATE wire format) or ``payload["cognitive_state"]`` (an
+        older field name some plans still carry). Missing / unknown
+        values collapse the pill so we never lie about the state.
+        """
+        raw = payload.get("state") or payload.get("cognitive_state") or ""
+        kind = str(raw).upper().strip()
+        if kind not in STATE_COLORS:
+            try:
+                self._state_pill.hide()
+            except Exception:
+                pass
+            return
+        color = STATE_COLORS[kind]
+        # Prefer the canonical label from tokens, fall back to our local
+        # friendly label set so the audit's "Idle/Recovering/Elevated/Flow"
+        # copy ships even if the token map drops a key.
+        label = STATE_LABELS.get(kind) or self._STATE_FRIENDLY_LABEL.get(kind, kind.title())
+        glyph = self._STATE_GLYPH.get(kind, "•")
+        try:
+            self._state_pill.setText(f"{glyph}  {label}")
+            self._state_pill.setStyleSheet(
+                "QLabel#CortexOverlayStatePill {"
+                "  padding: 2px 10px;"
+                f"  border-radius: {RADIUS_BUTTON}px;"
+                f"  color: {color};"
+                "  background: rgba(255,255,255,0.10);"
+                f"  border: 1px solid {color};"
+                "}"
+            )
+            self._state_pill.show()
+        except Exception:
+            logger.debug("state pill update failed", exc_info=True)
+
     def show_intervention(self, payload: dict) -> None:
         self._intervention_id = payload.get("intervention_id", "")
         # Fresh intervention — clear dismissed flag so this one can dismiss.
@@ -787,6 +886,16 @@ class OverlayWindow(QWidget):
         self._focus_label.setText(
             f"Focus: {payload.get('primary_focus', '')}"
         )
+
+        # P0 §3.5: visualise cognitive state via a small pill + tinted
+        # border on the headline. The palette is keyed by the upper-case
+        # state name (FLOW/HYPER/HYPO/RECOVERY) from tokens.STATE_COLORS;
+        # an unknown state collapses the pill rather than guessing.
+        self._apply_state_visual(payload)
+
+        # P0 §3.5: collapse any inline widget left over from a prior
+        # intervention so the new card starts clean.
+        self._clear_inline_widgets()
 
         # F27 (audit): show the offline-mode hint when the daemon
         # stamped ``metadata["source"] = "fallback"``. Hide otherwise so
@@ -1124,7 +1233,19 @@ class OverlayWindow(QWidget):
     # routing through the browser extension. Everything else needs an
     # IDENTIFY-ed Chrome / Edge / VS Code client to receive the
     # ACTION_EXECUTE frame.
-    _NATIVE_ACTION_TYPES = frozenset({"copy_to_clipboard", "start_timer"})
+    _NATIVE_ACTION_TYPES = frozenset({
+        "copy_to_clipboard",
+        "start_timer",
+        # P0 §3.5 extensions — native actions for HYPO / RECOVERY plans.
+        # ``resume_last_active_file`` is forwarded to the editor adapter
+        # via the controller; ``prompt_micro_commit`` and
+        # ``suggest_movement_break`` render inline widgets (text input +
+        # countdown card respectively) below the action buttons.
+        "resume_last_active_file",
+        "prompt_micro_commit",
+        "suggest_movement_break",
+        "take_biology_break",
+    })
     _BROWSER_ACTION_TYPES = frozenset({
         "close_tab",
         "bookmark_and_close",
@@ -1133,6 +1254,14 @@ class OverlayWindow(QWidget):
         "search_error",
         "highlight_tab",
         "save_session",
+    })
+
+    # Action types that render an inline widget below the button row
+    # rather than executing on click (the click reveals the widget; a
+    # secondary Confirm/Done emits USER_ACTION via ``action_invoked``).
+    _INLINE_WIDGET_ACTIONS = frozenset({
+        "prompt_micro_commit",
+        "suggest_movement_break",
     })
 
     # ------------------------------------------------------------------
@@ -1386,10 +1515,16 @@ class OverlayWindow(QWidget):
             # Capture-by-default to bind the action dict to this button.
             action_snapshot = dict(action)
             try:
-                btn.clicked.connect(
-                    lambda _checked=False, a=action_snapshot:
-                        self._on_action_clicked(a)
-                )
+                if action_type in self._INLINE_WIDGET_ACTIONS:
+                    btn.clicked.connect(
+                        lambda _checked=False, a=action_snapshot:
+                            self._reveal_inline_widget(a)
+                    )
+                else:
+                    btn.clicked.connect(
+                        lambda _checked=False, a=action_snapshot:
+                            self._on_action_clicked(a)
+                    )
             except Exception:
                 pass
             self._actions_container.addWidget(btn)
@@ -1417,6 +1552,190 @@ class OverlayWindow(QWidget):
             logger.debug("action_invoked emit failed", exc_info=True)
         # P0 §3.8: reveal the rating row immediately after engagement.
         self._reveal_feedback_row()
+
+    # ─────────────────────────────────────────────────────────────────
+    # P0 §3.5: inline-revealed widgets (micro-commit / movement-break)
+    # ─────────────────────────────────────────────────────────────────
+
+    def _clear_inline_widgets(self) -> None:
+        """Tear down any previously rendered inline widgets + timers."""
+        if self._inline_movement_timer is not None:
+            try:
+                self._inline_movement_timer.stop()
+            except Exception:
+                logger.debug("inline movement timer stop failed", exc_info=True)
+            self._inline_movement_timer = None
+        self._inline_movement_remaining = 0
+        for w in self._inline_widgets:
+            try:
+                self._inline_container.removeWidget(w)
+                w.deleteLater()
+            except Exception:
+                pass
+        self._inline_widgets.clear()
+
+    def _reveal_inline_widget(self, action: dict) -> None:
+        """Render a native widget below the action buttons.
+
+        Two action types are supported:
+
+        * ``prompt_micro_commit`` — single-line text input + Confirm
+          button. Confirming emits ``action_invoked`` with the original
+          ``action_type`` plus ``text`` carrying the user's typed
+          commitment (≤ 200 chars).
+        * ``suggest_movement_break`` — a 60-second countdown card with a
+          "Done" button. The countdown automatically completes after
+          60 s; either path emits ``action_invoked`` with the
+          ``action_type`` so the daemon records the engagement.
+        """
+        if not self._intervention_id:
+            return
+        action_type = str(action.get("action_type") or "")
+        self._clear_inline_widgets()
+        if action_type == "prompt_micro_commit":
+            self._build_micro_commit_widget(action)
+        elif action_type == "suggest_movement_break":
+            self._build_movement_break_widget(action)
+        # P0 §3.8: reveal the rating row immediately after engagement.
+        self._reveal_feedback_row()
+
+    def _build_micro_commit_widget(self, action: dict) -> None:
+        host = QFrame()
+        host.setStyleSheet("QFrame { background: transparent; }")
+        row = QHBoxLayout(host)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(SP2)
+        prompt_text = str(action.get("prompt") or "What's the smallest commit you can ship next?")
+        prompt = QLabel(prompt_text)
+        prompt.setFont(mac_native.system_font(FS_CAPTION, "regular"))
+        prompt.setStyleSheet(
+            f"color: {_TEXT_SECONDARY.name()}; background: transparent;"
+        )
+        prompt.setWordWrap(True)
+        host_layout_outer = QVBoxLayout()
+        host_layout_outer.setContentsMargins(0, 0, 0, 0)
+        host_layout_outer.setSpacing(SP2)
+        host_layout_outer.addWidget(prompt)
+        edit = QLineEdit()
+        edit.setMaxLength(200)
+        edit.setPlaceholderText("Type a one-line commitment…")
+        edit.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
+        edit.setStyleSheet(
+            "QLineEdit {"
+            "  background: rgba(255,255,255,0.06);"
+            "  color: rgba(255,255,255,0.92);"
+            "  border: 0.5px solid rgba(255,255,255,0.18);"
+            f"  border-radius: {RADIUS_BUTTON}px;"
+            "  padding: 6px 10px;"
+            "}"
+        )
+        confirm = QPushButton("Confirm")
+        confirm.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
+        confirm.setStyleSheet(
+            "QPushButton {"
+            f"  background-color: {_ACCENT.name()};"
+            "  color: white;"
+            "  border: none;"
+            f"  border-radius: {RADIUS_BUTTON}px;"
+            "  padding: 6px 14px;"
+            "}"
+            "QPushButton:hover { background-color: rgba(217,119,87,0.85); }"
+        )
+
+        def _on_confirm() -> None:
+            text = edit.text().strip()[:200]
+            payload = dict(action)
+            payload["text"] = text
+            try:
+                self.action_invoked.emit(self._intervention_id, payload)
+            except Exception:
+                logger.debug("micro_commit emit failed", exc_info=True)
+            self._clear_inline_widgets()
+
+        try:
+            confirm.clicked.connect(lambda _checked=False: _on_confirm())
+            edit.returnPressed.connect(_on_confirm)
+        except Exception:
+            logger.debug("micro_commit signal connect failed", exc_info=True)
+        row.addWidget(edit, stretch=1)
+        row.addWidget(confirm)
+        host_layout_outer.addLayout(row)
+        # Mount the outer layout into a container widget so we can free
+        # it cleanly on next intervention.
+        outer = QWidget()
+        outer.setLayout(host_layout_outer)
+        self._inline_container.addWidget(outer)
+        self._inline_widgets.append(outer)
+
+    def _build_movement_break_widget(self, action: dict) -> None:
+        # Soft 60s countdown card with "Done" early exit.
+        duration_seconds = int(action.get("duration_seconds") or 60)
+        self._inline_movement_remaining = max(15, min(300, duration_seconds))
+        card = QFrame()
+        card.setStyleSheet(
+            "QFrame {"
+            "  background: rgba(255,255,255,0.06);"
+            "  border: 0.5px solid rgba(255,255,255,0.14);"
+            f"  border-radius: {RADIUS_BUTTON}px;"
+            "}"
+        )
+        vbox = QVBoxLayout(card)
+        vbox.setContentsMargins(SP3, SP3, SP3, SP3)
+        vbox.setSpacing(SP2)
+        title = QLabel(str(action.get("label") or "Stand up · stretch · breathe"))
+        title.setFont(mac_native.system_font(FS_BODY, "semibold"))
+        title.setStyleSheet(
+            f"color: {_TEXT_PRIMARY.name()}; background: transparent;"
+        )
+        vbox.addWidget(title)
+        countdown = QLabel(f"{self._inline_movement_remaining}s")
+        countdown.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
+        countdown.setStyleSheet(
+            f"color: {_TEXT_SECONDARY.name()}; background: transparent;"
+        )
+        vbox.addWidget(countdown)
+        done_btn = QPushButton("Done")
+        done_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
+        done_btn.setStyleSheet(
+            "QPushButton {"
+            f"  background-color: {_ACCENT.name()};"
+            "  color: white;"
+            "  border: none;"
+            f"  border-radius: {RADIUS_BUTTON}px;"
+            "  padding: 6px 14px;"
+            "}"
+        )
+        vbox.addWidget(done_btn)
+
+        def _on_done(_checked: bool = False) -> None:
+            payload = dict(action)
+            payload["elapsed_seconds"] = duration_seconds - self._inline_movement_remaining
+            try:
+                self.action_invoked.emit(self._intervention_id, payload)
+            except Exception:
+                logger.debug("movement_break emit failed", exc_info=True)
+            self._clear_inline_widgets()
+
+        def _tick() -> None:
+            self._inline_movement_remaining = max(0, self._inline_movement_remaining - 1)
+            try:
+                countdown.setText(f"{self._inline_movement_remaining}s")
+            except Exception:
+                return
+            if self._inline_movement_remaining <= 0:
+                _on_done(False)
+
+        timer = QTimer(self)
+        timer.setInterval(1000)
+        timer.timeout.connect(_tick)
+        timer.start()
+        self._inline_movement_timer = timer
+        try:
+            done_btn.clicked.connect(_on_done)
+        except Exception:
+            logger.debug("movement_break done connect failed", exc_info=True)
+        self._inline_container.addWidget(card)
+        self._inline_widgets.append(card)
 
     # ─────────────────────────────────────────────────────────────────
     # P0 §3.8: rating + frustration-spiral helpers
@@ -1655,6 +1974,10 @@ class OverlayWindow(QWidget):
             return
         self._dismissed = True
         self._pacer.stop()
+        try:
+            self._clear_inline_widgets()
+        except Exception:
+            logger.debug("clear inline widgets failed", exc_info=True)
         self.hide()
         dismissed_id = self._intervention_id
         self.dismissed.emit(dismissed_id)
@@ -1672,6 +1995,10 @@ class OverlayWindow(QWidget):
             return
         self._dismissed = True
         self._pacer.stop()
+        try:
+            self._clear_inline_widgets()
+        except Exception:
+            logger.debug("clear inline widgets failed", exc_info=True)
         self.hide()
         dismissed_id = self._intervention_id
         self.dismissed.emit(dismissed_id)

@@ -366,12 +366,22 @@ export function activate(context: vscode.ExtensionContext): void {
     // bound before the first daemon-pushed throttle frame.
     wsClient.onCopilotThrottle((payload) => {
         const action = payload?.action;
+        // P2 (audit Phase 4d, Task D): gate the dev-time tracer lines
+        // behind ``cortex.debug``. Defaults to off so a production
+        // install no longer floods the user's Output panel.
+        const debug = vscode.workspace
+            .getConfiguration('cortex')
+            .get<boolean>('debug', false);
         if (action === 'disable') {
             vscode.commands.executeCommand('cortex.disableInlineSuggestions');
-            console.log('[cortex] COPILOT_THROTTLE: disabling inline suggestions');
+            if (debug) {
+                console.log('[cortex] COPILOT_THROTTLE: disabling inline suggestions');
+            }
         } else if (action === 'enable') {
             vscode.commands.executeCommand('cortex.enableInlineSuggestions');
-            console.log('[cortex] COPILOT_THROTTLE: re-enabling inline suggestions');
+            if (debug) {
+                console.log('[cortex] COPILOT_THROTTLE: re-enabling inline suggestions');
+            }
         }
     });
 

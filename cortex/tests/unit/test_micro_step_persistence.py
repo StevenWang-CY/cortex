@@ -20,7 +20,7 @@ implements the rule:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from cortex.libs.schemas.intervention import MicroStep
 from cortex.services.intervention_engine.restore import merge_micro_steps
@@ -71,8 +71,8 @@ def test_preserves_timestamps_on_match() -> None:
     """When the merge picks the OLD entry, all of its lifecycle
     metadata (started_at, completed_at) must survive too — those are
     needed for the session-report timeline."""
-    started = datetime(2026, 5, 25, 10, 0, tzinfo=timezone.utc)
-    completed = datetime(2026, 5, 25, 10, 5, tzinfo=timezone.utc)
+    started = datetime(2026, 5, 25, 10, 0, tzinfo=UTC)
+    completed = datetime(2026, 5, 25, 10, 5, tzinfo=UTC)
     old = [MicroStep(text="a", status="done", started_at=started, completed_at=completed)]
     new = [_step("a", "pending")]
     merged = merge_micro_steps(old, new)

@@ -13,6 +13,7 @@ from typing import Final
 # --- Brand (preserved across the macOS-native refactor) ---
 BRAND_ACCENT: Final[str] = '#D97757'
 BRAND_ACCENT_HOVER: Final[str] = '#C46547'
+BRAND_ACCENT_PRESSED: Final[str] = '#B45638'
 BRAND_ACCENT_DARK: Final[str] = '#E08E6F'
 BRAND_ACCENT_DIM: Final[str] = 'rgba(217, 119, 87, 0.12)'
 BRAND_ACCENT_SUBTLE: Final[str] = 'rgba(217, 119, 87, 0.06)'
@@ -81,17 +82,6 @@ BIO_HRV: Final[str] = '#57A0D9'
 BIO_RESP: Final[str] = '#57D99E'
 BIO_BLINK: Final[str] = '#D9B457'
 
-# --- HUD palette (F47 / F55) ---
-# Used by the intervention overlay, which sits on top of the macOS
-# NSVisualEffectMaterialHUDWindow vibrancy. Each entry is an (R, G, B, A)
-# tuple so the caller can wrap it in QColor without re-doing the math.
-# Alpha values are calibrated to meet WCAG AA contrast against the
-# dark vibrancy material (235/255 ≈ 92 % opacity → ≥ 7:1 on HUD black).
-TEXT_HUD_PRIMARY: Final[tuple[int, int, int, int]] = (255, 255, 255, 235)
-TEXT_HUD_SECONDARY: Final[tuple[int, int, int, int]] = (255, 255, 255, 150)
-TEXT_HUD_TERTIARY: Final[tuple[int, int, int, int]] = (255, 255, 255, 100)
-HUD_ACCENT: Final[tuple[int, int, int, int]] = (217, 119, 87, 255)  # brand terracotta
-
 # --- Typography ---
 FONT_SYSTEM: Final[str] = '-apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", system-ui, sans-serif'
 FONT_DISPLAY: Final[str] = '"Cormorant Garamond", ui-serif, Georgia, serif'
@@ -143,6 +133,53 @@ POPUP_WIDTH: Final[int] = 380
 POPUP_MAX_HEIGHT: Final[int] = 560
 BREATHING_PACER_SIZE: Final[int] = 140
 
+# --- HUD palette (intervention HUD vibrancy) ---
+# Wrap each tuple in QColor at call site; the alpha is calibrated for
+# WCAG AA contrast against the dark vibrancy material.
+TEXT_HUD_PRIMARY: Final[tuple[int, int, int, int]] = (255, 255, 255, 235)
+TEXT_HUD_SECONDARY: Final[tuple[int, int, int, int]] = (255, 255, 255, 150)
+TEXT_HUD_TERTIARY: Final[tuple[int, int, int, int]] = (255, 255, 255, 100)
+HUD_ACCENT: Final[tuple[int, int, int, int]] = (217, 119, 87, 255)
+
+# --- HUD palette extensions (break overlay + HUD shell) ---
+# Each value is an (R, G, B, A) tuple ready to wrap in QColor.
+HUD_BG_PRIMARY: Final[tuple[int, int, int, int]] = (8, 10, 14, 255)
+HUD_BG_SECONDARY: Final[tuple[int, int, int, int]] = (4, 5, 7, 255)
+HUD_SURFACE_DIM: Final[tuple[int, int, int, int]] = (255, 255, 255, 15)
+HUD_SURFACE_EMPHASIS: Final[tuple[int, int, int, int]] = (255, 255, 255, 26)
+HUD_BORDER_DIM: Final[tuple[int, int, int, int]] = (255, 255, 255, 36)
+HUD_ACCENT_RING: Final[tuple[int, int, int, int]] = (217, 119, 87, 115)
+HUD_HALO: Final[tuple[int, int, int, int]] = (217, 119, 87, 24)
+
+# --- Palette variants for color-blind accessibility ---
+# Maps palette name -> {state_name: hex} for STATE_COLORS swap.
+PALETTE_VARIANTS: Final[dict[str, dict[str, str]]] = {
+    "default": {
+        "FLOW": "#D97757",
+        "HYPER": "#D70015",
+        "HYPO": "#3C3C432E",
+        "RECOVERY": "#0A84FF",
+    },
+    "deuteranopia": {
+        "FLOW": "#0072B2",
+        "HYPER": "#E69F00",
+        "HYPO": "#999999",
+        "RECOVERY": "#009E73",
+    },
+    "protanopia": {
+        "FLOW": "#0072B2",
+        "HYPER": "#E69F00",
+        "HYPO": "#999999",
+        "RECOVERY": "#56B4E9",
+    },
+    "tritanopia": {
+        "FLOW": "#D55E00",
+        "HYPER": "#CC79A7",
+        "HYPO": "#999999",
+        "RECOVERY": "#009E73",
+    },
+}
+
 # --- Backward-compatible aliases (do not remove without callsite sweep) ---
 CX_BG: Final[str] = SEMANTIC_LIGHT["window_bg"]
 CX_BG_SECONDARY: Final[str] = SEMANTIC_LIGHT["grouped_bg"]
@@ -173,6 +210,15 @@ CX_FONT_DISPLAY: Final[str] = FONT_DISPLAY
 CX_FONT_SERIF: Final[str] = "Georgia, \"Times New Roman\", ui-serif, serif"
 CX_FONT_BRAND: Final[str] = FONT_DISPLAY
 CX_FONT_MONO: Final[str] = FONT_MONO
+SP1: Final[int] = 4
+SP2: Final[int] = 8
+SP3: Final[int] = 12
+SP4: Final[int] = 16
+SP5: Final[int] = 20
+SP6: Final[int] = 24
+SP7: Final[int] = 28
+SP8: Final[int] = 32
+SP10: Final[int] = 40
 RADIUS_XS: Final[int] = 6
 RADIUS_SM: Final[int] = RADIUS_BUTTON
 RADIUS_MD: Final[int] = RADIUS_CARD

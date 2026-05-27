@@ -135,7 +135,7 @@ def main() -> None:
     # Load data
     records = load_training_data(args.data)
     if not records:
-        print("No helpfulness records found. Exiting.")
+        logger.warning("No helpfulness records found. Exiting.")
         return
 
     # Split train/eval (80/20)
@@ -149,10 +149,15 @@ def main() -> None:
     # Evaluate
     if eval_records:
         eval_results = evaluate_bandit(bandit, eval_records)
-        print(f"\nEvaluation ({len(eval_records)} records):")
-        print(f"  Mean reward: {eval_results['mean_reward']:.3f}")
+        logger.info(
+            "Evaluation (%d records): mean reward = %.3f",
+            len(eval_records),
+            eval_results["mean_reward"],
+        )
         for stat in eval_results["arm_stats"]:
-            print(f"  {stat['arm']}: theta_norm={stat['theta_norm']:.3f}")
+            logger.info(
+                "  %s: theta_norm=%.3f", stat["arm"], stat["theta_norm"],
+            )
 
     # Save weights
     output_dir = Path(args.output)
@@ -160,7 +165,7 @@ def main() -> None:
     weights_path = output_dir / "bandit_weights.json"
     with weights_path.open("w", encoding="utf-8") as f:
         json.dump(bandit._to_dict(), f, indent=2)
-    print(f"\nWeights saved to {weights_path}")
+    logger.info("Weights saved to %s", weights_path)
 
 
 if __name__ == "__main__":

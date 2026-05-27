@@ -38,10 +38,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
 from cortex.libs.config.settings import get_config
 from cortex.libs.schemas.state import UserBaselines
@@ -183,7 +184,7 @@ async def run_simulate_calibration(
         face_ok=True,
         status="initializing",
     )
-    for i in range(total_ticks):
+    for _ in range(total_ticks):
         if is_aborted is not None and is_aborted():
             return samples
 

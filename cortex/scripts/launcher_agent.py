@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import shlex
 import signal
 import socket
@@ -157,30 +158,62 @@ def _launch_daemon() -> dict:
             return {"status": "error", "error": str(e)}
 
     # Dev path: run the cortex.scripts.run_dev module from the checkout.
+    #
+    # CLAUDE.md rule #1: a subprocess.Popen launched here would inherit
+    # the launcher's TCC context (or, if the launcher was started from a
+    # browser handoff, the browser's TCC context). With ``start_new_session
+    # =True`` macOS still tags the new process tree with the launcher's
+    # entitlements, so the daemon ends up without camera permission and
+    # silently fails the first ``cv2.VideoCapture.read()``.
+    #
+    # The proven fix (also used by ``native_host.py``) is to delegate the
+    # spawn to Terminal.app via ``osascript``. Terminal has its own TCC
+    # camera grant, the daemon runs in Terminal's foreground, and the
+    # full stdout/stderr is visible to the developer.
     project_root = _project_root()
     python = _python_path()
-    log_path = os.path.join(project_root, "cortex_daemon.log")
 
     try:
-        launcher_sh = os.path.join(project_root, ".cortex_launch.sh")
-        with open(launcher_sh, "w") as f:
-            f.write(
-                "#!/bin/bash\n"
-                f"cd {shlex.quote(project_root)}\n"
-                f"exec {shlex.quote(python)} -m cortex.scripts.run_dev\n"
-            )
-        os.chmod(launcher_sh, 0o755)
+        # User-writable launch script. ~/Desktop is sandboxed (CLAUDE.md
+        # rule #4) and writing into the project root spams the dev's
+        # checkout with a runtime artefact, so we use the macOS standard
+        # support directory.
+        support_dir = pathlib.Path.home() / "Library" / "Application Support" / "Cortex"
+        support_dir.mkdir(parents=True, exist_ok=True)
+        launcher_sh = support_dir / "launch.sh"
+        log_path = support_dir / "cortex_daemon.log"
 
-        log_file = open(log_path, "a")
-        subprocess.Popen(
-            ["/bin/bash", launcher_sh],
-            cwd=project_root,
-            stdout=log_file,
-            stderr=log_file,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
+        launcher_sh.write_text(
+            "#!/bin/bash\n"
+            f"cd {shlex.quote(project_root)}\n"
+            f"exec {shlex.quote(python)} -m cortex.scripts.run_dev "
+            f"2>&1 | tee -a {shlex.quote(str(log_path))}\n"
         )
-        return {"status": "starting", "message": "Daemon process spawned"}
+        launcher_sh.chmod(0o755)
+
+        # osascript -> Terminal.app -> bash launch.sh.
+        # ``do script`` opens a new Terminal window/tab and runs the
+        # command in Terminal's TCC context. The daemon stays attached
+        # to Terminal's foreground so it does not lose the camera grant
+        # the way a backgrounded process would.
+        terminal_cmd = f"/bin/bash {shlex.quote(str(launcher_sh))}"
+        result = subprocess.run(
+            [
+                "osascript",
+                "-e",
+                f'tell application "Terminal" to do script "{terminal_cmd}"',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            return {
+                "status": "error",
+                "error": stderr or "osascript failed to launch Terminal",
+            }
+        return {"status": "starting", "message": "Daemon launched via Terminal.app"}
     except Exception as e:
         return {"status": "error", "error": str(e)}
 

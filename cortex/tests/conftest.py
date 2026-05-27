@@ -17,11 +17,12 @@ import pytest
 
 
 def _make_qt_stubs() -> dict[str, types.ModuleType]:
-    """Return a dict of stubbed PySide6 submodules."""
-    pyside6 = types.ModuleType("PySide6")
-    qtcore = types.ModuleType("PySide6.QtCore")
-    qtgui = types.ModuleType("PySide6.QtGui")
-    qtwidgets = types.ModuleType("PySide6.QtWidgets")
+    """Return a dict of stubbed PySide6 submodules.
+
+    The submodules auto-vivify any requested attribute as a ``_Stub`` class
+    so new desktop_shell imports don't require updating the stub list — any
+    ``from PySide6.QtWidgets import QFoo`` resolves to a no-op Stub.
+    """
 
     class _Stub:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -46,6 +47,20 @@ def _make_qt_stubs() -> dict[str, types.ModuleType]:
 
         return Inner
 
+    class _AutoStubModule(types.ModuleType):
+        def __getattr__(self, name: str) -> Any:
+            # Cache so identity stays stable across repeated imports.
+            attr = _make_attr(name)
+            setattr(self, name, attr)
+            return attr
+
+    pyside6 = _AutoStubModule("PySide6")
+    qtcore = _AutoStubModule("PySide6.QtCore")
+    qtgui = _AutoStubModule("PySide6.QtGui")
+    qtwidgets = _AutoStubModule("PySide6.QtWidgets")
+
+    # Pre-populate well-known names so explicit checks for them keep
+    # their historical types; everything else is auto-vivified above.
     for name in ("QObject", "QTimer", "QSettings", "Qt", "Signal", "Slot", "QRectF", "QRect", "QPointF"):
         setattr(qtcore, name, _make_attr(name))
     for name in ("QColor", "QFont", "QIcon", "QPixmap", "QPainter", "QPainterPath",

@@ -6,7 +6,6 @@ behaviour lives in ``test_set_quiet_mode.py``.
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 import pytest
@@ -14,7 +13,6 @@ import pytest
 from cortex.libs.schemas.ws_message import WSMessage
 from cortex.libs.schemas.ws_message_types import MessageType
 from cortex.services.api_gateway.websocket_server import (
-    WebSocketClient,
     WebSocketServer,
 )
 

@@ -30,6 +30,11 @@ export type MessageType =
   | "WHY_DETAIL_REQUEST"
   | "QUIET_MODE_TOGGLE"
   | "SNOOZE_REQUEST"
+  | "COST_REQUEST"
+  | "TEST_PROVIDER"
+  | "GOAL_SET"
+  | "FORCE_RECAP"
+  | "DISMISS_OVERLAY"
   | "AUTH_OK"
   | "STATE_UPDATE"
   | "INTERVENTION_TRIGGER"
@@ -51,6 +56,11 @@ export type MessageType =
   | "QUIET_MODE_STATE"
   | "START_FOCUS_AUTO"
   | "STOP_FOCUS_AUTO"
+  | "INTERVENTION_FAILED"
+  | "INTERVENTION_PROMPT"
+  | "COST_RESPONSE"
+  | "TEST_PROVIDER_RESULT"
+  | "RAISE_DASHBOARD"
   | "LEETCODE_SHOW_SCRATCHPAD"
   | "LEETCODE_SHOW_PATTERN_LADDER"
   | "LEETCODE_SHOW_LOCKOUT"
@@ -618,6 +628,14 @@ export interface FeatureVector {
    * Focus thrashing score from transition graph
    */
   thrashing_score?: number;
+  /**
+   * True when the physiological channel was unavailable or invalid at fuse-time. Downstream gates (HYPER scoring) must defer triggering when this flag is True.
+   */
+  physio_missing?: boolean;
+  /**
+   * Number of telemetry samples seen so far in this session. HYPO scoring contributions from telemetry only count after 5+ samples (warm-up gate).
+   */
+  telemetry_seen_count?: number;
 }
 /**
  * An edge in the focus transition graph.
@@ -737,6 +755,10 @@ export interface FrameMeta {
    * Inter-frame motion quality score
    */
   motion_score: number;
+  /**
+   * Frame failed the per-frame quality gate. Consumers should skip the RGB sample or insert a NaN sentinel rather than appending the actual pixels.
+   */
+  low_quality?: boolean;
 }
 /**
  * Complete evaluation record for a single intervention.
@@ -1328,18 +1350,28 @@ export interface SessionDetailResponse {
    */
   report?: SessionReport | null;
   /**
-   * Error code when report is None. 'not_found' = no such session_id on disk; 'unreadable' = file present but JSON malformed; 'invalid_id' = id failed the safe-char regex; 'internal' = callback raised; 'daemon_unavailable' = no daemon registered.
+   * Error code when report is None. 'not_found' = no such session_id on disk; 'unreadable' = file present but JSON malformed; 'invalid_id' = id failed the safe-char regex; 'internal' = callback raised; 'daemon_unavailable' = no daemon registered; 'handler_not_registered' = the daemon has not wired a session-detail callback yet (cold-start race).
    */
-  error?: ("not_found" | "unreadable" | "invalid_id" | "internal" | "daemon_unavailable") | null;
+  error?:
+    | ("not_found" | "unreadable" | "invalid_id" | "internal" | "daemon_unavailable" | "handler_not_registered")
+    | null;
 }
 /**
  * Biometric study session report.
  */
 export interface SessionReport {
+  /**
+   * Document schema version. Bump on any non-backward-compatible field rename / removal. Readers SHOULD log a warning when a document is missing this key so we can track legacy-write rate.
+   */
+  schema_version?: number;
   session_id: string;
   start_time: string;
   end_time: string;
   duration_seconds: number;
+  /**
+   * User-provided session goal (trimmed). None when the user never set a goal during the session.
+   */
+  goal_title?: string | null;
   time_in_flow_seconds?: number;
   time_in_hyper_seconds?: number;
   time_in_hypo_seconds?: number;
@@ -1349,6 +1381,8 @@ export interface SessionReport {
   peak_stress_integral?: number;
   breaks_taken?: number;
   breaks_recommended?: number;
+  interventions_triggered?: number;
+  interventions_accepted?: number;
   break_records?: BreakRecord[];
   state_transitions?: StateTransition[];
   top_activities?: ActivitySummary[];
@@ -1446,9 +1480,9 @@ export interface SessionListResponse {
    */
   total_known?: number;
   /**
-   * Set when the daemon cannot fulfil the request. Known values: 'internal' | 'daemon_unavailable' | 'no_cache' | 'invalid_request' | None (success).
+   * Set when the daemon cannot fulfil the request. Known values: 'internal' | 'daemon_unavailable' | 'no_cache' | 'invalid_request' | 'handler_not_registered' | None (success).
    */
-  error?: string | null;
+  error?: ("internal" | "daemon_unavailable" | "no_cache" | "invalid_request" | "handler_not_registered") | null;
 }
 /**
  * One row in the History listing.
@@ -1872,9 +1906,9 @@ export interface TrendsResponse {
    */
   last_aggregated?: string | null;
   /**
-   * Set when the daemon cannot fulfil the request. Known values: 'internal' | 'daemon_unavailable' | 'no_cache' | 'invalid_window' | None (success).
+   * Set when the daemon cannot fulfil the request. Known values: 'internal' | 'daemon_unavailable' | 'no_cache' | 'invalid_window' | 'handler_not_registered' | None (success).
    */
-  error?: string | null;
+  error?: ("internal" | "daemon_unavailable" | "no_cache" | "invalid_window" | "handler_not_registered") | null;
 }
 /**
  * Aggregated model — trend_direction, sensitivity_multiplier, hourly_patterns, task_patterns.
@@ -2026,7 +2060,7 @@ export interface WSMessage {
     [k: string]: unknown;
   };
   /**
-   * Monotonic timestamp at construction time.
+   * UNIX epoch seconds (server wall-clock) at construction time. Clients send ``Date.now() / 1000`` — same units, comparable across daemon and client without conversion. (Phase-4a fix: was ``time.monotonic`` which is process-local and not comparable to a JS client clock.)
    */
   timestamp?: number;
   /**
@@ -2154,6 +2188,44 @@ export interface ActivitySummary1 {
    * ~200 chars of visible text when leaving
    */
   context_snapshot?: string;
+}
+/**
+ * P0 audit / Phase-4a: client → daemon ack of an intervention apply.
+ *
+ * Wire shape of the ``INTERVENTION_APPLIED`` WS message payload that
+ * the browser extension (and any other surface that mutates the
+ * workspace on behalf of the daemon) sends back so the executor can
+ * overwrite the optimistic ``Mutation.success`` with the real outcome.
+ *
+ * See ``cortex.services.api_gateway.websocket_server._handle_intervention_applied``
+ * for the dispatch arm that consumes this; the daemon ``_intervention_applied_callback``
+ * is the runtime handler.
+ */
+export interface InterventionApplied {
+  /**
+   * Intervention this ack belongs to
+   */
+  intervention_id: string;
+  /**
+   * Lifecycle phase being acked
+   */
+  phase?: "apply" | "restore";
+  /**
+   * True iff every requested mutation succeeded on this client
+   */
+  success: boolean;
+  /**
+   * action_ids the client successfully applied
+   */
+  applied_actions?: string[];
+  /**
+   * Per-action error strings reported by the client
+   */
+  errors?: string[];
+  /**
+   * Set by the server-side dispatcher (never trusted from the wire) so the daemon can attribute the ack to the actual client_type that produced it.
+   */
+  source_client_type?: string | null;
 }
 /**
  * F05: client-confirmed outcome of an intervention apply.
@@ -2419,4 +2491,307 @@ export interface StopMessage {
 }
 export interface StatusMessage {
   command: "status";
+}
+/**
+ * P0 §3.7: BREAK_RECOMMENDATION wire payload.
+ *
+ * Emitted exactly once per ``StressIntegralTracker.should_break``
+ * False → True transition. The popup / desktop overlay surfaces a
+ * soft pill with a single CTA that fires ``take_biology_break`` via
+ * ``ACTION_EXECUTE``.
+ *
+ * The ``urgency`` literal mirrors what the daemon's
+ * ``_classify_break_urgency`` actually emits (``"low" | "medium" |
+ * "high"``); see ``cortex.services.runtime_daemon.CortexDaemon._classify_break_urgency``.
+ */
+export interface BreakRecommendation {
+  /**
+   * Why this break was recommended — short, human-friendly string the overlay can read verbatim into the CTA pill.
+   */
+  reason: string;
+  /**
+   * Daemon-classified urgency derived from ``StressIntegralTracker.load_ratio``. The UI uses this to decide pill colour / tone, never to gate the action.
+   */
+  urgency?: "low" | "medium" | "high";
+  /**
+   * Current cumulative stress-integral load
+   */
+  stress_load: number;
+  /**
+   * Threshold the tracker crossed to fire this recommendation
+   */
+  threshold: number;
+  /**
+   * Suggested length of the guided breathing session, in seconds. The overlay's ``BreathingPacer`` paces ``pattern`` across this duration.
+   */
+  duration_seconds: number;
+  /**
+   * Pacer cadence variant. Picked by the daemon based on the user's recent HRV (4-7-8 = relaxation / parasympathetic; box = balanced; coherent = 5.5 BPM resonance breathing).
+   */
+  breathing_pattern?: "4-7-8" | "box" | "coherent";
+}
+/**
+ * P0 §3.15: COST_RESPONSE wire payload.
+ *
+ * Emitted as a reply to :attr:`MessageType.COST_REQUEST` and as an
+ * unsolicited push on every plan-finalised event so the desktop's
+ * cost meter updates without polling lag.
+ *
+ * Field naming note: the desktop shell historically read ``budget_usd``
+ * from the legacy stub payload; the new wire shape sends ``budget_today``
+ * (matching the §3.15 spec). The shell's ``apply_cost_response`` accepts
+ * both keys (Phase 4 follow-up).
+ */
+export interface CostResponse {
+  /**
+   * USD spent today by the LLM cost tracker.
+   */
+  cost_today: number;
+  /**
+   * USD daily budget cap (kill_usd). 0 means unlimited.
+   */
+  budget_today: number;
+  /**
+   * Active LLM provider name (e.g. ``bedrock``, ``vertex``, ``direct``, ``rule_based``).
+   */
+  provider?: string | null;
+  /**
+   * True when today's spend exceeded the budget cap.
+   */
+  budget_exhausted?: boolean;
+}
+/**
+ * P0 §3.11: QUIET_MODE_STATE broadcast payload.
+ *
+ * Emitted whenever ``RuntimeDaemon.set_quiet_mode`` runs, regardless
+ * of whether the mode was armed from the dashboard, overlay, tray,
+ * keyboard shortcut, or the F26 frustration-spiral path. All
+ * surfaces (dashboard, overlay, tray, browser popup, VS Code status
+ * bar) must rerender from this single broadcast — never from
+ * independent local state.
+ */
+export interface QuietModeState {
+  /**
+   * Mode flavour. ``snooze_15`` is overlay-only for ~15 min, ``quiet_session`` is a long-form blocking window, ``pause`` suspends sensing entirely, ``off`` clears any active mode.
+   */
+  kind: "snooze_15" | "quiet_session" | "pause" | "off";
+  /**
+   * How long this mode runs from arming, in minutes. None when kind=='off' or when the daemon uses an implicit default.
+   */
+  duration_minutes?: number | null;
+  /**
+   * UNIX epoch seconds (wall-clock) when the mode lapses. None when kind=='off'. Clients compute a countdown from (ends_at - Date.now() / 1000).
+   */
+  ends_at?: number | null;
+  /**
+   * Originator of the toggle. Lets analytics distinguish user-initiated quiet-mode entries from daemon-decay auto-armed ones without parsing the rest of the payload.
+   */
+  source?:
+    | "dashboard"
+    | "overlay"
+    | "tray"
+    | "shortcut"
+    | "popup"
+    | "vscode"
+    | "os_notification"
+    | "settings_sync"
+    | "daemon"
+    | "daemon_decay";
+}
+/**
+ * P0 §3.11: QUIET_MODE_TOGGLE inbound wire payload.
+ *
+ * Sent client → daemon to enter / leave a quiet or pause mode. The
+ * daemon validates ``source`` against the same vocabulary as
+ * :class:`QuietModeState`; an unknown source falls back to the
+ * presenting client's ``client_type``.
+ */
+export interface QuietModeTogglePayload {
+  /**
+   * Mode to enter (or 'off' to clear)
+   */
+  kind: "snooze_15" | "quiet_session" | "pause" | "off";
+  /**
+   * Requested duration. 0 / None reverts to the daemon's configured default for this ``kind``.
+   */
+  duration_minutes?: number | null;
+  /**
+   * Optional originator label; daemon falls back to the client's ``client_type`` when unset or unknown.
+   */
+  source?:
+    | (
+        | "dashboard"
+        | "overlay"
+        | "tray"
+        | "shortcut"
+        | "popup"
+        | "vscode"
+        | "os_notification"
+        | "settings_sync"
+        | "daemon"
+        | "daemon_decay"
+      )
+    | null;
+}
+/**
+ * P0 §3.3: SESSION_RECAP envelope (Phase-4a).
+ *
+ * Carries the full ``SessionReport`` plus two metadata fields the
+ * legacy raw-dict broadcast lacked:
+ *
+ * * ``generated_at`` — wall-clock instant the recap was constructed
+ *   (distinct from ``report.end_time`` which is the *session* end);
+ *   the popup uses this to badge stale recaps.
+ * * ``persisted`` — whether the atomic write to disk succeeded.
+ *   Defaults to True; the daemon sets it to False when the broadcast
+ *   fires before the disk write completes (e.g. the disk-write
+ *   coroutine raised). This lets the UI hint at "live-only, not on
+ *   disk" recaps.
+ *
+ * The legacy wire shape ``model_dump(mode="json")`` of bare
+ * ``SessionReport`` remains compatible because every field in
+ * :class:`SessionReport` appears under ``report``.
+ */
+export interface SessionRecap {
+  report: SessionReport1;
+  /**
+   * When the recap envelope was constructed (wall-clock). Distinct from ``report.end_time`` which is the session end.
+   */
+  generated_at?: string;
+  /**
+   * True iff the atomic write to ``storage/sessions/session_<id>.json`` succeeded. False when the broadcast races ahead of the disk write.
+   */
+  persisted?: boolean;
+}
+/**
+ * Biometric study session report.
+ */
+export interface SessionReport1 {
+  /**
+   * Document schema version. Bump on any non-backward-compatible field rename / removal. Readers SHOULD log a warning when a document is missing this key so we can track legacy-write rate.
+   */
+  schema_version?: number;
+  session_id: string;
+  start_time: string;
+  end_time: string;
+  duration_seconds: number;
+  /**
+   * User-provided session goal (trimmed). None when the user never set a goal during the session.
+   */
+  goal_title?: string | null;
+  time_in_flow_seconds?: number;
+  time_in_hyper_seconds?: number;
+  time_in_hypo_seconds?: number;
+  time_in_recovery_seconds?: number;
+  flow_percentage?: number;
+  longest_flow_streak_seconds?: number;
+  peak_stress_integral?: number;
+  breaks_taken?: number;
+  breaks_recommended?: number;
+  interventions_triggered?: number;
+  interventions_accepted?: number;
+  break_records?: BreakRecord[];
+  state_transitions?: StateTransition[];
+  top_activities?: ActivitySummary[];
+  top_distraction_domains?: string[];
+  golden_hour_start?: number | null;
+  golden_hour_end?: number | null;
+  avg_hr_bpm?: number | null;
+  avg_hrv_rmssd?: number | null;
+  comparison_to_7day?: ComparisonStats | null;
+}
+/**
+ * P0 §3.10: START_FOCUS_AUTO directive payload.
+ *
+ * Emitted to the browser extension when the user has opted in to
+ * ``CORTEX_INTERVENTION__ENABLE_AUTO_DISTRACTION_BLOCK`` AND the live
+ * state is HYPER with confidence above the gate. The extension reuses
+ * its existing focus-session start path; the daemon broadcasts a
+ * paired ``STOP_FOCUS_AUTO`` when the user exits HYPER.
+ */
+export interface StartFocusAutoPayload {
+  /**
+   * Length of the auto-armed focus session, in minutes
+   */
+  duration_minutes: number;
+  /**
+   * Short reason string the extension surfaces in the start notification (e.g. 'sustained_hyper_confidence').
+   */
+  reason: string;
+  /**
+   * Domain preset to apply. ``custom`` exclusively uses ``custom_domains``; other presets layer ``custom_domains`` on top of the preset's built-in list.
+   */
+  preset?: "developer" | "student" | "writer" | "custom";
+  /**
+   * User-editable extra domains to block. When ``preset=='custom'`` this is the entire blocklist; otherwise it's an additive layer.
+   *
+   * @maxItems 256
+   */
+  custom_domains?: string[];
+}
+/**
+ * P0 §3.10: STOP_FOCUS_AUTO directive payload.
+ *
+ * Sent after sustained non-HYPER state (FLOW ≥ 5 min) OR an explicit
+ * user disarm; the browser extension calls ``stopFocusSession`` only
+ * if the daemon was the one that armed the current session.
+ */
+export interface StopFocusAutoPayload {
+  /**
+   * Short reason string for analytics + extension logging (e.g. 'natural_recovery', 'user_disarm', 'shutdown').
+   */
+  reason: string;
+}
+/**
+ * P0 §3.19: TEST_PROVIDER inbound wire payload.
+ */
+export interface TestProviderRequest {
+  /**
+   * Provider key the user selected in the settings dropdown.
+   */
+  provider: "bedrock" | "vertex" | "anthropic_direct" | "rule_based";
+}
+/**
+ * P0 §3.19: TEST_PROVIDER_RESULT outbound wire payload.
+ */
+export interface TestProviderResult {
+  /**
+   * Echoes the provider that was tested.
+   */
+  provider: string;
+  /**
+   * True on a successful probe round-trip within 5 s.
+   */
+  ok: boolean;
+  /**
+   * Wall-clock round-trip in milliseconds (None on failure).
+   */
+  latency_ms?: number | null;
+  /**
+   * Short error category when ``ok`` is False.
+   */
+  error?: string | null;
+}
+/**
+ * P0 §3.9: WHY_DETAIL reply payload (causal rationale).
+ *
+ * Carries the structured causal rationale (top 2-3 signals, primary
+ * first) plus the originating ``intervention_id`` so the requesting
+ * client can match the reply to its in-flight prompt.
+ */
+export interface WhyDetail {
+  /**
+   * Intervention this rationale belongs to
+   */
+  intervention_id: string;
+  /**
+   * 2-3 dominant signals behind the trigger, ranked by |z-score|. First entry is the primary driver; empty list means the daemon could not attribute the trigger.
+   *
+   * @maxItems 3
+   */
+  causal_signals?: [] | [CausalSignal] | [CausalSignal, CausalSignal] | [CausalSignal, CausalSignal, CausalSignal];
+  /**
+   * Set when the daemon cannot supply a rationale (e.g. the intervention has already been GC'd from the active cache). Known values: 'not_found' | 'internal' | None (success).
+   */
+  error?: string | null;
 }

@@ -35,7 +35,6 @@ from cortex.libs.schemas.session_history import (
     TrendsResponse,
 )
 
-
 # ─── SessionListResponse.error envelope ─────────────────────────────
 
 

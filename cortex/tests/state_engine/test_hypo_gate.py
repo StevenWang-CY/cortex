@@ -14,8 +14,6 @@ The gate's contract:
 
 from __future__ import annotations
 
-import pytest
-
 from cortex.libs.config.settings import InterventionConfig, StateConfig
 from cortex.libs.schemas.state import (
     SignalQuality,

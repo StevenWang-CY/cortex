@@ -32,8 +32,10 @@ from typing import Any, Literal
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
+from cortex.libs.config.ports import HTTP_API_PORT, WEBSOCKET_PORT
 from cortex.libs.logging.correlation import get_correlation_id
 from cortex.libs.logging.structured import EventType
+from cortex.libs.ports.intervention_port import InterventionPort
 from cortex.libs.schemas.context import TaskContext
 from cortex.libs.schemas.features import (
     FeatureVector,
@@ -54,7 +56,61 @@ from cortex.libs.schemas.session_history import (
     TrendsResponse,
 )
 from cortex.libs.schemas.state import SignalQuality, StateEstimate, StateScores
-from cortex.services.intervention_engine import capture_snapshot, prepare_plan
+from cortex.libs.schemas.ws_message_types import MessageType
+from cortex.services.intervention_engine import (
+    capture_snapshot as _engine_capture_snapshot,
+)
+from cortex.services.intervention_engine import (
+    prepare_plan as _engine_prepare_plan,
+)
+
+
+def _get_intervention_port(request: Request) -> InterventionPort | None:
+    """Phase-4b TASK K: resolve the configured ``InterventionPort`` from
+    ``app.state.intervention_port`` (Phase-4b TASK L wires it on
+    startup). Falls back to the module-level engine functions for
+    legacy test rigs that construct the app without binding the port
+    explicitly so we don't break existing fixtures.
+    """
+    port = getattr(getattr(request, "app", None), "state", None)
+    if port is not None:
+        return getattr(port, "intervention_port", None)
+    return None
+
+
+def capture_snapshot(
+    context: TaskContext | None = None,
+    intervention_id: str | None = None,
+    *,
+    request: Request | None = None,
+    timestamp: float | None = None,
+) -> WorkspaceSnapshot:
+    """Phase-4b TASK K: thin shim that prefers the
+    ``app.state.intervention_port`` capability when available and
+    falls back to the engine module-level function otherwise. Keeps
+    every existing call site working without rewriting signatures."""
+    port = _get_intervention_port(request) if request is not None else None
+    if port is not None:
+        return port.capture_snapshot(
+            context, intervention_id, timestamp=timestamp,
+        )
+    return _engine_capture_snapshot(
+        context, intervention_id=intervention_id, timestamp=timestamp,
+    )
+
+
+def prepare_plan(
+    plan: InterventionPlan,
+    *,
+    tab_count: int | None = None,
+    request: Request | None = None,
+) -> Any:
+    """Phase-4b TASK K: prefer the injected port; fall back to the
+    engine module-level function for legacy rigs."""
+    port = _get_intervention_port(request) if request is not None else None
+    if port is not None:
+        return port.prepare_plan(plan, tab_count=tab_count)
+    return _engine_prepare_plan(plan, tab_count=tab_count)
 
 logger = logging.getLogger(__name__)
 
@@ -78,27 +134,85 @@ class AckResponse(BaseModel):
     """Simple acknowledgement response."""
 
     status: str = "ok"
-    timestamp: float = Field(default_factory=time.monotonic)
+    # Phase-4a fix: use wall-clock seconds so clients can compare this to
+    # ``Date.now() / 1000`` without a monotonic-vs-epoch unit mismatch.
+    timestamp: float = Field(default_factory=time.time)
 
 
 class ShutdownResponse(BaseModel):
     """Response for the /shutdown endpoint."""
 
     status: str = "shutting_down"
-    timestamp: float = Field(default_factory=time.monotonic)
+    # Phase-4a fix: see ``AckResponse.timestamp``.
+    timestamp: float = Field(default_factory=time.time)
 
 
 @router.post("/shutdown", response_model=ShutdownResponse)
 async def shutdown(request: Request) -> ShutdownResponse:
-    """Gracefully shut down the Cortex daemon."""
+    """Gracefully shut down the Cortex daemon.
+
+    Phase-4b TASK K: the daemon HTTP API listens on
+    ``HTTP_API_PORT`` (default
+    :data:`cortex.libs.config.ports.HTTP_API_PORT`); the paired WS
+    server lives on ``WEBSOCKET_PORT``
+    (:data:`cortex.libs.config.ports.WEBSOCKET_PORT`).
+    """
     import asyncio
     import os
     import signal as _signal
-    logger.info("Shutdown requested via API")
+    logger.info(
+        f"Shutdown requested via API (port={HTTP_API_PORT})",
+    )
     # Schedule shutdown after response is sent
     loop = asyncio.get_running_loop()
     loop.call_later(0.5, os.kill, os.getpid(), _signal.SIGTERM)
     return ShutdownResponse(status="shutting_down")
+
+
+class DashboardRaiseRequest(BaseModel):
+    """Phase-4b TASK K: optional ``target`` hint for the dashboard."""
+
+    target: str | None = None
+
+
+class DashboardRaiseResponse(BaseModel):
+    """Phase-4b TASK K: result of a /dashboard/raise call."""
+
+    raised: bool = True
+    target: str | None = None
+    timestamp: float = Field(default_factory=time.time)
+
+
+@router.post("/dashboard/raise", response_model=DashboardRaiseResponse)
+async def raise_dashboard(
+    body: DashboardRaiseRequest | None,
+    request: Request,
+) -> DashboardRaiseResponse:
+    """Phase-4b TASK K: instruct the desktop shell to raise its window.
+
+    Emits :attr:`MessageType.RAISE_DASHBOARD` over the WS bus. The
+    desktop shell handles the message; the route returns ``raised``
+    optimistically because the wire emission is fire-and-forget (the
+    shell may not be running, in which case the request is silently
+    dropped by every receiver).
+    """
+    target = body.target if body is not None else None
+    reg = _get_registry(request)
+    ws_server = reg.get("ws_server")
+    if ws_server is not None and hasattr(ws_server, "send_message"):
+        try:
+            await ws_server.send_message(
+                MessageType.RAISE_DASHBOARD.value,
+                {"target": target},
+                target_client_types=["desktop"],
+            )
+        except Exception:
+            logger.exception(
+                "RAISE_DASHBOARD broadcast failed (ws_port=%d)",
+                WEBSOCKET_PORT,
+            )
+            return DashboardRaiseResponse(raised=False, target=target)
+    return DashboardRaiseResponse(raised=True, target=target)
 
 
 class HealthResponse(BaseModel):
@@ -290,7 +404,12 @@ def _get_first_service(registry: Any, *names: str) -> Any | None:
     return None
 
 
-async def _build_snapshot_for_plan(registry: Any, plan: InterventionPlan) -> WorkspaceSnapshot:
+async def _build_snapshot_for_plan(
+    registry: Any,
+    plan: InterventionPlan,
+    *,
+    request: Request | None = None,
+) -> WorkspaceSnapshot:
     """Build the best available workspace snapshot for an intervention."""
     context = registry.get("latest_task_context")
     if context is None:
@@ -300,7 +419,9 @@ async def _build_snapshot_for_plan(registry: Any, plan: InterventionPlan) -> Wor
                 context = await context_engine.build_context()
             except Exception:
                 logger.exception("Failed to build context while snapshotting intervention")
-    snapshot = capture_snapshot(context, intervention_id=plan.intervention_id)
+    snapshot = capture_snapshot(
+        context, intervention_id=plan.intervention_id, request=request,
+    )
     registry.register(f"workspace_snapshot:{plan.intervention_id}", snapshot)
     return snapshot
 
@@ -606,7 +727,7 @@ async def apply_intervention(
 
     executor = _get_first_service(reg, "intervention_executor", "executor")
     if executor is not None and hasattr(executor, "apply"):
-        validation, commands = prepare_plan(body.plan)
+        validation, commands = prepare_plan(body.plan, request=request)
         if not validation.is_valid:
             logger.warning(
                 "Rejected intervention plan %s: %s",
@@ -617,7 +738,7 @@ async def apply_intervention(
                 applied=False, correlation_id=correlation_id,
             )
 
-        snapshot = await _build_snapshot_for_plan(reg, body.plan)
+        snapshot = await _build_snapshot_for_plan(reg, body.plan, request=request)
         mutations = await executor.apply(body.plan, commands)
         applied = bool(mutations) and all(m.success for m in mutations)
 
@@ -992,3 +1113,105 @@ async def get_trends_route(
     except Exception:
         logger.exception("GET /api/trends failed (window=%s)", window)
         return TrendsResponse(window=window)
+
+
+# =============================================================================
+# P0 §3.24: Feedback / bug-report endpoint
+# =============================================================================
+
+
+class FeedbackRequest(BaseModel):
+    """P0 §3.24: bug-report payload from the desktop shell.
+
+    The shell composes this when the user opens the "Send feedback" sheet.
+    Length bounds match the dashboard's UX (10–500 chars on description).
+    """
+
+    description: str = Field(..., min_length=10, max_length=500)
+    include_logs: bool = Field(default=False)
+    app_version: str = Field(default="", max_length=64)
+
+
+class FeedbackResponse(BaseModel):
+    """P0 §3.24: feedback acknowledgement."""
+
+    ok: bool = True
+    report_id: str = ""
+    timestamp: float = Field(default_factory=time.time)
+
+
+# Patterns redacted from bundled log tail. Two scrub passes are applied:
+# (1) the auth-token header value, (2) absolute home-directory paths.
+# Pre-compiled here so the route handler does not pay the cost on every
+# request.
+import re as _re  # noqa: E402  (placement keeps imports near use site)
+
+_FEEDBACK_AUTH_HEADER_RE = _re.compile(
+    r"(?i)(x-cortex-auth\s*[:=]\s*)\S+"
+)
+_FEEDBACK_USER_PATH_RE = _re.compile(r"/Users/[^/\s'\")]+")
+
+
+def _scrub_log_tail(lines: list[str]) -> list[str]:
+    """Apply the §3.24 PII scrubs in place; return the cleaned list."""
+    out: list[str] = []
+    for line in lines:
+        cleaned = _FEEDBACK_AUTH_HEADER_RE.sub(r"\1[REDACTED]", line)
+        cleaned = _FEEDBACK_USER_PATH_RE.sub("/Users/[REDACTED]", cleaned)
+        out.append(cleaned)
+    return out
+
+
+@router.post("/api/feedback", response_model=FeedbackResponse)
+async def submit_feedback(
+    body: FeedbackRequest,
+    request: Request,
+) -> FeedbackResponse:
+    """P0 §3.24: persist a user-submitted feedback / bug report.
+
+    Mounted on the capability-token-gated router (same as every other
+    mutating endpoint). Persists JSON via :func:`atomic_write_json` so a
+    SIGKILL mid-write never produces a half-written report. When
+    ``include_logs`` is True, the last 1000 lines of
+    ``~/Library/Logs/Cortex/cortex_daemon.log`` are bundled with the
+    record, after two PII-scrub passes.
+    """
+    import uuid as _uuid
+    from datetime import datetime as _dt
+    from pathlib import Path as _Path
+
+    from cortex.libs.utils.atomic_write import atomic_write_json
+    from cortex.libs.utils.platform import get_config_dir
+
+    report_id = _uuid.uuid4().hex
+    ts = _dt.now()
+    record: dict[str, Any] = {
+        "report_id": report_id,
+        "submitted_at": ts.isoformat(timespec="seconds"),
+        "description": body.description,
+        "include_logs": bool(body.include_logs),
+        "app_version": body.app_version or "",
+    }
+
+    if body.include_logs:
+        log_path = _Path.home() / "Library" / "Logs" / "Cortex" / "cortex_daemon.log"
+        try:
+            if log_path.exists():
+                lines = log_path.read_text(
+                    encoding="utf-8", errors="replace",
+                ).splitlines()[-1000:]
+                record["log_tail"] = _scrub_log_tail(lines)
+        except OSError:
+            logger.debug("feedback: failed to read log tail", exc_info=True)
+
+    try:
+        feedback_dir = get_config_dir() / "feedback"
+        feedback_dir.mkdir(parents=True, exist_ok=True)
+        stamp = ts.strftime("%Y%m%dT%H%M%S")
+        path = feedback_dir / f"{stamp}_{report_id}.json"
+        atomic_write_json(path, record)
+    except OSError:
+        logger.exception("POST /api/feedback failed to persist")
+        return FeedbackResponse(ok=False, report_id=report_id)
+
+    return FeedbackResponse(ok=True, report_id=report_id)

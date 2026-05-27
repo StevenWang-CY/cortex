@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -57,7 +57,7 @@ class HandoverSnapshot:
         Returns:
             Path to the written Markdown file.
         """
-        now = datetime.now()
+        now = datetime.now(UTC)
         date_str = now.strftime("%Y-%m-%d")
         time_str = now.strftime("%H:%M")
 
@@ -223,6 +223,6 @@ class HandoverSnapshot:
     def get_yesterday_handover(self) -> Path | None:
         """Get yesterday's handover file if it exists."""
         from datetime import timedelta
-        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        yesterday = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
         path = self._handovers_dir / f"{yesterday}.md"
         return path if path.exists() else None

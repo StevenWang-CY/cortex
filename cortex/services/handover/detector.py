@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 
 from cortex.libs.config.settings import HandoverConfig
 
@@ -113,8 +113,10 @@ class ShutdownDetector:
             self._fatigue_start = None
             return False
 
-        # Check time of day
-        now = datetime.now()
+        # Check time of day (UTC-anchored — keep semantics aligned with
+        # other handover timestamps; local-time scheduling is out of
+        # scope for this sweep).
+        now = datetime.now(UTC)
         is_late = now.hour >= self._late_hour or now.hour < 5
 
         if not is_late:

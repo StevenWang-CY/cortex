@@ -98,16 +98,26 @@ class ConsentLadder:
         # ``POST /consent/reset`` may be clearing them in parallel; the
         # pre-fix code had no synchronisation, so a reset arriving
         # mid-plan-construction could leave a partially-reset state
-        # dict visible to the in-flight planner. We lazy-instantiate
-        # because ``asyncio.Lock()`` binds to whichever loop is current
-        # at construction time and the ladder may be built on a
-        # different loop than the one that actually serves requests.
-        self._lock: asyncio.Lock | None = None
+        # dict visible to the in-flight planner.
+        #
+        # Phase-4b TASK H: bind the lock at construction. Python 3.10+
+        # ``asyncio.Lock()`` no longer binds to a specific event loop
+        # at construction — it lazily picks the running loop on the
+        # first ``__aenter__`` / ``__aexit__``. The legacy lazy
+        # ``_get_lock()`` shim was therefore redundant. Cross-thread
+        # callers don't exist today (consent state is only mutated by
+        # the daemon's event loop); if that changes, swap to
+        # ``threading.RLock`` and adjust the ``async with`` blocks
+        # below.
+        self._lock: asyncio.Lock = asyncio.Lock()
 
     def _get_lock(self) -> asyncio.Lock:
-        """Return the lock bound to the running event loop (F24)."""
-        if self._lock is None:
-            self._lock = asyncio.Lock()
+        """Return the lock bound to the running event loop (F24).
+
+        Phase-4b TASK H: retained as a thin wrapper for callers that
+        already referenced it. New code should use ``self._lock``
+        directly.
+        """
         return self._lock
 
     async def _ensure_loaded(self) -> None:
@@ -222,20 +232,34 @@ class ConsentLadder:
             self._prune_old_timestamps(state)
 
             # Check for escalation (recency-weighted trust, no recent reversals).
+            #
+            # Phase-4b TASK H: gate the threshold on the per-tier
+            # ``approvals`` counter (resets to 0 on escalation) rather
+            # than ``len(approval_timestamps)`` (which now persists
+            # across tiers to preserve the 30-day decay window). The
+            # timestamps list is still used for the recency-weighted
+            # trust factor, but only the counter decides "have we
+            # earned the next tier yet?".
             now = time.time()
             weighted_approvals = self._weighted_recent_approvals(state, now)
             recent_rejections = len(state.get("rejection_timestamps", []))
-            recent_approvals = len(state.get("approval_timestamps", []))
+            tier_approvals = int(state["approvals"])
             if (
-                recent_approvals >= self._escalation_threshold
+                tier_approvals >= self._escalation_threshold
                 and weighted_approvals >= (self._escalation_threshold * 0.8)
                 and recent_rejections == 0
                 and state["level"] < AUTONOMOUS_ACT
             ):
                 old_level = state["level"]
                 state["level"] = min(state["level"] + 1, AUTONOMOUS_ACT)
-                state["approvals"] = 0  # Reset counter for next level
-                state["approval_timestamps"] = []  # Recency window resets per earned tier.
+                # Phase-4b TASK H: reset only the approvals counter so
+                # the next escalation tier earns credit from scratch —
+                # do NOT clear ``approval_timestamps``. The 30-day
+                # decay window is the user's trust history and must
+                # survive across tier promotions; otherwise two
+                # consecutive escalations would silently bleed
+                # earned credit and ratchet the user back to suggest.
+                state["approvals"] = 0
                 logger.info(
                     "Consent escalated for '%s': %s -> %s (after %d approvals)",
                     action_type,

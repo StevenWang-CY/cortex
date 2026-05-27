@@ -42,11 +42,14 @@ dev: ## Start the daemon (FastAPI :9472, WebSocket :9473)
 
 # ─── Tests / quality ──────────────────────────────────────────────────
 
-test: ## Full pytest suite
-	$(PYTEST) cortex/tests/
+test: ## Full pytest suite (desktop_shell isolated to avoid PySide6 sys.modules pollution)
+	$(PYTEST) cortex/tests/unit/ --ignore=cortex/tests/unit/test_desktop_shell.py
+	$(PYTEST) cortex/tests/unit/test_desktop_shell.py
+	$(PYTEST) cortex/tests/services/
 
-test-unit: ## Unit tests only
-	$(PYTEST) cortex/tests/unit/
+test-unit: ## Unit tests only (desktop_shell pass runs last to avoid PySide6 sys.modules pollution)
+	$(PYTEST) cortex/tests/unit/ --ignore=cortex/tests/unit/test_desktop_shell.py
+	$(PYTEST) cortex/tests/unit/test_desktop_shell.py
 
 test-eval: ## AMIP / IPS / safety-floor / calibration eval suite
 	$(PYTEST) cortex/tests/eval/ cortex/tests/state_engine/test_calibration.py

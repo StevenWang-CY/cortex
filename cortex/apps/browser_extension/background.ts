@@ -271,6 +271,97 @@ const PERSIST_KEYS = [
     "autoFocusCustomDomains",
 ] as const;
 
+// Phase 4d Task A: auto-focus state mirrored to ``chrome.storage.local``
+// under a single key. ``chrome.storage.session`` clears whenever the
+// browser fully restarts (or when SW eviction races a profile restart),
+// but the daemon's ``STOP_FOCUS_AUTO`` is symmetric — if the extension
+// forgot it ever armed, the stop becomes a no-op and the daemon's
+// _auto_focus_armed bit gets stuck on. Local storage is the durable
+// floor that survives the worst restart scenarios.
+const AUTO_FOCUS_STATE_KEY = "cortex_auto_focus_state";
+let _autoFocusStatePersistTimer: ReturnType<typeof setTimeout> | null = null;
+
+async function persistAutoFocusState(): Promise<void> {
+    // Debounce so a rapid arm → tick → stop sequence collapses to one
+    // chrome.storage.local.set; matches the schedulePersist pattern.
+    if (_autoFocusStatePersistTimer) clearTimeout(_autoFocusStatePersistTimer);
+    _autoFocusStatePersistTimer = setTimeout(async () => {
+        try {
+            await chrome.storage.local.set({
+                [AUTO_FOCUS_STATE_KEY]: {
+                    autoFocusArmed,
+                    _activeFocusPresetName,
+                    activeFocusPresetPatterns: activeFocusPresetPatterns
+                        .map((p) => p.source),
+                },
+            });
+        } catch {
+            // storage.local may transiently fail (quota / extension reload).
+        }
+    }, 200);
+}
+
+async function restoreAutoFocusStateLocal(): Promise<void> {
+    try {
+        const data = await chrome.storage.local.get(AUTO_FOCUS_STATE_KEY);
+        const blob = data[AUTO_FOCUS_STATE_KEY] as
+            | {
+                  autoFocusArmed?: boolean;
+                  _activeFocusPresetName?: string;
+                  activeFocusPresetPatterns?: string[];
+              }
+            | undefined;
+        if (!blob) return;
+        // session storage takes precedence — it's the freshest source
+        // when both are available. Only adopt local-state fields the
+        // session restore left unset.
+        if (typeof blob._activeFocusPresetName === "string"
+            && !_activeFocusPresetName) {
+            _activeFocusPresetName = blob._activeFocusPresetName;
+        }
+        if (blob.autoFocusArmed === true && !autoFocusArmed) {
+            autoFocusArmed = true;
+            // Rebuild patterns from the preset name (regex literals
+            // don't survive JSON; the preset string does).
+            activeFocusPresetPatterns =
+                FOCUS_PRESET_DOMAINS[_activeFocusPresetName]
+                || FOCUS_PRESET_DOMAINS.developer;
+        }
+        // Sanity check (spec): inconsistent state where we claim
+        // ``autoFocusArmed=true`` but there is no ``focusSession`` means
+        // the SW restarted, restoreState lost the session payload, and
+        // the auto bit got stranded on. Recover by clearing the bit and
+        // notifying the daemon so its mirror bit clears too.
+        if (autoFocusArmed && focusSession === null) {
+            autoFocusArmed = false;
+            activeFocusPresetPatterns = [];
+            activeFocusCustomDomains = [];
+            _activeFocusPresetName = "developer";
+            await persistAutoFocusState();
+            if (connected && ws) {
+                try {
+                    send({
+                        type: "USER_ACTION",
+                        payload: {
+                            action: "auto_focus_inconsistent_state_recovered",
+                            source: "browser_extension",
+                            timestamp: Date.now() / 1000,
+                        },
+                        timestamp: Date.now() / 1000,
+                        sequence: ++sequence,
+                    });
+                } catch {
+                    // WS may be mid-reconnect; the daemon will
+                    // reconcile on the next STATE_UPDATE tick.
+                }
+            }
+        }
+    } catch {
+        // storage.local may be unavailable (test contexts without the
+        // mock); the in-memory defaults are safe.
+    }
+}
+
 function schedulePersist(): void {
     if (persistTimer) clearTimeout(persistTimer);
     persistTimer = setTimeout(async () => {
@@ -330,6 +421,13 @@ async function restoreState(): Promise<void> {
     if (autoFocusArmed && autoFocusEndsAt !== null && Date.now() > autoFocusEndsAt) {
         stopAutoFocusSession("duration_elapsed_post_restore");
     }
+    // Phase 4d Task A: also rehydrate from chrome.storage.local — the
+    // session bucket clears on browser restart so a HYPER-armed session
+    // that survived a Chrome relaunch loses its blocklist otherwise.
+    // The local restore is best-effort and runs even if session restore
+    // populated nothing; the sanity check inside handles the
+    // inconsistent ``autoFocusArmed && focusSession === null`` case.
+    await restoreAutoFocusStateLocal();
 }
 
 // Restore persisted state on service worker startup
@@ -2466,6 +2564,10 @@ function stopFocusSession(): FocusSession | null {
         autoFocusAlarmName = null;
     }
     schedulePersist();
+    // Phase 4d Task A: mirror the cleared auto-focus state to
+    // chrome.storage.local so the next SW boot sees a consistent
+    // zeroed blob instead of stale armed=true.
+    persistAutoFocusState();
     broadcastToPopup({ type: "FOCUS_SESSION_ENDED", session });
     return session;
 }
@@ -2510,6 +2612,10 @@ function startAutoFocusSession(opts: {
     activeFocusPresetPatterns =
         FOCUS_PRESET_DOMAINS[opts.preset] || FOCUS_PRESET_DOMAINS.developer;
     activeFocusCustomDomains = opts.customDomains.slice(0, 100);
+    // Phase 4d Task A: mirror to chrome.storage.local before scheduling
+    // the alarm so a worst-case SW eviction immediately after arming
+    // still leaves a durable trail for the next boot.
+    persistAutoFocusState();
     // Schedule a chrome.alarm to terminate the session after duration
     // — survives MV3 service-worker restarts (a setTimeout would not).
     autoFocusAlarmName = `cortex_auto_focus_${now}`;
@@ -2996,10 +3102,24 @@ async function executeCloseTab(action: SuggestedAction): Promise<ActionExecuteRe
             return { action_id: aid, success: false, message: "Tab closing is disabled", reversible: false };
         }
     } catch { /* storage read failed — proceed normally */ }
-    const tabIndex = typeof action.tab_index === "number" ? action.tab_index : Number(action.tab_index);
-    if (isNaN(tabIndex)) {
-        return { action_id: aid, success: false, message: "No tab_index provided", reversible: false };
+    // Phase 4d Task C: Pydantic's SuggestedAction.tab_index is strict
+    // ``int | None`` — a string-typed payload (e.g. from a buggy LLM
+    // adapter) gets rejected server-side, so we mirror that contract
+    // here and drop the action rather than silently coercing.
+    if (
+        action.tab_index === null
+        || action.tab_index === undefined
+        || typeof action.tab_index !== "number"
+        || !Number.isInteger(action.tab_index)
+        || action.tab_index < 0
+    ) {
+        console.warn(
+            "Cortex: invalid tab_index in close_tab action, dropping",
+            { action_id: aid, tab_index: action.tab_index },
+        );
+        return { action_id: aid, success: false, message: "Invalid tab_index", reversible: false };
     }
+    const tabIndex = action.tab_index;
 
     // Primary path: use snapshot
     const v = await validateTab(tabIndex);
@@ -3114,10 +3234,21 @@ async function executeBookmarkAndClose(action: SuggestedAction): Promise<ActionE
             return { action_id: aid, success: false, message: "Tab closing is disabled", reversible: false };
         }
     } catch { /* storage read failed — proceed normally */ }
-    const tabIndex = typeof action.tab_index === "number" ? action.tab_index : Number(action.tab_index);
-    if (isNaN(tabIndex)) {
-        return { action_id: aid, success: false, message: "No tab_index", reversible: false };
+    // Phase 4d Task C: strict tab_index parity with the Python schema.
+    if (
+        action.tab_index === null
+        || action.tab_index === undefined
+        || typeof action.tab_index !== "number"
+        || !Number.isInteger(action.tab_index)
+        || action.tab_index < 0
+    ) {
+        console.warn(
+            "Cortex: invalid tab_index in bookmark_and_close action, dropping",
+            { action_id: aid, tab_index: action.tab_index },
+        );
+        return { action_id: aid, success: false, message: "Invalid tab_index", reversible: false };
     }
+    const tabIndex = action.tab_index;
 
     const v = await validateTab(tabIndex);
     let tabId = v.valid ? v.tabId : -1;
@@ -4702,6 +4833,132 @@ chrome.alarms.onAlarm.addListener((alarm) => {
         });
     }
 });
+
+// --- Phase 4d Task G: §3.21 global browser shortcuts ---
+//
+// Three keyboard commands declared in package.json/manifest.commands
+// route here. Each maps to the canonical WS frame the popup would
+// otherwise emit so the daemon's audit log treats keyboard-driven
+// usage identically to UI-driven usage.
+//
+//   * pause-cortex    → QUIET_MODE_TOGGLE (toggles ``pause`` on/off)
+//   * dismiss-overlay → USER_ACTION {action: "dismiss_overlay"}
+//   * view-history    → relay to native_host raise_dashboard
+//
+// The native-host raise_dashboard contract is owned by Phase 4d-retry-2
+// (see ``cortex/scripts/native_host.py``). This site stubs the
+// ``chrome.runtime.sendNativeMessage`` call against the assumed
+// contract: ``{command: "raise_dashboard", target: "history"}`` →
+// ``{status: "ok" | "unavailable", error?: string}``.
+function handleCommandPauseCortex(): void {
+    if (!connected || !ws) return;
+    const next = quietMode ? "off" : "pause";
+    try {
+        send({
+            type: "QUIET_MODE_TOGGLE",
+            payload: {
+                kind: next,
+                duration_minutes: null,
+                source: "shortcut",
+            },
+            timestamp: Date.now() / 1000,
+            sequence: ++sequence,
+        });
+    } catch {
+        // WS may be mid-reconnect — silently drop. The daemon will
+        // resync on the next QUIET_MODE_STATE broadcast.
+    }
+}
+
+function handleCommandDismissOverlay(): void {
+    if (!connected || !ws) return;
+    const interventionId =
+        activeIntervention
+        && typeof activeIntervention.plan.intervention_id === "string"
+            ? activeIntervention.plan.intervention_id
+            : null;
+    try {
+        send({
+            type: "USER_ACTION",
+            payload: {
+                action: "dismiss_overlay",
+                intervention_id: interventionId,
+                source: "shortcut",
+                timestamp: Date.now() / 1000,
+            },
+            timestamp: Date.now() / 1000,
+            sequence: ++sequence,
+            correlation_id: activeIntervention?.correlation_id,
+        });
+    } catch {
+        // No active intervention or WS down — both are no-ops.
+    }
+    // Also clear the locally-mounted overlay state so the popup
+    // collapses immediately even before the daemon round-trips.
+    if (activeIntervention) {
+        activeIntervention = null;
+        broadcastToPopup({ type: "OVERLAY_DISMISSED" });
+    }
+}
+
+function handleCommandViewHistory(): void {
+    try {
+        chrome.runtime.sendNativeMessage(
+            "com.cortex.launcher",
+            { command: "raise_dashboard", target: "history" },
+            () => {
+                const lastErr = (chrome as unknown as {
+                    runtime?: { lastError?: { message?: string } };
+                }).runtime?.lastError;
+                if (lastErr && DEBUG) {
+                    console.warn(
+                        "[cortex.bg] view-history shortcut native_host unavailable",
+                        lastErr.message,
+                    );
+                }
+            },
+        );
+    } catch (e) {
+        if (DEBUG) {
+            console.warn("[cortex.bg] view-history shortcut threw", e);
+        }
+    }
+}
+
+// chrome.commands is only present in MV3 contexts that actually
+// declared a commands block in the manifest — older browsers and the
+// test harness leave it undefined, so we guard before subscribing.
+try {
+    const cmd = (chrome as unknown as {
+        commands?: {
+            onCommand?: { addListener: (cb: (command: string) => void) => void };
+        };
+    }).commands;
+    if (cmd && cmd.onCommand && cmd.onCommand.addListener) {
+        cmd.onCommand.addListener((command: string) => {
+            switch (command) {
+                case "pause-cortex":
+                    handleCommandPauseCortex();
+                    break;
+                case "dismiss-overlay":
+                    handleCommandDismissOverlay();
+                    break;
+                case "view-history":
+                    handleCommandViewHistory();
+                    break;
+                default:
+                    if (DEBUG) {
+                        console.debug(
+                            "[cortex.bg] unknown command",
+                            command,
+                        );
+                    }
+            }
+        });
+    }
+} catch {
+    // chrome.commands isn't critical to startup — log only in DEBUG.
+}
 
 // --- Auto-connect on install/startup ---
 

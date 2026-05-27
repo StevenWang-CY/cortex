@@ -54,7 +54,11 @@ class StressIntegralTracker:
         sensitivity_multiplier: float = 1.0,
     ) -> None:
         self._hrv_baseline = hrv_baseline
-        self._hrv_sigma = max(1.0, hrv_sigma)
+        # P1 Pipeline F: 5ms floor instead of 1ms. With sigma=1ms an RMSSD
+        # baseline of 50 ms drove the integral to ``threshold`` within ~25 s
+        # instead of the documented ~25 min, so biology-driven breaks fired
+        # almost immediately on the very first HRV dip.
+        self._hrv_sigma = max(5.0, hrv_sigma)
         self._base_threshold = threshold
         self._sensitivity_multiplier = sensitivity_multiplier
         self._integral: float = 0.0
@@ -88,7 +92,7 @@ class StressIntegralTracker:
 
     def update_sigma(self, hrv_sigma: float) -> None:
         """Update personalized HRV dispersion for standardized deficit."""
-        self._hrv_sigma = max(1.0, hrv_sigma)
+        self._hrv_sigma = max(5.0, hrv_sigma)
 
     def update_sensitivity(self, multiplier: float) -> None:
         """Update the sensitivity multiplier from longitudinal tracker."""

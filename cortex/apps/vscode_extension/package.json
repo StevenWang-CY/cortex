@@ -97,6 +97,11 @@
           "type": "boolean",
           "default": true,
           "description": "Show Cortex state in the status bar"
+        },
+        "cortex.debug": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable verbose diagnostic logs from the Cortex extension (COPILOT_THROTTLE tracer lines, WS reconnect noise). Off by default."
         }
       }
     }

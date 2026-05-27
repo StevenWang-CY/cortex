@@ -30,9 +30,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
-    from PySide6.QtCore import QRectF
+    from PySide6.QtCore import QRectF  # noqa: F401 — re-exported for older Qt fallback
 except ImportError:  # pragma: no cover - older Qt fallback
-    from PySide6.QtCore import QRect as QRectF  # type: ignore[assignment]
+    pass  # type: ignore[assignment]
 
 from PySide6.QtCore import Qt, QTimer, Signal
 
@@ -87,6 +87,26 @@ from cortex.libs.utils.atomic_write import atomic_write_json
 from cortex.libs.utils.platform import get_config_dir
 
 logger = logging.getLogger(__name__)
+
+
+def _is_embedded_daemon_runtime() -> bool:
+    """True when Cortex is running with an in-process embedded daemon.
+
+    The frozen .app bundle always uses the in-process daemon (no external
+    ``python -m cortex.scripts.run_dev`` invocation is needed); the dev
+    harness flips on ``--in-process``. End-user copy in the onboarding
+    wizard should never instruct a Terminal command in either of those
+    runtimes — the daemon is already in the process.
+    """
+    try:
+        import sys as _sys
+        if getattr(_sys, "frozen", False):
+            return True
+        if "--in-process" in _sys.argv:
+            return True
+    except Exception:
+        pass
+    return False
 
 
 # Phase J-1: copy keyed by step id. Surfaced from the "Why we need this"
@@ -1417,8 +1437,10 @@ class OnboardingWindow(QWidget):
 
         has_key = False
         try:
-            import keyring
-            existing = keyring.get_password(
+            # Phase-4a Debt-1: use ``get_password_safe`` so a wedged
+            # Keychain unlock sheet cannot pin the onboarding wizard.
+            from cortex.libs.utils.secrets import get_password_safe
+            existing = get_password_safe(
                 config.llm.bedrock.keychain_service,
                 config.llm.bedrock.keychain_account,
             )

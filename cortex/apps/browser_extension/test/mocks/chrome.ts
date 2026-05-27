@@ -140,6 +140,9 @@ export interface ChromeFake {
         setBadgeText: ReturnType<typeof vi.fn>;
         setBadgeBackgroundColor: ReturnType<typeof vi.fn>;
     };
+    commands: {
+        onCommand: ReturnType<typeof makeEvent>;
+    };
 }
 
 export function buildChromeFake(): ChromeFake {
@@ -212,6 +215,9 @@ export function buildChromeFake(): ChromeFake {
             setBadgeText: vi.fn(),
             setBadgeBackgroundColor: vi.fn(),
         },
+        commands: {
+            onCommand: makeEvent(),
+        },
     };
 }
 
@@ -260,4 +266,5 @@ export function resetChromeFake(fake: ChromeFake): void {
     fake.notifications.onButtonClicked.__clear();
     fake.action.setBadgeText.mockClear();
     fake.action.setBadgeBackgroundColor.mockClear();
+    fake.commands.onCommand.__clear();
 }

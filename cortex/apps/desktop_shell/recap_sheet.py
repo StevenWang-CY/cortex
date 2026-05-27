@@ -63,6 +63,7 @@ from cortex.apps.desktop_shell import mac_native
 from cortex.apps.desktop_shell.tokens import (
     BRAND_ACCENT,
     BRAND_ACCENT_HOVER,
+    BRAND_ACCENT_PRESSED,
     BRAND_DISPLAY_FONT,
     CX_TEXT_SECONDARY,
     CX_TEXT_TERTIARY,
@@ -275,7 +276,7 @@ class RecapSheet(QWidget):
             "  border: none;"
             "}"
             f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
-            "QPushButton:pressed { background: #B45638; }"
+            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; }}"
         )
         self._view_btn.clicked.connect(self._on_view_clicked)
         _safe_call(

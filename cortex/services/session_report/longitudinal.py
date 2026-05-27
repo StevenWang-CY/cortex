@@ -206,6 +206,12 @@ class _SessionFacts:
     has_hr_sample: bool
     has_hrv_sample: bool
     interventions: int
+    # P1 Pipeline B: real triggered / accepted counts when the session
+    # JSON has them. Legacy files (pre-Phase-4b-retry-2) only carry the
+    # HYPER-transition proxy in ``interventions``; those documents leave
+    # these fields at the schema default of 0.
+    interventions_triggered: int
+    interventions_accepted: int
     state_transitions: list[tuple[datetime, str]]
     top_distraction_domains: list[str]
 
@@ -298,6 +304,27 @@ def _load_session_facts(path: Path) -> _SessionFacts | None:
     domains_raw = data.get("top_distraction_domains") or []
     domains: list[str] = [d for d in domains_raw if isinstance(d, str)] if isinstance(domains_raw, list) else []
 
+    # P1 Pipeline B: prefer real counts when present; fall back to the
+    # HYPER-transition proxy for legacy session files.
+    raw_triggered = data.get("interventions_triggered")
+    try:
+        interventions_triggered = (
+            int(raw_triggered)
+            if isinstance(raw_triggered, (int, float))
+            else interventions
+        )
+    except (TypeError, ValueError):
+        interventions_triggered = interventions
+    raw_accepted = data.get("interventions_accepted")
+    try:
+        interventions_accepted = (
+            int(raw_accepted)
+            if isinstance(raw_accepted, (int, float))
+            else 0
+        )
+    except (TypeError, ValueError):
+        interventions_accepted = 0
+
     return _SessionFacts(
         session_id=session_id,
         start_time=start_time,
@@ -311,6 +338,8 @@ def _load_session_facts(path: Path) -> _SessionFacts | None:
         has_hr_sample=avg_hr_val is not None,
         has_hrv_sample=avg_hrv_val is not None,
         interventions=interventions,
+        interventions_triggered=interventions_triggered,
+        interventions_accepted=interventions_accepted,
         state_transitions=transitions,
         top_distraction_domains=domains,
     )
@@ -637,11 +666,16 @@ class LongitudinalAggregator:
 
         total_flow_minutes = sum(f.time_in_flow_seconds for f in facts) / 60.0
         total_hyper_minutes = sum(f.time_in_hyper_seconds for f in facts) / 60.0
-        interventions_count = sum(f.interventions for f in facts)
-        # interventions_accepted: best-effort proxy until we persist
-        # an explicit accept counter on SessionReport (audit Debt-1
-        # follow-up).
-        interventions_accepted = interventions_count
+        # P1 Pipeline B: read the real per-session counters. If every
+        # session in the day is a legacy file with no
+        # ``interventions_triggered`` key, fall back to the HYPER-
+        # transition proxy so historical days do not regress to zero.
+        real_triggered = sum(f.interventions_triggered for f in facts)
+        if real_triggered > 0:
+            interventions_count = real_triggered
+        else:
+            interventions_count = sum(f.interventions for f in facts)
+        interventions_accepted = sum(f.interventions_accepted for f in facts)
 
         # peak_overload_hours: bucket HYPER seconds per hour across the
         # day, keep the hours whose total is in the top 25 % (or at

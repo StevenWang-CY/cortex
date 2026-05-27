@@ -26,6 +26,20 @@ import traceback
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native_host_debug.log")
 
 
+# P1 (audit Phase 4d): centralise the port literals so a future port
+# migration only touches ``cortex/libs/config/ports.py``. Import is
+# wrapped in try/except because this script may be invoked by Chrome
+# native-messaging with a Python interpreter that doesn't have the
+# project installed (the installer copies the script out of the .app
+# but does NOT carry the package); the fallback defaults match the
+# constants in that module verbatim.
+try:
+    from cortex.libs.config.ports import HTTP_API_PORT, WEBSOCKET_PORT
+except Exception:  # pragma: no cover - import-path dependent
+    HTTP_API_PORT = 9472
+    WEBSOCKET_PORT = 9473
+
+
 def log(msg: str) -> None:
     """Append a debug line to the log file."""
     try:
@@ -72,7 +86,7 @@ def send_message(msg: dict) -> None:
     sys.stdout.buffer.flush()
 
 
-def is_daemon_running(port: int = 9473) -> bool:
+def is_daemon_running(port: int = WEBSOCKET_PORT) -> bool:
     """Check if the Cortex daemon is already listening on its WebSocket port."""
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=1):
@@ -131,7 +145,7 @@ def launch_daemon() -> dict:
                 log(f"Daemon ready after {(i+1)*0.5}s")
                 return {"status": "launched"}
         log("Daemon did not become ready in 20s")
-        return {"status": "timeout", "error": "Daemon started but port 9473 not yet ready"}
+        return {"status": "timeout", "error": f"Daemon started but port {WEBSOCKET_PORT} not yet ready"}
 
     # --- Dev path: python -m cortex.scripts.run_dev via Terminal.app -------
     # Find the project root (this script is at cortex/scripts/native_host.py)
@@ -190,7 +204,7 @@ def _find_all_daemon_pids() -> set[int]:
     pids: set[int] = set()
 
     # Method 1: lsof on known ports
-    for port in (9473, 9472):
+    for port in (WEBSOCKET_PORT, HTTP_API_PORT):
         try:
             result = subprocess.run(
                 ["lsof", "-ti", f"tcp:{port}"],
@@ -240,7 +254,7 @@ def stop_daemon() -> dict:
     try:
         import urllib.request
         req = urllib.request.Request(
-            "http://127.0.0.1:9472/shutdown", method="POST", data=b"",
+            f"http://127.0.0.1:{HTTP_API_PORT}/shutdown", method="POST", data=b"",
         )
         urllib.request.urlopen(req, timeout=2)
     except Exception:
@@ -291,6 +305,53 @@ def _get_auth_token_response() -> dict:
         return {"status": "error", "error": f"auth_token_unavailable: {exc}"}
 
 
+def _read_auth_token() -> str:
+    """Best-effort load of the capability token for HTTP header use.
+
+    Used by the ``raise_dashboard`` branch to authenticate against
+    ``POST /dashboard/raise`` (Phase 4b). Returns an empty string on
+    failure — the daemon route will then return 401, which surfaces to
+    the extension as ``{ok: false, error: "..."}``. We never propagate
+    a stack trace into the response body.
+    """
+    try:
+        from cortex.libs.auth import load_or_create_token
+
+        return load_or_create_token()
+    except Exception:
+        return ""
+
+
+def _raise_dashboard(target: str) -> dict:
+    """Ask the daemon to bring its desktop dashboard to the front.
+
+    P1 (audit Phase 4d, Task E): the browser extension popup needs a
+    way to "open Cortex" without juggling AppleScript or relying on the
+    user finding the menu bar icon. We POST to
+    ``http://127.0.0.1:<HTTP_API_PORT>/dashboard/raise`` (added in
+    Phase 4b-retry-1) and surface the daemon's response status. If the
+    route isn't deployed yet, urllib raises ``HTTPError(404)``; we
+    return ``{ok: false, error: "..."}`` rather than crashing the host.
+    """
+    import urllib.request
+
+    try:
+        url = f"http://127.0.0.1:{HTTP_API_PORT}/dashboard/raise"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps({"target": target}).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-Cortex-Auth": _read_auth_token(),
+            },
+            method="POST",
+        )
+        resp = urllib.request.urlopen(req, timeout=2)
+        return {"ok": True, "status": resp.status}
+    except Exception as exc:  # noqa: BLE001 — extension wants the string
+        return {"ok": False, "error": str(exc)}
+
+
 def main() -> None:
     log("--- invoked ---")
     try:
@@ -308,6 +369,30 @@ def main() -> None:
             # reply to. The Chrome native-messaging protocol expects no
             # further output in this case.
             log("stdin closed before payload arrived")
+            return
+
+        # P1 (audit Phase 4d, Task E): ``raise_dashboard`` lives
+        # outside the Pydantic discriminated-union in
+        # :mod:`cortex.libs.schemas.native_messaging` (owned by another
+        # phase). To avoid blocking on that schema bump, peek at the
+        # raw command and short-circuit when it matches. The payload is
+        # tiny (a single ``target`` string) so we validate inline
+        # rather than via a Pydantic model.
+        try:
+            _peek: dict = json.loads(raw.decode("utf-8"))
+        except Exception:
+            _peek = {}
+        if isinstance(_peek, dict) and _peek.get("command") == "raise_dashboard":
+            target_raw = _peek.get("target", "dashboard")
+            target = target_raw if isinstance(target_raw, str) else "dashboard"
+            # Guard against absurd payloads (Pydantic would do this for us
+            # in the standard path).
+            if len(target) > 64:
+                target = target[:64]
+            log(f"received: command=raise_dashboard target={target}")
+            result = _raise_dashboard(target)
+            log(f"sending: {result}")
+            send_message(result)
             return
 
         parsed = parse_native_message(raw)

@@ -56,6 +56,29 @@ class SessionReportGenerator:
         # show "+24 HRV recovery during break" without re-reading
         # storage.
         self._break_records: list[BreakRecord] = []
+        # P1 Pipeline B: real intervention counters wired from the
+        # runtime daemon. Longitudinal roll-ups previously aliased both
+        # to "HYPER state transitions"; now they reflect actual plan
+        # acceptance.
+        self._interventions_triggered: int = 0
+        self._interventions_accepted: int = 0
+        # P0 §3.13: the most-recent user-provided session goal. Stamped
+        # onto the SessionReport at ``finish()`` so longitudinal
+        # aggregators can later detect a "task_overload_pattern" trend.
+        self._goal_title: str | None = None
+
+    def set_goal_title(self, title: str | None) -> None:
+        """P0 §3.13: stamp the user-provided session goal.
+
+        ``None`` or empty string clears the goal. Re-setting overwrites
+        the prior value — the latest goal at ``finish()`` time wins, which
+        matches the UX: the goal input is editable mid-session.
+        """
+        if not title:
+            self._goal_title = None
+            return
+        trimmed = title.strip()[:240]
+        self._goal_title = trimmed or None
 
     def start(self) -> None:
         """Mark session start."""
@@ -65,11 +88,24 @@ class SessionReportGenerator:
         """Record a state transition."""
         now = timestamp
         if self._current_state is not None:
-            dt = now - self._current_state_start
+            # P0 Pipeline B: clamp negative dt to defend against NTP
+            # backjumps (system clock leaping backwards while the daemon
+            # is running). Without the clamp, the duration counter could
+            # accumulate negative values and the percentage roll-up
+            # would lie about how long the user spent in each state.
+            raw_dt = now - self._current_state_start
+            if raw_dt < 0:
+                logger.warning(
+                    "Negative state duration detected (dt=%.3fs, state=%s) — "
+                    "clamping to 0. NTP backjump or non-monotonic input?",
+                    raw_dt,
+                    self._current_state,
+                )
+            dt = max(0.0, raw_dt)
             self._state_durations[self._current_state] += dt
 
-            # Track hourly flow
-            hour = datetime.fromtimestamp(self._current_state_start).hour
+            # Track hourly flow (use UTC consistently — F26).
+            hour = datetime.fromtimestamp(self._current_state_start, tz=UTC).hour
             self._hourly_total[hour] += dt
             if self._current_state == "FLOW":
                 self._hourly_flow[hour] += dt
@@ -139,6 +175,31 @@ class SessionReportGenerator:
         """Record a distraction domain."""
         self._distraction_domains.append(domain)
 
+    def increment_interventions_triggered(self, count: int = 1) -> None:
+        """Increment the per-session triggered-plan counter (P1 Pipeline B).
+
+        Called by the runtime daemon every time the trigger policy approves
+        a plan AND the executor delivered it to the user. Independent from
+        :meth:`increment_interventions_accepted` so the gap between the
+        two (which equals "dismissed / never-rated") can be read off the
+        session report directly.
+        """
+        if count < 0:
+            return
+        self._interventions_triggered += int(count)
+
+    def increment_interventions_accepted(self, count: int = 1) -> None:
+        """Increment the per-session accepted-plan counter (P1 Pipeline B).
+
+        Called by the runtime daemon when the user posts a Keep / thumbs-
+        up outcome for a triggered plan. The caller is responsible for
+        sequencing — this counter must never exceed ``interventions_triggered``
+        for the same session, but the generator does not enforce that.
+        """
+        if count < 0:
+            return
+        self._interventions_accepted += int(count)
+
     def finish(
         self,
         comparison: ComparisonStats | None = None,
@@ -165,7 +226,7 @@ class SessionReportGenerator:
             dt = end_ts - self._current_state_start
             if dt > 0:
                 self._state_durations[self._current_state] += dt
-                hour = datetime.fromtimestamp(self._current_state_start).hour
+                hour = datetime.fromtimestamp(self._current_state_start, tz=UTC).hour
                 self._hourly_total[hour] += dt
                 if self._current_state == "FLOW":
                     self._hourly_flow[hour] += dt
@@ -216,6 +277,8 @@ class SessionReportGenerator:
             peak_stress_integral=self._peak_stress,
             breaks_taken=self._breaks_taken,
             breaks_recommended=self._breaks_recommended,
+            interventions_triggered=self._interventions_triggered,
+            interventions_accepted=self._interventions_accepted,
             break_records=list(self._break_records),
             state_transitions=self._state_transitions,
             top_activities=sorted_activities,
@@ -225,4 +288,5 @@ class SessionReportGenerator:
             avg_hr_bpm=round(sum(self._hr_samples) / len(self._hr_samples), 1) if self._hr_samples else None,
             avg_hrv_rmssd=round(sum(self._hrv_samples) / len(self._hrv_samples), 1) if self._hrv_samples else None,
             comparison_to_7day=comparison,
+            goal_title=self._goal_title,
         )

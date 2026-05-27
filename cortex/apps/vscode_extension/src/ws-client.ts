@@ -105,12 +105,43 @@ export class CortexWSClient {
     private _copilotThrottleHandlers: CopilotThrottleHandler[] = [];
     private _genericMessageHandlers: GenericMessageHandler[] = [];
 
+    // P1 (audit Phase 4d): bounded outbox so messages sent while
+    // disconnected are queued (up to 16 entries) and flushed on the
+    // next successful connection. Without this, any USER_ACTION fired
+    // during the 3-30s reconnect backoff was silently dropped, which
+    // made the panel feel "dead" after a daemon restart even though the
+    // user clicked buttons.
+    private static readonly _OUTBOX_MAX = 16;
+    private _outbox: WSMessage[] = [];
+    private _overflowWarned = false;
+
+    // P1 (audit Phase 4d, Task C): correlation_id-keyed pending
+    // WHY_DETAIL_REQUEST resolvers. Each request generates a UUID,
+    // resolves on a matching WHY_DETAIL reply, and times out after 5s.
+    private _pendingWhyDetail: Map<
+        string,
+        {
+            resolve: (payload: Record<string, unknown>) => void;
+            reject: (err: Error) => void;
+            timer: ReturnType<typeof setTimeout>;
+        }
+    > = new Map();
+
     constructor(url: string) {
         this._url = url;
     }
 
     /** Whether the client is currently connected. */
     get connected(): boolean {
+        return this._connected;
+    }
+
+    /**
+     * P1 (audit Phase 4d, Task B): public connection-state predicate
+     * used by ``CortexPanelProvider`` to branch the empty-state UI
+     * between "no active intervention" and "daemon offline / reconnect".
+     */
+    get isConnected(): boolean {
         return this._connected;
     }
 
@@ -203,6 +234,24 @@ export class CortexWSClient {
                     timestamp: Date.now() / 1000,
                     sequence: ++this._sequence,
                 });
+
+                // P1 (Task A): flush the bounded outbox now that we've
+                // reattached. Drain in FIFO order; do NOT re-queue on
+                // failure — a transient send error during flush is
+                // logged but not retried (the next disconnect/connect
+                // cycle would re-queue infinitely otherwise).
+                const queued = this._outbox;
+                this._outbox = [];
+                this._overflowWarned = false;
+                for (const msg of queued) {
+                    try {
+                        this._ws?.send(JSON.stringify(msg));
+                    } catch {
+                        // Connection torn down mid-flush; remaining
+                        // messages will be lost. The reconnect handler
+                        // re-enters this path on the next open.
+                    }
+                }
 
                 vscode.window.setStatusBarMessage(
                     "Cortex: Connected to daemon",
@@ -326,9 +375,56 @@ export class CortexWSClient {
     /**
      * P0 §3.9: request the structured causal rationale.
      *
+     * P1 (audit Phase 4d, Task C): now correlation-id keyed. Each call
+     * generates a fresh ``correlation_id`` (via ``crypto.randomUUID()``)
+     * and returns a Promise that resolves when the daemon's WHY_DETAIL
+     * reply carries the same id, or rejects after 5 s without a match.
+     * Older callers that ignore the return value still get the legacy
+     * fire-and-forget side effect: the frame is sent unchanged.
+     *
      * @param interventionId - id of the active intervention
+     * @returns Promise resolving to the daemon's WHY_DETAIL payload.
      */
-    sendWhyDetailRequest(interventionId: string): void {
+    sendWhyDetailRequest(
+        interventionId: string,
+    ): Promise<Record<string, unknown>> {
+        const correlationId = (() => {
+            // ``crypto.randomUUID()`` is available on Node >= 16.7.
+            // Cast to ``any`` keeps the fallback path narrow without
+            // requiring a polyfill import for ancient runtimes.
+            const c: { randomUUID?: () => string } =
+                (globalThis as { crypto?: { randomUUID?: () => string } })
+                    .crypto ?? {};
+            if (typeof c.randomUUID === "function") {
+                return c.randomUUID();
+            }
+            // Fallback: non-cryptographic UUID-shaped string so the
+            // correlation table still works on hosts that lack
+            // ``crypto.randomUUID``.
+            return `xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`.replace(
+                /[xy]/g,
+                (ch) => {
+                    const r = (Math.random() * 16) | 0;
+                    const v = ch === "x" ? r : (r & 0x3) | 0x8;
+                    return v.toString(16);
+                },
+            );
+        })();
+
+        const promise = new Promise<Record<string, unknown>>(
+            (resolve, reject) => {
+                const timer = setTimeout(() => {
+                    this._pendingWhyDetail.delete(correlationId);
+                    reject(new Error("WHY_DETAIL request timed out after 5s"));
+                }, 5000);
+                this._pendingWhyDetail.set(correlationId, {
+                    resolve,
+                    reject,
+                    timer,
+                });
+            },
+        );
+
         this._send({
             type: "WHY_DETAIL_REQUEST",
             payload: {
@@ -336,7 +432,10 @@ export class CortexWSClient {
             },
             timestamp: Date.now() / 1000,
             sequence: ++this._sequence,
+            correlation_id: correlationId,
         });
+
+        return promise;
     }
 
     /**
@@ -461,7 +560,30 @@ export class CortexWSClient {
     // --- Internal ---
 
     private _send(msg: WSMessage): void {
+        // P1 (Task A): when disconnected, queue into the bounded outbox
+        // instead of silently dropping the frame. The next successful
+        // open flushes the queue in FIFO order.
         if (!this._ws || !this._connected) {
+            if (this._outbox.length >= CortexWSClient._OUTBOX_MAX) {
+                // Drop oldest to make room for the new entry.
+                this._outbox.shift();
+                console.warn(
+                    "[Cortex] ws-client outbox overflow, dropping oldest",
+                );
+                if (!this._overflowWarned) {
+                    this._overflowWarned = true;
+                    try {
+                        vscode.window.showWarningMessage(
+                            "Cortex offline — action queued; some actions may be lost on reconnect",
+                        );
+                    } catch {
+                        // showWarningMessage may not be available in
+                        // some host contexts (tests); the warn line
+                        // above is the durable signal.
+                    }
+                }
+            }
+            this._outbox.push(msg);
             return;
         }
         try {
@@ -523,6 +645,36 @@ export class CortexWSClient {
                     }
                 }
                 break;
+
+            case "WHY_DETAIL": {
+                // P1 (audit Phase 4d, Task C): resolve the pending
+                // promise matching ``correlation_id``. The generic
+                // ``onMessage`` fan-out still runs below so the
+                // existing extension.ts ``WHY_DETAIL`` listener
+                // (forwarding to the panel) keeps working unchanged.
+                const correlationId = msg.correlation_id;
+                if (correlationId) {
+                    const pending = this._pendingWhyDetail.get(correlationId);
+                    if (pending) {
+                        clearTimeout(pending.timer);
+                        this._pendingWhyDetail.delete(correlationId);
+                        try {
+                            pending.resolve(msg.payload);
+                        } catch {
+                            // Resolver throwing should not crash the
+                            // client; pending map is already cleaned.
+                        }
+                    }
+                }
+                for (const handler of this._genericMessageHandlers) {
+                    try {
+                        handler(msg);
+                    } catch {
+                        // Handler error should not crash the client
+                    }
+                }
+                break;
+            }
 
             case "COPILOT_THROTTLE":
                 // B1 (audit-prod): explicit arm. Previously the message

@@ -68,8 +68,14 @@ class WSMessage(BaseModel):
         description="Message-specific JSON-serialisable payload.",
     )
     timestamp: float = Field(
-        default_factory=time.monotonic,
-        description="Monotonic timestamp at construction time.",
+        default_factory=time.time,
+        description=(
+            "UNIX epoch seconds (server wall-clock) at construction "
+            "time. Clients send ``Date.now() / 1000`` — same units, "
+            "comparable across daemon and client without conversion. "
+            "(Phase-4a fix: was ``time.monotonic`` which is "
+            "process-local and not comparable to a JS client clock.)"
+        ),
     )
     sequence: int = Field(
         default=0,

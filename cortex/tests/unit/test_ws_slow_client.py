@@ -101,7 +101,13 @@ async def test_slow_client_receives_close_frame_and_is_removed(monkeypatch):
         structured_mod, "get_logger", lambda *_a, **_kw: _CapturedLogger()
     )
 
-    msg = WSMessage(type="STATE_UPDATE", payload={"state": "FLOW"})
+    # Phase-4b TASK I: STATE_UPDATE is coalesce-eligible — the broadcast
+    # enqueues the frame onto the per-client queue and returns
+    # synchronously; the slow-consumer disconnect happens inside the
+    # drain task. Use INTERVENTION_TRIGGER which still goes through
+    # the direct-send F22 path so this test continues to exercise the
+    # synchronous slow-consumer contract.
+    msg = WSMessage(type="INTERVENTION_TRIGGER", payload={"intervention_id": "iv1"})
     sent = await server._broadcast(msg)
 
     assert sent == 0, "slow client should not count as sent"
@@ -140,8 +146,11 @@ async def test_healthy_client_unaffected_by_slow_peer():
         client_type="vscode", authenticated=True,
     )
 
+    # Phase-4b TASK I: same rationale as the prior test — use a
+    # direct-send message type so the slow-consumer contract fires
+    # synchronously inside ``_broadcast``.
     sent = await server._broadcast(
-        WSMessage(type="STATE_UPDATE", payload={"state": "FLOW"})
+        WSMessage(type="INTERVENTION_TRIGGER", payload={"intervention_id": "iv1"})
     )
 
     assert sent == 1, "healthy client should be counted as sent"
@@ -163,7 +172,9 @@ async def test_reconnection_cycle_after_slow_close():
         client_id="c1", websocket=slow_ws,
         client_type="chrome", authenticated=True,
     )
-    await server._broadcast(WSMessage(type="STATE_UPDATE", payload={}))
+    # Phase-4b TASK I: use a direct-send type so the slow-consumer
+    # disconnect runs synchronously inside ``_broadcast``.
+    await server._broadcast(WSMessage(type="INTERVENTION_TRIGGER", payload={"intervention_id": "iv1"}))
     assert "c1" not in server._clients
     # F22: the original (slow) socket must see the explicit close frame.
     assert slow_ws.closed_with == (1011, "slow consumer")
@@ -174,9 +185,19 @@ async def test_reconnection_cycle_after_slow_close():
         client_id="c1", websocket=new_ws,
         client_type="chrome", authenticated=True,
     )
+    # Phase-4b TASK I: STATE_UPDATE coalesces — the broadcast returns
+    # the queued count (1) after enqueueing onto the per-client queue.
     sent = await server._broadcast(WSMessage(type="STATE_UPDATE", payload={}))
     assert sent == 1
     assert "c1" in server._clients
+    # Drain the coalesce task so the test doesn't leak it.
+    fresh = server._clients["c1"]
+    if fresh.coalesce_task is not None:
+        fresh.coalesce_task.cancel()
+        try:
+            await fresh.coalesce_task
+        except asyncio.CancelledError:
+            pass
 
 
 @pytest.mark.asyncio
@@ -196,7 +217,11 @@ async def test_close_on_already_dead_socket_does_not_raise():
     )
 
     # Must not raise even though close() throws.
-    await server._broadcast(WSMessage(type="STATE_UPDATE", payload={}))
+    # Phase-4b TASK I: use a direct-send message type so the disconnect
+    # path runs synchronously inside ``_broadcast`` (STATE_UPDATE
+    # would coalesce and defer the dead-socket discovery to the drain
+    # task).
+    await server._broadcast(WSMessage(type="INTERVENTION_TRIGGER", payload={"intervention_id": "iv1"}))
     assert "c-dead" not in server._clients
 
     # And exercise the helper directly — the close-on-dead-socket path

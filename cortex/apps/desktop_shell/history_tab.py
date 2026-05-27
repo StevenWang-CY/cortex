@@ -49,9 +49,11 @@ except ImportError:  # pragma: no cover - test stubs
 
 try:
     from PySide6.QtWidgets import (
+        QFileDialog,
         QFrame,
         QHBoxLayout,
         QLabel,
+        QMenu,
         QPushButton,
         QScrollArea,
         QSizePolicy,
@@ -68,6 +70,26 @@ except ImportError:  # pragma: no cover - test stubs
         QVBoxLayout,
         QWidget,
     )
+
+    class QFileDialog(QWidget):  # type: ignore[override]
+        @staticmethod
+        def getSaveFileName(
+            *_a: Any, **_kw: Any,
+        ) -> tuple[str, str]:
+            return ("", "")
+
+    class QMenu(QWidget):  # type: ignore[override]
+        def addAction(self, *_a: Any, **_kw: Any) -> object:
+            class _A:
+                def triggered(self) -> object:
+                    class _S:
+                        def connect(self, *_a: Any, **_kw: Any) -> None:
+                            pass
+                    return _S()
+            return _A()
+
+        def exec(self, *_a: Any, **_kw: Any) -> object:
+            return None
 
     class QScrollArea(QWidget):  # type: ignore[override]
         def setWidgetResizable(self, *_a: Any, **_kw: Any) -> None: ...
@@ -1976,6 +1998,28 @@ class HistoryTab(QWidget):
         outer.setContentsMargins(SP4, SP3, SP4, SP3)
         outer.setSpacing(SP3)
 
+        # P0 §3.23: Export current session button row. Sits above the
+        # sub-segmented control so it is reachable from any tab. Only
+        # enabled while a detail panel has a session loaded.
+        export_row = QHBoxLayout()
+        export_row.addStretch(1)
+        self._export_btn = QPushButton("Export…")
+        try:
+            self._export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        except Exception:
+            pass
+        self._export_btn.setFont(mac_native.system_font(FS_CAPTION, "medium"))
+        self._export_btn.setEnabled(False)
+        try:
+            self._export_btn.setToolTip(
+                "Export the most recent session as CSV or JSON."
+            )
+        except Exception:
+            pass
+        self._export_btn.clicked.connect(self._on_export_clicked)
+        export_row.addWidget(self._export_btn)
+        outer.addLayout(export_row)
+
         self._sub_seg = _SubSegmented(["Today", "Week", "Month"])
         outer.addWidget(self._sub_seg)
 
@@ -2190,6 +2234,14 @@ class HistoryTab(QWidget):
                 pass
         self._pending_detail_id = None
         self._detail_panel.apply_payload(payload)
+        # P0 §3.23: stash the latest report for export. The report
+        # lives under ``report`` per the SessionReport WS contract.
+        try:
+            if isinstance(payload, dict) and payload.get("report"):
+                self._latest_export_report: dict = dict(payload.get("report") or {})
+                self._export_btn.setEnabled(True)
+        except Exception:
+            logger.debug("export stash failed", exc_info=True)
         # Make sure the panel is visible after the data lands (it may
         # have been pre-shown by ``_show_detail_panel_loading``).
         self._position_detail_panel()
@@ -2198,6 +2250,102 @@ class HistoryTab(QWidget):
             self._detail_panel.raise_()
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # P0 §3.23 — Session export (CSV / JSON)
+    # ------------------------------------------------------------------
+
+    def _on_export_clicked(self) -> None:
+        """Open a small menu offering CSV or JSON export of the latest
+        loaded session report. The choice opens a QFileDialog at the
+        user's home directory.
+        """
+        report = getattr(self, "_latest_export_report", None) or None
+        if not isinstance(report, dict) or not report:
+            return
+        try:
+            menu = QMenu(self)
+            csv_action = menu.addAction("Export as CSV…")
+            json_action = menu.addAction("Export as JSON…")
+            try:
+                csv_action.triggered.connect(
+                    lambda: self._do_export("csv", report),
+                )
+                json_action.triggered.connect(
+                    lambda: self._do_export("json", report),
+                )
+            except Exception:
+                pass
+            anchor = self._export_btn.mapToGlobal(
+                self._export_btn.rect().bottomLeft()
+            )
+            menu.exec(anchor)
+        except Exception:
+            logger.debug("export menu failed", exc_info=True)
+
+    def _do_export(self, fmt: str, report: dict) -> None:
+        from pathlib import Path
+        session_id = str(report.get("session_id") or "session")
+        suggested = f"cortex_{session_id}.{fmt}"
+        try:
+            path_str, _filter = QFileDialog.getSaveFileName(
+                self,
+                f"Export session as {fmt.upper()}",
+                suggested,
+                f"{fmt.upper()} files (*.{fmt})",
+            )
+        except Exception:
+            logger.debug("file dialog open failed", exc_info=True)
+            return
+        if not path_str:
+            return
+        target = Path(path_str)
+        try:
+            if fmt == "json":
+                import json as _json
+                target.write_text(_json.dumps(report, indent=2, default=str))
+            else:
+                target.write_text(self._report_to_csv(report))
+        except Exception:
+            logger.warning("session export to %s failed", target, exc_info=True)
+
+    @staticmethod
+    def _report_to_csv(report: dict) -> str:
+        """Flatten a SessionReport-like dict into a CSV string.
+
+        We emit one row per state transition + one row per intervention.
+        The columns are intentionally minimal so the output opens
+        cleanly in Excel / Numbers without ragged-row warnings.
+        """
+        import csv as _csv
+        import io as _io
+
+        buf = _io.StringIO()
+        writer = _csv.writer(buf)
+        writer.writerow(
+            ["kind", "timestamp", "field_a", "field_b", "field_c"]
+        )
+        for trans in report.get("state_transitions", []) or []:
+            if not isinstance(trans, dict):
+                continue
+            writer.writerow([
+                "state_transition",
+                str(trans.get("timestamp") or ""),
+                str(trans.get("from_state") or ""),
+                str(trans.get("to_state") or ""),
+                str(trans.get("confidence") or ""),
+            ])
+        for itv in report.get("interventions", []) or []:
+            if not isinstance(itv, dict):
+                continue
+            writer.writerow([
+                "intervention",
+                str(itv.get("timestamp") or itv.get("issued_at") or ""),
+                str(itv.get("intervention_id") or ""),
+                str(itv.get("headline") or ""),
+                str(itv.get("user_action") or ""),
+            ])
+        return buf.getvalue()
 
     def apply_trends(self, payload: dict) -> None:
         if not isinstance(payload, dict):

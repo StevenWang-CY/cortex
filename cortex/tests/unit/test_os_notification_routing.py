@@ -9,8 +9,6 @@ safe on non-mac so the module itself must always be importable.
 
 from __future__ import annotations
 
-import sys
-
 import pytest
 
 from cortex.libs.schemas.intervention import (

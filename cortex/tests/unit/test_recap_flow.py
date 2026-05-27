@@ -22,8 +22,6 @@ booting the entire runtime:
 from __future__ import annotations
 
 import asyncio
-import os
-import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -33,7 +31,6 @@ import pytest
 
 from cortex.libs.schemas.ws_message_types import MessageType
 from cortex.services.session_report.models import SessionReport
-
 
 # ─── helpers ──────────────────────────────────────────────────────────
 

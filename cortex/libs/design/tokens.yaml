@@ -24,6 +24,10 @@ brand:
   accent_hover:
     oklch: "oklch(56% 0.13 32)"
     hex:   "#C46547"
+  accent_pressed:
+    # Darker variant for active/pressed states (button press feedback).
+    oklch: "oklch(50% 0.13 30)"
+    hex:   "#B45638"
   accent_dark:
     # Boosted for legibility on dark window backgrounds (the macOS approach —
     # System Accent under dark appearance uses a slightly higher L).
@@ -157,3 +161,45 @@ dimensions:
     max_height: 560
   panel:
     breathing_pacer_size: 140
+
+# HUD backgrounds + tints — used by the full-screen break overlay and the
+# intervention HUD. Kept as RGBA tuples so the Python emitter can wrap them
+# directly into QColor without re-doing the math; the browser extension
+# converts them to CSS rgba() strings at emit time.
+hud:
+  bg_primary:   { rgba: "rgba(8, 10, 14, 255)" }   # outer overlay scrim
+  bg_secondary: { rgba: "rgba(4, 5, 7, 255)" }     # gradient bottom + sheet bg
+  surface_dim:  { rgba: "rgba(255, 255, 255, 15)" } # 6% white — pill backgrounds
+  surface_emphasis: { rgba: "rgba(255, 255, 255, 26)" } # 10% — hover
+  border_dim:   { rgba: "rgba(255, 255, 255, 36)" } # 14% — pill border
+  accent_ring:  { rgba: "rgba(217, 119, 87, 115)" } # 45% — accent border on pills
+  halo:         { rgba: "rgba(217, 119, 87, 24)" }  # outer halo around breathing disc
+
+# Accessibility — color-blind safe state palettes. The desktop shell can
+# switch at runtime via the settings dropdown; the browser extension picks
+# them up on next load. The "default" palette is the production red/green
+# variant used everywhere; the others swap hues that are reliably
+# distinguishable under the named color-vision deficiency.
+palette_variants:
+  default:
+    FLOW: "brand"
+    HYPER: "danger"
+    HYPO: "label_tertiary"
+    RECOVERY: "info"
+  # Deuteranopia — ~6% of men, red/green confusion. We anchor on blue+orange
+  # (high luminance contrast) and pick a warm yellow for HYPER instead of red.
+  deuteranopia:
+    FLOW: { hex: "#0072B2" }      # blue
+    HYPER: { hex: "#E69F00" }     # orange
+    HYPO: { hex: "#999999" }      # neutral grey
+    RECOVERY: { hex: "#009E73" }  # teal-green (safe under deutan)
+  protanopia:
+    FLOW: { hex: "#0072B2" }
+    HYPER: { hex: "#E69F00" }
+    HYPO: { hex: "#999999" }
+    RECOVERY: { hex: "#56B4E9" }  # sky blue
+  tritanopia:
+    FLOW: { hex: "#D55E00" }      # vermillion (FLOW=warm brand)
+    HYPER: { hex: "#CC79A7" }     # rose
+    HYPO: { hex: "#999999" }
+    RECOVERY: { hex: "#009E73" }

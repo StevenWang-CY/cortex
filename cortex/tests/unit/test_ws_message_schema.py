@@ -77,6 +77,15 @@ def test_message_type_catalog_covers_dispatch_arms() -> None:
         # P0 §3.11 — one-touch pause / quiet mode
         "QUIET_MODE_TOGGLE",
         "SNOOZE_REQUEST",
+        # P0 §3.15 — cost-meter poll
+        "COST_REQUEST",
+        # P0 §3.19 — provider probe
+        "TEST_PROVIDER",
+        # P0 §3.13 — user-supplied session goal
+        "GOAL_SET",
+        # P0 §3.21 — keyboard-shortcut overlay controls
+        "FORCE_RECAP",
+        "DISMISS_OVERLAY",
     }
     catalog = {m.value for m in MessageType}
     missing = dispatched_inbound - catalog
@@ -112,6 +121,10 @@ def test_message_type_catalog_covers_outbound() -> None:
         "STOP_FOCUS_AUTO",
         # P0 §3.11 — quiet/pause mode state broadcast
         "QUIET_MODE_STATE",
+        # P0 §3.15 — cost-meter reply / push
+        "COST_RESPONSE",
+        # P0 §3.19 — provider probe reply
+        "TEST_PROVIDER_RESULT",
     }
     catalog = {m.value for m in MessageType}
     missing = outbound - catalog
@@ -355,9 +368,7 @@ def test_unknown_keys_are_ignored() -> None:
 # ─── Wave-2 P1 (audit-cross-pipeline): missing-callback ERROR reply ──
 
 
-import asyncio  # noqa: E402
 
-import pytest  # noqa: E402
 
 from cortex.services.api_gateway.websocket_server import (  # noqa: E402
     WebSocketClient,

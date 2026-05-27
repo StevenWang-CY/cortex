@@ -140,6 +140,16 @@ def _project_header(path: Path, mtime: float) -> _ListingCacheEntry | None:
         logger.warning("session-reader: unexpected root type for %s", path)
         return None
 
+    # Phase-4a Debt-1: observe legacy documents written before the
+    # ``schema_version`` field was added so we can bound migration risk.
+    # Reader semantics are unchanged — a missing key implicitly means
+    # version 1, but we surface a warning so silent drift is visible.
+    if "schema_version" not in data:
+        logger.warning(
+            "session-reader: legacy session document without schema_version: %s",
+            path,
+        )
+
     session_id = data.get("session_id")
     start_time = _coerce_datetime(data.get("start_time"))
     end_time = _coerce_datetime(data.get("end_time"))

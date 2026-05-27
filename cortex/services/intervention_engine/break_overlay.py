@@ -241,11 +241,24 @@ class BiologyBreakController:
         pattern: BreathingPattern,
         audio_cue: bool,
     ) -> BreakUIResult:
-        """Invoke the UI handler when registered; otherwise sleep."""
+        """Invoke the UI handler when registered.
+
+        Phase-4b TASK G: when no UI handler is registered, return
+        ``(0.0, False)`` immediately. The legacy
+        ``asyncio.sleep(duration)`` faked a successful break — fine for
+        the schema round-trip in headless tests, but a misleading
+        "completed=True" credit when the daemon actually had no surface
+        bound (e.g. a forgotten ``set_ui_handler`` in a desktop build).
+        Callers detect the no-handler case by the ``completed=False``
+        result and skip the reset-on-completion path.
+        """
         handler = self._ui_handler
         if handler is None:
-            await asyncio.sleep(duration)
-            return (duration, True)
+            logger.warning(
+                "BiologyBreakController: no UI handler bound; returning "
+                "(0.0, False) instead of faking a sleep-based completion",
+            )
+            return (0.0, False)
         try:
             elapsed, completed = await handler(duration, pattern, audio_cue)
             elapsed = max(0.0, float(elapsed))

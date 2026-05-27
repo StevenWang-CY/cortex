@@ -156,8 +156,12 @@ async def test_break_controller_reentrant_start_returns_none() -> None:
 
 
 @pytest.mark.asyncio
-async def test_break_controller_runs_without_ui_handler() -> None:
-    """When no UI is bound the controller still produces a valid record."""
+async def test_break_controller_no_ui_handler_returns_incomplete_record() -> None:
+    """Phase-4b TASK G: when no UI is bound the controller no longer
+    fakes a sleep-based completion. The break record reflects the
+    no-handler path (``completed=False``, ``duration_seconds=0.0``)
+    and the stress tracker is NOT reset (no genuine recovery happened).
+    """
     stress = _FakeStressTracker()
     report = _FakeSessionReport()
     controller = BiologyBreakController(
@@ -166,11 +170,13 @@ async def test_break_controller_runs_without_ui_handler() -> None:
         suppress_interventions=lambda _active: None,
         stress_tracker=stress,
     )
-    # No set_ui_handler call → falls back to asyncio.sleep(duration).
-    # Set duration to 0.01 to keep the test fast.
+    # No set_ui_handler call.
     record = await controller.start(duration_seconds=30)
     assert record is not None
     assert record.pattern == "box"  # 50 ms → middle of the band
+    assert record.completed is False
+    assert record.duration_seconds == pytest.approx(0.0)
+    assert stress.reset_count == 0
 
 
 def test_break_controller_suppress_callback() -> None:

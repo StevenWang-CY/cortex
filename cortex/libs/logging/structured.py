@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -119,6 +119,37 @@ class EventType(StrEnum):
     # in-process desktop_shell cache.
     AUTH_TOKEN_ROTATED = "auth_token_rotated"
 
+    # P0 §3.7 (Phase-4a): biology-driven break lifecycle. STARTED fires
+    # when ``BiologyBreakController`` shows the breathing overlay;
+    # COMPLETED fires on natural completion OR early termination
+    # (``completed=False`` on the resulting ``BreakRecord``). Wired by
+    # the runtime daemon in Phase-4b — Phase-4a only adds the enum
+    # member so downstream callsites can be code-reviewed against a
+    # stable identifier.
+    BIOLOGY_BREAK_STARTED = "biology_break_started"
+    BIOLOGY_BREAK_COMPLETED = "biology_break_completed"
+
+    # P0 §3.11 (Phase-4a): quiet / pause mode lifecycle. ENTERED fires
+    # at ``set_quiet_mode(kind != "off")``; EXITED fires at
+    # ``set_quiet_mode("off")`` or at the natural ``ends_at`` lapse.
+    # Used by the dashboard's Phase-3 analytics rollup to attribute
+    # missed interventions to user-driven suppression.
+    QUIET_MODE_ENTERED = "quiet_mode_entered"
+    QUIET_MODE_EXITED = "quiet_mode_exited"
+
+    # P0 §3.10 (Phase-4a): a candidate intervention was suppressed
+    # because auto-distraction-block fired in its place (or because
+    # the user is in an active focus session). Distinct from
+    # INTERVENTION_DISMISSED — the user never saw a prompt.
+    DISTRACTION_BLOCKED = "distraction_blocked"
+
+    # P0 §3.12 (Phase-4a): the daemon emitted an OS-level notification
+    # (UNUserNotification on macOS, chrome.notifications fallback)
+    # because the dashboard was NOT in the foreground at trigger
+    # time. Carries the notification id so we can correlate with the
+    # eventual user click / dismiss.
+    OS_NOTIFICATION_SENT = "os_notification_sent"
+
 
 class StateTransitionEvent(BaseModel):
     """State transition event data."""
@@ -173,8 +204,13 @@ def add_timestamp(
     method_name: str,
     event_dict: dict[str, Any],
 ) -> dict[str, Any]:
-    """Add ISO timestamp to log events."""
-    event_dict["timestamp"] = datetime.utcnow().isoformat() + "Z"
+    """Add ISO timestamp to log events.
+
+    Phase-4a fix: ``datetime.utcnow()`` is deprecated in Python 3.12+
+    and emits a DeprecationWarning that pollutes daemon logs at INFO.
+    Use the timezone-aware ``datetime.now(UTC)`` instead.
+    """
+    event_dict["timestamp"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     return event_dict
 
 

@@ -15,8 +15,6 @@ Contracts:
 
 from __future__ import annotations
 
-import pytest
-
 from cortex.libs.schemas.context import TaskContext
 from cortex.libs.schemas.state import SignalQuality, StateEstimate, StateScores
 from cortex.services.llm_engine.prompts import (

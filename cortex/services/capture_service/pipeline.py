@@ -317,7 +317,13 @@ class CapturePipeline:
             frame, nose_displacement, gray_frame=gray_frame,
         )
 
-        # Step 4: Build FrameMeta
+        # Step 4: Build FrameMeta.
+        # P1 Pipeline A: stamp ``low_quality`` directly on the meta so
+        # downstream consumers do not have to read the full QualityScore
+        # struct. The rPPG window in ``runtime_daemon._rgb_history`` now
+        # skips the RGB append (or substitutes a NaN sentinel) when this
+        # flag is True instead of polluting the bvp signal with frames
+        # the quality scorer already rejected.
         frame_meta = FrameMeta(
             timestamp=captured.timestamp,
             face_detected=tracking.face_detected,
@@ -325,6 +331,7 @@ class CapturePipeline:
             brightness_score=quality.brightness_score,
             blur_score=quality.blur_score,
             motion_score=quality.motion_score,
+            low_quality=not quality.passed,
         )
 
         self._frames_processed += 1
@@ -332,9 +339,15 @@ class CapturePipeline:
         # Step 5: Quality gate
         if not quality.passed:
             self._frames_quality_rejected += 1
-            # Still emit for metrics, but mark as low quality
-            # Downstream consumers can check quality.passed
-            pass
+            logger.debug(
+                "Frame at t=%.3f rejected by quality gate "
+                "(brightness=%.2f blur=%.2f motion=%.2f); "
+                "frame_meta.low_quality=True, downstream must skip RGB sample.",
+                captured.timestamp,
+                quality.brightness_score,
+                quality.blur_score,
+                quality.motion_score,
+            )
 
         if not tracking.face_detected and not tracking.face_stable:
             self._frames_no_face += 1

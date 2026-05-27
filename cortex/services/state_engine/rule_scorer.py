@@ -173,26 +173,41 @@ class RuleScorer:
             else:
                 scores.append(0.0)
 
-        # Low mouse velocity (mouse drift / inactivity)
-        if fv.mouse_velocity_mean < 50.0:
-            scores.append(0.8)
-        elif fv.mouse_velocity_mean < 200.0:
-            scores.append(max(0.0, (200.0 - fv.mouse_velocity_mean) / 200.0))
-        else:
-            scores.append(0.0)
+        # Low mouse velocity (mouse drift / inactivity).
+        # P1 Pipeline A: same telemetry warm-up gate as the window-switch
+        # branch below. Pre-warm-up, mouse_velocity_mean defaults to 0.0
+        # because no telemetry update has populated it yet.
+        if fv.telemetry_seen_count >= 5:
+            if fv.mouse_velocity_mean < 50.0:
+                scores.append(0.8)
+            elif fv.mouse_velocity_mean < 200.0:
+                scores.append(max(0.0, (200.0 - fv.mouse_velocity_mean) / 200.0))
+            else:
+                scores.append(0.0)
 
-        # Posture slump (shoulder drop without forward lean)
-        if fv.shoulder_drop_ratio is not None and fv.shoulder_drop_ratio > 0.1:
-            lean = fv.forward_lean_angle or 0.0
+        # Posture slump (shoulder drop without forward lean).
+        # P1 Pipeline A: when forward_lean_angle is None we cannot score
+        # posture HYPO from shoulder drop alone — a user simply looking
+        # away from the camera should not be flagged as disengaged.
+        if (
+            fv.shoulder_drop_ratio is not None
+            and fv.shoulder_drop_ratio > 0.1
+            and fv.forward_lean_angle is not None
+        ):
+            lean = fv.forward_lean_angle
             if lean < 15.0:  # Slump without leaning forward
                 scores.append(min(1.0, fv.shoulder_drop_ratio / 0.3))
             else:
                 scores.append(0.0)
 
-        # Low window switching (minimal engagement)
-        if fv.tab_switch_frequency < 2.0:
+        # Low window switching (minimal engagement).
+        # P1 Pipeline A: only score telemetry HYPO contributions after
+        # the warm-up gate (>= 5 telemetry samples seen). Cold start
+        # always reads tab_switch_frequency=0 and would otherwise score
+        # HYPO during the very first seconds of a session.
+        if fv.telemetry_seen_count >= 5 and fv.tab_switch_frequency < 2.0:
             scores.append(0.3)
-        else:
+        elif fv.telemetry_seen_count >= 5:
             scores.append(0.0)
 
         # Screen apnea indicator (low respiration + fixation)

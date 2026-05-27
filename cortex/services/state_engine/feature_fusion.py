@@ -50,6 +50,13 @@ class FeatureFusion:
         self._kinematics_timestamp: float = 0.0
         self._telemetry_timestamp: float = 0.0
 
+        # P1 Pipeline A: cold-start counter so HYPO scoring can require
+        # at least 5 telemetry samples before trusting "low activity"
+        # signals (mouse drift, low tab-switch rate, etc.). Without the
+        # warm-up gate the first 2-3 seconds after launch always looked
+        # like HYPO disengagement.
+        self._telemetry_seen_count: int = 0
+
     def update_physio(
         self, features: PhysioFeatures, timestamp: float | None = None,
     ) -> None:
@@ -70,6 +77,7 @@ class FeatureFusion:
         """Update the telemetry feature channel."""
         self._telemetry = features
         self._telemetry_timestamp = timestamp or time.monotonic()
+        self._telemetry_seen_count += 1
 
     def fuse(self, timestamp: float | None = None) -> tuple[FeatureVector, SignalQuality]:
         """
@@ -93,6 +101,13 @@ class FeatureFusion:
         hr_delta = None
         physio_sqi = None
         respiration_rate = None
+        # P1 Pipeline A: explicit "physio missing" flag so downstream
+        # gates can defer HYPER triggering when only kinematics/telemetry
+        # are available. Setting None on the floats alone was not enough —
+        # rule_scorer.score_hr_*/score_hrv_drop guarded on None but the
+        # HYPER pathway as a whole had no way to know "physio is just
+        # absent" vs "physio is present and normal".
+        physio_missing = True
         if self._physio is not None and self._physio.valid:
             hr = self._physio.pulse_bpm
             hrv_rmssd = self._physio.pulse_variability_proxy
@@ -100,6 +115,7 @@ class FeatureFusion:
             hr_delta = self._physio.hr_delta_5s
             physio_sqi = self._physio.physio_sqi
             respiration_rate = self._physio.respiration_rate_bpm
+            physio_missing = False
 
         # Kinematic features (dimensions 4-7)
         blink_rate = None
@@ -115,7 +131,11 @@ class FeatureFusion:
             ear_variance = self._kinematics.ear_variance
             shoulder_drop_ratio = self._kinematics.shoulder_drop_ratio
             if self._kinematics.forward_lean_score is not None:
-                # Convert 0-1 score to 0-45 degree range for FeatureVector
+                # Convert 0-1 score to 0-45 degree range for FeatureVector.
+                # P1 Pipeline A: when forward_lean_score is None we leave
+                # forward_lean_angle as None instead of coercing to 0.0, so
+                # downstream lean-AND-shoulder posture-HYPO scoring can
+                # explicitly skip rather than score a false slump.
                 forward_lean_angle = self._kinematics.forward_lean_score * 45.0
 
         # Telemetry features (dimensions 8-12)
@@ -156,6 +176,8 @@ class FeatureFusion:
             tab_switch_frequency=tab_switch_frequency,
             scroll_back_rate_per_min=scroll_back_rate_per_min,
             respiration_rate=respiration_rate,
+            physio_missing=physio_missing,
+            telemetry_seen_count=self._telemetry_seen_count,
         )
 
         quality = self._compute_signal_quality(now)
@@ -216,3 +238,4 @@ class FeatureFusion:
         self._physio_timestamp = 0.0
         self._kinematics_timestamp = 0.0
         self._telemetry_timestamp = 0.0
+        self._telemetry_seen_count = 0

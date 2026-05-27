@@ -7,10 +7,13 @@ Async queue wrappers, timeout helpers, and graceful shutdown utilities.
 from __future__ import annotations
 
 import asyncio
+import logging
 import signal
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any, Generic, TypeVar
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -225,7 +228,12 @@ class GracefulShutdown:
                 if asyncio.iscoroutine(result):
                     await result
             except Exception:
-                pass  # Log but don't fail shutdown
+                # Phase-4a fix: swallowing silently here meant shutdown
+                # failures (camera handle not released, telemetry tasks
+                # left dangling) only surfaced when the next start
+                # tripped over a leaked resource. Emit the traceback so
+                # the daemon's log carries the real cause.
+                logger.exception("shutdown handler failed")
 
     def _signal_handler(self) -> None:
         """Handle shutdown signals."""
@@ -285,11 +293,18 @@ class RateLimiter:
     async def acquire(self) -> None:
         """Wait until rate limit allows next operation."""
         async with self._lock:
-            now = asyncio.get_event_loop().time()
+            # Phase-4a fix: ``asyncio.get_event_loop()`` silently
+            # creates a new (non-running) loop on Python 3.10+ when
+            # called outside of one, so the recorded timestamp drifts
+            # from the loop actually scheduling our ``sleep``. We're
+            # inside an ``async with`` so a running loop is guaranteed;
+            # use ``get_running_loop`` and let any caller bug surface
+            # as RuntimeError at the entry point.
+            now = asyncio.get_running_loop().time()
             wait_time = self._interval - (now - self._last_call)
             if wait_time > 0:
                 await asyncio.sleep(wait_time)
-            self._last_call = asyncio.get_event_loop().time()
+            self._last_call = asyncio.get_running_loop().time()
 
     async def __aenter__(self) -> None:
         await self.acquire()

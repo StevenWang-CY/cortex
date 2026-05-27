@@ -17,7 +17,6 @@ import asyncio
 import json
 import logging
 import signal
-import subprocess
 import sys
 import threading
 from typing import Any
@@ -618,11 +617,11 @@ class CortexApp:
         self._onboarding.run_calibration_requested.connect(self._run_calibration)
         self._onboarding.completed.connect(self._complete_onboarding)
         # P0 §3.4: Settings → Sensing → Recalibrate baselines also drives
-        # the same in-process CalibrationRunner code path.
-        if hasattr(self._settings, "recalibrate_requested"):
-            self._settings.recalibrate_requested.connect(self._run_calibration)
-        # P0 §3.4: Settings → Sensing → Recalibrate baselines also drives
-        # the same in-process CalibrationRunner code path.
+        # the same in-process CalibrationRunner code path. The controller
+        # owns the same wire-up (controller.py:415) — in the WS-mode
+        # CortexApp we add it once here too, but the previously-duplicated
+        # connect line was an audit regression that fired _run_calibration
+        # twice per click.
         if hasattr(self._settings, "recalibrate_requested"):
             self._settings.recalibrate_requested.connect(self._run_calibration)
         # Audit-2 fix: ask the remote daemon to reload LLM credentials

@@ -11,7 +11,7 @@ Usage:
     adapter = EditorAdapter()
     ctx = await adapter.get_context()
     if ctx is not None:
-        print(ctx.file_path, ctx.error_count)
+        logger.info("file=%s errors=%d", ctx.file_path, ctx.error_count)
 """
 
 from __future__ import annotations

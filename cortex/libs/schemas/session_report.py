@@ -83,10 +83,42 @@ class ComparisonStats(BaseModel):
 class SessionReport(BaseModel):
     """Biometric study session report."""
 
+    # Phase-4a Debt-1 closure: per-document schema version stamped onto
+    # every on-disk session_<id>.json. Readers default to 1 for legacy
+    # documents written before this field existed; future schema bumps
+    # bump the integer + add migration logic in
+    # ``session_report.reader``. The reader emits a ``log.warning`` when
+    # input is missing the field so silent drift is visible.
+    schema_version: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Document schema version. Bump on any non-backward-"
+            "compatible field rename / removal. Readers SHOULD log a "
+            "warning when a document is missing this key so we can "
+            "track legacy-write rate."
+        ),
+    )
+
     session_id: str
     start_time: datetime
     end_time: datetime
     duration_seconds: float
+
+    # P0 §3.13: optional user-provided session goal. The desktop shell
+    # emits ``GOAL_SET`` when the user types into the dashboard goal
+    # input or picks a recent goal; the daemon stamps the most-recent
+    # value here when ``finish()`` runs so longitudinal aggregators
+    # (cortex/services/session_report/longitudinal.py) can later detect
+    # "task_overload_pattern" trends.
+    goal_title: str | None = Field(
+        None,
+        max_length=240,
+        description=(
+            "User-provided session goal (trimmed). None when the user "
+            "never set a goal during the session."
+        ),
+    )
 
     # Biometric summary
     time_in_flow_seconds: float = 0.0
@@ -100,6 +132,13 @@ class SessionReport(BaseModel):
     peak_stress_integral: float = 0.0
     breaks_taken: int = 0
     breaks_recommended: int = 0
+    # P1 Pipeline B: real intervention counters. ``interventions_triggered``
+    # increments on every accepted plan (anti-spam pipeline approved it);
+    # ``interventions_accepted`` increments only when the user kept the
+    # change (thumbs-up / "Keep" outcome). Longitudinal roll-ups read these
+    # straight, instead of aliasing both to the HYPER-state transition count.
+    interventions_triggered: int = 0
+    interventions_accepted: int = 0
     # P0 §3.7: per-break audit trail. Each entry is one guided
     # breathing session; ``recovery_delta`` is the headline number
     # surfaced on the session report card.

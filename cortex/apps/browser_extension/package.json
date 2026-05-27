@@ -58,6 +58,29 @@
           "<all_urls>"
         ]
       }
-    ]
+    ],
+    "commands": {
+      "pause-cortex": {
+        "suggested_key": {
+          "default": "Ctrl+Shift+P",
+          "mac": "Command+Shift+P"
+        },
+        "description": "Pause / resume Cortex"
+      },
+      "dismiss-overlay": {
+        "suggested_key": {
+          "default": "Ctrl+Shift+D",
+          "mac": "Command+Shift+D"
+        },
+        "description": "Dismiss active Cortex overlay"
+      },
+      "view-history": {
+        "suggested_key": {
+          "default": "Ctrl+Shift+H",
+          "mac": "Command+Shift+H"
+        },
+        "description": "Open Cortex dashboard history"
+      }
+    }
   }
 }

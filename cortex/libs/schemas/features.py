@@ -25,6 +25,18 @@ class FrameMeta(BaseModel):
     motion_score: float = Field(
         ..., ge=0.0, le=1.0, description="Inter-frame motion quality score"
     )
+    # P1 Pipeline A: True when the per-frame quality gate rejected this
+    # sample. Downstream consumers (rPPG window, kinematics) MUST treat
+    # the frame as untrusted — append a NaN sentinel to keep window
+    # length stable instead of polluting the signal with garbage.
+    low_quality: bool = Field(
+        False,
+        description=(
+            "Frame failed the per-frame quality gate. Consumers should "
+            "skip the RGB sample or insert a NaN sentinel rather than "
+            "appending the actual pixels."
+        ),
+    )
 
 
 class PhysioFeatures(BaseModel):
@@ -226,6 +238,23 @@ class FeatureVector(BaseModel):
     )
     thrashing_score: float = Field(
         0.0, ge=0.0, le=1.0, description="Focus thrashing score from transition graph"
+    )
+    physio_missing: bool = Field(
+        False,
+        description=(
+            "True when the physiological channel was unavailable or invalid "
+            "at fuse-time. Downstream gates (HYPER scoring) must defer "
+            "triggering when this flag is True."
+        ),
+    )
+    telemetry_seen_count: int = Field(
+        0,
+        ge=0,
+        description=(
+            "Number of telemetry samples seen so far in this session. "
+            "HYPO scoring contributions from telemetry only count after "
+            "5+ samples (warm-up gate)."
+        ),
     )
 
     def to_array(self) -> list[float | None]:

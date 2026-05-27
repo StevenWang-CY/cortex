@@ -119,12 +119,14 @@ class TestStressIntegralWarning:
     def test_warning_at_80_percent(self):
         from cortex.services.state_engine.stress_integral import StressIntegralTracker
 
-        # hrv_sigma=1.0 preserves raw-ms integration so 1ms*s/sample arithmetic holds.
-        tracker = StressIntegralTracker(hrv_baseline=50.0, hrv_sigma=1.0, threshold=100.0)
+        # P1 Pipeline F: sigma floor is now 5 ms. With suppression=5 ms and
+        # sigma=5 the integrand is 1.0/s, so 81 samples still reach 80% of a
+        # threshold of 100 (~80 ms*s of standardized deficit).
+        tracker = StressIntegralTracker(hrv_baseline=50.0, hrv_sigma=5.0, threshold=100.0)
 
-        # Push to 80% (suppression=1ms/s, need 81 samples for 80ms integral)
+        # Push to 80%: 5 ms suppression / sigma=5 = 1.0/s, ~81 samples → 80.
         for i in range(82):
-            tracker.update(hrv_rmssd=49.0, timestamp=float(i))
+            tracker.update(hrv_rmssd=45.0, timestamp=float(i))
 
         assert tracker.should_warn() is True
         assert tracker.should_break() is False
@@ -132,7 +134,7 @@ class TestStressIntegralWarning:
     def test_no_warning_below_80(self):
         from cortex.services.state_engine.stress_integral import StressIntegralTracker
 
-        tracker = StressIntegralTracker(hrv_baseline=50.0, hrv_sigma=1.0, threshold=1000.0)
+        tracker = StressIntegralTracker(hrv_baseline=50.0, hrv_sigma=5.0, threshold=1000.0)
         tracker.update(hrv_rmssd=49.0, timestamp=0.0)
         tracker.update(hrv_rmssd=49.0, timestamp=1.0)
 
@@ -141,9 +143,9 @@ class TestStressIntegralWarning:
     def test_warning_fires_only_once(self):
         from cortex.services.state_engine.stress_integral import StressIntegralTracker
 
-        tracker = StressIntegralTracker(hrv_baseline=50.0, hrv_sigma=1.0, threshold=100.0)
+        tracker = StressIntegralTracker(hrv_baseline=50.0, hrv_sigma=5.0, threshold=100.0)
         for i in range(82):
-            tracker.update(hrv_rmssd=49.0, timestamp=float(i))
+            tracker.update(hrv_rmssd=45.0, timestamp=float(i))
 
         assert tracker.should_warn() is True
         assert tracker.should_warn() is False  # Second call returns False
@@ -151,15 +153,15 @@ class TestStressIntegralWarning:
     def test_reset_clears_warning(self):
         from cortex.services.state_engine.stress_integral import StressIntegralTracker
 
-        tracker = StressIntegralTracker(hrv_baseline=50.0, hrv_sigma=1.0, threshold=100.0)
+        tracker = StressIntegralTracker(hrv_baseline=50.0, hrv_sigma=5.0, threshold=100.0)
         for i in range(82):
-            tracker.update(hrv_rmssd=49.0, timestamp=float(i))
+            tracker.update(hrv_rmssd=45.0, timestamp=float(i))
         tracker.should_warn()
         tracker.reset()
 
         # After reset, warning should fire again when threshold approached
         for i in range(82):
-            tracker.update(hrv_rmssd=49.0, timestamp=float(100 + i))
+            tracker.update(hrv_rmssd=45.0, timestamp=float(200 + i))
         assert tracker.should_warn() is True
 
 

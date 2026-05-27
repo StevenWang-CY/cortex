@@ -20,12 +20,9 @@ reader code path as the daemon) and point the aggregator at
 
 from __future__ import annotations
 
-import json
-import os
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 

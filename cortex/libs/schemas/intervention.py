@@ -12,7 +12,7 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # F10: only these URL schemes may appear in an ``open_url`` action target.
 # Excludes ``javascript:``, ``data:``, ``chrome:``, ``file:``, ``vbscript:``
@@ -615,6 +615,50 @@ class DismissalRecord(BaseModel):
     def age_seconds(self) -> float:
         """Get age of dismissal in seconds."""
         return (datetime.now() - self.timestamp).total_seconds()
+
+
+class InterventionApplied(BaseModel):
+    """P0 audit / Phase-4a: client → daemon ack of an intervention apply.
+
+    Wire shape of the ``INTERVENTION_APPLIED`` WS message payload that
+    the browser extension (and any other surface that mutates the
+    workspace on behalf of the daemon) sends back so the executor can
+    overwrite the optimistic ``Mutation.success`` with the real outcome.
+
+    See ``cortex.services.api_gateway.websocket_server._handle_intervention_applied``
+    for the dispatch arm that consumes this; the daemon ``_intervention_applied_callback``
+    is the runtime handler.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    intervention_id: str = Field(
+        ..., description="Intervention this ack belongs to"
+    )
+    phase: Literal["apply", "restore"] = Field(
+        "apply",
+        description="Lifecycle phase being acked",
+    )
+    success: bool = Field(
+        ...,
+        description="True iff every requested mutation succeeded on this client",
+    )
+    applied_actions: list[str] = Field(
+        default_factory=list,
+        description="action_ids the client successfully applied",
+    )
+    errors: list[str] = Field(
+        default_factory=list,
+        description="Per-action error strings reported by the client",
+    )
+    source_client_type: str | None = Field(
+        None,
+        description=(
+            "Set by the server-side dispatcher (never trusted from the "
+            "wire) so the daemon can attribute the ack to the actual "
+            "client_type that produced it."
+        ),
+    )
 
 
 class InterventionApplyResult(BaseModel):

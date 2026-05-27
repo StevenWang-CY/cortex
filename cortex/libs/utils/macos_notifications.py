@@ -46,8 +46,8 @@ import logging
 import sys
 import threading
 import time
-from functools import lru_cache
-from typing import Callable
+from collections.abc import Callable
+from functools import cache, lru_cache
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ def _is_macos() -> bool:
     return sys.platform == "darwin"
 
 
-@lru_cache(maxsize=None)
+@cache
 def _log_unsupported_once(reason: str) -> None:
     """Log each distinct ``reason`` exactly once. ``maxsize=None`` (vs
     the previous ``maxsize=1`` which evicted between reasons) so two
@@ -165,7 +165,6 @@ def _build_delegate(un):  # type: ignore[no-untyped-def]
     if _delegate_instance is not None:
         return _delegate_instance
     try:
-        import objc  # type: ignore[import-not-found]
         from Foundation import NSObject  # type: ignore[import-not-found]
 
         class _CortexNotificationDelegate(NSObject):  # type: ignore[misc]

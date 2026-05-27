@@ -41,6 +41,18 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             this._currentState = payload;
             this._postStateToWebview();
         });
+
+        // P1 (audit Phase 4d, Task B): rerender the empty-state region
+        // when the connection flips between offline / online so the
+        // "Reconnect" button appears or disappears in real time. The
+        // full HTML rebuild here is acceptable because it only runs on
+        // connection transitions (rare), not on every STATE_UPDATE
+        // tick — the breathing-pacer animation is unaffected.
+        wsClient.onConnectionChange((_connected) => {
+            if (!this._currentPayload) {
+                this._updatePanel();
+            }
+        });
     }
 
     /**
@@ -184,6 +196,21 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                 this._wsClient.sendWhyDetailRequest(interventionId);
                 break;
             }
+
+            case "reconnect":
+                // P1 (audit Phase 4d, Task B): the webview's
+                // "Reconnect" button on the daemon-offline empty state
+                // tells the host to retry the WS handshake. We call
+                // ``connect()`` directly; the ws-client guards against
+                // double-connect when one is already in flight.
+                try {
+                    this._wsClient.connect();
+                } catch {
+                    // connect() is no-op on the happy path; the catch
+                    // is here only so a host-side throw never crashes
+                    // the message-pump.
+                }
+                break;
 
             case "microStepToggled": {
                 // P0 §3.6: forward the webview's micro-step toggle to
@@ -548,6 +575,31 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             color: var(--cx-text-secondary);
         }
 
+        /* P1 (audit Phase 4d, Task B): explicit empty-state for the
+           daemon-offline case so the user can tell "no overwhelm yet"
+           apart from "client can't reach the daemon". */
+        .daemon-offline {
+            text-align: center;
+            padding: 20px 12px;
+            color: var(--cx-text-secondary);
+            font-size: var(--fs-caption);
+        }
+
+        .daemon-offline button {
+            display: inline-block;
+            margin-left: 6px;
+            padding: 4px 12px;
+            border-radius: 5px;
+            background: var(--cx-accent);
+            color: white;
+            border: none;
+            cursor: pointer;
+            font-size: var(--fs-caption);
+            font-weight: 600;
+        }
+
+        .daemon-offline button:hover { filter: brightness(1.08); }
+
         /* P0 §3.7: BREAK_RECOMMENDATION pill */
         .break-rec {
             display: flex;
@@ -651,7 +703,9 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
         <span class="state-conf" id="cx-state-conf">${confPct}%</span>
     </div>
 
-    ${interventionHtml || '<div class="no-intervention">No active intervention</div>'}
+    ${interventionHtml || (this._wsClient.isConnected
+        ? '<div class="no-intervention">No active intervention</div>'
+        : '<div class="daemon-offline">Cortex daemon offline. <button id="reconnect-btn" type="button">Reconnect</button></div>')}
 
     <script>
         const vscode = acquireVsCodeApi();
@@ -680,6 +734,18 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
         if (dismissBtn) {
             dismissBtn.addEventListener('click', () => {
                 vscode.postMessage({ command: 'dismiss' });
+            });
+        }
+
+        // P1 (audit Phase 4d, Task B): reconnect button on the
+        // daemon-offline empty state. Asks the host to call
+        // ``CortexWSClient.connect()`` via a dedicated command rather
+        // than via the activity-bar palette command, so the panel can
+        // recover without leaving the webview.
+        const reconnectBtn = document.getElementById('reconnect-btn');
+        if (reconnectBtn) {
+            reconnectBtn.addEventListener('click', () => {
+                vscode.postMessage({ command: 'reconnect' });
             });
         }
 

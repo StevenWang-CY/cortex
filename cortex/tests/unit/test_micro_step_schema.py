@@ -13,6 +13,8 @@ length cap).
 
 from __future__ import annotations
 
+from datetime import UTC
+
 import pytest
 from pydantic import ValidationError
 
@@ -116,10 +118,10 @@ def test_done_status_preserves_timestamps() -> None:
     """Explicit ``started_at`` / ``completed_at`` values pass through
     untouched — they are the daemon's lifecycle stamps and must not be
     silently dropped."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    started = datetime(2026, 5, 25, 10, 0, tzinfo=timezone.utc)
-    completed = datetime(2026, 5, 25, 10, 5, tzinfo=timezone.utc)
+    started = datetime(2026, 5, 25, 10, 0, tzinfo=UTC)
+    completed = datetime(2026, 5, 25, 10, 5, tzinfo=UTC)
     plan = _build_plan([
         {
             "text": "a",

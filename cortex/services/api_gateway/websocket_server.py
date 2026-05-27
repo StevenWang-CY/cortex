@@ -86,6 +86,13 @@ class WebSocketClient:
     ``EventType.AUTH_REJECTED``. Setting the flag is intentionally
     one-way per connection — there is no way for a peer to demote
     itself back to ``pending_auth`` mid-session.
+
+    Phase-4b TASK I: ``coalesce_queue`` + ``coalesce_task`` implement
+    newest-wins per-client coalescing for the high-frequency broadcast
+    types (STATE_UPDATE, PHYSIO_DATA, KINEMATICS_UPDATE,
+    TELEMETRY_UPDATE). A slow client cannot accumulate a backlog — the
+    queue is capped at depth=1 and the producer drops the old frame
+    before inserting the new one.
     """
 
     client_id: str
@@ -94,6 +101,8 @@ class WebSocketClient:
     client_type: str = "unknown"  # "vscode", "chrome", "desktop", "unknown"
     last_message_at: float = 0.0
     authenticated: bool = False
+    coalesce_queue: Any | None = None  # asyncio.Queue[str] | None
+    coalesce_task: Any | None = None  # asyncio.Task | None
 
 
 # ─── WSMessage: Pydantic source of truth (Debt-1 closure, Commit 2) ───
@@ -448,16 +457,41 @@ class WebSocketServer:
         """
         Start the WebSocket server.
 
+        Phase-4b TASK J: pin an explicit ``process_request`` Origin
+        allowlist so a malicious page on http://localhost can't open a
+        cross-origin WebSocket to the daemon. The capability-token AUTH
+        handshake remains the primary defense; the Origin filter is
+        defense-in-depth so a browser that auto-sends ``Origin`` for an
+        attacker page is rejected at the TCP layer before the token
+        gate even sees the connection.
+
         Returns:
             True if started successfully, False on error.
         """
         try:
+            import re
+
             import websockets
 
+            # Phase-4b TASK J: pass a regex-based origins allowlist when
+            # supported (websockets >= 14 accepts ``re.Pattern`` entries
+            # in the ``origins`` sequence). Older versions silently
+            # ignore unknown kwargs via ``**kwargs`` so this stays
+            # forward-compatible. ``None`` in the sequence accepts a
+            # request that omits the Origin header entirely (native
+            # clients such as the desktop shell).
+            origin_allowlist = [
+                None,
+                re.compile(r"^chrome-extension://.*$"),
+                re.compile(r"^moz-extension://.*$"),
+                re.compile(r"^vscode-webview://.*$"),
+            ]
             self._server = await websockets.serve(
                 self._handle_client,
                 self._config.host,
                 self._config.ws_port,
+                origins=origin_allowlist,
+                process_request=self._origin_gate,
             )
             self._running = True
             logger.info(
@@ -472,12 +506,83 @@ class WebSocketServer:
             logger.error("websockets package not installed")
             return False
 
+    @staticmethod
+    def _is_allowed_origin(origin: str | None) -> bool:
+        """Phase-4b TASK J: accept only the Origin headers Cortex
+        legitimately serves: extension origins, vscode-webview, and
+        clients that send no Origin (Python ``websockets`` clients,
+        the desktop shell). Reject everything else."""
+        if origin is None:
+            # Native clients (desktop shell, python websockets) do not
+            # set Origin. Accept; the AUTH token gate covers them.
+            return True
+        if origin.startswith("chrome-extension://"):
+            return True
+        if origin.startswith("moz-extension://"):
+            return True
+        if origin.startswith("vscode-webview://"):
+            return True
+        return False
+
+    async def _origin_gate(
+        self, connection: Any, request: Any,
+    ) -> Any:
+        """Phase-4b TASK J: ``process_request`` hook for ``websockets``.
+
+        Reject the upgrade with a 403 if the Origin header is not in
+        our allowlist. Returning ``None`` lets the upgrade proceed.
+        The websockets library signature differs between major
+        versions; we duck-type the Origin header extraction so both
+        old (``request.headers.get``) and new (``request.headers["Origin"]``)
+        shapes are tolerated.
+        """
+        try:
+            headers = getattr(request, "headers", None) or {}
+            origin: str | None
+            if hasattr(headers, "get"):
+                origin = headers.get("Origin") or headers.get("origin")
+            else:
+                origin = None
+        except Exception:
+            origin = None
+        if self._is_allowed_origin(origin):
+            return None
+        logger.warning(
+            "Rejecting WS upgrade: disallowed Origin=%r", origin,
+        )
+        # Try the new-style websockets API first, falling back to a
+        # best-effort plain response builder.
+        try:
+            import http
+
+            from websockets.http11 import Response  # type: ignore
+
+            return Response(
+                http.HTTPStatus.FORBIDDEN,
+                "Forbidden",
+                [],
+                b"",
+            )
+        except Exception:
+            # Old websockets API returns (status, headers, body) tuple.
+            return (403, [], b"")
+
     async def stop(self) -> None:
         """Stop the WebSocket server and disconnect all clients."""
         self._running = False
 
         # Close all client connections
         for client in list(self._clients.values()):
+            # Phase-4b TASK I: cancel the per-client coalesce drain task
+            # so it doesn't survive the WS teardown waiting on a queue
+            # that will never receive another frame.
+            if client.coalesce_task is not None:
+                try:
+                    client.coalesce_task.cancel()
+                except Exception:
+                    pass
+                client.coalesce_task = None
+            client.coalesce_queue = None
             try:
                 await client.websocket.close()
             except Exception:
@@ -516,6 +621,20 @@ class WebSocketServer:
             logger.debug(f"Client {client_id} disconnected: {e}")
         finally:
             self._clients.pop(client_id, None)
+            # Phase-4b TASK I: dispose of the per-client coalesce queue
+            # + drain task so a dropped client doesn't leak a Task
+            # awaiting forever on a queue nobody will fill.
+            if client.coalesce_task is not None:
+                try:
+                    client.coalesce_task.cancel()
+                except Exception:
+                    logger.debug(
+                        "coalesce task cancel failed for %s",
+                        client.client_id,
+                        exc_info=True,
+                    )
+            client.coalesce_queue = None
+            client.coalesce_task = None
             # F23: cancel any in-flight context-request futures associated
             # with this client so the calling coroutine returns promptly
             # rather than waiting for the per-call timeout.
@@ -725,6 +844,25 @@ class WebSocketServer:
             # truth in the helpfulness log can attribute "overlay
             # snooze click" vs. "dashboard menu pick" later.
             await self._handle_snooze_request(client, msg)
+        elif msg.type == MessageType.COST_REQUEST.value:
+            # P0 §3.15: client (desktop shell on a ~10 s poll) asked
+            # for a snapshot of today's LLM spend.
+            await self._handle_cost_request(client, msg)
+        elif msg.type == MessageType.TEST_PROVIDER.value:
+            # P0 §3.19: client asked the daemon to probe a specific LLM
+            # provider and return latency / error.
+            await self._handle_test_provider(client, msg)
+        elif msg.type == MessageType.GOAL_SET.value:
+            # P0 §3.13: client announced the user-provided session goal.
+            await self._handle_goal_set(client, msg)
+        elif msg.type == MessageType.FORCE_RECAP.value:
+            # P0 §3.21: developer-keyboard-shortcut request to emit a
+            # SESSION_RECAP for the in-progress session.
+            await self._handle_force_recap(client, msg)
+        elif msg.type == MessageType.DISMISS_OVERLAY.value:
+            # P0 §3.21: developer-keyboard-shortcut request to dismiss
+            # the active overlay across every surface.
+            await self._handle_dismiss_overlay(client, msg)
         else:
             logger.debug(f"Unknown message type from {client.client_id}: {msg.type}")
 
@@ -1520,6 +1658,131 @@ class WebSocketServer:
                 exc,
             )
 
+    def _resolve_daemon(self) -> Any:
+        """Resolve the daemon via the service registry.
+
+        Returns ``None`` when the daemon hasn't registered itself yet
+        (e.g. early in startup or in unit tests that construct the WS
+        server in isolation). Handlers MUST tolerate this so a missing
+        daemon never closes the socket on the peer.
+        """
+        try:
+            from cortex.services.api_gateway.app import registry as _registry
+            return _registry.get("daemon")
+        except Exception:
+            return None
+
+    async def _handle_cost_request(
+        self, client: WebSocketClient, msg: WSMessage,
+    ) -> None:
+        """P0 §3.15: send the current LLM cost snapshot to ``client`` only.
+
+        Broadcasting would leak per-client UI state. A missing daemon
+        (early startup) is logged at debug level and silently dropped.
+        """
+        daemon = self._resolve_daemon()
+        if daemon is None or not hasattr(daemon, "get_cost_response"):
+            logger.debug("COST_REQUEST received but no daemon; dropping")
+            return
+        try:
+            payload = await daemon.get_cost_response()
+            await self._send_to(
+                client,
+                MessageType.COST_RESPONSE.value,
+                payload.model_dump(mode="json"),
+            )
+        except Exception:
+            logger.exception("COST_REQUEST handling failed")
+
+    async def _handle_test_provider(
+        self, client: WebSocketClient, msg: WSMessage,
+    ) -> None:
+        """P0 §3.19: forward to ``daemon.test_provider`` and reply on the
+        same client connection.
+        """
+        daemon = self._resolve_daemon()
+        if daemon is None or not hasattr(daemon, "test_provider"):
+            logger.debug("TEST_PROVIDER received but no daemon; dropping")
+            return
+        provider = str((msg.payload or {}).get("provider") or "").strip()
+        try:
+            result = await daemon.test_provider(provider)
+            await self._send_to(
+                client,
+                MessageType.TEST_PROVIDER_RESULT.value,
+                result.model_dump(mode="json"),
+            )
+        except Exception:
+            logger.exception("TEST_PROVIDER handling failed")
+
+    async def _handle_goal_set(
+        self, client: WebSocketClient, msg: WSMessage,
+    ) -> None:
+        """P0 §3.13: forward the user-supplied session goal to the daemon."""
+        daemon = self._resolve_daemon()
+        if daemon is None or not hasattr(daemon, "set_active_goal"):
+            logger.debug("GOAL_SET received but no daemon; dropping")
+            return
+        title = str((msg.payload or {}).get("title") or "").strip()
+        try:
+            await daemon.set_active_goal(title)
+        except Exception:
+            logger.exception("GOAL_SET handling failed")
+
+    async def _handle_force_recap(
+        self, client: WebSocketClient, msg: WSMessage,
+    ) -> None:
+        """P0 §3.21: invoke ``daemon.force_recap``."""
+        daemon = self._resolve_daemon()
+        if daemon is None or not hasattr(daemon, "force_recap"):
+            logger.debug("FORCE_RECAP received but no daemon; dropping")
+            return
+        try:
+            await daemon.force_recap()
+        except Exception:
+            logger.exception("FORCE_RECAP handling failed")
+
+    async def _handle_dismiss_overlay(
+        self, client: WebSocketClient, msg: WSMessage,
+    ) -> None:
+        """P0 §3.21: invoke ``daemon.dismiss_active_overlay``."""
+        daemon = self._resolve_daemon()
+        if daemon is None or not hasattr(daemon, "dismiss_active_overlay"):
+            logger.debug("DISMISS_OVERLAY received but no daemon; dropping")
+            return
+        try:
+            await daemon.dismiss_active_overlay()
+        except Exception:
+            logger.exception("DISMISS_OVERLAY handling failed")
+
+    async def _send_to(
+        self,
+        client: WebSocketClient,
+        message_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Send a single typed frame to a single client.
+
+        Used by ``COST_REQUEST`` / ``TEST_PROVIDER`` handlers because the
+        reply must be unicast (broadcast would leak per-client UI state).
+        """
+        self._sequence += 1
+        message = WSMessage(
+            type=message_type,
+            payload=payload,
+            sequence=self._sequence,
+            source_client_type="daemon",
+        )
+        try:
+            await client.websocket.send(message.to_json())
+        except Exception:
+            logger.debug(
+                "unicast send %s → %s failed",
+                message_type,
+                client.client_id,
+                exc_info=True,
+            )
+
     async def broadcast_state(
         self,
         estimate: StateEstimate,
@@ -1699,6 +1962,93 @@ class WebSocketServer:
             )
         return cancelled
 
+    # Phase-4b TASK I: WS broadcast types eligible for per-client
+    # newest-wins coalescing. Adding a type here means a slow client
+    # cannot accumulate a backlog of these messages — the queue depth
+    # is 1, and a fresh frame evicts any pending older frame. Outbound
+    # request-response and INTERVENTION_* paths bypass this queue and
+    # go through the direct-send path because their semantics require
+    # in-order delivery of every frame.
+    _COALESCE_ELIGIBLE: frozenset[str] = frozenset({
+        MessageType.STATE_UPDATE.value,
+        MessageType.AMBIENT_STATE_UPDATE.value,
+    })
+
+    async def _ensure_coalesce_loop(self, client: WebSocketClient) -> None:
+        """Phase-4b TASK I: lazily create the per-client coalesce queue +
+        consumer task. Idempotent — repeated calls are no-ops once the
+        task is running.
+        """
+        if client.coalesce_queue is not None and client.coalesce_task is not None:
+            return
+        client.coalesce_queue = asyncio.Queue(maxsize=1)
+        client.coalesce_task = asyncio.create_task(
+            self._drain_coalesce_queue(client),
+            name=f"ws-coalesce-{client.client_id}",
+        )
+
+    async def _drain_coalesce_queue(self, client: WebSocketClient) -> None:
+        """Phase-4b TASK I: per-client send loop. Awaits the next
+        coalesced frame and writes it. A send error / timeout closes
+        the socket with the F22 ``slow consumer`` reason and removes
+        the client from the registry so the disconnect contract is
+        preserved across coalesce-eligible broadcasts.
+        """
+        queue = client.coalesce_queue
+        if queue is None:
+            return
+        try:
+            while True:
+                frame = await queue.get()
+                reason: str | None = None
+                try:
+                    await asyncio.wait_for(
+                        client.websocket.send(frame),
+                        timeout=self._BROADCAST_PER_CLIENT_TIMEOUT_S,
+                    )
+                except TimeoutError:
+                    reason = "slow consumer"
+                except Exception:
+                    reason = "send error"
+                if reason is not None:
+                    logger.debug(
+                        "coalesce send failed for %s: %s",
+                        client.client_id, reason,
+                    )
+                    # Mirror the F22 contract on the direct-send path:
+                    # explicit close + remove + structured disconnect.
+                    self._clients.pop(client.client_id, None)
+                    await self._close_slow_consumer(client, reason)
+                    return
+        except asyncio.CancelledError:
+            return
+
+    def _coalesce_put_nowait(
+        self, client: WebSocketClient, frame: str,
+    ) -> bool:
+        """Phase-4b TASK I: newest-wins put on the per-client queue.
+
+        Returns True if the frame was queued (with or without evicting
+        an older frame), False if no queue exists for the client.
+        """
+        queue = client.coalesce_queue
+        if queue is None:
+            return False
+        try:
+            queue.put_nowait(frame)
+            return True
+        except asyncio.QueueFull:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                queue.put_nowait(frame)
+                return True
+            except asyncio.QueueFull:
+                # Producer raced with consumer; treat as dropped.
+                return False
+
     # audit Phase-I: per-send timeout (s) and total broadcast budget (s).
     # The per-send timeout is bumped from 1 s → 2 s so a transient
     # network blip on one client does not get classified as a dead
@@ -1757,6 +2107,20 @@ class WebSocketServer:
         ]
         if not targets:
             return 0
+
+        # Phase-4b TASK I: route coalesce-eligible high-frequency
+        # broadcasts (STATE_UPDATE, AMBIENT_STATE_UPDATE) through the
+        # per-client newest-wins queue. Slow clients only ever see the
+        # latest frame — a backlog cannot build up. INTERVENTION_*,
+        # response frames, and any request-response messages bypass
+        # this path because they require in-order delivery.
+        if msg.type in self._COALESCE_ELIGIBLE:
+            queued = 0
+            for _cid, client in targets:
+                await self._ensure_coalesce_loop(client)
+                if self._coalesce_put_nowait(client, payload):
+                    queued += 1
+            return queued
 
         async def _send_one(client: WebSocketClient) -> str | None:
             """Return ``None`` on success or a disconnect reason string."""

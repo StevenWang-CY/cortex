@@ -121,12 +121,18 @@ class SessionListResponse(BaseModel):
         ge=0,
         description="Total number of session files the daemon currently knows about (for the 'Sessions · last N' header).",
     )
-    error: str | None = Field(
+    error: Literal[
+        "internal",
+        "daemon_unavailable",
+        "no_cache",
+        "invalid_request",
+        "handler_not_registered",
+    ] | None = Field(
         None,
         description=(
             "Set when the daemon cannot fulfil the request. Known values: "
             "'internal' | 'daemon_unavailable' | 'no_cache' | "
-            "'invalid_request' | None (success)."
+            "'invalid_request' | 'handler_not_registered' | None (success)."
         ),
     )
 
@@ -146,6 +152,7 @@ class SessionDetailResponse(BaseModel):
         "invalid_id",
         "internal",
         "daemon_unavailable",
+        "handler_not_registered",
     ] | None = Field(
         None,
         description=(
@@ -153,7 +160,8 @@ class SessionDetailResponse(BaseModel):
             "session_id on disk; 'unreadable' = file present but JSON "
             "malformed; 'invalid_id' = id failed the safe-char regex; "
             "'internal' = callback raised; 'daemon_unavailable' = no "
-            "daemon registered."
+            "daemon registered; 'handler_not_registered' = the daemon "
+            "has not wired a session-detail callback yet (cold-start race)."
         ),
     )
 
@@ -216,12 +224,18 @@ class TrendsResponse(BaseModel):
         None,
         description="When the cached aggregator last ran (mirrors chronotype.last_updated for convenience).",
     )
-    error: str | None = Field(
+    error: Literal[
+        "internal",
+        "daemon_unavailable",
+        "no_cache",
+        "invalid_window",
+        "handler_not_registered",
+    ] | None = Field(
         None,
         description=(
             "Set when the daemon cannot fulfil the request. Known values: "
             "'internal' | 'daemon_unavailable' | 'no_cache' | "
-            "'invalid_window' | None (success)."
+            "'invalid_window' | 'handler_not_registered' | None (success)."
         ),
     )
 

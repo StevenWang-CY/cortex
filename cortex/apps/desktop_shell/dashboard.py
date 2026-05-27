@@ -67,6 +67,9 @@ except ImportError:  # pragma: no cover - compatibility for lightweight test moc
 try:
     from PySide6.QtWidgets import (
         QButtonGroup,
+        QComboBox,
+        QDialog,
+        QFileDialog,
         QFrame,
         QGridLayout,
         QHBoxLayout,
@@ -92,6 +95,74 @@ except ImportError:  # pragma: no cover - compatibility for lightweight test moc
         QVBoxLayout,
         QWidget,
     )
+
+    class QComboBox(QWidget):  # type: ignore[override]
+        """Lightweight stub for unit-test harnesses."""
+
+        def __init__(self, *_a: object, **_kw: object) -> None:
+            super().__init__()
+            self._items: list[tuple[str, object]] = []
+            self._current = 0
+
+        def addItem(self, label: str, data: object = None) -> None:
+            self._items.append((str(label), data))
+
+        def clear(self) -> None:
+            self._items.clear()
+            self._current = 0
+
+        def count(self) -> int:
+            return len(self._items)
+
+        def itemText(self, idx: int) -> str:
+            return self._items[idx][0] if 0 <= idx < len(self._items) else ""
+
+        def itemData(self, idx: int) -> object:
+            return self._items[idx][1] if 0 <= idx < len(self._items) else None
+
+        def setCurrentIndex(self, idx: int) -> None:
+            self._current = max(0, min(idx, len(self._items) - 1))
+
+        def setVisible(self, visible: bool) -> None:
+            pass
+
+        def setEditable(self, editable: bool) -> None:
+            pass
+
+        def setFont(self, *_a: object, **_kw: object) -> None:
+            pass
+
+        def setMinimumHeight(self, *_a: object) -> None:
+            pass
+
+        def setStyleSheet(self, *_a: object) -> None:
+            pass
+
+        @property
+        def activated(self) -> object:
+            class _S:
+                def connect(self, *_a: object, **_kw: object) -> None:
+                    pass
+
+            return _S()
+
+    class QDialog(QWidget):  # type: ignore[override]
+        """Lightweight QDialog stub for unit tests."""
+
+        def __init__(self, *_a: object, **_kw: object) -> None:
+            super().__init__()
+
+        def exec(self) -> int:
+            return 0
+
+    class QFileDialog(QWidget):  # type: ignore[override]
+        """Lightweight QFileDialog stub for unit tests."""
+
+        @staticmethod
+        def getSaveFileName(
+            *_a: object, **_kw: object
+        ) -> tuple[str, str]:
+            return ("", "")
 
     class QMenu(QWidget):  # type: ignore[override]
         """Lightweight stub: tests don't exercise the menu surface."""
@@ -155,6 +226,7 @@ from cortex.apps.desktop_shell.tokens import (
     BIO_HR,
     BIO_HRV,
     BRAND_ACCENT,
+    BRAND_ACCENT_DARK,
     BRAND_DISPLAY_FONT,
     CX_TEXT_SECONDARY,
     CX_TEXT_TERTIARY,
@@ -183,11 +255,54 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# P0 §3.17 — Concepts glossary shared between tooltips + Help → Concepts.
+# ---------------------------------------------------------------------------
+#
+# Single source of truth for the help copy on every quantitative widget in
+# the dashboard. Adding a new term here automatically makes it available to
+# the ``ConceptsDialog`` below; the dashboard's individual setToolTip(...)
+# calls reach in by key.
+_CONCEPTS_GLOSSARY: dict[str, str] = {
+    "state": (
+        "Cognitive state: Cortex infers FLOW (deep focus), HYPER (overwhelmed), "
+        "HYPO (idle), or RECOVERY (winding back to focus) from biometrics + "
+        "activity. The pill turns warmer when sustained HYPER is detected."
+    ),
+    "flow": "FLOW: sustained deep focus — your nervous system is regulated and engaged.",
+    "hyper": "HYPER: elevated arousal — heart rate up, attention scattered. Cortex offers a calming intervention.",
+    "hypo": "HYPO: low arousal — long pauses, low engagement. Cortex offers a re-engagement nudge.",
+    "recovery": "RECOVERY: post-HYPER cool-down — Cortex eases interventions while your nervous system settles.",
+    "hr": "BPM (Heart rate): beats per minute, inferred from your face using rPPG. Not medical-grade.",
+    "hrv": (
+        "HRV (Heart Rate Variability): variation between heartbeats. Higher HRV "
+        "correlates with a calmer, more adaptive nervous system."
+    ),
+    "perclos": (
+        "PERCLOS: percentage of eyelid closure, averaged over a minute. "
+        "A proxy for drowsiness / cognitive fatigue."
+    ),
+    "blink": "Blink rate: blinks per minute. Elevated rates can flag screen fatigue.",
+    "sqi": (
+        "SQI (Signal Quality Index): how confident Cortex is in its biometric "
+        "readout. Drops when lighting, motion, or face position degrade the signal."
+    ),
+    "stress_integral": (
+        "Stress integral: a running area-under-curve of elevated arousal. When it "
+        "crosses a threshold, Cortex suggests a paced break."
+    ),
+    "calibration": (
+        "Calibration: a 2-minute capture that locks in your resting baselines so "
+        "Cortex can detect *your* shift, not the population average."
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
 # P0 §3.4 — Baseline freshness helpers (shared with the Settings dialog).
 # ---------------------------------------------------------------------------
 
 
-def _baseline_default_path() -> "object":
+def _baseline_default_path() -> object:
     """Resolve `storage/baselines/default.json` via the active config.
     Lazy-imported so the dashboard stays importable under test stubs."""
     from pathlib import Path
@@ -217,7 +332,7 @@ def _baseline_age_days(now: float | None = None) -> float | None:
 # ---------------------------------------------------------------------------
 
 
-def _baseline_default_path() -> "object":
+def _baseline_default_path() -> object:
     """Resolve `storage/baselines/default.json` via the active config.
     Lazy-imported so the dashboard stays importable under test stubs."""
     from pathlib import Path
@@ -247,7 +362,7 @@ def _baseline_age_days(now: float | None = None) -> float | None:
 # ---------------------------------------------------------------------------
 
 
-def _baseline_default_path() -> "object":
+def _baseline_default_path() -> object:
     """Resolve `storage/baselines/default.json` via the active config.
     Lazy-imported so the dashboard stays importable under test stubs."""
     from pathlib import Path
@@ -503,10 +618,39 @@ class _ConsumerTab(QWidget):
     # P0 §3.10: bubble the "Turn off" auto-focus toast click up to the
     # DashboardWindow so the controller can call disarm_auto_focus.
     auto_focus_disarm_requested = Signal()
+    # P0 §3.7 desktop dispatch: bubble the "Take a break?" pill click
+    # up so the controller routes to the BiologyBreakOverlay. Payload
+    # is the BREAK_RECOMMENDATION dict the daemon broadcast (carries
+    # duration_seconds, breathing_pattern) so the overlay's args are
+    # available without a second WS round-trip.
+    break_pill_clicked = Signal(dict)
+    # P0 §3.21 global shortcuts: emitted on Cmd+Shift+R (force a session
+    # recap) and Cmd+Shift+D (dismiss the active intervention overlay).
+    # The controller forwards via WS / daemon.
+    force_recap_requested = Signal()
+    dismiss_overlay_requested = Signal()
+    # P0 §3.16: bubble the "Undo" toast click up so the controller
+    # forwards INTERVENTION_RESTORE to the daemon. Payload is the
+    # intervention_id of the action being undone.
+    undo_action_requested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setStyleSheet(f"background: transparent; color: {_LABEL};")
+        # P0 §3.7: cached BREAK_RECOMMENDATION payload so the click
+        # handler can carry it up to the controller. ``apply_break_recommendation``
+        # populates this; ``_clear_break_pill`` clears it.
+        self._break_recommendation_payload: dict = {}
+        self._break_pill_snooze_timer: QTimer | None = None
+        # P0 §3.16: ring buffer of recently-applied reversible
+        # intervention dispatches so the "Restore previous state" pill
+        # surfaces for ~5 min. Entries are
+        # (timestamp_monotonic, intervention_id, action_type, applied_count).
+        self._reversible_actions: list[tuple[float, str, str, int]] = []
+        self._reversible_window_seconds: int = 300
+        # Undo toast widget — built lazily inside _show_undo_toast.
+        self._undo_toast: QWidget | None = None
+        self._undo_toast_timer: QTimer | None = None
 
         # F34: state machine for the Stop button. ``_stopping`` flips to True
         # on first click and back to False on ``notify_daemon_stopped`` (or
@@ -568,6 +712,14 @@ class _ConsumerTab(QWidget):
         self._state_label.setStyleSheet(
             f"color: {_LABEL_SECONDARY}; background: transparent;"
         )
+        # P0 §3.17: glossary tooltips on every quantitative chrome
+        # element. Help text taken verbatim from _CONCEPTS_GLOSSARY
+        # below so a single edit point keeps the in-app tooltip + the
+        # Concepts dialog in lockstep.
+        try:
+            self._state_label.setToolTip(_CONCEPTS_GLOSSARY["state"])
+        except Exception:
+            pass
         badge_layout.addWidget(self._state_label, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         self._state_badge.setStyleSheet(
@@ -639,6 +791,41 @@ class _ConsumerTab(QWidget):
         except Exception:
             logger.debug("QShortcut setup failed", exc_info=True)
 
+        # P0 §3.21 global shortcuts:
+        #   Cmd+Shift+P → toggle quiet capsule (pause/resume)
+        #   Cmd+Shift+R → request a manual session recap
+        #   Cmd+Shift+D → dismiss the active intervention overlay
+        # All three are application-scoped so the user can fire them
+        # while focused in another app (popup, settings dialog, etc.).
+        def _install_shortcut(seq: str, slot: object) -> None:
+            try:
+                sc = QShortcut(QKeySequence(seq), self)
+                try:
+                    sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
+                except Exception:
+                    pass
+                sc.activated.connect(slot)
+            except Exception:
+                logger.debug("QShortcut %s setup failed", seq, exc_info=True)
+
+        _install_shortcut(
+            "Ctrl+Shift+P",
+            lambda: self.quiet_mode_requested.emit(
+                "off" if self._quiet_mode_state.get("kind") not in ("off", None) else "pause",
+                0,
+            ),
+        )
+        _install_shortcut(
+            "Ctrl+Shift+R",
+            lambda: getattr(self, "force_recap_requested", None)
+            and self.force_recap_requested.emit(),
+        )
+        _install_shortcut(
+            "Ctrl+Shift+D",
+            lambda: getattr(self, "dismiss_overlay_requested", None)
+            and self.dismiss_overlay_requested.emit(),
+        )
+
         # P0 §3.10: auto-armed focus protection toast. Hidden by
         # default; revealed via :meth:`apply_quiet_mode_state` when
         # the daemon emits START_FOCUS_AUTO (or QUIET_MODE_STATE with
@@ -671,6 +858,74 @@ class _ConsumerTab(QWidget):
         )
         header.addWidget(
             self._focus_protection_pill,
+            alignment=Qt.AlignmentFlag.AlignVCenter,
+        )
+
+        # P0 §3.15: LLM cost meter pill. Subdued unless near budget. The
+        # daemon publishes the running daily total via a COST_RESPONSE
+        # WS message (Phase 4b owns the plumbing); the desktop polls
+        # COST_REQUEST every ~60 s and re-renders. Until Phase 4b lands
+        # the message handler, the pill falls back to "$—".
+        self._cost_pill = QLabel("$—")
+        self._cost_pill.setFont(
+            mac_native.system_font(FS_CAPTION, "medium"),
+        )
+        self._cost_pill.setObjectName("CortexCostPill")
+        self._cost_pill.setStyleSheet(
+            "QLabel#CortexCostPill {"
+            f"  color: {_LABEL_TERTIARY};"
+            f"  background: {_GROUPED_BG};"
+            f"  border-radius: {RADIUS_PILL}px;"
+            "  padding: 3px 10px;"
+            "  margin-left: 8px;"
+            "}"
+        )
+        try:
+            self._cost_pill.setToolTip(
+                "LLM spend today — click Settings → Budget to set a daily cap."
+            )
+        except Exception:
+            pass
+        header.addWidget(
+            self._cost_pill, alignment=Qt.AlignmentFlag.AlignVCenter,
+        )
+        # Cache the last applied cost so we don't restyle on every poll.
+        self._cost_last_value: float = -1.0
+        self._cost_budget_warned: bool = False
+
+        # P0 §3.7 desktop dispatch: "Take a break?" soft pill. Hidden by
+        # default; surfaced via :meth:`apply_break_recommendation` when
+        # the daemon emits BREAK_RECOMMENDATION (stress integral
+        # threshold reached). Click → emits ``break_pill_clicked`` which
+        # the controller routes to the BiologyBreakOverlay; right-click
+        # snoozes the pill for 5 minutes. The pill auto-clears after a
+        # break completes or 10 minutes of no engagement.
+        self._break_pill = QPushButton("Take a break?")
+        try:
+            self._break_pill.setCursor(Qt.CursorShape.PointingHandCursor)
+        except Exception:
+            pass
+        self._break_pill.setFont(
+            mac_native.system_font(FS_CAPTION, "medium"),
+        )
+        self._break_pill.setStyleSheet(
+            "QPushButton {"
+            f"  background: rgba(217, 119, 87, 0.18);"
+            f"  color: {BRAND_ACCENT};"
+            f"  border-radius: {RADIUS_PILL}px;"
+            "  padding: 3px 10px;"
+            "  margin-left: 8px;"
+            "  border: none;"
+            "}"
+            "QPushButton:hover { background: rgba(217,119,87,0.30); }"
+        )
+        self._break_pill.setVisible(False)
+        try:
+            self._break_pill.clicked.connect(self._on_break_pill_clicked)
+        except Exception:
+            logger.debug("break pill connect failed", exc_info=True)
+        header.addWidget(
+            self._break_pill,
             alignment=Qt.AlignmentFlag.AlignVCenter,
         )
 
@@ -744,7 +999,19 @@ class _ConsumerTab(QWidget):
 
         def _fire_goal_emit() -> None:
             self._goal_debounce_pending = False
-            self.goal_set.emit(self._goal_input.text().strip())
+            text = self._goal_input.text().strip()
+            self.goal_set.emit(text)
+            # P0 §3.13: persist the goal to the on-disk recent-goals
+            # store so the dropdown picks it up on next open. Failures
+            # are non-fatal — we never want a write error to swallow
+            # the daemon-bound goal_set emission.
+            if text:
+                try:
+                    from cortex.libs.store.goal_store import add_goal
+                    add_goal(text)
+                    self._refresh_recent_goals_dropdown()
+                except Exception:
+                    logger.debug("goal_store add_goal failed", exc_info=True)
 
         self._goal_input.returnPressed.connect(_schedule_goal_emit)
         # Expose the scheduler for tests so they can drive the coalescer
@@ -753,7 +1020,40 @@ class _ConsumerTab(QWidget):
         # ``QApplication.processEvents``).
         self._schedule_goal_emit = _schedule_goal_emit
         self._fire_goal_emit = _fire_goal_emit
+
+        # P0 §3.13: recent-goals dropdown above the input. Hidden when
+        # the store is empty (first-time users see a clean blank field);
+        # surfaces the most recent ~8 goals when populated.
+        self._recent_goals_combo = QComboBox()
+        try:
+            self._recent_goals_combo.setEditable(False)
+            self._recent_goals_combo.setFont(
+                mac_native.system_font(FS_FOOTNOTE, "regular")
+            )
+            self._recent_goals_combo.setMinimumHeight(28)
+            self._recent_goals_combo.setStyleSheet(
+                "QComboBox {"
+                "  padding: 2px 8px;"
+                f"  border: 0.5px solid {_SEPARATOR};"
+                "  border-radius: 6px;"
+                f"  color: {_LABEL_SECONDARY};"
+                f"  background: {_GROUPED_BG};"
+                "}"
+                f"QComboBox:focus {{ border: 1.5px solid {BRAND_ACCENT}; }}"
+            )
+            self._recent_goals_combo.activated.connect(
+                self._on_recent_goal_picked,
+            )
+        except Exception:
+            logger.debug("recent goals combo init failed", exc_info=True)
+        self._recent_goals_combo.setVisible(False)
+        root.addWidget(self._recent_goals_combo)
         root.addWidget(self._goal_input)
+        # Populate from disk on first paint (silently).
+        try:
+            self._refresh_recent_goals_dropdown()
+        except Exception:
+            logger.debug("initial recent goals refresh failed", exc_info=True)
         root.addSpacing(SP5)
 
         # ── Biometrics inset section (no shadow, hairline border) ──
@@ -818,11 +1118,14 @@ class _ConsumerTab(QWidget):
         self._hrv_label = QLabel("--")
         self._blk_label = QLabel("--")
 
-        for val_widget, title, color in [
-            (self._bpm_label, "BPM", BIO_HR),
-            (self._hrv_label, "HRV", BIO_HRV),
-            (self._blk_label, "BLK", BIO_BLINK),
-        ]:
+        # P0 §3.17: tooltip key per biometric channel so the dialog +
+        # the inline tooltips share a single source of truth.
+        bio_specs = [
+            (self._bpm_label, "BPM", BIO_HR, "hr"),
+            (self._hrv_label, "HRV", BIO_HRV, "hrv"),
+            (self._blk_label, "BLK", BIO_BLINK, "blink"),
+        ]
+        for val_widget, title, color, glossary_key in bio_specs:
             col = QVBoxLayout()
             col.setSpacing(2)
             col.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -837,6 +1140,12 @@ class _ConsumerTab(QWidget):
                 f"color: {_LABEL};"
                 f"background: transparent; border: none;"
             )
+            try:
+                tip = _CONCEPTS_GLOSSARY.get(glossary_key)
+                if tip:
+                    val_widget.setToolTip(tip)
+            except Exception:
+                pass
 
             heading = QLabel(title)
             heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -844,6 +1153,12 @@ class _ConsumerTab(QWidget):
             heading.setStyleSheet(
                 f"color: {color}; background: transparent; border: none;"
             )
+            try:
+                tip = _CONCEPTS_GLOSSARY.get(glossary_key)
+                if tip:
+                    heading.setToolTip(tip)
+            except Exception:
+                pass
             col.addWidget(val_widget)
             col.addWidget(heading)
             bio_row.addLayout(col, stretch=1)
@@ -1096,6 +1411,144 @@ class _ConsumerTab(QWidget):
         else:
             pill.setVisible(False)
 
+    # ── P0 §3.15: LLM cost meter ────────────────────────────────────
+
+    def apply_cost_update(
+        self,
+        cost_today: float,
+        budget: float = 0.0,
+    ) -> None:
+        """Render the cost pill from a COST_RESPONSE payload.
+
+        ``cost_today`` is the running daily spend in USD; ``budget`` is
+        the configured daily cap (0.0 = unlimited). At 80% of budget
+        we emit a one-shot toast so the user can pre-empt the
+        kill-switch. The pill is subdued (tertiary label) until 50% of
+        budget then warms up to the accent so the user notices.
+        """
+        try:
+            cost = max(0.0, float(cost_today))
+        except (TypeError, ValueError):
+            cost = 0.0
+        try:
+            cap = max(0.0, float(budget))
+        except (TypeError, ValueError):
+            cap = 0.0
+
+        ratio = (cost / cap) if cap > 0 else 0.0
+        # Compose the visible string. Below $0.005 we show "$—" so the
+        # initial empty state doesn't lie ("$0.00 today" is misleading
+        # when the daemon hasn't reported any data yet).
+        text = "$—" if cost < 0.005 and self._cost_last_value < 0 else f"${cost:.2f}"
+        if cap > 0:
+            text = f"{text} / ${cap:.2f}"
+        if cost == self._cost_last_value:
+            return
+        self._cost_last_value = cost
+        try:
+            self._cost_pill.setText(text)
+            if ratio >= 0.80:
+                color = BRAND_ACCENT
+            elif ratio >= 0.50:
+                color = _LABEL_SECONDARY
+            else:
+                color = _LABEL_TERTIARY
+            self._cost_pill.setStyleSheet(
+                "QLabel#CortexCostPill {"
+                f"  color: {color};"
+                f"  background: {_GROUPED_BG};"
+                f"  border-radius: {RADIUS_PILL}px;"
+                "  padding: 3px 10px;"
+                "  margin-left: 8px;"
+                "}"
+            )
+        except Exception:
+            logger.debug("cost pill update failed", exc_info=True)
+        # One-shot 80% threshold toast.
+        if cap > 0 and ratio >= 0.80 and not self._cost_budget_warned:
+            self._cost_budget_warned = True
+            toast = getattr(self, "_toast", None)
+            if toast is not None:
+                try:
+                    toast.show_info(
+                        "Approaching daily LLM budget.",
+                        f"You've used ${cost:.2f} of your ${cap:.2f} cap today.",
+                    )
+                except Exception:
+                    logger.debug("toast budget warn failed", exc_info=True)
+
+    # ── P0 §3.13: recent goals dropdown ─────────────────────────────
+
+    def _refresh_recent_goals_dropdown(self) -> None:
+        """Re-populate the recent-goals combo from disk.
+
+        Idempotent — safe to call from the input return-pressed handler
+        (after each new goal is persisted) and from the constructor.
+        """
+        combo = getattr(self, "_recent_goals_combo", None)
+        if combo is None:
+            return
+        try:
+            from cortex.libs.store.goal_store import load_goals
+            goals = load_goals()
+        except Exception:
+            logger.debug("load_goals failed; hiding dropdown", exc_info=True)
+            try:
+                combo.setVisible(False)
+            except Exception:
+                pass
+            return
+        try:
+            combo.clear()
+        except Exception:
+            return
+        if not goals:
+            try:
+                combo.setVisible(False)
+            except Exception:
+                pass
+            return
+        try:
+            combo.addItem("Recent goals…", "")
+            for g in goals[:8]:
+                combo.addItem(g.title[:80], g.id)
+            combo.setCurrentIndex(0)
+            combo.setVisible(True)
+        except Exception:
+            logger.debug("recent goals populate failed", exc_info=True)
+
+    def _on_recent_goal_picked(self, index: int) -> None:
+        """User clicked a goal in the recent-goals dropdown — copy the
+        title into the QLineEdit and emit ``goal_set`` so the daemon
+        picks it up. Index 0 ("Recent goals…") is a no-op header.
+        """
+        if index <= 0:
+            return
+        combo = getattr(self, "_recent_goals_combo", None)
+        if combo is None:
+            return
+        try:
+            text = combo.itemText(index)
+            goal_id = combo.itemData(index) or ""
+        except Exception:
+            return
+        try:
+            self._goal_input.setText(text)
+        except Exception:
+            logger.debug("goal_input setText failed", exc_info=True)
+        # Mark the goal as used in the store (bumps last_used_at +
+        # sessions_count) so the dropdown is sorted correctly next open.
+        if goal_id:
+            try:
+                from cortex.libs.store.goal_store import mark_used
+                mark_used(str(goal_id))
+            except Exception:
+                logger.debug("mark_used failed", exc_info=True)
+        try:
+            self.goal_set.emit(text)
+        except Exception:
+            logger.debug("goal_set emit failed", exc_info=True)
+
     # ── P0 §3.11 / §3.10: quiet-mode + auto-focus surfaces ──────────
 
     def _on_quiet_capsule_clicked(self) -> None:
@@ -1216,6 +1669,291 @@ class _ConsumerTab(QWidget):
                 self._focus_protection_pill.setVisible(False)
         except Exception:
             logger.debug("focus protection pill update failed", exc_info=True)
+
+    def apply_break_recommendation(self, payload: dict) -> None:
+        """P0 §3.7 desktop dispatch: surface the "Take a break?" pill.
+
+        Idempotent: if the pill is already visible, the payload is
+        refreshed (so a higher-urgency recommendation can over-write a
+        prior low one) but no flicker is introduced.
+        """
+        if not isinstance(payload, dict):
+            return
+        self._break_recommendation_payload = dict(payload)
+        urgency = str(payload.get("urgency") or "low").lower()
+        label_by_urgency = {
+            "low": "Take a break?",
+            "medium": "Time for a break",
+            "high": "Break recommended now",
+        }
+        try:
+            self._break_pill.setText(label_by_urgency.get(urgency, "Take a break?"))
+            self._break_pill.setToolTip(
+                str(payload.get("reason") or "")
+                or "Stress integral threshold reached. Click for a paced break."
+            )
+            self._break_pill.setVisible(True)
+        except Exception:
+            logger.debug("break pill update failed", exc_info=True)
+
+    def _on_break_pill_clicked(self) -> None:
+        """Bubble the cached BREAK_RECOMMENDATION payload up to the host."""
+        payload = dict(self._break_recommendation_payload)
+        try:
+            self.break_pill_clicked.emit(payload)
+        except Exception:
+            logger.debug("break_pill_clicked emit failed", exc_info=True)
+        self._clear_break_pill()
+
+    def _clear_break_pill(self) -> None:
+        """Hide the break pill + clear cached payload."""
+        try:
+            self._break_pill.setVisible(False)
+        except Exception:
+            pass
+        self._break_recommendation_payload = {}
+        if self._break_pill_snooze_timer is not None:
+            try:
+                self._break_pill_snooze_timer.stop()
+            except Exception:
+                pass
+            self._break_pill_snooze_timer = None
+
+    # ── P0 §3.16: undo toast + restore pill ─────────────────────────
+
+    # Mirror of cortex/services/intervention_engine/executor.py::_REVERSE_ACTIONS.
+    # Membership controls when the Undo toast + Restore pill surface.
+    # We could ship the daemon-side `is_reversible: bool` on every
+    # INTERVENTION_APPLIED payload (Phase 4b), but pre-empting that with
+    # a local mirror keeps the desktop UX functional in isolation.
+    _DESKTOP_REVERSIBLE_ACTIONS: frozenset[str] = frozenset({
+        "hide_tabs_except_active",
+        "collapse_before_error",
+        "fold_except_current",
+        "dim_background",
+        "show_overlay",
+        "close_tab",
+        "group_tabs",
+        "bookmark_and_close",
+    })
+
+    def apply_intervention_applied(self, payload: dict) -> None:
+        """Render the Undo toast on a reversible INTERVENTION_APPLIED.
+
+        Payload keys (matches the daemon's contract):
+        ``intervention_id``, ``action_type``, ``mutations_applied_count``,
+        and optional ``is_reversible`` (Phase 4b will start stamping
+        this; until then we fall back to ``action_type`` membership in
+        :data:`_DESKTOP_REVERSIBLE_ACTIONS`).
+        """
+        if not isinstance(payload, dict):
+            return
+        action_type = str(payload.get("action_type") or "")
+        intervention_id = str(payload.get("intervention_id") or "")
+        try:
+            applied = int(payload.get("mutations_applied_count") or 0)
+        except (TypeError, ValueError):
+            applied = 0
+        is_reversible = payload.get("is_reversible")
+        if not isinstance(is_reversible, bool):
+            is_reversible = action_type in self._DESKTOP_REVERSIBLE_ACTIONS
+        if not is_reversible or applied <= 0 or not intervention_id:
+            return
+        import time as _time
+        now = _time.monotonic()
+        self._reversible_actions.append(
+            (now, intervention_id, action_type, applied)
+        )
+        # Trim entries older than the configured window so the restore
+        # pill clears naturally.
+        cutoff = now - self._reversible_window_seconds
+        self._reversible_actions = [
+            entry for entry in self._reversible_actions
+            if entry[0] >= cutoff
+        ]
+        self._show_undo_toast(intervention_id, action_type, applied)
+        self._refresh_restore_pill()
+
+    def _show_undo_toast(
+        self,
+        intervention_id: str,
+        action_type: str,
+        applied_count: int,
+    ) -> None:
+        """Gmail-style toast at the bottom of the dashboard with a 5 s
+        countdown. Clicking Undo emits ``undo_action_requested``.
+        """
+        action_label = action_type.replace("_", " ")
+        if action_type == "close_tab":
+            verb = f"Closed {applied_count} tab" + ("s" if applied_count != 1 else "")
+        elif action_type == "group_tabs":
+            verb = f"Grouped {applied_count} tab" + ("s" if applied_count != 1 else "")
+        else:
+            verb = action_label.capitalize()
+        # Tear down any prior toast.
+        if self._undo_toast is not None:
+            try:
+                self._undo_toast.deleteLater()
+            except Exception:
+                pass
+            self._undo_toast = None
+        if self._undo_toast_timer is not None:
+            try:
+                self._undo_toast_timer.stop()
+            except Exception:
+                pass
+            self._undo_toast_timer = None
+        toast = QFrame(self)
+        toast.setObjectName("CortexUndoToast")
+        toast.setStyleSheet(
+            "QFrame#CortexUndoToast {"
+            "  background: rgba(28, 28, 30, 0.94);"
+            f"  border-radius: {RADIUS_PILL}px;"
+            "  padding: 6px 14px;"
+            "}"
+            "QLabel { color: white; background: transparent; }"
+            "QPushButton {"
+            "  background: transparent;"
+            f"  color: {BRAND_ACCENT_DARK};"
+            "  border: none;"
+            "  padding: 2px 8px;"
+            f"  font-weight: {FW_SEMIBOLD};"
+            "}"
+            "QPushButton:hover { color: white; }"
+        )
+        row = QHBoxLayout(toast)
+        row.setContentsMargins(SP3, SP2, SP2, SP2)
+        row.setSpacing(SP3)
+        msg = QLabel(f"{verb} · ")
+        msg.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
+        countdown = QLabel("5s")
+        countdown.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
+        undo = QPushButton("Undo")
+        undo.setCursor(Qt.CursorShape.PointingHandCursor)
+        undo.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
+        row.addWidget(msg)
+        row.addWidget(countdown)
+        row.addWidget(undo)
+
+        remaining = {"sec": 5}
+
+        def _on_undo(_checked: bool = False) -> None:
+            try:
+                self.undo_action_requested.emit(intervention_id)
+            except Exception:
+                logger.debug("undo emit failed", exc_info=True)
+            _dismiss()
+
+        def _dismiss() -> None:
+            try:
+                if self._undo_toast_timer is not None:
+                    self._undo_toast_timer.stop()
+                    self._undo_toast_timer = None
+            except Exception:
+                pass
+            try:
+                toast.deleteLater()
+            except Exception:
+                pass
+            self._undo_toast = None
+
+        def _tick() -> None:
+            remaining["sec"] -= 1
+            if remaining["sec"] <= 0:
+                _dismiss()
+                return
+            try:
+                countdown.setText(f"{remaining['sec']}s")
+            except Exception:
+                _dismiss()
+
+        try:
+            undo.clicked.connect(_on_undo)
+        except Exception:
+            pass
+        timer = QTimer(self)
+        timer.setInterval(1000)
+        timer.timeout.connect(_tick)
+        timer.start()
+        self._undo_toast_timer = timer
+
+        # Anchor toast at the bottom-center of the dashboard widget.
+        try:
+            toast.adjustSize()
+            x = (self.width() - toast.width()) // 2
+            y = self.height() - toast.height() - 24
+            toast.move(max(SP3, x), max(SP3, y))
+            toast.show()
+            toast.raise_()
+        except Exception:
+            logger.debug("toast positioning failed", exc_info=True)
+        self._undo_toast = toast
+
+    def _refresh_restore_pill(self) -> None:
+        """Show / hide the "Restore previous state" pill based on the
+        sliding-window membership of recently reversible actions."""
+        # The pill itself is created lazily so the dashboard's header
+        # doesn't grow another permanent widget when no reversible
+        # action has happened yet.
+        import time as _time
+        now = _time.monotonic()
+        cutoff = now - self._reversible_window_seconds
+        self._reversible_actions = [
+            entry for entry in self._reversible_actions
+            if entry[0] >= cutoff
+        ]
+        # Lazily build the pill.
+        if not hasattr(self, "_restore_pill") or self._restore_pill is None:
+            pill = QPushButton("Restore previous state")
+            try:
+                pill.setCursor(Qt.CursorShape.PointingHandCursor)
+            except Exception:
+                pass
+            pill.setFont(mac_native.system_font(FS_CAPTION, "medium"))
+            pill.setStyleSheet(
+                "QPushButton {"
+                f"  background: {_GROUPED_BG};"
+                f"  color: {_LABEL_SECONDARY};"
+                f"  border-radius: {RADIUS_PILL}px;"
+                "  padding: 3px 10px;"
+                "  border: none;"
+                "}"
+                f"QPushButton:hover {{ background: rgba(0,0,0,0.05); color: {_LABEL}; }}"
+            )
+            try:
+                pill.clicked.connect(self._on_restore_pill_clicked)
+            except Exception:
+                pass
+            try:
+                # Add to header row if available.
+                self._header_layout.addWidget(  # type: ignore[attr-defined]
+                    pill, alignment=Qt.AlignmentFlag.AlignVCenter,
+                )
+            except Exception:
+                # No header reference — keep the pill detached; the
+                # consumer can show()/hide() it programmatically without
+                # blowing up.
+                pass
+            self._restore_pill: QPushButton | None = pill
+        try:
+            self._restore_pill.setVisible(bool(self._reversible_actions))
+        except Exception:
+            pass
+
+    def _on_restore_pill_clicked(self) -> None:
+        """User wants to restore — undo the most recent reversible action."""
+        if not self._reversible_actions:
+            self._refresh_restore_pill()
+            return
+        _ts, intervention_id, _action_type, _applied = self._reversible_actions[-1]
+        try:
+            self.undo_action_requested.emit(intervention_id)
+        except Exception:
+            logger.debug("undo emit failed", exc_info=True)
+        # Drop the entry we just undid; the pill auto-hides if it was
+        # the only one in the window.
+        self._reversible_actions = self._reversible_actions[:-1]
+        self._refresh_restore_pill()
 
     def update_state(self, payload: dict) -> None:
         # Phase J-3: first frame retires the empty state. The flag is
@@ -1708,6 +2446,47 @@ class _SignalQualityBar(QWidget):
             f" border-radius: 2px; }}"
         )
 
+    def set_subcomponents(
+        self,
+        *,
+        luminance: float | None = None,
+        motion_penalty: float | None = None,
+        face_loss_rate: float | None = None,
+    ) -> None:
+        """P0 §3.18: cache sub-component values so the tooltip surfaces
+        the per-channel breakdown without requiring an extra widget.
+
+        Values fall in [0, 1]. ``None`` means the upstream
+        STATE_UPDATE did not include the field — we render "—".
+        Recommendation copy is attached when a sub-component is in a
+        problematic range:
+
+        * Luminance below 0.35 → "Move toward a window."
+        * Motion penalty above 0.5 → "Centre your face."
+        * Face-loss rate above 0.3 → "Stay in frame."
+        """
+        def _fmt(v: float | None) -> str:
+            return "—" if v is None else f"{v * 100:.0f}%"
+
+        lines = [
+            f"Luminance: {_fmt(luminance)}",
+            f"Motion penalty: {_fmt(motion_penalty)}",
+            f"Face-loss rate: {_fmt(face_loss_rate)}",
+        ]
+        if isinstance(luminance, (int, float)) and luminance < 0.35:
+            lines.append("→ Move toward a window for better lighting.")
+        if isinstance(motion_penalty, (int, float)) and motion_penalty > 0.5:
+            lines.append("→ Hold still and centre your face.")
+        if isinstance(face_loss_rate, (int, float)) and face_loss_rate > 0.3:
+            lines.append("→ Stay in frame so Cortex can read your face.")
+        tip = "\n".join(lines)
+        try:
+            self.setToolTip(tip)
+            self._bar.setToolTip(tip)
+            self._val_label.setToolTip(tip)
+        except Exception:
+            pass
+
 
 # ---------------------------------------------------------------------------
 # Tab 2: Advanced
@@ -1938,6 +2717,21 @@ class _AdvancedTab(QWidget):
         self._kine_q.set_value(sig_q.get("kinematics", 0.0))
         self._tele_q.set_value(sig_q.get("telemetry", 0.0))
 
+        # P0 §3.18: feed the physio bar's per-component breakdown into
+        # its tooltip. The fields are optional on STATE_UPDATE — passing
+        # ``None`` for a missing key renders "—" instead of fabricating
+        # a value. The underlying schema (cortex/libs/schemas/state.py)
+        # gates these on physio_sqi presence; the dashboard does not.
+        try:
+            sqi_detail = sig_q.get("physio_subcomponents") or {}
+            self._physio_q.set_subcomponents(
+                luminance=sqi_detail.get("luminance"),
+                motion_penalty=sqi_detail.get("motion_penalty"),
+                face_loss_rate=sqi_detail.get("face_loss_rate"),
+            )
+        except Exception:
+            logger.debug("physio SQI subcomponent update failed", exc_info=True)
+
         hr = bio.get("heart_rate")
         if hr is not None:
             self._hr_plot.add_value(hr)
@@ -1966,6 +2760,70 @@ class _AdvancedTab(QWidget):
                 m, s = int(t // 60), t % 60
                 lines.append(f"{m:02d}:{s:04.1f}  {ev['state']:<10} {ev['confidence']:.0%}")
             self._timeline_text.setText("\n".join(lines) if lines else "No events yet")
+
+
+# ---------------------------------------------------------------------------
+# P0 §3.17 — Concepts dialog (Help → Concepts).
+# ---------------------------------------------------------------------------
+
+
+class ConceptsDialog(QDialog):
+    """Small modal dialog listing every term in ``_CONCEPTS_GLOSSARY``.
+
+    Reuses the same glossary used by setToolTip across the dashboard so
+    there is exactly one place to edit help copy.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        try:
+            self.setWindowTitle("Concepts")
+        except Exception:
+            pass
+        try:
+            self.setMinimumWidth(440)
+        except Exception:
+            pass
+        try:
+            self.setStyleSheet(f"background: {_WINDOW_BG};")
+        except Exception:
+            pass
+        layout = QVBoxLayout(self)
+        try:
+            layout.setContentsMargins(SP5, SP5, SP5, SP5)
+            layout.setSpacing(SP3)
+        except Exception:
+            pass
+        try:
+            title = QLabel("Concepts")
+            title.setFont(mac_native.system_font(FS_TITLE, "semibold"))
+            title.setStyleSheet(f"color: {_LABEL}; background: transparent;")
+            layout.addWidget(title)
+        except Exception:
+            pass
+        for key, body in _CONCEPTS_GLOSSARY.items():
+            try:
+                term = QLabel(key.upper())
+                term.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
+                term.setStyleSheet(
+                    f"color: {BRAND_ACCENT}; background: transparent;"
+                )
+                layout.addWidget(term)
+                desc = QLabel(body)
+                desc.setWordWrap(True)
+                desc.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
+                desc.setStyleSheet(
+                    f"color: {_LABEL_SECONDARY}; background: transparent;"
+                )
+                layout.addWidget(desc)
+            except Exception:
+                continue
+        try:
+            close_btn = QPushButton("Close")
+            close_btn.clicked.connect(self.accept)
+            layout.addWidget(close_btn)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -2014,6 +2872,13 @@ class DashboardWindow(QWidget):
     # releases the daemon's stop() wait — without this, the daemon's
     # 5 s recap-dismiss timeout fires unnecessarily on every stop.
     recap_dismissed_ack = Signal(str)  # session_id (may be empty)
+    # P0 §3.7 desktop dispatch: re-emitted from consumer tab's break pill.
+    break_pill_clicked = Signal(dict)
+    # P0 §3.16: re-emitted from consumer tab's undo toast / restore pill.
+    undo_action_requested = Signal(str)
+    # P0 §3.21 global shortcuts re-emit.
+    force_recap_requested = Signal()
+    dismiss_overlay_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -2033,9 +2898,25 @@ class DashboardWindow(QWidget):
         # Segmented control sits at the top under the unified title bar.
         # P0 §3.1: add a third "History" segment between Dashboard and
         # Advanced so the user can browse past sessions and trends.
+        # Audit fix: if the History tab module fails to import (test stubs
+        # or partial Qt), we hide its segment entirely rather than
+        # surfacing a broken tab that lands on Advanced.
         seg_container = QHBoxLayout()
         seg_container.setContentsMargins(SP6, SP3, SP6, SP3)
-        self._seg = _MacSegmentedControl(["Dashboard", "History", "Advanced"])
+        # Probe the History tab availability before building the segments.
+        # The actual instance is constructed below; we only need to know
+        # whether the import resolves.
+        try:
+            from cortex.apps.desktop_shell.history_tab import (
+                HistoryTab as _HistoryTabProbe,  # noqa: F401
+            )
+            _history_segment_available = True
+        except Exception:
+            _history_segment_available = False
+        if _history_segment_available:
+            self._seg = _MacSegmentedControl(["Dashboard", "History", "Advanced"])
+        else:
+            self._seg = _MacSegmentedControl(["Dashboard", "Advanced"])
         seg_container.addWidget(self._seg, stretch=1)
         layout.addLayout(seg_container)
 
@@ -2093,6 +2974,24 @@ class DashboardWindow(QWidget):
         self._consumer.auto_focus_disarm_requested.connect(
             self.auto_focus_disarm_requested.emit,
         )
+        # P0 §3.7 desktop dispatch + §3.16 undo.
+        if hasattr(self._consumer, "break_pill_clicked"):
+            self._consumer.break_pill_clicked.connect(
+                self.break_pill_clicked.emit,
+            )
+        if hasattr(self._consumer, "undo_action_requested"):
+            self._consumer.undo_action_requested.connect(
+                self.undo_action_requested.emit,
+            )
+        # P0 §3.21 global shortcut re-emit.
+        if hasattr(self._consumer, "force_recap_requested"):
+            self._consumer.force_recap_requested.connect(
+                self.force_recap_requested.emit,
+            )
+        if hasattr(self._consumer, "dismiss_overlay_requested"):
+            self._consumer.dismiss_overlay_requested.connect(
+                self.dismiss_overlay_requested.emit,
+            )
 
         # P0 §3.1 + §3.2: forward history-tab outgoing signals so the
         # controller can route them to the daemon via WS or direct call.
@@ -2348,6 +3247,54 @@ class DashboardWindow(QWidget):
                 logger.debug(
                     "consumer apply_auto_focus_state failed", exc_info=True,
                 )
+
+    def apply_break_recommendation(self, payload: dict) -> None:
+        """P0 §3.7 desktop dispatch: forward to consumer tab's break pill."""
+        if self._consumer is not None and hasattr(
+            self._consumer, "apply_break_recommendation",
+        ):
+            try:
+                self._consumer.apply_break_recommendation(payload)
+            except Exception:
+                logger.debug(
+                    "consumer apply_break_recommendation failed",
+                    exc_info=True,
+                )
+
+    def apply_intervention_applied(self, payload: dict) -> None:
+        """P0 §3.16: forward INTERVENTION_APPLIED to consumer tab's undo toast."""
+        if self._consumer is not None and hasattr(
+            self._consumer, "apply_intervention_applied",
+        ):
+            try:
+                self._consumer.apply_intervention_applied(payload)
+            except Exception:
+                logger.debug(
+                    "consumer apply_intervention_applied failed",
+                    exc_info=True,
+                )
+
+    def apply_cost_update(self, cost_today: float, budget: float = 0.0) -> None:
+        """P0 §3.15: forward LLM cost data to consumer tab's pill."""
+        if self._consumer is not None and hasattr(
+            self._consumer, "apply_cost_update",
+        ):
+            try:
+                self._consumer.apply_cost_update(cost_today, budget)
+            except Exception:
+                logger.debug(
+                    "consumer apply_cost_update failed", exc_info=True,
+                )
+
+    def show_concepts_dialog(self) -> None:
+        """P0 §3.17: open the Concepts glossary dialog. Wired into the
+        Help menu (or hosted by the controller through ``main_app``).
+        """
+        try:
+            dialog = ConceptsDialog(self)
+            dialog.exec()
+        except Exception:
+            logger.debug("Concepts dialog failed to open", exc_info=True)
 
     def _on_recap_dismissed(self) -> None:
         """RecapSheet was closed (manual / autohide) — proceed with the

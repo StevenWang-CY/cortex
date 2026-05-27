@@ -88,6 +88,13 @@ class DaemonBridge(QObject):
     quiet_mode_state_received = Signal(dict)
     # P0 §3.10: daemon-armed focus session arm/disarm broadcast.
     auto_focus_armed_changed = Signal(bool, str)  # armed, preset
+    # P0 §3.7 desktop dispatch: daemon-emitted "consider a break"
+    # recommendation. Payload mirrors :attr:`MessageType.BREAK_RECOMMENDATION`
+    # (reason, urgency, stress_load, threshold, duration_seconds,
+    # breathing_pattern). Wired to the dashboard's break-pill in
+    # CortexAppController so the UI nudges the user toward
+    # ``take_biology_break`` without forcing the modal break overlay.
+    break_recommendation_received = Signal(dict)
     # P0 §3.4: pushed at ~2 Hz from the CalibrationRunner so the
     # onboarding wizard's ECG trace, status pills, numerics, and bar all
     # stay in sync with the running capture loop. Payload is a plain
@@ -221,6 +228,21 @@ class DaemonBridge(QObject):
         except Exception:
             logger.debug("on_stop_focus_auto emit failed", exc_info=True)
 
+    def on_break_recommendation(self, payload: dict) -> None:
+        """P0 §3.7: relay BREAK_RECOMMENDATION onto the Qt main thread.
+
+        Mirrors the other on_* handlers — dict is shallow-copied so the
+        bridge can re-broadcast without callers mutating shared state.
+        """
+        try:
+            self.break_recommendation_received.emit(
+                dict(payload) if payload else {}
+            )
+        except Exception:
+            logger.debug(
+                "break_recommendation_received emit failed", exc_info=True,
+            )
+
     def on_error(self, title: str, body: str, cid: str = "") -> None:
         """Phase J-2: surface a daemon error in the dashboard toast.
 
@@ -264,14 +286,6 @@ class CortexAppController:
         self._daemon: Any = None  # CortexDaemon (lazy import to avoid heavy deps at module level)
         self._daemon_loop: asyncio.AbstractEventLoop | None = None
         self._daemon_thread: threading.Thread | None = None
-        # P0 §3.4: in-flight calibration runner. None when idle. Guards
-        # against double-click re-entry and lets ``_stop_daemon_and_quit``
-        # cooperatively abort the runner on shutdown.
-        self._calibration_runner: Any = None
-        # P0 §3.4: in-flight calibration runner. None when idle. Guards
-        # against double-click re-entry and lets ``_stop_daemon_and_quit``
-        # cooperatively abort the runner on shutdown.
-        self._calibration_runner: Any = None
         # P0 §3.4: in-flight calibration runner. None when idle. Guards
         # against double-click re-entry and lets ``_stop_daemon_and_quit``
         # cooperatively abort the runner on shutdown.
@@ -367,6 +381,14 @@ class CortexAppController:
         self._bridge.quiet_mode_state_received.connect(
             self._on_quiet_mode_state_to_tray,
         )
+        # P0 §3.7 desktop dispatch: route BREAK_RECOMMENDATION into the
+        # dashboard's break pill (and tray notification helper). The
+        # dashboard handler is the source of truth — if it isn't wired
+        # (legacy lightweight test stub) we fall through silently.
+        if hasattr(self._dashboard, "apply_break_recommendation"):
+            self._bridge.break_recommendation_received.connect(
+                self._dashboard.apply_break_recommendation,
+            )
 
         self._overlay.dismissed.connect(self._on_overlay_dismissed)
         # G4 (audit-prod): overlay action buttons emit ``action_invoked``;
@@ -683,6 +705,8 @@ class CortexAppController:
                 MessageType.QUIET_MODE_STATE.value: bridge.on_quiet_mode_state,
                 MessageType.START_FOCUS_AUTO.value: bridge.on_start_focus_auto,
                 MessageType.STOP_FOCUS_AUTO.value: bridge.on_stop_focus_auto,
+                # P0 §3.7 desktop dispatch.
+                MessageType.BREAK_RECOMMENDATION.value: bridge.on_break_recommendation,
             }
         except Exception:
             logger.debug("MessageType import failed; broadcast observer disabled", exc_info=True)

@@ -50,27 +50,66 @@ def _setup_pyside6_mocks() -> bool:
         def __call__(self, func):
             return func
 
+    class _QtEnumMeta(type):
+        """Auto-vivify unknown ``Qt.Foo.Bar`` lookups to plain ints."""
+
+        _counter = 0
+
+        def __getattr__(cls, name):
+            cls._counter += 1
+            return cls._counter
+
+    class _QtEnumNS:
+        """Namespace whose missing attributes resolve to enum-value stubs."""
+
+        def __init__(self, parent_name: str = "") -> None:
+            self._parent_name = parent_name
+            self._seen: dict[str, int] = {}
+
+        def __getattr__(self, name):
+            if name not in self._seen:
+                # Stable integer per enum value so identity comparisons work.
+                self._seen[name] = (hash(self._parent_name + "." + name) & 0xFFFFFFFF)
+            return self._seen[name]
+
     class MockQt:
-        class AlignmentFlag:
+        AlignmentFlag = _QtEnumNS("AlignmentFlag")
+        Orientation = _QtEnumNS("Orientation")
+        WindowType = _QtEnumNS("WindowType")
+        CursorShape = _QtEnumNS("CursorShape")
+        WidgetAttribute = _QtEnumNS("WidgetAttribute")
+        PenStyle = _QtEnumNS("PenStyle")
+        Key = _QtEnumNS("Key")
+        TextFormat = _QtEnumNS("TextFormat")
+        TextInteractionFlag = _QtEnumNS("TextInteractionFlag")
+        FocusPolicy = _QtEnumNS("FocusPolicy")
+        FocusReason = _QtEnumNS("FocusReason")
+        ShortcutContext = _QtEnumNS("ShortcutContext")
+        BrushStyle = _QtEnumNS("BrushStyle")
+        PenCapStyle = _QtEnumNS("PenCapStyle")
+        PenJoinStyle = _QtEnumNS("PenJoinStyle")
+        ScrollBarPolicy = _QtEnumNS("ScrollBarPolicy")
+        ContextMenuPolicy = _QtEnumNS("ContextMenuPolicy")
+        # Historical values some tests check identity on.
+        class _LegacyAlignmentValues:
             AlignCenter = 0x84
             AlignTop = 0x20
             AlignVCenter = 0x80
             AlignLeft = 0x01
             AlignRight = 0x02
-        class Orientation:
-            Horizontal = 1
-        class WindowType:
-            FramelessWindowHint = 0x800
-            WindowStaysOnTopHint = 0x40000
-            Tool = 0x800
-        class CursorShape:
-            PointingHandCursor = 13
-        class WidgetAttribute:
-            WA_TranslucentBackground = 120
-        class PenStyle:
-            NoPen = 0
-        class Key:
-            Key_Escape = 0x01000000
+        # Fall back to legacy literal mapping when callers index the
+        # canonical Qt5-style attribute names directly.
+        # (kept for back-compat with the few tests that compare to 0x84 etc.)
+        # AlignmentFlag is the modern shape; the legacy class is an alias.
+        AlignmentFlag.__dict__.update(  # type: ignore[arg-type]
+            {
+                "AlignCenter": 0x84,
+                "AlignTop": 0x20,
+                "AlignVCenter": 0x80,
+                "AlignLeft": 0x01,
+                "AlignRight": 0x02,
+            }
+        )
 
     class MockQTimer:
         def __init__(self, parent=None):
@@ -217,11 +256,45 @@ def _setup_pyside6_mocks() -> bool:
     qtgui.QGraphicsOpacityEffect = type("QGraphicsOpacityEffect", (), {"__init__": lambda self, *a: None})
 
     # --- QtWidgets mocks ---
+    _SIGNAL_NAME_SUFFIXES = (
+        "Activated", "Pressed", "Released", "Clicked", "Toggled",
+        "Changed", "Finished", "Started", "Edited", "Selected",
+        "Triggered", "Submitted", "Hovered",
+    )
+
     class MockQWidget:
         def __init__(self, parent=None):
             self._visible = False
             self._size = (400, 300)
             self._object_name = ""
+        def __getattr__(self, name):
+            # Auto-vivify any attribute the mock didn't model so newly-
+            # added desktop_shell code (Phase 4c additions like
+            # ``QLabel.setOpenExternalLinks`` or
+            # ``QLabel.linkActivated.connect``) doesn't require updating
+            # every mock subclass. Names that look like Qt signals — i.e.
+            # end in a common signal suffix — get a MockSignal so callers
+            # can do ``foo.linkActivated.connect(...)``. Everything else
+            # gets a no-op callable.
+            if name.startswith("_"):
+                raise AttributeError(name)
+            if any(name.endswith(suffix) for suffix in _SIGNAL_NAME_SUFFIXES):
+                sig = MockSignal()
+                setattr(self, name, sig)
+                return sig
+            # Numeric / boolean accessors that callers downcast.
+            _numeric_accessors = ("value", "currentIndex", "minimum", "maximum")
+            _bool_accessors = ("isChecked", "isEnabled", "isVisible", "hasFocus")
+            _str_accessors = ("currentText", "toolTip", "accessibleName", "accessibleDescription")
+            if name in _numeric_accessors:
+                return lambda *_a, **_kw: 0
+            if name in _bool_accessors:
+                return lambda *_a, **_kw: False
+            if name in _str_accessors:
+                return lambda *_a, **_kw: ""
+            def _noop(*_args, **_kwargs):
+                return None
+            return _noop
         def setWindowFlags(self, f): pass
         def setAttribute(self, a): pass
         def setMinimumSize(self, w, h): self._size = (w, h)
@@ -500,6 +573,25 @@ def _setup_pyside6_mocks() -> bool:
     qtwidgets.QFormLayout = MockLayout
     qtwidgets.QGraphicsOpacityEffect = type("QGraphicsOpacityEffect", (), {"__init__": lambda self, *a: None})
     qtwidgets.QGraphicsDropShadowEffect = MockQGraphicsDropShadowEffect
+
+    # Widgets added by later Phase-4 features (Phase 4c Budget panel,
+    # glossary dialog, weekly schedule, export menu, recent-goals
+    # dropdown, etc.). Each maps to a permissive stub so import-time
+    # ``from PySide6.QtWidgets import Q…`` resolves without forcing
+    # every new widget to be hand-rolled in this mock.
+    def _passthrough_stub(name: str):
+        return type(name, (MockQWidget,), {"__init__": lambda self, *a, **kw: MockQWidget.__init__(self)})
+
+    for _name in (
+        "QDoubleSpinBox", "QPlainTextEdit", "QDialog", "QDialogButtonBox",
+        "QFileDialog", "QShortcut", "QToolButton", "QScrollBar", "QLCDNumber",
+        "QListView", "QListWidget", "QListWidgetItem", "QGraphicsView",
+        "QGraphicsScene", "QToolTip", "QRadioButton", "QStyleOption",
+        "QStyle", "QStyleOptionViewItem", "QAbstractItemView",
+        "QSplitter", "QHeaderView", "QTreeView", "QTableView",
+    ):
+        if not hasattr(qtwidgets, _name):
+            setattr(qtwidgets, _name, _passthrough_stub(_name))
 
     sys.modules["PySide6"] = pyside6
     sys.modules["PySide6.QtCore"] = qtcore

@@ -391,9 +391,11 @@ def _cli(argv: list[str] | None = None) -> int:
 
     baseline = load_baseline(args.baseline)
     if baseline.seed != args.seed:
-        print(
-            f"WARNING: baseline seed {baseline.seed} differs from run seed "
-            f"{args.seed}; deltas may be noise rather than signal."
+        logger.warning(
+            "Baseline seed %d differs from run seed %d; deltas may be noise "
+            "rather than signal.",
+            baseline.seed,
+            args.seed,
         )
     deltas = compare_to_baseline(metrics, baseline)
     print(format_report(deltas))

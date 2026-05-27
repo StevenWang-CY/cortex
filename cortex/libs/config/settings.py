@@ -21,6 +21,20 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
+from cortex.libs.config.ports import (
+    HTTP_API_PORT,
+    LAUNCHER_AGENT_PORT,
+    WEBSOCKET_PORT,
+)
+
+# Bound at module-import time so Pydantic field defaults read from the
+# same constants without re-importing on every model construction.
+_PORTS: dict[str, int] = {
+    "HTTP_API_PORT": HTTP_API_PORT,
+    "LAUNCHER_AGENT_PORT": LAUNCHER_AGENT_PORT,
+    "WEBSOCKET_PORT": WEBSOCKET_PORT,
+}
+
 
 def _is_bundled() -> bool:
     """True when running inside a PyInstaller ``.app`` bundle."""
@@ -344,11 +358,32 @@ class HandoverConfig(BaseModel):
 
 
 class APIConfig(BaseModel):
-    """API gateway configuration."""
+    """API gateway configuration.
+
+    Port defaults sourced from :mod:`cortex.libs.config.ports` so a
+    future port migration only edits one file.
+
+    Phase-4b TASK L: ``cors_allow_origins`` lifts the hardcoded
+    localhost allowlist out of ``app.py`` into config so deployments
+    that proxy through a different origin (e.g. a Tauri shell at a
+    custom scheme) can extend it via env var without patching code.
+    """
 
     host: str = "127.0.0.1"
-    port: int = 9472
-    ws_port: int = 9473
+    port: int = Field(default_factory=lambda: _PORTS["HTTP_API_PORT"])
+    ws_port: int = Field(default_factory=lambda: _PORTS["WEBSOCKET_PORT"])
+    cors_allow_origins: list[str] = Field(
+        default_factory=lambda: [
+            "http://localhost",
+            "http://127.0.0.1",
+        ],
+        description=(
+            "Static CORS allowlist for the HTTP API. The dynamic "
+            "extension/webview regex is still applied in app.py via "
+            "``allow_origin_regex``; this list is the simple-match "
+            "fallback for browser tabs that aren't extensions."
+        ),
+    )
 
 
 class TelemetryConfig(BaseModel):
@@ -582,6 +617,53 @@ def load_yaml_defaults() -> dict:
     return {}
 
 
+# Phase-4a Debt-1: env toggles that gate user-visible features. The
+# values are read by Pydantic from the environment / .env file; if
+# neither source carries them the field defaults apply. That is
+# semantically correct but operationally silent — a power user who
+# meant to flip ``ENABLE_AUTO_DISTRACTION_BLOCK=true`` and mistyped the
+# key would never know. We surface a one-line WARN at config load to
+# bound mis-configuration surprise.
+_REQUIRED_FEATURE_TOGGLES: tuple[str, ...] = (
+    "CORTEX_INTERVENTION__ENABLE_BIOLOGY_BREAK",
+    "CORTEX_INTERVENTION__ENABLE_AUTO_DISTRACTION_BLOCK",
+    "CORTEX_INTERVENTION__ENABLE_OS_NOTIFICATIONS",
+)
+
+
+def _check_required_feature_toggles() -> None:
+    """Warn (once per process) when documented feature toggles are
+    absent from both the environment and the .env files.
+
+    The defaults remain authoritative; this only surfaces mis-typed
+    or forgotten overrides so operations is never silent. Disabled when
+    ``CORTEX_SUPPRESS_FEATURE_TOGGLE_WARNINGS=1`` is set (used by
+    tests so the suite doesn't flood stdout).
+    """
+    if os.environ.get("CORTEX_SUPPRESS_FEATURE_TOGGLE_WARNINGS") == "1":
+        return
+    log = __import__("logging").getLogger(__name__)
+    env_files = _bundled_env_files()
+    env_contents = ""
+    for env_path in env_files:
+        try:
+            with open(env_path) as fp:
+                env_contents += fp.read() + "\n"
+        except OSError:
+            continue
+    for key in _REQUIRED_FEATURE_TOGGLES:
+        if key in os.environ:
+            continue
+        if env_contents and key in env_contents:
+            continue
+        log.warning(
+            "Documented feature toggle %s is not set in environment or "
+            ".env; falling back to compiled default. Set it explicitly "
+            "to silence this warning.",
+            key,
+        )
+
+
 @lru_cache
 def get_config() -> CortexConfig:
     """
@@ -599,6 +681,7 @@ def get_config() -> CortexConfig:
         CortexConfig: The global configuration instance.
     """
     config = CortexConfig()
+    _check_required_feature_toggles()
 
     if _is_bundled():
         storage_path = Path(config.storage.path).expanduser()
@@ -609,14 +692,20 @@ def get_config() -> CortexConfig:
     # BYOK: surface the Bedrock bearer token via env so the Anthropic SDK
     # (AsyncAnthropicBedrock) and any boto3 fallbacks can find it. We never
     # store the token on the config object — keychain is the source of truth.
+    #
+    # Phase-4a Debt-1: wrap the lookup in ``get_password_safe`` so a
+    # wedged Keychain backend (TCC prompt, unlock sheet, dbus stall)
+    # cannot pin module-import for tens of seconds. A 5 s ceiling means
+    # the daemon degrades to the rule-based fallback after at most that
+    # delay, never wedges.
     if (
         config.llm.provider == "bedrock"
         and config.llm.use_keychain
         and not os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
     ):
         try:
-            import keyring
-            token = keyring.get_password(
+            from cortex.libs.utils.secrets import get_password_safe
+            token = get_password_safe(
                 config.llm.bedrock.keychain_service,
                 config.llm.bedrock.keychain_account,
             )

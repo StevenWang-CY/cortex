@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -18,6 +19,20 @@ from cortex.libs.schemas.intervention import InterventionPlan
 from cortex.services.intervention_engine.planner import AdapterCommand
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Per-action consent decision callable type (Phase-4b TASK 1)
+# ---------------------------------------------------------------------------
+#
+# Signature: ``async (action_type: str, requested_level: int) -> bool``.
+# Return True when the requested action is permitted; False when the
+# consent ladder denies the action. The ``apply()`` loop short-circuits a
+# denied command into a Mutation with ``success=False`` and the reason
+# ``"consent_denied"`` so callers can surface it in observability without
+# crashing the workspace.
+
+ConsentDecisionFn = Callable[[str, int], Awaitable[bool]]
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +63,11 @@ class Mutation:
     timestamp: float = 0.0
     success: bool = False
     reverse_action: str | None = None
+    # Phase-4b TASK 1: optional structured reason for failures so callers
+    # (runtime_daemon → WS broadcast) can surface
+    # ``"consent_denied"`` / ``"no_active_editor"`` / ``"adapter_missing"``
+    # without parsing free-form log lines.
+    reason: str | None = None
 
     @property
     def is_reversible(self) -> bool:
@@ -56,12 +76,33 @@ class Mutation:
 
 
 # Action → reverse action mapping
+#
+# Membership policy: only actions whose effect can be sensibly undone by
+# another single adapter command belong in this map. Actions that are
+# either inherently one-shot (e.g. a copy_to_clipboard, a notification,
+# a guided breathing overlay) or whose "undo" would itself be
+# user-driven (e.g. the user reopens the tab they just closed) are
+# omitted on purpose. The downstream "Restore" pill in the desktop
+# overlay gates its visibility on membership here.
 _REVERSE_ACTIONS: dict[str, str] = {
+    # Legacy adapter-level mutations.
     "hide_tabs_except_active": "show_all_tabs",
     "collapse_before_error": "expand_terminal",
     "fold_except_current": "unfold_all",
     "dim_background": "remove_dim",
     "show_overlay": "hide_overlay",
+    # Phase-4a Debt-1: round out the reversibility map for the suggested-
+    # action vocabulary (``intervention.py::SuggestedAction.action_type``).
+    # Tab actions are reversible via the standard browser undo paths; the
+    # extension owns the actual reopen via captured tab metadata.
+    "close_tab": "reopen_tab",
+    "group_tabs": "ungroup_tabs",
+    "bookmark_and_close": "reopen_from_bookmark",
+    # NOTE: ``take_biology_break``, ``resume_last_active_file``,
+    # ``prompt_micro_commit``, ``suggest_movement_break``, ``open_url``,
+    # ``search_error``, ``highlight_tab``, ``save_session``,
+    # ``copy_to_clipboard`` and ``start_timer`` are intentionally
+    # omitted — they have no sensible single-step reverse mutation.
 }
 
 
@@ -82,6 +123,63 @@ class InterventionExecutor:
         self._registry: AdapterRegistry | None = adapter_registry
         self._active_mutations: dict[str, list[Mutation]] = {}
         # intervention_id → list of mutations
+        # Phase-4b TASK 1: per-action consent gate. The daemon binds this
+        # at startup so the executor can refuse an action whose live
+        # consent level is below the action's policy minimum. When unset
+        # (legacy callers / test rigs) the gate is permissive.
+        self._consent_check: ConsentDecisionFn | None = None
+        # Phase-4b TASK 1: optional hook(s) for the three special actions
+        # (resume_last_active_file, prompt_micro_commit, suggest_movement_break).
+        # The daemon injects these so the executor can deliver the action
+        # without taking a direct dependency on the editor adapter or WS
+        # server. Each must be ``async (params: dict) -> tuple[bool, str | None]``
+        # — the bool is success, the str is an optional ``reason`` returned
+        # in the Mutation when success=False.
+        self._editor_focus_hook: Callable[
+            [dict[str, Any]], Awaitable[tuple[bool, str | None]]
+        ] | None = None
+        self._prompt_broadcast_hook: Callable[
+            [str, dict[str, Any]], Awaitable[tuple[bool, str | None]]
+        ] | None = None
+
+    def set_consent_check(self, fn: ConsentDecisionFn | None) -> None:
+        """Bind the per-action consent gate (Phase-4b TASK 1).
+
+        The gate runs BEFORE adapter dispatch inside :meth:`apply`. A
+        denial short-circuits the command into a Mutation with
+        ``success=False, reason="consent_denied"`` so the daemon can
+        record the outcome and inform AMIP that this plan should have
+        been gated at LLM time.
+        """
+        self._consent_check = fn
+
+    def set_editor_focus_hook(
+        self,
+        hook: Callable[[dict[str, Any]], Awaitable[tuple[bool, str | None]]] | None,
+    ) -> None:
+        """Bind the ``resume_last_active_file`` adapter hook.
+
+        Signature: ``async (params) -> (success, reason)``. ``params``
+        is the planner-emitted action params (currently empty for this
+        action). ``reason`` is None on success or one of
+        ``"no_active_editor"`` / ``"editor_send_failed"`` on failure.
+        """
+        self._editor_focus_hook = hook
+
+    def set_prompt_broadcast_hook(
+        self,
+        hook: Callable[[str, dict[str, Any]], Awaitable[tuple[bool, str | None]]]
+        | None,
+    ) -> None:
+        """Bind the WS broadcast hook for ``prompt_micro_commit`` /
+        ``suggest_movement_break``.
+
+        Signature: ``async (action_type, params) -> (success, reason)``.
+        The daemon implements this by sending a typed broadcast with the
+        appropriate payload; failure returns ``"broadcast_failed"`` so
+        the executor can mark the mutation accordingly.
+        """
+        self._prompt_broadcast_hook = hook
 
     def register_adapter(self, name: str, adapter: WorkspaceAdapter) -> None:
         """Register a workspace adapter (editor, browser, terminal, overlay)."""
@@ -130,6 +228,25 @@ class InterventionExecutor:
         now = timestamp if timestamp is not None else time.monotonic()
         mutations: list[Mutation] = []
 
+        # Phase-4b TASK M: map planner action_type → consent level int.
+        # Mirrors ``runtime_daemon.consent_level_map`` so the gate runs
+        # at the same policy resolution as the upstream check.
+        _CONSENT_LEVELS = {
+            "observe": 0, "suggest": 1, "preview": 2,
+            "reversible_act": 3, "autonomous_act": 4,
+        }
+        plan_level_int = _CONSENT_LEVELS.get(plan.consent_level, 2)
+
+        # Phase-4b TASK M: action_type → handler hook dispatch. The
+        # special actions are not adapter-bound; the daemon wires
+        # hooks via ``set_editor_focus_hook`` (resume_last_active_file)
+        # and ``set_prompt_broadcast_hook`` (prompt_micro_commit,
+        # suggest_movement_break).
+        _PROMPT_BROADCAST_ACTIONS = frozenset({
+            "prompt_micro_commit",
+            "suggest_movement_break",
+        })
+
         for cmd in commands:
             mutation = Mutation(
                 adapter=cmd.adapter,
@@ -139,6 +256,72 @@ class InterventionExecutor:
                 reverse_action=_REVERSE_ACTIONS.get(cmd.action),
             )
 
+            # Phase-4b TASK M: per-action consent gate. Runs BEFORE
+            # adapter dispatch so a denied command never touches the
+            # workspace. Permissive when the daemon hasn't wired the
+            # gate (legacy callers / test rigs).
+            if self._consent_check is not None:
+                try:
+                    permitted = await self._consent_check(
+                        cmd.action, plan_level_int,
+                    )
+                except Exception:
+                    logger.exception(
+                        "consent_check raised for action=%s; treating as denied",
+                        cmd.action,
+                    )
+                    permitted = False
+                if not permitted:
+                    mutation.success = False
+                    mutation.reason = "consent_denied"
+                    mutations.append(mutation)
+                    continue
+
+            # Phase-4b TASK M: special action hooks. These don't run
+            # through the adapter registry because their effect is a
+            # daemon-side WS broadcast or an editor-focus message.
+            if cmd.action == "resume_last_active_file":
+                if self._editor_focus_hook is None:
+                    mutation.success = False
+                    mutation.reason = "hook_not_registered"
+                    mutations.append(mutation)
+                    continue
+                try:
+                    ok, reason = await self._editor_focus_hook(dict(cmd.params))
+                    mutation.success = bool(ok)
+                    if not ok:
+                        mutation.reason = reason or "editor_focus_failed"
+                except Exception:
+                    logger.exception(
+                        "editor_focus_hook raised for action=%s", cmd.action,
+                    )
+                    mutation.success = False
+                    mutation.reason = "editor_focus_hook_raised"
+                mutations.append(mutation)
+                continue
+            if cmd.action in _PROMPT_BROADCAST_ACTIONS:
+                if self._prompt_broadcast_hook is None:
+                    mutation.success = False
+                    mutation.reason = "hook_not_registered"
+                    mutations.append(mutation)
+                    continue
+                try:
+                    ok, reason = await self._prompt_broadcast_hook(
+                        cmd.action, dict(cmd.params),
+                    )
+                    mutation.success = bool(ok)
+                    if not ok:
+                        mutation.reason = reason or "broadcast_failed"
+                except Exception:
+                    logger.exception(
+                        "prompt_broadcast_hook raised for action=%s",
+                        cmd.action,
+                    )
+                    mutation.success = False
+                    mutation.reason = "prompt_broadcast_hook_raised"
+                mutations.append(mutation)
+                continue
+
             adapter = self._get_adapter(cmd.adapter)
             if adapter is None:
                 logger.warning(
@@ -147,6 +330,7 @@ class InterventionExecutor:
                     cmd.action,
                 )
                 mutation.success = False
+                mutation.reason = "adapter_missing"
                 mutations.append(mutation)
                 continue
 
@@ -154,6 +338,7 @@ class InterventionExecutor:
                 success = await adapter.execute(cmd.action, cmd.params)
                 mutation.success = success
                 if not success:
+                    mutation.reason = "adapter_returned_false"
                     logger.warning(
                         "Adapter '%s' failed to execute '%s'",
                         cmd.adapter,
@@ -166,6 +351,7 @@ class InterventionExecutor:
                     cmd.adapter,
                 )
                 mutation.success = False
+                mutation.reason = "adapter_raised"
 
             mutations.append(mutation)
 

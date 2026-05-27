@@ -14,6 +14,7 @@ POSIX and on NTFS Win32 (per Python docs).
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -51,10 +52,29 @@ def atomic_write_text(
             if fsync:
                 try:
                     os.fsync(fp.fileno())
-                except OSError:
-                    # Some FUSE filesystems reject fsync. The rename is
-                    # still atomic; we lose only the durability guarantee.
-                    pass
+                except (AttributeError, OSError) as exc:
+                    # Phase-4a fix: previously this swallowed every
+                    # OSError, including ``ENOSPC`` (disk full). On an
+                    # out-of-space write the file fd contains a partial
+                    # / truncated buffer; promoting it via os.replace
+                    # silently overwrites the prior good copy with
+                    # garbage. Distinguish the two cases:
+                    #   * AttributeError (Windows pre-3.3 / FUSE) or
+                    #     non-ENOSPC OSError (e.g. EINVAL on /tmpfs):
+                    #     durability is lost but the bytes are still
+                    #     valid — proceed with the rename.
+                    #   * ENOSPC: the bytes are NOT valid. Delete the
+                    #     temp and re-raise so the caller sees the disk-
+                    #     full condition instead of corrupting the
+                    #     destination.
+                    if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+                        try:
+                            os.unlink(tmp)
+                        except OSError:
+                            pass
+                        raise
+                    # Otherwise tolerate the fsync failure; the rename
+                    # is still atomic and we only lose durability.
     except Exception:
         try:
             os.unlink(tmp)

@@ -2,22 +2,25 @@
  * Cortex Chrome Extension — Onboarding Page
  *
  * A minimal 3-step guide shown on first install:
- *   1. Start daemon
+ *   1. Launch desktop app (daemon auto-starts)
  *   2. Permissions explained
  *   3. Calibrate baseline
  */
 
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "../page-reset.css";
 import { CX, CX_KEYFRAMES } from "../design-tokens";
 
 const STEPS = [
     {
-        title: "Start the Cortex daemon",
-        body: "Cortex runs a local daemon that processes your biometric signals. Open a terminal and run:",
-        code: "python -m cortex.scripts.run_dev",
-        hint: "The extension will automatically connect once the daemon is running.",
+        // Phase 4d Task E: the desktop .app launches the daemon in-process —
+        // no terminal command required. Onboarding copy was stuck on the
+        // dev-mode instructions which confused first-run users on the DMG
+        // install path.
+        title: "Launch the Cortex desktop app",
+        body: "Launch the Cortex desktop app — the daemon starts automatically. The extension will connect on its own as soon as the app is running.",
+        hint: "Don't have the desktop app yet? Install Cortex.dmg from your download or grab it from cortex.so.",
     },
     {
         title: "Permissions explained",
@@ -45,6 +48,51 @@ function Onboarding(): React.ReactElement {
     const [step, setStep] = useState(0);
     const current = STEPS[step];
     const isLast = step === STEPS.length - 1;
+
+    // Phase 4d Task F: poll the background script for daemon
+    // connectivity on the first step so the user can't blindly click
+    // "Next" against a dead daemon. ``null`` = not yet probed,
+    // ``true``/``false`` mirror background's ``connected`` flag.
+    const [daemonConnected, setDaemonConnected] = useState<boolean | null>(null);
+    const [skippedOffline, setSkippedOffline] = useState(false);
+    const [offlineWarning, setOfflineWarning] = useState(false);
+
+    useEffect(() => {
+        // Only poll on the daemon step — re-polling later steps adds
+        // no signal and noise up the runtime.lastError handling.
+        if (step !== 0) return;
+        let cancelled = false;
+        const probe = () => {
+            try {
+                chrome.runtime.sendMessage({ type: "GET_STATE" }, (resp) => {
+                    const lastErr = (chrome as unknown as {
+                        runtime?: { lastError?: { message?: string } };
+                    }).runtime?.lastError;
+                    if (cancelled) return;
+                    if (lastErr || !resp) {
+                        setDaemonConnected(false);
+                        return;
+                    }
+                    const r = resp as { connected?: boolean };
+                    setDaemonConnected(Boolean(r.connected));
+                });
+            } catch {
+                if (!cancelled) setDaemonConnected(false);
+            }
+        };
+        probe();
+        const handle = setInterval(probe, 2000);
+        return () => {
+            cancelled = true;
+            clearInterval(handle);
+        };
+    }, [step]);
+
+    const isDaemonStep = step === 0;
+    const nextBlocked =
+        isDaemonStep
+        && daemonConnected !== true
+        && !skippedOffline;
 
     return (
         <div style={S.page}>
@@ -81,13 +129,6 @@ function Onboarding(): React.ReactElement {
                 {/* Body */}
                 <p style={S.body}>{current.body}</p>
 
-                {/* Code block */}
-                {current.code && (
-                    <pre style={S.codeBlock}>
-                        <code>{current.code}</code>
-                    </pre>
-                )}
-
                 {/* Item list */}
                 {current.items && (
                     <div style={S.itemList}>
@@ -100,6 +141,97 @@ function Onboarding(): React.ReactElement {
                                 </div>
                             </div>
                         ))}
+                    </div>
+                )}
+
+                {/* Phase 4d Task F: daemon connectivity status — only on
+                    the launch step. Renders a coloured pill plus a
+                    "Skip offline" escape hatch so users without the
+                    desktop app installed can still finish onboarding. */}
+                {isDaemonStep && (
+                    <div
+                        data-testid="daemon-health-status"
+                        style={{
+                            ...S.hint,
+                            marginBottom: 16,
+                            fontStyle: "normal",
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 10,
+                            color: CX.text,
+                        }}
+                    >
+                        <span
+                            aria-label={
+                                daemonConnected === true
+                                    ? "Daemon connected"
+                                    : daemonConnected === false
+                                        ? "Daemon not detected"
+                                        : "Checking daemon"
+                            }
+                            style={{
+                                display: "inline-block",
+                                width: 8,
+                                height: 8,
+                                borderRadius: "50%",
+                                background:
+                                    daemonConnected === true
+                                        ? "#4CAF50"
+                                        : daemonConnected === false
+                                            ? "#E47A6E"
+                                            : CX.textTertiary,
+                            }}
+                        />
+                        <span data-testid="daemon-health-label">
+                            {daemonConnected === true
+                                ? "Connected to daemon"
+                                : daemonConnected === false
+                                    ? "Daemon not detected — launch the desktop app"
+                                    : "Checking daemon…"}
+                        </span>
+                        {daemonConnected !== true && !skippedOffline && (
+                            <button
+                                data-testid="onboarding-skip-offline"
+                                onClick={() => {
+                                    setSkippedOffline(true);
+                                    setOfflineWarning(true);
+                                    setTimeout(
+                                        () => setOfflineWarning(false),
+                                        4000,
+                                    );
+                                }}
+                                style={{
+                                    background: "transparent",
+                                    border: "none",
+                                    color: CX.accent,
+                                    fontSize: 12,
+                                    cursor: "pointer",
+                                    textDecoration: "underline",
+                                    padding: 0,
+                                    marginLeft: "auto",
+                                    fontFamily: CX.font,
+                                }}
+                                aria-label="Skip — continue offline"
+                            >
+                                Skip — continue offline
+                            </button>
+                        )}
+                    </div>
+                )}
+
+                {offlineWarning && (
+                    <div
+                        role="status"
+                        data-testid="onboarding-offline-toast"
+                        style={{
+                            ...S.hint,
+                            marginBottom: 16,
+                            color: "#E47A6E",
+                            fontStyle: "normal",
+                        }}
+                    >
+                        Continuing without daemon — features will be limited
+                        until you launch the desktop app.
                     </div>
                 )}
 
@@ -120,8 +252,16 @@ function Onboarding(): React.ReactElement {
                     )}
                     <div style={{ flex: 1 }} />
                     <button
-                        style={S.nextBtn}
+                        data-testid="onboarding-next-btn"
+                        disabled={nextBlocked}
+                        aria-disabled={nextBlocked}
+                        style={{
+                            ...S.nextBtn,
+                            opacity: nextBlocked ? 0.5 : 1,
+                            cursor: nextBlocked ? "not-allowed" : "pointer",
+                        }}
                         onClick={() => {
+                            if (nextBlocked) return;
                             if (isLast) {
                                 window.close();
                             } else {

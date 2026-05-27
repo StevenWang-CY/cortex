@@ -157,7 +157,7 @@ class MessageType(str, Enum):  # noqa: UP042 — pydantic-to-typescript requires
     MICRO_STEP_TOGGLED = "MICRO_STEP_TOGGLED"
     """P0 §3.6: client toggles a micro-step's completion state.
 
-    Payload: ``{intervention_id: str, step_index: int, status: "done"|"skipped"|"pending"}``.
+    Payload: ``{intervention_id: str, step_index: int, new_status: "done"|"skipped"|"pending"}``.
     Daemon updates the active intervention's micro_step status with timestamps and
     broadcasts the updated INTERVENTION_TRIGGER envelope to all clients."""
 
@@ -188,6 +188,43 @@ class MessageType(str, Enum):  # noqa: UP042 — pydantic-to-typescript requires
     overlay click vs. a dashboard menu pick) without bloating the
     QUIET_MODE_TOGGLE payload. Payload:
     ``{duration_minutes: int | None}`` — defaults to 15."""
+
+    COST_REQUEST = "COST_REQUEST"
+    """P0 §3.15: client asks for the running daily LLM spend snapshot.
+
+    Sent by the desktop shell on a ~10 s poll AND any time the dashboard
+    re-opens. Payload: ``{}``. Reply: :attr:`COST_RESPONSE`."""
+
+    TEST_PROVIDER = "TEST_PROVIDER"
+    """P0 §3.19: client asks the daemon to send a minimal probe to the
+    selected LLM provider and report the round-trip latency.
+
+    Payload: ``{provider: "bedrock"|"vertex"|"anthropic_direct"|"rule_based"}``.
+    Reply: :attr:`TEST_PROVIDER_RESULT`. The probe uses a 5 s timeout;
+    the ``rule_based`` provider short-circuits to ``ok=True,
+    latency_ms=0`` because it never hits the network."""
+
+    GOAL_SET = "GOAL_SET"
+    """P0 §3.13: client (desktop dashboard, browser popup) announces the
+    user-provided session goal so the daemon can stamp it on the next
+    SessionReport and feed it to the planner's ``current_goal_hint``.
+
+    Payload: ``{title: str}`` (trimmed; empty clears the override)."""
+
+    FORCE_RECAP = "FORCE_RECAP"
+    """P0 §3.21: developer/keyboard-shortcut request to emit a
+    SESSION_RECAP for the in-progress session right now.
+
+    Payload: ``{}``. When no session is active the daemon broadcasts a
+    minimal synthesised recap with ``persisted=False``."""
+
+    DISMISS_OVERLAY = "DISMISS_OVERLAY"
+    """P0 §3.21: developer/keyboard-shortcut request to dismiss any
+    active overlay across every surface. The daemon also clears any
+    pending intervention state so a new one can be triggered.
+
+    Inbound payload: ``{}``. Outbound broadcast carries
+    ``{intervention_id: str | None, reason: "user_shortcut"}``."""
 
     # ─── Daemon → Client (outbound, made by _make_* helpers) ─────────
 
@@ -289,11 +326,12 @@ class MessageType(str, Enum):  # noqa: UP042 — pydantic-to-typescript requires
     Emitted whenever ``RuntimeDaemon.set_quiet_mode`` runs (whether
     armed by the dashboard menu, the overlay footer, the global
     keyboard shortcut, or the existing F26 frustration-spiral path).
-    Payload: ``{kind: "snooze_15" | "quiet_session" | "pause" | "off",
-    duration_minutes: int | None, ends_at: float | None, source: str}``
-    where ``ends_at`` is a unix timestamp (seconds) and ``source``
-    identifies the originator (``"dashboard"`` / ``"overlay"`` /
-    ``"tray"`` / ``"shortcut"`` / ``"daemon"``)."""
+    Payload mirrors :class:`cortex.libs.schemas.realtime.QuietModeState`:
+    ``{kind: "snooze_15" | "quiet_session" | "pause" | "off",
+    duration_minutes: float | None, ends_at: float | None,
+    source: "dashboard" | "overlay" | "tray" | "shortcut" | "popup" |
+    "vscode" | "os_notification" | "settings_sync" | "daemon" |
+    "daemon_decay"}`` where ``ends_at`` is a unix timestamp (seconds)."""
 
     START_FOCUS_AUTO = "START_FOCUS_AUTO"
     """P0 §3.10: daemon-armed focus session start directive.
@@ -314,6 +352,50 @@ class MessageType(str, Enum):  # noqa: UP042 — pydantic-to-typescript requires
     user disarm; the browser extension calls ``stopFocusSession`` only
     if the daemon was the one that armed the current session. Payload:
     ``{reason: str}``."""
+
+    INTERVENTION_FAILED = "INTERVENTION_FAILED"
+    """Phase-4b: emitted when ``InterventionExecutor.apply`` returned
+    only failed mutations and the workspace was NOT actually mutated.
+
+    Distinct from :attr:`INTERVENTION_TRIGGER` (which still fires for
+    suggested-action-only plans). Payload:
+    ``{intervention_id: str, error_reason: str,
+    failed_action_types: list[str]}``.
+    """
+
+    INTERVENTION_PROMPT = "INTERVENTION_PROMPT"
+    """Phase-4b: WS broadcast for the prompt-only adapter hooks
+    (``prompt_micro_commit`` / ``suggest_movement_break``).
+
+    Emitted by the :class:`InterventionExecutor` via the daemon's
+    ``_broadcast_prompt`` hook when the active plan carries one of these
+    action types. Payload:
+    ``{action_type: str, prompt: str, timeout_seconds: int | None,
+    metadata: dict}``.
+    """
+
+    COST_RESPONSE = "COST_RESPONSE"
+    """P0 §3.15: reply to :attr:`COST_REQUEST` plus a push broadcast on
+    every plan-finalised event so the UI's cost meter updates without
+    polling lag. Payload mirrors :class:`CostResponse` —
+    ``{cost_today: float, budget_today: float, provider: str | None,
+    budget_exhausted: bool}``."""
+
+    TEST_PROVIDER_RESULT = "TEST_PROVIDER_RESULT"
+    """P0 §3.19: reply to :attr:`TEST_PROVIDER`. Payload mirrors
+    :class:`TestProviderResult` — ``{provider: str, ok: bool,
+    latency_ms: float | None, error: str | None}``."""
+
+    RAISE_DASHBOARD = "RAISE_DASHBOARD"
+    """Phase-4b: instruct the desktop shell to raise its window.
+
+    Emitted in response to ``POST /dashboard/raise`` so any surface
+    (browser extension, VS Code, external tool) can bring the dashboard
+    to the foreground. Payload: ``{target: str | None}`` — the ``target``
+    string is a free-form hint (e.g. ``"history"``, ``"trends"``) the
+    shell may use to pick a starting tab; ``None`` opens to the default
+    tab.
+    """
 
     # ─── LeetCode adapter cues (Daemon → Chrome, target_client_types=["chrome"]) ─
     # Emitted by ``LeetCodeAdapter.execute`` via

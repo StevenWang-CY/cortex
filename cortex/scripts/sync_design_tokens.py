@@ -64,6 +64,27 @@ def _py_const(name: str, value: object) -> str:
     return f"{name}: Final[int] = {value!r}\n"
 
 
+def _rgba_str_to_tuple(rgba_str: str) -> tuple[int, int, int, int]:
+    """Parse a ``rgba(R, G, B, A)`` literal into a 4-int tuple.
+
+    Accepts both 0-255 integer and 0.0-1.0 float alpha; normalises to
+    integer 0-255 for QColor consumption.
+    """
+    inner = rgba_str.strip()
+    if inner.startswith("rgba"):
+        inner = inner[inner.index("(") + 1 : inner.rindex(")")]
+    parts = [p.strip() for p in inner.split(",")]
+    if len(parts) != 4:
+        raise ValueError(f"malformed rgba literal: {rgba_str!r}")
+    r, g, b = (int(parts[0]), int(parts[1]), int(parts[2]))
+    a_raw = parts[3]
+    if "." in a_raw:
+        a = int(round(float(a_raw) * 255))
+    else:
+        a = int(a_raw)
+    return (r, g, b, a)
+
+
 def emit_python(data: dict[str, Any]) -> str:
     out: list[str] = [_PY_HEADER]
 
@@ -71,6 +92,8 @@ def emit_python(data: dict[str, Any]) -> str:
     out.append("# --- Brand (preserved across the macOS-native refactor) ---\n")
     out.append(_py_const("BRAND_ACCENT", brand["accent"]["hex"]))
     out.append(_py_const("BRAND_ACCENT_HOVER", brand["accent_hover"]["hex"]))
+    if "accent_pressed" in brand:
+        out.append(_py_const("BRAND_ACCENT_PRESSED", brand["accent_pressed"]["hex"]))
     out.append(_py_const("BRAND_ACCENT_DARK", brand["accent_dark"]["hex"]))
     out.append(_py_const("BRAND_ACCENT_DIM", brand["accent_dim"]["rgba"]))
     out.append(_py_const("BRAND_ACCENT_SUBTLE", brand["accent_subtle"]["rgba"]))
@@ -154,6 +177,55 @@ def emit_python(data: dict[str, Any]) -> str:
     out.append(_py_const("POPUP_MAX_HEIGHT", dim["popup"]["max_height"]))
     out.append(_py_const("BREATHING_PACER_SIZE", dim["panel"]["breathing_pacer_size"]))
     out.append("\n")
+
+    # --- HUD palette (break overlay + intervention HUD) ---
+    out.append("# --- HUD palette (intervention HUD vibrancy) ---\n")
+    out.append("# Wrap each tuple in QColor at call site; the alpha is calibrated for\n")
+    out.append("# WCAG AA contrast against the dark vibrancy material.\n")
+    out.append("TEXT_HUD_PRIMARY: Final[tuple[int, int, int, int]] = (255, 255, 255, 235)\n")
+    out.append("TEXT_HUD_SECONDARY: Final[tuple[int, int, int, int]] = (255, 255, 255, 150)\n")
+    out.append("TEXT_HUD_TERTIARY: Final[tuple[int, int, int, int]] = (255, 255, 255, 100)\n")
+    out.append("HUD_ACCENT: Final[tuple[int, int, int, int]] = (217, 119, 87, 255)\n")
+    out.append("\n")
+    if "hud" in data:
+        hud = data["hud"]
+        out.append("# --- HUD palette extensions (break overlay + HUD shell) ---\n")
+        out.append("# Each value is an (R, G, B, A) tuple ready to wrap in QColor.\n")
+        for key in (
+            "bg_primary", "bg_secondary",
+            "surface_dim", "surface_emphasis", "border_dim",
+            "accent_ring", "halo",
+        ):
+            if key not in hud:
+                continue
+            tup = _rgba_str_to_tuple(hud[key]["rgba"])
+            out.append(f"HUD_{key.upper()}: Final[tuple[int, int, int, int]] = {tup!r}\n")
+        out.append("\n")
+
+    # --- Color-blind palette variants ---
+    if "palette_variants" in data:
+        out.append("# --- Palette variants for color-blind accessibility ---\n")
+        out.append("# Maps palette name -> {state_name: hex} for STATE_COLORS swap.\n")
+        out.append("PALETTE_VARIANTS: Final[dict[str, dict[str, str]]] = {\n")
+        light_sem = data["semantic"]["light"]
+        for variant_name, variant_map in data["palette_variants"].items():
+            out.append(f'    "{variant_name}": {{\n')
+            for state_name, state_value in variant_map.items():
+                if isinstance(state_value, dict) and "hex" in state_value:
+                    hex_value = state_value["hex"]
+                elif isinstance(state_value, str):
+                    role = state_value
+                    if role == "brand":
+                        hex_value = brand["accent"]["hex"]
+                    elif role in light_sem:
+                        hex_value = light_sem[role]["hex"]
+                    else:
+                        hex_value = "#999999"
+                else:
+                    hex_value = "#999999"
+                out.append(f'        "{state_name}": "{hex_value}",\n')
+            out.append("    },\n")
+        out.append("}\n\n")
 
     out.append("# --- Backward-compatible aliases (do not remove without callsite sweep) ---\n")
     out.append('CX_BG: Final[str] = SEMANTIC_LIGHT["window_bg"]\n')

@@ -183,9 +183,13 @@ def _keychain_get_bedrock_token(config: LLMConfig) -> str | None:
     if not config.use_keychain or config.provider != "bedrock":
         return None
     try:
-        import keyring  # noqa: PLC0415 — intentional lazy import
+        # Phase-4a Debt-1: route through ``get_password_safe`` so a
+        # wedged macOS Keychain prompt cannot pin the planner-init
+        # call for tens of seconds. The helper enforces a 5 s wall-
+        # clock ceiling and returns ``None`` on timeout.
+        from cortex.libs.utils.secrets import get_password_safe  # noqa: PLC0415
 
-        return keyring.get_password(
+        return get_password_safe(
             config.bedrock.keychain_service,
             config.bedrock.keychain_account,
         )

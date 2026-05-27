@@ -12,7 +12,8 @@ Endpoints:
 - Intervention control
 - Health & status
 
-Configuration: APIConfig (host=127.0.0.1, port=9472)
+Configuration: APIConfig (host=127.0.0.1; ports from
+``cortex.libs.config.ports``: HTTP_API_PORT / WEBSOCKET_PORT)
 """
 
 from __future__ import annotations
@@ -147,12 +148,15 @@ def create_app(
 
     # CORS — allow local extensions to connect. Expose the request-id
     # header so browser-side clients can read it off responses.
+    # Phase-4b TASK L: the static origin allowlist now lives on
+    # APIConfig.cors_allow_origins so deployments can extend it via
+    # config rather than patching this file.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[
+        allow_origins=list(getattr(cfg, "cors_allow_origins", []) or [
             "http://localhost",
             "http://127.0.0.1",
-        ],
+        ]),
         allow_origin_regex=(
             r"^(https?://(localhost|127\.0\.0\.1)(:\d+)?"
             r"|chrome-extension://[a-p]{32}"

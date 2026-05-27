@@ -130,7 +130,7 @@ async def _run(args: argparse.Namespace) -> None:
     print(f"  Mouse Variance:   {baselines.mouse_variance_baseline:.0f}")
     print(f"  Shoulder Y:       {baselines.shoulder_neutral_y:.3f}")
     print(f"  Calibrated At:    {baselines.calibrated_at}")
-    print(f"\nBaseline saved to: storage/baselines/default.json")
+    print("\nBaseline saved to: storage/baselines/default.json")
 
 
 def main() -> None:

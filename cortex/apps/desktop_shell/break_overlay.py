@@ -48,7 +48,33 @@ from PySide6.QtGui import (
 from PySide6.QtMultimedia import QSoundEffect
 from PySide6.QtWidgets import QPushButton, QWidget
 
+from cortex.apps.desktop_shell.tokens import (
+    FONT_SYSTEM,
+    FS_CAPTION,
+    HUD_ACCENT,
+    HUD_ACCENT_RING,
+    HUD_BG_PRIMARY,
+    HUD_BG_SECONDARY,
+    HUD_HALO,
+    HUD_SURFACE_DIM,
+    HUD_SURFACE_EMPHASIS,
+    RADIUS_WINDOW,
+    TEXT_HUD_PRIMARY,
+)
+
 logger = logging.getLogger(__name__)
+
+
+def _rgba_css(t: tuple[int, int, int, int]) -> str:
+    """Format an (R,G,B,A 0-255) tuple as a Qt-stylesheet ``rgba()`` literal."""
+    return f"rgba({t[0]}, {t[1]}, {t[2]}, {t[3]})"
+
+
+_BG_PRIMARY_CSS = "#{:02x}{:02x}{:02x}".format(*HUD_BG_PRIMARY[:3])
+_SURFACE_DIM_CSS = _rgba_css(HUD_SURFACE_DIM)
+_SURFACE_EMPHASIS_CSS = _rgba_css(HUD_SURFACE_EMPHASIS)
+_ACCENT_RING_CSS = _rgba_css(HUD_ACCENT_RING)
+_TEXT_HUD_PRIMARY_CSS = _rgba_css(TEXT_HUD_PRIMARY)
 
 # Reveal the "End early" affordance only after this many seconds so the
 # user does not bail before the breathing pattern has any chance of
@@ -117,27 +143,29 @@ class _BreathingCanvas(QWidget):
             r = float(min(rect.width(), rect.height())) * self._radius_ratio
 
             # Background gradient — soft black at the edges so the circle
-            # halo blends into the dim overlay.
+            # halo blends into the dim overlay. Driven by HUD_BG tokens so
+            # the warmth + luma stay consistent across surfaces.
             grad = QLinearGradient(0, 0, 0, rect.height())
-            grad.setColorAt(0.0, QColor(8, 10, 14))
-            grad.setColorAt(1.0, QColor(4, 5, 7))
+            grad.setColorAt(0.0, QColor(*HUD_BG_PRIMARY))
+            grad.setColorAt(1.0, QColor(*HUD_BG_SECONDARY))
             painter.fillRect(rect, grad)
 
-            # Outer halo (soft ring).
-            painter.setBrush(QColor(217, 119, 87, 24))  # warm accent, very low alpha
+            # Outer halo (soft ring) — token: warm accent, very low alpha.
+            painter.setBrush(QColor(*HUD_HALO))
             painter.setPen(Qt.PenStyle.NoPen)
             painter.drawEllipse(QPointF(cx, cy), r * 1.45, r * 1.45)
 
-            # Main breathing disc.
-            painter.setBrush(QColor(245, 235, 220, 32))  # warm-cream low alpha
-            ring_pen = QPen(QColor(217, 119, 87, 200))
+            # Main breathing disc. Warm-cream low alpha is local to this
+            # widget (no shared token); the ring uses HUD_ACCENT.
+            painter.setBrush(QColor(245, 235, 220, 32))
+            ring_pen = QPen(QColor(HUD_ACCENT[0], HUD_ACCENT[1], HUD_ACCENT[2], 200))
             ring_pen.setWidth(2)
             painter.setPen(ring_pen)
             painter.drawEllipse(QPointF(cx, cy), r, r)
 
             # Phase label in the center.
-            painter.setPen(QColor(232, 222, 207))
-            phase_font = QFont("Inter", 28)
+            painter.setPen(QColor(*TEXT_HUD_PRIMARY))
+            phase_font = QFont(FONT_SYSTEM.split(",")[0].strip(), 28)
             phase_font.setWeight(QFont.Weight.Medium)
             painter.setFont(phase_font)
             painter.drawText(
@@ -169,7 +197,7 @@ class BreakOverlayWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setStyleSheet("background-color: #0a0a0c;")
+        self.setStyleSheet(f"background-color: {_BG_PRIMARY_CSS};")
 
         self._canvas = _BreathingCanvas(self)
         self._end_early_btn: QPushButton | None = None
@@ -230,15 +258,15 @@ class BreakOverlayWindow(QWidget):
             btn = QPushButton("End early", self)
             btn.setStyleSheet(
                 "QPushButton {"
-                "  background: rgba(255, 255, 255, 0.06);"
-                "  color: rgba(232, 222, 207, 0.92);"
-                "  border: 1px solid rgba(217, 119, 87, 0.45);"
-                "  border-radius: 10px;"
+                f"  background: {_SURFACE_DIM_CSS};"
+                f"  color: {_TEXT_HUD_PRIMARY_CSS};"
+                f"  border: 1px solid {_ACCENT_RING_CSS};"
+                f"  border-radius: {RADIUS_WINDOW}px;"
                 "  padding: 8px 18px;"
-                "  font-family: Inter, system-ui, sans-serif;"
-                "  font-size: 12px;"
+                f"  font-family: {FONT_SYSTEM};"
+                f"  font-size: {FS_CAPTION}px;"
                 "}"
-                "QPushButton:hover { background: rgba(255, 255, 255, 0.10); }"
+                f"QPushButton:hover {{ background: {_SURFACE_EMPHASIS_CSS}; }}"
             )
             btn.clicked.connect(self._end_early)
             btn.hide()

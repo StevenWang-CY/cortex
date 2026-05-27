@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -49,7 +49,7 @@ _RETENTION_DAYS: int = 90
 
 def _today_iso(now: datetime | None = None) -> str:
     """Return the local-midnight calendar date as ``YYYY-MM-DD``."""
-    return (now or datetime.now()).date().isoformat()
+    return (now or datetime.now(UTC)).date().isoformat()
 
 
 def _prune_old(
@@ -205,7 +205,7 @@ class CostTracker:
         if usd < 0:
             raise ValueError(f"usd must be non-negative; got {usd!r}")
         cid_key = cid or "-"
-        moment = now or datetime.now()
+        moment = now or datetime.now(UTC)
         today = _today_iso(moment)
         with self._lock:
             day = self._day(today)
@@ -272,7 +272,7 @@ class CostTracker:
         ``WARN`` and ``KILL`` events are emitted at most once per day so
         a high-frequency caller does not spam the log aggregator.
         """
-        moment = now or datetime.now()
+        moment = now or datetime.now(UTC)
         today = _today_iso(moment)
         total = self.today_total_usd(now=moment)
         if total >= self._kill_usd:

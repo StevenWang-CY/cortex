@@ -8,7 +8,6 @@ back to the original investigation.
 from __future__ import annotations
 
 import asyncio
-import time
 from types import SimpleNamespace
 
 import pytest
@@ -18,7 +17,6 @@ from cortex.services.consent.policy import (
     REVERSIBLE_ACT,
     ConsentPolicy,
 )
-
 
 # ----------------------------------------------------------------------
 # Fakes shared across tests

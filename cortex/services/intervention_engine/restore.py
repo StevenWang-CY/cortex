@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 
 from cortex.libs.schemas.intervention import (
     InterventionOutcome,
@@ -53,7 +53,7 @@ def merge_micro_steps(
     if len(old) != len(new):
         return list(new)
     merged: list[MicroStep] = []
-    for old_step, new_step in zip(old, new):
+    for old_step, new_step in zip(old, new, strict=True):
         if old_step.text == new_step.text:
             merged.append(old_step)
         else:
@@ -283,8 +283,8 @@ class RestoreManager:
 
         outcome = InterventionOutcome(
             intervention_id=iid,
-            started_at=datetime.now(),  # approximate
-            ended_at=datetime.now(),
+            started_at=datetime.now(UTC),  # approximate
+            ended_at=datetime.now(UTC),
             duration_seconds=duration,
             user_action=user_action,
             recovery_detected=is_recovery,

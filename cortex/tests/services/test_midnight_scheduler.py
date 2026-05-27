@@ -17,10 +17,8 @@ directly without sleeping.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
-
-import pytest
 
 from cortex.services.session_report.scheduler import (
     MidnightScheduler,

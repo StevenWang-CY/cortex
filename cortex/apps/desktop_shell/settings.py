@@ -25,9 +25,11 @@ from PySide6.QtCore import QMutex, QSettings, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSlider,
@@ -212,6 +214,20 @@ class SettingsDialog(QWidget):
     # the Sensing section. Controller routes to the same in-process
     # CalibrationRunner code path as the onboarding wizard.
     recalibrate_requested = Signal()
+    # P0 §3.19: emitted when the user clicks "Test connection" in the
+    # LLM backend section. Phase 4b's daemon handles TEST_PROVIDER → the
+    # desktop renders the result via :meth:`apply_provider_test_result`.
+    # Payload is the current provider key (e.g. "bedrock", "vertex",
+    # "anthropic", "rule_based").
+    test_provider_requested = Signal(str)
+    # P0 §3.15: emitted when the user changes the daily LLM cap.
+    # Controller (or Phase 4b daemon's settings sync) consumes the
+    # value via the SETTINGS_SYNC channel. Payload is USD.
+    daily_budget_changed = Signal(float)
+    # P0 §3.25: emitted when the user picks a new accessibility
+    # palette in the dropdown. Payload is the palette name
+    # ("default" / "deuteranopia" / "protanopia" / "tritanopia").
+    palette_changed = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -613,7 +629,190 @@ class SettingsDialog(QWidget):
         self._llm_backend.setStyleSheet(_COMBO_QSS)
         llm_inner.addWidget(self._llm_backend)
 
+        # P0 §3.19: provider status pill + "Test connection" button.
+        # The pill shows the last known result of a test, e.g.
+        # "Bedrock ✓ 142 ms" or "Vertex ✗ token expired". Phase 4b
+        # owns the WS messages TEST_PROVIDER / TEST_PROVIDER_RESULT; we
+        # stub the desktop UI and document the contract.
+        provider_row = QHBoxLayout()
+        provider_row.setContentsMargins(0, 0, 0, 0)
+        provider_row.setSpacing(SP2)
+        self._provider_status_pill = QLabel("Status unknown")
+        self._provider_status_pill.setFont(
+            mac_native.system_font(FS_CAPTION, "regular"),
+        )
+        self._provider_status_pill.setStyleSheet(
+            "QLabel {"
+            "  padding: 2px 10px;"
+            f"  border-radius: {RADIUS_BUTTON}px;"
+            f"  color: {_LABEL_SECONDARY};"
+            f"  background: {_GROUPED_BG};"
+            "}"
+        )
+        provider_row.addWidget(self._provider_status_pill, stretch=1)
+        self._test_provider_btn = QPushButton("Test connection")
+        self._test_provider_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._test_provider_btn.setFont(
+            mac_native.system_font(FS_CAPTION, "medium"),
+        )
+        self._test_provider_btn.setStyleSheet(
+            "QPushButton {"
+            "  padding: 4px 10px;"
+            f"  border-radius: {RADIUS_BUTTON}px;"
+            "  background: transparent;"
+            f"  color: {_LABEL};"
+            f"  border: 0.5px solid {_SEPARATOR};"
+            "}"
+            "QPushButton:hover { background: rgba(0,0,0,0.03); }"
+        )
+        self._test_provider_btn.clicked.connect(self._on_test_provider_clicked)
+        provider_row.addWidget(self._test_provider_btn)
+        llm_inner.addLayout(provider_row)
+
         layout.addWidget(llm_card)
+
+        # ── Budget (P0 §3.15) ────────────────────────────────────────
+        budget_label = QLabel("Budget")
+        budget_label.setStyleSheet(_SECTION_HEADING_QSS)
+        layout.addWidget(budget_label)
+
+        budget_card = self._make_card()
+        budget_inner = QVBoxLayout(budget_card)
+        budget_inner.setContentsMargins(SP4, SP4, SP4, SP4)
+        budget_inner.setSpacing(SP3)
+
+        # Daily cap row. ``$ X.XX / day`` — anything > 0 enables the
+        # daemon's kill-switch.
+        cap_row = QHBoxLayout()
+        cap_label = QLabel("Daily LLM cap")
+        cap_label.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
+        cap_label.setStyleSheet(f"color: {_LABEL}; background: transparent;")
+        cap_row.addWidget(cap_label)
+        cap_row.addStretch()
+        self._budget_daily_spin = QDoubleSpinBox()
+        self._budget_daily_spin.setDecimals(2)
+        self._budget_daily_spin.setRange(0.0, 50.0)
+        self._budget_daily_spin.setSingleStep(0.25)
+        self._budget_daily_spin.setValue(1.50)
+        self._budget_daily_spin.setSuffix(" USD")
+        self._budget_daily_spin.setMinimumWidth(96)
+        cap_row.addWidget(self._budget_daily_spin)
+        budget_inner.addLayout(cap_row)
+
+        self._budget_today_label = QLabel("Cost so far today: pending…")
+        self._budget_today_label.setFont(
+            mac_native.system_font(FS_CAPTION, "regular"),
+        )
+        self._budget_today_label.setStyleSheet(
+            f"color: {_LABEL_SECONDARY}; background: transparent;"
+        )
+        budget_inner.addWidget(self._budget_today_label)
+
+        budget_help = QLabel(
+            "Cortex pauses Claude calls and falls back to the rule-based "
+            "planner once the daily cap is reached. 0 disables the cap."
+        )
+        budget_help.setFont(mac_native.system_font(FS_CAPTION, "regular"))
+        budget_help.setWordWrap(True)
+        budget_help.setStyleSheet(
+            f"color: {_LABEL_TERTIARY}; background: transparent;"
+        )
+        budget_inner.addWidget(budget_help)
+
+        layout.addWidget(budget_card)
+
+        # ── Accessibility (P0 §3.25) ─────────────────────────────────
+        a11y_label = QLabel("Accessibility")
+        a11y_label.setStyleSheet(_SECTION_HEADING_QSS)
+        layout.addWidget(a11y_label)
+        a11y_card = self._make_card()
+        a11y_inner = QVBoxLayout(a11y_card)
+        a11y_inner.setContentsMargins(SP4, SP4, SP4, SP4)
+        a11y_inner.setSpacing(SP3)
+
+        palette_row = QHBoxLayout()
+        palette_label = QLabel("Color palette")
+        palette_label.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
+        palette_label.setStyleSheet(f"color: {_LABEL}; background: transparent;")
+        palette_row.addWidget(palette_label)
+        palette_row.addStretch()
+        self._palette_combo = QComboBox()
+        self._palette_combo.addItem("Default", "default")
+        self._palette_combo.addItem("Deuteranopia (red/green)", "deuteranopia")
+        self._palette_combo.addItem("Protanopia", "protanopia")
+        self._palette_combo.addItem("Tritanopia", "tritanopia")
+        self._palette_combo.setFont(
+            mac_native.system_font(FS_FOOTNOTE, "regular"),
+        )
+        self._palette_combo.setStyleSheet(_COMBO_QSS)
+        try:
+            self._palette_combo.activated.connect(self._on_palette_changed)
+        except Exception:
+            logger.debug("palette combo connect failed", exc_info=True)
+        palette_row.addWidget(self._palette_combo)
+        a11y_inner.addLayout(palette_row)
+
+        a11y_help = QLabel(
+            "Swap the state palette to a color-blind-safe variant. "
+            "Restart Cortex to apply the new colors everywhere."
+        )
+        a11y_help.setFont(mac_native.system_font(FS_CAPTION, "regular"))
+        a11y_help.setWordWrap(True)
+        a11y_help.setStyleSheet(
+            f"color: {_LABEL_TERTIARY}; background: transparent;"
+        )
+        a11y_inner.addWidget(a11y_help)
+        layout.addWidget(a11y_card)
+
+        # ── Weekly schedule (P0 §3.20) ───────────────────────────────
+        sched_label = QLabel("Weekly schedule")
+        sched_label.setStyleSheet(_SECTION_HEADING_QSS)
+        layout.addWidget(sched_label)
+        sched_card = self._make_card()
+        sched_inner = QVBoxLayout(sched_card)
+        sched_inner.setContentsMargins(SP4, SP4, SP4, SP4)
+        sched_inner.setSpacing(SP2)
+
+        # 7 rows (Mon-Sun), 4 time slots each (morning / midday /
+        # afternoon / evening). Each slot is a small QComboBox with
+        # ``on`` / ``quiet`` / ``off`` so the daemon can consult the
+        # schedule before surfacing interventions outside the working
+        # window. The schedule is persisted into QSettings under
+        # ``weekly_schedule`` (a JSON-encoded dict).
+        self._schedule_combos: dict[str, list[QComboBox]] = {}
+        self._SCHEDULE_DAYS = (
+            "monday", "tuesday", "wednesday",
+            "thursday", "friday", "saturday", "sunday",
+        )
+        self._SCHEDULE_SLOTS = ("morning", "midday", "afternoon", "evening")
+        header_row = QHBoxLayout()
+        header_row.addWidget(QLabel(""), stretch=1)
+        for slot in self._SCHEDULE_SLOTS:
+            lab = QLabel(slot.title())
+            lab.setFont(mac_native.system_font(FS_CAPTION, "medium"))
+            lab.setStyleSheet(
+                f"color: {_LABEL_SECONDARY}; background: transparent;"
+            )
+            header_row.addWidget(lab, stretch=1)
+        sched_inner.addLayout(header_row)
+        for day in self._SCHEDULE_DAYS:
+            row = QHBoxLayout()
+            day_label = QLabel(day[:3].title())
+            day_label.setFont(mac_native.system_font(FS_CAPTION, "regular"))
+            day_label.setStyleSheet(
+                f"color: {_LABEL}; background: transparent;"
+            )
+            row.addWidget(day_label, stretch=1)
+            combos: list[QComboBox] = []
+            for _ in self._SCHEDULE_SLOTS:
+                cb = QComboBox()
+                cb.addItems(["on", "quiet", "off"])
+                cb.setStyleSheet(_COMBO_QSS)
+                combos.append(cb)
+                row.addWidget(cb, stretch=1)
+            self._schedule_combos[day] = combos
+            sched_inner.addLayout(row)
+        layout.addWidget(sched_card)
 
         # ── Security ────────────────────────────────────────────────
         # Audit Debt-2 Commit 5: the capability token gates every
@@ -1027,6 +1226,20 @@ class SettingsDialog(QWidget):
             if line.strip()
         ]
 
+        # P0 §3.20: weekly schedule serialized as JSON-friendly dict.
+        weekly_schedule: dict[str, list[str]] = {}
+        for day in self._SCHEDULE_DAYS:
+            combos = self._schedule_combos.get(day, [])
+            weekly_schedule[day] = [c.currentText() for c in combos]
+
+        # P0 §3.25: accessibility palette key.
+        try:
+            palette_value = self._palette_combo.itemData(
+                self._palette_combo.currentIndex()
+            ) or "default"
+        except Exception:
+            palette_value = "default"
+
         return {
             "webcam_enabled": self._webcam_enabled.isChecked(),
             "input_telemetry_enabled": self._input_telemetry_enabled.isChecked(),
@@ -1047,6 +1260,12 @@ class SettingsDialog(QWidget):
             "auto_distraction_block_custom_domains": custom_domains,
             # P0 §3.12: OS-level notification routing
             "enable_os_notifications": self._os_notifications.isChecked(),
+            # P0 §3.15: daily LLM budget cap (USD; 0 = unlimited).
+            "daily_llm_budget_usd": float(self._budget_daily_spin.value()),
+            # P0 §3.20: weekly schedule rules.
+            "weekly_schedule": weekly_schedule,
+            # P0 §3.25: color-blind palette variant.
+            "palette_variant": str(palette_value),
         }
 
     def _apply_settings(self) -> None:
@@ -1091,6 +1310,9 @@ class SettingsDialog(QWidget):
     def _persist_settings(self, settings: dict) -> None:
         """Push every setting into QSettings and trigger a sync().
 
+        P0 §3.20: weekly_schedule round-trips as JSON because QSettings'
+        backing INI dialect cannot encode nested dicts portably.
+
         F53: sync() can fail silently (NoError but no actual on-disk
         write) on a read-only filesystem, in a sandbox container with a
         revoked ACL, or with the disk full. Prior code swallowed every
@@ -1100,9 +1322,14 @@ class SettingsDialog(QWidget):
         ``settings_save_failed(reason)`` so the controller can surface
         the failure.
         """
+        import json as _json
         for key, value in settings.items():
             try:
-                self._qs.setValue(key, value)
+                if isinstance(value, dict):
+                    # QSettings dicts round-trip as JSON strings.
+                    self._qs.setValue(key, _json.dumps(value, separators=(",", ":")))
+                else:
+                    self._qs.setValue(key, value)
             except Exception:
                 # Per-key set failures are rare and per-key recoverable;
                 # we continue setting the rest and let the sync() pass
@@ -1151,6 +1378,145 @@ class SettingsDialog(QWidget):
         except Exception:
             pass
         return f"QSettings status={status!r}"
+
+    def _on_palette_changed(self, index: int) -> None:
+        """P0 §3.25: persist + activate the chosen palette variant.
+
+        We update the runtime palette immediately so future state-colour
+        lookups respect the choice; existing widgets keep their pre-swap
+        colour until next paint, hence the QMessageBox suggesting a
+        restart for a fully consistent swap.
+        """
+        try:
+            value = self._palette_combo.itemData(index) or "default"
+        except Exception:
+            value = "default"
+        try:
+            from cortex.apps.desktop_shell.palette_runtime import set_active_palette
+            set_active_palette(str(value))
+        except Exception:
+            logger.debug("palette runtime swap failed", exc_info=True)
+        try:
+            self.palette_changed.emit(str(value))
+        except Exception:
+            pass
+        if value != "default":
+            try:
+                QMessageBox.information(
+                    self,
+                    "Restart to apply",
+                    "Restart Cortex to apply the new color palette everywhere.",
+                )
+            except Exception:
+                logger.debug("palette restart dialog failed", exc_info=True)
+
+    def _on_test_provider_clicked(self) -> None:
+        """P0 §3.19: emit ``test_provider_requested`` carrying the
+        provider key the user selected in the dropdown. The controller
+        forwards to the daemon via the ``TEST_PROVIDER`` WS message;
+        the daemon's reply lands in :meth:`apply_provider_test_result`.
+
+        While the test is in flight the pill shows "Testing…" so the
+        user knows the click registered.
+        """
+        llm_modes = ["bedrock", "vertex", "direct", "rule_based"]
+        try:
+            idx = self._llm_backend.currentIndex()
+        except Exception:
+            idx = 0
+        provider = llm_modes[idx] if 0 <= idx < len(llm_modes) else "bedrock"
+        try:
+            self._provider_status_pill.setText("Testing…")
+            self._provider_status_pill.setStyleSheet(
+                "QLabel {"
+                "  padding: 2px 10px;"
+                f"  border-radius: {RADIUS_BUTTON}px;"
+                f"  color: {_LABEL};"
+                f"  background: {_GROUPED_BG};"
+                "}"
+            )
+        except Exception:
+            pass
+        try:
+            self.test_provider_requested.emit(provider)
+        except Exception:
+            logger.debug("test_provider_requested emit failed", exc_info=True)
+
+    def apply_provider_test_result(self, payload: dict) -> None:
+        """Render the result of a TEST_PROVIDER round-trip.
+
+        Payload keys: ``provider`` (str), ``ok`` (bool),
+        ``latency_ms`` (int|None), ``error`` (str|None). The pill flips
+        to the result colour and quotes the latency (success) or error
+        (failure).
+        """
+        if not isinstance(payload, dict):
+            return
+        provider = str(payload.get("provider") or "")
+        ok = bool(payload.get("ok"))
+        latency = payload.get("latency_ms")
+        error = str(payload.get("error") or "")
+        label_map = {
+            "bedrock": "Bedrock",
+            "vertex": "Vertex",
+            "direct": "Anthropic",
+            "rule_based": "Rule-based",
+        }
+        nice = label_map.get(provider, provider or "Provider")
+        if ok:
+            if isinstance(latency, (int, float)):
+                text = f"{nice} ✓ {int(latency)} ms"
+            else:
+                text = f"{nice} ✓"
+            color = SEMANTIC_LIGHT["success"]
+        else:
+            text = f"{nice} ✗ {error[:40]}" if error else f"{nice} ✗"
+            color = SEMANTIC_LIGHT["danger"]
+        try:
+            self._provider_status_pill.setText(text)
+            self._provider_status_pill.setStyleSheet(
+                "QLabel {"
+                "  padding: 2px 10px;"
+                f"  border-radius: {RADIUS_BUTTON}px;"
+                f"  color: {color};"
+                f"  background: {_GROUPED_BG};"
+                "}"
+            )
+        except Exception:
+            logger.debug("provider pill update failed", exc_info=True)
+
+    def apply_cost_response(self, payload: dict) -> None:
+        """P0 §3.15: render the running daily spend in the Budget panel.
+
+        Payload keys: ``cost_today`` (float USD), ``budget_today`` (float;
+        ``budget_usd`` is honoured as a legacy alias). The controller
+        calls this in response to the COST_RESPONSE WS message; the Phase
+        4 follow-up wires the daemon side.
+        """
+        if not isinstance(payload, dict):
+            return
+        try:
+            cost = float(payload.get("cost_today") or 0.0)
+        except (TypeError, ValueError):
+            cost = 0.0
+        # Accept the new ``budget_today`` wire key first; fall back to the
+        # legacy ``budget_usd`` so older daemon builds still render.
+        try:
+            budget = float(
+                payload.get("budget_today")
+                or payload.get("budget_usd")
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            budget = 0.0
+        if budget > 0:
+            line = f"Cost so far today: ${cost:.2f} of ${budget:.2f}"
+        else:
+            line = f"Cost so far today: ${cost:.2f}"
+        try:
+            self._budget_today_label.setText(line)
+        except Exception:
+            logger.debug("budget label update failed", exc_info=True)
 
     def _on_rotate_token(self) -> None:
         """Audit Debt-2 Commit 5: mint a fresh capability token, drop
@@ -1262,6 +1628,47 @@ class SettingsDialog(QWidget):
             self._os_notifications.setChecked(
                 _get_bool("enable_os_notifications", True),
             )
+            # P0 §3.15 — daily LLM budget cap.
+            try:
+                budget_raw = self._qs.value("daily_llm_budget_usd", 1.50)
+                self._budget_daily_spin.setValue(float(budget_raw))
+            except (TypeError, ValueError):
+                self._budget_daily_spin.setValue(1.50)
+            # P0 §3.20 — weekly schedule.
+            try:
+                import json as _json
+                schedule_raw = self._qs.value("weekly_schedule", "")
+                if isinstance(schedule_raw, str) and schedule_raw:
+                    schedule_dict = _json.loads(schedule_raw)
+                elif isinstance(schedule_raw, dict):
+                    schedule_dict = schedule_raw
+                else:
+                    schedule_dict = {}
+                for day, combos in self._schedule_combos.items():
+                    saved = schedule_dict.get(day, []) if isinstance(schedule_dict, dict) else []
+                    for idx, cb in enumerate(combos):
+                        if idx < len(saved):
+                            val = str(saved[idx])
+                            cb_idx = cb.findText(val) if hasattr(cb, "findText") else -1
+                            if cb_idx >= 0:
+                                cb.setCurrentIndex(cb_idx)
+            except Exception:
+                logger.debug("weekly schedule restore failed", exc_info=True)
+            # P0 §3.25 — palette variant.
+            try:
+                palette_value = str(self._qs.value("palette_variant", "default"))
+                for i in range(self._palette_combo.count()):
+                    if self._palette_combo.itemData(i) == palette_value:
+                        self._palette_combo.setCurrentIndex(i)
+                        break
+                # Apply at startup so the runtime helper returns the
+                # right palette from the very first state lookup.
+                from cortex.apps.desktop_shell.palette_runtime import (
+                    set_active_palette,
+                )
+                set_active_palette(palette_value)
+            except Exception:
+                logger.debug("palette restore failed", exc_info=True)
         except Exception:
             logger.debug("Failed to restore persisted settings", exc_info=True)
 

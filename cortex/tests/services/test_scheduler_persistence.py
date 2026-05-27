@@ -28,8 +28,6 @@ import json
 from datetime import date
 from pathlib import Path
 
-import pytest
-
 from cortex.services.session_report.scheduler import (
     _STATE_FILENAME,
     MidnightScheduler,

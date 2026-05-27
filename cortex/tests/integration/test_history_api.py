@@ -16,7 +16,7 @@ We register a tiny stub daemon in the service registry under the
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +29,7 @@ from cortex.libs.schemas.session_history import (
     SessionSummary,
     TrendsResponse,
 )
-from cortex.services.api_gateway.app import ServiceRegistry, create_app, registry
+from cortex.services.api_gateway.app import create_app, registry
 
 
 class _StubDaemon:

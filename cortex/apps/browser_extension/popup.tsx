@@ -26,12 +26,72 @@ function sendWithCid(
     console.debug(
         `cortex.popup.send cid=${correlation_id} type=${String(msg.type)}`,
     );
-    if (cb) {
-        chrome.runtime.sendMessage(enriched, cb);
-    } else {
-        chrome.runtime.sendMessage(enriched);
-    }
+    safeSendMessage(enriched, cb);
     return correlation_id;
+}
+
+/**
+ * Phase 4d Task B: every ``chrome.runtime.sendMessage`` callback in
+ * MV3 must consult ``chrome.runtime.lastError`` or Chrome surfaces an
+ * "Unchecked runtime.lastError" warning when the background SW was
+ * evicted mid-call. ``safeSendMessage`` centralises the lastError
+ * inspection and routes failures through the popup-wide error sink
+ * (``__cortexLastErrorSink``) that the toast renderer subscribes to.
+ *
+ * Callers that don't care about the response pass no callback; we
+ * still wrap so the lastError check fires.
+ */
+type RuntimeErrorSink = (msg: string) => void;
+let __cortexLastErrorSink: RuntimeErrorSink | null = null;
+export function __setLastErrorSink(fn: RuntimeErrorSink | null): void {
+    __cortexLastErrorSink = fn;
+}
+export function safeSendMessage(
+    msg: Record<string, unknown>,
+    cb?: (resp: unknown) => void,
+): void {
+    try {
+        chrome.runtime.sendMessage(msg, (response) => {
+            const lastErr = (chrome as unknown as {
+                runtime?: { lastError?: { message?: string } };
+            }).runtime?.lastError;
+            if (lastErr) {
+                if (
+                    typeof process !== "undefined"
+                    && process.env
+                    && process.env.CORTEX_DEBUG === "true"
+                ) {
+                    console.warn(
+                        "[cortex.popup] sendMessage",
+                        String(msg.type ?? "?"),
+                        lastErr.message,
+                    );
+                }
+                if (__cortexLastErrorSink) {
+                    __cortexLastErrorSink(
+                        lastErr.message ?? "background unavailable",
+                    );
+                }
+                return;
+            }
+            if (cb) cb(response);
+        });
+    } catch (err) {
+        if (
+            typeof process !== "undefined"
+            && process.env
+            && process.env.CORTEX_DEBUG === "true"
+        ) {
+            console.warn(
+                "[cortex.popup] sendMessage threw",
+                String(msg.type ?? "?"),
+                err,
+            );
+        }
+        if (__cortexLastErrorSink) {
+            __cortexLastErrorSink("background unavailable");
+        }
+    }
 }
 
 // Generated from Pydantic — Debt-1 closure (F42/F43/F44).
@@ -646,6 +706,14 @@ function CortexPopup(): React.ReactElement {
     const [recap, setRecap] = useState<SessionReport | null>(null);
     const [recapTimestamp, setRecapTimestamp] = useState<number | null>(null);
     const [historyStatus, setHistoryStatus] = useState<string>("");
+    // Phase 4d Task H / §3.24: in-app bug report.
+    const [bugReportOpen, setBugReportOpen] = useState(false);
+    const [bugReportText, setBugReportText] = useState("");
+    const [bugReportIncludeLogs, setBugReportIncludeLogs] = useState(true);
+    const [bugReportStatus, setBugReportStatus] = useState<
+        "idle" | "submitting" | "saved" | "queued" | "error"
+    >("idle");
+    const [bugReportError, setBugReportError] = useState<string>("");
 
     // Inject fonts + keyframes (single injection point)
     useEffect(() => {
@@ -771,13 +839,19 @@ function CortexPopup(): React.ReactElement {
     }, []);
 
     useEffect(() => {
-        chrome.runtime.sendMessage({ type: "GET_STATE" }, (resp) => {
+        safeSendMessage({ type: "GET_STATE" }, (raw) => {
+            const resp = raw as {
+                connected: boolean;
+                state: CortexState | null;
+                focusSession: FocusSnapshot | null;
+                intervention?: Record<string, unknown>;
+            } | undefined;
             if (!resp) return;
             setConnected(resp.connected);
             setState(resp.state);
             setFocus(resp.focusSession);
             if (resp.intervention) {
-                const p = resp.intervention as Record<string, unknown>;
+                const p = resp.intervention;
                 const rawActions = (p.suggested_actions as Record<string, unknown>[]) || [];
                 const recs = (p.tab_recommendations as TabRecommendations | undefined) ?? null;
                 setActiveActions(synthesizeActions(rawActions, recs));
@@ -788,16 +862,17 @@ function CortexPopup(): React.ReactElement {
                 setApplied(false);
             }
         });
-        chrome.runtime.sendMessage({ type: "GET_DAILY_STATS" }, (stats) => {
+        safeSendMessage({ type: "GET_DAILY_STATS" }, (raw) => {
+            const stats = raw as DailyStats | undefined;
             if (stats) setDailyStats(stats);
         });
         // G2 (audit-prod): ask the background script to re-run its
         // connectivity probe so the popup renders a fresh diagnostic
         // (native-host / daemon-version / handshake) at open time.
-        chrome.runtime.sendMessage({ type: "REQUEST_CONNECTIVITY_DIAGNOSTIC" });
+        safeSendMessage({ type: "REQUEST_CONNECTIVITY_DIAGNOSTIC" });
         // P0 §3.3: pull the cached recap so we can render the card
         // immediately. Only adopt it if it's still inside the 24h TTL.
-        chrome.runtime.sendMessage({ type: "GET_CACHED_RECAP" }, (raw) => {
+        safeSendMessage({ type: "GET_CACHED_RECAP" }, (raw) => {
             const resp = raw as
                 | { recap: SessionReport | null; timestamp: number | null }
                 | undefined;
@@ -807,7 +882,7 @@ function CortexPopup(): React.ReactElement {
             setRecap(resp.recap);
             setRecapTimestamp(ts);
             // Card is now visible to the user — clear the toolbar badge.
-            chrome.runtime.sendMessage({ type: "RECAP_VIEWED" });
+            safeSendMessage({ type: "RECAP_VIEWED" });
         });
     }, []);
 
@@ -858,7 +933,8 @@ function CortexPopup(): React.ReactElement {
             }
             case "FOCUS_SESSION_ENDED":
                 setFocus(null);
-                chrome.runtime.sendMessage({ type: "GET_DAILY_STATS" }, (stats) => {
+                safeSendMessage({ type: "GET_DAILY_STATS" }, (raw) => {
+                    const stats = raw as DailyStats | undefined;
                     if (stats) setDailyStats(stats);
                 });
                 break;
@@ -1049,7 +1125,7 @@ function CortexPopup(): React.ReactElement {
                         : Date.now();
                 setRecap(next);
                 setRecapTimestamp(ts);
-                chrome.runtime.sendMessage({ type: "RECAP_VIEWED" });
+                safeSendMessage({ type: "RECAP_VIEWED" });
                 break;
             }
         }
@@ -1070,7 +1146,7 @@ function CortexPopup(): React.ReactElement {
     // surface a single-line install hint right under the link.
     const handleOpenDashboardHistory = useCallback(() => {
         setHistoryStatus("");
-        chrome.runtime.sendMessage(
+        safeSendMessage(
             { type: "OPEN_DASHBOARD_HISTORY" },
             (raw) => {
                 const resp = raw as { status?: string } | undefined;
@@ -1090,10 +1166,86 @@ function CortexPopup(): React.ReactElement {
     // P0 §3.3: clear the cached recap and badge, then drop the card
     // locally so the user gets immediate feedback.
     const handleDismissRecap = useCallback(() => {
-        chrome.runtime.sendMessage({ type: "DISMISS_RECAP" });
+        safeSendMessage({ type: "DISMISS_RECAP" });
         setRecap(null);
         setRecapTimestamp(null);
     }, []);
+
+    // Phase 4d Task H / §3.24: in-app bug report submitter. POSTs to the
+    // daemon's ``/api/feedback`` endpoint (added by Phase 4b-retry-1);
+    // on 404 we stash the payload in chrome.storage.local under
+    // ``pending_feedback`` so a future popup mount can retry. Anything
+    // else (network error, 5xx) becomes a generic error state the user
+    // can retry from.
+    const handleBugReportSubmit = useCallback(async () => {
+        const description = bugReportText.trim();
+        if (description.length < 10 || description.length > 500) {
+            setBugReportError("Description must be 10-500 characters.");
+            return;
+        }
+        setBugReportStatus("submitting");
+        setBugReportError("");
+        const body = {
+            description,
+            include_logs: bugReportIncludeLogs,
+            user_agent: typeof navigator !== "undefined"
+                ? navigator.userAgent
+                : "",
+            timestamp: Date.now() / 1000,
+        };
+        try {
+            const resp = await fetch("http://127.0.0.1:9472/api/feedback", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+            });
+            if (resp.ok) {
+                setBugReportStatus("saved");
+                setBugReportText("");
+                setTimeout(() => {
+                    setBugReportOpen(false);
+                    setBugReportStatus("idle");
+                }, 1500);
+                return;
+            }
+            if (resp.status === 404) {
+                // Endpoint not present yet — queue locally.
+                await chrome.storage.local.set({
+                    pending_feedback: [
+                        ...(((await chrome.storage.local.get(
+                            "pending_feedback",
+                        )).pending_feedback as unknown[]) || []),
+                        body,
+                    ],
+                });
+                setBugReportStatus("queued");
+                setBugReportText("");
+                return;
+            }
+            setBugReportStatus("error");
+            setBugReportError(`Server returned ${resp.status}.`);
+        } catch (err) {
+            // Network failure — queue locally as well so the user
+            // doesn't lose the report.
+            try {
+                await chrome.storage.local.set({
+                    pending_feedback: [
+                        ...(((await chrome.storage.local.get(
+                            "pending_feedback",
+                        )).pending_feedback as unknown[]) || []),
+                        body,
+                    ],
+                });
+                setBugReportStatus("queued");
+                setBugReportText("");
+            } catch {
+                setBugReportStatus("error");
+                setBugReportError(
+                    err instanceof Error ? err.message : String(err),
+                );
+            }
+        }
+    }, [bugReportText, bugReportIncludeLogs]);
 
     // P0 §3.3 hardening: the recap card's 24h TTL check at render time
     // hides a stale card on the next paint, but if the popup is left
@@ -1214,7 +1366,7 @@ function CortexPopup(): React.ReactElement {
         setMicroSteps(prev => prev.map(
             (s, i) => i === idx ? { ...s, status: newStatus } : s
         ));
-        chrome.runtime.sendMessage({
+        safeSendMessage({
             type: "MICRO_STEP_TOGGLED",
             intervention_id: interventionId,
             step_index: idx,
@@ -1585,7 +1737,7 @@ function CortexPopup(): React.ReactElement {
                         }}
                         data-testid="break-recommendation-cta"
                         onClick={() => {
-                            chrome.runtime.sendMessage({
+                            safeSendMessage({
                                 type: "EXECUTE_ACTION",
                                 action: {
                                     action_id: `bk_${Date.now()}`,
@@ -1643,7 +1795,7 @@ function CortexPopup(): React.ReactElement {
                                 aria-label="Show structured causal rationale"
                                 onClick={() => {
                                     if (!whyOpen && causalSignals.length === 0 && interventionId) {
-                                        chrome.runtime.sendMessage({
+                                        safeSendMessage({
                                             type: "WHY_DETAIL_REQUEST",
                                             intervention_id: interventionId,
                                         });
@@ -1897,7 +2049,7 @@ function CortexPopup(): React.ReactElement {
                                 onClick={() => {
                                     if (!interventionId) return;
                                     setRating("thumbs_up");
-                                    chrome.runtime.sendMessage({
+                                    safeSendMessage({
                                         type: "USER_RATING",
                                         intervention_id: interventionId,
                                         rating: "thumbs_up",
@@ -1925,7 +2077,7 @@ function CortexPopup(): React.ReactElement {
                                     if (!interventionId) return;
                                     setRating("thumbs_down");
                                     setRatingTextOpen(true);
-                                    chrome.runtime.sendMessage({
+                                    safeSendMessage({
                                         type: "USER_RATING",
                                         intervention_id: interventionId,
                                         rating: "thumbs_down",
@@ -1959,7 +2111,7 @@ function CortexPopup(): React.ReactElement {
                             onKeyDown={(e) => {
                                 if (e.key === "Enter") {
                                     if (interventionId && ratingText.trim()) {
-                                        chrome.runtime.sendMessage({
+                                        safeSendMessage({
                                             type: "USER_RATING",
                                             intervention_id: interventionId,
                                             rating: "thumbs_down",
@@ -2201,13 +2353,199 @@ function CortexPopup(): React.ReactElement {
                     data-testid="view-history-link"
                     aria-label="Open History tab in desktop dashboard"
                 >View history <span aria-hidden="true">{"→"}</span></button>
+                <span
+                    aria-hidden="true"
+                    style={{
+                        color: CX.textTertiary,
+                        margin: "0 8px",
+                        fontSize: 11,
+                    }}
+                >·</span>
+                {/* Phase 4d Task H / §3.24: in-app bug report. */}
+                <button
+                    style={S.historyLink}
+                    onClick={() => setBugReportOpen(true)}
+                    data-testid="report-bug-link"
+                    aria-label="Report a bug"
+                >Report bug</button>
                 {historyStatus !== "" && (
                     <div
                         style={S.historyStatusLine}
                         data-testid="view-history-status"
                     >{historyStatus}</div>
                 )}
+                {bugReportStatus === "saved" && (
+                    <div
+                        role="status"
+                        data-testid="bug-report-success"
+                        style={{
+                            ...S.historyStatusLine,
+                            color: CX.accent,
+                        }}
+                    >Thanks — report sent.</div>
+                )}
+                {bugReportStatus === "queued" && (
+                    <div
+                        role="status"
+                        data-testid="bug-report-queued"
+                        style={S.historyStatusLine}
+                    >Saved locally — will retry.</div>
+                )}
             </div>
+
+            {/* Phase 4d Task H / §3.24: bug report modal. */}
+            {bugReportOpen && (
+                <div
+                    role="dialog"
+                    aria-modal="true"
+                    aria-labelledby="cortex-bug-report-title"
+                    data-testid="bug-report-modal"
+                    style={{
+                        position: "fixed",
+                        inset: 0,
+                        background: "rgba(12,12,14,0.78)",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        zIndex: 100,
+                    }}
+                    onClick={(e) => {
+                        if (e.target === e.currentTarget) {
+                            setBugReportOpen(false);
+                            setBugReportStatus("idle");
+                            setBugReportError("");
+                        }
+                    }}
+                >
+                    <div
+                        style={{
+                            background: CX.surface,
+                            border: `1px solid ${CX.borderDefault}`,
+                            borderRadius: CX.radiusMd,
+                            padding: 20,
+                            width: 320,
+                            boxShadow: CX.shadowFloat,
+                        }}
+                    >
+                        <h2
+                            id="cortex-bug-report-title"
+                            style={{
+                                fontSize: 15,
+                                fontWeight: 600,
+                                margin: "0 0 12px 0",
+                                color: CX.text,
+                                fontFamily: CX.fontSerif,
+                            }}
+                        >Report a bug</h2>
+                        <textarea
+                            data-testid="bug-report-textarea"
+                            value={bugReportText}
+                            onChange={(e) => setBugReportText(e.target.value)}
+                            placeholder="What happened? (10-500 chars)"
+                            maxLength={500}
+                            rows={5}
+                            aria-label="Bug description"
+                            style={{
+                                width: "100%",
+                                background: "rgba(255,255,255,0.04)",
+                                color: CX.text,
+                                border: `1px solid ${CX.borderDefault}`,
+                                borderRadius: CX.radiusSm,
+                                padding: 10,
+                                fontSize: 12,
+                                fontFamily: CX.font,
+                                resize: "vertical",
+                                boxSizing: "border-box",
+                                marginBottom: 10,
+                            }}
+                        />
+                        <label
+                            style={{
+                                display: "flex",
+                                alignItems: "center",
+                                gap: 8,
+                                fontSize: 12,
+                                color: CX.textSecondary,
+                                fontFamily: CX.font,
+                                marginBottom: 12,
+                                cursor: "pointer",
+                            }}
+                        >
+                            <input
+                                type="checkbox"
+                                data-testid="bug-report-logs-checkbox"
+                                checked={bugReportIncludeLogs}
+                                onChange={(e) =>
+                                    setBugReportIncludeLogs(e.target.checked)
+                                }
+                            />
+                            Include recent logs
+                        </label>
+                        {bugReportError !== "" && (
+                            <div
+                                role="alert"
+                                data-testid="bug-report-error"
+                                style={{
+                                    color: "#E47A6E",
+                                    fontSize: 11,
+                                    marginBottom: 10,
+                                    fontFamily: CX.font,
+                                }}
+                            >{bugReportError}</div>
+                        )}
+                        <div
+                            style={{
+                                display: "flex",
+                                gap: 8,
+                                justifyContent: "flex-end",
+                            }}
+                        >
+                            <button
+                                onClick={() => {
+                                    setBugReportOpen(false);
+                                    setBugReportStatus("idle");
+                                    setBugReportError("");
+                                }}
+                                style={{
+                                    padding: "6px 12px",
+                                    background: "transparent",
+                                    border: `1px solid ${CX.borderDefault}`,
+                                    borderRadius: CX.radiusSm,
+                                    color: CX.textSecondary,
+                                    fontSize: 12,
+                                    cursor: "pointer",
+                                    fontFamily: CX.font,
+                                }}
+                            >Cancel</button>
+                            <button
+                                data-testid="bug-report-submit"
+                                disabled={bugReportStatus === "submitting"}
+                                onClick={handleBugReportSubmit}
+                                style={{
+                                    padding: "6px 14px",
+                                    background: CX.accent,
+                                    border: "none",
+                                    borderRadius: CX.radiusSm,
+                                    color: "white",
+                                    fontSize: 12,
+                                    fontWeight: 600,
+                                    cursor: bugReportStatus === "submitting"
+                                        ? "default"
+                                        : "pointer",
+                                    opacity: bugReportStatus === "submitting"
+                                        ? 0.6
+                                        : 1,
+                                    fontFamily: CX.font,
+                                }}
+                            >
+                                {bugReportStatus === "submitting"
+                                    ? "Sending…"
+                                    : "Submit"}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }

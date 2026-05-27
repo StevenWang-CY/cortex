@@ -22,10 +22,33 @@ function nt_sendWithCid(
     const correlation_id = newCorrelationId();
     const enriched = { ...msg, correlation_id };
     console.debug(`cortex.newtab.send cid=${correlation_id} type=${String(msg.type)}`);
-    if (cb) {
-        chrome.runtime.sendMessage(enriched, cb);
-    } else {
-        chrome.runtime.sendMessage(enriched);
+    // Phase 4d Task B: lastError sweep — wrap raw sendMessage so the
+    // callback drops cleanly when the SW is mid-eviction. The polling
+    // callsites further down also inspect lastError themselves.
+    try {
+        chrome.runtime.sendMessage(enriched, (response) => {
+            const lastErr = (chrome as unknown as {
+                runtime?: { lastError?: { message?: string } };
+            }).runtime?.lastError;
+            if (lastErr) {
+                if (
+                    typeof process !== "undefined"
+                    && process.env
+                    && process.env.CORTEX_DEBUG === "true"
+                ) {
+                    console.warn(
+                        "[cortex.newtab] sendMessage",
+                        String(msg.type ?? "?"),
+                        lastErr.message,
+                    );
+                }
+                return;
+            }
+            if (cb) cb(response);
+        });
+    } catch {
+        /* extension context lost; newtab keeps rendering on cached
+           biometrics so silent-drop is fine here. */
     }
     return correlation_id;
 }
