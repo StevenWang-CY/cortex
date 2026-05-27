@@ -37,10 +37,11 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
 from cortex.libs.schemas.context import TaskContext
-from cortex.libs.schemas.intervention import InterventionPlan, WorkspaceSnapshot
-from cortex.services.intervention_engine.planner import (
+from cortex.libs.schemas.intervention import (
     AdapterCommand,
+    InterventionPlan,
     ValidationResult,
+    WorkspaceSnapshot,
 )
 
 

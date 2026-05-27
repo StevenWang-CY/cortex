@@ -156,33 +156,70 @@ if [ ! -f "${ICON_ICNS}" ]; then
     rm -rf "${ICONSET_DIR}"
     mkdir -p "${ICONSET_DIR}"
 
-    # Render SVG to PNG at various sizes using sips (requires rsvg-convert or qlmanage)
-    # Fallback: use qlmanage which is always available on macOS
+    # I4: do NOT silence qlmanage/sips/iconutil errors. Previously every
+    # tool call had ``2>/dev/null || true`` which produced an empty
+    # .icns on broken installs without any signal. Now we capture
+    # failures into ICON_BUILD_FAILED so the trailing check below can
+    # exit the whole build script non-zero with a clear message.
+    ICON_BUILD_FAILED=0
+
+    # Render SVG to PNG at various sizes using rsvg-convert (preferred)
+    # or qlmanage (macOS fallback).
     TEMP_PNG="/tmp/cortex_icon_1024.png"
+    PRIMARY_FAILED=0
+    FALLBACK_FAILED=0
     if command -v rsvg-convert &>/dev/null; then
-        rsvg-convert -w 1024 -h 1024 "${ICON_SVG}" -o "${TEMP_PNG}"
+        if ! rsvg-convert -w 1024 -h 1024 "${ICON_SVG}" -o "${TEMP_PNG}"; then
+            echo "WARN: rsvg-convert failed for ${ICON_SVG}" >&2
+            PRIMARY_FAILED=1
+            TEMP_PNG=""
+        fi
     else
-        qlmanage -t -s 1024 -o /tmp "${ICON_SVG}" 2>/dev/null || true
+        if ! qlmanage -t -s 1024 -o /tmp "${ICON_SVG}"; then
+            echo "WARN: qlmanage rendering failed for ${ICON_SVG}" >&2
+            FALLBACK_FAILED=1
+        fi
         # qlmanage outputs to a different name
         QLOUT="/tmp/logo.svg.png"
         if [ -f "${QLOUT}" ]; then
             mv "${QLOUT}" "${TEMP_PNG}"
         else
-            echo "WARNING: Could not convert SVG to PNG. Using default icon."
+            echo "WARN: qlmanage did not produce ${QLOUT}; cannot build .icns" >&2
+            FALLBACK_FAILED=1
             TEMP_PNG=""
         fi
     fi
 
     if [ -n "${TEMP_PNG}" ] && [ -f "${TEMP_PNG}" ]; then
         for SIZE in 16 32 64 128 256 512 1024; do
-            sips -z ${SIZE} ${SIZE} "${TEMP_PNG}" --out "${ICONSET_DIR}/icon_${SIZE}x${SIZE}.png" 2>/dev/null
+            if ! sips -z ${SIZE} ${SIZE} "${TEMP_PNG}" --out "${ICONSET_DIR}/icon_${SIZE}x${SIZE}.png"; then
+                echo "WARN: sips failed for size ${SIZE}" >&2
+                ICON_BUILD_FAILED=1
+            fi
             HALF=$((SIZE / 2))
-            if [ ${HALF} -ge 16 ]; then
+            if [ ${HALF} -ge 16 ] && [ -f "${ICONSET_DIR}/icon_${SIZE}x${SIZE}.png" ]; then
                 cp "${ICONSET_DIR}/icon_${SIZE}x${SIZE}.png" "${ICONSET_DIR}/icon_${HALF}x${HALF}@2x.png"
             fi
         done
-        iconutil -c icns "${ICONSET_DIR}" -o "${ICON_ICNS}" 2>/dev/null || true
+        if ! iconutil -c icns "${ICONSET_DIR}" -o "${ICON_ICNS}"; then
+            echo "WARN: iconutil failed; .icns will not be embedded" >&2
+            ICON_BUILD_FAILED=1
+        fi
         rm -rf "${ICONSET_DIR}" "${TEMP_PNG}"
+    fi
+
+    # If both rendering paths failed (primary attempted + fallback
+    # attempted with no successful TEMP_PNG, or iconutil refused to
+    # package the iconset) we must NOT silently produce a brand-less
+    # build. A user-installed Cortex.app with the generic gear icon is
+    # the #1 cosmetic regression we ship; better to fail the build.
+    if [ "${PRIMARY_FAILED}" = "1" ] && [ "${FALLBACK_FAILED}" = "1" ]; then
+        echo "[FATAL] Could not render icon SVG via either rsvg-convert or qlmanage." >&2
+        exit 1
+    fi
+    if [ "${ICON_BUILD_FAILED}" = "1" ] && [ ! -f "${ICON_ICNS}" ]; then
+        echo "[FATAL] Icon pipeline failed to produce ${ICON_ICNS}." >&2
+        exit 1
     fi
 else
     echo "→ .icns already exists"
@@ -257,11 +294,21 @@ if command -v create-dmg &>/dev/null; then
         "${DMG_STAGE_DIR}"; then
         echo "WARNING: create-dmg failed; falling back to hdiutil" >&2
         rm -f "${DMG_PATH}"
-        hdiutil create -volname "Cortex" -srcfolder "${DMG_STAGE_DIR}" -ov -format UDZO "${DMG_PATH}"
+        # I8: previously the hdiutil fallback's exit code was discarded,
+        # so a second failure left the DMG missing and the build appeared
+        # green until the final ``[ ! -f "${DMG_PATH}" ]`` check fired.
+        # Surface the failure at source with a single FATAL line.
+        if ! hdiutil create -volname "Cortex" -srcfolder "${DMG_STAGE_DIR}" -ov -format UDZO "${DMG_PATH}"; then
+            echo "[FATAL] DMG creation failed via both create-dmg and hdiutil" >&2
+            exit 1
+        fi
     fi
 else
     # Fallback to hdiutil
-    hdiutil create -volname "Cortex" -srcfolder "${DMG_STAGE_DIR}" -ov -format UDZO "${DMG_PATH}"
+    if ! hdiutil create -volname "Cortex" -srcfolder "${DMG_STAGE_DIR}" -ov -format UDZO "${DMG_PATH}"; then
+        echo "[FATAL] DMG creation failed via hdiutil (create-dmg not installed)" >&2
+        exit 1
+    fi
 fi
 
 if [ ! -f "${DMG_PATH}" ]; then

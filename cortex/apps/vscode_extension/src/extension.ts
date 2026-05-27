@@ -21,6 +21,26 @@ let statusBarItem: vscode.StatusBarItem | undefined;
 // deactivate so the closure doesn't outlive the disposed status bar.
 let osNotifPulseTimeout: ReturnType<typeof setTimeout> | undefined;
 
+// F9 (Phase-4 audit): single OutputChannel shared by every debug-gated
+// diagnostic line in the extension. Replaces console.log so messages
+// flow into VS Code's Output panel under "Cortex" rather than the
+// developer-tools console where the user can't see them. Only created
+// once at activation; cleaned up at deactivate.
+let outputChannel: vscode.OutputChannel | undefined;
+
+function _logDebug(message: string): void {
+    // Gated by ``cortex.debug`` exactly like the prior console.log
+    // surface — production installs stay quiet.
+    const debug = vscode.workspace
+        .getConfiguration("cortex")
+        .get<boolean>("debug", false);
+    if (!debug) return;
+    if (!outputChannel) {
+        outputChannel = vscode.window.createOutputChannel("Cortex");
+    }
+    outputChannel.appendLine(`[debug] ${message}`);
+}
+
 /**
  * Extension activation — called once on startup.
  */
@@ -369,19 +389,15 @@ export function activate(context: vscode.ExtensionContext): void {
         // P2 (audit Phase 4d, Task D): gate the dev-time tracer lines
         // behind ``cortex.debug``. Defaults to off so a production
         // install no longer floods the user's Output panel.
-        const debug = vscode.workspace
-            .getConfiguration('cortex')
-            .get<boolean>('debug', false);
+        // F9 (Phase-4 audit): route through the shared OutputChannel
+        // rather than console.log so messages surface in the user-
+        // visible Output panel.
         if (action === 'disable') {
             vscode.commands.executeCommand('cortex.disableInlineSuggestions');
-            if (debug) {
-                console.log('[cortex] COPILOT_THROTTLE: disabling inline suggestions');
-            }
+            _logDebug('COPILOT_THROTTLE: disabling inline suggestions');
         } else if (action === 'enable') {
             vscode.commands.executeCommand('cortex.enableInlineSuggestions');
-            if (debug) {
-                console.log('[cortex] COPILOT_THROTTLE: re-enabling inline suggestions');
-            }
+            _logDebug('COPILOT_THROTTLE: re-enabling inline suggestions');
         }
     });
 
@@ -491,6 +507,9 @@ export function deactivate(): void {
     contextProvider = undefined;
     foldController = undefined;
     panelProvider = undefined;
+    // F9: dispose the shared OutputChannel.
+    outputChannel?.dispose();
+    outputChannel = undefined;
 }
 
 // --- Internal helpers ---

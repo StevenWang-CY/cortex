@@ -154,7 +154,20 @@ async def test_auth_handshake_unlocks_subsequent_messages(token: str) -> None:
             {"action": "engaged", "intervention_id": "iv_1"},
         ),
     )
-    assert captured == [{"action": "engaged", "intervention_id": "iv_1"}]
+    # Audit-prod P1-B (confused-deputy): the daemon-side callback receives
+    # an extra ``_source_client_type`` wire-implementation key stamped by
+    # the WS server. It is NEVER echoed back into outbound broadcasts; the
+    # leading underscore convention marks it as in-process bookkeeping
+    # rather than user data. Assert on the user-facing keys explicitly so
+    # the test does not regress if the stamping policy adds more
+    # underscore-prefixed fields later.
+    assert len(captured) == 1
+    payload = captured[0]
+    assert payload["action"] == "engaged"
+    assert payload["intervention_id"] == "iv_1"
+    assert payload.get("_source_client_type") in ("unknown", "", None) or isinstance(
+        payload.get("_source_client_type"), str
+    )
 
 
 # ---------------------------------------------------------------------------

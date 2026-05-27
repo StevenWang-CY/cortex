@@ -7,27 +7,28 @@ maps hide_targets to concrete adapter commands.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import Literal
 
 from cortex.libs.schemas.intervention import (
+    AdapterCommand,
     InterventionPlan,
     SuggestedAction,
     UIPlan,
+    ValidationResult,
 )
 
-# ---------------------------------------------------------------------------
-# Adapter command types
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class AdapterCommand:
-    """A concrete command to send to a workspace adapter."""
-
-    adapter: str  # "editor", "browser", "terminal", "overlay"
-    action: str
-    params: dict[str, object] = field(default_factory=dict)
+# ``AdapterCommand`` / ``ValidationResult`` re-exported from libs to keep
+# the planner's public surface backwards compatible — both names were
+# importable from this module before the libs ⊥ services split.
+__all__ = [
+    "AdapterCommand",
+    "ValidationResult",
+    "validate_plan",
+    "sanitize_plan_actions",
+    "map_hide_targets",
+    "promote_biology_break",
+    "prepare_plan",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -53,15 +54,6 @@ _HIDE_TARGET_MAP: dict[str, AdapterCommand] = {
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class ValidationResult:
-    """Result of plan validation."""
-
-    is_valid: bool
-    errors: list[str] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
 
 
 def validate_plan(plan: InterventionPlan) -> ValidationResult:

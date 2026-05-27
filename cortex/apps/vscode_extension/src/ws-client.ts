@@ -71,6 +71,28 @@ type CopilotThrottleHandler = (payload: Record<string, unknown>) => void;
 type GenericMessageHandler = (msg: { type: string; payload: Record<string, unknown> }) => void;
 
 /**
+ * Typed rejection for ``sendWhyDetailRequest`` timeouts.
+ *
+ * F11 (Phase-4 audit): the WHY_DETAIL promise previously rejected with
+ * a plain ``new Error("…timed out…")`` which forced every caller to
+ * pattern-match the error message. Callers that want to render a
+ * specific "explanation took too long" UI can now ``instanceof``-check
+ * this class. Plain-Error catches keep working for backwards compat.
+ */
+export class WhyDetailTimeoutError extends Error {
+    /** The correlation_id of the request that timed out. */
+    readonly correlationId: string;
+    /** Timeout window in milliseconds. */
+    readonly timeoutMs: number;
+    constructor(correlationId: string, timeoutMs: number) {
+        super(`WHY_DETAIL request timed out after ${timeoutMs}ms`);
+        this.name = "WhyDetailTimeoutError";
+        this.correlationId = correlationId;
+        this.timeoutMs = timeoutMs;
+    }
+}
+
+/**
  * WebSocket client for communication with the Cortex daemon.
  *
  * Manages connection lifecycle, message routing, and auto-reconnection.
@@ -84,6 +106,26 @@ export class CortexWSClient {
     private _maxReconnectDelay = 30000;
     private _intentionalDisconnect = false;
     private _sequence = 0;
+
+    /**
+     * F6 (Phase-4 audit): WebSocket frame-level ping/pong heartbeat.
+     *
+     * The `websockets` Python library (daemon) does NOT auto-emit
+     * application-layer pings unless `ping_interval` is set; it DOES
+     * auto-respond to inbound frame-level pings with pongs. So the
+     * client sends ``ws.ping()`` every 30s and waits for the
+     * frame-level pong reply. If no pong arrives within 45s
+     * (``HEARTBEAT_TIMEOUT_MS``), we consider the connection stale
+     * and force a reconnect.
+     *
+     * This is the WS-protocol-level mechanism (RFC 6455 §5.5.2) — not
+     * an application-layer message — so it costs nothing on the
+     * daemon side and stays out of the WSMessage dispatch path.
+     */
+    private static readonly _HEARTBEAT_INTERVAL_MS = 30_000;
+    private static readonly _HEARTBEAT_TIMEOUT_MS = 45_000;
+    private _heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+    private _lastPongAt = 0;
     // swift-concurrency-pro rule (transferred to TS): the reconnect timer
     // should be propagation-aware. ``disconnect()`` aborts this controller
     // so the queued reconnect doesn't fire after teardown.
@@ -203,6 +245,13 @@ export class CortexWSClient {
                 this._connected = true;
                 this._reconnectDelay = 3000; // Reset backoff
                 this._notifyConnection(true);
+                // F6 (Phase-4 audit): start the heartbeat the moment
+                // we transition to "open". A stale connection where
+                // the TCP socket stayed up but the daemon stopped
+                // serving will be detected within ~45s instead of
+                // waiting for the next inbound message that never
+                // arrives.
+                this._startHeartbeat();
 
                 // Audit Debt-2: AUTH first. The daemon refuses every other
                 // type until this frame validates; without it the server
@@ -263,6 +312,14 @@ export class CortexWSClient {
                 this._handleMessage(data.toString());
             });
 
+            // F6: WS-protocol-level pong handler. The daemon's
+            // ``websockets`` server auto-pongs every inbound frame-level
+            // ping; the timestamp lets ``_checkHeartbeatHealth`` decide
+            // whether the connection is alive.
+            this._ws.on("pong", () => {
+                this._lastPongAt = Date.now();
+            });
+
             this._ws.on("close", () => {
                 this._handleDisconnect();
             });
@@ -290,6 +347,10 @@ export class CortexWSClient {
             this._reconnectTimer = undefined;
         }
 
+        // F6: stop the heartbeat before tearing down the socket so we
+        // don't spuriously trigger reconnect on the in-flight ping.
+        this._stopHeartbeat();
+
         if (this._ws) {
             this._ws.removeAllListeners("close");
             this._ws.close();
@@ -299,6 +360,62 @@ export class CortexWSClient {
         if (this._connected) {
             this._connected = false;
             this._notifyConnection(false);
+        }
+    }
+
+    /**
+     * F6 (Phase-4 audit): start the WS-protocol-level heartbeat.
+     *
+     * Sends ``ws.ping()`` every ``_HEARTBEAT_INTERVAL_MS`` and checks
+     * ``_lastPongAt`` against ``_HEARTBEAT_TIMEOUT_MS``. The first
+     * pong is seeded to ``Date.now()`` at start so a freshly-opened
+     * connection has a full window before the first stale check.
+     */
+    private _startHeartbeat(): void {
+        this._stopHeartbeat();
+        this._lastPongAt = Date.now();
+        this._heartbeatTimer = setInterval(() => {
+            this._checkHeartbeatHealth();
+        }, CortexWSClient._HEARTBEAT_INTERVAL_MS);
+    }
+
+    /** F6: clear the heartbeat interval. Safe to call when no timer is armed. */
+    private _stopHeartbeat(): void {
+        if (this._heartbeatTimer) {
+            clearInterval(this._heartbeatTimer);
+            this._heartbeatTimer = undefined;
+        }
+    }
+
+    /**
+     * F6: one heartbeat tick. If no pong arrived within the timeout
+     * window, force a reconnect; otherwise emit a fresh ping.
+     */
+    private _checkHeartbeatHealth(): void {
+        if (!this._ws || !this._connected) {
+            this._stopHeartbeat();
+            return;
+        }
+        const sincePong = Date.now() - this._lastPongAt;
+        if (sincePong > CortexWSClient._HEARTBEAT_TIMEOUT_MS) {
+            // Stale — force a reconnect. ``_handleDisconnect`` re-arms
+            // the backoff cycle and ``connect()`` will restart the
+            // heartbeat on the next ``open``.
+            console.warn(
+                `[Cortex] ws heartbeat timeout (${sincePong}ms since pong) — reconnecting`,
+            );
+            this._stopHeartbeat();
+            try {
+                this._ws.terminate();
+            } catch {
+                // Already closing; ``close`` event will follow.
+            }
+            return;
+        }
+        try {
+            this._ws.ping();
+        } catch {
+            // Send failure → close event will follow.
         }
     }
 
@@ -411,12 +528,21 @@ export class CortexWSClient {
             );
         })();
 
+        const WHY_DETAIL_TIMEOUT_MS = 5000;
         const promise = new Promise<Record<string, unknown>>(
             (resolve, reject) => {
                 const timer = setTimeout(() => {
+                    // F11 (Phase-4 audit): reject with a typed error so
+                    // callers can ``instanceof WhyDetailTimeoutError``
+                    // instead of string-matching the message.
                     this._pendingWhyDetail.delete(correlationId);
-                    reject(new Error("WHY_DETAIL request timed out after 5s"));
-                }, 5000);
+                    reject(
+                        new WhyDetailTimeoutError(
+                            correlationId,
+                            WHY_DETAIL_TIMEOUT_MS,
+                        ),
+                    );
+                }, WHY_DETAIL_TIMEOUT_MS);
                 this._pendingWhyDetail.set(correlationId, {
                     resolve,
                     reject,
@@ -748,6 +874,8 @@ export class CortexWSClient {
 
     private _handleDisconnect(): void {
         this._ws = undefined;
+        // F6: kill the heartbeat — a stopped socket cannot send pings.
+        this._stopHeartbeat();
 
         if (this._connected) {
             this._connected = false;

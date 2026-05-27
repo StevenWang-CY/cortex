@@ -180,7 +180,14 @@ class HandoverSnapshot:
         return output_path
 
     def _get_git_diff(self) -> str:
-        """Get git diff --stat for uncommitted changes."""
+        """Get git diff --stat for uncommitted changes.
+
+        B13 (Phase 4.1): capture and surface stderr in the structured
+        log when the subprocess returns a non-zero exit code. Pre-fix
+        we silently dropped the error context, so "git diff returned
+        nothing" was indistinguishable from "git refused to run" (no
+        repo, permission denied, dubious-ownership safety prompt).
+        """
         try:
             result = subprocess.run(
                 ["git", "diff", "--stat", "HEAD"],
@@ -188,11 +195,32 @@ class HandoverSnapshot:
                 text=True,
                 timeout=5,
                 cwd=str(self._storage_path.parent),
+                check=False,
             )
             if result.returncode == 0 and result.stdout.strip():
                 return result.stdout.strip()
+            if result.returncode != 0:
+                stderr_text = (result.stderr or "").strip()
+                logger.warning(
+                    "git diff returned %d in %s: %s",
+                    result.returncode,
+                    self._storage_path.parent,
+                    stderr_text or "<no stderr>",
+                )
+        except subprocess.TimeoutExpired as exc:
+            logger.warning(
+                "git diff timed out in %s: %s",
+                self._storage_path.parent,
+                exc,
+            )
+        except FileNotFoundError:
+            logger.debug("git executable not available; handover skipping diff")
         except Exception:
-            pass
+            logger.warning(
+                "git diff subprocess raised in %s",
+                self._storage_path.parent,
+                exc_info=True,
+            )
         return ""
 
     async def _generate_llm_summary(

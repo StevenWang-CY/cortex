@@ -59,11 +59,24 @@ class LongitudinalTracker:
         self._intervention_count: int = 0
         self._intervention_accepted: int = 0
 
-        # Per-topic tracking for subject-specific calibration
+        # Per-topic tracking for subject-specific calibration.
+        # B16 (Phase 4.1): cap to ``_TOPIC_CAP`` entries with insertion-
+        # order LRU eviction so a session that touches hundreds of unique
+        # topics (e.g. a researcher reading many tabs in one day) cannot
+        # grow these dicts without bound. We mirror the eviction across
+        # all three companion dicts so a topic evicted from one is
+        # evicted from all.
         self._topic_stress: dict[str, list[float]] = defaultdict(list)
         self._topic_flow: dict[str, float] = defaultdict(float)
         self._topic_hyper: dict[str, float] = defaultdict(float)
         self._current_topic: str | None = None
+        self._topic_cap: int = 100
+        # Bounded hourly overload — the buckets are keyed by hour-of-day
+        # (0..23) so the dict itself is naturally bounded to 24, but each
+        # list of bools could grow unbounded if the daemon ran 24 h
+        # without a midnight rotation. Cap each bucket to the latest
+        # 7200 samples (≈1 h at 2 Hz).
+        self._hourly_overload_per_bucket_cap: int = 7200
 
     def accumulate(
         self,
@@ -98,7 +111,12 @@ class LongitudinalTracker:
             self._resp_samples.append(resp)
 
         hour = datetime.now().hour
-        self._hourly_overload[hour].append(state == "HYPER")
+        bucket = self._hourly_overload[hour]
+        bucket.append(state == "HYPER")
+        # B16 (Phase 4.1): bound the bucket length to avoid unbounded
+        # list growth in long-running sessions.
+        if len(bucket) > self._hourly_overload_per_bucket_cap:
+            del bucket[: len(bucket) - self._hourly_overload_per_bucket_cap]
 
         if state == "FLOW":
             self._flow_seconds += dt_seconds
@@ -111,8 +129,37 @@ class LongitudinalTracker:
                 self._topic_flow[self._current_topic] += dt_seconds
             elif state == "HYPER":
                 self._topic_hyper[self._current_topic] += dt_seconds
+            else:
+                # Ensure the topic is at least registered with a 0.0
+                # contribution so _touch_topic's eviction sees it.
+                _ = self._topic_flow[self._current_topic]
             if hrv is not None:
-                self._topic_stress[self._current_topic].append(hrv)
+                samples = self._topic_stress[self._current_topic]
+                samples.append(hrv)
+                if len(samples) > 1000:
+                    # Per-topic HRV sample list cap.
+                    del samples[: len(samples) - 1000]
+            # B16 (Phase 4.1): evict AFTER insertion so the post-call
+            # size invariant ``len(topic_dict) <= cap`` is preserved.
+            self._touch_topic(self._current_topic)
+
+    def _touch_topic(self, topic: str) -> None:
+        """B16 (Phase 4.1): mark ``topic`` as the most-recently-used and
+        evict the oldest topic across all three per-topic dicts if the
+        cap is exceeded. Insertion-order LRU using dict re-insertion
+        (Python 3.7+ dicts preserve insertion order).
+        """
+        # Bump to most-recent by re-inserting; for defaultdict this is
+        # cheap because the value type is mutable / float.
+        for d in (self._topic_stress, self._topic_flow, self._topic_hyper):
+            if topic in d:
+                d[topic] = d.pop(topic)
+        # Evict the oldest topic (first key) until we're under cap.
+        while len(self._topic_flow) > self._topic_cap:
+            oldest = next(iter(self._topic_flow))
+            self._topic_flow.pop(oldest, None)
+            self._topic_stress.pop(oldest, None)
+            self._topic_hyper.pop(oldest, None)
 
     def record_intervention(self, accepted: bool) -> None:
         """Record an intervention event."""

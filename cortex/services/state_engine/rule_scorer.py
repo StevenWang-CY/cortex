@@ -84,7 +84,16 @@ class RuleScorer:
             return 0.0
         from collections import Counter
         counts = Counter(cats)
-        most_common_count = counts.most_common(1)[0][1]
+        # B22 (Phase 4.1): guard ``most_common(1)`` against empty input.
+        # ``Counter()`` on a non-empty list always returns at least one
+        # entry, but if a filtering step ever produces an empty Counter
+        # (e.g. all categories are sentinels), ``most_common(1)[0][1]``
+        # would raise IndexError. Defensive zero-return matches the
+        # contract documented above: "0.0 when no tab categories…".
+        top = counts.most_common(1)
+        if not top:
+            return 0.0
+        most_common_count = top[0][1]
         return most_common_count / len(cats)
 
     def compute_scores(self, fv: FeatureVector) -> StateScores:

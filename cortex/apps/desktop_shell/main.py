@@ -98,12 +98,35 @@ class WebSocketBridge(QObject):
         self._thread.start()
 
     def stop(self) -> None:
-        """Stop the WebSocket listener."""
+        """Stop the WebSocket listener.
+
+        F14 (Phase-4 audit): the join timeout was raised from 3.0 s to
+        8.0 s because slow systems (cold start, swap pressure, M1 Air
+        under thermal throttling) routinely take 4-5 s to settle the
+        asyncio event loop after ``loop.stop()``. The 3 s ceiling
+        caused the desktop shell to abandon the thread mid-cleanup
+        which left the WebSocket reader dangling and printed an
+        unfriendly ``daemon thread will be killed`` warning on exit.
+        """
         self._running = False
         if self._loop is not None:
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread is not None:
-            self._thread.join(timeout=3.0)
+            join_timeout = 8.0
+            self._thread.join(timeout=join_timeout)
+            if self._thread.is_alive():
+                # Best-effort log — main.py imports logging via
+                # PySide6 modules; using ``print`` keeps this resilient
+                # on broken logger configurations.
+                try:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "WS listener thread did not exit within %.1fs — "
+                        "the worker is stuck; leaving it daemon-marked.",
+                        join_timeout,
+                    )
+                except Exception:
+                    pass
             self._thread = None
 
     def send_user_action(self, action: str, intervention_id: str) -> None:

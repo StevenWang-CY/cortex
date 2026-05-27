@@ -197,6 +197,62 @@ def _keychain_get_bedrock_token(config: LLMConfig) -> str | None:
         return None
 
 
+class PlannerResult:
+    """B11 (Phase 4.1): discriminated result of a planner call.
+
+    The planner historically returned a single :class:`InterventionPlan`
+    where the failure mode (timeout, parse error, budget kill, retry
+    exhaustion, etc.) was inferable only by reading
+    ``plan.metadata["fallback_reason"]`` — a stringly-typed field that
+    callers had to know to inspect. This struct makes the failure mode
+    a first-class discriminator so the route (and any future caller)
+    can branch on it without parsing metadata.
+
+    ``failure_mode`` literal values:
+      * ``"ok"`` — live LLM call succeeded, no degradation.
+      * ``"timeout"`` — call exhausted retries or the SDK timed out.
+      * ``"parse_error"`` — response was malformed (no tool_use block,
+        Pydantic validation failed).
+      * ``"empty_response"`` — fallback used because of an upstream
+        constraint (budget kill, circuit open, auth error).
+      * ``"cache_hit"`` — served from the in-process plan cache.
+
+    The plan field is always populated (the daemon never returns no
+    plan; the fallback path produces a deterministic plan) so callers
+    can use the same downstream path regardless of failure_mode.
+    """
+
+    __slots__ = ("plan", "failure_mode")
+
+    def __init__(self, plan: Any, failure_mode: str) -> None:
+        self.plan = plan
+        self.failure_mode = failure_mode
+
+    def __repr__(self) -> str:
+        return f"PlannerResult(failure_mode={self.failure_mode!r})"
+
+
+def classify_plan_failure_mode(plan: Any) -> str:
+    """B11 (Phase 4.1): map an :class:`InterventionPlan` to a failure_mode.
+
+    Inspects the plan's ``metadata.fallback_reason`` /
+    ``metadata.source`` fields to derive the discriminator without
+    requiring the caller to know which metadata keys mean what.
+    """
+    meta = getattr(plan, "metadata", None) or {}
+    reason = str(meta.get("fallback_reason") or "")
+    source = str(meta.get("source") or "")
+    if reason == "budget_killed" or reason == "circuit_open" or reason == "auth_error":
+        return "empty_response"
+    if reason == "retries_exhausted":
+        return "timeout"
+    if reason == "invalid_response":
+        return "parse_error"
+    if source == "fallback":
+        return "empty_response"
+    return "ok"
+
+
 class _CircuitBreaker:
     """Trip on consecutive failures; auto-close after a cooldown."""
 
@@ -637,10 +693,17 @@ class AnthropicPlanner:
                 )
                 if attempt == attempts - 1:
                     self._circuit.record_failure(time.monotonic())
+                    # B11 (Phase 4.1): stash the discriminator so the
+                    # post-loop fallback path can stamp the right
+                    # failure_mode (parse_error vs. timeout). Without
+                    # this stamp the caller sees ``retries_exhausted``
+                    # which conflates the two cases.
+                    self._last_validation_error = True
                     break
                 continue
 
             self._circuit.record_success()
+            self._last_validation_error = False
             latency_ms = (time.perf_counter() - t0) * 1000.0
             usage = getattr(response, "usage", None)
             # F19: include the active correlation id so downstream cost
@@ -699,7 +762,14 @@ class AnthropicPlanner:
             get_correlation_id() or "-",
         )
         fallback = build_fallback_plan(context)
-        fallback.metadata["fallback_reason"] = "retries_exhausted"
+        # B11 (Phase 4.1): the discriminator depends on which retry path
+        # exhausted — a string of malformed responses is a ``parse_error``
+        # while transport timeouts / 5xx are ``timeout``.
+        if getattr(self, "_last_validation_error", False):
+            fallback.metadata["fallback_reason"] = "invalid_response"
+            self._last_validation_error = False
+        else:
+            fallback.metadata["fallback_reason"] = "retries_exhausted"
         return fallback
 
     # ------------------------------------------------------------------

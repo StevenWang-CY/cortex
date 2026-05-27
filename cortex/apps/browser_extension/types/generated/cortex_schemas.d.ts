@@ -1876,9 +1876,9 @@ export interface TelemetryFeatures {
  */
 export interface TrendsRequest {
   /**
-   * Aggregation window: 'week' = last 7 days, 'month' = last 30, 'quarter' = last 90.
+   * Aggregation window: 'week' = last 7 days, 'month' = last 30. ``quarter`` was dropped from the wire — no UI panel renders it.
    */
-  window?: "week" | "month" | "quarter";
+  window?: "week" | "month";
   /**
    * When True, force the daemon to recompute the chronotype model from disk before replying. Defaults to False so the cached model.json is served.
    */
@@ -1893,9 +1893,9 @@ export interface TrendsRequest {
  */
 export interface TrendsResponse {
   /**
-   * The window the daily rows cover. Week=last 7 days, month=last 30, quarter=last 90.
+   * The window the daily rows cover. Week=last 7 days, month=last 30. ``quarter`` was dropped from the wire.
    */
-  window?: "week" | "month" | "quarter";
+  window?: "week" | "month";
   /**
    * One DailyBaseline row per day in the window, chronologically ascending. UI must read this — never iterate ``chronotype.baselines`` directly.
    */

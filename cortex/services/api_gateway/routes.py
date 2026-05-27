@@ -180,7 +180,10 @@ class DashboardRaiseResponse(BaseModel):
 
     raised: bool = True
     target: str | None = None
-    timestamp: float = Field(default_factory=time.time)
+    timestamp: float = Field(
+        default_factory=time.time,
+        description="Wall-clock seconds since epoch (UTC).",
+    )
 
 
 @router.post("/dashboard/raise", response_model=DashboardRaiseResponse)
@@ -225,16 +228,53 @@ class HealthResponse(BaseModel):
     # extension's CONNECTIVITY_DIAGNOSTIC can detect a version mismatch
     # between the installed extension and the running daemon.
     version: str | None = None
+    # B2 (Phase 4.1): operator-facing counter of duplicate
+    # INTERVENTION_APPLIED ack frames seen since the daemon started.
+    # A nonzero value points at extension misbehaviour (re-acking the
+    # same phase) but is non-fatal — the dedup logic still suppresses
+    # the second mutation overwrite.
+    duplicate_intervention_acks: int = 0
+    # B3 (Phase 4.1): operator-facing counter of frames the capture
+    # pipeline evicted from its output queue when the queue was full.
+    # A sustained nonzero value means a downstream consumer is slower
+    # than the capture rate; rPPG / kinematics quality may degrade.
+    frames_dropped_total: int = 0
+    # B4 (Phase 4.1): True when the daemon fell back to the in-memory
+    # store at boot because Redis was unreachable. Persistence is
+    # non-durable while this is True.
+    store_degraded: bool = False
+    # B5 (Phase 4.1): count of feedback bundle log-tail reads that
+    # raised OSError. A spike here usually means the daemon's log path
+    # was rotated out from under us.
+    feedback_log_read_failures: int = 0
 
 
 class StatusResponse(BaseModel):
-    """Current system status."""
+    """Current system status.
 
+    Phase 4.4 T3: ``status`` is an explicit discriminator that clients can
+    use without inspecting the nullability of ``state``/``features``. The
+    legacy optional fields are preserved so callers that already inspect
+    them continue to compile; new clients should branch on ``status``.
+    """
+
+    status: Literal["initializing", "ready", "degraded"] = Field(
+        "initializing",
+        description=(
+            "Coarse readiness discriminator. ``initializing`` = no "
+            "estimate yet; ``ready`` = state engine producing live "
+            "estimates; ``degraded`` = serving a synthetic/last-known "
+            "estimate because real inference failed."
+        ),
+    )
     state: str | None = None
     confidence: float | None = None
     signal_quality: SignalQuality | None = None
     features: FeatureVector | None = None
-    timestamp: float = Field(default_factory=time.monotonic)
+    timestamp: float = Field(
+        default_factory=time.time,
+        description="Wall-clock seconds since epoch (UTC).",
+    )
 
 
 class StateInferRequest(BaseModel):
@@ -257,7 +297,10 @@ class StateInferResponse(BaseModel):
     """
 
     estimate: StateEstimate
-    timestamp: float = Field(default_factory=time.monotonic)
+    timestamp: float = Field(
+        default_factory=time.time,
+        description="Wall-clock seconds since epoch (UTC).",
+    )
     source: Literal["classifier", "fallback"] = Field(
         "classifier",
         description=(
@@ -289,7 +332,10 @@ class ContextBuildResponse(BaseModel):
 
     context: TaskContext | None = None
     available: bool = False
-    timestamp: float = Field(default_factory=time.monotonic)
+    timestamp: float = Field(
+        default_factory=time.time,
+        description="Wall-clock seconds since epoch (UTC).",
+    )
 
 
 class LLMPlanRequest(BaseModel):
@@ -304,7 +350,10 @@ class LLMPlanResponse(BaseModel):
 
     plan: InterventionPlan | None = None
     fallback_used: bool = False
-    timestamp: float = Field(default_factory=time.monotonic)
+    timestamp: float = Field(
+        default_factory=time.time,
+        description="Wall-clock seconds since epoch (UTC).",
+    )
 
 
 class InterventionApplyRequest(BaseModel):
@@ -327,7 +376,10 @@ class InterventionApplyResponse(BaseModel):
     snapshot: WorkspaceSnapshot | None = None
     correlation_id: str | None = None
     confirmation: InterventionApplyResult | None = None
-    timestamp: float = Field(default_factory=time.monotonic)
+    timestamp: float = Field(
+        default_factory=time.time,
+        description="Wall-clock seconds since epoch (UTC).",
+    )
 
 
 class InterventionRestoreRequest(BaseModel):
@@ -342,7 +394,10 @@ class InterventionRestoreResponse(BaseModel):
 
     restored: bool = False
     outcome: InterventionOutcome | None = None
-    timestamp: float = Field(default_factory=time.monotonic)
+    timestamp: float = Field(
+        default_factory=time.time,
+        description="Wall-clock seconds since epoch (UTC).",
+    )
 
 
 # Track app start time for uptime computation
@@ -446,17 +501,44 @@ async def health_check(request: Request) -> HealthResponse:
 
     overall = "healthy" if reg.healthy else "unhealthy"
 
+    # B2/B3/B4/B5 (Phase 4.1): surface the operator-facing diagnostic
+    # counters when a daemon instance is registered. Falls back to
+    # zeros for legacy test rigs that build the FastAPI app without a
+    # daemon (unit tests of the routes themselves).
+    duplicate_acks = 0
+    frames_dropped_total = 0
+    store_degraded = False
+    daemon = reg.get("daemon") if hasattr(reg, "get") else None
+    if daemon is not None:
+        duplicate_acks = int(
+            getattr(daemon, "_duplicate_intervention_ack_count", 0) or 0
+        )
+        store_degraded = bool(getattr(daemon, "_store_degraded", False))
+        pipeline = getattr(daemon, "_capture_pipeline", None)
+        if pipeline is not None:
+            frames_dropped_total = int(
+                getattr(pipeline, "frames_dropped_total", 0) or 0
+            )
+
     return HealthResponse(
         status=overall,
         services=services,
         uptime_seconds=time.monotonic() - _start_time,
         version=_resolve_daemon_version(),
+        duplicate_intervention_acks=duplicate_acks,
+        frames_dropped_total=frames_dropped_total,
+        store_degraded=store_degraded,
+        feedback_log_read_failures=int(_feedback_log_read_failures),
     )
 
 
 @router.get("/status/current", response_model=StatusResponse)
 async def get_current_status(request: Request) -> StatusResponse:
-    """Get current system state, confidence, and signal quality."""
+    """Get current system state, confidence, and signal quality.
+
+    Phase 4.4 T3: stamps ``status`` so clients can branch without
+    inspecting nullability of ``state``/``features``.
+    """
     reg = _get_registry(request)
 
     # Try to get state from state engine
@@ -465,6 +547,7 @@ async def get_current_status(request: Request) -> StatusResponse:
         est = state_engine.latest_estimate
         if est is not None:
             return StatusResponse(
+                status="ready",
                 state=est.state,
                 confidence=est.confidence,
                 signal_quality=est.signal_quality,
@@ -475,13 +558,14 @@ async def get_current_status(request: Request) -> StatusResponse:
     latest_state = reg.get("latest_state_estimate")
     if latest_state is not None:
         return StatusResponse(
+            status="ready",
             state=latest_state.state,
             confidence=latest_state.confidence,
             signal_quality=latest_state.signal_quality,
             timestamp=latest_state.timestamp,
         )
 
-    return StatusResponse()
+    return StatusResponse(status="initializing")
 
 
 # =============================================================================
@@ -660,12 +744,41 @@ async def request_llm_plan(
     llm_engine = reg.get("llm_engine")
     if llm_engine is not None:
         if hasattr(llm_engine, "generate_intervention_plan"):
+            # B8 (Phase 4.1): tag the chosen planner branch so operators
+            # can diff log distributions across deploys when one branch
+            # silently degrades to the wrong fallback.
+            logger.info(
+                "LLM planner branch selected",
+                extra={"planner_method": "llm_engine.generate_intervention_plan"},
+            )
             plan = await llm_engine.generate_intervention_plan(
                 body.task_context,
                 body.state_estimate,
             )
+            # B11 (Phase 4.1): inspect the discriminated failure_mode
+            # and log a structured entry tagged with the result. Hands
+            # downstream callers a stable signal to branch on (e.g.,
+            # 'parse_error' triggers a retry hint to the operator).
+            try:
+                from cortex.services.llm_engine.anthropic_planner import (
+                    classify_plan_failure_mode,
+                )
+                failure_mode = classify_plan_failure_mode(plan)
+            except Exception:
+                failure_mode = "ok"
+            logger.info(
+                "LLM planner result classified",
+                extra={
+                    "planner_method": "llm_engine.generate_intervention_plan",
+                    "failure_mode": failure_mode,
+                },
+            )
             return LLMPlanResponse(plan=plan)
         if hasattr(llm_engine, "generate_plan"):
+            logger.info(
+                "LLM planner branch selected",
+                extra={"planner_method": "llm_engine.generate_plan"},
+            )
             plan = await llm_engine.generate_plan(
                 body.state_estimate, body.task_context,
             )
@@ -677,12 +790,20 @@ async def request_llm_plan(
     # the helper signature.
     llm_client = _get_first_service(reg, "llm_client")
     if llm_client is not None and hasattr(llm_client, "generate_intervention_plan"):
+        logger.info(
+            "LLM planner branch selected",
+            extra={"planner_method": "llm_client.generate_intervention_plan"},
+        )
         plan = await llm_client.generate_intervention_plan(
             body.task_context,
             body.state_estimate,
         )
         return LLMPlanResponse(plan=plan)
 
+    logger.info(
+        "LLM planner branch selected",
+        extra={"planner_method": "fallback"},
+    )
     return LLMPlanResponse(fallback_used=True)
 
 
@@ -814,8 +935,17 @@ async def _maybe_await_confirmation(
             correlation_id=correlation_id,
         )
     except Exception:
-        logger.debug(
-            "await_apply_confirmation failed for %s", intervention_id,
+        # B9 (Phase 4.1): elevate to WARNING with structured fields so
+        # operators see when the apply-confirmation future was
+        # cancelled (e.g. by daemon stop) or raised a non-timeout
+        # error. correlation_id + intervention_id let log aggregators
+        # join the failure back to the originating HTTP call.
+        logger.warning(
+            "await_apply_confirmation failed",
+            extra={
+                "intervention_id": intervention_id,
+                "correlation_id": correlation_id,
+            },
             exc_info=True,
         )
         return None
@@ -870,7 +1000,10 @@ class StressIntegralResponse(BaseModel):
     threshold: float = 500.0
     should_break: bool = False
     sensitivity_multiplier: float = 1.0
-    timestamp: float = Field(default_factory=time.monotonic)
+    timestamp: float = Field(
+        default_factory=time.time,
+        description="Wall-clock seconds since epoch (UTC).",
+    )
 
 
 @router.get("/api/stress-integral", response_model=StressIntegralResponse)
@@ -895,7 +1028,10 @@ class HelpfulnessSummaryResponse(BaseModel):
     mean_reward: float = 0.0
     engagement_rate: float = 0.0
     recent_rewards: list[float] = Field(default_factory=list)
-    timestamp: float = Field(default_factory=time.monotonic)
+    timestamp: float = Field(
+        default_factory=time.time,
+        description="Wall-clock seconds since epoch (UTC).",
+    )
 
 
 @router.get("/api/helpfulness/summary", response_model=HelpfulnessSummaryResponse)
@@ -917,14 +1053,31 @@ async def get_helpfulness_summary(request: Request) -> HelpfulnessSummaryRespons
 class ConsentLevelResponse(BaseModel):
     """Current consent state."""
     levels: dict[str, dict] = Field(default_factory=dict)
-    timestamp: float = Field(default_factory=time.monotonic)
+    timestamp: float = Field(
+        default_factory=time.time,
+        description="Wall-clock seconds since epoch (UTC).",
+    )
+
+
+class ConsentResetRequest(BaseModel):
+    """Phase 4.4 T4: explicit (currently empty) body for ``POST
+    /consent/reset``.
+
+    Defined so the OpenAPI spec advertises a request schema (rather
+    than implicit ``Body(None)``) and TS codegen emits a typed shape.
+    Future fields (e.g. ``reason``, ``actor``) can be added without
+    breaking existing callers because every field is optional.
+    """
 
 
 class ConsentResetResponse(BaseModel):
     """Result of consent reset."""
     reset: bool = False
     levels: dict[str, dict] = Field(default_factory=dict)
-    timestamp: float = Field(default_factory=time.monotonic)
+    timestamp: float = Field(
+        default_factory=time.time,
+        description="Wall-clock seconds since epoch (UTC).",
+    )
 
 
 @router.get("/consent/level", response_model=ConsentLevelResponse)
@@ -939,8 +1092,17 @@ async def get_consent_level(request: Request) -> ConsentLevelResponse:
 
 
 @router.post("/consent/reset", response_model=ConsentResetResponse)
-async def reset_consent(request: Request) -> ConsentResetResponse:
-    """Reset consent ladder to defaults and return new state."""
+async def reset_consent(
+    request: Request,
+    body: ConsentResetRequest | None = None,
+) -> ConsentResetResponse:
+    """Reset consent ladder to defaults and return new state.
+
+    Phase 4.4 T4: ``body`` is accepted explicitly so the OpenAPI spec
+    advertises a request shape (even though it is currently empty);
+    callers may continue to send ``{}`` or omit the body entirely.
+    """
+    _ = body  # currently no fields to apply; reserved for future use
     reg = _get_registry(request)
     ladder = reg.get("consent_ladder")
     if ladder is not None and hasattr(ladder, "reset"):
@@ -948,6 +1110,210 @@ async def reset_consent(request: Request) -> ConsentResetResponse:
         states = await ladder.get_all_states()
         return ConsentResetResponse(reset=True, levels=states)
     return ConsentResetResponse()
+
+
+# =============================================================================
+# P0 §3.15 (HTTP parity): /api/cost — BYOK spend telemetry
+# =============================================================================
+#
+# Phase 4.4 T2: the WS path emits ``COST_RESPONSE`` payloads on every
+# plan-finalise event, but there was no HTTP surface for callers that
+# don't hold a websocket (the desktop shell's diagnostics tab, support
+# tooling, integration tests). This route exposes the same numbers as
+# a snapshot. We deliberately do NOT subclass the wire CostResponse in
+# ``cortex/libs/schemas/realtime.py`` — that one's field names mirror
+# the §3.15 wire spec (``cost_today`` / ``budget_today``); this HTTP
+# shape mirrors the Phase 4.4 spec (``total_usd`` / ``session_usd``).
+
+
+class CostResponse(BaseModel):
+    """Phase 4.4 T2: BYOK cost telemetry snapshot.
+
+    Field semantics:
+
+    - ``total_usd``: cumulative USD spent today (matches the LLM cost
+      tracker's ``today_total_usd``). The tracker resets at local
+      midnight; restarts within the same day preserve the running
+      total via the on-disk ledger.
+    - ``session_usd``: USD spent since the daemon process started.
+      Equal to ``total_usd`` after a fresh restart; smaller than
+      ``total_usd`` after midnight rollover within the same daemon
+      lifetime.
+    - ``prompt_tokens`` / ``completion_tokens``: best-effort counters
+      surfaced by the active LLM client when available, else ``0``.
+    - ``provider``: active provider key (e.g. ``"anthropic_direct"``,
+      ``"bedrock"``); ``"none"`` when BYOK is not configured.
+    - ``model``: active model id (e.g. ``"claude-sonnet-4-5"``); empty
+      string when no client is registered.
+    - ``timestamp``: wall-clock seconds since epoch (UTC).
+    """
+
+    total_usd: float = Field(
+        default=0.0, ge=0.0,
+        description="Cumulative USD spent today by the LLM cost tracker.",
+    )
+    session_usd: float = Field(
+        default=0.0, ge=0.0,
+        description=(
+            "USD spent since the daemon process started. ``total_usd`` "
+            "minus the on-disk ledger value at daemon boot."
+        ),
+    )
+    prompt_tokens: int = Field(
+        default=0, ge=0,
+        description="Best-effort prompt-token counter (0 if unavailable).",
+    )
+    completion_tokens: int = Field(
+        default=0, ge=0,
+        description="Best-effort completion-token counter (0 if unavailable).",
+    )
+    provider: str = Field(
+        default="none",
+        description=(
+            "Active LLM provider key (``anthropic_direct``, "
+            "``bedrock``, ``vertex``, ``rule_based``); ``\"none\"`` "
+            "when no cost tracker is registered."
+        ),
+    )
+    model: str = Field(
+        default="",
+        description=(
+            "Active model id (e.g. ``claude-sonnet-4-5``); empty "
+            "string when no LLM client is registered."
+        ),
+    )
+    timestamp: float = Field(
+        default_factory=time.time,
+        description="Wall-clock seconds since epoch (UTC).",
+    )
+
+
+def _resolve_cost_tracker(registry: Any) -> Any | None:
+    """Locate the LLM ``CostTracker`` regardless of how it was wired.
+
+    Two registration paths exist in the codebase:
+
+    1. The Anthropic planner attaches a private ``_cost_tracker``
+       attribute on the LLM client; that client is registered as
+       ``"llm_client"`` (see
+       :mod:`cortex.services.runtime_daemon._register_services`).
+    2. Future callers may register a tracker directly under
+       ``"cost_tracker"`` for unit tests / alt providers.
+
+    We check the explicit key first because it lets test rigs avoid
+    constructing a whole planner just to exercise this route.
+    """
+    direct = registry.get("cost_tracker") if hasattr(registry, "get") else None
+    if direct is not None:
+        return direct
+    llm_client = registry.get("llm_client") if hasattr(registry, "get") else None
+    if llm_client is not None:
+        return getattr(llm_client, "_cost_tracker", None)
+    return None
+
+
+def _resolve_active_model(registry: Any) -> str:
+    """Best-effort lookup of the active model id from the LLM client."""
+    llm_client = registry.get("llm_client") if hasattr(registry, "get") else None
+    if llm_client is None:
+        return ""
+    for attr in ("model", "_model", "model_id", "_model_id"):
+        val = getattr(llm_client, attr, None)
+        if isinstance(val, str) and val:
+            return val
+    cfg = getattr(llm_client, "config", None)
+    if cfg is not None:
+        for attr in ("model", "model_id"):
+            val = getattr(cfg, attr, None)
+            if isinstance(val, str) and val:
+                return val
+    return ""
+
+
+def _resolve_active_provider(registry: Any) -> str | None:
+    """Best-effort provider key lookup from the daemon's config."""
+    daemon = registry.get("daemon") if hasattr(registry, "get") else None
+    if daemon is None:
+        return None
+    cfg = getattr(daemon, "config", None)
+    llm_cfg = getattr(cfg, "llm", None) if cfg is not None else None
+    provider = getattr(llm_cfg, "provider", None) if llm_cfg is not None else None
+    return str(provider) if provider else None
+
+
+@router.get("/api/cost", response_model=CostResponse)
+async def get_cost(request: Request) -> CostResponse:
+    """Phase 4.4 T2: snapshot today's BYOK LLM spend.
+
+    Returns a zero-valued ``CostResponse`` with ``provider="none"`` when
+    no tracker is registered (BYOK not configured, or no calls yet) —
+    deliberately NOT a 404, so the desktop shell can poll the route
+    unconditionally without branching on HTTP status.
+    """
+    reg = _get_registry(request)
+    tracker = _resolve_cost_tracker(reg)
+    provider = _resolve_active_provider(reg)
+    model = _resolve_active_model(reg)
+
+    if tracker is None:
+        return CostResponse(
+            provider=(provider or "none"),
+            model=model,
+        )
+
+    total_usd = 0.0
+    try:
+        total_usd = float(tracker.today_total_usd())
+    except Exception:
+        logger.debug("/api/cost: today_total_usd failed", exc_info=True)
+
+    # ``session_usd`` is best-effort: trackers may not expose a session
+    # baseline; if they do (via ``session_start_total_usd`` set at
+    # daemon boot) we subtract it. Otherwise fall back to ``total_usd``
+    # so the field is at least populated rather than misleadingly 0.
+    session_start = getattr(tracker, "session_start_total_usd", None)
+    if isinstance(session_start, (int, float)):
+        session_usd = max(0.0, total_usd - float(session_start))
+    else:
+        session_usd = total_usd
+
+    prompt_tokens = 0
+    completion_tokens = 0
+    for attr in ("prompt_tokens_today", "total_prompt_tokens"):
+        val = getattr(tracker, attr, None)
+        if isinstance(val, int):
+            prompt_tokens = val
+            break
+        if callable(val):
+            try:
+                got = val()
+                if isinstance(got, int):
+                    prompt_tokens = got
+                    break
+            except Exception:
+                pass
+    for attr in ("completion_tokens_today", "total_completion_tokens"):
+        val = getattr(tracker, attr, None)
+        if isinstance(val, int):
+            completion_tokens = val
+            break
+        if callable(val):
+            try:
+                got = val()
+                if isinstance(got, int):
+                    completion_tokens = got
+                    break
+            except Exception:
+                pass
+
+    return CostResponse(
+        total_usd=total_usd,
+        session_usd=session_usd,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        provider=(provider or "anthropic_direct"),
+        model=model,
+    )
 
 
 class ProjectListResponse(BaseModel):
@@ -1151,6 +1517,11 @@ _FEEDBACK_AUTH_HEADER_RE = _re.compile(
 )
 _FEEDBACK_USER_PATH_RE = _re.compile(r"/Users/[^/\s'\")]+")
 
+# B5 (Phase 4.1): module-level counter of bug-report log-tail read
+# failures. Surfaced on /health so operators can spot a rotated /
+# permission-denied log path that's silently breaking feedback bundles.
+_feedback_log_read_failures: int = 0
+
 
 def _scrub_log_tail(lines: list[str]) -> list[str]:
     """Apply the §3.24 PII scrubs in place; return the cleaned list."""
@@ -1201,8 +1572,21 @@ async def submit_feedback(
                     encoding="utf-8", errors="replace",
                 ).splitlines()[-1000:]
                 record["log_tail"] = _scrub_log_tail(lines)
-        except OSError:
-            logger.debug("feedback: failed to read log tail", exc_info=True)
+        except OSError as exc:
+            # B5 (Phase 4.1): elevate to WARNING with structured fields.
+            # A user opted into log-bundling and the read failed —
+            # operators need to know the bug-report tail will be empty.
+            global _feedback_log_read_failures
+            _feedback_log_read_failures += 1
+            logger.warning(
+                "feedback: failed to read log tail",
+                extra={
+                    "path": str(log_path),
+                    "errno": getattr(exc, "errno", -1),
+                    "feedback_log_read_failures": _feedback_log_read_failures,
+                },
+                exc_info=True,
+            )
 
     try:
         feedback_dir = get_config_dir() / "feedback"

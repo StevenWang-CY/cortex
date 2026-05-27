@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass
 
 import cv2
@@ -157,6 +158,22 @@ class CapturePipeline:
         self._frames_processed = 0
         self._frames_quality_rejected = 0
         self._frames_no_face = 0
+        # B3 (Phase 4.1): cumulative count of frames the output queue
+        # evicted because a slow consumer let the queue fill. Exposed
+        # via ``get_diagnostics`` for the /health endpoint; emits a
+        # rate-limited WARNING when more than 10 evictions happen in
+        # any rolling 5 s window.
+        self._frames_dropped_total: int = 0
+        # Sliding-window timestamps (seconds, monotonic) of recent
+        # evictions. Trimmed inside ``_record_frame_drop`` to keep its
+        # length bounded to entries within the 5 s window.
+        self._frame_drop_window_seconds: float = 5.0
+        self._frame_drop_warn_threshold: int = 10
+        self._frame_drop_timestamps: deque[float] = deque()
+        # Monotonic timestamp of the last emitted warning. Used to
+        # rate-limit the warning to one per drop-window so a sustained
+        # backpressure spike doesn't spam the log.
+        self._last_frame_drop_warning_at: float = 0.0
 
     @property
     def is_running(self) -> bool:
@@ -173,6 +190,65 @@ class CapturePipeline:
     @property
     def frames_skipped(self) -> int:
         return self._frame_skipper.total_skipped
+
+    @property
+    def frames_dropped_total(self) -> int:
+        """B3 (Phase 4.1): cumulative count of evicted frames.
+
+        A nonzero value means downstream (state engine, broadcast loop)
+        could not keep up with capture and the pipeline had to drop
+        frames to bound queue memory.
+        """
+        return self._frames_dropped_total
+
+    def get_diagnostics(self) -> dict[str, int | float]:
+        """B3 (Phase 4.1): operator-facing diagnostics snapshot.
+
+        Returns a flat dict suitable for embedding in a /health response
+        or a structured log line. Keys are documented above on the
+        individual counters.
+        """
+        return {
+            "frames_processed": self._frames_processed,
+            "frames_quality_rejected": self._frames_quality_rejected,
+            "frames_no_face": self._frames_no_face,
+            "frames_skipped": self._frame_skipper.total_skipped,
+            "frames_dropped_total": self._frames_dropped_total,
+        }
+
+    def _record_frame_drop(self) -> None:
+        """B3 (Phase 4.1): instrument an output-queue eviction.
+
+        Increments the cumulative counter, prunes the sliding window of
+        recent drops to the last ``_frame_drop_window_seconds`` worth of
+        entries, and emits ONE warning per window if the threshold is
+        exceeded.
+        """
+        self._frames_dropped_total += 1
+        now = time.monotonic()
+        window = self._frame_drop_window_seconds
+        self._frame_drop_timestamps.append(now)
+        cutoff = now - window
+        # Trim entries that fell out of the rolling window. The deque is
+        # ordered by insertion so a single popleft loop is O(n) amortised
+        # across all calls — never quadratic.
+        while (
+            self._frame_drop_timestamps
+            and self._frame_drop_timestamps[0] < cutoff
+        ):
+            self._frame_drop_timestamps.popleft()
+        if (
+            len(self._frame_drop_timestamps) > self._frame_drop_warn_threshold
+            and (now - self._last_frame_drop_warning_at) >= window
+        ):
+            self._last_frame_drop_warning_at = now
+            logger.warning(
+                "Capture pipeline backpressure: %d frames dropped in "
+                "%.0fs (total=%d). Downstream consumer is slow.",
+                len(self._frame_drop_timestamps),
+                window,
+                self._frames_dropped_total,
+            )
 
     async def start(self) -> None:
         """Start the full capture pipeline."""
@@ -213,6 +289,10 @@ class CapturePipeline:
                 "quality_rejected": self._frames_quality_rejected,
                 "no_face": self._frames_no_face,
                 "skipped": self._frame_skipper.total_skipped,
+                # B3 (Phase 4.1): include the drop counter in the
+                # shutdown diagnostics so the value lands in archived
+                # daemon logs without requiring a /health request.
+                "dropped": self._frames_dropped_total,
             },
         )
 
@@ -267,13 +347,27 @@ class CapturePipeline:
                     # Drop oldest to maintain real-time
                     try:
                         self._output_queue.get_nowait()
+                        # B3 (Phase 4.1): record the eviction.
+                        self._record_frame_drop()
                     except asyncio.QueueEmpty:
-                        pass
+                        # Race: another consumer drained the queue between
+                        # the ``full()`` check and ``get_nowait`` call.
+                        # Benign — fall through to the put_nowait below.
+                        logger.debug(
+                            "frame drop race: queue drained between full() and get_nowait",
+                        )
 
                 try:
                     self._output_queue.put_nowait(output)
                 except asyncio.QueueFull:
-                    pass
+                    # B3 (Phase 4.1): even after dropping the oldest the
+                    # queue is still full (consumer added another
+                    # producer concurrently?). Record this as a drop too
+                    # so the counter reflects ALL frames lost.
+                    self._record_frame_drop()
+                    logger.debug(
+                        "frame drop: put_nowait racing with refill",
+                    )
 
         except asyncio.CancelledError:
             pass

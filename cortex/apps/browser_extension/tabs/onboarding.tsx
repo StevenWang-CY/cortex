@@ -11,6 +11,7 @@ import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "../page-reset.css";
 import { CX, CX_KEYFRAMES } from "../design-tokens";
+import { getLastRuntimeError } from "../lib/chrome-runtime";
 
 const STEPS = [
     {
@@ -65,11 +66,25 @@ function Onboarding(): React.ReactElement {
         const probe = () => {
             try {
                 chrome.runtime.sendMessage({ type: "GET_STATE" }, (resp) => {
-                    const lastErr = (chrome as unknown as {
-                        runtime?: { lastError?: { message?: string } };
-                    }).runtime?.lastError;
+                    // F10 (Phase-4 audit): read lastError *before*
+                    // dereferencing ``resp``. The MV3 runtime sets
+                    // lastError when the background SW is unreachable,
+                    // and reading the response in that case throws a
+                    // confusing "Unchecked runtime.lastError" warning.
+                    // Centralised reader from lib/chrome-runtime.ts.
+                    const lastErr = getLastRuntimeError();
                     if (cancelled) return;
-                    if (lastErr || !resp) {
+                    if (lastErr) {
+                        if (typeof console !== "undefined") {
+                            console.warn(
+                                "[cortex.onboarding] GET_STATE lastError:",
+                                lastErr.message,
+                            );
+                        }
+                        setDaemonConnected(false);
+                        return;
+                    }
+                    if (!resp) {
                         setDaemonConnected(false);
                         return;
                     }

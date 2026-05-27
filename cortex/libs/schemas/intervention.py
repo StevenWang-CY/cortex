@@ -3,16 +3,54 @@ Cortex Intervention Schemas
 
 Pydantic models for intervention plans, workspace snapshots,
 and intervention outcomes.
+
+Also hosts the lightweight ``AdapterCommand`` / ``ValidationResult``
+dataclasses that the planner / executor / ports layer share. These live
+in libs/ rather than under ``cortex.services.intervention_engine`` so
+``cortex.libs.ports.intervention_port`` can reference them without
+violating the libs ⊥ services architectural invariant enforced by
+``cortex/tests/unit/test_module_boundaries.py``.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from dataclasses import field as dc_field
 from datetime import datetime
 from typing import Any, Literal
 from urllib.parse import urlparse
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+# ---------------------------------------------------------------------------
+# Planner-side dataclasses (intentionally NOT pydantic models).
+#
+# These are runtime carriers between the planner, the executor, and the
+# api_gateway port. They never cross the wire (the wire payload is
+# ``InterventionPlan`` + ``InterventionApplied``), so a dataclass is the
+# right tool — no need for the Pydantic validator machinery. They live in
+# libs/ so the InterventionPort Protocol can type-hint them without
+# pulling cortex.services back into libs.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AdapterCommand:
+    """A concrete command to send to a workspace adapter."""
+
+    adapter: str  # "editor", "browser", "terminal", "overlay"
+    action: str
+    params: dict[str, object] = dc_field(default_factory=dict)
+
+
+@dataclass
+class ValidationResult:
+    """Result of plan validation."""
+
+    is_valid: bool
+    errors: list[str] = dc_field(default_factory=list)
+    warnings: list[str] = dc_field(default_factory=list)
 
 # F10: only these URL schemes may appear in an ``open_url`` action target.
 # Excludes ``javascript:``, ``data:``, ``chrome:``, ``file:``, ``vbscript:``

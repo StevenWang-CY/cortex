@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
@@ -26,6 +28,103 @@ from cortex.libs.config.ports import (
     LAUNCHER_AGENT_PORT,
     WEBSOCKET_PORT,
 )
+
+
+class StorageConfigError(RuntimeError):
+    """Raised when the configured storage path cannot be created.
+
+    Carries the offending path and the original OS errno so callers can
+    surface a clean user-facing message ("Cortex can't write to ...; pick
+    a different location") without swallowing the underlying ``OSError``.
+    """
+
+    def __init__(self, path: str, original: OSError) -> None:
+        self.path = path
+        self.original = original
+        self.errno = getattr(original, "errno", None)
+        super().__init__(
+            f"Cannot create storage directory {path!r}: {original} (errno={self.errno})"
+        )
+
+
+# I2: Bedrock bearer token cache. Populated lazily by
+# ``get_bedrock_token()`` from the macOS Keychain (BYOK). The token is
+# NEVER written into ``os.environ`` — child processes inherit env, so a
+# debugger / crash-dump attached to any descendant could read it. The
+# Anthropic SDK reads ``AWS_BEARER_TOKEN_BEDROCK`` at construction time;
+# call ``bedrock_token_env_scope()`` around the SDK constructor instead.
+_bedrock_token_cache: str | None = None
+
+
+def get_bedrock_token(config: CortexConfig | None = None) -> str | None:
+    """Return the Bedrock bearer token, cached after first successful read.
+
+    Resolution order:
+        1. If ``AWS_BEARER_TOKEN_BEDROCK`` is already set in the env
+           (user-supplied), return that value unchanged.
+        2. Otherwise consult the macOS Keychain via ``get_password_safe``
+           with a 5 s ceiling so a wedged TCC prompt cannot pin the
+           daemon. The retrieved value is cached for the process lifetime.
+
+    Returns ``None`` when no token is available (the planner will then
+    fall back to the rule-based intervention path).
+    """
+    global _bedrock_token_cache
+    env_token = os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
+    if env_token:
+        return env_token
+    if _bedrock_token_cache is not None:
+        return _bedrock_token_cache
+    cfg = config or get_config()
+    if cfg.llm.provider != "bedrock" or not cfg.llm.use_keychain:
+        return None
+    try:
+        from cortex.libs.utils.secrets import get_password_safe
+        token = get_password_safe(
+            cfg.llm.bedrock.keychain_service,
+            cfg.llm.bedrock.keychain_account,
+        )
+    except (ImportError, OSError, RuntimeError):
+        return None
+    if token:
+        _bedrock_token_cache = token
+    return token
+
+
+def _clear_bedrock_token_cache() -> None:
+    """Test helper: reset the in-memory token cache."""
+    global _bedrock_token_cache
+    _bedrock_token_cache = None
+
+
+@contextmanager
+def bedrock_token_env_scope(
+    config: CortexConfig | None = None,
+) -> Iterator[str | None]:
+    """Context-manager: temporarily expose the Bedrock token via env.
+
+    The Anthropic Bedrock SDK reads ``AWS_BEARER_TOKEN_BEDROCK`` at
+    construction time only. This context manager scopes that env mutation
+    so the variable is removed (or restored to its prior value) on exit —
+    no child process spawned after the ``with`` block can inherit the
+    token.
+
+    Yields the resolved token (or ``None`` if no token is available so
+    callers can short-circuit to the fallback path).
+    """
+    token = get_bedrock_token(config)
+    if not token:
+        yield None
+        return
+    prior = os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
+    try:
+        os.environ["AWS_BEARER_TOKEN_BEDROCK"] = token
+        yield token
+    finally:
+        if prior is None:
+            os.environ.pop("AWS_BEARER_TOKEN_BEDROCK", None)
+        else:
+            os.environ["AWS_BEARER_TOKEN_BEDROCK"] = prior
 
 # Bound at module-import time so Pydantic field defaults read from the
 # same constants without re-importing on every model construction.
@@ -636,11 +735,18 @@ def _check_required_feature_toggles() -> None:
     absent from both the environment and the .env files.
 
     The defaults remain authoritative; this only surfaces mis-typed
-    or forgotten overrides so operations is never silent. Disabled when
-    ``CORTEX_SUPPRESS_FEATURE_TOGGLE_WARNINGS=1`` is set (used by
-    tests so the suite doesn't flood stdout).
+    or forgotten overrides so operations is never silent.
+
+    I5: ``CORTEX_SUPPRESS_FEATURE_TOGGLE_WARNINGS`` is honoured ONLY when
+    ``CORTEX_ENV=test``. Production deployments that inadvertently set
+    the suppression flag still emit warnings — we'd rather log-flood than
+    silently ship with a wedged feature flag. Tests that need to suppress
+    must explicitly set ``CORTEX_ENV=test`` as well.
     """
-    if os.environ.get("CORTEX_SUPPRESS_FEATURE_TOGGLE_WARNINGS") == "1":
+    if (
+        os.environ.get("CORTEX_SUPPRESS_FEATURE_TOGGLE_WARNINGS") == "1"
+        and os.environ.get("CORTEX_ENV") == "test"
+    ):
         return
     log = __import__("logging").getLogger(__name__)
     env_files = _bundled_env_files()
@@ -687,32 +793,31 @@ def get_config() -> CortexConfig:
         storage_path = Path(config.storage.path).expanduser()
         if not storage_path.is_absolute():
             config.storage.path = _bundled_storage_path()
-        Path(config.storage.path).mkdir(parents=True, exist_ok=True)
-
-    # BYOK: surface the Bedrock bearer token via env so the Anthropic SDK
-    # (AsyncAnthropicBedrock) and any boto3 fallbacks can find it. We never
-    # store the token on the config object — keychain is the source of truth.
-    #
-    # Phase-4a Debt-1: wrap the lookup in ``get_password_safe`` so a
-    # wedged Keychain backend (TCC prompt, unlock sheet, dbus stall)
-    # cannot pin module-import for tens of seconds. A 5 s ceiling means
-    # the daemon degrades to the rule-based fallback after at most that
-    # delay, never wedges.
-    if (
-        config.llm.provider == "bedrock"
-        and config.llm.use_keychain
-        and not os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
-    ):
+        # I10: surface mkdir failures as a structured ``StorageConfigError``
+        # rather than letting a raw ``PermissionError`` escape from
+        # ``get_config()``. The caller (desktop shell / native host) maps
+        # this to a user-visible "pick a different storage location"
+        # toast; the unstructured exception would have surfaced as a
+        # cryptic stack trace at first launch.
         try:
-            from cortex.libs.utils.secrets import get_password_safe
-            token = get_password_safe(
-                config.llm.bedrock.keychain_service,
-                config.llm.bedrock.keychain_account,
+            Path(config.storage.path).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log = __import__("logging").getLogger(__name__)
+            log.error(
+                "storage_mkdir_failed path=%s errno=%s msg=%s",
+                config.storage.path,
+                getattr(exc, "errno", None),
+                exc,
             )
-            if token:
-                os.environ["AWS_BEARER_TOKEN_BEDROCK"] = token
-        except Exception:
-            pass  # keyring not available — daemon will degrade to fallback
+            raise StorageConfigError(config.storage.path, exc) from exc
+
+    # I2: BYOK Bedrock token is NO LONGER written into ``os.environ``
+    # at config-load time. The Anthropic SDK reads
+    # ``AWS_BEARER_TOKEN_BEDROCK`` only at construction time; callers that
+    # need the token use ``bedrock_token_env_scope()`` (a context manager
+    # that scopes the env mutation to the SDK constructor call) or
+    # ``get_bedrock_token()`` for direct access. This eliminates the leak
+    # of the long-lived bearer into every subprocess the daemon spawns.
 
     # Mirror provider + region into the env the SDK reads, so subprocess
     # workers and the planner module see the same configuration.

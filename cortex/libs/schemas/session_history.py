@@ -178,11 +178,11 @@ class TrendsRequest(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    window: Literal["week", "month", "quarter"] = Field(
+    window: Literal["week", "month"] = Field(
         "week",
         description=(
-            "Aggregation window: 'week' = last 7 days, 'month' = last 30, "
-            "'quarter' = last 90."
+            "Aggregation window: 'week' = last 7 days, 'month' = last 30. "
+            "``quarter`` was dropped from the wire — no UI panel renders it."
         ),
     )
     refresh: bool = Field(
@@ -205,11 +205,11 @@ class TrendsResponse(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    window: Literal["week", "month", "quarter"] = Field(
+    window: Literal["week", "month"] = Field(
         "week",
         description=(
             "The window the daily rows cover. Week=last 7 days, "
-            "month=last 30, quarter=last 90."
+            "month=last 30. ``quarter`` was dropped from the wire."
         ),
     )
     daily: list[DailyBaseline] = Field(

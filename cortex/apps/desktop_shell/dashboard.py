@@ -956,6 +956,31 @@ class _ConsumerTab(QWidget):
         except Exception:
             logger.debug("initial baseline freshness check failed", exc_info=True)
 
+        # F16 (Phase-4 audit): envelope-level health warning strip,
+        # mirrored from the daemon's ``payload["capture"]["stale"]`` and
+        # ``payload["store"]["degraded"]`` flags. Hidden by default;
+        # ``update_state`` flips visibility on receipt of a STATE_UPDATE
+        # carrying either flag. Uses the existing danger token (no new
+        # palette).
+        self._health_banner = QLabel("")
+        self._health_banner.setObjectName("CortexHealthBanner")
+        self._health_banner.setWordWrap(True)
+        self._health_banner.setFont(
+            mac_native.system_font(FS_CAPTION, "regular")
+        )
+        self._health_banner.setStyleSheet(
+            "QLabel#CortexHealthBanner {"
+            f"  color: {_DANGER};"
+            f"  background: rgba(215, 0, 21, 0.10);"
+            f"  border: 1px solid {_DANGER};"
+            f"  border-radius: 6px;"
+            f"  padding: 6px 10px;"
+            "}"
+        )
+        self._health_banner.setVisible(False)
+        _set_accessible_name(self._health_banner, "Health warning")
+        root.addWidget(self._health_banner)
+
         # ── Goal input — minimum width, flexible (HIG: avoid fixed sizes) ──
         self._goal_input = QLineEdit()
         self._goal_input.setPlaceholderText("What are you working on?")
@@ -978,8 +1003,28 @@ class _ConsumerTab(QWidget):
             f"  background: {_CONTROL_BG};"
             "}"
             f"QLineEdit:focus {{ border: 1.5px solid {BRAND_ACCENT}; }}"
-            f"QLineEdit::placeholder {{ color: {_LABEL_TERTIARY}; }}"
         )
+        # F19 (Phase-4 audit/UI 4.6): drive placeholder color via
+        # QPalette.PlaceholderText instead of the
+        # ``QLineEdit::placeholder`` QSS selector. The QSS form silently
+        # no-ops on some Qt 6.x builds (the parser accepts
+        # ``::placeholder`` but never wires it to the actual paint
+        # path), while the palette role is the documented Qt API and
+        # works on every backend.
+        try:
+            from PySide6.QtGui import QColor, QPalette
+
+            placeholder_palette = self._goal_input.palette()
+            placeholder_palette.setColor(
+                QPalette.ColorRole.PlaceholderText,
+                QColor(_LABEL_TERTIARY),
+            )
+            self._goal_input.setPalette(placeholder_palette)
+        except Exception:
+            # Headless test envs may not have a real platform plugin —
+            # the placeholder colour is non-functional in that case,
+            # which is harmless for unit tests.
+            pass
         # E.1: emit goal_set when the user hits return.
         # F33: debounce the goal-set emission. A held-down Return key fires
         # ``returnPressed`` repeatedly (Qt key auto-repeat); without a
@@ -1968,6 +2013,35 @@ class _ConsumerTab(QWidget):
                 # Lightweight mock widgets may not expose setVisible —
                 # the flag itself is what the contract pins on.
                 pass
+
+        # F16 (Phase-4 audit): drive the health banner from the
+        # envelope-level flags the daemon stamps on STATE_UPDATE. The
+        # capture-stale message wins over the store-degraded one
+        # because a dead camera is more user-actionable than a
+        # degraded SQLite store.
+        try:
+            capture_envelope = payload.get("capture") or {}
+            store_envelope = payload.get("store") or {}
+            capture_stale = bool(capture_envelope.get("stale", False))
+            store_degraded = bool(store_envelope.get("degraded", False))
+            if capture_stale:
+                self._set_text_if_changed(
+                    self._health_banner,
+                    "Camera offline — frames are not flowing",
+                )
+                self._health_banner.setVisible(True)
+            elif store_degraded:
+                self._set_text_if_changed(
+                    self._health_banner,
+                    "Storage degraded — sessions may not persist",
+                )
+                self._health_banner.setVisible(True)
+            else:
+                self._health_banner.setVisible(False)
+        except Exception:
+            # Mock widgets in unit tests may not expose setVisible /
+            # setText; the visibility flag isn't load-bearing.
+            pass
 
         state = payload.get("state", "FLOW")
         color = STATE_COLORS.get(state, _LABEL_TERTIARY)

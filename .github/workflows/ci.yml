@@ -75,13 +75,30 @@ jobs:
           pip install -e "./cortex[dev]"
       - name: Lint (ruff)
         run: ruff check cortex/
-      - name: Typecheck (mypy)
-        # Informational: mypy report runs on every CI but is not yet a
-        # blocking gate. The codebase still has ~1k legacy type errors
-        # (largely Pydantic-default-factory call-arg false positives
-        # and lightweight test stubs that the strict path can't see).
-        # Tracking issue: hardening mypy into a blocking gate is a
-        # future cleanup pass.
+      - name: Typecheck (mypy — blocking scope, I9)
+        # I9: mypy is now BLOCKING for a curated set of directories that
+        # currently pass cleanly. Per-directory migration plan:
+        #   1. cortex/libs/design/   ✓ (blocking, this PR)
+        #   2. cortex/libs/llm/      ✓ (blocking, this PR)
+        #   3. cortex/libs/ports/    → blocking once libs/schemas
+        #      Pydantic-default-factory false positives are silenced
+        #   4. cortex/libs/schemas/  → blocking after upgrading
+        #      pydantic-to-typescript or adding type: ignore comments to
+        #      ChronotypeModel / DestructiveStruggleEstimate default
+        #      factories
+        #   5. cortex/libs/config/   → blocking after `types-PyYAML` is
+        #      added to the dev extras
+        #   6. cortex/libs/utils/    → blocking after pyobjc stubs land
+        #   7. cortex/services/api_gateway/ → blocking next pass
+        #   8. cortex/services/      → blocking last
+        # Bump this scope upward as each directory's residual errors are
+        # closed; do NOT silently weaken it by re-adding ``|| true``.
+        run: mypy cortex/libs/design/ cortex/libs/llm/
+      - name: Typecheck (mypy — full project, informational)
+        # Full-tree mypy is still surfaced but kept non-blocking until
+        # every libs/services subtree migrates. Failures print in the
+        # CI log so cleanup PRs have a single source of truth for the
+        # remaining error budget.
         run: mypy cortex/ || true
         continue-on-error: true
       - name: Test (pytest)

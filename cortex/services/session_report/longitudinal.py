@@ -105,6 +105,10 @@ _HRV_TREND_MEAN_FLOOR: float = 5.0
 # Default window sizes for the trends rollup. All three values are
 # part of the public ``TrendsRequest`` / ``TrendsResponse`` literal
 # (P0 §3.2): week=last 7 days, month=last 30, quarter=last 90.
+# Phase 4.4 contracts: ``quarter`` was dropped from the wire literal
+# (no UI panel renders it). The aggregator still understands the alias
+# internally — clients that request "quarter" get clamped to ``month``
+# below — but the response envelope always carries the narrowed literal.
 _WINDOWS: dict[str, int] = {"week": 7, "month": 30, "quarter": 90}
 
 
@@ -520,11 +524,18 @@ class LongitudinalAggregator:
         fall back to ``"week"`` for defense-in-depth (the schema layer
         is the strict gate; the WS / REST dispatch layers also clamp).
         """
+        # Phase 4.4: ``quarter`` is no longer on the response literal.
+        # Accept the legacy alias internally (return 90 days of data)
+        # but always stamp the envelope with the narrowed wire literal
+        # so the schema validator never sees an out-of-set string.
         if window not in _WINDOWS:
-            wire_window: Literal["week", "month", "quarter"] = "week"
+            internal_window = "week"
         else:
-            wire_window = window  # type: ignore[assignment]
-        days = _WINDOWS.get(wire_window, 7)
+            internal_window = window
+        days = _WINDOWS.get(internal_window, 7)
+        wire_window: Literal["week", "month"] = (
+            "month" if internal_window in ("month", "quarter") else "week"
+        )
         model = self._load_or_refresh_model(
             refresh=refresh, window_days=_CHRONOTYPE_WINDOW_DAYS,
         )

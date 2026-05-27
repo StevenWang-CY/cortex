@@ -10,6 +10,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { CX, STATE_COLORS, STATE_LABELS, CX_KEYFRAMES } from "./design-tokens";
 import { newCorrelationId } from "./lib/correlation";
+import { getLastRuntimeError } from "./lib/chrome-runtime";
 
 /**
  * F19b: every popup-initiated request mints a correlation id at the click
@@ -52,9 +53,10 @@ export function safeSendMessage(
 ): void {
     try {
         chrome.runtime.sendMessage(msg, (response) => {
-            const lastErr = (chrome as unknown as {
-                runtime?: { lastError?: { message?: string } };
-            }).runtime?.lastError;
+            // F18 (Phase-4 audit): the unsafe ``chrome as unknown as``
+            // cast lives in exactly one helper (lib/chrome-runtime.ts)
+            // so every other surface stays clean.
+            const lastErr = getLastRuntimeError();
             if (lastErr) {
                 if (
                     typeof process !== "undefined"
@@ -146,6 +148,18 @@ interface CortexState {
     signal_quality: Record<string, number>;
     dwell_seconds: number;
     biometrics?: Biometrics;
+    // Phase-4 audit (F5/F16): the daemon stamps capture-pipeline and
+    // session-store health flags onto the STATE_UPDATE envelope. The
+    // popup mirrors them into the BPM/HRV status banner and the
+    // warning strip at the top of the panel.
+    capture?: {
+        frames_flowing?: boolean;
+        face_detected?: boolean;
+        stale?: boolean;
+    };
+    store?: {
+        degraded?: boolean;
+    };
 }
 
 interface FocusSnapshot {
@@ -397,9 +411,8 @@ function TrendsMiniStrip(): React.ReactElement {
                     // ``chrome.runtime.lastError`` populates inside the
                     // callback when the background SW disconnected mid-
                     // call; treat that the same as a thrown error.
-                    const lastErr = (chrome as unknown as {
-                        runtime?: { lastError?: { message?: string } };
-                    }).runtime?.lastError;
+                    // F18 (Phase-4 audit): centralised lastError reader.
+                    const lastErr = getLastRuntimeError();
                     if (lastErr) {
                         console.warn(
                             "[cortex.popup] GET_CACHED_TRENDS lastError",
@@ -442,11 +455,8 @@ function TrendsMiniStrip(): React.ReactElement {
                             chrome.runtime.sendMessage(
                                 { type: "REQUEST_TRENDS" },
                                 (raw2: unknown) => {
-                                    const lastErr2 = (chrome as unknown as {
-                                        runtime?: {
-                                            lastError?: { message?: string };
-                                        };
-                                    }).runtime?.lastError;
+                                    // F18: centralised lastError reader.
+                                    const lastErr2 = getLastRuntimeError();
                                     if (lastErr2) {
                                         console.warn(
                                             "[cortex.popup] REQUEST_TRENDS lastError",
@@ -615,6 +625,15 @@ function CortexPopup(): React.ReactElement {
     const [nativeHostStatus, setNativeHostStatus] = useState<"present" | "missing" | "unknown">("unknown");
     const [daemonVersion, setDaemonVersion] = useState<string | null>(null);
     const [handshakeError, setHandshakeError] = useState<string | null>(null);
+    // F21 (Phase-4 audit / §3.15): BYOK cost indicator — hidden when
+    // the daemon reports provider="none" / "rule_based" (no LLM
+    // spend), shown as a one-line "$0.07 / $5.00 today" pill otherwise.
+    const [costInfo, setCostInfo] = useState<{
+        cost_today: number;
+        budget_today: number;
+        provider: string | null;
+        budget_exhausted: boolean;
+    } | null>(null);
     const [state, setState] = useState<CortexState | null>(null);
     const [focus, setFocus] = useState<FocusSnapshot | null>(null);
     const [dailyStats, setDailyStats] = useState<DailyStats | null>(null);
@@ -649,7 +668,16 @@ function CortexPopup(): React.ReactElement {
     // below replaces it with a tick-on-every-second update.
     const [quietModeDurationMin, setQuietModeDurationMin] = useState<number | null>(null);
     useEffect(() => {
-        if (quietModeEndsAt === null) return;
+        // F8 (Phase-4 audit): include ``quietMode`` in the dep array so
+        // the interval restarts (and the tick re-evaluates) when the
+        // user toggles quiet mode while a countdown is armed. Without
+        // ``quietMode`` here, an off-toggle leaked a running interval
+        // that kept overwriting ``quietModeDurationMin`` with stale
+        // values for the rest of the popup's lifetime.
+        if (quietModeEndsAt === null || !quietMode) {
+            setQuietModeDurationMin(null);
+            return;
+        }
         const tick = () => {
             const remainingMs = quietModeEndsAt - Date.now();
             if (remainingMs <= 0) {
@@ -661,7 +689,7 @@ function CortexPopup(): React.ReactElement {
         tick();
         const handle = setInterval(tick, 30_000); // 30s is plenty for minute-grain countdown
         return () => clearInterval(handle);
-    }, [quietModeEndsAt]);
+    }, [quietModeEndsAt, quietMode]);
     const [launching, setLaunching] = useState(false);
     const [launchError, setLaunchError] = useState(false);
     const [tabsExpanded, setTabsExpanded] = useState(false);
@@ -714,6 +742,46 @@ function CortexPopup(): React.ReactElement {
         "idle" | "submitting" | "saved" | "queued" | "error"
     >("idle");
     const [bugReportError, setBugReportError] = useState<string>("");
+
+    // F21 (Phase-4 audit / §3.15 follow-up): poll the daemon's
+    // /api/cost endpoint every 30s while the popup is open. The
+    // background script proxies the fetch so we don't need
+    // cross-origin credentials. Stops polling if the popup closes
+    // (component unmount).
+    useEffect(() => {
+        if (!connected) return;
+        let cancelled = false;
+        const fetchCost = () => {
+            safeSendMessage({ type: "GET_COST" }, (raw: unknown) => {
+                if (cancelled) return;
+                const resp = raw as
+                    | {
+                          ok?: boolean;
+                          cost?: {
+                              cost_today: number;
+                              budget_today: number;
+                              provider?: string | null;
+                              budget_exhausted?: boolean;
+                          };
+                      }
+                    | undefined;
+                if (resp?.ok && resp.cost) {
+                    setCostInfo({
+                        cost_today: resp.cost.cost_today,
+                        budget_today: resp.cost.budget_today,
+                        provider: resp.cost.provider ?? null,
+                        budget_exhausted: resp.cost.budget_exhausted === true,
+                    });
+                }
+            });
+        };
+        fetchCost();
+        const handle = setInterval(fetchCost, 30_000);
+        return () => {
+            cancelled = true;
+            clearInterval(handle);
+        };
+    }, [connected]);
 
     // Inject fonts + keyframes (single injection point)
     useEffect(() => {
@@ -1318,9 +1386,16 @@ function CortexPopup(): React.ReactElement {
     // ``state`` may be null pre-first-STATE_UPDATE; default both flags
     // to ``true`` so the most benign message ("Reading your pulse…")
     // wins until we hear otherwise — same fallback as the desktop tab.
-    const captureRaw = (state as unknown as { capture?: { frames_flowing?: boolean; face_detected?: boolean } })?.capture;
+    // F5 (Phase-4 audit): ``capture`` is now part of the CortexState
+    // interface, so no double cast is needed — TS narrows the optional
+    // field directly.
+    const captureRaw = state?.capture;
     const framesFlowing = captureRaw?.frames_flowing ?? true;
     const faceDetected = captureRaw?.face_detected ?? true;
+    // F16: ``capture.stale`` and ``store.degraded`` are the two
+    // health-warning surfaces the daemon raises at the envelope level.
+    const captureStale = captureRaw?.stale === true;
+    const storeDegraded = state?.store?.degraded === true;
     const bioStatusMessage = !state
         ? "Connecting to daemon…"
         : !framesFlowing
@@ -1405,6 +1480,40 @@ function CortexPopup(): React.ReactElement {
                     </div>
                 )}
             </div>
+
+            {/* F16 (Phase-4 audit): envelope-level health warning
+                strip. The daemon stamps ``capture.stale=true`` when the
+                webcam loop has not produced a frame in the staleness
+                window, and ``store.degraded=true`` when SQLite has
+                fallen back to read-only / journal-only mode. Surface
+                the most-severe single message at the top of the popup
+                so the user can take action (reopen permissions, kill
+                a conflicting process, etc). Uses the existing danger
+                tint from design-tokens — no new palette.
+                aria-live="polite" so screen readers announce it
+                without interrupting other speech. */}
+            {connected && (captureStale || storeDegraded) && (
+                <div
+                    role="status"
+                    aria-live="polite"
+                    data-testid="cortex-health-banner"
+                    style={{
+                        margin: "0 16px 8px",
+                        padding: "6px 10px",
+                        borderRadius: CX.radiusSm,
+                        background: "rgba(215, 0, 21, 0.10)",
+                        border: `1px solid ${CX.danger}`,
+                        color: CX.danger,
+                        fontSize: 11,
+                        fontFamily: CX.font,
+                        lineHeight: 1.35,
+                    }}
+                >
+                    {captureStale
+                        ? "Camera offline — frames are not flowing"
+                        : "Storage degraded — sessions may not persist"}
+                </div>
+            )}
 
             {/* P0 §3.3: end-of-session recap card. Sits at the top of
                 the popup body so it's the first thing the user sees on
@@ -1615,7 +1724,12 @@ function CortexPopup(): React.ReactElement {
                         style={S.goalInput}
                         placeholder="What are you working on?"
                         value={goalInput}
-                        maxLength={120}
+                        // F15 (Phase-4 audit): cap at 500 chars so the
+                        // text never breaches the daemon's GoalSet
+                        // schema upper bound. The visual input is sized
+                        // for ~80 chars but pasted content used to slip
+                        // through unbounded.
+                        maxLength={500}
                         onChange={(e) => setGoalInput(e.target.value)}
                         onKeyDown={(e) => e.key === "Enter" && handleStartFocus()}
                     />
@@ -2374,6 +2488,36 @@ function CortexPopup(): React.ReactElement {
                         data-testid="view-history-status"
                     >{historyStatus}</div>
                 )}
+                {/* F21 (Phase-4 audit / §3.15): BYOK spend indicator.
+                    Hidden when provider is "none" or "rule_based"
+                    (no LLM spend to report). Budget cap of 0 means
+                    unlimited so we elide the "/ $X.XX" tail. */}
+                {costInfo
+                    && costInfo.provider !== null
+                    && costInfo.provider !== "none"
+                    && costInfo.provider !== "rule_based" && (
+                        <div
+                            data-testid="cost-indicator"
+                            style={{
+                                ...S.historyStatusLine,
+                                color: costInfo.budget_exhausted
+                                    ? CX.danger
+                                    : CX.textTertiary,
+                                marginTop: 4,
+                            }}
+                            aria-label={
+                                costInfo.budget_today > 0
+                                    ? `LLM spend today: $${costInfo.cost_today.toFixed(2)} of $${costInfo.budget_today.toFixed(2)} budget`
+                                    : `LLM spend today: $${costInfo.cost_today.toFixed(2)}`
+                            }
+                        >
+                            {`$${costInfo.cost_today.toFixed(2)}`}
+                            {costInfo.budget_today > 0
+                                ? ` / $${costInfo.budget_today.toFixed(2)} today`
+                                : " today"}
+                            {costInfo.budget_exhausted && " · budget hit"}
+                        </div>
+                    )}
                 {bugReportStatus === "saved" && (
                     <div
                         role="status"

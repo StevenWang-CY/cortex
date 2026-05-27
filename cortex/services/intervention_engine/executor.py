@@ -15,8 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from cortex.libs.adapters.registry import AdapterRegistry
-from cortex.libs.schemas.intervention import InterventionPlan
-from cortex.services.intervention_engine.planner import AdapterCommand
+from cortex.libs.schemas.intervention import AdapterCommand, InterventionPlan
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +121,11 @@ class InterventionExecutor:
         self._adapters: dict[str, WorkspaceAdapter] = {}
         self._registry: AdapterRegistry | None = adapter_registry
         self._active_mutations: dict[str, list[Mutation]] = {}
+        # B17 (Phase 4.1): cumulative count of permanently-missing
+        # adapter dispatches. Increments only after the one-shot retry
+        # below also fails, so a transient adapter registration race
+        # (extension reconnecting) doesn't inflate the counter.
+        self._adapter_missing_total: int = 0
         # intervention_id → list of mutations
         # Phase-4b TASK 1: per-action consent gate. The daemon binds this
         # at startup so the executor can refuse an action whose live
@@ -324,10 +328,22 @@ class InterventionExecutor:
 
             adapter = self._get_adapter(cmd.adapter)
             if adapter is None:
+                # B17 (Phase 4.1): one retry after 500ms to absorb a
+                # transient adapter-registration race (e.g. the browser
+                # extension just reconnected and the daemon hasn't yet
+                # finished re-binding ``register_adapter``). Permanent
+                # misses still set ``success=False`` and increment the
+                # counter for /health visibility.
+                import asyncio as _asyncio
+                await _asyncio.sleep(0.5)
+                adapter = self._get_adapter(cmd.adapter)
+            if adapter is None:
+                self._adapter_missing_total += 1
                 logger.warning(
-                    "No adapter registered for '%s', skipping %s",
+                    "No adapter registered for '%s', skipping %s (adapter_missing_total=%d)",
                     cmd.adapter,
                     cmd.action,
+                    self._adapter_missing_total,
                 )
                 mutation.success = False
                 mutation.reason = "adapter_missing"

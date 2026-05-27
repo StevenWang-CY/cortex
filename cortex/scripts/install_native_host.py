@@ -293,9 +293,22 @@ def install(*, project_root: str | None = None) -> bool:
         return True
 
 
-def main() -> None:
-    install()
+def main() -> int:
+    """Entry point. Returns 0 on success, 1 when no browsers were
+    detected so the build script / CI can fail fast instead of silently
+    shipping a daemon with no extension wiring.
+    """
+    if not install():
+        print(
+            "ERROR: Native messaging host could NOT be installed (no "
+            "supported browsers detected).\n"
+            "       Install Chrome / Edge / Brave / Vivaldi / Arc and "
+            "re-run this script.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -2316,7 +2316,13 @@ class WebSocketServer:
         capture_status: dict[str, bool] = {
             "frames_flowing": False,
             "face_detected": False,
+            # B1 (Phase 4.1): ``stale=True`` means the camera channel is
+            # offline (pipeline failed to start, no recent frames, etc.).
+            # The dashboard reads this to swap the "Reading your pulse"
+            # ambient string for the "Camera offline" tile.
+            "stale": False,
         }
+        store_degraded = False
         try:
             from cortex.services.api_gateway.app import registry as _registry
             frame_meta = _registry.get("latest_frame_meta")
@@ -2328,10 +2334,26 @@ class WebSocketServer:
                 capture_status["face_detected"] = bool(
                     getattr(frame_meta, "face_detected", False)
                 )
+            # Daemon plants this when the capture pipeline fails to
+            # start so the very first broadcast carries the offline
+            # marker.
+            if bool(_registry.get("capture_stale") or False):
+                capture_status["stale"] = True
+            # If there ARE recent frames, capture is healthy regardless of
+            # what the stale flag says — clear it so a transient init
+            # failure followed by a successful resume doesn't leave the
+            # UI stuck in "offline".
+            if capture_status["frames_flowing"]:
+                capture_status["stale"] = False
+            store_degraded = bool(_registry.get("store_degraded") or False)
         except Exception:
             # Registry lookup is best-effort; never block a broadcast.
-            pass
+            logger.debug("registry lookup for capture/store status failed", exc_info=True)
         payload["capture"] = capture_status
+        # B4 (Phase 4.1): expose the store degradation indicator on
+        # every broadcast so a late-joining client still learns the
+        # daemon is running on an in-memory store.
+        payload["store"] = {"degraded": store_degraded}
 
         if biometrics:
             payload["biometrics"] = biometrics

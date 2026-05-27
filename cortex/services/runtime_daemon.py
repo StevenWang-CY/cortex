@@ -119,6 +119,27 @@ from cortex.services.throttle.copilot_throttle import CopilotThrottle
 
 logger = logging.getLogger(__name__)
 
+
+def _supervise_background_task(task: asyncio.Task[Any]) -> None:
+    """B7 (Phase 4.1): module-level supervisor for ``asyncio.create_task``.
+
+    Lives at module scope so test scaffolds that bind a subset of
+    :class:`CortexDaemon` methods (notably ``_spawn_background_task``)
+    don't have to also bind this callback. Logs unexpected exceptions
+    at WARNING; cancellations are intentional and silently swallowed.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is None:
+        return
+    logger.warning(
+        "Background task %s raised %s",
+        task.get_name(),
+        exc.__class__.__name__,
+        exc_info=exc,
+    )
+
 # P0 §3.3: bound on the SESSION_RECAP broadcast inside ``stop()`` so a
 # stuck WS client (e.g. a dead browser tab that never reads its frame)
 # cannot deadlock the daemon shutdown.
@@ -277,6 +298,13 @@ class SessionRecorder:
             queue.Queue(maxsize=4096)
         )
         self._stop_event = threading.Event()
+        # B19 (Phase 4.1): consecutive-overflow tracker for the
+        # ``queue.Full`` path. Reset on every successful put; promotes
+        # the second-in-a-row overflow log line to ERROR with the
+        # current sequence number stamped so on-call can locate the
+        # exact gap in session JSONL.
+        self._overflow_streak: int = 0
+        self._overflow_seq: int = 0
         self._writer_thread = threading.Thread(
             target=self._writer_loop,
             name="cortex-session-recorder",
@@ -288,17 +316,40 @@ class SessionRecorder:
         record = (event_type, payload, time.time())
         try:
             self._queue.put_nowait(record)
+            # B19 (Phase 4.1): clear the overflow streak counter on every
+            # successful put so an intermittent burst doesn't accumulate
+            # into a false-alarm ERROR after a healthy stretch.
+            self._overflow_streak = 0
+            return
         except queue.Full:
             # Drop oldest to keep producer non-blocking. Surface the
             # drop as a structured event so the on-call can see backpressure.
             try:
                 self._queue.get_nowait()
             except queue.Empty:
-                pass
+                # B6 (Phase 4.1): another consumer drained the queue
+                # between the .full() check and .get_nowait — benign
+                # race, fall through to the put_nowait below.
+                logger.debug("SessionRecorder dedrop race: queue empty under contention")
             try:
                 self._queue.put_nowait(record)
             except queue.Full:
-                logger.warning("SessionRecorder backpressure: dropped %s", event_type)
+                # B19 (Phase 4.1): bounded queue is genuinely full. Escalate
+                # on the SECOND consecutive overflow so a transient burst
+                # doesn't generate WARNING noise but sustained backpressure
+                # is alarm-worthy.
+                self._overflow_streak += 1
+                if self._overflow_streak >= 2:
+                    logger.error(
+                        "SessionRecorder backpressure (overflow #%d): "
+                        "dropped %s seq=%d — writer thread is starving",
+                        self._overflow_streak,
+                        event_type,
+                        self._overflow_seq,
+                    )
+                else:
+                    logger.warning("SessionRecorder backpressure: dropped %s", event_type)
+                self._overflow_seq += 1
 
     def _writer_loop(self) -> None:
         try:
@@ -329,12 +380,19 @@ class SessionRecorder:
         try:
             self._queue.put_nowait(None)
         except queue.Full:
-            pass
+            # B6 (Phase 4.1): queue is full — the writer thread is alive
+            # but pinned. The ``_stop_event.set()`` below still wakes
+            # it, and the join timeout will handle a thread that won't
+            # come up. Benign.
+            logger.debug("SessionRecorder.flush: sentinel put failed (queue full)")
         self._stop_event.set()
         try:
             self._writer_thread.join(timeout=timeout)
         except Exception:
-            pass
+            # B6 (Phase 4.1): join() can raise RuntimeError if the
+            # thread was never started; best-effort cleanup, log and
+            # move on.
+            logger.debug("SessionRecorder.flush: writer thread join failed", exc_info=True)
 
 
 class CortexDaemon:
@@ -506,6 +564,10 @@ class CortexDaemon:
             confidence=0.0,
         )
         self._last_physio_update = 0.0
+        # B22 (Phase 4.1): monotonic timestamp of the most recent
+        # kinematics feature delivery. State loop marks the kinematics
+        # channel stale when ``time.monotonic() - _last_kinematics_ts > 2.0``.
+        self._last_kinematics_ts: float = 0.0
         self._active_intervention_id: str | None = None
         # P0 §3.6: cache the most recently broadcast InterventionPlan
         # keyed by its ``intervention_id`` so the daemon can mutate
@@ -571,10 +633,41 @@ class CortexDaemon:
         self._telemetry_enabled = True
         self._interventions_enabled = True
         self._latest_context: Any = None
+        # B1 (Phase 4.1): when ``start()`` cannot bring the capture
+        # pipeline up the daemon must still announce to every connected
+        # client that the camera channel is unavailable. Set to True by
+        # ``_emit_capture_stale_broadcast`` and surfaced as
+        # ``capture.stale=True`` on the next STATE_UPDATE envelope so
+        # the dashboard / popup overlay can flip from "Reading your
+        # pulse" to "Camera offline" within a single broadcast cycle.
+        self._capture_stale: bool = False
+        # B2 (Phase 4.1): counter incremented for every duplicate
+        # INTERVENTION_APPLIED ack (same intervention_id, same phase).
+        # Surfaced via /health diagnostics so duplicate-ack churn from
+        # buggy extensions is observable without enabling debug logs.
+        # The companion set tracks which intervention_ids have already
+        # had their structured warning fired so we only log once per
+        # intervention rather than spamming the log on every dupe.
+        self._duplicate_intervention_ack_count: int = 0
+        self._duplicate_intervention_ack_warned: set[str] = set()
+        # B19: count SessionRecorder queue overflows so a second
+        # consecutive overflow can be escalated from warning to ERROR.
+        # Reset whenever a successful put_nowait succeeds (handled
+        # inside the recorder).
 
         # --- v2.0 services ---
         # Store (Redis with in-memory fallback)
         self._store: RedisStore | InMemoryStore
+        # B4 (Phase 4.1): flips True the moment the daemon falls back
+        # to ``InMemoryStore`` from Redis. Surfaced on every subsequent
+        # STATE_UPDATE under ``store.degraded`` so the dashboard's
+        # connectivity strip can light up its yellow "in-memory store"
+        # indicator within one broadcast cycle of the fallback. Also
+        # broadcast as a one-time SYSTEM_NOTICE-shaped frame via
+        # :meth:`_announce_store_degraded` so peer surfaces (browser
+        # popup) that don't render the STATE_UPDATE strip can still
+        # react to the degradation.
+        self._store_degraded: bool = False
         if self.config.redis.enabled:
             try:
                 self._store = RedisStore(
@@ -584,8 +677,15 @@ class CortexDaemon:
                     key_prefix=self.config.redis.key_prefix,
                 )
             except Exception:
-                logger.warning("Redis unavailable, falling back to in-memory store")
+                logger.warning(
+                    "Redis unavailable, falling back to in-memory store",
+                    exc_info=True,
+                )
                 self._store = InMemoryStore()
+                # B4: mark store as degraded so the next broadcast cycle
+                # stamps the indicator on STATE_UPDATE and the one-time
+                # announcement task fires from ``start()``.
+                self._store_degraded = True
         else:
             self._store = InMemoryStore()
 
@@ -661,6 +761,12 @@ class CortexDaemon:
         # transition broadcasts exactly one BREAK_RECOMMENDATION pulse.
         # Reset to False on every ``StressIntegralTracker.reset``.
         self._break_recommendation_sent: bool = False
+        # B21 (Phase 4.1): timestamp of the most recent HRV reading
+        # used by the recommendation-latch re-arm gate. When HRV has
+        # been None for > 30 s the latch can re-arm even without a
+        # fresh HRV sample so the user is not permanently silenced if
+        # the camera ROI degrades after a recommendation fires.
+        self._last_hrv_seen_at: float = 0.0
         # Flipped by ``_set_break_suppression`` for the duration of a
         # break overlay so the state loop skips trigger evaluation.
         self._break_active: bool = False
@@ -887,11 +993,87 @@ class CortexDaemon:
         timeout watcher in particular) must use this helper so ``stop()``
         can cancel them cleanly. Tasks auto-prune themselves from the set
         on completion via ``add_done_callback``.
+
+        B7 (Phase 4.1): also installs the
+        :meth:`_supervise_background_task` callback so a crash inside the
+        coroutine surfaces as a structured WARNING in the daemon log
+        instead of disappearing into asyncio's "Task exception was
+        never retrieved" garbage-collection warning at process exit.
         """
         task = asyncio.create_task(coro, name=name)
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+        task.add_done_callback(_supervise_background_task)
         return task
+
+    @staticmethod
+    def _supervise_background_task(task: asyncio.Task[Any]) -> None:
+        """B7 (Phase 4.1): structured supervisor for ``asyncio.create_task``.
+
+        Every spawned background task in the daemon is wrapped with this
+        callback so a bare ``raise`` inside the coroutine is logged at
+        WARNING (and not silently swallowed). Cancellations are
+        intentional and ignored.
+        """
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        logger.warning(
+            "Background task %s raised %s",
+            task.get_name(),
+            exc.__class__.__name__,
+            exc_info=exc,
+        )
+
+    async def _emit_capture_stale_broadcast(self) -> None:
+        """B1 (Phase 4.1): synthesise + broadcast a STATE_UPDATE that
+        carries ``capture.stale=True`` so every client learns within a
+        single cycle that the camera channel is offline.
+
+        Called from ``start()`` after the capture pipeline raises so
+        the dashboard / popup don't sit waiting for a frame that will
+        never arrive. We construct a minimal :class:`StateEstimate`
+        with zeroed signal-quality scores; the WS ``_make_state_update``
+        helper picks up the ``capture.stale=True`` flag via the registry
+        marker we plant below. Synchronous best-effort — exceptions are
+        logged + swallowed so a transient WS failure cannot crash the
+        boot path.
+        """
+        try:
+            from cortex.libs.schemas.state import (
+                SignalQuality as _SQ,
+            )
+            from cortex.libs.schemas.state import (
+                StateEstimate as _StateEstimate,
+            )
+            from cortex.libs.schemas.state import (
+                StateScores as _StateScores,
+            )
+
+            estimate = _StateEstimate(
+                state="FLOW",
+                confidence=0.0,
+                scores=_StateScores(flow=0.0, hypo=0.0, hyper=0.0, recovery=0.0),
+                signal_quality=_SQ(physio=0.0, kinematics=0.0, telemetry=0.0),
+                timestamp=time.monotonic(),
+                dwell_seconds=0.0,
+                reasons=["capture_unavailable"],
+            )
+            # Plant the stale marker so ``_make_state_update`` stamps
+            # the field on the outbound payload. The registry is a
+            # process-wide bag the WS server already reads from to
+            # surface ``capture.frames_flowing`` and ``face_detected``;
+            # adding the ``stale`` field there keeps the wire path
+            # unchanged.
+            registry.register("capture_stale", True)
+            await self._ws_server.broadcast_state(estimate, None)
+        except Exception:
+            logger.warning(
+                "B1: capture-unavailable broadcast failed",
+                exc_info=True,
+            )
 
     async def await_apply_confirmation(
         self,
@@ -986,11 +1168,23 @@ class CortexDaemon:
         # F07: ensure the local capability token exists before any service
         # that gates on it (WebSocket SHUTDOWN, launcher /stop) comes up.
         # Generated lazily, persists across restarts.
+        # I6: narrow the startup-token exception handler. KeyboardInterrupt
+        # and SystemExit are NOT subclasses of Exception in Python 3, but
+        # we keep this whitelist explicit so a future refactor cannot
+        # accidentally re-broaden it to ``except Exception``. Anything
+        # outside this set (typing errors, asyncio.CancelledError,
+        # signal-delivered exits) must propagate so the daemon does not
+        # start in a half-initialised state with the user thinking it
+        # came up cleanly.
         try:
             from cortex.libs.auth import load_or_create_token
             load_or_create_token()
-        except Exception:
-            logger.warning("Could not provision Cortex auth token", exc_info=True)
+        except (OSError, ImportError, RuntimeError) as exc:
+            logger.warning(
+                "Could not provision Cortex auth token: %s",
+                exc,
+                exc_info=True,
+            )
         # F56: register SIGINT/SIGTERM through ``loop.add_signal_handler``
         # so the handler runs as a regular loop callback rather than
         # interrupting whatever native frame (numpy, mediapipe, OpenCV)
@@ -1004,15 +1198,39 @@ class CortexDaemon:
         try:
             await self._capture_pipeline.start()
             self._capture_available = True
+            self._capture_stale = False
         except Exception:
             logger.exception("Capture pipeline failed to start; continuing in telemetry-first mode")
             self._capture_available = False
+            # B1 (Phase 4.1): the camera channel is permanently offline
+            # for the lifetime of this start attempt. Mark the capture
+            # signal as stale so the next broadcast cycle (and the
+            # synthetic kickoff broadcast below) tells every client.
+            self._capture_stale = True
         ws_started = await self._ws_server.start()
         if not ws_started:
             raise RuntimeError(
                 f"WebSocket server failed to bind {self.config.api.host}:{self.config.api.ws_port}"
             )
         self._start_api_server()
+
+        # B1 (Phase 4.1): if the capture pipeline never came up, broadcast
+        # an initial STATE_UPDATE with ``capture.stale=True`` so clients
+        # don't wait indefinitely for a first frame. Idempotent — if a
+        # client connects later it still reads the registry-stored
+        # ``capture_stale=True`` flag via subsequent broadcasts.
+        if not self._capture_available:
+            await self._emit_capture_stale_broadcast()
+        # B4 (Phase 4.1): if the store fell back to in-memory at __init__
+        # time, fire a one-time broadcast so every connected surface
+        # learns the persistence layer is non-durable. We use the
+        # STATE_UPDATE envelope to ride the existing dispatch path
+        # rather than adding a new MessageType.
+        if self._store_degraded:
+            try:
+                registry.register("store_degraded", True)
+            except Exception:
+                logger.debug("registry.register(store_degraded) failed", exc_info=True)
 
         self._tasks = [
             asyncio.create_task(self._capture_loop(), name="cortex-capture-loop"),
@@ -1034,10 +1252,18 @@ class CortexDaemon:
         # P0 §3.2: kick off chronotype backfill on a worker thread so
         # cold-start doesn't block the daemon loop. The aggregator is
         # idempotent — repeated calls are no-ops if the model is fresh.
-        asyncio.create_task(
+        # B7 (Phase 4.1): the previously-orphaned task is now tracked on
+        # ``self._tasks`` AND wrapped with the supervision callback so
+        # any unexpected exception lands in the daemon log instead of
+        # being silently swallowed by asyncio's garbage collector.
+        _chronotype_backfill_task = asyncio.create_task(
             asyncio.to_thread(self._session_aggregator.backfill_if_needed),
             name="cortex-chronotype-backfill",
         )
+        _chronotype_backfill_task.add_done_callback(
+            _supervise_background_task,
+        )
+        self._tasks.append(_chronotype_backfill_task)
         # P0 §3.2: start the nightly aggregation scheduler. The state
         # dir is the chronotype storage path so ``scheduler_state.json``
         # lives alongside ``model.json`` / ``daily/`` — persisting the
@@ -1161,9 +1387,23 @@ class CortexDaemon:
                 *list(self._background_tasks), return_exceptions=True
             )
             self._background_tasks.clear()
-        # F05: any apply-confirmation future still pending at shutdown is
-        # treated as a missed ack — resolve to confirmed=False so awaiters
-        # don't hang. "Daemon restart loses in-flight" case from the plan.
+        # F05 / B18 (Phase 4.1): any apply-confirmation future still
+        # pending at shutdown is treated as a missed ack — resolve to
+        # confirmed=False so awaiters don't hang.
+        #
+        # B18 escalation: log a structured WARNING per pending future
+        # so on-call can see exactly how many in-flight applies were
+        # aborted. The HTTP caller still receives a typed
+        # :class:`InterventionApplyResult` (confirmed=False,
+        # timed_out=True) so existing branch logic continues to work,
+        # but operators now have visibility into the shutdown-aborted
+        # set instead of inferring it from absent ack frames.
+        if self._pending_apply_results:
+            logger.warning(
+                "B18: aborting %d in-flight apply-confirmation futures "
+                "on daemon shutdown",
+                len(self._pending_apply_results),
+            )
         for intervention_id, future in list(self._pending_apply_results.items()):
             if not future.done():
                 future.set_result(
@@ -1567,7 +1807,8 @@ class CortexDaemon:
                         # keep the loop running.
                         logger.exception("Capture frame processing failed; skipping frame")
         except asyncio.CancelledError:
-            pass
+            # B6 (Phase 4.1): graceful task shutdown; intentional.
+            logger.debug("capture loop cancelled")
 
     async def _process_capture_output(self, output: PipelineOutput) -> None:
         registry.register("latest_frame_meta", output.frame_meta)
@@ -1621,6 +1862,11 @@ class CortexDaemon:
             confidence=output.frame_meta.face_confidence,
         )
         registry.register("latest_kinematics", self._latest_kinematics)
+        # B22 (Phase 4.1): stamp the monotonic timestamp the
+        # kinematics features were derived from. The state loop reads
+        # this to decide whether the signal is fresh enough to drive a
+        # state estimate (see ``kinematics_age`` check below).
+        self._last_kinematics_ts = float(output.frame_meta.timestamp)
         self._feature_fusion.update_kinematics(self._latest_kinematics, timestamp=output.frame_meta.timestamp)
 
     async def _telemetry_loop(self) -> None:
@@ -1634,7 +1880,8 @@ class CortexDaemon:
                 self._feature_fusion.update_telemetry(features)
                 await asyncio.sleep(0.5)
         except asyncio.CancelledError:
-            pass
+            # B6 (Phase 4.1): graceful telemetry shutdown.
+            logger.debug("telemetry loop cancelled")
 
     async def _broadcast_loop(self) -> None:
         """Broadcast STATE_UPDATE at a steady 500ms cadence (B.3).
@@ -1669,7 +1916,8 @@ class CortexDaemon:
                 except Exception:
                     logger.debug("broadcast_state failed", exc_info=True)
         except asyncio.CancelledError:
-            pass
+            # B6 (Phase 4.1): graceful broadcast loop shutdown.
+            logger.debug("broadcast loop cancelled")
 
     async def _context_loop(self) -> None:
         """Build context every 5s — separate from fast state loop to avoid blocking."""
@@ -1698,7 +1946,8 @@ class CortexDaemon:
                     logger.exception("Context loop error")
                 await asyncio.sleep(5.0)
         except asyncio.CancelledError:
-            pass
+            # B6 (Phase 4.1): graceful context loop shutdown.
+            logger.debug("context loop cancelled")
 
     async def _retention_sweep_loop(self) -> None:
         """Run the daily retention sweep (G.2).
@@ -1730,7 +1979,8 @@ class CortexDaemon:
                     logger.debug("Retention sweep failed", exc_info=True)
                 await asyncio.sleep(24 * 60 * 60)
         except asyncio.CancelledError:
-            pass
+            # B6 (Phase 4.1): graceful retention-sweep shutdown.
+            logger.debug("retention sweep loop cancelled")
 
     async def _causal_report_loop(self) -> None:
         """Generate nightly causal report from AMIP policy logs."""
@@ -1747,7 +1997,8 @@ class CortexDaemon:
                     logger.debug("Failed generating causal report", exc_info=True)
                 await asyncio.sleep(60.0)
         except asyncio.CancelledError:
-            pass
+            # B6 (Phase 4.1): graceful causal report loop shutdown.
+            logger.debug("causal report loop cancelled")
 
     async def _state_loop(self) -> None:
         try:
@@ -1789,6 +2040,42 @@ class CortexDaemon:
                         ml_alpha=ml_alpha,
                     )
 
+                    # B22 (Phase 4.1): mark the kinematics channel signal-
+                    # quality stale when no new kinematics features have
+                    # arrived within the last 2 seconds. The smoother
+                    # already computes a quality score from the upstream
+                    # feature_fusion, but a stale feed produces a
+                    # non-zero quality without reflecting that the data
+                    # is old; this guard explicitly zeroes the channel.
+                    kinematics_age = (
+                        timestamp - self._last_kinematics_ts
+                        if self._last_kinematics_ts > 0.0
+                        else None
+                    )
+                    if kinematics_age is not None and kinematics_age > 2.0:
+                        if estimate.signal_quality.kinematics > 0.0:
+                            logger.debug(
+                                "kinematics signal stale (age=%.2fs) — "
+                                "zeroing channel quality",
+                                kinematics_age,
+                            )
+                            try:
+                                # SignalQuality is a Pydantic model;
+                                # mutate via model_copy for safety.
+                                from cortex.libs.schemas.state import (
+                                    SignalQuality as _SQ,
+                                )
+                                estimate.signal_quality = _SQ(
+                                    physio=estimate.signal_quality.physio,
+                                    kinematics=0.0,
+                                    telemetry=estimate.signal_quality.telemetry,
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "kinematics stale-clear failed",
+                                    exc_info=True,
+                                )
+
                     # v2.0: Update stress integral
                     if vector.hrv_rmssd is not None:
                         self._stress_tracker.update(vector.hrv_rmssd, timestamp)
@@ -1810,6 +2097,34 @@ class CortexDaemon:
                                 self._stress_tracker.load_ratio * 100,
                             )
                             self._break_recommendation_sent = False
+                        # B21: remember the timestamp of the most recent
+                        # HRV reading so the time-elapsed re-arm gate
+                        # below can tell "HRV silent for a while" apart
+                        # from "HRV never delivered".
+                        self._last_hrv_seen_at = timestamp
+                    else:
+                        # B21 (Phase 4.1): when HRV has been None for an
+                        # extended period AND the recommendation is
+                        # still latched, allow a time-elapsed re-arm so
+                        # the user can be re-prompted on the NEXT
+                        # genuine stress integral build-up. Pre-fix the
+                        # latch required an HRV reading to clear; if the
+                        # user's camera ROI degraded post-break the
+                        # recommendation would never re-fire.
+                        last_seen = getattr(self, "_last_hrv_seen_at", 0.0)
+                        hrv_silent_for = timestamp - last_seen
+                        if (
+                            self._break_recommendation_sent
+                            and last_seen > 0.0
+                            and hrv_silent_for > 30.0
+                        ):
+                            logger.info(
+                                "HRV silent for %.0fs after a break "
+                                "recommendation — re-arming so the next "
+                                "build-up can re-trigger",
+                                hrv_silent_for,
+                            )
+                            self._break_recommendation_sent = False
 
                     # P0 §3.9: feed the causal attributor at the same
                     # cadence so the per-signal sparkline buffers fill
@@ -1821,7 +2136,14 @@ class CortexDaemon:
                         self._causal_attributor.record_feature_vector(vector)
                         registry.register("latest_feature_vector", vector)
                     except Exception:
-                        logger.debug("causal attributor feed failed", exc_info=True)
+                        # B20 (Phase 4.1): a silent attributor failure
+                        # means the per-intervention causal sparkline
+                        # buffers stop filling, so the "Why this?" panel
+                        # serves stale data. Elevate to WARNING so the
+                        # observability path catches it.
+                        logger.warning(
+                            "causal attributor feed failed", exc_info=True,
+                        )
 
                     # v2.0: Feed longitudinal tracker per-sample data
                     self._longitudinal.accumulate(
@@ -2193,7 +2515,8 @@ class CortexDaemon:
 
                 await asyncio.sleep(0.5)
         except asyncio.CancelledError:
-            pass
+            # B6 (Phase 4.1): graceful state loop shutdown.
+            logger.debug("state loop cancelled")
 
     async def _trigger_intervention(
         self,
@@ -4162,7 +4485,10 @@ class CortexDaemon:
             try:
                 self._per_tab_feedback_ids.remove(intervention_id)
             except ValueError:
-                pass
+                # B6 (Phase 4.1): id wasn't in the deque (already evicted
+                # by maxlen, or this is the first/legacy tab feedback for
+                # this intervention) — benign, fall through to debug.
+                logger.debug("per-tab feedback dedup miss for %s", intervention_id)
             logger.debug("Skipping legacy tab feedback — per-tab feedback already received")
             return
 
@@ -4290,11 +4616,31 @@ class CortexDaemon:
         # event. Drop duplicates silently after the first one.
         dedup_key = (intervention_id, phase)
         if dedup_key in self._intervention_applied_seen:
-            logger.debug(
-                "Duplicate INTERVENTION_APPLIED ack for %s (phase=%s); ignoring",
-                intervention_id,
-                phase,
-            )
+            # B2 (Phase 4.1): increment the counter on every duplicate
+            # and surface a structured WARNING the first time we see a
+            # duplicate per intervention_id (subsequent dupes for the
+            # same id stay at DEBUG so the log doesn't fill with noise
+            # if an extension keeps echoing). The counter is exposed
+            # via /health for operators.
+            self._duplicate_intervention_ack_count += 1
+            if intervention_id not in self._duplicate_intervention_ack_warned:
+                self._duplicate_intervention_ack_warned.add(intervention_id)
+                logger.warning(
+                    "Duplicate INTERVENTION_APPLIED ack for %s "
+                    "(phase=%s) — extension echoed a previously-acked "
+                    "phase; total_duplicate_acks=%d",
+                    intervention_id,
+                    phase,
+                    self._duplicate_intervention_ack_count,
+                )
+            else:
+                logger.debug(
+                    "Duplicate INTERVENTION_APPLIED ack for %s (phase=%s); "
+                    "ignoring (total_duplicate_acks=%d)",
+                    intervention_id,
+                    phase,
+                    self._duplicate_intervention_ack_count,
+                )
             return
         self._intervention_applied_seen.add(dedup_key)
 
@@ -4637,7 +4983,8 @@ class CortexDaemon:
                     logger.exception("Longitudinal loop error")
                 await asyncio.sleep(3600.0)  # every hour
         except asyncio.CancelledError:
-            pass
+            # B6 (Phase 4.1): graceful longitudinal loop shutdown.
+            logger.debug("longitudinal loop cancelled")
 
     def register_client_identified_listener(
         self, listener: Callable[[str, bool], None],

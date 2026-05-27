@@ -103,10 +103,14 @@ async def test_broadcast_stamps_active_correlation_id_on_outgoing_message() -> N
             "client_type": "test",
             "client_id": "fake",
             "authenticated": True,
+            "coalesce_queue": None,
+            "coalesce_task": None,
         },
     )()
 
-    msg = WSMessage(type="STATE_UPDATE", payload={"state": "FLOW"})
+    # Use a non-coalesce-eligible message type so the broadcast takes the
+    # direct-send path and the fake websocket actually receives the payload.
+    msg = WSMessage(type="INTERVENTION_TRIGGER", payload={"state": "FLOW"})
     assert msg.correlation_id is None
 
     with correlation_scope("cid_aaaabbbbcccc"):
@@ -137,11 +141,13 @@ async def test_broadcast_preserves_caller_supplied_id() -> None:
             "client_type": "test",
             "client_id": "fake",
             "authenticated": True,
+            "coalesce_queue": None,
+            "coalesce_task": None,
         },
     )()
 
     msg = WSMessage(
-        type="STATE_UPDATE",
+        type="INTERVENTION_TRIGGER",
         payload={"state": "FLOW"},
         correlation_id="cid_supplied00000",
     )

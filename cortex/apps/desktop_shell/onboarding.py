@@ -299,6 +299,65 @@ def check_accessibility_permission() -> bool:
         return False
 
 
+# F13 (Phase-4 audit): module-level Popen handle registry. The
+# permission-prompt helpers below are invoked by the OnboardingWindow,
+# but they're plain functions (not methods) for legacy reasons. We
+# track every spawned ``open`` / ``x-apple.systempreferences:`` child
+# here so ``OnboardingWindow.closeEvent`` can drain them on teardown
+# instead of leaking zombie Popen objects.
+_PENDING_PERMISSION_PROCS: list[subprocess.Popen[bytes]] = []
+
+
+def _spawn_permission_open(args: list[str]) -> None:
+    """Spawn an ``open``/``open scheme`` subprocess in its own session.
+
+    ``start_new_session=True`` detaches the child from the parent
+    process group so we can reap it on a short timeout in
+    :func:`drain_pending_permission_procs` without blocking on
+    user-driven UI in System Settings.
+    """
+    proc = subprocess.Popen(args, start_new_session=True)
+    _PENDING_PERMISSION_PROCS.append(proc)
+    # Best-effort immediate reap: ``open`` typically exits within a
+    # few hundred ms once Settings launches.
+    try:
+        proc.wait(timeout=0.1)
+        _PENDING_PERMISSION_PROCS.remove(proc)
+    except subprocess.TimeoutExpired:
+        # Still running — leave on the list for closeEvent drain.
+        pass
+    except ValueError:
+        # Already removed by a concurrent drain — ignore.
+        pass
+
+
+def drain_pending_permission_procs(timeout: float = 3.0) -> None:
+    """Terminate + reap every outstanding permission-prompt subprocess.
+
+    Called by :meth:`OnboardingWindow.closeEvent` so the wizard
+    teardown does not leak zombie processes when the user clicks the
+    permission CTAs and then closes the window without confirming.
+    """
+    for proc in list(_PENDING_PERMISSION_PROCS):
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        pass
+        except Exception:
+            pass
+        try:
+            _PENDING_PERMISSION_PROCS.remove(proc)
+        except ValueError:
+            pass
+
+
 def request_camera_permission() -> None:
     """Trigger the native AVFoundation camera permission dialog."""
     try:
@@ -311,7 +370,7 @@ def request_camera_permission() -> None:
     except Exception:
         pass
     try:
-        subprocess.Popen([
+        _spawn_permission_open([
             "open",
             "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera",
         ])
@@ -326,7 +385,7 @@ def request_accessibility_permission() -> None:
         ApplicationServices.AXIsProcessTrustedWithOptions(options)
     except Exception:
         try:
-            subprocess.Popen([
+            _spawn_permission_open([
                 "open",
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
             ])
@@ -595,6 +654,17 @@ class OnboardingWindow(QWidget):
         except Exception:
             pass
         super().hideEvent(event)
+
+    def closeEvent(self, event: object) -> None:  # noqa: D401 - Qt override
+        """F13 (Phase-4 audit): drain any outstanding ``open`` /
+        ``x-apple.systempreferences:`` Popen handles before the wizard
+        tears down. Otherwise the user-driven permission prompts leak
+        zombie processes that ``ps`` reports as ``<defunct>``."""
+        try:
+            drain_pending_permission_procs(timeout=3.0)
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     def _build_ui(self) -> None:
         # Two-tier layout:

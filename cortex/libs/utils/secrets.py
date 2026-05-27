@@ -28,6 +28,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import subprocess
+import threading
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -45,6 +46,43 @@ _SECURITY_SUBPROCESS_TIMEOUT_S: float = 5.0
 # above — the call is normally instant; anything slower means a
 # backend stall and we'd rather degrade than hang.
 _KEYRING_DEFAULT_TIMEOUT_S: float = 5.0
+
+
+# I3: module-level singleton executor. Previously every call created a
+# fresh ``ThreadPoolExecutor`` and shut it down with ``wait=False`` on
+# timeout, which leaked one OS thread per stall. We now share a single
+# worker — keyring operations are inherently serial on macOS (the
+# Security framework serialises Keychain access), so one worker is the
+# right bound. On timeout we just cancel the future; the worker thread
+# eventually unblocks and returns to the pool for the next call.
+_KEYRING_EXECUTOR_LOCK = threading.Lock()
+_KEYRING_EXECUTOR: concurrent.futures.ThreadPoolExecutor | None = None
+
+# I3: observability counter for stalled keyring lookups. Surfaced via
+# the existing /metrics endpoint by importing this attribute.
+_keyring_timeouts_total: int = 0
+
+
+def _get_keyring_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Return the process-wide singleton keyring executor (lazy init)."""
+    global _KEYRING_EXECUTOR
+    if _KEYRING_EXECUTOR is None:
+        with _KEYRING_EXECUTOR_LOCK:
+            if _KEYRING_EXECUTOR is None:
+                _KEYRING_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="cortex-keyring",
+                )
+    return _KEYRING_EXECUTOR
+
+
+def get_keyring_timeouts_total() -> int:
+    """Total count of keyring lookups that exceeded the timeout window.
+
+    Surfaces I3 observability — telemetry / metrics endpoints poll this
+    to expose stalled-backend events without parsing logs.
+    """
+    return _keyring_timeouts_total
 
 
 def get_keychain_password(service: str, account: str) -> str | None:
@@ -138,39 +176,40 @@ def get_password_safe(
             )
             return None
 
-    # NOTE: do not use ``with ThreadPoolExecutor(...)`` here — its
-    # ``__exit__`` calls ``shutdown(wait=True)`` which would re-block
-    # the caller for the full backend stall, defeating the timeout
-    # entirely. We use ``shutdown(wait=False)`` so the helper returns
-    # as soon as ``future.result(timeout=...)`` resolves; the worker
-    # thread is allowed to drain in the background. The cost is at
-    # most one daemon-lifetime thread per stalled backend.
-    executor = concurrent.futures.ThreadPoolExecutor(
-        max_workers=1,
-        thread_name_prefix="cortex-keyring",
-    )
+    # I3: use the module-level singleton executor so we never accumulate
+    # threads across calls. Each timeout cancels the future and leaves
+    # the worker to drain in the background; subsequent calls reuse the
+    # same worker once it returns to idle. Worst case: ``max_workers=1``
+    # means a single stalled keyring backend stalls all subsequent
+    # lookups until it unblocks, which is preferable to thread leaks
+    # because the next caller will hit the same ``timeout`` window and
+    # degrade to ``None`` anyway.
+    global _keyring_timeouts_total
+    executor = _get_keyring_executor()
+    future = executor.submit(_read)
     try:
-        future = executor.submit(_read)
-        try:
-            return future.result(timeout=timeout)
-        except concurrent.futures.TimeoutError:
-            logger.warning(
-                "keyring.get_password for %s/%s timed out after %.1fs; "
-                "returning None (caller falls back to env var)",
-                service,
-                username,
-                timeout,
-            )
-            # Best-effort cancel; the thread may still be blocked in the
-            # backend, but it will not deliver its eventual result.
-            future.cancel()
-            return None
-    finally:
-        # wait=False: don't block on the still-running worker thread.
-        executor.shutdown(wait=False)
+        return future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        _keyring_timeouts_total += 1
+        logger.warning(
+            "keyring.get_password for %s/%s timed out after %.1fs; "
+            "returning None (caller falls back to env var) "
+            "[total_timeouts=%d]",
+            service,
+            username,
+            timeout,
+            _keyring_timeouts_total,
+        )
+        # Best-effort cancel; the thread may still be blocked in the
+        # backend, but it will not deliver its eventual result. The
+        # worker remains in the singleton pool — when it eventually
+        # unblocks it returns to idle for the next call.
+        future.cancel()
+        return None
 
 
 __all__ = [
     "get_keychain_password",
+    "get_keyring_timeouts_total",
     "get_password_safe",
 ]

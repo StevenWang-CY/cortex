@@ -23,6 +23,35 @@ from cortex.services.launcher.project_config import ProjectConfig
 logger = logging.getLogger(__name__)
 
 
+def _terminate_process(
+    proc: asyncio.subprocess.Process,
+    label: str,
+) -> None:
+    """B14 (Phase 4.1): best-effort SIGTERM on a subprocess.
+
+    Called from the cancellation arms of ``_open_vscode`` /
+    ``_open_chrome_url`` / ``_hide_app`` to make sure an in-flight
+    child is reaped instead of orphaned. We DO NOT await its exit here
+    — the caller is in the middle of propagating a cancellation and
+    must not block on another await. The kernel reaps the process when
+    it eventually exits; if it ignores SIGTERM the parent's eventual
+    exit will (on POSIX) send SIGKILL via the init-handover path.
+    """
+    try:
+        proc.terminate()
+        logger.debug("Terminated child %s (pid=%s) on cancellation", label, proc.pid)
+    except ProcessLookupError:
+        # Already exited between the cancellation and our terminate call.
+        logger.debug("child %s (pid=%s) already exited", label, proc.pid)
+    except Exception:
+        logger.warning(
+            "Failed to terminate child %s (pid=%s) on cancellation",
+            label,
+            getattr(proc, "pid", "?"),
+            exc_info=True,
+        )
+
+
 class ProjectLauncher:
     """
     Launches a project environment with zero friction.
@@ -131,32 +160,56 @@ class ProjectLauncher:
         return [c.model_dump() for c in configs]
 
     async def _open_vscode(self, workspace: str) -> bool:
-        """Open VS Code workspace/directory."""
+        """Open VS Code workspace/directory.
+
+        B14 (Phase 4.1): wrap ``proc.wait()`` in :func:`asyncio.shield`
+        so an outer cancellation doesn't orphan the subprocess. On
+        cancellation we explicitly ``terminate`` the process and wait
+        a moment for it to exit before letting the cancel propagate.
+        """
+        proc: asyncio.subprocess.Process | None = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 "code", workspace,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            await asyncio.wait_for(proc.wait(), timeout=10)
+            await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=10)
             return proc.returncode == 0
+        except asyncio.CancelledError:
+            if proc is not None and proc.returncode is None:
+                _terminate_process(proc, "code")
+            raise
         except Exception:
+            if proc is not None and proc.returncode is None:
+                _terminate_process(proc, "code")
             logger.debug("Failed to open VS Code: %s", workspace)
             return False
 
     async def _open_chrome_url(self, url: str) -> bool:
-        """Open a URL in Chrome."""
+        """Open a URL in Chrome.
+
+        B14 (Phase 4.1): same shield + terminate-on-cancel contract as
+        ``_open_vscode``.
+        """
         if not self._is_macos:
             return False
+        proc: asyncio.subprocess.Process | None = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 "open", "-a", "Google Chrome", url,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            await asyncio.wait_for(proc.wait(), timeout=10)
+            await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=10)
             return proc.returncode == 0
+        except asyncio.CancelledError:
+            if proc is not None and proc.returncode is None:
+                _terminate_process(proc, "open Google Chrome")
+            raise
         except Exception:
+            if proc is not None and proc.returncode is None:
+                _terminate_process(proc, "open Google Chrome")
             logger.debug("Failed to open URL: %s", url)
             return False
 
@@ -223,18 +276,28 @@ class ProjectLauncher:
             }
 
     async def _hide_app(self, app_name: str) -> bool:
-        """Hide an application using macOS osascript."""
+        """Hide an application using macOS osascript.
+
+        B14 (Phase 4.1): shield + terminate-on-cancel.
+        """
         if not self._is_macos:
             return False
         script = f'tell application "System Events" to set visible of process "{app_name}" to false'
+        proc: asyncio.subprocess.Process | None = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 "osascript", "-e", script,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            await asyncio.wait_for(proc.wait(), timeout=5)
+            await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=5)
             return proc.returncode == 0
+        except asyncio.CancelledError:
+            if proc is not None and proc.returncode is None:
+                _terminate_process(proc, "osascript")
+            raise
         except Exception:
+            if proc is not None and proc.returncode is None:
+                _terminate_process(proc, "osascript")
             logger.debug("Failed to hide app: %s", app_name)
             return False

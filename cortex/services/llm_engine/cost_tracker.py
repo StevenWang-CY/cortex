@@ -121,6 +121,50 @@ class CostTracker:
     # (silently losing the user's running spend history).
     _LEDGER_SCHEMA_VERSION = 1
 
+    @staticmethod
+    def _migrate_ledger(
+        data: dict[str, Any],
+        from_version: int,
+        to_version: int,
+    ) -> dict[str, Any]:
+        """I12: in-place ledger schema migration.
+
+        Walks ``data`` from ``from_version`` to ``to_version`` applying
+        every step. Returns the migrated envelope shape
+        ``{"schema_version": to_version, "days": {...}}``.
+
+        Today this is a no-op (only one schema version exists); the
+        function exists so future field renames (e.g. v2 adds
+        ``by_model_tier`` counters per day) can branch cleanly without
+        the legacy "drop and start empty" path silently destroying the
+        user's running spend history.
+        """
+        if from_version == to_version:
+            return data
+        if from_version > to_version:
+            # Down-migrations are unsupported — a newer ledger written by
+            # a future daemon must not be silently truncated by an older
+            # daemon rollback. Refuse rather than corrupt.
+            raise ValueError(
+                f"cannot down-migrate cost ledger from v{from_version} to "
+                f"v{to_version}; refusing to truncate forward-compatible data"
+            )
+        days = data.get("days", {}) if isinstance(data, dict) else {}
+        if not isinstance(days, dict):
+            days = {}
+        # Future migrations should add a branch here, e.g.:
+        #   current = from_version
+        #   if current == 1 and to_version >= 2:
+        #       days = _migrate_v1_to_v2(days)
+        #       current = 2
+        # For now we simply re-stamp the envelope to the target version.
+        logger.info(
+            "cost_tracker: migrated ledger v%s → v%s (no-op for current schema)",
+            from_version,
+            to_version,
+        )
+        return {"schema_version": to_version, "days": days}
+
     def _load(self) -> dict[str, dict[str, Any]]:
         try:
             raw = self._ledger_path.read_text(encoding="utf-8")
@@ -141,14 +185,26 @@ class CostTracker:
         # day_key → entry and load straight through.
         if "schema_version" in data and "days" in data:
             ver = data.get("schema_version")
-            if ver != self._LEDGER_SCHEMA_VERSION:
+            if not isinstance(ver, int):
                 logger.warning(
-                    "cost_tracker: ledger schema_version=%s != expected %s; "
-                    "starting empty (rebuilt on next flush)",
+                    "cost_tracker: non-integer schema_version=%r; starting empty",
                     ver,
-                    self._LEDGER_SCHEMA_VERSION,
                 )
                 return {}
+            if ver != self._LEDGER_SCHEMA_VERSION:
+                # I12: run the migration rather than silently dropping.
+                try:
+                    data = self._migrate_ledger(
+                        data,
+                        from_version=ver,
+                        to_version=self._LEDGER_SCHEMA_VERSION,
+                    )
+                except ValueError as exc:
+                    logger.warning(
+                        "cost_tracker: ledger migration refused (%s); starting empty",
+                        exc,
+                    )
+                    return {}
             data = data.get("days", {}) or {}
             if not isinstance(data, dict):
                 return {}

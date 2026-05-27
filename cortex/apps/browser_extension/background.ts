@@ -19,6 +19,11 @@ import {
 } from "./tab-manager";
 import { getAuthToken } from "./lib/auth";
 import { detectBrowser } from "./lib/browser";
+import {
+    isCortexState,
+    normaliseInterventionPayload,
+    truncatePayloadForLog,
+} from "./lib/state-guards";
 
 // --- Types (generated from Pydantic — Debt-1 closure) ---
 //
@@ -975,11 +980,27 @@ if (typeof chrome !== "undefined" && chrome.runtime?.onSuspend) {
 
 async function scrapeVisibleText(tabId?: number): Promise<string> {
     try {
-        const targetTabId = tabId || (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id;
+        let targetTabId = tabId;
+        if (!targetTabId) {
+            // F3 (Phase-4 audit): destructure-and-check rather than the
+            // ``[0]?.id`` shorthand. The shorthand worked but obscured
+            // the empty-array contingency; the explicit guard documents
+            // the "no active tab" branch and lets us log it.
+            const tabs = await chrome.tabs.query({
+                active: true,
+                currentWindow: true,
+            });
+            if (!tabs.length) {
+                console.warn("[cortex.bg] scrapeVisibleText: no active tab");
+                return "";
+            }
+            targetTabId = tabs[0]?.id;
+        }
         if (!targetTabId) return "";
         const response = await chrome.tabs.sendMessage(targetTabId, { type: "EXTRACT_TEXT" });
         return response?.text || "";
-    } catch {
+    } catch (err) {
+        console.warn("[cortex.bg] scrapeVisibleText failed:", err);
         return "";
     }
 }
@@ -1135,7 +1156,32 @@ async function handleMessage(raw: string): Promise<void> {
             break;
 
         case "STATE_UPDATE":
-            currentState = msg.payload as unknown as CortexState;
+            // F1 (Phase-4 audit): validate the payload shape at runtime
+            // before committing it to ``currentState``. A malformed
+            // STATE_UPDATE (legacy daemon, fuzzed frame, corrupted
+            // upstream) would otherwise blow up the popup's
+            // ``Object.entries`` / numeric reads at render time. Drop
+            // the message and warn with a truncated dump so the bug
+            // shows up in dev tools without leaking the full payload.
+            if (!isCortexState(msg.payload)) {
+                console.warn(
+                    "[cortex.bg] F1: dropping malformed STATE_UPDATE payload:",
+                    truncatePayloadForLog(msg.payload),
+                );
+                break;
+            }
+            // F1: ``isCortexState`` narrows to the runtime-validated
+            // shape, so the assignment is now safe without the
+            // ``as unknown as`` ladder. The local interface differs
+            // from the guard's interface only in optional fields.
+            currentState = {
+                state: msg.payload.state,
+                confidence: msg.payload.confidence,
+                scores: msg.payload.scores,
+                signal_quality: msg.payload.signal_quality,
+                dwell_seconds: msg.payload.dwell_seconds,
+                reasons: msg.payload.reasons,
+            };
             updateFocusSession(msg.payload);
             checkHealthAlerts(msg.payload);
             checkBreakNeeded(msg.payload);
@@ -1152,11 +1198,26 @@ async function handleMessage(raw: string): Promise<void> {
             break;
 
         case "INTERVENTION_TRIGGER": {
-            const iid = typeof msg.payload.intervention_id === "string" ? msg.payload.intervention_id : null;
+            // F2 (Phase-4 audit): normalise the payload into a typed
+            // shape before dispatching. Missing ``intervention_id`` or
+            // ``intervention_type`` → log + skip; missing numeric
+            // fields default to 0; missing ``actions`` defaults to [].
+            // The downstream ``handleIntervention`` still receives the
+            // raw payload for fields it reads opportunistically (e.g.
+            // ui_plan, hide_targets, micro_steps).
+            const plan = normaliseInterventionPayload(msg.payload);
+            if (plan === null) {
+                console.warn(
+                    "[cortex.bg] F2: dropping malformed INTERVENTION_TRIGGER:",
+                    truncatePayloadForLog(msg.payload),
+                );
+                break;
+            }
+            const iid = plan.intervention_id;
             const now = Date.now();
 
             // Check cooldown: skip if this intervention was recently dismissed
-            if (iid && dismissedInterventions.has(iid)) {
+            if (dismissedInterventions.has(iid)) {
                 const dismissedAt = dismissedInterventions.get(iid)!;
                 if (now - dismissedAt < interventionDismissCooldown) {
                     if (DEBUG) console.log(`Cortex: skipping intervention ${iid} — dismissed ${Math.round((now - dismissedAt) / 1000)}s ago`);
@@ -1167,7 +1228,7 @@ async function handleMessage(raw: string): Promise<void> {
             }
 
             // Check URL-based cooldown: don't re-trigger for same site within window
-            const triggerUrl = typeof msg.payload.trigger_url === "string" ? msg.payload.trigger_url : null;
+            const triggerUrl = plan.trigger_url;
             const urlKey = triggerUrl ? new URL(triggerUrl).hostname : null;
             if (urlKey && dismissedUrlPatterns.has(urlKey)) {
                 const dismissedAt = dismissedUrlPatterns.get(urlKey)!;
@@ -1209,7 +1270,15 @@ async function handleMessage(raw: string): Promise<void> {
                     cortex_active_intervention_cid: inboundCid,
                     cortex_active_intervention_mounted_at: now,
                 });
-            } catch {}
+            } catch (err) {
+                // F4: storage.session may be unavailable (very rare —
+                // e.g. SW in odd reload state). Log so we have a
+                // diagnostic trail when popup-after-SW-restart breaks.
+                console.warn(
+                    "[cortex.bg] persist active intervention failed:",
+                    err,
+                );
+            }
             handleIntervention(msg.payload);
             // P0 §3.12: when the desktop dashboard isn't focused the
             // daemon stamps ``desktop_not_focused: true`` on the wire.
@@ -1221,12 +1290,16 @@ async function handleMessage(raw: string): Promise<void> {
             // has snoozed or paused, the OS notification fall-through
             // is just another surrogate overlay and should also be
             // suppressed.
-            if (msg.payload.desktop_not_focused === true && !quietMode) {
+            if (plan.desktop_not_focused && !quietMode) {
                 try {
                     surfaceInterventionOSNotification(msg.payload, inboundCid);
-                } catch {
+                } catch (err) {
                     // chrome.notifications may not be available in odd
                     // test environments; never crash the dispatcher.
+                    console.warn(
+                        "[cortex.bg] surfaceInterventionOSNotification failed:",
+                        err,
+                    );
                 }
             }
             break;
@@ -1831,7 +1904,13 @@ function injectOverlay(payload: Record<string, unknown>): void {
             type: "USER_ACTION",
             action: "dismissed",
             intervention_id: payload.intervention_id,
-        }).catch(() => {});
+        }).catch((err: unknown) => {
+            // F4 (Phase-4 audit): this runs in the *page* context via
+            // executeScript injection, so the SW may have been torn
+            // down between the click and the send. Log so we at least
+            // see it in the page console; the UI still tears down.
+            console.warn("[cortex.overlay] dismiss notify failed:", err);
+        });
         const el = document.getElementById(OID);
         if (el) {
             el.style.transition = "opacity .2s ease";
@@ -2178,7 +2257,15 @@ async function handleIntervention(
                                 protectedIds.add(tab.id);
                             }
                         }
-                    } catch {}
+                    } catch (err) {
+                        // F12 (Phase-4 audit): query may transiently fail
+                        // mid-extension-reload; we degrade to "no extra
+                        // protection" which is safer than crashing.
+                        console.warn(
+                            "[cortex.bg] goal-keyword tab protection failed:",
+                            err,
+                        );
+                    }
                 }
             }
             try {
@@ -2303,8 +2390,27 @@ async function handleRestore(payload: Record<string, unknown>): Promise<void> {
     } catch {
         errors.push("remove_overlay");
     }
+    // F4 (Phase-4 audit): the in-memory latch MUST be nulled even if
+    // session-storage clearing throws. The earlier ``try { ... } catch {}``
+    // both swallowed the failure and worked correctly, but a noisy
+    // platform bug (e.g. quota exhausted) would never surface for
+    // debugging. Log + still null the latch so behaviour is identical
+    // but observable.
     activeIntervention = null;
-    try { chrome.storage.session.remove(["cortex_active_intervention", "cortex_active_intervention_cid", "cortex_active_intervention_mounted_at", "cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]); } catch {}
+    try {
+        chrome.storage.session.remove([
+            "cortex_active_intervention",
+            "cortex_active_intervention_cid",
+            "cortex_active_intervention_mounted_at",
+            "cortex_tab_snapshot",
+            "cortex_tab_mgr_snapshots",
+        ]);
+    } catch (err) {
+        console.warn(
+            "[cortex.bg] F4: storage.session.remove failed during restore:",
+            err,
+        );
+    }
     broadcastToPopup({ type: "INTERVENTION_RESTORE", payload });
 
     if (typeof interventionId === "string") {
@@ -2927,7 +3033,16 @@ async function snapshotTabsForIntervention(): Promise<void> {
                 delete snapData[String(idx)];
             }
         }
-    } catch {}
+    } catch (err) {
+        // F12 (Phase-4 audit): live-tab reconciliation is best-effort
+        // — a query failure simply leaves the snapshot stale (the next
+        // intervention will rebuild it). Log so we can detect chronic
+        // failures.
+        console.warn(
+            "[cortex.bg] snapshot live-tab reconciliation failed:",
+            err,
+        );
+    }
 
     // Persist for service worker restart resilience
     try {
@@ -4521,6 +4636,36 @@ chrome.runtime.onMessage.addListener(
                 setRecapBadge(false);
                 sendResponse({ ok: true });
                 break;
+            }
+
+            case "GET_COST": {
+                // F21 (Phase-4 audit / §3.15 §3 follow-up): proxy a
+                // cost-telemetry fetch from popup → daemon HTTP API.
+                // Popup polls every 30s; we fan out to ``/api/cost``
+                // so the popup doesn't need cross-origin credentials.
+                (async () => {
+                    try {
+                        const ctrl = new AbortController();
+                        const t = setTimeout(() => ctrl.abort(), 1500);
+                        const resp = await fetch(
+                            `${DAEMON_HTTP_URL}/api/cost`,
+                            { signal: ctrl.signal },
+                        );
+                        clearTimeout(t);
+                        if (!resp.ok) {
+                            sendResponse({ ok: false, error: `status_${resp.status}` });
+                            return;
+                        }
+                        const body = await resp.json();
+                        sendResponse({ ok: true, cost: body });
+                    } catch (err) {
+                        sendResponse({
+                            ok: false,
+                            error: (err as Error)?.message ?? "fetch_failed",
+                        });
+                    }
+                })();
+                return true; // async
             }
 
             case "GET_CACHED_TRENDS": {

@@ -6,6 +6,7 @@ import logging
 import uuid
 from collections import Counter, defaultdict
 from datetime import UTC, datetime
+from typing import Any
 
 from cortex.services.session_report.models import (
     ActivitySummary,
@@ -66,6 +67,14 @@ class SessionReportGenerator:
         # onto the SessionReport at ``finish()`` so longitudinal
         # aggregators can later detect a "task_overload_pattern" trend.
         self._goal_title: str | None = None
+        # B22 (Phase 4.1): list of clock-anomaly events observed during
+        # the session. Each entry is a ``{"timestamp": float, "kind":
+        # "ntp_backjump", "dt_seconds": float, "state": str}`` dict.
+        # Appended by ``record_state`` when ``raw_dt < 0`` triggers the
+        # backjump clamp; surfaced on the report so the recap can show a
+        # "clock anomaly" badge instead of silently producing an
+        # implausible duration roll-up.
+        self._clock_anomalies: list[dict[str, Any]] = []
 
     def set_goal_title(self, title: str | None) -> None:
         """P0 §3.13: stamp the user-provided session goal.
@@ -79,6 +88,17 @@ class SessionReportGenerator:
             return
         trimmed = title.strip()[:240]
         self._goal_title = trimmed or None
+
+    @property
+    def clock_anomalies(self) -> list[dict[str, Any]]:
+        """B22 (Phase 4.1): observed clock-anomaly events.
+
+        Each entry is a ``{"timestamp", "kind", "dt_seconds", "state"}``
+        dict. The recap UI reads this to surface a "clock anomaly"
+        badge when the report's durations are derived from a session
+        that crossed an NTP backjump.
+        """
+        return list(self._clock_anomalies)
 
     def start(self) -> None:
         """Mark session start."""
@@ -101,6 +121,17 @@ class SessionReportGenerator:
                     raw_dt,
                     self._current_state,
                 )
+                # B22 (Phase 4.1): record the anomaly so the session
+                # report can carry a structured event the recap UI can
+                # render as a "clock anomaly" badge. Without this the
+                # clamp silently swallowed the discrepancy and the user
+                # had no signal that their durations were not authoritative.
+                self._clock_anomalies.append({
+                    "timestamp": now,
+                    "kind": "ntp_backjump",
+                    "dt_seconds": raw_dt,
+                    "state": self._current_state,
+                })
             dt = max(0.0, raw_dt)
             self._state_durations[self._current_state] += dt
 

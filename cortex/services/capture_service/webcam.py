@@ -156,22 +156,67 @@ def _llm_pick_builtin_camera(names: list[str]) -> int | None:
         f"{numbered}"
     )
 
+    # B12 (Phase 4.1): wrap the httpx.post in a small retry loop so a
+    # transient classifier outage (Ollama restarting, 503 from the
+    # server) doesn't immediately collapse to the keyword fallback.
+    # We DO NOT retry on 4xx — those are caller errors and another
+    # round-trip won't fix them. Backoff schedule: 50 / 200 / 800 ms.
     try:
         import httpx
-        resp = httpx.post(
-            "http://localhost:11434/api/generate",
-            json={"model": "llama3.2", "prompt": prompt, "stream": False},
-            timeout=8.0,
-        )
-        if resp.status_code == 200:
-            text = resp.json().get("response", "").strip()
-            # Extract first digit from the response
-            for ch in text:
-                if ch.isdigit():
-                    idx = int(ch)
-                    if 0 <= idx < len(names):
-                        logger.info("LLM selected camera %d (%s) from %d candidates", idx, names[idx], len(names))
-                        return idx
+        backoffs = (0.05, 0.2, 0.8)
+        last_status: int | None = None
+        last_exc: Exception | None = None
+        for attempt, backoff in enumerate(backoffs):
+            try:
+                resp = httpx.post(
+                    "http://localhost:11434/api/generate",
+                    json={"model": "llama3.2", "prompt": prompt, "stream": False},
+                    timeout=8.0,
+                )
+            except Exception as exc:
+                last_exc = exc
+                logger.debug(
+                    "LLM camera classifier transport error (attempt %d): %s",
+                    attempt + 1,
+                    type(exc).__name__,
+                )
+                if attempt < len(backoffs) - 1:
+                    import time as _t
+                    _t.sleep(backoff)
+                    continue
+                break
+            last_status = resp.status_code
+            if resp.status_code == 200:
+                text = resp.json().get("response", "").strip()
+                # Extract first digit from the response
+                for ch in text:
+                    if ch.isdigit():
+                        idx = int(ch)
+                        if 0 <= idx < len(names):
+                            logger.info("LLM selected camera %d (%s) from %d candidates", idx, names[idx], len(names))
+                            return idx
+                # 200 but no digit — treat like a parse error, no retry.
+                logger.debug("LLM camera classifier returned 200 but no digit; aborting retries")
+                break
+            # 4xx: do NOT retry (caller error / model misconfigured).
+            if 400 <= resp.status_code < 500:
+                logger.debug(
+                    "LLM camera classifier returned %d; not retrying",
+                    resp.status_code,
+                )
+                break
+            # 5xx: retry with backoff.
+            if attempt < len(backoffs) - 1:
+                import time as _t
+                _t.sleep(backoff)
+                continue
+        if last_status is not None and last_status != 200:
+            logger.debug(
+                "LLM camera classifier exhausted retries, last status=%d",
+                last_status,
+            )
+        elif last_exc is not None:
+            logger.debug("LLM camera classifier transport failed after retries")
     except Exception:
         logger.debug("LLM camera selection unavailable, using keyword fallback")
     return None

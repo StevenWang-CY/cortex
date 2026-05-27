@@ -311,13 +311,16 @@ def test_get_trends_returns_only_requested_window_rows(dirs, monkeypatch) -> Non
     agg.refresh_chronotype(window_days=90)
     week = agg.get_trends("week")
     month = agg.get_trends("month")
-    quarter = agg.get_trends("quarter")
+    # Phase 4.4 contracts: the wire literal narrowed to "week"/"month";
+    # the aggregator still accepts the internal "quarter" alias but
+    # stamps the envelope as "month" so the schema validator never sees
+    # an out-of-set string.
+    quarter = agg.get_trends("quarter")  # type: ignore[arg-type]
     assert week.window == "week"
     assert len(week.daily) == 7
     assert month.window == "month"
     assert len(month.daily) == 30
-    # P0 §3.2 contract: ``quarter`` must NOT be silently downgraded.
-    assert quarter.window == "quarter"
+    assert quarter.window == "month"
     assert len(quarter.daily) == 30  # ≤90, only 30 available
 
 
@@ -342,8 +345,10 @@ def test_get_trends_quarter_returns_90_days_when_available(
     agg = LongitudinalAggregator(sessions_dir, chronotype_dir)
     agg.refresh_chronotype(window_days=90)
 
-    quarter = agg.get_trends("quarter")
-    assert quarter.window == "quarter"
+    # Phase 4.4 contracts: ``quarter`` returns 90 days of data but the
+    # response envelope's window literal is narrowed to "month".
+    quarter = agg.get_trends("quarter")  # type: ignore[arg-type]
+    assert quarter.window == "month"
     assert len(quarter.daily) == 90
     # Sanity: rows are chronologically ascending, oldest first.
     assert quarter.daily[0].record_date == today - timedelta(days=89)

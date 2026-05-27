@@ -93,32 +93,98 @@ def canonical_app_path() -> Path:
 # Editor detection
 # ---------------------------------------------------------------------------
 
-_EDITOR_CANDIDATES: list[tuple[str, list[str]]] = [
-    ("VS Code", [
-        "/usr/local/bin/code",
-        "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
-    ]),
-    ("VS Code Insiders", [
-        "/usr/local/bin/code-insiders",
-        "/Applications/Visual Studio Code - Insiders.app/Contents/Resources/app/bin/code-insiders",
-    ]),
-    ("Cursor", [
-        "/usr/local/bin/cursor",
-        "/Applications/Cursor.app/Contents/Resources/app/bin/cursor",
-    ]),
-    ("VSCodium", [
-        "/usr/local/bin/codium",
-        "/Applications/VSCodium.app/Contents/Resources/app/bin/codium",
-    ]),
+# F17 (Phase-4 audit): factor app-bundle discovery into a single helper
+# so the user's home-folder install path (``~/Applications``) and the
+# system path (``/Applications``) both work. Previously every editor /
+# browser hardcoded ``/Applications/Foo.app`` and silently failed when
+# the user installed under ``~/Applications`` — a common pattern on
+# macOS for multi-user setups and corporate-managed devices.
+def _find_app_bundle(
+    bundle_name: str,
+    cli_subpath: str | None = None,
+) -> Path | None:
+    """Locate a macOS ``.app`` bundle by name.
+
+    Checks (in order):
+      1. ``/Applications/<bundle_name>`` (system-wide install)
+      2. ``~/Applications/<bundle_name>`` (per-user install)
+      3. ``~/Applications/Chrome Apps/<bundle_name>`` (rare PWA install)
+
+    Returns the bundle ``Path`` if found, or ``None`` if no candidate
+    exists. When ``cli_subpath`` is provided, requires that the
+    embedded CLI file is present and executable; this filters out
+    partial / corrupted installs.
+    """
+    candidates = [
+        Path("/Applications") / bundle_name,
+        Path.home() / "Applications" / bundle_name,
+        Path.home() / "Applications" / "Chrome Apps" / bundle_name,
+    ]
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        if cli_subpath is not None:
+            cli = candidate / cli_subpath
+            if not cli.is_file() or not os.access(str(cli), os.X_OK):
+                continue
+        return candidate
+    return None
+
+
+def _resolve_editor_cli(bundle_name: str, cli_subpath: str) -> str | None:
+    """Return the absolute CLI path for an editor bundle, if installed."""
+    bundle = _find_app_bundle(bundle_name, cli_subpath=cli_subpath)
+    if bundle is None:
+        return None
+    return str(bundle / cli_subpath)
+
+
+# Each candidate is (display_name, [bundle_name, cli_subpath, extra
+# fallback abs path]). The legacy ``/usr/local/bin/<cli>`` symlink path
+# is still checked first because users who ``code --install …`` get
+# that shim installed, and it is the canonical "this editor's CLI is
+# on PATH" answer.
+_EDITOR_CANDIDATES: list[tuple[str, str, str, list[str]]] = [
+    (
+        "VS Code",
+        "Visual Studio Code.app",
+        "Contents/Resources/app/bin/code",
+        ["/usr/local/bin/code"],
+    ),
+    (
+        "VS Code Insiders",
+        "Visual Studio Code - Insiders.app",
+        "Contents/Resources/app/bin/code-insiders",
+        ["/usr/local/bin/code-insiders"],
+    ),
+    (
+        "Cursor",
+        "Cursor.app",
+        "Contents/Resources/app/bin/cursor",
+        ["/usr/local/bin/cursor"],
+    ),
+    (
+        "VSCodium",
+        "VSCodium.app",
+        "Contents/Resources/app/bin/codium",
+        ["/usr/local/bin/codium"],
+    ),
 ]
 
 
 def find_editor_cli() -> tuple[str, str] | None:
     """Return (cli_path, display_name) for the first available editor."""
-    for name, paths in _EDITOR_CANDIDATES:
-        for p in paths:
+    for name, bundle, subpath, fallbacks in _EDITOR_CANDIDATES:
+        # First try the legacy ``/usr/local/bin/`` symlink — fastest
+        # path when the user has run ``Shell Command: Install 'code'``.
+        for p in fallbacks:
             if os.path.isfile(p) and os.access(p, os.X_OK):
                 return (p, name)
+        # Then resolve the bundle (system or per-user Applications).
+        resolved = _resolve_editor_cli(bundle, subpath)
+        if resolved is not None:
+            return (resolved, name)
+    # ``shutil.which`` is the last resort — catches custom PATH installs.
     for cmd, name in [("code", "VS Code"), ("cursor", "Cursor"), ("codium", "VSCodium")]:
         found = shutil.which(cmd)
         if found:
@@ -130,10 +196,35 @@ def find_editor_cli() -> tuple[str, str] | None:
 # Browsers
 # ---------------------------------------------------------------------------
 
-_BROWSERS: list[tuple[str, str, str]] = [
-    ("Chrome", "/Applications/Google Chrome.app", "chrome://extensions"),
-    ("Edge", "/Applications/Microsoft Edge.app", "edge://extensions"),
+# Each entry is (display_name, bundle_name, settings_url). The bundle
+# is resolved via ``_find_app_bundle`` so per-user ``~/Applications``
+# installs work.
+_BROWSER_BUNDLES: list[tuple[str, str, str]] = [
+    ("Chrome", "Google Chrome.app", "chrome://extensions"),
+    ("Edge", "Microsoft Edge.app", "edge://extensions"),
 ]
+
+
+def _resolve_browser_bundles() -> list[tuple[str, str, str]]:
+    """Return (name, abs_bundle_path, settings_url) for installed browsers.
+
+    The legacy ``_BROWSERS`` constant hardcoded ``/Applications/...``;
+    this helper lifts ``~/Applications`` installs into parity.
+    """
+    out: list[tuple[str, str, str]] = []
+    for name, bundle, url in _BROWSER_BUNDLES:
+        path = _find_app_bundle(bundle)
+        if path is None:
+            # Preserve the legacy /Applications/ fallback so callers
+            # that show a CTA "install Chrome" still have a sensible
+            # default to display.
+            out.append((name, f"/Applications/{bundle}", url))
+        else:
+            out.append((name, str(path), url))
+    return out
+
+
+_BROWSERS: list[tuple[str, str, str]] = _resolve_browser_bundles()
 
 
 # ---------------------------------------------------------------------------

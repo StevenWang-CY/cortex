@@ -29,6 +29,20 @@ class ActivityAggregator:
                    (InMemoryStore or RedisStore).
         """
         self._store = store
+        # B15 (Phase 4.1): operator-facing counter of activity records
+        # that failed Pydantic validation and were silently skipped.
+        # A nonzero value indicates the browser extension is sending
+        # a schema-mismatched payload; surfaced via ``get_summary``.
+        self._malformed_records: int = 0
+
+    @property
+    def malformed_records(self) -> int:
+        """B15 (Phase 4.1): cumulative count of malformed activity records."""
+        return self._malformed_records
+
+    def get_summary(self) -> dict[str, int]:
+        """B15 (Phase 4.1): operator-facing diagnostics snapshot."""
+        return {"malformed_records": self._malformed_records}
 
     async def ingest(self, activities: list[dict]) -> None:
         """Ingest a batch of activity summaries from the browser extension.
@@ -52,6 +66,9 @@ class ActivityAggregator:
             try:
                 summary = ActivitySummary(**raw)
             except Exception:
+                # B15 (Phase 4.1): bump the counter so a misbehaving
+                # extension is observable via ``get_summary``.
+                self._malformed_records += 1
                 logger.debug("Skipping malformed activity: %s", raw)
                 continue
             by_id[summary.content_id] = summary
