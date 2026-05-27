@@ -33,7 +33,7 @@ export interface TabSnapshot {
 // --- Classification ---
 
 const DOC_PATTERNS =
-    /docs\.|documentation|\/docs\/|developer\.mozilla|devdocs\.io|readthedocs|sphinx|javadoc|rustdoc|godoc|pkg\.go\.dev|react\.dev|vuejs\.org\/guide|angular\.io\/docs|pytorch\.org\/docs|numpy\.org\/doc|pandas\.pydata\.org\/docs|fastapi\.tiangolo\.com/i;
+    /docs?\.|documentation|\/docs?\/|developer\.mozilla|devdocs\.io|readthedocs|sphinx|javadoc|rustdoc|godoc|pkg\.go\.dev|react\.dev|vuejs\.org\/guide|angular\.io\/docs|pytorch\.org\/docs|numpy\.org\/doc|pandas\.pydata\.org\/docs|fastapi\.tiangolo\.com/i;
 const PDF_PATTERNS = /(\.pdf(?:$|\?)|arxiv\.org\/pdf\/|openreview\.net\/pdf)/i;
 const PAPER_PATTERNS =
     /(arxiv\.org\/abs\/|openreview\.net\/forum|acm\.org\/doi|ieeexplore\.ieee\.org|paperswithcode\.com\/paper)/i;

@@ -37,9 +37,18 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
         // the state label + confidence in place. Full HTML re-render is
         // reserved for showIntervention / clearIntervention where the
         // structural content actually changes.
+        //
+        // P0-4: wrap in try/catch so a throw inside _postStateToWebview
+        // (e.g. a bad payload crashing postMessage) does not silently
+        // kill the subscription — the onStateUpdate stream stays alive
+        // and the next valid payload will still be delivered.
         wsClient.onStateUpdate((payload) => {
-            this._currentState = payload;
-            this._postStateToWebview();
+            try {
+                this._currentState = payload;
+                this._postStateToWebview();
+            } catch (err) {
+                console.error("[CortexPanel] onStateUpdate handler threw:", err);
+            }
         });
 
         // P1 (audit Phase 4d, Task B): rerender the empty-state region
@@ -48,9 +57,16 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
         // full HTML rebuild here is acceptable because it only runs on
         // connection transitions (rare), not on every STATE_UPDATE
         // tick — the breathing-pacer animation is unaffected.
+        //
+        // P0-4: same guard — _updatePanel should not take down the
+        // subscription if the webview is mid-teardown.
         wsClient.onConnectionChange((_connected) => {
-            if (!this._currentPayload) {
-                this._updatePanel();
+            try {
+                if (!this._currentPayload) {
+                    this._updatePanel();
+                }
+            } catch (err) {
+                console.error("[CortexPanel] onConnectionChange handler threw:", err);
             }
         });
     }
@@ -71,8 +87,14 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
         };
 
         // Handle messages from webview
+        // P0-4: wrap so a throw inside _handleWebviewMessage (bad message
+        // shape, null intervention_id, etc.) cannot kill the subscription.
         webviewView.webview.onDidReceiveMessage((message) => {
-            this._handleWebviewMessage(message);
+            try {
+                this._handleWebviewMessage(message);
+            } catch (err) {
+                console.error("[CortexPanel] onDidReceiveMessage handler threw:", err);
+            }
         });
 
         this._updatePanel();
@@ -243,6 +265,40 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
         }
 
         this._view.webview.html = this._getWebviewContent();
+    }
+
+    /**
+     * P2-6: return the correct empty-state HTML snippet for the three
+     * distinct panel states:
+     *
+     *   (a) Daemon offline — client is not connected. Shows a
+     *       "Daemon offline" message with a Reconnect button.
+     *   (b) Connected, awaiting state — client is connected but
+     *       _currentState has not yet been populated by a STATE_UPDATE.
+     *       Shows a subtle spinner so the user knows data is on the way.
+     *   (c) Active — client is connected and state is live. Shows the
+     *       standard "No active intervention" message.
+     */
+    private _getEmptyStateHtml(): string {
+        if (!this._wsClient.isConnected) {
+            // (a) Daemon offline.
+            return '<div class="daemon-offline" data-testid="cx-state-offline">'
+                + 'Cortex daemon offline. '
+                + '<button id="reconnect-btn" type="button">Reconnect</button>'
+                + '</div>';
+        }
+        const hasState = Object.keys(this._currentState).length > 0;
+        if (!hasState) {
+            // (b) Connected, awaiting first STATE_UPDATE.
+            return '<div class="cx-awaiting-state" data-testid="cx-state-awaiting">'
+                + '<span class="cx-spinner" aria-hidden="true"></span>'
+                + ' Connecting…'
+                + '</div>';
+        }
+        // (c) Active — connected and state received, no intervention right now.
+        return '<div class="no-intervention" data-testid="cx-state-active">'
+            + 'No active intervention'
+            + '</div>';
     }
 
     /**
@@ -600,6 +656,31 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
 
         .daemon-offline button:hover { filter: brightness(1.08); }
 
+        /* P2-6: "Connected, awaiting state" empty state */
+        .cx-awaiting-state {
+            text-align: center;
+            padding: 20px 12px;
+            color: var(--cx-text-secondary);
+            font-size: var(--fs-caption);
+        }
+
+        /* Subtle CSS-only pulsing dot spinner — no external assets. */
+        .cx-spinner {
+            display: inline-block;
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: var(--cx-text-tertiary);
+            animation: cx-pulse 1.2s ease-in-out infinite;
+            vertical-align: middle;
+            margin-right: 4px;
+        }
+
+        @keyframes cx-pulse {
+            0%, 100% { opacity: 0.3; transform: scale(0.85); }
+            50%       { opacity: 1.0; transform: scale(1.15); }
+        }
+
         /* P0 §3.7: BREAK_RECOMMENDATION pill */
         .break-rec {
             display: flex;
@@ -703,9 +784,7 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
         <span class="state-conf" id="cx-state-conf">${confPct}%</span>
     </div>
 
-    ${interventionHtml || (this._wsClient.isConnected
-        ? '<div class="no-intervention">No active intervention</div>'
-        : '<div class="daemon-offline">Cortex daemon offline. <button id="reconnect-btn" type="button">Reconnect</button></div>')}
+    ${interventionHtml || this._getEmptyStateHtml()}
 
     <script>
         const vscode = acquireVsCodeApi();

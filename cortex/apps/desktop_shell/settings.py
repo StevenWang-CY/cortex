@@ -248,6 +248,9 @@ class SettingsDialog(QWidget):
         # land out-of-order behind an in-flight earlier apply.
         self._settings_version: int = 0
         self._apply_btn: QPushButton | None = None
+        # P1-14: timestamp guard so a burst of apply failures does not spam
+        # the user with QMessageBox dialogs. At most one dialog per second.
+        self._last_error_dialog_ts: float = 0.0
         self._build_ui()
         self._load_persisted_settings()
 
@@ -1201,6 +1204,38 @@ class SettingsDialog(QWidget):
         self.hide()
         self.back_requested.emit()
 
+    def _show_apply_error(
+        self,
+        friendly_msg: str,
+        cid: str | None = None,
+    ) -> None:
+        """P1-14: surface an apply/save failure to the user via QMessageBox.
+
+        Rate-limited to one dialog per second so a burst of failures
+        (e.g. repeated rapid Apply clicks with a crashing slot) does not
+        open multiple overlapping dialogs.
+
+        Also logs at WARNING with ``cid`` so the event is findable in the
+        structured log stream.
+        """
+        now = time.monotonic()
+        if now - self._last_error_dialog_ts < 1.0:
+            return
+        self._last_error_dialog_ts = now
+        if cid:
+            logger.warning("Apply error surfaced to user [cid=%s]: %s", cid, friendly_msg)
+        else:
+            logger.warning("Apply error surfaced to user: %s", friendly_msg)
+        try:
+            detail = f"\n\n(Error ID: {cid})" if cid else ""
+            QMessageBox.warning(
+                self,
+                "Cortex — Settings error",
+                friendly_msg + detail,
+            )
+        except Exception:
+            logger.debug("QMessageBox.warning call failed", exc_info=True)
+
     # ------------------------------------------------------------------
     # API surface (preserved byte-identical from pre-refactor)
     # ------------------------------------------------------------------
@@ -1483,7 +1518,10 @@ class SettingsDialog(QWidget):
                 "}"
             )
         except Exception:
-            logger.debug("provider pill update failed", exc_info=True)
+            logger.warning("provider pill update failed", exc_info=True)
+            self._show_apply_error(
+                "Could not update the provider status display.",
+            )
 
     def apply_cost_response(self, payload: dict) -> None:
         """P0 §3.15: render the running daily spend in the Budget panel.
@@ -1516,7 +1554,10 @@ class SettingsDialog(QWidget):
         try:
             self._budget_today_label.setText(line)
         except Exception:
-            logger.debug("budget label update failed", exc_info=True)
+            logger.warning("budget label update failed", exc_info=True)
+            self._show_apply_error(
+                "Could not update the budget display. The underlying data is valid.",
+            )
 
     def _on_rotate_token(self) -> None:
         """Audit Debt-2 Commit 5: mint a fresh capability token, drop
@@ -1736,6 +1777,9 @@ class SettingsDialog(QWidget):
                 self._os_notifications.setChecked(
                     bool(payload["enable_os_notifications"]),
                 )
-        except Exception:
-            logger.debug("Failed to apply SETTINGS_SYNC payload", exc_info=True)
+        except Exception as _exc:
+            logger.warning("Failed to apply SETTINGS_SYNC payload", exc_info=True)
+            self._show_apply_error(
+                "Some settings could not be applied. Your changes may not have taken effect.",
+            )
         self._persist_settings(self.get_settings())

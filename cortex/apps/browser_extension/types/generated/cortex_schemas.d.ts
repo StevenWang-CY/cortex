@@ -8,6 +8,10 @@
 //
 // Debt-1 closure (audit/findings.md) — closes F42, F43, F44, F45.
 
+export type UserState = "FLOW" | "HYPO" | "HYPER" | "RECOVERY";
+/**
+ * Wire-level message type; see ``MessageType``.
+ */
 export type MessageType =
   | "AUTH"
   | "IDENTIFY"
@@ -61,6 +65,7 @@ export type MessageType =
   | "COST_RESPONSE"
   | "TEST_PROVIDER_RESULT"
   | "RAISE_DASHBOARD"
+  | "ERROR"
   | "LEETCODE_SHOW_SCRATCHPAD"
   | "LEETCODE_SHOW_PATTERN_LADDER"
   | "LEETCODE_SHOW_LOCKOUT"
@@ -545,7 +550,7 @@ export interface EditorContext {
  */
 export interface FeatureVector {
   /**
-   * Monotonic timestamp in seconds
+   * UNIX epoch seconds (wall-clock, UTC); comparable across producer and consumer. Previously documented as 'Monotonic' but the producer uses time.time(), not time.monotonic().
    */
   timestamp: number;
   /**
@@ -732,7 +737,7 @@ export interface FoldState {
  */
 export interface FrameMeta {
   /**
-   * Monotonic timestamp in seconds
+   * UNIX epoch seconds (wall-clock, UTC); comparable across producer and consumer. Previously documented as 'Monotonic' but the producer uses time.time(), not time.monotonic().
    */
   timestamp: number;
   /**
@@ -1582,10 +1587,7 @@ export interface SimplificationConstraints {
  * Produced every 500ms from fused feature vectors.
  */
 export interface StateEstimate {
-  /**
-   * Classified user state
-   */
-  state: "FLOW" | "HYPO" | "HYPER" | "RECOVERY";
+  state: UserState;
   /**
    * Confidence in state classification
    */
@@ -1597,7 +1599,7 @@ export interface StateEstimate {
   reasons?: string[];
   signal_quality: SignalQuality1;
   /**
-   * Monotonic timestamp
+   * UNIX epoch seconds (wall-clock, UTC); comparable across producer and consumer. Previously documented as 'Monotonic' but the producer uses time.time(), not time.monotonic().
    */
   timestamp: number;
   /**
@@ -1693,7 +1695,7 @@ export interface StateScores1 {
  */
 export interface StateTransition1 {
   /**
-   * When transition occurred
+   * UNIX epoch seconds (wall-clock, UTC) when the transition occurred; comparable across producer and consumer.
    */
   timestamp: number;
   /**
@@ -2531,16 +2533,26 @@ export interface BreakRecommendation {
   breathing_pattern?: "4-7-8" | "box" | "coherent";
 }
 /**
- * P0 §3.15: COST_RESPONSE wire payload.
+ * P0 §3.15: COST_RESPONSE wire payload (unified HTTP + WS envelope).
  *
- * Emitted as a reply to :attr:`MessageType.COST_REQUEST` and as an
- * unsolicited push on every plan-finalised event so the desktop's
- * cost meter updates without polling lag.
+ * Emitted as a reply to :attr:`MessageType.COST_REQUEST` (WebSocket path)
+ * AND as the response body of ``GET /api/cost`` (HTTP path). Both surfaces
+ * share this single canonical shape so consumers always see the same keys.
  *
- * Field naming note: the desktop shell historically read ``budget_usd``
- * from the legacy stub payload; the new wire shape sends ``budget_today``
- * (matching the §3.15 spec). The shell's ``apply_cost_response`` accepts
- * both keys (Phase 4 follow-up).
+ * Core fields (always present):
+ * - ``cost_today``: cumulative USD spent today (resets at local midnight).
+ * - ``budget_today``: daily budget cap (kill_usd); 0 means unlimited.
+ * - ``provider``: active provider key or ``None`` when no tracker is wired.
+ *   Never the string ``"none"`` — always ``None`` (JSON ``null``).
+ * - ``budget_exhausted``: True when today's spend exceeded the budget cap.
+ * - ``timestamp``: UNIX epoch seconds (wall-clock UTC) when this snapshot
+ *   was taken.
+ *
+ * Extended fields (optional — may be ``None`` when the WS path omits them
+ * or when no LLM client is registered):
+ * - ``prompt_tokens``: best-effort prompt-token counter for today.
+ * - ``completion_tokens``: best-effort completion-token counter for today.
+ * - ``model``: active model id (e.g. ``claude-sonnet-4-5``).
  */
 export interface CostResponse {
   /**
@@ -2552,13 +2564,29 @@ export interface CostResponse {
    */
   budget_today: number;
   /**
-   * Active LLM provider name (e.g. ``bedrock``, ``vertex``, ``direct``, ``rule_based``).
+   * Active LLM provider key (e.g. ``bedrock``, ``vertex``, ``anthropic_direct``, ``rule_based``). ``None`` (JSON null) when no tracker is active — never the string ``"none"``.
    */
   provider?: string | null;
   /**
    * True when today's spend exceeded the budget cap.
    */
   budget_exhausted?: boolean;
+  /**
+   * UNIX epoch seconds (wall-clock UTC) when this cost snapshot was taken. Comparable across producer and consumer.
+   */
+  timestamp?: number;
+  /**
+   * Best-effort prompt-token counter for today. ``None`` when the active tracker does not expose token counters.
+   */
+  prompt_tokens?: number | null;
+  /**
+   * Best-effort completion-token counter for today. ``None`` when the active tracker does not expose token counters.
+   */
+  completion_tokens?: number | null;
+  /**
+   * Active model id (e.g. ``claude-sonnet-4-5``). ``None`` when no LLM client is registered.
+   */
+  model?: string | null;
 }
 /**
  * P0 §3.11: QUIET_MODE_STATE broadcast payload.

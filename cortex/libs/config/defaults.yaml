@@ -91,6 +91,18 @@ intervention:
   dismissal_model_enabled: true
   dismissal_model_threshold: 0.6
 
+  # P0 §3.7 — Biology-driven break. When true, StressIntegralTracker
+  # transitions emit BREAK_RECOMMENDATION and promote take_biology_break.
+  enable_biology_break: true
+
+  # P0 §3.10 — Auto-armed distraction blocking on sustained HYPER.
+  # Defaults OFF (principle of least surprise; users opt in from Settings).
+  enable_auto_distraction_block: false
+
+  # P0 §3.12 — OS-level notification fallback (macOS UNUserNotification +
+  # Chrome action badge + VS Code status-bar pulse).
+  enable_os_notifications: true
+
 handover:
   late_hour: 23
 

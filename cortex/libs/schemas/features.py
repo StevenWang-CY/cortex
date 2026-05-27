@@ -7,13 +7,20 @@ webcam, face tracking, and telemetry sources.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class FrameMeta(BaseModel):
     """Metadata for a captured webcam frame."""
 
-    timestamp: float = Field(..., description="Monotonic timestamp in seconds")
+    timestamp: float = Field(
+        ...,
+        description=(
+            "UNIX epoch seconds (wall-clock, UTC); comparable across "
+            "producer and consumer. Previously documented as 'Monotonic' "
+            "but the producer uses time.time(), not time.monotonic()."
+        ),
+    )
     face_detected: bool = Field(..., description="Whether a face was detected")
     face_confidence: float = Field(
         ..., ge=0.0, le=1.0, description="Face detection confidence score"
@@ -83,6 +90,37 @@ class PhysioFeatures(BaseModel):
         None, ge=0.0, le=60.0, description="Respiration rate in breaths per minute"
     )
     valid: bool = Field(..., description="Whether physiological features are valid")
+
+    @model_validator(mode="after")
+    def _enforce_invalid_nulls(self) -> "PhysioFeatures":
+        """P1-5: when ``valid`` is False, all data fields must be None.
+
+        Signal-quality fields (``pulse_quality``, ``physio_sqi``,
+        ``physio_sqi_components``) are exempt — they describe the signal
+        quality itself, not the data. Every other numeric/optional field
+        must be ``None`` when ``valid is False`` to prevent downstream
+        consumers from silently using garbage values.
+        """
+        if not self.valid:
+            _data_fields = (
+                "pulse_bpm",
+                "pulse_variability_proxy",
+                "hrv_sdnn",
+                "hrv_pnn50",
+                "hrv_sd1",
+                "hrv_sd2",
+                "hrv_lf_hf_ratio",
+                "hrv_sample_entropy",
+                "hr_delta_5s",
+                "respiration_rate_bpm",
+            )
+            bad = [f for f in _data_fields if getattr(self, f) is not None]
+            if bad:
+                raise ValueError(
+                    f"PhysioFeatures(valid=False) must have None for data fields; "
+                    f"got non-None values for: {bad}"
+                )
+        return self
 
 
 class KinematicFeatures(BaseModel):
@@ -174,7 +212,14 @@ class FeatureVector(BaseModel):
     vector for state classification.
     """
 
-    timestamp: float = Field(..., description="Monotonic timestamp in seconds")
+    timestamp: float = Field(
+        ...,
+        description=(
+            "UNIX epoch seconds (wall-clock, UTC); comparable across "
+            "producer and consumer. Previously documented as 'Monotonic' "
+            "but the producer uses time.time(), not time.monotonic()."
+        ),
+    )
 
     # Physiological features (1-3)
     hr: float | None = Field(

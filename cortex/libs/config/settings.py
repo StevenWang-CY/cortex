@@ -91,10 +91,23 @@ def get_bedrock_token(config: CortexConfig | None = None) -> str | None:
     return token
 
 
-def _clear_bedrock_token_cache() -> None:
-    """Test helper: reset the in-memory token cache."""
+def clear_bedrock_token_cache() -> None:
+    """Reset the in-memory Bedrock token cache.
+
+    Must be called whenever the keychain entry is rewritten (e.g. after a
+    BYOK onboarding step overwrites the ``cortex.bedrock`` / ``bearer_token``
+    entry). Without calling this the old token lingers for the lifetime of the
+    process and the freshly-written credential is never used.
+
+    Also useful in tests: call between subtests to force a fresh keychain read.
+    """
     global _bedrock_token_cache
     _bedrock_token_cache = None
+
+
+# Backward-compatible private alias so any call sites that pre-date the
+# public rename continue to work without a hard error.
+_clear_bedrock_token_cache = clear_bedrock_token_cache
 
 
 @contextmanager

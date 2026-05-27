@@ -1,3 +1,32 @@
+"""Pydantic schemas for Cortex.
+
+WIRE_CONTRACTS
+==============
+
+Timestamp unit
+--------------
+All ``float`` timestamps in this package are **UNIX epoch seconds
+(wall-clock UTC)**.  Use ``time.time()`` on the producer side; compare to
+``Date.now() / 1000`` on the TypeScript consumer side.  ``datetime``
+fields serialize to ISO-8601 strings via Pydantic's JSON encoder.
+
+Enum policy
+-----------
+Pydantic **enums** are configured with ``use_enum_values=True`` on every
+model that carries an enum field, so the **wire JSON contains the plain
+string value** (e.g. ``"FLOW"``, not ``"UserState.FLOW"``).  The
+TypeScript codegen pipeline emits matching **literal string unions**
+(e.g. ``"FLOW" | "HYPO" | "HYPER" | "RECOVERY"``) rather than TS enums,
+keeping the contract simple for JavaScript consumers.
+
+Null policy
+-----------
+**Optional fields** (``field: T | None``) may be serialized as JSON
+``null`` *or* omitted entirely (when ``exclude_none=True`` is passed to
+``model_dump``).  Consumers **must treat absent keys and ``null`` values
+as equivalent** — never assume an absent key means ``False`` or ``0``.
+"""
+
 # Pydantic schemas for Cortex
 
 from cortex.libs.schemas.consent import (

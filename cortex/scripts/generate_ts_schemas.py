@@ -123,27 +123,41 @@ def _resolve_json2ts_command() -> str:
        binary lives in a non-standard location).
     2. ``json2ts`` on PATH (global ``npm i -g
        json-schema-to-typescript``).
-    3. ``pnpm --filter cortex-browser-extension exec json2ts`` if a
-       pnpm workspace is detected next to this repo (local-dev path).
+    3. Local ``node_modules/.bin/json2ts`` under the browser extension
+       workspace (``pnpm install`` in cortex/apps/browser_extension/).
+
+    Raises SystemExit(2) — not RuntimeError — when no path resolves.
+    A non-zero SystemExit is required so the pre-commit hook and CI gate
+    fail loudly rather than silently passing when json2ts is absent.
+    Previously this raised RuntimeError which was caught by the broad
+    ``except Exception`` in ``run_check`` / ``run_generate`` and emitted
+    only a log.error — the pre-commit hook returned 0 (P2-15 fix).
     """
+    _NOT_FOUND_MSG = (
+        "json2ts not found; install via:\n"
+        "  npm install -g json-schema-to-typescript\n"
+        "or, from cortex/apps/browser_extension/:\n"
+        "  pnpm install\n"
+        "Or set CORTEX_JSON2TS_CMD to an explicit path."
+    )
+
     override = os.environ.get("CORTEX_JSON2TS_CMD")
     if override:
         return override
     if shutil.which("json2ts"):
         return "json2ts"
-    # Fallback: try pnpm exec from the browser extension workspace.
+    # Fallback: try local node_modules from the browser extension workspace.
     ext_dir = (
         Path(__file__).resolve().parent.parent / "apps" / "browser_extension"
     )
-    if (ext_dir / "node_modules" / ".bin" / "json2ts").exists():
-        return str(ext_dir / "node_modules" / ".bin" / "json2ts")
-    raise RuntimeError(
-        "json2ts not found. Install via either:\n"
-        "  npm install -g json-schema-to-typescript\n"
-        "or, from cortex/apps/browser_extension/:\n"
-        "  pnpm add -D json-schema-to-typescript\n"
-        "Or set CORTEX_JSON2TS_CMD to an explicit path."
-    )
+    local_bin = ext_dir / "node_modules" / ".bin" / "json2ts"
+    if local_bin.exists():
+        return str(local_bin)
+    # P2-15: exit non-zero immediately with a human-readable message.
+    # Do NOT raise RuntimeError — that gets swallowed by the broad except
+    # in run_check/run_generate, causing the pre-commit hook to exit 0.
+    print(_NOT_FOUND_MSG, file=sys.stderr)
+    raise SystemExit(2)
 
 
 def _generate_into(target: Path) -> None:

@@ -132,6 +132,11 @@ class InterventionExecutor:
         # consent level is below the action's policy minimum. When unset
         # (legacy callers / test rigs) the gate is permissive.
         self._consent_check: ConsentDecisionFn | None = None
+        # P1-7: when the consent gate is not wired, default-deny any plan
+        # that requires workspace mutation (i.e. not overlay-only). Set
+        # this flag to True ONLY in unit tests that want to exercise the
+        # executor logic without binding a real consent handler.
+        self._allow_unwired_consent: bool = False
         # Phase-4b TASK 1: optional hook(s) for the three special actions
         # (resume_last_active_file, prompt_micro_commit, suggest_movement_break).
         # The daemon injects these so the executor can deliver the action
@@ -240,6 +245,34 @@ class InterventionExecutor:
             "reversible_act": 3, "autonomous_act": 4,
         }
         plan_level_int = _CONSENT_LEVELS.get(plan.consent_level, 2)
+
+        # P1-7: default-deny when consent handler is not wired and the
+        # plan requires workspace mutation (i.e. anything beyond a pure
+        # overlay that only shows information without touching tabs/files).
+        # overlay_only plans are safe to execute without a consent gate.
+        _OVERLAY_ONLY = "overlay_only"
+        if (
+            self._consent_check is None
+            and not self._allow_unwired_consent
+            and plan.level != _OVERLAY_ONLY
+        ):
+            logger.warning(
+                "executor: consent_check not wired and plan.level=%r requires mutation"
+                " — refusing plan %s",
+                plan.level,
+                plan.intervention_id,
+            )
+            for cmd in commands:
+                mutations.append(Mutation(
+                    adapter=cmd.adapter,
+                    action=cmd.action,
+                    params=dict(cmd.params),
+                    timestamp=now,
+                    success=False,
+                    reason="consent_handler_not_wired",
+                ))
+            self._active_mutations[plan.intervention_id] = mutations
+            return mutations
 
         # Phase-4b TASK M: action_type → handler hook dispatch. The
         # special actions are not adapter-bound; the daemon wires

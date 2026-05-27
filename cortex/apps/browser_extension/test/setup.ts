@@ -13,6 +13,24 @@ import { afterEach, beforeEach } from "vitest";
 // runs them synchronously and we wrap explicit state changes already.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+
+// P2-7: jsdom does not implement window.matchMedia. Install a minimal
+// stub so newtab.tsx's ``prefers-reduced-motion`` query does not throw.
+if (typeof window !== "undefined" && !window.matchMedia) {
+    Object.defineProperty(window, "matchMedia", {
+        writable: true,
+        value: (query: string) => ({
+            matches: false,
+            media: query,
+            onchange: null,
+            addListener: () => {},
+            removeListener: () => {},
+            addEventListener: () => {},
+            removeEventListener: () => {},
+            dispatchEvent: () => false,
+        }),
+    });
+}
 import {
     installChromeFake,
     resetChromeFake,

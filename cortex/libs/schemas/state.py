@@ -10,7 +10,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 
 class UserState(StrEnum):
@@ -77,7 +77,9 @@ class StateEstimate(BaseModel):
     Produced every 500ms from fused feature vectors.
     """
 
-    state: Literal["FLOW", "HYPO", "HYPER", "RECOVERY"] = Field(
+    model_config = ConfigDict(use_enum_values=True)
+
+    state: UserState = Field(
         ..., description="Classified user state"
     )
     confidence: float = Field(
@@ -93,7 +95,14 @@ class StateEstimate(BaseModel):
     signal_quality: SignalQuality = Field(
         ..., description="Signal quality per channel"
     )
-    timestamp: float = Field(..., description="Monotonic timestamp")
+    timestamp: float = Field(
+        ...,
+        description=(
+            "UNIX epoch seconds (wall-clock, UTC); comparable across "
+            "producer and consumer. Previously documented as 'Monotonic' "
+            "but the producer uses time.time(), not time.monotonic()."
+        ),
+    )
     dwell_seconds: float = Field(
         0.0, ge=0.0, description="Seconds in current state"
     )
@@ -197,7 +206,13 @@ class UserBaselines(BaseModel):
 class StateTransition(BaseModel):
     """Record of a state transition event."""
 
-    timestamp: float = Field(..., description="When transition occurred")
+    timestamp: float = Field(
+        ...,
+        description=(
+            "UNIX epoch seconds (wall-clock, UTC) when the transition "
+            "occurred; comparable across producer and consumer."
+        ),
+    )
     from_state: Literal["FLOW", "HYPO", "HYPER", "RECOVERY"] = Field(
         ..., description="Previous state"
     )

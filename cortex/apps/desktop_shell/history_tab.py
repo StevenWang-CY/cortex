@@ -559,6 +559,9 @@ class _TodayPanel(_RenderCacheMixin, QWidget):
         self._items_hash = ""
         self._next_cursor: float | None = None
         self._total_known: int = 0
+        # P2-5: track whether a list request is in-flight so we can
+        # show a "Loading…" label while waiting for SESSION_LIST.
+        self._list_loading: bool = False
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(SP4, SP3, SP4, SP3)
@@ -607,9 +610,22 @@ class _TodayPanel(_RenderCacheMixin, QWidget):
         scroll.setWidget(self._list_host)
         outer.addWidget(scroll, stretch=1)
 
+        # P2-5: list-loading label (shown while SESSION_LIST is in-flight).
+        self._list_loading_label = QLabel("Loading…")
+        self._list_loading_label.setObjectName("CortexListLoadingLabel")
+        self._list_loading_label.setFont(
+            mac_native.system_font(FS_FOOTNOTE, "regular")
+        )
+        self._list_loading_label.setStyleSheet(
+            f"color: {_LABEL_TERTIARY}; background: transparent;"
+        )
+        self._list_loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._list_loading_label.setVisible(False)
+        outer.addWidget(self._list_loading_label)
+
         # Empty-state label (shown when there are no items).
         self._empty_label = QLabel(
-            "No sessions yet — start one and it will appear here."
+            "No sessions yet — your history will appear here as you use Cortex."
         )
         self._empty_label.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         self._empty_label.setStyleSheet(
@@ -651,6 +667,28 @@ class _TodayPanel(_RenderCacheMixin, QWidget):
         self._more_btn.setText("Loading…")
         self.more_requested.emit(self._next_cursor, 30)
 
+    def set_list_loading(self, loading: bool) -> None:
+        """P2-5: toggle the list-loading state.
+
+        When *loading* is ``True`` the "Loading…" label is shown and the
+        empty-state label is hidden. When *loading* is ``False`` the
+        labels are restored to their data-driven visibility (the next
+        ``apply_payload`` call will reconcile correctly because it already
+        checks ``self._items``).
+        """
+        self._list_loading = loading
+        try:
+            self._list_loading_label.setVisible(loading)
+        except Exception:
+            pass
+        if loading:
+            # Suppress the empty-state label while fetching so the layout
+            # doesn't briefly show "No sessions yet" before data arrives.
+            try:
+                self._empty_label.setVisible(False)
+            except Exception:
+                pass
+
     def apply_payload(self, payload: dict) -> None:
         """Replace or append the rows based on the incoming
         ``SessionListResponse`` payload.
@@ -661,6 +699,8 @@ class _TodayPanel(_RenderCacheMixin, QWidget):
         """
         if not isinstance(payload, dict):
             return
+        # P2-5: clear the in-flight loading state now that the response landed.
+        self.set_list_loading(False)
         new_items_raw = payload.get("items") or []
         if not isinstance(new_items_raw, list):
             new_items_raw = []
@@ -1321,7 +1361,12 @@ class _DetailPanel(_RenderCacheMixin, QWidget):
                 self._distractions_layout.removeWidget(w)
                 w.deleteLater()
         if not domains:
-            placeholder = QLabel("None — nice work staying focused.")
+            # P2-8: per-session detail empty state — sessions exist but this
+            # one had no distraction domains detected.
+            placeholder = QLabel(
+                "No interventions in this session — focus held steady."
+            )
+            placeholder.setObjectName("CortexDetailDistractionsEmpty")
             placeholder.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
             placeholder.setStyleSheet(
                 f"color: {_LABEL_TERTIARY}; background: transparent;"
@@ -2074,10 +2119,20 @@ class HistoryTab(QWidget):
         if index == 0:
             if "today" not in self._requested:
                 self._requested.add("today")
+                # P2-5: show "Loading…" label while waiting for SESSION_LIST.
+                try:
+                    self._today_panel.set_list_loading(True)
+                except Exception:
+                    pass
                 try:
                     self.history_requested.emit(None, 30)
                 except Exception:
                     logger.debug("history_requested emit failed", exc_info=True)
+                    # Clear loading if emit itself failed.
+                    try:
+                        self._today_panel.set_list_loading(False)
+                    except Exception:
+                        pass
         elif index == 1:
             if "week" not in self._requested:
                 self._requested.add("week")

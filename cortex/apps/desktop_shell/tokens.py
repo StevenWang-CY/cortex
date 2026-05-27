@@ -4,27 +4,6 @@
 Semantic palette resolves through :mod:`cortex.apps.desktop_shell.mac_native`
 at runtime, so light/dark mode flips without an app restart on macOS. The
 hex fallbacks below are used in dev mode (non-mac) and in test harnesses.
-
-F20 (Phase-4 audit) — token consumers:
-
-The semantic palette + spacing + radius tokens defined here are
-consumed by every Qt surface in :mod:`cortex.apps.desktop_shell`.
-Notable call sites:
-
-* ``dashboard.py`` — biometrics card, goal input, state pill,
-  health-warning banner, today panel, advanced tab.
-* ``onboarding.py`` — 4-step wizard cards, permission pills, ECG
-  trace, calibration progress strip.
-* ``recap_sheet.py`` — end-of-session recap glass sheet.
-* ``settings.py`` — preferences pane (palette variant picker,
-  BYOK token row, debug toggles).
-* ``break_overlay.py`` — full-screen biology-break overlay.
-* ``overlay.py`` / ``components.py`` — shared chrome (buttons,
-  rounded surfaces, divider rules).
-
-Smoke test in ``cortex/tests/unit/test_desktop_tokens_smoke.py``
-verifies every exported token has a non-empty string value (no
-silent drift to ``""`` during a future YAML edit).
 """
 
 from __future__ import annotations

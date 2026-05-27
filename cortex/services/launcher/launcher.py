@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import signal
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -79,6 +80,26 @@ class ProjectLauncher:
         self._user_command_allowlist: tuple[str, ...] = tuple(
             user_command_allowlist or ()
         )
+        # P1-1: track spawned background subprocess tasks so stop()/aclose()
+        # can cancel them and avoid leaving zombie processes.
+        self._spawned: set[asyncio.Task] = set()
+
+    async def stop(self) -> None:
+        """Cancel and reap all tracked background subprocess tasks."""
+        await self._cancel_spawned_tasks()
+
+    async def aclose(self) -> None:
+        """Async context-manager style cleanup."""
+        await self._cancel_spawned_tasks()
+
+    async def _cancel_spawned_tasks(self) -> None:
+        """Cancel every task in ``_spawned`` and wait for them to finish."""
+        tasks = list(self._spawned)
+        self._spawned.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def launch(self, project_name: str) -> dict:
         """
@@ -254,11 +275,38 @@ class ProjectLauncher:
             }
 
         try:
-            await asyncio.create_subprocess_exec(
+            proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
+
+            async def _reap_proc(p: asyncio.subprocess.Process, label: str) -> None:
+                """Wait up to 30 s for the subprocess; SIGKILL on timeout."""
+                try:
+                    await asyncio.wait_for(p.wait(), timeout=30.0)
+                except TimeoutError:
+                    logger.warning(
+                        "Background subprocess %s (pid=%s) did not exit in 30 s; sending SIGKILL",
+                        label, p.pid,
+                    )
+                    try:
+                        p.send_signal(signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    except Exception:
+                        logger.debug("SIGKILL failed for %s (pid=%s)", label, p.pid, exc_info=True)
+                except asyncio.CancelledError:
+                    _terminate_process(p, label)
+                    raise
+
+            task = asyncio.create_task(
+                _reap_proc(proc, command[:40]),
+                name=f"launcher-reap-{proc.pid}",
+            )
+            self._spawned.add(task)
+            task.add_done_callback(self._spawned.discard)
+
             # Don't wait for completion — some commands are long-running (docker)
             await asyncio.sleep(1.0)
             return {

@@ -170,3 +170,33 @@ export function normaliseInterventionPayload(
         desktop_not_focused: p.desktop_not_focused === true,
     };
 }
+
+/**
+ * Minimal runtime guard for a SuggestedAction from the daemon. The
+ * discriminating fields are ``action_id`` (string) and
+ * ``action_type`` (string) — the extension only needs those two to
+ * dispatch. All other fields remain ``unknown`` until the individual
+ * action handler accesses them.
+ *
+ * P1-13 closure: replaces ``dispatchPayload.action as SuggestedAction``
+ * at the ACTION_DISPATCH wire boundary so a malformed daemon frame
+ * (or a fuzzed payload) cannot reach ``executeAction`` as an untrusted
+ * object.
+ */
+export interface SuggestedActionMinimal {
+    action_id: string;
+    action_type: string;
+    target?: string;
+    label?: string;
+    reason?: string;
+    category?: string;
+    reversible?: boolean;
+    metadata?: Record<string, unknown>;
+}
+
+export function isSuggestedAction(obj: unknown): obj is SuggestedActionMinimal {
+    if (typeof obj !== "object" || obj === null) return false;
+    const o = obj as Record<string, unknown>;
+    return typeof o.action_id === "string" && o.action_id !== ""
+        && typeof o.action_type === "string" && o.action_type !== "";
+}

@@ -315,8 +315,17 @@ def log_state_transition(
     confidence: float,
     reasons: list[str],
     dwell_seconds: float,
+    *,
+    correlation_id: str | None = None,
 ) -> None:
-    """Log a state transition event."""
+    """Log a state transition event.
+
+    P2-16: emits a structured ``STATE_TRANSITION`` event with
+    ``from_state``, ``to_state``, ``dwell_seconds``, ``confidence``,
+    and an optional ``correlation_id`` so the event can be correlated
+    with the upstream intervention or LLM request that was active at
+    the time of the transition.
+    """
     logger = _get_default_logger()
     logger.info(
         EventType.STATE_TRANSITION.value,
@@ -325,6 +334,7 @@ def log_state_transition(
         confidence=confidence,
         reasons=reasons,
         dwell_seconds=dwell_seconds,
+        correlation_id=correlation_id,
     )
 
 

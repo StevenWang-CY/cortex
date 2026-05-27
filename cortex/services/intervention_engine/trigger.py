@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import time
 import warnings
+from collections import deque
 from dataclasses import dataclass, field
 
 from cortex.libs.schemas.state import StateEstimate
@@ -91,7 +92,10 @@ class InterventionTrigger:
         self._dismissal_decay = dismissal_decay_seconds
 
         self._last_trigger_time: float | None = None
-        self._dismissals: list[DismissalEntry] = []
+        # P1-4: bounded deque prevents unbounded memory growth in long
+        # sessions. 256 entries is far more than any realistic dismissal
+        # count inside one decay window (~1 h).
+        self._dismissals: deque[DismissalEntry] = deque(maxlen=256)
         self._quiet_mode_until: float = 0.0
 
     def evaluate(
@@ -226,10 +230,14 @@ class InterventionTrigger:
         return "overlay_only"
 
     def _active_threshold_bump(self, now: float) -> float:
-        """Calculate the active threshold bump from recent dismissals."""
-        total = 0.0
-        for d in self._dismissals:
-            age = now - d.timestamp
-            if age < self._dismissal_decay:
-                total += d.threshold_bump
-        return total
+        """Calculate the active threshold bump from recent dismissals.
+
+        P1-4: prune expired entries from the left (oldest) before summing
+        so the deque never accumulates phantom bump from expired dismissals
+        and the maxlen=256 cap is as effective as possible.
+        """
+        cutoff = now - self._dismissal_decay
+        # popleft while the oldest entry is stale
+        while self._dismissals and self._dismissals[0].timestamp < cutoff:
+            self._dismissals.popleft()
+        return sum(d.threshold_bump for d in self._dismissals)

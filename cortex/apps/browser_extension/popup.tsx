@@ -11,6 +11,23 @@ import { createRoot } from "react-dom/client";
 import { CX, STATE_COLORS, STATE_LABELS, CX_KEYFRAMES } from "./design-tokens";
 import { newCorrelationId } from "./lib/correlation";
 import { getLastRuntimeError } from "./lib/chrome-runtime";
+import { DAEMON_HTTP_URL } from "./config";
+
+// P2-9: centralised debug flag for popup. Mirrors background.ts's DEBUG
+// pattern. In production builds (NODE_ENV=production / Plasmo production
+// build) all console.debug / console.warn calls in this file are silenced.
+const CORTEX_DEBUG: boolean = (() => {
+    try {
+        const ime = (import.meta as unknown as { env?: Record<string, unknown> }).env;
+        if (ime && ime.CORTEX_DEBUG === "true") return true;
+    } catch { /* import.meta not available */ }
+    try {
+        if (typeof process !== "undefined" && process.env && process.env.CORTEX_DEBUG === "true") {
+            return true;
+        }
+    } catch { /* process not available */ }
+    return false;
+})();
 
 /**
  * F19b: every popup-initiated request mints a correlation id at the click
@@ -24,9 +41,11 @@ function sendWithCid(
 ): string {
     const correlation_id = newCorrelationId();
     const enriched = { ...msg, correlation_id };
-    console.debug(
-        `cortex.popup.send cid=${correlation_id} type=${String(msg.type)}`,
-    );
+    if (CORTEX_DEBUG) {
+        console.debug(
+            `cortex.popup.send cid=${correlation_id} type=${String(msg.type)}`,
+        );
+    }
     safeSendMessage(enriched, cb);
     return correlation_id;
 }
@@ -58,11 +77,7 @@ export function safeSendMessage(
             // so every other surface stays clean.
             const lastErr = getLastRuntimeError();
             if (lastErr) {
-                if (
-                    typeof process !== "undefined"
-                    && process.env
-                    && process.env.CORTEX_DEBUG === "true"
-                ) {
+                if (CORTEX_DEBUG) {
                     console.warn(
                         "[cortex.popup] sendMessage",
                         String(msg.type ?? "?"),
@@ -79,11 +94,7 @@ export function safeSendMessage(
             if (cb) cb(response);
         });
     } catch (err) {
-        if (
-            typeof process !== "undefined"
-            && process.env
-            && process.env.CORTEX_DEBUG === "true"
-        ) {
+        if (CORTEX_DEBUG) {
             console.warn(
                 "[cortex.popup] sendMessage threw",
                 String(msg.type ?? "?"),
@@ -414,10 +425,12 @@ function TrendsMiniStrip(): React.ReactElement {
                     // F18 (Phase-4 audit): centralised lastError reader.
                     const lastErr = getLastRuntimeError();
                     if (lastErr) {
-                        console.warn(
-                            "[cortex.popup] GET_CACHED_TRENDS lastError",
-                            lastErr.message,
-                        );
+                        if (CORTEX_DEBUG) {
+                            console.warn(
+                                "[cortex.popup] GET_CACHED_TRENDS lastError",
+                                lastErr.message,
+                            );
+                        }
                         setLoadFailed(true);
                         return;
                     }
@@ -458,10 +471,12 @@ function TrendsMiniStrip(): React.ReactElement {
                                     // F18: centralised lastError reader.
                                     const lastErr2 = getLastRuntimeError();
                                     if (lastErr2) {
-                                        console.warn(
-                                            "[cortex.popup] REQUEST_TRENDS lastError",
-                                            lastErr2.message,
-                                        );
+                                        if (CORTEX_DEBUG) {
+                                            console.warn(
+                                                "[cortex.popup] REQUEST_TRENDS lastError",
+                                                lastErr2.message,
+                                            );
+                                        }
                                         setLoadFailed(true);
                                         return;
                                     }
@@ -476,10 +491,12 @@ function TrendsMiniStrip(): React.ReactElement {
                             // sendMessage may throw in odd contexts —
                             // surface as the error UI rather than the
                             // (misleading) empty-state copy.
-                            console.warn(
-                                "[cortex.popup] REQUEST_TRENDS threw",
-                                err,
-                            );
+                            if (CORTEX_DEBUG) {
+                                console.warn(
+                                    "[cortex.popup] REQUEST_TRENDS threw",
+                                    err,
+                                );
+                            }
                             setLoadFailed(true);
                         }
                     }
@@ -488,10 +505,12 @@ function TrendsMiniStrip(): React.ReactElement {
         } catch (err) {
             // chrome.runtime unavailable; render the error UI rather
             // than the (misleading) empty-state copy.
-            console.warn(
-                "[cortex.popup] GET_CACHED_TRENDS threw",
-                err,
-            );
+            if (CORTEX_DEBUG) {
+                console.warn(
+                    "[cortex.popup] GET_CACHED_TRENDS threw",
+                    err,
+                );
+            }
             setLoadFailed(true);
         }
     }, []);
@@ -579,6 +598,29 @@ function TrendsMiniStrip(): React.ReactElement {
         <div style={S.trendsStrip} data-testid="trends-strip">
             <div style={S.trendsHeader}>
                 <span style={S.trendsTitle}>Last 7 days</span>
+                {/* P2-4: show a "Stale" badge when we have cached trends but
+                    the latest refresh attempt failed. The chart stays visible
+                    so the user still sees their data; the badge signals it
+                    may be outdated. */}
+                {loadFailed && (
+                    <span
+                        data-testid="trends-stale-badge"
+                        style={{
+                            fontSize: 9,
+                            color: CX.textTertiary,
+                            background: CX.surface,
+                            border: `1px solid ${CX.borderDefault}`,
+                            borderRadius: 4,
+                            padding: "1px 5px",
+                            fontFamily: CX.mono,
+                            textTransform: "uppercase" as const,
+                            letterSpacing: "0.04em",
+                            alignSelf: "center",
+                        }}
+                    >
+                        Stale
+                    </span>
+                )}
                 <span style={S.trendsAvg} data-testid="trends-avg">
                     {avgMin} min avg/day
                 </span>
@@ -762,6 +804,10 @@ function CortexPopup(): React.ReactElement {
                               budget_today: number;
                               provider?: string | null;
                               budget_exhausted?: boolean;
+                              prompt_tokens?: number | null;
+                              completion_tokens?: number | null;
+                              model?: string | null;
+                              timestamp?: number;
                           };
                       }
                     | undefined;
@@ -1262,7 +1308,7 @@ function CortexPopup(): React.ReactElement {
             timestamp: Date.now() / 1000,
         };
         try {
-            const resp = await fetch("http://127.0.0.1:9472/api/feedback", {
+            const resp = await fetch(`${DAEMON_HTTP_URL}/api/feedback`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(body),

@@ -64,7 +64,14 @@ def _serialize_timestamp(ts: Any) -> Any:
     """``StateEstimate.timestamp`` is typed loosely (float monotonic or
     datetime depending on producer). Return an ISO string for datetimes
     and the raw value for everything else so JSON serialisation works
-    consistently across both shapes."""
+    consistently across both shapes.
+
+    P2-2: the previously bare ``except Exception: pass`` silently
+    swallowed isoformat errors making them invisible in production logs.
+    Replaced with a ``logger.debug`` that includes ``exc_info=True`` so
+    the root cause is visible in debug logging while the fall-through
+    behaviour (return the raw value) is preserved.
+    """
     if ts is None:
         return None
     iso = getattr(ts, "isoformat", None)
@@ -72,7 +79,9 @@ def _serialize_timestamp(ts: Any) -> Any:
         try:
             return iso()
         except Exception:
-            pass
+            logger.debug(
+                "timestamp ISO serialize failed for %r", ts, exc_info=True
+            )
     return ts
 
 
@@ -1672,6 +1681,29 @@ class WebSocketServer:
         except Exception:
             return None
 
+    async def _send_daemon_not_ready(
+        self,
+        client: WebSocketClient,
+        msg: WSMessage,
+    ) -> None:
+        """P2-22: unicast an ``ERROR`` frame to ``client`` indicating the daemon
+        is not ready.
+
+        Preserves the ``correlation_id`` from the triggering message so
+        the client can match the error back to its pending request.
+        Called from every ``_handle_*`` that performs an early return
+        when ``_resolve_daemon()`` returns ``None`` (EXCEPT
+        ``_handle_cost_request`` which is owned by Agent C).
+        """
+        await self._send_to(
+            client,
+            MessageType.ERROR.value,
+            {
+                "code": "daemon_not_ready",
+                "correlation_id": getattr(msg, "correlation_id", None),
+            },
+        )
+
     async def _handle_cost_request(
         self, client: WebSocketClient, msg: WSMessage,
     ) -> None:
@@ -1702,7 +1734,8 @@ class WebSocketServer:
         """
         daemon = self._resolve_daemon()
         if daemon is None or not hasattr(daemon, "test_provider"):
-            logger.debug("TEST_PROVIDER received but no daemon; dropping")
+            logger.debug("TEST_PROVIDER received but no daemon; sending daemon_not_ready")
+            await self._send_daemon_not_ready(client, msg)
             return
         provider = str((msg.payload or {}).get("provider") or "").strip()
         try:
@@ -1721,7 +1754,8 @@ class WebSocketServer:
         """P0 §3.13: forward the user-supplied session goal to the daemon."""
         daemon = self._resolve_daemon()
         if daemon is None or not hasattr(daemon, "set_active_goal"):
-            logger.debug("GOAL_SET received but no daemon; dropping")
+            logger.debug("GOAL_SET received but no daemon; sending daemon_not_ready")
+            await self._send_daemon_not_ready(client, msg)
             return
         title = str((msg.payload or {}).get("title") or "").strip()
         try:
@@ -1735,7 +1769,8 @@ class WebSocketServer:
         """P0 §3.21: invoke ``daemon.force_recap``."""
         daemon = self._resolve_daemon()
         if daemon is None or not hasattr(daemon, "force_recap"):
-            logger.debug("FORCE_RECAP received but no daemon; dropping")
+            logger.debug("FORCE_RECAP received but no daemon; sending daemon_not_ready")
+            await self._send_daemon_not_ready(client, msg)
             return
         try:
             await daemon.force_recap()
@@ -1748,7 +1783,8 @@ class WebSocketServer:
         """P0 §3.21: invoke ``daemon.dismiss_active_overlay``."""
         daemon = self._resolve_daemon()
         if daemon is None or not hasattr(daemon, "dismiss_active_overlay"):
-            logger.debug("DISMISS_OVERLAY received but no daemon; dropping")
+            logger.debug("DISMISS_OVERLAY received but no daemon; sending daemon_not_ready")
+            await self._send_daemon_not_ready(client, msg)
             return
         try:
             await daemon.dismiss_active_overlay()
@@ -2030,6 +2066,11 @@ class WebSocketServer:
 
         Returns True if the frame was queued (with or without evicting
         an older frame), False if no queue exists for the client.
+
+        P1-8: on a confirmed drop (producer raced consumer and lost the
+        second put_nowait too), emit a WARNING log and increment the
+        ``cortex_ws_coalesce_drops_total`` Prometheus counter so the
+        silent-drop rate is observable in /metrics.
         """
         queue = client.coalesce_queue
         if queue is None:
@@ -2047,6 +2088,14 @@ class WebSocketServer:
                 return True
             except asyncio.QueueFull:
                 # Producer raced with consumer; treat as dropped.
+                qs = queue.qsize()
+                logger.warning(
+                    "WS_COALESCE_DROP client=%s queue_size=%s",
+                    client.client_id,
+                    qs,
+                )
+                from cortex.libs.observability.metrics import WS_COALESCE_DROPS_TOTAL
+                WS_COALESCE_DROPS_TOTAL.inc()
                 return False
 
     # audit Phase-I: per-send timeout (s) and total broadcast budget (s).

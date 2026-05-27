@@ -84,7 +84,10 @@ else
 fi
 
 # ── Step 2: Build VS Code extension ────────────────────────────────────────
-VSIX="${CORTEX_DIR}/apps/vscode_extension/cortex-somatic-0.2.1.vsix"
+# P2-12: Read version from package.json so the VSIX path is always
+# consistent with the manifest; never hardcode the version string here.
+VSIX_VERSION=$(jq -r .version "${CORTEX_DIR}/apps/vscode_extension/package.json")
+VSIX="${CORTEX_DIR}/apps/vscode_extension/cortex-somatic-${VSIX_VERSION}.vsix"
 VSCODE_EXT_DIR="${CORTEX_DIR}/apps/vscode_extension"
 if [ "${CORTEX_SKIP_VSCODE_EXT_BUILD:-0}" = "1" ]; then
     echo "→ Skipping VS Code extension build (CORTEX_SKIP_VSCODE_EXT_BUILD=1)"
@@ -106,7 +109,7 @@ fi
 # ── Step 3: Verify VSIX ────────────────────────────────────────────────────
 if [ ! -f "${VSIX}" ]; then
     echo "ERROR: VSIX not found at ${VSIX}" >&2
-    echo "Build it with: cd cortex/apps/vscode_extension && npx @vscode/vsce package --out cortex-somatic-0.2.1.vsix" >&2
+    echo "Build it with: cd cortex/apps/vscode_extension && npx @vscode/vsce package --out cortex-somatic-${VSIX_VERSION}.vsix" >&2
     exit 1
 fi
 echo "→ VSIX found"
@@ -115,7 +118,20 @@ echo "→ VSIX found"
 # Only non-secret pointers ship inside the DMG. Secrets live in macOS Keychain
 # (cortex.bedrock / bearer_token). Anything not matching ALLOWED_KEYS is dropped.
 echo "→ Generating bundled .env (allowlist scrub)..."
-ALLOWED_KEYS='^(CORTEX_API__HOST|CORTEX_API__PORT|CORTEX_API__WS_PORT|CORTEX_LLM__PROVIDER|CORTEX_LLM__BEDROCK__AWS_REGION|CORTEX_LLM__USE_KEYCHAIN|CORTEX_LLM__MODEL_DEFAULT|CORTEX_LLM__MODEL_FAST|CORTEX_LLM__MODEL_DEEP|CORTEX_STORAGE__BASE_DIR)='
+# P2-11: Removed CORTEX_STORAGE__BASE_DIR — the real key is CORTEX_STORAGE__PATH
+#        and the bundled app must not pin to a developer's local path.
+# P2-13: Each remaining key is kept because at least one .py file references
+#        it; see cortex/libs/config/settings.py (APIConfig, LLMConfig).
+#   CORTEX_API__HOST            — APIConfig.host; daemon bind address
+#   CORTEX_API__PORT            — APIConfig.port; HTTP API port (9472)
+#   CORTEX_API__WS_PORT         — APIConfig.ws_port; WebSocket port (9473)
+#   CORTEX_LLM__PROVIDER        — LLMConfig.provider; selects Bedrock/vertex/direct
+#   CORTEX_LLM__BEDROCK__AWS_REGION — BedrockConfig.aws_region; region for IAM
+#   CORTEX_LLM__USE_KEYCHAIN    — LLMConfig.use_keychain; enables BYOK path
+#   CORTEX_LLM__MODEL_DEFAULT   — LLMConfig.model_default; default model tier
+#   CORTEX_LLM__MODEL_FAST      — LLMConfig.model_fast; fast-tier model
+#   CORTEX_LLM__MODEL_DEEP      — LLMConfig.model_deep; deep-tier model
+ALLOWED_KEYS='^(CORTEX_API__HOST|CORTEX_API__PORT|CORTEX_API__WS_PORT|CORTEX_LLM__PROVIDER|CORTEX_LLM__BEDROCK__AWS_REGION|CORTEX_LLM__USE_KEYCHAIN|CORTEX_LLM__MODEL_DEFAULT|CORTEX_LLM__MODEL_FAST|CORTEX_LLM__MODEL_DEEP)='
 if [ -f "${ROOT_DIR}/.env" ]; then
     grep -E "${ALLOWED_KEYS}" "${ROOT_DIR}/.env" > "${ROOT_DIR}/.env.bundled" || true
 else

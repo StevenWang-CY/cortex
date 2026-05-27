@@ -126,9 +126,14 @@ class SessionReportGenerator:
                 # render as a "clock anomaly" badge. Without this the
                 # clamp silently swallowed the discrepancy and the user
                 # had no signal that their durations were not authoritative.
+                # P2-21: stamp ``raw_dt_seconds`` explicitly so the recap
+                # UI and test assertions can read the un-clamped value.
+                # ``dt_seconds`` is kept for backward compatibility with
+                # existing callers that read the old key.
                 self._clock_anomalies.append({
                     "timestamp": now,
                     "kind": "ntp_backjump",
+                    "raw_dt_seconds": raw_dt,
                     "dt_seconds": raw_dt,
                     "state": self._current_state,
                 })

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from datetime import UTC, datetime
 
 from cortex.libs.config.settings import HandoverConfig
@@ -70,7 +71,11 @@ class ShutdownDetector:
         self._cooldown = cooldown
         self._fatigue_start: float | None = None
         self._last_trigger: float = 0.0
-        self._error_timestamps: list[float] = []
+        # P2-20: bounded deque prevents unbounded memory growth on
+        # long-running sessions with high error rates. 1024 entries at
+        # even the most pathological 1 error/second rate covers >17 min
+        # — far beyond the 5-minute detection window.
+        self._error_timestamps: deque[float] = deque(maxlen=1024)
 
     def update_baseline(self, hrv_baseline: float) -> None:
         """Update HRV baseline."""
@@ -80,9 +85,12 @@ class ShutdownDetector:
         """Record a syntax/compile error occurrence."""
         ts = timestamp or time.monotonic()
         self._error_timestamps.append(ts)
-        # Keep only last 5 minutes
+        # P2-20: popleft stale entries (older than 5-minute window)
+        # instead of rebuilding a new list — deque makes this O(k) where
+        # k is the number of expired entries rather than O(n) total.
         cutoff = ts - 300.0
-        self._error_timestamps = [t for t in self._error_timestamps if t >= cutoff]
+        while self._error_timestamps and self._error_timestamps[0] < cutoff:
+            self._error_timestamps.popleft()
 
     def should_handover(
         self,

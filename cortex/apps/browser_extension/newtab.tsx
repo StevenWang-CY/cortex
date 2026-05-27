@@ -13,6 +13,20 @@ import "./page-reset.css";
 import { CX, STATE_COLORS_RGB, CX_KEYFRAMES } from "./design-tokens";
 import { newCorrelationId } from "./lib/correlation";
 
+// P2-9: debug flag for newtab page — silences console output in production.
+const CORTEX_DEBUG: boolean = (() => {
+    try {
+        const ime = (import.meta as unknown as { env?: Record<string, unknown> }).env;
+        if (ime && ime.CORTEX_DEBUG === "true") return true;
+    } catch { /* import.meta not available */ }
+    try {
+        if (typeof process !== "undefined" && process.env && process.env.CORTEX_DEBUG === "true") {
+            return true;
+        }
+    } catch { /* process not available */ }
+    return false;
+})();
+
 // F19b: every newtab-initiated user click mints a cid so the trace is
 // continuous from this page through the background and daemon logs.
 function nt_sendWithCid(
@@ -21,7 +35,9 @@ function nt_sendWithCid(
 ): string {
     const correlation_id = newCorrelationId();
     const enriched = { ...msg, correlation_id };
-    console.debug(`cortex.newtab.send cid=${correlation_id} type=${String(msg.type)}`);
+    if (CORTEX_DEBUG) {
+        console.debug(`cortex.newtab.send cid=${correlation_id} type=${String(msg.type)}`);
+    }
     // Phase 4d Task B: lastError sweep — wrap raw sendMessage so the
     // callback drops cleanly when the SW is mid-eviction. The polling
     // callsites further down also inspect lastError themselves.
@@ -31,11 +47,7 @@ function nt_sendWithCid(
                 runtime?: { lastError?: { message?: string } };
             }).runtime?.lastError;
             if (lastErr) {
-                if (
-                    typeof process !== "undefined"
-                    && process.env
-                    && process.env.CORTEX_DEBUG === "true"
-                ) {
+                if (CORTEX_DEBUG) {
                     console.warn(
                         "[cortex.newtab] sendMessage",
                         String(msg.type ?? "?"),
@@ -95,6 +107,10 @@ function PulseRoom(): React.ReactElement {
     const [displayHR, setDisplayHR] = useState(0);
     const [displayConnected, setDisplayConnected] = useState(false);
     const [reducedMotion, setReducedMotion] = useState(false);
+    // P2-7: pacer phase label for the aria-live accessibility region.
+    // Derived from pulsePhase so screen readers can announce the
+    // current breathing cue without coupling to canvas internals.
+    const [pacerPhase, setPacerPhase] = useState<"inhale" | "hold" | "exhale">("inhale");
 
     // Launch controls
     const [launching, setLaunching] = useState(false);
@@ -199,6 +215,9 @@ function PulseRoom(): React.ReactElement {
     // Canvas animation loop + Logo Interaction
     const logoRef = useRef<HTMLDivElement>(null);
     const auraRef = useRef<HTMLDivElement>(null);
+    // P2-7: track last-announced pacer phase to avoid flooding the
+    // aria-live region with identical strings every rAF tick.
+    const lastPacerPhaseRef = useRef<"inhale" | "hold" | "exhale">("inhale");
 
     useEffect(() => {
         if (reducedMotion) return;
@@ -264,6 +283,21 @@ function PulseRoom(): React.ReactElement {
             } else {
                 // Idle breathing
                 anim.pulsePhase = (Math.sin(now / 1500) * 0.5 + 0.5);
+            }
+
+            // P2-7: derive the pacer phase for the aria-live region.
+            // 4-7-8 pattern mapped onto pulsePhase [0..1]:
+            //   [0, 0.33)  → inhale   (first third)
+            //   [0.33, 0.5) → hold    (short plateau)
+            //   [0.5, 1]   → exhale   (latter half)
+            {
+                const p = anim.pulsePhase;
+                const derived: "inhale" | "hold" | "exhale" =
+                    p < 0.33 ? "inhale" : p < 0.5 ? "hold" : "exhale";
+                if (derived !== lastPacerPhaseRef.current) {
+                    lastPacerPhaseRef.current = derived;
+                    setPacerPhase(derived);
+                }
             }
 
             // Ripple rings — delicate water ripples expanding outward
@@ -365,10 +399,30 @@ function PulseRoom(): React.ReactElement {
                         ";margin:0;padding:0}",
                 }}
             />
+            {/* P2-7: role + aria-label satisfy WCAG SC 1.1.1 for the canvas
+                visualisation. The aria-live region announces the breathing
+                pacer phase transitions to screen reader users. */}
             <canvas
                 ref={canvasRef}
+                role="img"
+                aria-label="Cortex breathing pacer visualization"
                 style={{ display: "block", width: "100%", height: "100%" }}
             />
+            <div
+                aria-live="polite"
+                aria-atomic="true"
+                data-testid="pacer-phase-announcement"
+                style={{
+                    position: "absolute",
+                    width: 1,
+                    height: 1,
+                    overflow: "hidden",
+                    clip: "rect(0 0 0 0)",
+                    whiteSpace: "nowrap",
+                }}
+            >
+                {pacerPhase}
+            </div>
 
             {/* Static orb for reduced motion */}
             {reducedMotion && (

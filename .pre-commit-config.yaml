@@ -41,3 +41,22 @@ repos:
         # ``--check`` writes the diff to stdout; pre-commit captures
         # and prints it on failure, so the developer immediately
         # sees what changed without re-running the generator.
+
+      # P1-18: Design-token parity drift gate. Fires whenever the YAML
+      # source, the sync script, or any emitted token file is touched.
+      # ``--check`` regenerates in memory and fails on any diff so a
+      # developer who edits tokens.yaml without re-running the emitter
+      # cannot land drift.
+      - id: cortex-design-tokens-check
+        name: cortex design tokens (drift gate)
+        entry: python -m cortex.scripts.sync_design_tokens --check
+        language: system
+        pass_filenames: false
+        files: |
+          (?x)^(
+            cortex/libs/design/tokens\.yaml|
+            cortex/scripts/sync_design_tokens\.py|
+            cortex/apps/desktop_shell/tokens\.py|
+            cortex/apps/browser_extension/design-tokens\.ts|
+            cortex/apps/vscode_extension/src/design-tokens\.ts
+          )$

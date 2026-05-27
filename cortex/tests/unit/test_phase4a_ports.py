@@ -58,3 +58,15 @@ def test_intervention_port_rejects_partial_implementation() -> None:
             raise NotImplementedError
 
     assert not isinstance(_Partial(), InterventionPort)
+
+
+# P2-14: Port uniqueness + valid range
+def test_ports_unique() -> None:
+    """All three ports must be distinct integers in the unprivileged range."""
+    assert len({ports.HTTP_API_PORT, ports.WEBSOCKET_PORT, ports.LAUNCHER_AGENT_PORT}) == 3, (
+        "HTTP_API_PORT, WEBSOCKET_PORT, and LAUNCHER_AGENT_PORT must all be distinct"
+    )
+    for p in (ports.HTTP_API_PORT, ports.WEBSOCKET_PORT, ports.LAUNCHER_AGENT_PORT):
+        assert 1024 < p < 65535, (
+            f"Port {p} is outside the valid unprivileged range (1024, 65535)"
+        )

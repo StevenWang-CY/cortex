@@ -24,6 +24,8 @@ from dataclasses import dataclass
 import numpy as np
 
 from cortex.libs.config.settings import StateConfig
+from cortex.libs.logging.correlation import get_correlation_id
+from cortex.libs.logging.structured import log_state_transition
 from cortex.libs.schemas.state import (
     SignalQuality,
     StateEstimate,
@@ -184,9 +186,16 @@ class ScoreSmoother:
                 trigger_reasons=self._generate_reasons(),
             )
             self._transitions.append(transition)
-            logger.info(
-                f"State transition: {self._current_state.value} → {confirmed_state.value} "
-                f"(confidence={dominant_score:.2f}, dwell={self._dwell_seconds:.1f}s)"
+            # P2-16: emit structured STATE_TRANSITION event via structlog so
+            # the event stream carries from_state, to_state, dwell_seconds,
+            # confidence, and correlation_id for observability dashboards.
+            log_state_transition(
+                from_state=self._current_state.value,
+                to_state=confirmed_state.value,
+                confidence=dominant_score,
+                reasons=self._generate_reasons(),
+                dwell_seconds=self._dwell_seconds,
+                correlation_id=get_correlation_id(),
             )
 
             self._current_state = confirmed_state

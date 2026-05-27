@@ -20,6 +20,7 @@ parser, matching the rest of the schemas in this package.
 
 from __future__ import annotations
 
+import time
 from datetime import datetime
 from typing import Literal
 
@@ -357,16 +358,26 @@ class SessionRecap(BaseModel):
 
 
 class CostResponse(BaseModel):
-    """P0 §3.15: COST_RESPONSE wire payload.
+    """P0 §3.15: COST_RESPONSE wire payload (unified HTTP + WS envelope).
 
-    Emitted as a reply to :attr:`MessageType.COST_REQUEST` and as an
-    unsolicited push on every plan-finalised event so the desktop's
-    cost meter updates without polling lag.
+    Emitted as a reply to :attr:`MessageType.COST_REQUEST` (WebSocket path)
+    AND as the response body of ``GET /api/cost`` (HTTP path). Both surfaces
+    share this single canonical shape so consumers always see the same keys.
 
-    Field naming note: the desktop shell historically read ``budget_usd``
-    from the legacy stub payload; the new wire shape sends ``budget_today``
-    (matching the §3.15 spec). The shell's ``apply_cost_response`` accepts
-    both keys (Phase 4 follow-up).
+    Core fields (always present):
+    - ``cost_today``: cumulative USD spent today (resets at local midnight).
+    - ``budget_today``: daily budget cap (kill_usd); 0 means unlimited.
+    - ``provider``: active provider key or ``None`` when no tracker is wired.
+      Never the string ``"none"`` — always ``None`` (JSON ``null``).
+    - ``budget_exhausted``: True when today's spend exceeded the budget cap.
+    - ``timestamp``: UNIX epoch seconds (wall-clock UTC) when this snapshot
+      was taken.
+
+    Extended fields (optional — may be ``None`` when the WS path omits them
+    or when no LLM client is registered):
+    - ``prompt_tokens``: best-effort prompt-token counter for today.
+    - ``completion_tokens``: best-effort completion-token counter for today.
+    - ``model``: active model id (e.g. ``claude-sonnet-4-5``).
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -382,13 +393,42 @@ class CostResponse(BaseModel):
     provider: str | None = Field(
         None,
         description=(
-            "Active LLM provider name (e.g. ``bedrock``, ``vertex``, "
-            "``direct``, ``rule_based``)."
+            "Active LLM provider key (e.g. ``bedrock``, ``vertex``, "
+            "``anthropic_direct``, ``rule_based``). ``None`` (JSON null) "
+            "when no tracker is active — never the string ``\"none\"``."
         ),
     )
     budget_exhausted: bool = Field(
         False,
         description="True when today's spend exceeded the budget cap.",
+    )
+    timestamp: float = Field(
+        default_factory=lambda: time.time(),
+        description=(
+            "UNIX epoch seconds (wall-clock UTC) when this cost snapshot "
+            "was taken. Comparable across producer and consumer."
+        ),
+    )
+    prompt_tokens: int | None = Field(
+        None, ge=0,
+        description=(
+            "Best-effort prompt-token counter for today. ``None`` when "
+            "the active tracker does not expose token counters."
+        ),
+    )
+    completion_tokens: int | None = Field(
+        None, ge=0,
+        description=(
+            "Best-effort completion-token counter for today. ``None`` "
+            "when the active tracker does not expose token counters."
+        ),
+    )
+    model: str | None = Field(
+        None,
+        description=(
+            "Active model id (e.g. ``claude-sonnet-4-5``). ``None`` "
+            "when no LLM client is registered."
+        ),
     )
 
 

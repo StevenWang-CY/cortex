@@ -125,6 +125,8 @@ def test_message_type_catalog_covers_outbound() -> None:
         "COST_RESPONSE",
         # P0 §3.19 — provider probe reply
         "TEST_PROVIDER_RESULT",
+        # P2-22 — daemon-not-ready unicast error frame
+        "ERROR",
     }
     catalog = {m.value for m in MessageType}
     missing = outbound - catalog

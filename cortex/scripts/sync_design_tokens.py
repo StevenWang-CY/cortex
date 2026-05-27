@@ -581,19 +581,126 @@ def emit_vscode_ts(data: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Check / apply helpers
+# ---------------------------------------------------------------------------
+
+def _check_in_sync() -> int:
+    """Regenerate all three token files in memory; diff against committed copies.
+
+    Returns 0 if every file is in sync, 1 if any drift is detected.
+    Uses the same unified-diff format as ``generate_ts_schemas --check``
+    so CI output is consistent.
+
+    ``--check`` is idempotent and writes nothing to disk.
+    """
+    import difflib
+    import tempfile
+
+    data = _load()
+    targets = [
+        (_PY_OUT, emit_python(data)),
+        (_BROWSER_OUT, emit_browser_ts(data)),
+        (_VSCODE_OUT, emit_vscode_ts(data)),
+    ]
+
+    drift_found = False
+    for path, regenerated in targets:
+        if not path.exists():
+            print(
+                f"MISSING: {path.relative_to(_ROOT)} — run "
+                "'python -m cortex.scripts.sync_design_tokens --apply' to create it.",
+                file=sys.stderr,
+            )
+            drift_found = True
+            continue
+        committed = path.read_text(encoding="utf-8")
+        if committed == regenerated:
+            continue
+        rel = path.relative_to(_ROOT)
+        diff = difflib.unified_diff(
+            committed.splitlines(keepends=True),
+            regenerated.splitlines(keepends=True),
+            fromfile=f"committed:{rel}",
+            tofile=f"regenerated:{rel}",
+            n=3,
+        )
+        diff_str = "".join(diff)
+        if diff_str:
+            sys.stdout.write(diff_str)
+            sys.stdout.flush()
+            print(
+                f"\nDesign-token drift in {rel}. Run "
+                "'python -m cortex.scripts.sync_design_tokens --apply' "
+                "and commit the result.",
+                file=sys.stderr,
+            )
+            drift_found = True
+
+    return 1 if drift_found else 0
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
+    """Entry point.
+
+    Flags
+    -----
+    (no flags)
+        Regenerate all three token surfaces from ``tokens.yaml``. Writes
+        ``tokens.py``, ``design-tokens.ts`` (browser), and
+        ``design-tokens.ts`` (vscode) in-place. This is the **apply** mode.
+
+    ``--check``
+        Regenerate in memory and diff against committed copies. Exit
+        non-zero if any file is stale. Used by the pre-commit hook and CI
+        drift gate. Writes nothing to disk.
+
+    ``--apply``
+        Explicit alias for the default (no-flag) behaviour. Useful when
+        invoking from a script that needs to be explicit about intent.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="cortex-sync-design-tokens",
+        description=(
+            "Regenerate per-surface design token files from "
+            "``cortex/libs/design/tokens.yaml``. "
+            "Python source of truth → tokens.py + design-tokens.ts."
+        ),
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "Regenerate in memory and exit non-zero if committed copies "
+            "are stale. Writes nothing to disk."
+        ),
+    )
+    mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="Regenerate and write all token files (default behaviour).",
+    )
+    args = parser.parse_args(argv)
+
+    if args.check:
+        return _check_in_sync()
+
+    # --apply or bare invocation: write all three surfaces.
     data = _load()
     py_out = emit_python(data)
     browser_out = emit_browser_ts(data)
     vscode_out = emit_vscode_ts(data)
 
-    _PY_OUT.write_text(py_out)
-    _BROWSER_OUT.write_text(browser_out)
+    _PY_OUT.write_text(py_out, encoding="utf-8")
+    _BROWSER_OUT.write_text(browser_out, encoding="utf-8")
     _VSCODE_OUT.parent.mkdir(parents=True, exist_ok=True)
-    _VSCODE_OUT.write_text(vscode_out)
+    _VSCODE_OUT.write_text(vscode_out, encoding="utf-8")
 
     print(f"Wrote {_PY_OUT.relative_to(_ROOT)}", file=sys.stderr)
     print(f"Wrote {_BROWSER_OUT.relative_to(_ROOT)}", file=sys.stderr)

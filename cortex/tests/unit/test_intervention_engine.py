@@ -458,6 +458,9 @@ class TestHideTargetMapping(unittest.TestCase):
 @pytest.mark.asyncio
 async def test_executor_apply_commands():
     executor = InterventionExecutor()
+    # P1-7 escape hatch: test rigs that don't wire a consent handler must
+    # opt in explicitly so production callers still get default-deny.
+    executor._allow_unwired_consent = True
     adapter = MockAdapter()
     executor.register_adapter("editor", adapter)
     executor.register_adapter("overlay", MockAdapter())
@@ -474,6 +477,7 @@ async def test_executor_apply_commands():
 @pytest.mark.asyncio
 async def test_executor_missing_adapter():
     executor = InterventionExecutor()
+    executor._allow_unwired_consent = True  # P1-7 test escape hatch
     # No adapters registered
     plan = _make_plan()
     commands = [AdapterCommand(adapter="browser", action="hide_tabs")]
@@ -485,6 +489,7 @@ async def test_executor_missing_adapter():
 @pytest.mark.asyncio
 async def test_executor_failing_adapter():
     executor = InterventionExecutor()
+    executor._allow_unwired_consent = True  # P1-7 test escape hatch
     executor.register_adapter("editor", MockAdapter(fail=True))
 
     plan = _make_plan()
@@ -496,6 +501,7 @@ async def test_executor_failing_adapter():
 @pytest.mark.asyncio
 async def test_executor_reverse():
     executor = InterventionExecutor()
+    executor._allow_unwired_consent = True  # P1-7 test escape hatch
     adapter = MockAdapter()
     executor.register_adapter("editor", adapter)
     executor.register_adapter("overlay", MockAdapter())
@@ -512,6 +518,7 @@ async def test_executor_reverse():
 @pytest.mark.asyncio
 async def test_executor_active_interventions():
     executor = InterventionExecutor()
+    executor._allow_unwired_consent = True  # P1-7 test escape hatch
     executor.register_adapter("editor", MockAdapter())
 
     plan = _make_plan()
@@ -525,6 +532,7 @@ async def test_executor_active_interventions():
 @pytest.mark.asyncio
 async def test_executor_reverse_clears_active():
     executor = InterventionExecutor()
+    executor._allow_unwired_consent = True  # P1-7 test escape hatch
     executor.register_adapter("editor", MockAdapter())
 
     plan = _make_plan()
@@ -692,6 +700,7 @@ async def test_full_intervention_cycle():
 
     # 4. Execute
     executor = InterventionExecutor()
+    executor._allow_unwired_consent = True  # P1-7 test escape hatch
     editor_adapter = MockAdapter()
     overlay_adapter = MockAdapter()
     executor.register_adapter("editor", editor_adapter)

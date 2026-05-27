@@ -21,9 +21,15 @@ import { getAuthToken } from "./lib/auth";
 import { detectBrowser } from "./lib/browser";
 import {
     isCortexState,
+    isSuggestedAction,
     normaliseInterventionPayload,
     truncatePayloadForLog,
 } from "./lib/state-guards";
+import {
+    DAEMON_WS_URL,
+    DAEMON_HTTP_URL,
+    LAUNCHER_HTTP_URL,
+} from "./config";
 
 // --- Types (generated from Pydantic — Debt-1 closure) ---
 //
@@ -141,9 +147,7 @@ let reconnectDelay = INITIAL_RECONNECT_DELAY;
 const MAX_RECONNECT_DELAY = 30000;
 let intentionalDisconnect = false;
 let sequence = 0;
-const DAEMON_WS_URL = "ws://127.0.0.1:9473";
-const DAEMON_HTTP_URL = "http://127.0.0.1:9472";
-const LAUNCHER_HTTP_URL = "http://127.0.0.1:9471";
+// DAEMON_WS_URL, DAEMON_HTTP_URL, LAUNCHER_HTTP_URL — imported from "./config"
 
 let currentState: CortexState | null = null;
 
@@ -863,7 +867,9 @@ function handleDisconnect(): void {
     // G2 (audit-prod): probe the four-state diagnostic on disconnect so
     // the popup can render an actionable error (not_installed /
     // installed_no_daemon / version_mismatch / handshake_failed).
-    void probeConnectivity("disconnected").catch(() => undefined);
+    void probeConnectivity("disconnected").catch((err: unknown) => {
+        if (DEBUG) console.debug("[cortex.bg] probeConnectivity(disconnected) failed: %o", err);
+    });
     if (!intentionalDisconnect) {
         scheduleReconnect();
     }
@@ -1393,11 +1399,14 @@ async function handleMessage(raw: string): Promise<void> {
             // initiated. The extension runs the action via the existing
             // ``executeAction`` helper and reports back the standard
             // ACTION_EXECUTE log so the daemon can record success.
-            const dispatchPayload = msg.payload as Record<string, unknown>;
+            const dispatchPayload = msg.payload;
             const interventionId = String(dispatchPayload.intervention_id || "");
-            const action = dispatchPayload.action as SuggestedAction | undefined;
+            // P1-13: use isSuggestedAction runtime guard instead of a bare cast
+            // so a malformed daemon frame cannot reach executeAction unchecked.
+            const rawAction = dispatchPayload.action;
+            const action = isSuggestedAction(rawAction) ? rawAction : undefined;
             if (action && action.action_id && action.action_type) {
-                executeAction(action)
+                executeAction(action as SuggestedAction)
                     .then((result) => {
                         send({
                             type: "ACTION_EXECUTE",
@@ -1556,7 +1565,7 @@ async function handleMessage(raw: string): Promise<void> {
             //      explicitly clicked "Dismiss" on this recap; the
             //      daemon may re-broadcast (e.g. on extension reconnect)
             //      but we honour the dismissal.
-            const recapPayload = msg.payload as Record<string, unknown>;
+            const recapPayload = msg.payload;
             const sessionIdRaw = recapPayload?.session_id;
             const hasValidSessionId =
                 typeof sessionIdRaw === "string" && sessionIdRaw.length > 0;
@@ -1633,7 +1642,7 @@ async function handleMessage(raw: string): Promise<void> {
             // the WS has since dropped, then broadcast TRENDS_READY so
             // any currently-open popup re-renders immediately. Mirrors
             // the SESSION_RECAP wiring above.
-            const trendsPayload = msg.payload as Record<string, unknown>;
+            const trendsPayload = msg.payload;
             const timestamp = Date.now();
             try {
                 chrome.storage.local.set({
@@ -2200,6 +2209,11 @@ async function handleIntervention(
     // a descriptor; failures push to ``errors``.
     const appliedActions: string[] = [];
     const errors: string[] = [];
+    // P1-9: track whether we have hidden tabs so the recovery path can
+    // unconditionally restore them if an unhandled exception escapes
+    // after the hide step. This prevents the user from being stranded
+    // with a half-applied workspace.
+    let tabsWereHidden = false;
 
     // Snapshot tabs so action executor can resolve tab_index → chrome tab ID
     await snapshotTabsForIntervention();
@@ -2270,6 +2284,7 @@ async function handleIntervention(
             }
             try {
                 await hideTabsForIntervention(interventionId, protectedIds);
+                tabsWereHidden = true;
                 appliedActions.push("hide_tabs_except_active");
             } catch (e) {
                 errors.push(`hide_tabs: ${(e as Error)?.message ?? String(e)}`);
@@ -2277,24 +2292,39 @@ async function handleIntervention(
         }
     }
 
-    broadcastToPopup({
-        type: "INTERVENTION_TRIGGER",
-        payload,
-    });
+    try {
+        broadcastToPopup({
+            type: "INTERVENTION_TRIGGER",
+            payload,
+        });
 
-    // B.2: ack the apply so the daemon can replace the optimistic
-    // _OptimisticInterventionAdapter mutation tracking with real
-    // browser-side outcomes. Without this, InterventionOutcome.workspace_restored
-    // is theatrical for tab/overlay mutations (which are the majority).
-    const interventionId = payload.intervention_id;
-    if (typeof interventionId === "string") {
-        sendInterventionApplied(
-            interventionId,
-            "apply",
-            errors.length === 0,
-            appliedActions,
-            errors,
-        );
+        // B.2: ack the apply so the daemon can replace the optimistic
+        // _OptimisticInterventionAdapter mutation tracking with real
+        // browser-side outcomes. Without this, InterventionOutcome.workspace_restored
+        // is theatrical for tab/overlay mutations (which are the majority).
+        const interventionId = payload.intervention_id;
+        if (typeof interventionId === "string") {
+            sendInterventionApplied(
+                interventionId,
+                "apply",
+                errors.length === 0,
+                appliedActions,
+                errors,
+            );
+        }
+    } catch (applyErr) {
+        // P1-9: if an unexpected error escapes after we already hid tabs,
+        // restore all tabs immediately so the user is not stranded with a
+        // half-applied workspace. Log the original error so it's visible.
+        if (DEBUG) {
+            console.error("[cortex.bg] P1-9: intervention apply threw after hideTabsForIntervention — restoring all tabs", applyErr);
+        }
+        if (tabsWereHidden) {
+            await restoreAllTabs().catch((restoreErr: unknown) => {
+                if (DEBUG) console.debug("[cortex.bg] P1-9: restoreAllTabs recovery also failed: %o", restoreErr);
+            });
+        }
+        throw applyErr;
     }
 }
 
@@ -2383,7 +2413,9 @@ async function handleRestore(payload: Record<string, unknown>): Promise<void> {
                 .map((tab) =>
                     chrome.tabs.sendMessage(tab.id as number, {
                         type: "REMOVE_OVERLAY",
-                    }).catch(() => undefined),
+                    }).catch((err: unknown) => {
+                        if (DEBUG) console.debug("[cortex.bg] REMOVE_OVERLAY sendMessage failed (tab may not have content script): %o", err);
+                    }),
                 ),
         );
         appliedActions.push("remove_overlay");
@@ -4121,7 +4153,9 @@ chrome.runtime.onMessage.addListener(
 
             case "REQUEST_CONNECTIVITY_DIAGNOSTIC":
                 // G2 (audit-prod): popup opened; refresh the diagnostic.
-                void probeConnectivity("popup_open").catch(() => undefined);
+                void probeConnectivity("popup_open").catch((err: unknown) => {
+                    if (DEBUG) console.debug("[cortex.bg] probeConnectivity(popup_open) failed: %o", err);
+                });
                 sendResponse({ ok: true });
                 break;
 
@@ -4345,7 +4379,9 @@ chrome.runtime.onMessage.addListener(
                                 schedulePersist();
                             } catch {}
                         }
-                    }).catch(() => {});
+                    }).catch((err: unknown) => {
+                        if (DEBUG) console.debug("[cortex.bg] tabs.query(active) for URL dismiss cooldown failed: %o", err);
+                    });
                     // Prune old entries
                     for (const [k, t] of dismissedInterventions) {
                         if (now - t > interventionDismissCooldown) dismissedInterventions.delete(k);
@@ -4358,9 +4394,13 @@ chrome.runtime.onMessage.addListener(
                     activeIntervention = null;
                     try { chrome.storage.session.remove(["cortex_active_intervention", "cortex_active_intervention_cid", "cortex_active_intervention_mounted_at", "cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]); } catch {}
                     if (interventionId) {
-                        restoreTabsForIntervention(interventionId);
+                        void restoreTabsForIntervention(interventionId).catch((err: unknown) => {
+                            if (DEBUG) console.debug("[cortex.bg] restoreTabsForIntervention failed on dismiss: %o", err);
+                        });
                     } else {
-                        restoreAllTabs();
+                        void restoreAllTabs().catch((err: unknown) => {
+                            if (DEBUG) console.debug("[cortex.bg] restoreAllTabs failed on dismiss: %o", err);
+                        });
                     }
                 }
                 sendResponse({ ok: true });
@@ -4368,7 +4408,12 @@ chrome.runtime.onMessage.addListener(
             }
 
             case "RESTORE_TABS":
-                restoreAllTabs().then(() => sendResponse({ ok: true }));
+                restoreAllTabs()
+                    .then(() => sendResponse({ ok: true }))
+                    .catch((err: unknown) => {
+                        if (DEBUG) console.debug("[cortex.bg] restoreAllTabs failed on RESTORE_TABS message: %o", err);
+                        sendResponse({ ok: false, error: String(err) });
+                    });
                 return true; // Async response
 
             case "CONTENT_EXTRACTED":
@@ -4853,7 +4898,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, _tab) => {
                         snap?.distractionsBlocked ?? 0,
                         url,
                     ],
-                }).catch(() => {});
+                }).catch((err: unknown) => {
+                    if (DEBUG) console.debug("[cortex.bg] scripting.executeScript distraction interceptor failed: %o", err);
+                });
             });
         }
     }
@@ -4907,7 +4954,9 @@ try {
             chrome.tabs.sendMessage(details.tabId, {
                 type: "SHOW_RESUME_CARD",
                 activity,
-            }).catch(() => {});
+            }).catch((err: unknown) => {
+                if (DEBUG) console.debug("[cortex.bg] SHOW_RESUME_CARD sendMessage failed (SPA nav, content script may not be ready): %o", err);
+            });
         }
     });
 } catch {
@@ -5119,7 +5168,9 @@ chrome.runtime.onInstalled.addListener((details) => {
     connect();
     // G2 (audit-prod): probe connectivity on install so the popup
     // immediately renders the right four-state UI before any WS attempt.
-    void probeConnectivity("install").catch(() => undefined);
+    void probeConnectivity("install").catch((err: unknown) => {
+        if (DEBUG) console.debug("[cortex.bg] probeConnectivity(install) failed: %o", err);
+    });
     // Open onboarding tab only on first-ever install (not updates/reloads)
     if (details.reason === "install") {
         chrome.storage.local.get("cortex_onboarded", (data) => {
@@ -5141,14 +5192,18 @@ chrome.runtime.onStartup.addListener(() => {
     });
     connect();
     // G2 (audit-prod): same probe on every browser-startup activation.
-    void probeConnectivity("startup").catch(() => undefined);
+    void probeConnectivity("startup").catch((err: unknown) => {
+        if (DEBUG) console.debug("[cortex.bg] probeConnectivity(startup) failed: %o", err);
+    });
 });
 
 // Start immediately (service worker activation)
 connect();
 // G2 (audit-prod): cold-start probe so a popup opened immediately after
 // service-worker activation has a non-null connectivity diagnostic.
-void probeConnectivity("activation").catch(() => undefined);
+void probeConnectivity("activation").catch((err: unknown) => {
+    if (DEBUG) console.debug("[cortex.bg] probeConnectivity(activation) failed: %o", err);
+});
 
 // P0 §3.12: notification button click handlers. The OS-notification
 // path (``surfaceInterventionOSNotification``) emits notifications with

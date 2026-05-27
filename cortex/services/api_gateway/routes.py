@@ -29,7 +29,8 @@ import logging
 import time
 from typing import Any, Literal
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Path, Request
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from cortex.libs.config.ports import HTTP_API_PORT, WEBSOCKET_PORT
@@ -50,6 +51,7 @@ from cortex.libs.schemas.intervention import (
     InterventionPlan,
     WorkspaceSnapshot,
 )
+from cortex.libs.schemas.realtime import CostResponse
 from cortex.libs.schemas.session_history import (
     SessionDetailResponse,
     SessionListResponse,
@@ -445,9 +447,39 @@ def _resolve_daemon_version() -> str | None:
     return version
 
 
+class _NullRegistry:
+    """Fallback registry returned when ``app.state.registry`` is absent.
+
+    All ``get`` calls return ``None`` and every read-only property
+    returns a safe empty/falsy value so route handlers degrade gracefully
+    (return empty/disabled response) rather than raising ``AttributeError``.
+    P1-2: replaces the bare attribute access that crashed routes when
+    ``app.state.registry`` was not set (e.g. lightweight test rigs).
+    """
+
+    def get(self, *_: Any) -> None:
+        return None
+
+    @property
+    def registered_services(self) -> list[str]:
+        return []
+
+    @property
+    def healthy(self) -> bool:
+        return False
+
+
+_EMPTY_REGISTRY = _NullRegistry()
+
+
 def _get_registry(request: Request) -> Any:
-    """Get the service registry from app state."""
-    return request.app.state.registry
+    """Get the service registry from app state.
+
+    P1-2: falls back to ``_EMPTY_REGISTRY`` (a null-object that returns
+    ``None`` for every ``get`` call) when ``app.state.registry`` is not
+    set, so endpoints degrade gracefully instead of raising ``AttributeError``.
+    """
+    return getattr(request.app.state, "registry", None) or _EMPTY_REGISTRY
 
 
 def _get_first_service(registry: Any, *names: str) -> Any | None:
@@ -529,6 +561,32 @@ async def health_check(request: Request) -> HealthResponse:
         frames_dropped_total=frames_dropped_total,
         store_degraded=store_degraded,
         feedback_log_read_failures=int(_feedback_log_read_failures),
+    )
+
+
+@health_router.get("/metrics")
+async def prometheus_metrics() -> Response:
+    """P1-19: Prometheus metrics endpoint.
+
+    Serves the full prometheus_client default registry in the standard
+    text exposition format (text/plain; version=0.0.4).  Mounted on the
+    public ``health_router`` (no auth) so a Prometheus scraper can reach
+    it without a capability token.
+
+    Guaranteed metrics:
+      cortex_ws_coalesce_drops_total
+      cortex_keyring_timeouts_total
+      cortex_state_transitions_total{from_state, to_state}
+      cortex_interventions_applied_total{action_type, consent_level}
+      cortex_daemon_uptime_seconds
+    """
+    import prometheus_client
+    from cortex.libs.observability import metrics as _m  # noqa: F401 — side-effect import registers metrics
+
+    data = prometheus_client.generate_latest(prometheus_client.REGISTRY)
+    return Response(
+        content=data,
+        media_type=prometheus_client.CONTENT_TYPE_LATEST,
     )
 
 
@@ -1120,72 +1178,8 @@ async def reset_consent(
 # plan-finalise event, but there was no HTTP surface for callers that
 # don't hold a websocket (the desktop shell's diagnostics tab, support
 # tooling, integration tests). This route exposes the same numbers as
-# a snapshot. We deliberately do NOT subclass the wire CostResponse in
-# ``cortex/libs/schemas/realtime.py`` — that one's field names mirror
-# the §3.15 wire spec (``cost_today`` / ``budget_today``); this HTTP
-# shape mirrors the Phase 4.4 spec (``total_usd`` / ``session_usd``).
-
-
-class CostResponse(BaseModel):
-    """Phase 4.4 T2: BYOK cost telemetry snapshot.
-
-    Field semantics:
-
-    - ``total_usd``: cumulative USD spent today (matches the LLM cost
-      tracker's ``today_total_usd``). The tracker resets at local
-      midnight; restarts within the same day preserve the running
-      total via the on-disk ledger.
-    - ``session_usd``: USD spent since the daemon process started.
-      Equal to ``total_usd`` after a fresh restart; smaller than
-      ``total_usd`` after midnight rollover within the same daemon
-      lifetime.
-    - ``prompt_tokens`` / ``completion_tokens``: best-effort counters
-      surfaced by the active LLM client when available, else ``0``.
-    - ``provider``: active provider key (e.g. ``"anthropic_direct"``,
-      ``"bedrock"``); ``"none"`` when BYOK is not configured.
-    - ``model``: active model id (e.g. ``"claude-sonnet-4-5"``); empty
-      string when no client is registered.
-    - ``timestamp``: wall-clock seconds since epoch (UTC).
-    """
-
-    total_usd: float = Field(
-        default=0.0, ge=0.0,
-        description="Cumulative USD spent today by the LLM cost tracker.",
-    )
-    session_usd: float = Field(
-        default=0.0, ge=0.0,
-        description=(
-            "USD spent since the daemon process started. ``total_usd`` "
-            "minus the on-disk ledger value at daemon boot."
-        ),
-    )
-    prompt_tokens: int = Field(
-        default=0, ge=0,
-        description="Best-effort prompt-token counter (0 if unavailable).",
-    )
-    completion_tokens: int = Field(
-        default=0, ge=0,
-        description="Best-effort completion-token counter (0 if unavailable).",
-    )
-    provider: str = Field(
-        default="none",
-        description=(
-            "Active LLM provider key (``anthropic_direct``, "
-            "``bedrock``, ``vertex``, ``rule_based``); ``\"none\"`` "
-            "when no cost tracker is registered."
-        ),
-    )
-    model: str = Field(
-        default="",
-        description=(
-            "Active model id (e.g. ``claude-sonnet-4-5``); empty "
-            "string when no LLM client is registered."
-        ),
-    )
-    timestamp: float = Field(
-        default_factory=time.time,
-        description="Wall-clock seconds since epoch (UTC).",
-    )
+# a snapshot, using the canonical CostResponse imported from
+# ``cortex.libs.schemas.realtime`` so HTTP and WS share one envelope.
 
 
 def _resolve_cost_tracker(registry: Any) -> Any | None:
@@ -1245,40 +1239,54 @@ def _resolve_active_provider(registry: Any) -> str | None:
 async def get_cost(request: Request) -> CostResponse:
     """Phase 4.4 T2: snapshot today's BYOK LLM spend.
 
-    Returns a zero-valued ``CostResponse`` with ``provider="none"`` when
-    no tracker is registered (BYOK not configured, or no calls yet) —
-    deliberately NOT a 404, so the desktop shell can poll the route
+    Returns a zero-valued ``CostResponse`` with ``provider=None`` (JSON
+    null) when no tracker is registered (BYOK not configured, or no calls
+    yet) — deliberately NOT a 404, so the desktop shell can poll the route
     unconditionally without branching on HTTP status.
+
+    Uses the canonical ``CostResponse`` from ``cortex.libs.schemas.realtime``
+    (same envelope as the WS COST_RESPONSE). Field mapping from tracker:
+    - ``today_total_usd()`` → ``cost_today``
+    - ``budget_today`` is always 0.0 (the HTTP snapshot has no per-day
+      budget visible from the tracker alone; the WS path may carry more).
     """
     reg = _get_registry(request)
     tracker = _resolve_cost_tracker(reg)
     provider = _resolve_active_provider(reg)
-    model = _resolve_active_model(reg)
+    model = _resolve_active_model(reg) or None
 
     if tracker is None:
         return CostResponse(
-            provider=(provider or "none"),
+            cost_today=0.0,
+            budget_today=0.0,
+            provider=provider,  # None when no daemon/config wired
             model=model,
         )
 
-    total_usd = 0.0
+    cost_today = 0.0
     try:
-        total_usd = float(tracker.today_total_usd())
+        cost_today = float(tracker.today_total_usd())
     except Exception:
         logger.debug("/api/cost: today_total_usd failed", exc_info=True)
 
-    # ``session_usd`` is best-effort: trackers may not expose a session
-    # baseline; if they do (via ``session_start_total_usd`` set at
-    # daemon boot) we subtract it. Otherwise fall back to ``total_usd``
-    # so the field is at least populated rather than misleadingly 0.
-    session_start = getattr(tracker, "session_start_total_usd", None)
-    if isinstance(session_start, (int, float)):
-        session_usd = max(0.0, total_usd - float(session_start))
-    else:
-        session_usd = total_usd
+    # budget_today: read from tracker if exposed, else 0.0 (unlimited).
+    budget_today = 0.0
+    for attr in ("daily_budget_usd", "kill_usd", "budget_usd"):
+        val = getattr(tracker, attr, None)
+        if isinstance(val, (int, float)):
+            budget_today = float(val)
+            break
 
-    prompt_tokens = 0
-    completion_tokens = 0
+    # budget_exhausted: check tracker flag or derive from budget.
+    budget_exhausted = False
+    flag = getattr(tracker, "budget_exhausted", None)
+    if isinstance(flag, bool):
+        budget_exhausted = flag
+    elif budget_today > 0.0:
+        budget_exhausted = cost_today >= budget_today
+
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
     for attr in ("prompt_tokens_today", "total_prompt_tokens"):
         val = getattr(tracker, attr, None)
         if isinstance(val, int):
@@ -1307,11 +1315,12 @@ async def get_cost(request: Request) -> CostResponse:
                 pass
 
     return CostResponse(
-        total_usd=total_usd,
-        session_usd=session_usd,
+        cost_today=cost_today,
+        budget_today=budget_today,
+        budget_exhausted=budget_exhausted,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
-        provider=(provider or "anthropic_direct"),
+        provider=provider,  # None when no daemon config — never "none"
         model=model,
     )
 
@@ -1340,7 +1349,20 @@ class LaunchProjectResponse(BaseModel):
 
 
 @router.post("/api/launch/{project_name}", response_model=LaunchProjectResponse)
-async def launch_project(project_name: str, request: Request) -> LaunchProjectResponse:
+async def launch_project(
+    request: Request,
+    project_name: str = Path(
+        ...,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9._-]+$",
+        description=(
+            "P2-1: alphanumeric + dot/underscore/hyphen only; "
+            "1–64 chars.  Path-traversal sequences are rejected by "
+            "FastAPI before the handler runs."
+        ),
+    ),
+) -> LaunchProjectResponse:
     """Launch a project workspace configuration.
 
     Audit-prod fix (P1-C + P1-E): wrap the launch in a 20 s timeout so

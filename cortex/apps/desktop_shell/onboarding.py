@@ -594,6 +594,16 @@ class OnboardingWindow(QWidget):
         # F49: durable per-step completion record. Loaded from disk so
         # a re-entry into the wizard does not lose prior progress.
         self._onboarding_state = OnboardingState.load()
+        # P1-20: mint a single correlation id for the lifetime of this
+        # wizard entry. Every USER_ACTION emitted during onboarding
+        # carries this cid so all steps can be correlated in the log
+        # stream even if the user completes them over multiple sessions
+        # (re-entry re-mints so each wizard session has its own cid).
+        try:
+            from cortex.libs.logging.correlation import new_correlation_id
+            self._onboarding_cid: str = new_correlation_id()
+        except Exception:
+            self._onboarding_cid = ""
         self._build_ui()
 
         # Permissions are granted in System Settings out-of-process — there's
@@ -810,6 +820,10 @@ class OnboardingWindow(QWidget):
             f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
         )
         connect_btn.clicked.connect(self.extensions_requested.emit)
+        # P1-20: log USER_ACTION so the extension-connect step is traceable.
+        connect_btn.clicked.connect(
+            lambda: self._log_onboarding_action("extension_connect")
+        )
         set_accessible_name(connect_btn, "Open Connections panel")
         set_accessible_description(
             connect_btn,
@@ -974,6 +988,9 @@ class OnboardingWindow(QWidget):
                 "Failed to mark onboarding step %s complete", step,
                 exc_info=True,
             )
+        # P1-20: emit a USER_ACTION event with the wizard correlation id
+        # so every per-step completion is traceable in the log stream.
+        self._log_onboarding_action(f"{step}_complete", step=step)
 
     def mark_step_incomplete(self, step: str) -> None:
         """Inverse of :meth:`mark_step_complete` — used when the user
@@ -985,6 +1002,30 @@ class OnboardingWindow(QWidget):
                 "Failed to mark onboarding step %s incomplete", step,
                 exc_info=True,
             )
+
+    def _log_onboarding_action(self, action: str, **extra: object) -> None:
+        """P1-20: emit a structured USER_ACTION log line for an onboarding
+        event. Every call includes the wizard-session correlation id
+        (``_onboarding_cid``) so all steps for one user session can be
+        joined in the log stream.
+
+        Parameters
+        ----------
+        action:
+            Short camel_case descriptor, e.g. ``"camera_grant"``.
+        **extra:
+            Additional key/value pairs forwarded to the structlog record.
+        """
+        cid = getattr(self, "_onboarding_cid", "")
+        try:
+            logger.info(
+                "USER_ACTION action=%s cid=%s surface=onboarding %s",
+                action,
+                cid,
+                " ".join(f"{k}={v}" for k, v in extra.items()),
+            )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Section helpers
@@ -1574,6 +1615,9 @@ class OnboardingWindow(QWidget):
                 self.byok_token_saved.emit()
             except Exception:
                 logger.debug("byok_token_saved emit failed", exc_info=True)
+            # P1-20: emit USER_ACTION so the BYOK-save step is traceable.
+            self._log_onboarding_action("byok_save", provider="bedrock")
+            self.mark_step_complete("llm_backend")
             QMessageBox.information(
                 self,
                 "Saved",

@@ -48,6 +48,11 @@ cortex/apps/browser_extension/build/
 # ``package-lock.json`` we explicitly don't want to commit.
 cortex/apps/browser_extension/package-lock.json
 
+# P1-15: VS Code extension package-lock.json — mirrors the browser_extension
+# exclusion above. The vscode_extension uses npm/vsce; package-lock.json is
+# generated on the developer's machine and must not be committed.
+cortex/apps/vscode_extension/package-lock.json
+
 # VS Code extension build artifacts
 *.vsix
 

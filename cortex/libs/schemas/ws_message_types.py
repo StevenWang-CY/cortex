@@ -397,6 +397,16 @@ class MessageType(str, Enum):  # noqa: UP042 — pydantic-to-typescript requires
     tab.
     """
 
+    ERROR = "ERROR"
+    """P2-22: unicast error frame from the daemon to the requesting client.
+
+    Sent when a handler cannot serve a request, e.g. because the daemon
+    has not finished starting up yet (``code="daemon_not_ready"``).
+    Payload: ``{code: str, correlation_id: str | None}`` — ``code`` is a
+    machine-readable error code; ``correlation_id`` echoes the cid from
+    the triggering message so the client can match the reply to its
+    pending request."""
+
     # ─── LeetCode adapter cues (Daemon → Chrome, target_client_types=["chrome"]) ─
     # Emitted by ``LeetCodeAdapter.execute`` via
     # ``runtime_daemon._send_leetcode_ws_message`` → ``WebSocketServer.send_message``

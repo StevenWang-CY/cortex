@@ -70,15 +70,14 @@ WINDOW_SECONDS: float = 60.0
 def _normalise_route(path: str, *, limits: dict[str, int]) -> str | None:
     """Return the limit-table key for *path*, or ``None`` for pass-through.
 
-    The match is prefix-based on the configured keys, so trailing slashes
-    or query strings don't accidentally bypass the cap. Returns the
-    matched key (so the bucket and the log line agree on the route name).
+    P1-3: exact match only. The previous prefix-with-trailing-slash clause
+    (``path.startswith(route + "/")``) allowed paths like ``/shutdownX``
+    or ``/shutdown/extra`` to match the ``/shutdown`` bucket, enabling a
+    confused-path bypass. Removing the prefix clause means only the
+    exact path string hits the bucket.
     """
     for route in limits:
-        # exact match or prefix-with-trailing-/ — keeps the table free of
-        # regex; FastAPI's path parameters are not used by the gated
-        # routes today, so this string match is sufficient.
-        if path == route or path.startswith(route + "/"):
+        if path == route:
             return route
     return None
 

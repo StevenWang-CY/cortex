@@ -7,6 +7,7 @@ maps hide_targets to concrete adapter commands.
 
 from __future__ import annotations
 
+import logging
 from typing import Literal
 
 from cortex.libs.schemas.intervention import (
@@ -30,6 +31,7 @@ __all__ = [
     "prepare_plan",
 ]
 
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # hide_targets → adapter command mapping
@@ -139,6 +141,30 @@ def sanitize_plan_actions(
     """
     warnings: list[str] = []
     sanitized = []
+
+    # P1-6: when tab_count is unknown (None), any action that references a
+    # specific tab by index is unsafe — we cannot validate the index and the
+    # executor would send a command to an arbitrary tab. Drop all such
+    # actions and emit a structured warning so the caller can surface it.
+    # The remaining (non-tab-indexed) actions still flow through the
+    # full safety-filter loop below.
+    if tab_count is None:
+        filtered: list[SuggestedAction] = []
+        for action in plan.suggested_actions:
+            if action.tab_index is not None:
+                msg = (
+                    f"dropped action {action.action_id}: tab_index={action.tab_index} "
+                    "cannot be validated because tab_count is unknown"
+                )
+                warnings.append(msg)
+                logger.warning(
+                    "sanitize_plan_actions: %s", msg,
+                    extra={"action_id": action.action_id, "tab_index": action.tab_index},
+                )
+            else:
+                filtered.append(action)
+        plan.suggested_actions = filtered
+
     for action in plan.suggested_actions:
         if action.tab_index is not None and tab_count is not None:
             if action.tab_index < 0 or action.tab_index >= tab_count:

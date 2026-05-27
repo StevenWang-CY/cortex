@@ -57,6 +57,30 @@ jobs:
       - name: Verify cortex_schemas.d.ts is in sync
         run: python -m cortex.scripts.generate_ts_schemas --check
 
+  design-tokens-check:
+    name: design-tokens-check (drift gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install package (for PyYAML + cortex.scripts)
+        run: pip install -e "./cortex[dev]"
+
+      # P1-18: Regenerate all three token surfaces in memory and diff against
+      # the committed copies. Exit 1 with a unified diff if any file is stale.
+      # Developers fix by running:
+      #   python -m cortex.scripts.sync_design_tokens --apply
+      # and committing the result.
+      - name: Verify design tokens are in sync
+        run: python -m cortex.scripts.sync_design_tokens --check
+
   python:
     name: python (pytest + ruff + mypy)
     # Cortex is macOS-only — many of the PySide6 / pyobjc / AVFoundation

@@ -541,6 +541,8 @@ class CortexDaemon:
         self._rgb_history: deque[np.ndarray] = deque(
             maxlen=max(1, self.config.signal.rppg.window_seconds * self.config.capture.fps)
         )
+        # P0-2: count of low-quality frames rejected from the rPPG window.
+        self._frames_low_quality_rejected: int = 0
         self._latest_physio = PhysioFeatures(
             pulse_bpm=None,
             pulse_quality=0.0,
@@ -1818,7 +1820,12 @@ class CortexDaemon:
         roi_frame = self._roi_extractor.extract(output.frame, output.landmarks_px, output.frame_meta.timestamp)
         combined_rgb = roi_frame.combined_rgb()
         if combined_rgb is not None:
-            self._rgb_history.append(combined_rgb)
+            # P0-2: skip low-quality frames so motion blur / occlusion
+            # artefacts don't corrupt the rPPG window.
+            if output.frame_meta.low_quality:
+                self._frames_low_quality_rejected += 1
+            else:
+                self._rgb_history.append(combined_rgb)
 
         stride_seconds = self.config.signal.rppg.stride_seconds
         if len(self._rgb_history) >= self._rgb_history.maxlen and (
