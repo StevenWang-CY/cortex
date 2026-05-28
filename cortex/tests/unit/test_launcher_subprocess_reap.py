@@ -12,8 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import signal
-import sys
-import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -21,7 +19,6 @@ import pytest
 
 from cortex.services.launcher.launcher import ProjectLauncher
 from cortex.services.launcher.project_config import ProjectConfig
-
 
 # ---------------------------------------------------------------------------
 # Helper: minimal launcher that can spawn sleep

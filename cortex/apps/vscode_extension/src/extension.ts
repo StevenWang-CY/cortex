@@ -298,7 +298,7 @@ export function activate(context: vscode.ExtensionContext): void {
                 ? (items as string[]).map((item: string, i: number) => `${i + 1}. ${item}`).join('\n')
                 : leftOff as string;
             vscode.window.showInformationMessage(
-                `☀️ ${summary}`,
+                `Morning briefing: ${summary}`,
                 { modal: false, detail },
                 'Show Details',
             ).then(choice => {

@@ -14,7 +14,6 @@ from cortex.libs.schemas.intervention import (
     AdapterCommand,
     InterventionPlan,
     MicroStep,
-    SuggestedAction,
     UIPlan,
 )
 from cortex.services.intervention_engine.executor import InterventionExecutor

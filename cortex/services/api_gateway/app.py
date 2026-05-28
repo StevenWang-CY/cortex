@@ -22,8 +22,9 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.routing import APIRoute
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from cortex.libs.config.settings import APIConfig, CortexConfig
@@ -181,9 +182,44 @@ def create_app(
     # (audit Debt-2). A new route added to ``router`` automatically gets
     # the gate; a new route added to ``health_router`` is by-convention
     # liveness-only and visible in code review.
-    from cortex.services.api_gateway.routes import health_router, router
+    from cortex.services.api_gateway.routes import (
+        health_router,
+        prometheus_metrics,
+        router,
+    )
 
-    app.include_router(health_router)
+    # SECURITY (audit Debt-2): ``/metrics`` exposes the full Prometheus
+    # registry which includes labelled state-transition counters and
+    # daemon uptime — useful for monitoring but also useful for a
+    # localhost web page fingerprinting the daemon when it has no auth
+    # gate. ``/health`` MUST stay un-authenticated (it's the launcher's
+    # liveness probe and runs before the UI has a capability token),
+    # so we mount the unauthenticated routes through a fresh router
+    # that excludes ``/metrics``, and mount ``/metrics`` on a dedicated
+    # router behind the same capability-token gate the rest of
+    # ``router`` uses.
+    #
+    # NOTE: we deliberately do NOT mutate ``health_router.routes`` —
+    # that would corrupt the global singleton for tests that import it
+    # directly. Instead we copy the non-/metrics routes into a fresh
+    # ``unauthenticated_router`` and leave the source ``health_router``
+    # untouched.
+    unauthenticated_router = APIRouter()
+    for r in health_router.routes:
+        if isinstance(r, APIRoute) and r.path != "/metrics":
+            unauthenticated_router.routes.append(r)
+    metrics_router = APIRouter()
+    metrics_router.add_api_route(
+        "/metrics",
+        prometheus_metrics,
+        methods=["GET"],
+    )
+
+    app.include_router(unauthenticated_router)
+    app.include_router(
+        metrics_router,
+        dependencies=[Depends(require_capability_token)],
+    )
     app.include_router(router, dependencies=[Depends(require_capability_token)])
 
     logger.info(f"API Gateway configured on {cfg.host}:{cfg.port}")

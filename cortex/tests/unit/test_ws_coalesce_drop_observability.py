@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -56,7 +55,7 @@ async def test_coalesce_drop_logs_warning(caplog) -> None:
     assert queue.full()
 
     # Patch queue.get_nowait to raise QueueEmpty (simulate consumer raced us).
-    original_get_nowait = queue.get_nowait
+    original_get_nowait = queue.get_nowait  # noqa: F841 — kept for symmetry with restore pattern used elsewhere in this suite
 
     def _raise_empty():
         raise asyncio.QueueEmpty

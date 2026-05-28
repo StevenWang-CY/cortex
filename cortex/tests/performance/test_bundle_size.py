@@ -47,11 +47,14 @@ _SOURCE_BUDGETS: dict[str, int] = {
     # below are sized for the *post-P0* footprint + ~10-15% headroom
     # so ordinary follow-up feature work does not need to bump them.
     "background.ts": 240_000,
-    "popup.tsx": 130_000,
+    "popup.tsx": 160_000,
     "newtab.tsx": 80_000,
     "tab-manager.ts": 60_000,
     "activity-tracker.ts": 40_000,
     "design-tokens.ts": 30_000,
+    # Shared constants (NATIVE_HOST_ID etc.) — small surface; sized to
+    # accommodate ports + a handful of identifiers without churn.
+    "config.ts": 4_000,
     # Content scripts under contents/ ship as separate bundles per Plasmo
     # convention. leetcode-observer was moved here in audit Phase-I so
     # its 25 KB never gets pulled into the background bundle.

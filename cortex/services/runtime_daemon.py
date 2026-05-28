@@ -43,7 +43,7 @@ from cortex.libs.schemas.state import UserBaselines
 from cortex.libs.schemas.ws_message_types import MessageType
 
 # v2.0 imports
-from cortex.libs.store import InMemoryStore, RedisStore
+from cortex.libs.store import InMemoryStore, RedisStore, make_default_store
 from cortex.libs.utils import receptivity
 from cortex.services.activity_tracker.aggregator import ActivityAggregator
 from cortex.services.api_gateway.app import create_app, registry
@@ -683,13 +683,21 @@ class CortexDaemon:
                     "Redis unavailable, falling back to in-memory store",
                     exc_info=True,
                 )
-                self._store = InMemoryStore()
+                # P0 durability fix: use make_default_store so the
+                # fallback InMemoryStore writes JSON to ~/Library/...
+                # — without this, ConsentLadder._persist + earned
+                # escalation state are lost on every daemon restart in
+                # the DMG-default no-Redis deployment.
+                self._store = make_default_store(self.config)
                 # B4: mark store as degraded so the next broadcast cycle
                 # stamps the indicator on STATE_UPDATE and the one-time
                 # announcement task fires from ``start()``.
                 self._store_degraded = True
         else:
-            self._store = InMemoryStore()
+            # DMG default: no Redis. The persisted file-backed
+            # InMemoryStore preserves consent / helpfulness across
+            # restarts.
+            self._store = make_default_store(self.config)
 
         # Stress integral tracker (biological pomodoros). The standardized
         # deficit math requires the user-specific HRV sigma so the integral
@@ -2014,9 +2022,11 @@ class CortexDaemon:
                 try:
                     vector, quality = self._feature_fusion.fuse(timestamp=timestamp)
 
-                    # v2.0: Inject thrashing score from aggregator
-                    if hasattr(self._aggregator, 'thrashing_score'):
-                        vector.thrashing_score = self._aggregator.thrashing_score
+                    # v2.0: Inject thrashing score from aggregator. The
+                    # FeatureAggregator guarantees ``thrashing_score`` as
+                    # a property returning float (0.0 when no events have
+                    # accumulated yet) so we can read it unconditionally.
+                    vector.thrashing_score = self._aggregator.thrashing_score
 
                     scores = self._scorer.compute_scores(vector)
                     # C.2: blend ML classifier into smoother HYPER score
@@ -2152,13 +2162,17 @@ class CortexDaemon:
                             "causal attributor feed failed", exc_info=True,
                         )
 
-                    # v2.0: Feed longitudinal tracker per-sample data
-                    self._longitudinal.accumulate(
-                        hr=vector.hr,
-                        hrv=vector.hrv_rmssd,
-                        resp=vector.respiration_rate,
-                        state=estimate.state,
-                    )
+                    # v2.0: Feed longitudinal tracker per-sample data.
+                    # Skip when HR is missing — accumulate() treats None
+                    # as the absence of biometric signal, and a None-only
+                    # sample contributes no rows to the daily baseline.
+                    if vector.hr is not None:
+                        self._longitudinal.accumulate(
+                            hr=vector.hr,
+                            hrv=vector.hrv_rmssd,
+                            resp=vector.respiration_rate,
+                            state=estimate.state,
+                        )
 
                     registry.register("latest_state_estimate", estimate)
                     self._recorder.append("state_estimate", estimate.model_dump(mode="json"))
@@ -4389,6 +4403,16 @@ class CortexDaemon:
         elif action == "snoozed":
             self._trigger_policy.activate_quiet_mode(duration_minutes=15)
             outcome = await self._restore_manager.snooze(intervention_id)
+        elif action == "restore":
+            # Desktop "Undo" pill (audit fix #15) — user wants the
+            # workspace mutations reversed without recording an
+            # engagement / dismissal. ``restore_intervention`` is the
+            # stable public entry point we expose to the desktop_shell
+            # controller so it can wire the Undo button to a single
+            # method name. It delegates to RestoreManager.cancel(),
+            # which performs the executor.reverse() pass and produces
+            # an InterventionOutcome with user_action="system_cancelled".
+            outcome = await self.restore_intervention(intervention_id)
         else:
             outcome = await self._restore_manager.dismiss(intervention_id)
             if action == "dismissed":
@@ -4606,7 +4630,7 @@ class CortexDaemon:
         sends ``{intervention_id, phase, success, applied_actions, errors}``
         after executing the plan or the restore — we use ``success`` to
         overwrite every mutation's ``success`` flag, and accumulate
-        ``errors`` into ``Mutation.error`` so downstream
+        ``errors`` into ``Mutation.reason`` so downstream
         ``InterventionOutcome.workspace_restored`` reflects reality.
 
         F05: also resolves any pending ``await_apply_confirmation`` future
@@ -4694,7 +4718,16 @@ class CortexDaemon:
         for mutation in mutations:
             mutation.success = success
             if not success and error_text:
-                mutation.error = error_text
+                # The Mutation dataclass field is ``reason`` (see
+                # cortex/services/intervention_engine/executor.py:69).
+                # The previous ``mutation.error = error_text`` set a
+                # never-read attribute via attribute punning while
+                # leaving ``reason`` as None, hiding failure cause from
+                # both the WS broadcast and the dashboard's Restore
+                # pill telemetry. Preserve any prior structured reason
+                # so we don't overwrite a richer message with the
+                # generic concatenation.
+                mutation.reason = mutation.reason or error_text
 
         self._recorder.append(
             "intervention_applied",
@@ -5541,6 +5574,21 @@ class CortexDaemon:
             self._session_reader.read_session, session_id,
         )
 
+    async def restore_intervention(
+        self, intervention_id: str,
+    ) -> Any | None:
+        """Public Undo entry point for the desktop "Undo" pill.
+
+        Reverses every workspace mutation belonging to
+        ``intervention_id`` via the executor, drops the active
+        intervention from the RestoreManager, and returns the
+        resulting :class:`InterventionOutcome` (or ``None`` if no
+        active intervention matches). The caller (desktop_shell
+        controller) does not need to depend on RestoreManager
+        internals — this method is the stable contract.
+        """
+        return await self._restore_manager.cancel(intervention_id)
+
     async def get_trends(
         self,
         window: str,
@@ -5549,11 +5597,13 @@ class CortexDaemon:
     ) -> TrendsResponse:
         """P0 §3.2: longitudinal trend rollup.
 
-        ``window`` is clamped to ``{"week","month","quarter"}``; an
-        unknown value logs a WARNING and falls back to ``"week"``.
-        ``quarter`` returns the last 90 days of ``DailyBaseline`` rows.
+        ``window`` is clamped to ``{"week","month"}`` to match the
+        :class:`TrendsRequest` / :class:`TrendsResponse` schema. An
+        unknown value (including the legacy ``"quarter"``) logs a
+        WARNING and falls back to ``"week"`` so the dashboard never
+        renders an empty pane on a stale URL.
         """
-        if window not in ("week", "month", "quarter"):
+        if window not in ("week", "month"):
             logger.warning(
                 "get_trends: unknown window=%r; falling back to 'week'", window
             )

@@ -2484,7 +2484,7 @@ export interface LaunchMessage {
  * extension.
  */
 export interface ParseResult {
-  message?: (LaunchMessage | StopMessage | StatusMessage | GetAuthTokenMessage) | null;
+  message?: (LaunchMessage | StopMessage | StatusMessage | GetAuthTokenMessage | RaiseDashboardMessage) | null;
   error?: string | null;
   detail?: string | null;
 }
@@ -2493,6 +2493,80 @@ export interface StopMessage {
 }
 export interface StatusMessage {
   command: "status";
+}
+/**
+ * ``{"command":"raise_dashboard", "target":"desktop"}``.
+ *
+ * Audit-prod Phase-4 closure: native_host.py was peeking the raw JSON
+ * for this command and dispatching outside the Pydantic-validated
+ * union. Promoting the command to a typed message gives the same
+ * validation guarantees the rest of the native-host vocabulary has,
+ * and lets the codegen pipeline emit a generated TypeScript type for
+ * the extension's side of the channel.
+ *
+ * ``target`` is a short string identifying the surface to raise (the
+ * desktop shell window, an editor host, etc.). The 64-char cap is
+ * generous for short identifiers and prevents a hostile / malformed
+ * extension from blowing up the host with a megabyte target.
+ */
+export interface RaiseDashboardMessage {
+  command: "raise_dashboard";
+  target: string;
+}
+/**
+ * Per-tick biometrics summary attached to STATE_UPDATE payloads.
+ *
+ * All fields are ``float | None`` because the underlying signals are
+ * independently gated — heart rate may be available while respiration
+ * isn't, etc. The producer in
+ * ``runtime_daemon._process_capture_output`` builds this dict from
+ * the live ``FusedFeatureVector`` plus the stress-integral tracker.
+ *
+ * The wire-level shape is ``payload.biometrics`` and is omitted when
+ * the producer has no values to share (the ``_make_state_update``
+ * helper only sets the key when biometrics is truthy).
+ */
+export interface BiometricsSummary {
+  /**
+   * rPPG heart-rate estimate in BPM
+   */
+  heart_rate?: number | null;
+  /**
+   * HRV RMSSD in milliseconds
+   */
+  hrv_rmssd?: number | null;
+  /**
+   * Heart-rate delta versus baseline; sign carries direction (positive = above baseline).
+   */
+  hr_delta?: number | null;
+  /**
+   * Blink rate in blinks/minute
+   */
+  blink_rate?: number | null;
+  /**
+   * PERCLOS (percent eye closure) over the recent window; not always populated.
+   */
+  perclos?: number | null;
+  /**
+   * Forward-lean score rescaled to 0..1. Browser-side posture alert threshold (0.6) is compared against this rescaled value, not raw degrees.
+   */
+  forward_lean?: number | null;
+  /**
+   * Forward-lean angle in degrees (legacy / debug). Consumers preferring a score should read ``forward_lean`` instead.
+   */
+  forward_lean_angle?: number | null;
+  /**
+   * Respiration rate in breaths/minute
+   */
+  respiration_rate?: number | null;
+  /**
+   * Kinematic thrashing score (input-device chaos indicator); 0..1 with higher meaning more thrashing.
+   */
+  thrashing_score?: number | null;
+  /**
+   * Cumulative stress-integral load tracked by ``StressIntegralTracker``. Used by the break-readiness UI.
+   */
+  stress_integral?: number | null;
 }
 /**
  * P0 §3.7: BREAK_RECOMMENDATION wire payload.
@@ -2531,6 +2605,32 @@ export interface BreakRecommendation {
    * Pacer cadence variant. Picked by the daemon based on the user's recent HRV (4-7-8 = relaxation / parasympathetic; box = balanced; coherent = 5.5 BPM resonance breathing).
    */
   breathing_pattern?: "4-7-8" | "box" | "coherent";
+}
+/**
+ * P0 §3 (audit Debt-1 closure): capture-channel status sub-payload.
+ *
+ * The dashboard's "Reading your pulse" / "Camera offline" ambient
+ * string is driven by this sub-shape. The producer in
+ * ``websocket_server._make_state_update`` stamps it on every STATE_UPDATE
+ * broadcast off the registry-cached ``latest_frame_meta``.
+ */
+export interface CaptureStatus {
+  /**
+   * True when a frame newer than 2 s ago was observed. False when the capture loop hasn't produced a frame yet (camera not open, permission denied, daemon mid-startup).
+   */
+  frames_flowing?: boolean;
+  /**
+   * True when the most recent frame's MediaPipe FaceMesh detected at least one face.
+   */
+  face_detected?: boolean;
+  /**
+   * True when the daemon planted ``capture_stale`` because the pipeline failed to start or has gone offline. Cleared automatically when ``frames_flowing`` is True (transient init failure followed by a successful resume).
+   */
+  stale?: boolean;
+  /**
+   * Latest capture-loop sequence number; surfaced for debug overlays that need to detect dropped frames. None when the producer does not stamp a sequence.
+   */
+  sequence?: number | null;
 }
 /**
  * P0 §3.15: COST_RESPONSE wire payload (unified HTTP + WS envelope).
@@ -2589,6 +2689,134 @@ export interface CostResponse {
   model?: string | null;
 }
 /**
+ * P0 §3 (audit Debt-1): INTERVENTION_TRIGGER wire payload.
+ *
+ * The producer stamps two envelope-level fields onto the dumped
+ * :class:`InterventionPlan` — ``desktop_not_focused`` and
+ * ``connected_clients`` — before broadcasting. To keep the wire shape
+ * backward-compatible with consumers that read
+ * ``payload.intervention_id`` directly (browser extension, popup,
+ * VS Code), we extend :class:`InterventionPlan` rather than wrapping
+ * it. The two stamp fields are optional with defaults so older code
+ * constructing a bare ``InterventionPlan`` is still type-valid.
+ *
+ * DESIGN NOTE: this choice preserves the flat wire shape at the cost
+ * of carrying two non-domain fields on the InterventionPlan extension.
+ * The alternative — a nested ``{plan: ..., desktop_not_focused: ...,
+ * connected_clients: ...}`` envelope — is more correct semantically
+ * but would break every consumer that reads
+ * ``payload.intervention_id``. The extension approach matches the
+ * pattern Pydantic uses for protocol evolution (additive fields with
+ * defaults).
+ */
+export interface InterventionTriggerPayload {
+  /**
+   * Unique intervention identifier
+   */
+  intervention_id?: string;
+  /**
+   * Intervention severity level
+   */
+  level: "overlay_only" | "simplified_workspace" | "guided_mode";
+  /**
+   * 1-2 sentence summary of situation
+   */
+  situation_summary: string;
+  /**
+   * Headline for overlay (< 15 words)
+   */
+  headline: string;
+  /**
+   * The one thing to focus on
+   */
+  primary_focus: string;
+  /**
+   * 1-3 concrete next steps
+   *
+   * @minItems 1
+   * @maxItems 3
+   */
+  micro_steps: [MicroStep] | [MicroStep, MicroStep] | [MicroStep, MicroStep, MicroStep];
+  /**
+   * Elements to hide/fold
+   */
+  hide_targets?: string[];
+  ui_plan: UIPlan2;
+  /**
+   * Tone of intervention text
+   */
+  tone?: "direct" | "supportive" | "minimal";
+  /**
+   * Executable actions the user can approve
+   */
+  suggested_actions?: SuggestedAction[];
+  /**
+   * Detailed error analysis with suggested fixes
+   */
+  error_analysis?: ErrorAnalysis | null;
+  /**
+   * Per-tab keep/close/group recommendations
+   */
+  tab_recommendations?: TabRecommendations | null;
+  /**
+   * Why Cortex triggered this intervention, referencing specific signals
+   */
+  causal_explanation?: string;
+  /**
+   * 2-3 dominant signals behind the trigger; first is primary
+   *
+   * @maxItems 3
+   */
+  causal_signals?: [] | [CausalSignal] | [CausalSignal, CausalSignal] | [CausalSignal, CausalSignal, CausalSignal];
+  /**
+   * Consent ladder level for this intervention
+   */
+  consent_level?: "observe" | "suggest" | "preview" | "reversible_act" | "autonomous_act";
+  /**
+   * Non-fatal validation or grounding warnings to surface in debug UI
+   */
+  plan_warnings?: string[];
+  /**
+   * Daemon-stamped plan metadata (e.g. {'source': 'fallback'}) and prompt-budget telemetry (e.g. {'context_truncated_sections': ['terminal_errors']}). Never trust this field for executor decisions — it is purely an observability hint.
+   */
+  metadata?: {
+    [k: string]: unknown;
+  };
+  /**
+   * P0 §3.12: True when the daemon observed that the desktop shell isn't focused (user on a different Space / fullscreen app). Receivers surface OS-level notification cues. None means 'focus state unknown' (default — only stamped when explicitly observed unfocused).
+   */
+  desktop_not_focused?: boolean | null;
+  /**
+   * Snapshot of currently-IDENTIFY-ed client types at broadcast time, so WS-mode overlay action buttons gate on the same authoritative list ``STATE_UPDATE`` uses. None means the producer didn't stamp this field.
+   */
+  connected_clients?: string[] | null;
+}
+/**
+ * UI manipulation instructions
+ */
+export interface UIPlan2 {
+  /**
+   * Whether to dim background windows
+   */
+  dim_background?: boolean;
+  /**
+   * Whether to show intervention overlay
+   */
+  show_overlay?: boolean;
+  /**
+   * Whether to fold unrelated code in editor
+   */
+  fold_unrelated_code?: boolean;
+  /**
+   * Type of intervention
+   */
+  intervention_type?: "overlay_only" | "simplified_workspace" | "guided_mode";
+  /**
+   * Half-window of source lines to keep visible around cursor
+   */
+  max_visible_lines?: number;
+}
+/**
  * P0 §3.11: QUIET_MODE_STATE broadcast payload.
  *
  * Emitted whenever ``RuntimeDaemon.set_quiet_mode`` runs, regardless
@@ -2604,7 +2832,7 @@ export interface QuietModeState {
    */
   kind: "snooze_15" | "quiet_session" | "pause" | "off";
   /**
-   * How long this mode runs from arming, in minutes. None when kind=='off' or when the daemon uses an implicit default.
+   * How long this mode runs from arming, in minutes. None when kind=='off' or when the daemon uses an implicit default. Semantically integral — the daemon already rounds via ``int(round(...))`` before broadcasting, so the wire shape matches.
    */
   duration_minutes?: number | null;
   /**
@@ -2758,6 +2986,167 @@ export interface StartFocusAutoPayload {
   custom_domains?: string[];
 }
 /**
+ * P0 §3 (audit Debt-1): STATE_UPDATE wire payload — typed.
+ *
+ * Previously ``websocket_server._make_state_update`` built a free-form
+ * ``dict[str, Any]`` literal; promoting it to a Pydantic model gives
+ * the codegen pipeline a generated TypeScript type the browser
+ * extension can consume and prevents silent field drift between the
+ * daemon and the dashboard.
+ *
+ * Field set mirrors ``StateEstimate`` plus the envelope-level F18
+ * additions (``degraded`` / ``source``) and the capture / store /
+ * biometrics sub-shapes the producer stamps. ``extra="ignore"`` keeps
+ * forward-compatibility: a new field added by a future daemon is
+ * silently ignored by an older client parser.
+ */
+export interface StateUpdatePayload {
+  /**
+   * Classified user state (mirrors ``StateEstimate.state``)
+   */
+  state: "FLOW" | "HYPO" | "HYPER" | "RECOVERY";
+  /**
+   * Confidence in state classification
+   */
+  confidence: number;
+  scores: StateScores2;
+  signal_quality: SignalQuality2;
+  /**
+   * Seconds in current state
+   */
+  dwell_seconds?: number;
+  /**
+   * Human-readable reasons for current state
+   */
+  reasons?: string[];
+  /**
+   * Cumulative stress-integral load (ms*s)
+   */
+  stress_integral?: number | null;
+  /**
+   * Calibrated class probabilities (optional ML/rule ensemble output)
+   */
+  calibrated_probabilities?: StateScores1 | null;
+  /**
+   * Classifier source used for this estimate
+   */
+  classifier_source?: ("rule" | "ml" | "ensemble") | null;
+  /**
+   * Ensemble weight on ML branch when used
+   */
+  classifier_alpha?: number | null;
+  /**
+   * Envelope-level source (mirrors ``StateInferResponse.source``). ``fallback`` when no real classifier ran; the dashboard's 'classifier unavailable' banner reads this.
+   */
+  source?: "classifier" | "fallback";
+  /**
+   * True when no real classifier ran (``classifier_source is None``) — same condition the ``/state/infer`` fallback branch uses to flag synthetic confidence.
+   */
+  degraded?: boolean;
+  /**
+   * Wall-clock timestamp the estimate was produced. May be an ISO string (datetime path) or float (monotonic-style producer); consumers must accept both shapes for backwards-compatibility.
+   */
+  timestamp?: number | string | null;
+  /**
+   * Deduped list of currently-IDENTIFY-ed client types (``chrome``, ``edge``, ``vscode``, ``desktop``). Used by the dashboard to light up connection dots without a separate event stream.
+   */
+  connected_clients?: string[];
+  capture?: CaptureStatus1;
+  store?: StoreHealth;
+  /**
+   * Per-tick biometrics summary. Omitted by the producer when no values are available (early startup, capture offline).
+   */
+  biometrics?: BiometricsSummary | null;
+  /**
+   * Monotonic sequence number stamped by the producer for consumer-side dedup. Currently the envelope-level ``sequence`` field on ``WSMessage`` carries this; the field here is a forward-compatibility hook for callers that round-trip just the payload.
+   */
+  sequence?: number | null;
+}
+/**
+ * Scores for each possible user state.
+ */
+export interface StateScores2 {
+  /**
+   * Flow state score
+   */
+  flow?: number;
+  /**
+   * Hypo-arousal score
+   */
+  hypo?: number;
+  /**
+   * Hyper-arousal score
+   */
+  hyper?: number;
+  /**
+   * Recovery state score
+   */
+  recovery?: number;
+}
+/**
+ * Signal quality per channel
+ */
+export interface SignalQuality2 {
+  /**
+   * Physiological signal quality
+   */
+  physio?: number;
+  /**
+   * Kinematic signal quality
+   */
+  kinematics?: number;
+  /**
+   * Telemetry signal quality
+   */
+  telemetry?: number;
+  /**
+   * Compute overall signal quality as weighted average.
+   */
+  overall: number;
+  /**
+   * Check if signal quality is acceptable for intervention.
+   */
+  acceptable: boolean;
+}
+/**
+ * Capture-channel health sub-payload
+ */
+export interface CaptureStatus1 {
+  /**
+   * True when a frame newer than 2 s ago was observed. False when the capture loop hasn't produced a frame yet (camera not open, permission denied, daemon mid-startup).
+   */
+  frames_flowing?: boolean;
+  /**
+   * True when the most recent frame's MediaPipe FaceMesh detected at least one face.
+   */
+  face_detected?: boolean;
+  /**
+   * True when the daemon planted ``capture_stale`` because the pipeline failed to start or has gone offline. Cleared automatically when ``frames_flowing`` is True (transient init failure followed by a successful resume).
+   */
+  stale?: boolean;
+  /**
+   * Latest capture-loop sequence number; surfaced for debug overlays that need to detect dropped frames. None when the producer does not stamp a sequence.
+   */
+  sequence?: number | null;
+}
+/**
+ * Persistence-layer health sub-payload
+ */
+export interface StoreHealth {
+  /**
+   * True when the daemon is running on the InMemoryStore fallback (intended Redis unreachable). The dashboard uses this to surface a soft 'no Redis' hint.
+   */
+  degraded?: boolean;
+  /**
+   * Backend identifier (``redis`` / ``in_memory``). Optional — present when the daemon plants it in the registry; None otherwise.
+   */
+  backend?: string | null;
+  /**
+   * Optional explicit health flag from the store's ``health_check`` probe. None when the daemon hasn't run a probe recently.
+   */
+  healthy?: boolean | null;
+}
+/**
  * P0 §3.10: STOP_FOCUS_AUTO directive payload.
  *
  * Sent after sustained non-HYPER state (FLOW ≥ 5 min) OR an explicit
@@ -2769,6 +3158,28 @@ export interface StopFocusAutoPayload {
    * Short reason string for analytics + extension logging (e.g. 'natural_recovery', 'user_disarm', 'shutdown').
    */
   reason: string;
+}
+/**
+ * Persistence-layer health indicator surfaced on every STATE_UPDATE.
+ *
+ * The desktop dashboard uses ``degraded`` to render an in-memory
+ * "you'll lose state on restart" hint when Redis is unavailable; the
+ * DMG default deployment now uses :func:`make_default_store` so this
+ * flag is only True when both Redis is configured AND unreachable.
+ */
+export interface StoreHealth1 {
+  /**
+   * True when the daemon is running on the InMemoryStore fallback (intended Redis unreachable). The dashboard uses this to surface a soft 'no Redis' hint.
+   */
+  degraded?: boolean;
+  /**
+   * Backend identifier (``redis`` / ``in_memory``). Optional — present when the daemon plants it in the registry; None otherwise.
+   */
+  backend?: string | null;
+  /**
+   * Optional explicit health flag from the store's ``health_check`` probe. None when the daemon hasn't run a probe recently.
+   */
+  healthy?: boolean | null;
 }
 /**
  * P0 §3.19: TEST_PROVIDER inbound wire payload.

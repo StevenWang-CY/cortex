@@ -10,10 +10,10 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 authors = [
-    { name = "Steven Wang", email = "wangchuyue888@gmail.com" }
+    { name = "Cortex Maintainers", email = "noreply@cortex.invalid" }
 ]
 maintainers = [
-    { name = "Steven Wang", email = "wangchuyue888@gmail.com" }
+    { name = "Cortex Maintainers", email = "noreply@cortex.invalid" }
 ]
 keywords = [
     "biofeedback",

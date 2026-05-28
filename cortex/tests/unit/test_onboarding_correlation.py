@@ -11,7 +11,6 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -129,7 +128,6 @@ class _CapturingHandler(logging.Handler):
 def test_user_action_log_lines_share_cid(wizard, tmp_path):
     """mark_step_complete for each step emits a USER_ACTION log record
     that contains the wizard's cid."""
-    from cortex.apps.desktop_shell import onboarding as onb_mod
 
     handler = _CapturingHandler()
     log = logging.getLogger("cortex.apps.desktop_shell.onboarding")

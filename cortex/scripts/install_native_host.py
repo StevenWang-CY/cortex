@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 
 HOST_NAME = "com.cortex.launcher"
@@ -180,6 +181,33 @@ def _prepare_host_script(source_script: str, *, project_root: str | None = None)
     os.chmod(host_script, 0o755)
     print(f"Native host: {host_script}")
     print(f"Python:      {python_path}")
+
+    # Probe that the patched Python can import the cortex package.
+    # ``native_host.py`` swallows its own ImportError inside a broad
+    # try/except (and writes only to native_host_debug.log), so a
+    # mis-installed venv would otherwise fail silently the first time
+    # Chrome opens the host — surface the error here instead.
+    try:
+        subprocess.run(
+            [python_path, "-c", "import cortex.libs.schemas.native_messaging"],
+            check=True,
+            timeout=5,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        stderr = ""
+        if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+            stderr_bytes = exc.stderr if isinstance(exc.stderr, bytes) else b""
+            try:
+                stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
+            except Exception:
+                stderr = ""
+        raise RuntimeError(
+            "Native host python lacks the cortex package "
+            f"({python_path}) — install with `pip install -e cortex` "
+            f"first. underlying error: {exc}; stderr: {stderr}"
+        ) from exc
     return host_script
 
 

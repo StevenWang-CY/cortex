@@ -92,7 +92,7 @@ class PhysioFeatures(BaseModel):
     valid: bool = Field(..., description="Whether physiological features are valid")
 
     @model_validator(mode="after")
-    def _enforce_invalid_nulls(self) -> "PhysioFeatures":
+    def _enforce_invalid_nulls(self) -> PhysioFeatures:
         """P1-5: when ``valid`` is False, all data fields must be None.
 
         Signal-quality fields (``pulse_quality``, ``physio_sqi``,

@@ -13,8 +13,6 @@ from collections import deque
 from datetime import datetime
 from unittest.mock import patch
 
-import pytest
-
 from cortex.services.handover.detector import ShutdownDetector
 
 

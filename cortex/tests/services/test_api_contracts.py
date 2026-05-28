@@ -96,7 +96,6 @@ class TestWallClockTimestamps:
             HelpfulnessSummaryResponse,
             ConsentLevelResponse,
             ConsentResetResponse,
-            CostResponse,
         ],
     )
     def test_timestamp_is_wall_clock(self, model_cls: type) -> None:
@@ -111,6 +110,14 @@ class TestWallClockTimestamps:
             f"not within 5 s of wall-clock [{before}, {after}] — likely "
             "a regression to time.monotonic()."
         )
+
+    def test_cost_response_timestamp_is_wall_clock(self) -> None:
+        """``CostResponse`` has required ``cost_today``/``budget_today``
+        fields; supply zero values to exercise the default timestamp."""
+        before = time.time()
+        instance = CostResponse(cost_today=0.0, budget_today=0.0)
+        after = time.time()
+        assert before - 5.0 <= instance.timestamp <= after + 5.0
 
     def test_state_infer_response_timestamp_is_wall_clock(self) -> None:
         """``StateInferResponse`` has a required ``estimate`` field, so
@@ -202,17 +209,17 @@ class TestCostEndpoint:
         self, client: TestClient,
     ) -> None:
         """When no tracker is registered, the route returns a 200 with a
-        zero-valued ``CostResponse`` and ``provider="none"`` — not a
-        404. The shell polls unconditionally."""
+        zero-valued ``CostResponse`` and ``provider=None`` — not a 404.
+        The shell polls unconditionally. The canonical wire shape is
+        ``cost_today``/``budget_today``/``budget_exhausted``; the popup
+        and the generated TS schema consume these field names."""
         resp = client.get("/api/cost")
         assert resp.status_code == 200
         body = resp.json()
-        assert body["total_usd"] == 0.0
-        assert body["session_usd"] == 0.0
-        assert body["prompt_tokens"] == 0
-        assert body["completion_tokens"] == 0
-        assert body["provider"] == "none"
-        assert body["model"] == ""
+        assert body["cost_today"] == 0.0
+        assert body["budget_today"] == 0.0
+        assert body["budget_exhausted"] is False
+        assert body["provider"] is None
         # T1: timestamp is wall-clock.
         assert abs(body["timestamp"] - time.time()) < 5.0
 
@@ -233,8 +240,7 @@ class TestCostEndpoint:
         resp = client.get("/api/cost")
         assert resp.status_code == 200
         body = resp.json()
-        assert body["total_usd"] == pytest.approx(2.50)
-        assert body["session_usd"] == pytest.approx(2.00)
+        assert body["cost_today"] == pytest.approx(2.50)
         assert body["prompt_tokens"] == 1000
         assert body["completion_tokens"] == 250
         assert body["provider"] == "anthropic_direct"
@@ -252,7 +258,7 @@ class TestCostEndpoint:
         resp = client.get("/api/cost")
         assert resp.status_code == 200
         body = resp.json()
-        assert body["total_usd"] == pytest.approx(0.42)
+        assert body["cost_today"] == pytest.approx(0.42)
         assert body["model"] == "claude-sonnet-4-5"
         assert body["provider"] == "anthropic_direct"
 
@@ -261,12 +267,12 @@ class TestCostEndpoint:
         accepts the documented field set."""
         # Negative cost is rejected.
         with pytest.raises(Exception):
-            CostResponse(total_usd=-1.0)
+            CostResponse(cost_today=-1.0, budget_today=0.0)
 
         # The documented shape parses cleanly.
         resp = CostResponse(
-            total_usd=1.0,
-            session_usd=0.5,
+            cost_today=1.0,
+            budget_today=5.0,
             prompt_tokens=10,
             completion_tokens=5,
             provider="bedrock",

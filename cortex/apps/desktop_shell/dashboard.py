@@ -985,6 +985,10 @@ class _ConsumerTab(QWidget):
         self._goal_input = QLineEdit()
         self._goal_input.setPlaceholderText("What are you working on?")
         self._goal_input.setMinimumHeight(36)
+        # Mirror the browser-extension popup (popup.tsx) and the backend
+        # ``GoalSet`` schema upper bound so the desktop input can never
+        # accumulate more characters than the daemon will accept.
+        self._goal_input.setMaxLength(500)
         # F55: accessible name + description for VoiceOver / screen
         # readers. Wrapped because the legacy MockQLineEdit stub in
         # test_desktop_shell.py does not expose these QWidget methods.

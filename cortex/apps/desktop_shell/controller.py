@@ -290,6 +290,12 @@ class CortexAppController:
         # against double-click re-entry and lets ``_stop_daemon_and_quit``
         # cooperatively abort the runner on shutdown.
         self._calibration_runner: Any = None
+        # Re-entrancy guard for :meth:`_on_daemon_stop_requested` — flipped
+        # to True the first time a Stop click is processed and cleared by
+        # the daemon-stopped callback. A double-click on Stop (or any
+        # legacy back-compat signal that fans in to the same handler) is
+        # then a no-op instead of re-scheduling ``daemon.stop()``.
+        self._stopping: bool = False
 
     # -- public API -----------------------------------------------------------
 
@@ -487,10 +493,52 @@ class CortexAppController:
             self._dashboard.gui_quit_requested.connect(
                 self._on_gui_quit_requested,
             )
-        if hasattr(self._dashboard, "stop_requested"):
-            self._dashboard.stop_requested.connect(self._on_daemon_stop_requested)
+        # The legacy ``stop_requested`` signal is no longer wired here —
+        # ``daemon_stop_requested`` (connected just above) is the canonical
+        # path. Both signals are still emitted by the dashboard for
+        # back-compat, but the duplicate connection would route a single
+        # Stop click into ``_on_daemon_stop_requested`` twice, scheduling
+        # two redundant ``daemon.stop()`` futures. The ``_stopping`` guard
+        # inside that handler is now the second line of defence.
         if hasattr(self._dashboard, "goal_set"):
             self._dashboard.goal_set.connect(self._on_goal_set)
+        # Audit-prod fix (P0): wire the previously-orphan dashboard
+        # signals so the user-facing affordances actually drive the
+        # daemon.
+        #
+        # * ``break_pill_clicked(payload)`` — Take-a-break pill click.
+        #   Routes through the same ``USER_ACTION`` channel the browser
+        #   extension uses so the daemon's break controller can promote
+        #   the recommendation to a full breathing session.
+        # * ``undo_action_requested(intervention_id)`` — Undo toast +
+        #   Restore previous state pill. We submit an ``undone``
+        #   USER_ACTION so the restore manager rolls back the most
+        #   recent reversible mutation.
+        # * ``force_recap_requested`` — Cmd+Shift+R developer shortcut.
+        #   Calls ``daemon.force_recap`` (P0 §3.21).
+        # * ``dismiss_overlay_requested`` — Cmd+Shift+D developer
+        #   shortcut. Calls ``daemon.dismiss_active_overlay`` (P0 §3.21).
+        if hasattr(self._dashboard, "break_pill_clicked"):
+            self._dashboard.break_pill_clicked.connect(
+                self._on_break_pill_clicked,
+            )
+        if hasattr(self._dashboard, "undo_action_requested"):
+            self._dashboard.undo_action_requested.connect(
+                self._on_undo_action_requested,
+            )
+        if hasattr(self._dashboard, "force_recap_requested"):
+            self._dashboard.force_recap_requested.connect(
+                self._on_force_recap_requested,
+            )
+        if hasattr(self._dashboard, "dismiss_overlay_requested"):
+            self._dashboard.dismiss_overlay_requested.connect(
+                self._on_dismiss_overlay_requested,
+            )
+        # P0 §3.19: settings → daemon TEST_PROVIDER round-trip.
+        if hasattr(self._settings, "test_provider_requested"):
+            self._settings.test_provider_requested.connect(
+                self._on_test_provider_requested,
+            )
         # P0 §3.1 / §3.2: route outgoing history/trends requests from the
         # dashboard to the daemon. In-process mode can call the daemon's
         # async methods directly via run_coroutine_threadsafe; the
@@ -1005,6 +1053,10 @@ class CortexAppController:
     def _on_daemon_stopped(self) -> None:
         """F34: the daemon's stop() resolved on the main thread; re-enable
         the dashboard Stop button and the tray Quit action."""
+        # Clear the re-entrancy latch so a subsequent Start → Stop cycle
+        # within the same Qt process is honoured (e.g. test harnesses,
+        # future hot-restart support).
+        self._stopping = False
         if self._dashboard is not None and hasattr(
             self._dashboard, "notify_daemon_stopped"
         ):
@@ -1461,6 +1513,202 @@ class CortexAppController:
                 self._daemon_loop,
             )
 
+    # ── Audit-prod P0 fix: orphan-signal handlers ──────────────────────
+    #
+    # Each handler matches the established ``_on_settings_changed``
+    # pattern — schedule the daemon-side coroutine on the daemon's
+    # asyncio loop via ``run_coroutine_threadsafe``. None of these
+    # touch Qt state directly; result fan-out (e.g. TEST_PROVIDER) lands
+    # via the existing bridge → dashboard/settings ``apply_*`` slots.
+
+    @Slot(dict)
+    def _on_break_pill_clicked(self, payload: dict) -> None:
+        """P0 §3.7: user clicked the "Take a break" pill on the dashboard.
+
+        Schedules ``daemon.start_biology_break`` directly so the desktop
+        full-screen overlay drives the same breathing controller as a
+        daemon-initiated promotion. Pulls duration / pattern / audio cue
+        out of the cached BREAK_RECOMMENDATION payload that the dashboard
+        echoes back; falls back to the controller's existing defaults
+        when fields are missing.
+        """
+        if self._daemon is None or self._daemon_loop is None:
+            return
+        if not isinstance(payload, dict):
+            payload = {}
+        # The payload mirrors MessageType.BREAK_RECOMMENDATION fields.
+        # ``duration_seconds`` defaults to 240 (4 min) per the spec.
+        try:
+            duration_seconds = int(payload.get("duration_seconds") or 240)
+        except (TypeError, ValueError):
+            duration_seconds = 240
+        pattern_raw = payload.get("breathing_pattern")
+        pattern: str | None = (
+            str(pattern_raw) if isinstance(pattern_raw, str) and pattern_raw else None
+        )
+        audio_cue = bool(payload.get("audio_cue", True))
+        reason = str(payload.get("reason") or "user_break_pill_click")[:120]
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._daemon.start_biology_break(
+                    intervention_id=None,
+                    duration_seconds=duration_seconds,
+                    breathing_pattern=pattern,
+                    audio_cue=audio_cue,
+                    reason=reason,
+                ),
+                self._daemon_loop,
+            )
+        except Exception:
+            logger.debug(
+                "start_biology_break scheduling failed", exc_info=True,
+            )
+
+    @Slot(str)
+    def _on_undo_action_requested(self, intervention_id: str) -> None:
+        """Dashboard Undo toast / "Restore previous state" pill click.
+
+        Submits an ``undone`` USER_ACTION so the restore manager rolls
+        back the most-recent reversible mutation for this intervention.
+        Mirrors the action verb the helpfulness tracker already
+        understands.
+        """
+        if (
+            self._daemon is None
+            or self._daemon_loop is None
+            or not intervention_id
+        ):
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._daemon._handle_user_action({
+                    "action": "undone",
+                    "intervention_id": str(intervention_id),
+                }),
+                self._daemon_loop,
+            )
+        except Exception:
+            logger.debug(
+                "undo USER_ACTION scheduling failed", exc_info=True,
+            )
+
+    @Slot()
+    def _on_force_recap_requested(self) -> None:
+        """P0 §3.21: Cmd+Shift+R developer shortcut → ``daemon.force_recap``.
+
+        Broadcasts a SESSION_RECAP for the active session (or a
+        synthesised empty recap when no session is running) so the
+        dashboard's recap sheet has something to render.
+        """
+        if self._daemon is None or self._daemon_loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._daemon.force_recap(),
+                self._daemon_loop,
+            )
+        except Exception:
+            logger.debug(
+                "force_recap scheduling failed", exc_info=True,
+            )
+
+    @Slot()
+    def _on_dismiss_overlay_requested(self) -> None:
+        """P0 §3.21: Cmd+Shift+D developer shortcut → dismiss every
+        active overlay across surfaces and clear pending intervention
+        state. Reuses the daemon's ``dismiss_active_overlay`` helper.
+        """
+        if self._daemon is None or self._daemon_loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._daemon.dismiss_active_overlay(),
+                self._daemon_loop,
+            )
+        except Exception:
+            logger.debug(
+                "dismiss_active_overlay scheduling failed", exc_info=True,
+            )
+
+    @Slot(str)
+    def _on_test_provider_requested(self, provider: str) -> None:
+        """P0 §3.19: Settings → LLM backend → "Test connection".
+
+        Schedules ``daemon.test_provider(provider)`` and routes the
+        result back into ``settings.apply_provider_test_result`` so the
+        status pill updates with latency / error. The future's result
+        is a ``TestProviderResult`` Pydantic model — we marshal to a
+        dict before hopping back onto the Qt thread.
+        """
+        if self._daemon is None or self._daemon_loop is None:
+            return
+        settings_dialog = self._settings
+        if settings_dialog is None:
+            return
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._daemon.test_provider(str(provider)),
+                self._daemon_loop,
+            )
+        except Exception:
+            logger.debug(
+                "test_provider scheduling failed", exc_info=True,
+            )
+            return
+
+        def _on_done(fut: Any) -> None:
+            payload: dict[str, Any]
+            try:
+                result = fut.result()
+            except Exception as exc:
+                logger.debug("test_provider raised: %r", exc)
+                payload = {
+                    "provider": str(provider),
+                    "ok": False,
+                    "latency_ms": None,
+                    "error": "exception",
+                }
+            else:
+                if hasattr(result, "model_dump"):
+                    try:
+                        payload = result.model_dump(mode="json")
+                    except Exception:
+                        payload = {
+                            "provider": str(provider),
+                            "ok": False,
+                            "latency_ms": None,
+                            "error": "serialization_failed",
+                        }
+                elif isinstance(result, dict):
+                    payload = result
+                else:
+                    payload = {
+                        "provider": str(provider),
+                        "ok": False,
+                        "latency_ms": None,
+                        "error": "bad_result_type",
+                    }
+            # Hop onto the Qt main thread via singleShot so the dialog's
+            # paint chain stays on the correct thread.
+            try:
+                from PySide6.QtCore import QTimer as _QTimer
+
+                _QTimer.singleShot(
+                    0,
+                    lambda p=payload: settings_dialog.apply_provider_test_result(p),
+                )
+            except Exception:
+                logger.debug(
+                    "apply_provider_test_result marshal failed", exc_info=True,
+                )
+
+        try:
+            future.add_done_callback(_on_done)
+        except Exception:
+            logger.debug(
+                "test_provider done-callback wire failed", exc_info=True,
+            )
+
     def _show_dashboard(self) -> None:
         if self._dashboard is not None:
             self._dashboard.show()
@@ -1693,6 +1941,20 @@ class CortexAppController:
         leaving no window for the recap sheet to render between the
         broadcast and the Qt exit. Splitting the slots fixes that.
         """
+        # Re-entrancy guard: a double-click on Stop (or a stray legacy
+        # ``stop_requested`` connection that fans into the same handler)
+        # would otherwise schedule ``daemon.stop()`` twice. The dashboard
+        # also emits ``daemon_stop_requested`` and the legacy
+        # ``stop_requested`` alias for back-compat; only the canonical
+        # one is wired in ``run()`` now, but the guard keeps us safe if a
+        # future test harness or peer surface fires either signal again.
+        if self._stopping:
+            logger.debug(
+                "_on_daemon_stop_requested: stop already in flight; "
+                "ignoring re-entry"
+            )
+            return
+        self._stopping = True
         logger.info("Dashboard Stop button — scheduling daemon stop")
         if (
             self._daemon is None

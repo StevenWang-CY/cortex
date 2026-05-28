@@ -29,6 +29,12 @@ from cortex.libs.utils.platform import is_macos
 
 logger = logging.getLogger(__name__)
 _AUTO_CAMERA_DEVICE_ID = 0
+
+# Phase 4 fix #3: how many consecutive failed ``cap.read()`` calls before we
+# flag capture as stale. ~1 s at 30 FPS — long enough to ride out a single
+# transient hiccup, short enough to surface a stuck camera before the UI
+# notices on its own.
+_CAPTURE_STALE_THRESHOLD: int = 30
 _BUILTIN_MAC_CAMERA_KEYWORDS = (
     "facetime",
     "built-in",
@@ -51,7 +57,7 @@ class CapturedFrame:
     """A single captured webcam frame with metadata."""
 
     frame: np.ndarray  # BGR uint8, shape (H, W, 3)
-    timestamp: float  # time.monotonic() seconds
+    timestamp: float  # UNIX epoch seconds (time.time()), to match FrameMeta.timestamp schema
     sequence: int  # monotonically increasing frame counter
 
 
@@ -576,11 +582,24 @@ class WebcamCapture:
         # Metrics
         self._sequence = 0
         self._frames_captured = 0
-        self._frames_dropped = 0
+        # Per-arm drop counters (renamed for clarity — see ``frames_dropped``
+        # docstring). The pipeline-side ``CapturePipeline.frames_dropped_total``
+        # is the authoritative cross-system counter; this one specifically
+        # tracks evictions from the *webcam-thread → asyncio-loop* hand-off
+        # queue (i.e. "capture too fast for the pipeline to consume").
+        self._input_queue_drops = 0
         self._last_fps_time = 0.0
         self._fps_frame_count = 0
         self._measured_fps = 0.0
         self._camera_selection: CameraSelection | None = None
+
+        # Phase 4 fix #3: consecutive-failure tracking. Incremented on each
+        # ``cap.read()`` False/raise, reset on a successful frame. When the
+        # counter exceeds ``_CAPTURE_STALE_THRESHOLD`` (~1 s at 30 FPS) we
+        # set ``_capture_stale`` so the daemon's poll path can broadcast a
+        # capture-stale signal to the UI.
+        self._consecutive_failed_reads: int = 0
+        self._capture_stale: bool = False
 
     @property
     def is_running(self) -> bool:
@@ -599,8 +618,28 @@ class WebcamCapture:
 
     @property
     def frames_dropped(self) -> int:
-        """Total frames dropped due to full queue."""
-        return self._frames_dropped
+        """Total frames dropped at the *input* (webcam-thread → asyncio-loop)
+        queue because the pipeline consumer fell behind capture.
+
+        NOTE (Phase 4 fix #4): This counter is distinct from
+        :attr:`CapturePipeline.frames_dropped_total`, which counts drops at
+        the *output* (pipeline → state-engine) queue. They measure different
+        stages — together they tell operators whether a backpressure spike
+        is caused by a fast camera, a slow pipeline, or a slow consumer.
+        """
+        return self._input_queue_drops
+
+    @property
+    def capture_stale(self) -> bool:
+        """Phase 4 fix #3: True when the capture thread has seen
+        :data:`_CAPTURE_STALE_THRESHOLD` consecutive failed ``cap.read()``
+        calls without a successful frame in between.
+
+        The runtime daemon polls this in its capture-health watchdog and
+        emits a ``capture_stale`` broadcast plus a registry flag when set.
+        Cleared automatically the moment a successful frame is enqueued.
+        """
+        return self._capture_stale
 
     async def start(self) -> None:
         """
@@ -631,7 +670,9 @@ class WebcamCapture:
         # Reset counters
         self._sequence = 0
         self._frames_captured = 0
-        self._frames_dropped = 0
+        self._input_queue_drops = 0
+        self._consecutive_failed_reads = 0
+        self._capture_stale = False
         self._last_fps_time = time.monotonic()
         self._fps_frame_count = 0
 
@@ -671,18 +712,24 @@ class WebcamCapture:
             self._thread = None
 
         # ALWAYS release the camera — this is the critical cleanup
+        # (CLAUDE.md rule 15). If release() raises, that is serious enough to
+        # log at WARNING with traceback — a leaked handle blocks future
+        # opens until the OS reaps the process.
         if self._cap is not None:
             try:
                 self._cap.release()
             except Exception:
-                pass
+                logger.warning(
+                    "cap.release() raised; camera handle may leak",
+                    exc_info=True,
+                )
             self._cap = None
 
         logger.info(
             "WebcamCapture stopped",
             extra={
                 "total_captured": self._frames_captured,
-                "total_dropped": self._frames_dropped,
+                "total_dropped": self._input_queue_drops,
             },
         )
 
@@ -736,18 +783,60 @@ class WebcamCapture:
                     logger.error("Webcam lost")
                     break
 
-                ret, frame = self._cap.read()
-                timestamp = time.monotonic()
+                # Phase 4 fix #1: ``CapturedFrame.timestamp`` MUST be UNIX
+                # epoch seconds (``time.time()``) to match the
+                # ``FrameMeta.timestamp`` schema contract — see
+                # cortex/libs/schemas/features.py docstring. Internal timing
+                # (FPS, next-capture scheduling) keeps using
+                # ``time.monotonic()`` because that clock is drift-free.
+                read_failed = False
+                try:
+                    ret, frame = self._cap.read()
+                except Exception:
+                    logger.warning(
+                        "cap.read() raised; treating as failed read",
+                        exc_info=True,
+                    )
+                    ret, frame = False, None
+                    read_failed = True
+                wall_ts = time.time()
+                mono_ts = time.monotonic()
 
                 if not ret or frame is None:
-                    logger.warning("Failed to read frame from webcam")
-                    next_capture_time = timestamp + target_interval
+                    # Phase 4 fix #3: track consecutive read failures so the
+                    # daemon's capture-health watchdog can surface a stale
+                    # camera before the UI notices on its own.
+                    self._consecutive_failed_reads += 1
+                    if (
+                        self._consecutive_failed_reads >= _CAPTURE_STALE_THRESHOLD
+                        and not self._capture_stale
+                    ):
+                        self._capture_stale = True
+                        logger.warning(
+                            "Capture stalled: %d consecutive failed reads "
+                            "(threshold=%d); flagging capture_stale=True",
+                            self._consecutive_failed_reads,
+                            _CAPTURE_STALE_THRESHOLD,
+                        )
+                    if not read_failed:
+                        logger.warning("Failed to read frame from webcam")
+                    next_capture_time = mono_ts + target_interval
                     continue
 
-                # Create captured frame
+                # Successful frame — clear the stale flag if it was set.
+                if self._consecutive_failed_reads > 0:
+                    if self._capture_stale:
+                        logger.info(
+                            "Capture recovered after %d failed reads",
+                            self._consecutive_failed_reads,
+                        )
+                    self._consecutive_failed_reads = 0
+                    self._capture_stale = False
+
+                # Create captured frame (wall-clock timestamp per schema).
                 captured = CapturedFrame(
                     frame=frame,
-                    timestamp=timestamp,
+                    timestamp=wall_ts,
                     sequence=self._sequence,
                 )
                 self._sequence += 1
@@ -756,19 +845,19 @@ class WebcamCapture:
                 # Publish to async queue (non-blocking)
                 self._enqueue_frame(captured)
 
-                # Update FPS measurement
+                # Update FPS measurement (uses monotonic clock — drift-free).
                 self._fps_frame_count += 1
-                elapsed = timestamp - self._last_fps_time
+                elapsed = mono_ts - self._last_fps_time
                 if elapsed >= 1.0:
                     self._measured_fps = self._fps_frame_count / elapsed
                     self._fps_frame_count = 0
-                    self._last_fps_time = timestamp
+                    self._last_fps_time = mono_ts
 
                 # Schedule next capture
                 next_capture_time += target_interval
                 # If we've fallen behind, reset to avoid burst capture
-                if next_capture_time < timestamp - target_interval:
-                    next_capture_time = timestamp + target_interval
+                if next_capture_time < mono_ts - target_interval:
+                    next_capture_time = mono_ts + target_interval
 
         except Exception:
             logger.exception("Error in capture loop")
@@ -788,7 +877,14 @@ class WebcamCapture:
             pass
 
     def _try_put(self, frame: CapturedFrame) -> None:
-        """Try to put a frame in the queue, dropping oldest if full."""
+        """Try to put a frame in the queue, dropping oldest if full.
+
+        Phase 4 fix #4: drops here are *input-side* drops — capture is
+        running faster than the asyncio pipeline consumer can drain. They
+        are tracked separately from ``CapturePipeline.frames_dropped_total``
+        (which measures output-side drops). See the ``frames_dropped``
+        property docstring for the rationale.
+        """
         if self._queue is None:
             return
 
@@ -796,11 +892,11 @@ class WebcamCapture:
             # Drop oldest frame to maintain real-time
             try:
                 self._queue.get_nowait()
-                self._frames_dropped += 1
+                self._input_queue_drops += 1
             except asyncio.QueueEmpty:
                 pass
 
         try:
             self._queue.put_nowait(frame)
         except asyncio.QueueFull:
-            self._frames_dropped += 1
+            self._input_queue_drops += 1

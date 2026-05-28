@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import signal
 import subprocess
 import sys
@@ -84,7 +85,12 @@ def start_background() -> None:
 
     python = _python_path()
     project_root = _project_root()
-    log_path = os.path.join(project_root, "cortex_launcher.log")
+    # Match ``launcher_agent.py:184`` — the macOS standard support
+    # directory keeps runtime artefacts out of the dev's checkout
+    # (writing into ``project_root`` spammed the working tree).
+    support_dir = pathlib.Path.home() / "Library" / "Application Support" / "Cortex"
+    support_dir.mkdir(parents=True, exist_ok=True)
+    log_path = str(support_dir / "cortex_launcher.log")
 
     log_file = open(log_path, "a")
     proc = subprocess.Popen(

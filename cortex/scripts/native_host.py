@@ -72,8 +72,8 @@ def read_message_bytes() -> bytes | None:
         # protocol for the next message; cap at 1 MB to bound work.
         try:
             sys.stdin.buffer.read(min(length, 1024 * 1024))
-        except Exception:
-            pass
+        except Exception as drain_exc:
+            log(f"oversized-payload drain failed: {drain_exc}")
         return b""
     return sys.stdin.buffer.read(length)
 
@@ -342,7 +342,11 @@ def _raise_dashboard(target: str) -> dict:
             data=json.dumps({"target": target}).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
-                "X-Cortex-Auth": _read_auth_token(),
+                # auth.py only accepts ``X-Cortex-Auth-Token`` or
+                # ``Authorization: Bearer``; the legacy
+                # ``X-Cortex-Auth`` header silently failed authentication
+                # and caused /dashboard/raise to bounce as 401.
+                "X-Cortex-Auth-Token": _read_auth_token(),
             },
             method="POST",
         )

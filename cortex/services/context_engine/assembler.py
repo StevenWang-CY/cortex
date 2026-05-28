@@ -173,7 +173,9 @@ class ContextAssembler:
                 app_name = self._active_app_provider()
                 return classify_app(app_name)
             except Exception:
-                pass
+                logger.debug(
+                    "active_app_provider raised", exc_info=True,
+                )
         return "other"
 
     async def _gather_editor(self) -> EditorContext | None:

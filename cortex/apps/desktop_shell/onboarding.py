@@ -1597,13 +1597,29 @@ class OnboardingWindow(QWidget):
             )
             return
         try:
-            import keyring
+            # Use ``set_password_safe`` (timeout-bounded, executor-based)
+            # so a wedged Keychain unlock sheet or TCC prompt can't pin
+            # the Qt event loop. The helper returns ``False`` on timeout
+            # / missing backend / write error — we surface a user-visible
+            # warning in that case instead of silently swallowing it.
+            from cortex.libs.utils.secrets import set_password_safe
+
             config = get_config()
-            keyring.set_password(
+            ok = set_password_safe(
                 config.llm.bedrock.keychain_service,
                 config.llm.bedrock.keychain_account,
                 key,
             )
+            if not ok:
+                QMessageBox.warning(
+                    self,
+                    "Couldn't save token",
+                    "Saving the Bedrock token to the macOS Keychain "
+                    "timed out or the backend is unavailable. Open "
+                    "Keychain Access and unlock the login keychain, "
+                    "then try again.",
+                )
+                return
             try:
                 config.llm.bedrock.aws_region = self._region_combo.currentText()
             except AttributeError:

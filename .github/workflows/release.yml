@@ -72,13 +72,23 @@ jobs:
           node-version: "20"
 
       - name: Install pnpm
-        run: npm install -g pnpm
+        # Audit fix: ``npm install -g pnpm`` pulled "whatever pnpm
+        # tagged latest" at release time — silent version drift across
+        # tag builds. ``pnpm/action-setup`` pins to the same version as
+        # ci.yml so the lockfile that passed PR CI is the lockfile the
+        # release build consumes.
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9
 
       - name: Install Cortex (dev)
         run: pip install -e "./cortex[dev]"
 
       - name: Install browser-extension deps
-        run: cd cortex/apps/browser_extension && pnpm install
+        # ``--frozen-lockfile`` aborts if pnpm-lock.yaml is out of
+        # sync — prevents a stale lockfile from quietly resolving
+        # different versions in CI than in dev.
+        run: cd cortex/apps/browser_extension && pnpm install --frozen-lockfile
 
       - name: Build DMG (ad-hoc signed)
         env:

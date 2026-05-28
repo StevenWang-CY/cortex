@@ -89,6 +89,7 @@ export interface ChromeFake {
         onInstalled: ReturnType<typeof makeEvent>;
         onStartup: ReturnType<typeof makeEvent>;
         getURL: ReturnType<typeof vi.fn>;
+        getManifest: ReturnType<typeof vi.fn>;
         lastError: { message: string } | undefined;
         id: string;
     };
@@ -164,6 +165,11 @@ export function buildChromeFake(): ChromeFake {
             onInstalled: makeEvent(),
             onStartup: makeEvent(),
             getURL: vi.fn((path: string) => `chrome-extension://test/${path}`),
+            getManifest: vi.fn(() => ({
+                manifest_version: 3,
+                name: "Cortex",
+                version: "0.2.1",
+            })),
             lastError: undefined,
             id: "test-extension-id",
         },
@@ -236,6 +242,7 @@ export function resetChromeFake(fake: ChromeFake): void {
     fake.runtime.onInstalled.__clear();
     fake.runtime.onStartup.__clear();
     fake.runtime.getURL.mockClear();
+    fake.runtime.getManifest.mockClear();
     fake.storage.local.__reset();
     fake.storage.session.__reset();
     fake.storage.sync.__reset();

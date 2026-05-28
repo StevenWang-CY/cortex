@@ -147,7 +147,9 @@ class FeatureAggregator:
             try:
                 tab_count = self._tab_count_provider()
             except Exception:
-                pass
+                logger.debug(
+                    "tab_count_provider raised", exc_info=True,
+                )
 
         self._latest_thrashing_score = thrashing
 

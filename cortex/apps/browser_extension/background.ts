@@ -29,6 +29,7 @@ import {
     DAEMON_WS_URL,
     DAEMON_HTTP_URL,
     LAUNCHER_HTTP_URL,
+    NATIVE_HOST_ID,
 } from "./config";
 
 // --- Types (generated from Pydantic — Debt-1 closure) ---
@@ -893,7 +894,7 @@ async function probeConnectivity(trigger: string): Promise<void> {
             const timeout = setTimeout(() => reject(new Error("native_host_ping_timeout")), 1500);
             try {
                 chrome.runtime.sendNativeMessage(
-                    "com.cortex.launcher",
+                    NATIVE_HOST_ID,
                     { command: "status" },
                     (response) => {
                         clearTimeout(timeout);
@@ -2627,7 +2628,7 @@ async function runLaunchCortex(): Promise<LaunchResult> {
         const nativeResult = await new Promise<Record<string, string>>((resolve) => {
             try {
                 chrome.runtime.sendNativeMessage(
-                    "com.cortex.launcher",
+                    NATIVE_HOST_ID,
                     { command: "launch" },
                     (response) => {
                         if (chrome.runtime.lastError) {
@@ -3260,10 +3261,12 @@ async function executeCloseTab(action: SuggestedAction): Promise<ActionExecuteRe
         || !Number.isInteger(action.tab_index)
         || action.tab_index < 0
     ) {
-        console.warn(
-            "Cortex: invalid tab_index in close_tab action, dropping",
-            { action_id: aid, tab_index: action.tab_index },
-        );
+        if (DEBUG) {
+            console.warn(
+                "Cortex: invalid tab_index in close_tab action, dropping",
+                { action_id: aid, tab_index: action.tab_index },
+            );
+        }
         return { action_id: aid, success: false, message: "Invalid tab_index", reversible: false };
     }
     const tabIndex = action.tab_index;
@@ -3389,10 +3392,12 @@ async function executeBookmarkAndClose(action: SuggestedAction): Promise<ActionE
         || !Number.isInteger(action.tab_index)
         || action.tab_index < 0
     ) {
-        console.warn(
-            "Cortex: invalid tab_index in bookmark_and_close action, dropping",
-            { action_id: aid, tab_index: action.tab_index },
-        );
+        if (DEBUG) {
+            console.warn(
+                "Cortex: invalid tab_index in bookmark_and_close action, dropping",
+                { action_id: aid, tab_index: action.tab_index },
+            );
+        }
         return { action_id: aid, success: false, message: "Invalid tab_index", reversible: false };
     }
     const tabIndex = action.tab_index;
@@ -4237,7 +4242,7 @@ chrome.runtime.onMessage.addListener(
                     // because it works even when HTTP/WebSocket are unresponsive.
                     try {
                         chrome.runtime.sendNativeMessage(
-                            "com.cortex.launcher",
+                            NATIVE_HOST_ID,
                             { command: "stop" },
                             () => { /* ignore response */ }
                         );
@@ -4788,7 +4793,7 @@ chrome.runtime.onMessage.addListener(
                 // "Install desktop app to view history".
                 try {
                     chrome.runtime.sendNativeMessage(
-                        "com.cortex.launcher",
+                        NATIVE_HOST_ID,
                         { command: "raise_dashboard", target: "history" },
                         (response) => {
                             if (chrome.runtime.lastError) {
@@ -5098,7 +5103,7 @@ function handleCommandDismissOverlay(): void {
 function handleCommandViewHistory(): void {
     try {
         chrome.runtime.sendNativeMessage(
-            "com.cortex.launcher",
+            NATIVE_HOST_ID,
             { command: "raise_dashboard", target: "history" },
             () => {
                 const lastErr = (chrome as unknown as {

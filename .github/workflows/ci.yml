@@ -99,32 +99,15 @@ jobs:
           pip install -e "./cortex[dev]"
       - name: Lint (ruff)
         run: ruff check cortex/
-      - name: Typecheck (mypy — blocking scope, I9)
-        # I9: mypy is now BLOCKING for a curated set of directories that
-        # currently pass cleanly. Per-directory migration plan:
-        #   1. cortex/libs/design/   ✓ (blocking, this PR)
-        #   2. cortex/libs/llm/      ✓ (blocking, this PR)
-        #   3. cortex/libs/ports/    → blocking once libs/schemas
-        #      Pydantic-default-factory false positives are silenced
-        #   4. cortex/libs/schemas/  → blocking after upgrading
-        #      pydantic-to-typescript or adding type: ignore comments to
-        #      ChronotypeModel / DestructiveStruggleEstimate default
-        #      factories
-        #   5. cortex/libs/config/   → blocking after `types-PyYAML` is
-        #      added to the dev extras
-        #   6. cortex/libs/utils/    → blocking after pyobjc stubs land
-        #   7. cortex/services/api_gateway/ → blocking next pass
-        #   8. cortex/services/      → blocking last
-        # Bump this scope upward as each directory's residual errors are
-        # closed; do NOT silently weaken it by re-adding ``|| true``.
-        run: mypy cortex/libs/design/ cortex/libs/llm/
-      - name: Typecheck (mypy — full project, informational)
-        # Full-tree mypy is still surfaced but kept non-blocking until
-        # every libs/services subtree migrates. Failures print in the
-        # CI log so cleanup PRs have a single source of truth for the
-        # remaining error budget.
-        run: mypy cortex/ || true
-        continue-on-error: true
+      - name: Typecheck (mypy --strict — blocking, full project)
+        # Audit fix: previously the blocking scope was a curated subset
+        # (libs/design + libs/llm) and the full tree ran with
+        # ``|| true``. Tag release builds (release.yml) ran the full
+        # ``mypy cortex/ --strict`` gate, so a PR could land green and
+        # break the next release. Promote the strict full-project gate
+        # to block PR merges as well so the two CI surfaces stay
+        # aligned and tag-time surprises stop happening.
+        run: mypy cortex/ --strict
       - name: Test (pytest)
         env:
           QT_QPA_PLATFORM: offscreen

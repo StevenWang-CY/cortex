@@ -401,7 +401,7 @@ def _try_parse(text: str) -> dict[str, Any] | None:
         if isinstance(obj, dict):
             return obj
     except (json.JSONDecodeError, ValueError):
-        pass
+        logger.debug("parser fallback hit", exc_info=True)
     return None
 
 

@@ -3,15 +3,21 @@
  *
  * Design: Cortex Visual Identity Guide — dark, calm, Linear/Claude-inspired.
  * Inter + JetBrains Mono typography, indigo accent, 4px grid spacing.
- * No emoji. No motivational copy. Sentence case everywhere.
+ * No emoji glyphs in user-visible UI — text labels only. No motivational
+ * copy. Sentence case everywhere. (Inline comments may still reference
+ * the legacy thumbs-up / thumbs-down emoji for historical clarity.)
  */
 
 import React, { useCallback, useEffect, useState } from "react";
-import { createRoot } from "react-dom/client";
 import { CX, STATE_COLORS, STATE_LABELS, CX_KEYFRAMES } from "./design-tokens";
 import { newCorrelationId } from "./lib/correlation";
 import { getLastRuntimeError } from "./lib/chrome-runtime";
 import { DAEMON_HTTP_URL } from "./config";
+import type {
+    BreakRecommendation as BreakRecommendationSchema,
+    CausalSignal as CausalSignalSchema,
+    WhyDetail as WhyDetailSchema,
+} from "./types/generated/cortex_schemas";
 
 // P2-9: centralised debug flag for popup. Mirrors background.ts's DEBUG
 // pattern. In production builds (NODE_ENV=production / Plasmo production
@@ -134,6 +140,15 @@ const RECAP_TTL_MS = 24 * 60 * 60 * 1000;
  * also keeps the cache warm; this is the on-demand belt-and-braces.
  */
 const TRENDS_STALENESS_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Phase 4d Task H / §3.24: hard cap on the ``pending_feedback`` queue in
+ * ``chrome.storage.local``. Every offline bug report adds one entry and
+ * we only drain on popup mount, so a user who runs Cortex with the
+ * daemon down for months could otherwise accumulate thousands of
+ * entries. Most-recent N wins — older reports are silently dropped.
+ */
+const PENDING_FEEDBACK_MAX = 100;
 
 const CortexLogo = () => (
     <svg width="22" height="22" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ flexShrink: 0 }}>
@@ -757,6 +772,11 @@ function CortexPopup(): React.ReactElement {
           severity: "primary" | "secondary" | "tertiary"; }[]
     >([]);
     const [whyOpen, setWhyOpen] = useState<boolean>(false);
+    // P0 §3.9 audit fix: surface the WhyDetail.error field so the popup
+    // can explain *why* the drilldown is empty instead of just rendering
+    // a blank panel when the daemon returns ``error="not_found"`` or
+    // similar. Reset on each new INTERVENTION_TRIGGER.
+    const [whyError, setWhyError] = useState<string | null>(null);
     // P0 §3.7: BREAK_RECOMMENDATION pulse from the daemon. When set we
     // render a soft pill above the intervention card with a one-click
     // "Take a 4-minute break" CTA.
@@ -922,9 +942,18 @@ function CortexPopup(): React.ReactElement {
 
     const [launchStatus, setLaunchStatus] = useState("");
 
-    // F54: pinned in code rather than read from manifest at runtime so a
-    // mismatch with the daemon is immediately surfaceable in tests.
-    const EXPECTED_VERSION = "0.2.1";
+    // F54: self-derived from the extension manifest so a future
+    // ``package.json`` version bump cannot desync the check against
+    // itself. Tests can still override via the ``classifyConnectivity``
+    // helper which accepts ``expectedVersion`` as an explicit arg.
+    const EXPECTED_VERSION: string = (() => {
+        try {
+            const manifest = chrome?.runtime?.getManifest?.();
+            const v = manifest?.version;
+            if (typeof v === "string" && v.length > 0) return v;
+        } catch { /* chrome.runtime not available in some test envs */ }
+        return "0.0.0";
+    })();
     const connectivity = classifyConnectivity({
         connected,
         nativeHostStatus,
@@ -1086,30 +1115,42 @@ function CortexPopup(): React.ReactElement {
                 setMicroSteps(normaliseMicroSteps(p.micro_steps));
                 // P0 §3.9: adopt structured causal signals from the
                 // intervention trigger payload (top 2-3 ranked drivers).
+                // The wire shape is validated by the daemon's Pydantic
+                // model; we narrow to ``CausalSignalSchema[]`` after the
+                // runtime guard so a future schema-rename surfaces here
+                // as a TS error.
                 const signals = (p.causal_signals as unknown[]) || [];
+                // Each raw entry is validated against ``CausalSignalSchema``
+                // by the daemon; we narrow at the wire boundary so a
+                // future schema-rename surfaces as a TS error rather
+                // than a silent ``Number(undefined) === NaN``.
                 setCausalSignals(
                     signals
                         .filter((s): s is Record<string, unknown> => typeof s === "object" && s !== null)
-                        .map((s) => ({
-                            name: String(s.name ?? ""),
-                            current_value: Number(s.current_value ?? 0),
-                            baseline_value: s.baseline_value == null ? null : Number(s.baseline_value),
-                            unit: String(s.unit ?? ""),
-                            delta_pct: s.delta_pct == null ? null : Number(s.delta_pct),
-                            samples_60s: Array.isArray(s.samples_60s)
-                                ? (s.samples_60s as number[]).map((v) => Number(v))
-                                : [],
-                            severity:
-                                s.severity === "primary" || s.severity === "tertiary"
-                                    ? (s.severity as "primary" | "tertiary")
-                                    : ("secondary" as const),
-                        })),
+                        .map((s) => {
+                            const typed = s as Partial<CausalSignalSchema>;
+                            return {
+                                name: String(typed.name ?? ""),
+                                current_value: Number(typed.current_value ?? 0),
+                                baseline_value: typed.baseline_value == null ? null : Number(typed.baseline_value),
+                                unit: String(typed.unit ?? ""),
+                                delta_pct: typed.delta_pct == null ? null : Number(typed.delta_pct),
+                                samples_60s: Array.isArray(typed.samples_60s)
+                                    ? typed.samples_60s.map((v) => Number(v))
+                                    : [],
+                                severity:
+                                    typed.severity === "primary" || typed.severity === "tertiary"
+                                        ? typed.severity
+                                        : ("secondary" as const),
+                            };
+                        }),
                 );
                 // P0 §3.8: reset rating state when a new intervention arrives.
                 setRating(null);
                 setRatingTextOpen(false);
                 setRatingText("");
                 setWhyOpen(false);
+                setWhyError(null);
                 setApplied(false);
                 break;
             }
@@ -1124,6 +1165,7 @@ function CortexPopup(): React.ReactElement {
                 setRatingTextOpen(false);
                 setRatingText("");
                 setWhyOpen(false);
+                setWhyError(null);
                 setApplied(false);
                 // P0 §3.7 audit fix: when the underlying intervention
                 // ends (dismiss / engage / restore), the standalone
@@ -1135,9 +1177,10 @@ function CortexPopup(): React.ReactElement {
                 break;
             case "BREAK_RECOMMENDATION": {
                 // P0 §3.7: BREAK_RECOMMENDATION pulse relayed from
-                // background.ts. Adopt as a soft pill above the
-                // intervention card.
-                const p = msg.payload as Record<string, unknown>;
+                // background.ts. Typed against the generated
+                // ``BreakRecommendationSchema`` so a future schema-rename
+                // produces a TS error instead of a silent fallthrough.
+                const p = msg.payload as Partial<BreakRecommendationSchema> & Record<string, unknown>;
                 setBreakRec({
                     reason: String(p.reason ?? "stress_integral_crossed_threshold"),
                     urgency:
@@ -1156,27 +1199,39 @@ function CortexPopup(): React.ReactElement {
                 break;
             }
             case "WHY_DETAIL": {
-                // P0 §3.9: on-demand reply to WHY_DETAIL_REQUEST.
-                const p = msg.payload as Record<string, unknown>;
+                // P0 §3.9: on-demand reply to WHY_DETAIL_REQUEST. Typed
+                // against the generated ``WhyDetailSchema`` so a future
+                // rename of ``causal_signals``/``error`` surfaces here
+                // as a TS error rather than a silently-empty drilldown.
+                const p = msg.payload as Partial<WhyDetailSchema> & Record<string, unknown>;
                 const sigs = (p.causal_signals as unknown[]) || [];
                 setCausalSignals(
                     sigs
                         .filter((s): s is Record<string, unknown> => typeof s === "object" && s !== null)
-                        .map((s) => ({
-                            name: String(s.name ?? ""),
-                            current_value: Number(s.current_value ?? 0),
-                            baseline_value: s.baseline_value == null ? null : Number(s.baseline_value),
-                            unit: String(s.unit ?? ""),
-                            delta_pct: s.delta_pct == null ? null : Number(s.delta_pct),
-                            samples_60s: Array.isArray(s.samples_60s)
-                                ? (s.samples_60s as number[]).map((v) => Number(v))
-                                : [],
-                            severity:
-                                s.severity === "primary" || s.severity === "tertiary"
-                                    ? (s.severity as "primary" | "tertiary")
-                                    : ("secondary" as const),
-                        })),
+                        .map((s) => {
+                            const typed = s as Partial<CausalSignalSchema>;
+                            return {
+                                name: String(typed.name ?? ""),
+                                current_value: Number(typed.current_value ?? 0),
+                                baseline_value: typed.baseline_value == null ? null : Number(typed.baseline_value),
+                                unit: String(typed.unit ?? ""),
+                                delta_pct: typed.delta_pct == null ? null : Number(typed.delta_pct),
+                                samples_60s: Array.isArray(typed.samples_60s)
+                                    ? typed.samples_60s.map((v) => Number(v))
+                                    : [],
+                                severity:
+                                    typed.severity === "primary" || typed.severity === "tertiary"
+                                        ? typed.severity
+                                        : ("secondary" as const),
+                            };
+                        }),
                 );
+                // Surface the error string from the daemon when it
+                // could not attribute (e.g. ``handler_not_registered``,
+                // ``not_found``) so the drilldown renders a one-line
+                // dimmed cause instead of a misleading empty state.
+                const errVal = (p as { error?: unknown }).error;
+                setWhyError(typeof errVal === "string" && errVal.length > 0 ? errVal : null);
                 setWhyOpen(true);
                 break;
             }
@@ -1323,15 +1378,15 @@ function CortexPopup(): React.ReactElement {
                 return;
             }
             if (resp.status === 404) {
-                // Endpoint not present yet — queue locally.
-                await chrome.storage.local.set({
-                    pending_feedback: [
-                        ...(((await chrome.storage.local.get(
-                            "pending_feedback",
-                        )).pending_feedback as unknown[]) || []),
-                        body,
-                    ],
-                });
+                // Endpoint not present yet — queue locally. Cap at
+                // ``PENDING_FEEDBACK_MAX`` most-recent entries on every
+                // write so the queue can never grow unboundedly across
+                // months of offline use.
+                const existing = (((await chrome.storage.local.get(
+                    "pending_feedback",
+                )).pending_feedback as unknown[]) || []);
+                const recent = [...existing, body].slice(-PENDING_FEEDBACK_MAX);
+                await chrome.storage.local.set({ pending_feedback: recent });
                 setBugReportStatus("queued");
                 setBugReportText("");
                 return;
@@ -1340,16 +1395,13 @@ function CortexPopup(): React.ReactElement {
             setBugReportError(`Server returned ${resp.status}.`);
         } catch (err) {
             // Network failure — queue locally as well so the user
-            // doesn't lose the report.
+            // doesn't lose the report. Same recent-N bound applies.
             try {
-                await chrome.storage.local.set({
-                    pending_feedback: [
-                        ...(((await chrome.storage.local.get(
-                            "pending_feedback",
-                        )).pending_feedback as unknown[]) || []),
-                        body,
-                    ],
-                });
+                const existing = (((await chrome.storage.local.get(
+                    "pending_feedback",
+                )).pending_feedback as unknown[]) || []);
+                const recent = [...existing, body].slice(-PENDING_FEEDBACK_MAX);
+                await chrome.storage.local.set({ pending_feedback: recent });
                 setBugReportStatus("queued");
                 setBugReportText("");
             } catch {
@@ -1360,6 +1412,50 @@ function CortexPopup(): React.ReactElement {
             }
         }
     }, [bugReportText, bugReportIncludeLogs]);
+
+    // Phase 4d Task H / §3.24 hardening: on popup mount, drain the
+    // ``pending_feedback`` queue against the daemon's ``/api/feedback``
+    // endpoint. Each item that re-POSTs successfully is dropped; the
+    // rest stay queued for the next mount. The queue is hard-capped at
+    // ``PENDING_FEEDBACK_MAX`` at the end of every drain so a long
+    // string of failures cannot bloat ``chrome.storage.local``.
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            let queue: unknown[];
+            try {
+                queue = (((await chrome.storage.local.get(
+                    "pending_feedback",
+                )).pending_feedback as unknown[]) || []);
+            } catch {
+                return;
+            }
+            if (!Array.isArray(queue) || queue.length === 0) return;
+            const remaining: unknown[] = [];
+            for (const item of queue) {
+                if (cancelled) {
+                    remaining.push(item);
+                    continue;
+                }
+                try {
+                    const resp = await fetch(`${DAEMON_HTTP_URL}/api/feedback`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(item),
+                    });
+                    if (!resp.ok) remaining.push(item);
+                } catch {
+                    remaining.push(item);
+                }
+            }
+            if (cancelled) return;
+            try {
+                const capped = remaining.slice(-PENDING_FEEDBACK_MAX);
+                await chrome.storage.local.set({ pending_feedback: capped });
+            } catch { /* storage write failed — leave queue untouched */ }
+        })();
+        return () => { cancelled = true; };
+    }, []);
 
     // P0 §3.3 hardening: the recap card's 24h TTL check at render time
     // hides a stale card on the next paint, but if the popup is left
@@ -1976,6 +2072,23 @@ function CortexPopup(): React.ReactElement {
                             >
                                 {whyOpen ? "Hide why" : "Why?"}
                             </button>
+                            {whyOpen && whyError && (
+                                <div
+                                    data-testid="why-error"
+                                    style={{
+                                        marginTop: 6,
+                                        padding: "6px 10px",
+                                        background: "rgba(255, 255, 255, 0.03)",
+                                        borderRadius: CX.radiusSm,
+                                        color: CX.textSecondary,
+                                        fontSize: 10,
+                                        fontFamily: CX.font,
+                                        fontStyle: "italic",
+                                    }}
+                                >
+                                    Cause data temporarily unavailable: {whyError}
+                                </div>
+                            )}
                             {whyOpen && causalSignals.length > 0 && (
                                 <div
                                     style={{
@@ -2182,9 +2295,9 @@ function CortexPopup(): React.ReactElement {
                     )}
 
                     {/* P0 §3.8: rating row — surfaces after action click
-                        or 30 s, whichever comes first. 👎 reveals an
-                        optional one-line text input the user can skip
-                        with Enter. Rating + text are routed via
+                        or 30 s, whichever comes first. "Not helpful"
+                        reveals an optional one-line text input the user
+                        can skip with Enter. Rating + text are routed via
                         background.ts → USER_RATING WS frame.
                         Spec line 710: only show on guided_mode +
                         simplified_workspace to keep minimal-tone
@@ -2226,9 +2339,11 @@ function CortexPopup(): React.ReactElement {
                                     borderRadius: CX.radiusSm,
                                     padding: "6px 12px",
                                     cursor: "pointer",
-                                    fontSize: 14,
+                                    fontSize: 12,
+                                    fontFamily: CX.font,
+                                    fontWeight: 500,
                                 }}
-                            >👍</button>
+                            >Helpful</button>
                             <button
                                 data-testid="rating-thumbs-down"
                                 aria-label="Mark unhelpful"
@@ -2254,9 +2369,11 @@ function CortexPopup(): React.ReactElement {
                                     borderRadius: CX.radiusSm,
                                     padding: "6px 12px",
                                     cursor: "pointer",
-                                    fontSize: 14,
+                                    fontSize: 12,
+                                    fontFamily: CX.font,
+                                    fontWeight: 500,
                                 }}
-                            >👎</button>
+                            >Not helpful</button>
                         </div>
                     )}
 

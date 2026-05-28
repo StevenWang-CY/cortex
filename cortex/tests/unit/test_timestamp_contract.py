@@ -12,8 +12,6 @@ from __future__ import annotations
 
 import time
 
-import pytest
-
 from cortex.libs.schemas.features import FeatureVector, FrameMeta
 from cortex.libs.schemas.state import (
     SignalQuality,

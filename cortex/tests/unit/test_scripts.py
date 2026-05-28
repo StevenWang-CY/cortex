@@ -2,7 +2,7 @@
 Tests for Phase 15: Scripts & Developer Tools
 
 Tests cover:
-- run_dev: DevServer creation, signal handling, ServiceProcess lifecycle
+- run_dev: DevServer creation, signal handling
 - run_capture: argument parsing, statistics computation
 - run_llm_server: status checking, argument parsing
 - calibrate: simulation, baseline computation, save/load
@@ -25,31 +25,6 @@ import pytest
 # ============================================================================
 
 
-class TestServiceProcess:
-    """Tests for ServiceProcess lifecycle."""
-
-    def test_create_service_process(self):
-        from cortex.scripts.run_dev import ServiceProcess
-
-        proc = ServiceProcess("test-svc", lambda: None)
-        assert proc.name == "test-svc"
-        assert proc.process is None
-        assert not proc.alive
-
-    def test_alive_when_no_process(self):
-        from cortex.scripts.run_dev import ServiceProcess
-
-        proc = ServiceProcess("x", lambda: None)
-        assert not proc.alive
-
-    def test_stop_when_no_process(self):
-        from cortex.scripts.run_dev import ServiceProcess
-
-        proc = ServiceProcess("x", lambda: None)
-        # Should not raise
-        proc.stop()
-
-
 class TestDevServer:
     """Tests for DevServer initialization."""
 
@@ -58,7 +33,7 @@ class TestDevServer:
 
         server = DevServer()
         assert server.config is not None
-        assert server._processes == []
+        assert server._tasks == []
 
     def test_create_with_custom_config(self):
         from cortex.libs.config.settings import CortexConfig
@@ -76,32 +51,6 @@ class TestRunDevMain:
         from cortex.scripts.run_dev import main
 
         assert callable(main)
-
-    def test_async_services_list(self):
-        from cortex.scripts.run_dev import _ASYNC_SERVICES
-
-        assert "capture_service" in _ASYNC_SERVICES
-        assert "physio_engine" in _ASYNC_SERVICES
-        assert "state_engine" in _ASYNC_SERVICES
-
-    def test_run_ws_server_uses_api_config_object(self):
-        from cortex.libs.config.settings import CortexConfig
-        from cortex.scripts.run_dev import _run_ws_server
-
-        config = CortexConfig()
-
-        def _close_coro(coro):
-            coro.close()
-
-        with patch("cortex.services.api_gateway.websocket_server.WebSocketServer") as ws_cls:
-            with patch(
-                "cortex.scripts.run_dev.asyncio.run",
-                side_effect=_close_coro,
-            ) as run_mock:
-                _run_ws_server(config)
-
-        ws_cls.assert_called_once_with(config.api)
-        run_mock.assert_called_once()
 
 
 # ============================================================================

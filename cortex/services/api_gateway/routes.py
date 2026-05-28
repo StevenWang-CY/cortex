@@ -581,7 +581,10 @@ async def prometheus_metrics() -> Response:
       cortex_daemon_uptime_seconds
     """
     import prometheus_client
-    from cortex.libs.observability import metrics as _m  # noqa: F401 — side-effect import registers metrics
+
+    from cortex.libs.observability import (
+        metrics as _m,  # noqa: F401 — side-effect import registers metrics
+    )
 
     data = prometheus_client.generate_latest(prometheus_client.REGISTRY)
     return Response(
@@ -1163,6 +1166,15 @@ async def reset_consent(
     _ = body  # currently no fields to apply; reserved for future use
     reg = _get_registry(request)
     ladder = reg.get("consent_ladder")
+    # Audit forensic-trail: emit the CONSENT_RESET event before
+    # mutating the ladder so we record the request even if the reset
+    # itself raises mid-flight.
+    logger.info(
+        "%s cid=%s ladder_present=%s",
+        EventType.CONSENT_RESET.value,
+        get_correlation_id() or "-",
+        ladder is not None,
+    )
     if ladder is not None and hasattr(ladder, "reset"):
         await ladder.reset()
         states = await ladder.get_all_states()
@@ -1299,7 +1311,11 @@ async def get_cost(request: Request) -> CostResponse:
                     prompt_tokens = got
                     break
             except Exception:
-                pass
+                logger.debug(
+                    "cost tracker attr probe raised",
+                    exc_info=True,
+                    extra={"attr": attr},
+                )
     for attr in ("completion_tokens_today", "total_completion_tokens"):
         val = getattr(tracker, attr, None)
         if isinstance(val, int):
@@ -1312,7 +1328,11 @@ async def get_cost(request: Request) -> CostResponse:
                     completion_tokens = got
                     break
             except Exception:
-                pass
+                logger.debug(
+                    "cost tracker attr probe raised",
+                    exc_info=True,
+                    extra={"attr": attr},
+                )
 
     return CostResponse(
         cost_today=cost_today,
@@ -1464,12 +1484,34 @@ async def get_session_detail(
     traversal). A missing / unparsable file returns
     ``{report: None, error: "not_found"|"unreadable"}``.
     """
+    import asyncio as _asyncio
+
     reg = _get_registry(request)
     daemon = reg.get("daemon")
     if daemon is None or not hasattr(daemon, "get_session"):
         return SessionDetailResponse(report=None, error="not_found")
     try:
-        return await daemon.get_session(session_id)
+        # Hard ceiling so a pathological JSON file can't pin a worker
+        # in the asyncio thread pool forever. The daemon delegates the
+        # actual read to ``asyncio.to_thread``; the cancellation here
+        # frees this request even if the worker is still grinding.
+        return await _asyncio.wait_for(
+            daemon.get_session(session_id),
+            timeout=10.0,
+        )
+    except TimeoutError:
+        # Deviation note: the audit plan asked for ``error="timeout"``,
+        # but :class:`SessionDetailResponse.error` is a strict Literal
+        # owned by another phase (``cortex/libs/schemas/*``) that does
+        # NOT include ``"timeout"``. We map to ``"internal"`` (which
+        # IS in the literal) and surface the cause in the WARN log so
+        # operators can still distinguish a timeout from a generic
+        # callback exception when triaging.
+        logger.warning(
+            "GET /api/sessions/%s timed out after 10s — mapped to error='internal'",
+            session_id,
+        )
+        return SessionDetailResponse(report=None, error="internal")
     except Exception:
         logger.exception("GET /api/sessions/{} failed", session_id)
         return SessionDetailResponse(report=None, error="unreadable")
@@ -1478,14 +1520,17 @@ async def get_session_detail(
 @router.get("/api/trends", response_model=TrendsResponse)
 async def get_trends_route(
     request: Request,
-    window: Literal["week", "month", "quarter"] = "week",
+    window: Literal["week", "month"] = "week",
     refresh: bool = False,
 ) -> TrendsResponse:
     """P0 §3.2: longitudinal trend / chronotype rollup.
 
     Query params:
-        window: ``"week"`` (last 7 days), ``"month"`` (last 30), or
-            ``"quarter"`` (last 90).
+        window: ``"week"`` (last 7 days) or ``"month"`` (last 30).
+            The TrendsRequest / TrendsResponse schemas only support
+            these two values; "quarter" was a stale doc claim that
+            FastAPI accepted at the route boundary but the response
+            schema rejected — leading to 500s instead of a 422.
         refresh: when True, forces a recompute from disk before
             returning (slower but always-fresh). Defaults to False
             so the dashboard serves the cached ``model.json``.

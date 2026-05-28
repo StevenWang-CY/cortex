@@ -291,6 +291,16 @@ else
         "${APP_PATH}"
 fi
 
+# Post-sign verification — catches signing regressions before the user
+# sees a Gatekeeper bounce. ``codesign --verify`` is authoritative for
+# both ad-hoc and Developer ID bundles; ``spctl`` is warn-only for
+# ad-hoc because Gatekeeper rejects unsigned binaries by design.
+if ! codesign --verify --deep --strict --verbose=2 "${APP_PATH}"; then
+    echo "[FATAL] codesign --verify failed for ${APP_PATH}" >&2
+    exit 1
+fi
+spctl -a -v --type execute "${APP_PATH}" 2>&1 || true
+
 # ── Step 8: Create DMG ────────────────────────────────────────────────────
 DMG_PATH="${DIST_DIR}/Cortex.dmg"
 echo "→ Creating DMG..."
@@ -329,6 +339,13 @@ fi
 
 if [ ! -f "${DMG_PATH}" ]; then
     echo "ERROR: DMG was not generated at ${DMG_PATH}" >&2
+    exit 1
+fi
+
+# Verify DMG integrity — corrupt UDZO archives bounce silently at
+# install time, so block the build now if hdiutil disagrees.
+if ! hdiutil verify "${DMG_PATH}"; then
+    echo "[FATAL] hdiutil verify failed for ${DMG_PATH}" >&2
     exit 1
 fi
 

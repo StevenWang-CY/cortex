@@ -594,7 +594,6 @@ def _check_in_sync() -> int:
     ``--check`` is idempotent and writes nothing to disk.
     """
     import difflib
-    import tempfile
 
     data = _load()
     targets = [

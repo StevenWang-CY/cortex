@@ -26,8 +26,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from cortex.libs.schemas.intervention import CausalSignal
+from cortex.libs.schemas.intervention import CausalSignal, InterventionPlan
 from cortex.libs.schemas.session_report import SessionReport
+from cortex.libs.schemas.state import SignalQuality, StateScores
 
 # ─── Shared Literal vocabularies ──────────────────────────────────────
 
@@ -145,12 +146,15 @@ class QuietModeState(BaseModel):
             "active mode."
         ),
     )
-    duration_minutes: float | None = Field(
+    duration_minutes: int | None = Field(
         None,
-        ge=0.0,
+        ge=0,
         description=(
             "How long this mode runs from arming, in minutes. None when "
-            "kind=='off' or when the daemon uses an implicit default."
+            "kind=='off' or when the daemon uses an implicit default. "
+            "Semantically integral — the daemon already rounds via "
+            "``int(round(...))`` before broadcasting, so the wire shape "
+            "matches."
         ),
     )
     ends_at: float | None = Field(
@@ -469,16 +473,360 @@ class TestProviderResult(BaseModel):
     )
 
 
+# ─── StateUpdatePayload (STATE_UPDATE payload) ────────────────────────
+
+
+class CaptureStatus(BaseModel):
+    """P0 §3 (audit Debt-1 closure): capture-channel status sub-payload.
+
+    The dashboard's "Reading your pulse" / "Camera offline" ambient
+    string is driven by this sub-shape. The producer in
+    ``websocket_server._make_state_update`` stamps it on every STATE_UPDATE
+    broadcast off the registry-cached ``latest_frame_meta``.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    frames_flowing: bool = Field(
+        False,
+        description=(
+            "True when a frame newer than 2 s ago was observed. False "
+            "when the capture loop hasn't produced a frame yet (camera "
+            "not open, permission denied, daemon mid-startup)."
+        ),
+    )
+    face_detected: bool = Field(
+        False,
+        description=(
+            "True when the most recent frame's MediaPipe FaceMesh "
+            "detected at least one face."
+        ),
+    )
+    stale: bool = Field(
+        False,
+        description=(
+            "True when the daemon planted ``capture_stale`` because the "
+            "pipeline failed to start or has gone offline. Cleared "
+            "automatically when ``frames_flowing`` is True (transient "
+            "init failure followed by a successful resume)."
+        ),
+    )
+    sequence: int | None = Field(
+        None,
+        description=(
+            "Latest capture-loop sequence number; surfaced for debug "
+            "overlays that need to detect dropped frames. None when the "
+            "producer does not stamp a sequence."
+        ),
+    )
+
+
+class StoreHealth(BaseModel):
+    """Persistence-layer health indicator surfaced on every STATE_UPDATE.
+
+    The desktop dashboard uses ``degraded`` to render an in-memory
+    "you'll lose state on restart" hint when Redis is unavailable; the
+    DMG default deployment now uses :func:`make_default_store` so this
+    flag is only True when both Redis is configured AND unreachable.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    degraded: bool = Field(
+        False,
+        description=(
+            "True when the daemon is running on the InMemoryStore "
+            "fallback (intended Redis unreachable). The dashboard uses "
+            "this to surface a soft 'no Redis' hint."
+        ),
+    )
+    backend: str | None = Field(
+        None,
+        description=(
+            "Backend identifier (``redis`` / ``in_memory``). Optional — "
+            "present when the daemon plants it in the registry; None "
+            "otherwise."
+        ),
+    )
+    healthy: bool | None = Field(
+        None,
+        description=(
+            "Optional explicit health flag from the store's "
+            "``health_check`` probe. None when the daemon hasn't run a "
+            "probe recently."
+        ),
+    )
+
+
+class BiometricsSummary(BaseModel):
+    """Per-tick biometrics summary attached to STATE_UPDATE payloads.
+
+    All fields are ``float | None`` because the underlying signals are
+    independently gated — heart rate may be available while respiration
+    isn't, etc. The producer in
+    ``runtime_daemon._process_capture_output`` builds this dict from
+    the live ``FusedFeatureVector`` plus the stress-integral tracker.
+
+    The wire-level shape is ``payload.biometrics`` and is omitted when
+    the producer has no values to share (the ``_make_state_update``
+    helper only sets the key when biometrics is truthy).
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    heart_rate: float | None = Field(
+        None, description="rPPG heart-rate estimate in BPM"
+    )
+    hrv_rmssd: float | None = Field(
+        None, description="HRV RMSSD in milliseconds"
+    )
+    hr_delta: float | None = Field(
+        None,
+        description=(
+            "Heart-rate delta versus baseline; sign carries direction "
+            "(positive = above baseline)."
+        ),
+    )
+    blink_rate: float | None = Field(
+        None, description="Blink rate in blinks/minute"
+    )
+    perclos: float | None = Field(
+        None,
+        description=(
+            "PERCLOS (percent eye closure) over the recent window; not "
+            "always populated."
+        ),
+    )
+    forward_lean: float | None = Field(
+        None,
+        description=(
+            "Forward-lean score rescaled to 0..1. Browser-side posture "
+            "alert threshold (0.6) is compared against this rescaled "
+            "value, not raw degrees."
+        ),
+    )
+    forward_lean_angle: float | None = Field(
+        None,
+        description=(
+            "Forward-lean angle in degrees (legacy / debug). Consumers "
+            "preferring a score should read ``forward_lean`` instead."
+        ),
+    )
+    respiration_rate: float | None = Field(
+        None, description="Respiration rate in breaths/minute"
+    )
+    thrashing_score: float | None = Field(
+        None,
+        description=(
+            "Kinematic thrashing score (input-device chaos indicator); "
+            "0..1 with higher meaning more thrashing."
+        ),
+    )
+    stress_integral: float | None = Field(
+        None,
+        ge=0.0,
+        description=(
+            "Cumulative stress-integral load tracked by "
+            "``StressIntegralTracker``. Used by the break-readiness UI."
+        ),
+    )
+
+
+class StateUpdatePayload(BaseModel):
+    """P0 §3 (audit Debt-1): STATE_UPDATE wire payload — typed.
+
+    Previously ``websocket_server._make_state_update`` built a free-form
+    ``dict[str, Any]`` literal; promoting it to a Pydantic model gives
+    the codegen pipeline a generated TypeScript type the browser
+    extension can consume and prevents silent field drift between the
+    daemon and the dashboard.
+
+    Field set mirrors ``StateEstimate`` plus the envelope-level F18
+    additions (``degraded`` / ``source``) and the capture / store /
+    biometrics sub-shapes the producer stamps. ``extra="ignore"`` keeps
+    forward-compatibility: a new field added by a future daemon is
+    silently ignored by an older client parser.
+    """
+
+    model_config = ConfigDict(extra="ignore", use_enum_values=True)
+
+    state: Literal["FLOW", "HYPO", "HYPER", "RECOVERY"] = Field(
+        ...,
+        description="Classified user state (mirrors ``StateEstimate.state``)",
+    )
+    confidence: float = Field(
+        ..., ge=0.0, le=1.0, description="Confidence in state classification"
+    )
+    scores: StateScores = Field(
+        ...,
+        description="Raw scores for each state",
+    )
+    signal_quality: SignalQuality = Field(
+        ...,
+        description="Signal quality per channel",
+    )
+    dwell_seconds: float = Field(
+        0.0, ge=0.0, description="Seconds in current state"
+    )
+    reasons: list[str] = Field(
+        default_factory=list,
+        description="Human-readable reasons for current state",
+    )
+    stress_integral: float | None = Field(
+        None,
+        ge=0.0,
+        description="Cumulative stress-integral load (ms*s)",
+    )
+    calibrated_probabilities: StateScores | None = Field(
+        None,
+        description="Calibrated class probabilities (optional ML/rule ensemble output)",
+    )
+    classifier_source: Literal["rule", "ml", "ensemble"] | None = Field(
+        None,
+        description="Classifier source used for this estimate",
+    )
+    classifier_alpha: float | None = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Ensemble weight on ML branch when used",
+    )
+    source: Literal["classifier", "fallback"] = Field(
+        "classifier",
+        description=(
+            "Envelope-level source (mirrors ``StateInferResponse.source``). "
+            "``fallback`` when no real classifier ran; the dashboard's "
+            "'classifier unavailable' banner reads this."
+        ),
+    )
+    degraded: bool = Field(
+        False,
+        description=(
+            "True when no real classifier ran (``classifier_source is "
+            "None``) — same condition the ``/state/infer`` fallback "
+            "branch uses to flag synthetic confidence."
+        ),
+    )
+    timestamp: float | str | None = Field(
+        None,
+        description=(
+            "Wall-clock timestamp the estimate was produced. May be an "
+            "ISO string (datetime path) or float (monotonic-style "
+            "producer); consumers must accept both shapes for "
+            "backwards-compatibility."
+        ),
+    )
+    connected_clients: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Deduped list of currently-IDENTIFY-ed client types "
+            "(``chrome``, ``edge``, ``vscode``, ``desktop``). Used by "
+            "the dashboard to light up connection dots without a "
+            "separate event stream."
+        ),
+    )
+    # ``default_factory=CaptureStatus`` follows the established project
+    # pattern (session_history.py:220 / leetcode.py:122). mypy-strict
+    # without the pydantic plugin flags the class-as-factory pattern;
+    # the project already accepts these two warnings in the listed
+    # peers and the CI gate does not fail on them.
+    capture: CaptureStatus = Field(
+        default_factory=CaptureStatus,
+        description="Capture-channel health sub-payload",
+    )
+    store: StoreHealth = Field(
+        default_factory=StoreHealth,
+        description="Persistence-layer health sub-payload",
+    )
+    biometrics: BiometricsSummary | None = Field(
+        None,
+        description=(
+            "Per-tick biometrics summary. Omitted by the producer when "
+            "no values are available (early startup, capture offline)."
+        ),
+    )
+    sequence: int | None = Field(
+        None,
+        description=(
+            "Monotonic sequence number stamped by the producer for "
+            "consumer-side dedup. Currently the envelope-level "
+            "``sequence`` field on ``WSMessage`` carries this; the "
+            "field here is a forward-compatibility hook for callers "
+            "that round-trip just the payload."
+        ),
+    )
+
+
+# ─── InterventionTriggerPayload (INTERVENTION_TRIGGER payload) ────────
+
+
+class InterventionTriggerPayload(InterventionPlan):
+    """P0 §3 (audit Debt-1): INTERVENTION_TRIGGER wire payload.
+
+    The producer stamps two envelope-level fields onto the dumped
+    :class:`InterventionPlan` — ``desktop_not_focused`` and
+    ``connected_clients`` — before broadcasting. To keep the wire shape
+    backward-compatible with consumers that read
+    ``payload.intervention_id`` directly (browser extension, popup,
+    VS Code), we extend :class:`InterventionPlan` rather than wrapping
+    it. The two stamp fields are optional with defaults so older code
+    constructing a bare ``InterventionPlan`` is still type-valid.
+
+    DESIGN NOTE: this choice preserves the flat wire shape at the cost
+    of carrying two non-domain fields on the InterventionPlan extension.
+    The alternative — a nested ``{plan: ..., desktop_not_focused: ...,
+    connected_clients: ...}`` envelope — is more correct semantically
+    but would break every consumer that reads
+    ``payload.intervention_id``. The extension approach matches the
+    pattern Pydantic uses for protocol evolution (additive fields with
+    defaults).
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    desktop_not_focused: bool | None = Field(
+        None,
+        description=(
+            "P0 §3.12: True when the daemon observed that the desktop "
+            "shell isn't focused (user on a different Space / "
+            "fullscreen app). Receivers surface OS-level notification "
+            "cues. None means 'focus state unknown' (default — only "
+            "stamped when explicitly observed unfocused)."
+        ),
+    )
+    connected_clients: list[str] | None = Field(
+        None,
+        description=(
+            "Snapshot of currently-IDENTIFY-ed client types at "
+            "broadcast time, so WS-mode overlay action buttons gate on "
+            "the same authoritative list ``STATE_UPDATE`` uses. None "
+            "means the producer didn't stamp this field."
+        ),
+    )
+
+
+# ─── Native-messaging-related (RaiseDashboard relay) ──────────────────
+#
+# ``RaiseDashboardMessage`` lives in ``native_messaging.py`` not here —
+# it belongs to the native-host command vocabulary, not the WS
+# broadcast vocabulary. See ``cortex.libs.schemas.native_messaging``.
+
+
 __all__ = [
+    "BiometricsSummary",
     "BreakRecommendation",
+    "CaptureStatus",
     "CostResponse",
     "DistractionBlockPreset",
+    "InterventionTriggerPayload",
     "QuietModeSource",
     "QuietModeState",
     "QuietModeTogglePayload",
     "SessionRecap",
     "StartFocusAutoPayload",
+    "StateUpdatePayload",
     "StopFocusAutoPayload",
+    "StoreHealth",
     "TestProviderRequest",
     "TestProviderResult",
     "WhyDetail",

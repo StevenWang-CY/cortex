@@ -150,6 +150,13 @@ class EventType(StrEnum):
     # eventual user click / dismiss.
     OS_NOTIFICATION_SENT = "os_notification_sent"
 
+    # Audit forensic-trail event: the user (or an automated test rig)
+    # called ``POST /consent/reset`` and cleared the consent ladder.
+    # Carries the bound correlation id so the action can be tied back
+    # to whichever WS / HTTP client originated the request. Records
+    # "who reset what when" for audit.
+    CONSENT_RESET = "consent_reset"
+
 
 class StateTransitionEvent(BaseModel):
     """State transition event data."""

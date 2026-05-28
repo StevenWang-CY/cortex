@@ -17,15 +17,18 @@ Endpoints:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import pathlib
+import re
 import shlex
 import signal
-import socket
 import subprocess
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+logger = logging.getLogger(__name__)
 
 PORT = 9471
 DAEMON_WS_PORT = 9473
@@ -40,6 +43,29 @@ DAEMON_HTTP_PORT = 9472
 # ``cortex/libs/auth/local_token.py``.
 
 _AUTH_TOKEN_HEADER = "X-Cortex-Auth-Token"
+
+# CORS lockdown (audit fix): the previous ``*`` wildcard echoed
+# ``Access-Control-Allow-Origin`` on every request, which let any open
+# tab read ``/status`` and exfiltrate the project root, Python path and
+# daemon PID via XHR. Browser extensions present an Origin of the form
+# ``chrome-extension://<id>`` (or ``extension://`` for some Firefox-like
+# builds); we echo the Origin only when it matches one of these
+# patterns, otherwise we omit the CORS header entirely so the browser
+# blocks the cross-origin response.
+_ALLOWED_ORIGIN_PATTERNS = (
+    re.compile(r"^chrome-extension://[a-zA-Z0-9_-]+$"),
+    re.compile(r"^extension://[a-zA-Z0-9_-]+$"),
+)
+
+
+def _allowed_origin(origin: str | None) -> str | None:
+    """Return ``origin`` iff it matches an extension scheme, else None."""
+    if not origin:
+        return None
+    for pat in _ALLOWED_ORIGIN_PATTERNS:
+        if pat.match(origin):
+            return origin
+    return None
 
 
 def _auth_token_path() -> str:
@@ -76,6 +102,7 @@ def _verify_auth_token(presented: str | None) -> bool:
     try:
         return hmac.compare_digest(stored, presented.strip())
     except Exception:
+        logger.debug("auth token compare_digest raised", exc_info=True)
         return False
 
 
@@ -101,28 +128,30 @@ def _python_path() -> str:
 
 
 def _is_daemon_running() -> bool:
-    """Check if the Cortex daemon is listening on its WebSocket port."""
-    try:
-        with socket.create_connection(("127.0.0.1", DAEMON_WS_PORT), timeout=1):
-            return True
-    except (ConnectionRefusedError, OSError):
-        return False
+    """Return True iff at least one daemon PID is alive.
+
+    Audit fix: the previous implementation only TCP-probed the WS port.
+    That returned True for any process binding 127.0.0.1:9473 — including
+    orphaned daemons whose camera handle is stale, or unrelated tools
+    that grabbed the port. Combining port + pgrep (via
+    ``_find_all_daemon_pids``) closes the "already_running" false
+    positive that bounced the extension's Launch button.
+    """
+    return bool(_find_all_daemon_pids())
 
 
 def _find_daemon_pid() -> int | None:
-    """Find the PID of the process listening on the daemon WebSocket port."""
-    try:
-        result = subprocess.run(
-            ["lsof", "-ti", f"tcp:{DAEMON_WS_PORT}"],
-            capture_output=True, text=True, timeout=5,
-        )
-        for line in result.stdout.strip().split("\n"):
-            line = line.strip()
-            if line.isdigit():
-                return int(line)
-    except Exception:
-        pass
-    return None
+    """Return one daemon PID (port + pgrep), or None.
+
+    Used by /status. Delegates to ``_find_all_daemon_pids`` so a daemon
+    that lost its port binding but still holds the camera is still
+    reported.
+    """
+    pids = _find_all_daemon_pids()
+    if not pids:
+        return None
+    # Stable ordering for log/UI purposes.
+    return min(pids)
 
 
 CORTEX_APP_PATH = "/Applications/Cortex.app"
@@ -232,7 +261,7 @@ def _find_all_daemon_pids() -> set[int]:
                 if line.isdigit():
                     pids.add(int(line))
         except Exception:
-            pass
+            logger.debug("lsof probe failed (port=%d)", port, exc_info=True)
     try:
         result = subprocess.run(
             ["pgrep", "-f", "cortex.scripts.run_dev"],
@@ -243,7 +272,7 @@ def _find_all_daemon_pids() -> set[int]:
             if line.isdigit():
                 pids.add(int(line))
     except Exception:
-        pass
+        logger.debug("pgrep run_dev failed", exc_info=True)
     # Bundled app process name/path for DMG installs.
     try:
         result = subprocess.run(
@@ -255,7 +284,7 @@ def _find_all_daemon_pids() -> set[int]:
             if line.isdigit():
                 pids.add(int(line))
     except Exception:
-        pass
+        logger.debug("pgrep Cortex.app failed", exc_info=True)
     return pids
 
 
@@ -270,7 +299,7 @@ def _stop_daemon() -> dict:
         )
         urllib.request.urlopen(req, timeout=2)
     except Exception:
-        pass
+        logger.debug("HTTP /shutdown probe failed", exc_info=True)
 
     # Step 2: SIGTERM all daemon PIDs
     pids = _find_all_daemon_pids()
@@ -280,7 +309,7 @@ def _stop_daemon() -> dict:
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
-            pass
+            logger.debug("SIGTERM target pid %d already gone", pid)
 
     # Step 3: Wait for graceful shutdown
     for _ in range(6):
@@ -293,7 +322,7 @@ def _stop_daemon() -> dict:
         try:
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
-            pass
+            logger.debug("SIGKILL target pid %d already gone", pid)
     return {"status": "stopped"}
 
 
@@ -305,19 +334,33 @@ class LauncherHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        # CORS — allow Chrome extension to call us
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        # CORS lockdown: echo Origin only when it matches an extension
+        # scheme (see ``_allowed_origin``). The previous ``*`` wildcard
+        # let any tab read /status and exfiltrate the project root.
+        origin = _allowed_origin(self.headers.get("Origin"))
+        if origin is not None:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                f"Content-Type, {_AUTH_TOKEN_HEADER}",
+            )
         self.end_headers()
         self.wfile.write(body)
 
     def do_OPTIONS(self) -> None:
-        """Handle CORS preflight."""
+        """Handle CORS preflight — extension origins only."""
+        origin = _allowed_origin(self.headers.get("Origin"))
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        if origin is not None:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                f"Content-Type, {_AUTH_TOKEN_HEADER}",
+            )
         self.end_headers()
 
     def do_GET(self) -> None:
@@ -389,6 +432,7 @@ def _check_existing_launcher() -> bool:
         data = json.loads(resp.read())
         return data.get("ok") is True
     except Exception:
+        logger.debug("existing-launcher probe failed", exc_info=True)
         return False
 
 

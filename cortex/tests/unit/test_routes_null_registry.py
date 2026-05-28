@@ -19,11 +19,10 @@ from fastapi.testclient import TestClient
 
 from cortex.services.api_gateway.routes import (
     _EMPTY_REGISTRY,
-    _NullRegistry,
     _get_registry,
+    _NullRegistry,
     health_router,
 )
-
 
 # ---------------------------------------------------------------------------
 # Unit: _get_registry with no registry on app state

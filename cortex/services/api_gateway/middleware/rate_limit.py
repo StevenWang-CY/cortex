@@ -142,7 +142,23 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         while bucket and bucket[0] <= cutoff:
             bucket.popleft()
 
+        # Audit-prod fix (memory leak): ``self._buckets`` is a
+        # ``defaultdict`` keyed on ``(ip, route)`` — under client churn
+        # (short-lived IPs from a fuzzer, localhost extension restart
+        # loop) the dict would otherwise grow without bound. After
+        # draining the sliding window above, opportunistically evict
+        # empty buckets so the dict is bounded by the count of *active*
+        # (in-window) clients rather than the lifetime sum of all
+        # clients ever seen. The next call from the same ``(ip, route)``
+        # will simply re-create the empty deque via the defaultdict.
+        if not bucket:
+            self._buckets.pop((ip, route), None)
+
         if len(bucket) < cap:
+            # Re-fetch the bucket because the eviction above may have
+            # removed it. ``self._buckets`` is a defaultdict so the
+            # subscript re-creates an empty deque on demand.
+            bucket = self._buckets[(ip, route)]
             bucket.append(now)
             return None
 

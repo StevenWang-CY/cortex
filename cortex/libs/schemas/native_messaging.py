@@ -151,8 +151,32 @@ class GetAuthTokenMessage(_Base):
     command: Literal["get_auth_token"]
 
 
+class RaiseDashboardMessage(_Base):
+    """``{"command":"raise_dashboard", "target":"desktop"}``.
+
+    Audit-prod Phase-4 closure: native_host.py was peeking the raw JSON
+    for this command and dispatching outside the Pydantic-validated
+    union. Promoting the command to a typed message gives the same
+    validation guarantees the rest of the native-host vocabulary has,
+    and lets the codegen pipeline emit a generated TypeScript type for
+    the extension's side of the channel.
+
+    ``target`` is a short string identifying the surface to raise (the
+    desktop shell window, an editor host, etc.). The 64-char cap is
+    generous for short identifiers and prevents a hostile / malformed
+    extension from blowing up the host with a megabyte target.
+    """
+
+    command: Literal["raise_dashboard"]
+    target: str = Field(..., max_length=64)
+
+
 NativeMessage = Annotated[
-    LaunchMessage | StopMessage | StatusMessage | GetAuthTokenMessage,
+    LaunchMessage
+    | StopMessage
+    | StatusMessage
+    | GetAuthTokenMessage
+    | RaiseDashboardMessage,
     Field(discriminator="command"),
 ]
 
@@ -232,6 +256,7 @@ __all__ = [
     "MAX_MESSAGE_BYTES",
     "NativeMessage",
     "ParseResult",
+    "RaiseDashboardMessage",
     "StatusMessage",
     "StopMessage",
     "parse_native_message",

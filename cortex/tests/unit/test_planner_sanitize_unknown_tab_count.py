@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import logging
 
-import pytest
-
 from cortex.libs.schemas.intervention import (
     InterventionPlan,
     MicroStep,

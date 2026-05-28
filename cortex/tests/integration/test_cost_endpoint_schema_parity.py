@@ -10,17 +10,14 @@ Verifies:
 from __future__ import annotations
 
 import asyncio
-import json
 from pathlib import Path
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from cortex.libs.schemas.realtime import CostResponse
 from cortex.services.api_gateway.app import create_app, registry
-
 
 # ─── Expected canonical keys ──────────────────────────────────────────
 

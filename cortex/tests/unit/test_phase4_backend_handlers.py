@@ -10,12 +10,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
-from collections import Counter
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 
 # ---------------------------------------------------------------------
 # B1 — capture-unavailable propagation
@@ -28,13 +26,13 @@ async def test_b1_capture_unavailable_emits_stale_broadcast() -> None:
     a STATE_UPDATE with ``capture.stale=True`` so clients learn within one
     cycle that the camera channel is offline.
     """
-    from cortex.services.api_gateway import app as app_module
-    from cortex.services.api_gateway.websocket_server import WebSocketServer
     from cortex.libs.schemas.state import (
         SignalQuality,
         StateEstimate,
         StateScores,
     )
+    from cortex.services.api_gateway import app as app_module
+    from cortex.services.api_gateway.websocket_server import WebSocketServer
 
     server = WebSocketServer()
     sent: list[dict[str, Any]] = []
@@ -115,6 +113,52 @@ async def test_b2_duplicate_intervention_ack_counter_increments(
 
 
 # ---------------------------------------------------------------------
+# Audit fix — INTERVENTION_APPLIED failure populates Mutation.reason
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_failed_intervention_ack_populates_mutation_reason() -> None:
+    """A failure ack must surface its error_text on ``Mutation.reason``.
+
+    Regression guard for the audit fix: the daemon used to set
+    ``mutation.error`` — a never-defined attribute on the Mutation
+    dataclass — so the failure cause silently disappeared. We now
+    write to the real ``reason: str | None`` field and preserve any
+    prior structured reason.
+    """
+    from cortex.services.intervention_engine.executor import Mutation
+    from cortex.services.runtime_daemon import CortexDaemon
+
+    daemon = CortexDaemon()
+    mut_a = Mutation(adapter="browser", action="hide_tabs_except_active")
+    mut_b = Mutation(
+        adapter="editor",
+        action="collapse_before_error",
+        reason="prior_consent_denied",
+    )
+    captured = [mut_a, mut_b]
+    daemon._executor.get_active_mutations = (  # type: ignore[assignment]
+        lambda iid: captured
+    )
+
+    await daemon._handle_intervention_applied(
+        {
+            "intervention_id": "iv_audit_reason",
+            "phase": "apply",
+            "success": False,
+            "errors": ["adapter_missing", "tab_index_out_of_range"],
+        }
+    )
+
+    assert mut_a.success is False
+    assert mut_a.reason == "adapter_missing; tab_index_out_of_range"
+    # Pre-existing structured reason MUST be preserved (not overwritten
+    # by the generic concatenation).
+    assert mut_b.reason == "prior_consent_denied"
+
+
+# ---------------------------------------------------------------------
 # B3 — pipeline frame-drop counter
 # ---------------------------------------------------------------------
 
@@ -163,13 +207,13 @@ async def test_b4_store_degraded_indicator_in_broadcast() -> None:
     STATE_UPDATE carries ``store.degraded=True`` so the dashboard's
     connectivity strip can light up its yellow indicator.
     """
-    from cortex.services.api_gateway import app as app_module
-    from cortex.services.api_gateway.websocket_server import WebSocketServer
     from cortex.libs.schemas.state import (
         SignalQuality,
         StateEstimate,
         StateScores,
     )
+    from cortex.services.api_gateway import app as app_module
+    from cortex.services.api_gateway.websocket_server import WebSocketServer
 
     server = WebSocketServer()
     sent: list[dict[str, Any]] = []
@@ -208,8 +252,9 @@ def test_b5_feedback_log_read_failure_warning(caplog: pytest.LogCaptureFixture) 
     """When the feedback bundle log-tail read raises OSError, the route
     elevates to WARNING and increments the global counter.
     """
-    from cortex.services.api_gateway import routes
     from pathlib import Path
+
+    from cortex.services.api_gateway import routes
 
     # Snapshot counter so the test can assert the delta.
     before = routes._feedback_log_read_failures
@@ -612,6 +657,7 @@ def test_b19_session_recorder_overflow_escalation(
 ) -> None:
     """Two consecutive overflows promote the log line from WARNING to ERROR."""
     import queue
+
     from cortex.services.runtime_daemon import SessionRecorder
 
     recorder = SessionRecorder(str(tmp_path))

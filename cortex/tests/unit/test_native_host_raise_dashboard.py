@@ -50,8 +50,9 @@ class TestRaiseDashboard:
         called_request = mock_open.call_args[0][0]
         assert f"127.0.0.1:{native_host.HTTP_API_PORT}" in called_request.full_url
         assert called_request.full_url.endswith("/dashboard/raise")
-        # X-Cortex-Auth header is populated from the cached token.
-        assert called_request.headers.get("X-cortex-auth") == "fake-token"
+        # X-Cortex-Auth-Token header is populated from the cached token
+        # (legacy header name accepted by cortex.services.api_gateway.auth).
+        assert called_request.headers.get("X-cortex-auth-token") == "fake-token"
 
     def test_http_error_surfaces_as_ok_false(self) -> None:
         with patch.object(native_host, "_read_auth_token", return_value=""):

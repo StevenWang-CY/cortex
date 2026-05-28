@@ -19,7 +19,11 @@ def test_write_stamps_schema_version(tmp_path: Path) -> None:
 
 
 def test_read_returns_data(tmp_path: Path) -> None:
-    from cortex.libs.storage.schema_version import SCHEMA_VERSION, read_with_version, write_with_version
+    from cortex.libs.storage.schema_version import (
+        SCHEMA_VERSION,
+        read_with_version,
+        write_with_version,
+    )
 
     target = tmp_path / "data.json"
     write_with_version(target, {"answer": 42})

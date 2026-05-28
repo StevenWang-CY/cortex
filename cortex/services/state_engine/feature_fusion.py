@@ -42,6 +42,13 @@ class FeatureFusion:
     """
 
     def __init__(self) -> None:
+        # Phase 4 fix #5/#7 invariant: the per-channel timestamp must always
+        # be valid *by the time* the matching feature pointer becomes
+        # non-None. ``update_*`` enforces this by assigning timestamp BEFORE
+        # the feature pointer. The 0.0 sentinel below is safe because
+        # ``_compute_signal_quality`` short-circuits on ``self._<chan> is
+        # None`` before ever reading the timestamp, so the sentinel never
+        # participates in a staleness computation.
         self._physio: PhysioFeatures | None = None
         self._kinematics: KinematicFeatures | None = None
         self._telemetry: TelemetryFeatures | None = None
@@ -60,23 +67,36 @@ class FeatureFusion:
     def update_physio(
         self, features: PhysioFeatures, timestamp: float | None = None,
     ) -> None:
-        """Update the physiological feature channel."""
+        """Update the physiological feature channel.
+
+        Phase 4 fix #5: timestamp is assigned BEFORE the feature pointer so
+        any reader that observes ``self._physio is not None`` is guaranteed
+        to see a matching ``_physio_timestamp``. asyncio is single-threaded
+        today so this is belt-and-braces, but the ordering invariant must
+        match the code regardless.
+        """
+        self._physio_timestamp = timestamp if timestamp is not None else time.monotonic()
         self._physio = features
-        self._physio_timestamp = timestamp or time.monotonic()
 
     def update_kinematics(
         self, features: KinematicFeatures, timestamp: float | None = None,
     ) -> None:
-        """Update the kinematic feature channel."""
+        """Update the kinematic feature channel.
+
+        Phase 4 fix #5: see ``update_physio`` for ordering rationale.
+        """
+        self._kinematics_timestamp = timestamp if timestamp is not None else time.monotonic()
         self._kinematics = features
-        self._kinematics_timestamp = timestamp or time.monotonic()
 
     def update_telemetry(
         self, features: TelemetryFeatures, timestamp: float | None = None,
     ) -> None:
-        """Update the telemetry feature channel."""
+        """Update the telemetry feature channel.
+
+        Phase 4 fix #5: see ``update_physio`` for ordering rationale.
+        """
+        self._telemetry_timestamp = timestamp if timestamp is not None else time.monotonic()
         self._telemetry = features
-        self._telemetry_timestamp = timestamp or time.monotonic()
         self._telemetry_seen_count += 1
 
     def fuse(self, timestamp: float | None = None) -> tuple[FeatureVector, SignalQuality]:

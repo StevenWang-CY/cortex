@@ -14,9 +14,7 @@ The test captures the structlog events by patching
 
 from __future__ import annotations
 
-from unittest.mock import call, patch
-
-import pytest
+from unittest.mock import patch
 
 from cortex.libs.config.settings import StateConfig
 from cortex.libs.schemas.state import SignalQuality, StateScores, UserState
@@ -73,13 +71,13 @@ class TestStateTransitionLogging:
         # Positional args
         if len(args) >= 5:
             from_state, to_state, confidence, reasons, dwell_seconds = args[:5]
-            correlation_id = kwargs.get("correlation_id")
+            correlation_id = kwargs.get("correlation_id")  # noqa: F841 — only kwargs membership is asserted below
         else:
             from_state = kwargs.get("from_state") or args[0]
             to_state = kwargs.get("to_state") or args[1]
             confidence = kwargs.get("confidence") or args[2]
             dwell_seconds = kwargs.get("dwell_seconds") or args[4] if len(args) > 4 else kwargs.get("dwell_seconds")
-            correlation_id = kwargs.get("correlation_id")
+            correlation_id = kwargs.get("correlation_id")  # noqa: F841 — only kwargs membership is asserted below
 
         assert from_state == UserState.FLOW.value, f"expected from_state=FLOW, got {from_state!r}"
         assert to_state == UserState.HYPER.value, f"expected to_state=HYPER, got {to_state!r}"

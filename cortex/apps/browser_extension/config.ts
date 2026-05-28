@@ -15,3 +15,12 @@ export const LAUNCHER_PORT = 9471;
 export const DAEMON_HTTP_URL = `http://127.0.0.1:${HTTP_API_PORT}`;
 export const DAEMON_WS_URL = `ws://127.0.0.1:${WEBSOCKET_PORT}`;
 export const LAUNCHER_HTTP_URL = `http://127.0.0.1:${LAUNCHER_PORT}`;
+
+/**
+ * Chrome native-messaging host ID — must match the ``name`` field in
+ * the native messaging manifest installed by
+ * ``cortex/scripts/install_native_host.py``. Centralised here so a
+ * future rename only touches one constant rather than five
+ * ``chrome.runtime.sendNativeMessage`` call sites in background.ts.
+ */
+export const NATIVE_HOST_ID = "com.cortex.launcher";

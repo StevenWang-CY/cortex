@@ -62,6 +62,11 @@ _KEYRING_EXECUTOR: concurrent.futures.ThreadPoolExecutor | None = None
 # the existing /metrics endpoint by importing this attribute.
 _keyring_timeouts_total: int = 0
 
+# Audit fix #20: mirror counter for keyring WRITE timeouts so the BYOK
+# onboarding step can detect a stalled backend on its first attempt
+# instead of swallowing the stall as a silent "saved" outcome.
+_set_password_timeouts_total: int = 0
+
 
 def _get_keyring_executor() -> concurrent.futures.ThreadPoolExecutor:
     """Return the process-wide singleton keyring executor (lazy init)."""
@@ -83,6 +88,14 @@ def get_keyring_timeouts_total() -> int:
     to expose stalled-backend events without parsing logs.
     """
     return _keyring_timeouts_total
+
+
+def get_set_password_timeouts_total() -> int:
+    """Total count of keyring WRITE attempts that exceeded the timeout.
+
+    Mirror of :func:`get_keyring_timeouts_total` for the BYOK path.
+    """
+    return _set_password_timeouts_total
 
 
 def get_keychain_password(service: str, account: str) -> str | None:
@@ -208,8 +221,81 @@ def get_password_safe(
         return None
 
 
+def set_password_safe(
+    service: str,
+    account: str,
+    password: str,
+    *,
+    timeout: float = _KEYRING_DEFAULT_TIMEOUT_S,
+) -> bool:
+    """Write a generic password via ``keyring`` with a hard wall-clock timeout.
+
+    Mirror of :func:`get_password_safe` for the write path. Wraps
+    ``keyring.set_password`` in the same single-worker
+    ``ThreadPoolExecutor`` so a stalled backend (macOS unlock sheet,
+    dbus hang, GNOME keyring unavailable, …) cannot block the caller
+    for longer than ``timeout`` seconds. On any failure — backend
+    missing, timeout, or backend exception — we degrade to ``False``
+    so the onboarding step can surface the failure to the user instead
+    of pretending the write succeeded.
+
+    Args:
+        service: Keychain service identifier (e.g. ``"cortex.bedrock"``).
+        account: Account within that service (e.g. ``"bearer_token"``).
+        password: Secret value to store.
+        timeout: Wall-clock seconds before we give up and return ``False``.
+
+    Returns:
+        ``True`` iff ``keyring.set_password`` returned within the
+        timeout window without raising; ``False`` otherwise.
+    """
+    try:
+        import keyring  # local import — keyring is an optional dep at runtime
+    except ImportError:
+        logger.debug(
+            "keyring library not installed; cannot write %s/%s",
+            service,
+            account,
+        )
+        return False
+
+    def _write() -> bool:
+        try:
+            keyring.set_password(service, account, password)
+            return True
+        except Exception:
+            logger.debug(
+                "keyring.set_password raised for %s/%s",
+                service,
+                account,
+                exc_info=True,
+            )
+            return False
+
+    global _set_password_timeouts_total
+    executor = _get_keyring_executor()
+    future = executor.submit(_write)
+    try:
+        return bool(future.result(timeout=timeout))
+    except concurrent.futures.TimeoutError:
+        _set_password_timeouts_total += 1
+        logger.warning(
+            "keyring.set_password for %s/%s timed out after %.1fs; "
+            "returning False (caller should surface to user) "
+            "[total_set_timeouts=%d]",
+            service,
+            account,
+            timeout,
+            _set_password_timeouts_total,
+        )
+        future.cancel()
+        return False
+
+
 __all__ = [
     "get_keychain_password",
     "get_keyring_timeouts_total",
     "get_password_safe",
+    "get_set_password_timeouts_total",
+    "set_password_safe",
 ]

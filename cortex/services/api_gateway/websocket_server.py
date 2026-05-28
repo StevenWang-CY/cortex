@@ -19,7 +19,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import ValidationError
 
@@ -28,6 +28,13 @@ from cortex.libs.config.settings import APIConfig
 from cortex.libs.logging.correlation import correlation_scope, get_correlation_id
 from cortex.libs.logging.structured import EventType
 from cortex.libs.schemas.intervention import InterventionPlan
+from cortex.libs.schemas.realtime import (
+    BiometricsSummary,
+    CaptureStatus,
+    InterventionTriggerPayload,
+    StateUpdatePayload,
+    StoreHealth,
+)
 from cortex.libs.schemas.session_history import (
     SessionDetailResponse,
     SessionListResponse,
@@ -49,10 +56,15 @@ def _auth_ok_frame() -> str:
     ``MessageType.AUTH_OK.value`` so the client side narrows it via the
     same generated TypeScript union.
     """
+    # ``time.time()`` (wall-clock seconds) per the WSMessage schema
+    # docstring at cortex/libs/schemas/ws_message.py:74-78 — JS clients
+    # compare this against ``Date.now() / 1000`` and ``time.monotonic``
+    # is process-local, not comparable. Phase-4a regression closure: the
+    # Pydantic model was fixed but the hand-built AUTH_OK frame wasn't.
     return json.dumps({
         "type": MessageType.AUTH_OK.value,
         "payload": {},
-        "timestamp": time.monotonic(),
+        "timestamp": time.time(),
         "sequence": 0,
         "correlation_id": None,
         "target_client_types": None,
@@ -146,7 +158,13 @@ class WSMessageLegacy:
 
     type: str
     payload: dict[str, Any]
-    timestamp: float = field(default_factory=time.monotonic)
+    # Wall-clock seconds matching the Pydantic ``WSMessage`` contract
+    # (cortex/libs/schemas/ws_message.py:70-78). The legacy dataclass
+    # previously seeded with ``time.monotonic`` which is process-local
+    # and not comparable to a JS client clock — fixed here so the
+    # round-trip ``WSMessageLegacy → WSMessage → JSON`` produces a
+    # uniform wire format regardless of construction path.
+    timestamp: float = field(default_factory=time.time)
     sequence: int = 0
     correlation_id: str | None = None
     target_client_types: list[str] | None = None
@@ -169,7 +187,8 @@ class WSMessageLegacy:
         return cls(
             type=parsed.get("type", "UNKNOWN"),
             payload=parsed.get("payload", {}),
-            timestamp=parsed.get("timestamp", time.monotonic()),
+            # Same wall-clock contract as the field default above.
+            timestamp=parsed.get("timestamp", time.time()),
             sequence=parsed.get("sequence", 0),
             correlation_id=parsed.get("correlation_id"),
             target_client_types=parsed.get("target_client_types"),
@@ -589,13 +608,28 @@ class WebSocketServer:
                 try:
                     client.coalesce_task.cancel()
                 except Exception:
-                    pass
+                    # P2-2: previously ``pass`` swallowed cancellation
+                    # failures silently. ``logger.debug`` with
+                    # ``exc_info=True`` matches the pattern used in
+                    # ``_close_slow_consumer`` so root causes are
+                    # visible without changing behaviour.
+                    logger.debug(
+                        "coalesce task cancel failed during stop() for %s",
+                        client.client_id,
+                        exc_info=True,
+                    )
                 client.coalesce_task = None
             client.coalesce_queue = None
             try:
                 await client.websocket.close()
             except Exception:
-                pass
+                # P2-2: surface close failures in debug logs (e.g.
+                # already-closed sockets, broken transports).
+                logger.debug(
+                    "websocket close failed during stop() for %s",
+                    client.client_id,
+                    exc_info=True,
+                )
 
         self._clients.clear()
 
@@ -1384,7 +1418,14 @@ class WebSocketServer:
             return
         try:
             payload = dict(msg.payload or {})
-            payload.setdefault("source_client_type", client.client_type)
+            # SECURITY: the InterventionApplied schema explicitly notes
+            # ``source_client_type`` is "set by the server-side dispatcher
+            # (never trusted from the wire)" (intervention.py:692-699).
+            # ``setdefault`` allowed a hostile client to spoof the field
+            # by stuffing a value into ``payload.source_client_type``;
+            # unconditional overwrite mirrors the correct pattern in
+            # ``_handle_user_action`` below.
+            payload["source_client_type"] = client.client_type
             if asyncio.iscoroutinefunction(callback):
                 await callback(payload)
             else:
@@ -2323,38 +2364,11 @@ class WebSocketServer:
         # the debug-overlay ``classifier_source`` field (``rule`` / ``ml`` /
         # ``ensemble``).
         degraded = estimate.classifier_source is None
-        envelope_source = "fallback" if degraded else "classifier"
-        payload: dict[str, Any] = {
-            "state": estimate.state,
-            "confidence": estimate.confidence,
-            "scores": {
-                "flow": estimate.scores.flow,
-                "hypo": estimate.scores.hypo,
-                "hyper": estimate.scores.hyper,
-                "recovery": estimate.scores.recovery,
-            },
-            "signal_quality": {
-                "physio": estimate.signal_quality.physio,
-                "kinematics": estimate.signal_quality.kinematics,
-                "telemetry": estimate.signal_quality.telemetry,
-                "overall": estimate.signal_quality.overall,
-            },
-            "dwell_seconds": estimate.dwell_seconds,
-            "reasons": estimate.reasons,
-            "stress_integral": estimate.stress_integral,
-            "calibrated_probabilities": estimate.calibrated_probabilities,
-            "classifier_source": estimate.classifier_source,
-            "classifier_alpha": estimate.classifier_alpha,
-            "source": envelope_source,
-            "degraded": degraded,
-            "timestamp": _serialize_timestamp(estimate.timestamp),
-            # G1 (audit-prod): stamp the deduped list of currently-IDENTIFY-ed
-            # client types so consumers (desktop dashboard) can light up the
-            # Chrome / Edge / Editor connection dots without subscribing to
-            # a separate event stream.
-            "connected_clients": self.connected_client_types(),
-        }
+        envelope_source: Literal["classifier", "fallback"] = (
+            "fallback" if degraded else "classifier"
+        )
 
+        # ── Capture status sub-payload ─────────────────────────────────
         # Surface capture status so the consumer dashboard can render
         # "Camera offline" vs "Looking for your face" vs "Reading your
         # pulse" instead of a bare ``--`` while the rPPG window fills.
@@ -2362,53 +2376,99 @@ class WebSocketServer:
         # ``runtime_daemon._process_capture_output``; absence here means
         # the capture loop hasn't produced a frame yet (camera not open,
         # permission denied, or daemon mid-startup).
-        capture_status: dict[str, bool] = {
-            "frames_flowing": False,
-            "face_detected": False,
-            # B1 (Phase 4.1): ``stale=True`` means the camera channel is
-            # offline (pipeline failed to start, no recent frames, etc.).
-            # The dashboard reads this to swap the "Reading your pulse"
-            # ambient string for the "Camera offline" tile.
-            "stale": False,
-        }
+        frames_flowing = False
+        face_detected = False
+        stale = False
+        capture_sequence: int | None = None
         store_degraded = False
         try:
             from cortex.services.api_gateway.app import registry as _registry
             frame_meta = _registry.get("latest_frame_meta")
             if frame_meta is not None:
                 fm_ts = float(getattr(frame_meta, "timestamp", 0.0))
-                capture_status["frames_flowing"] = (
-                    time.monotonic() - fm_ts < 2.0
-                )
-                capture_status["face_detected"] = bool(
+                # ``fm_ts`` is wall-clock seconds per the FrameMeta
+                # schema docstring; the producer (capture pipeline) is
+                # being aligned to ``time.time()`` in tandem with this
+                # consumer change. Comparing against ``time.time()``
+                # here is the correct freshness window once both sides
+                # agree on the clock.
+                frames_flowing = time.time() - fm_ts < 2.0
+                face_detected = bool(
                     getattr(frame_meta, "face_detected", False)
                 )
+                seq = getattr(frame_meta, "sequence", None)
+                if seq is not None:
+                    try:
+                        capture_sequence = int(seq)
+                    except (TypeError, ValueError):
+                        capture_sequence = None
             # Daemon plants this when the capture pipeline fails to
             # start so the very first broadcast carries the offline
             # marker.
             if bool(_registry.get("capture_stale") or False):
-                capture_status["stale"] = True
+                stale = True
             # If there ARE recent frames, capture is healthy regardless of
             # what the stale flag says — clear it so a transient init
             # failure followed by a successful resume doesn't leave the
             # UI stuck in "offline".
-            if capture_status["frames_flowing"]:
-                capture_status["stale"] = False
+            if frames_flowing:
+                stale = False
             store_degraded = bool(_registry.get("store_degraded") or False)
         except Exception:
             # Registry lookup is best-effort; never block a broadcast.
             logger.debug("registry lookup for capture/store status failed", exc_info=True)
-        payload["capture"] = capture_status
+
+        capture_status = CaptureStatus(
+            frames_flowing=frames_flowing,
+            face_detected=face_detected,
+            stale=stale,
+            sequence=capture_sequence,
+        )
         # B4 (Phase 4.1): expose the store degradation indicator on
         # every broadcast so a late-joining client still learns the
         # daemon is running on an in-memory store.
-        payload["store"] = {"degraded": store_degraded}
+        store_health = StoreHealth(degraded=store_degraded)
 
+        # ── Biometrics sub-payload (optional) ──────────────────────────
+        # The producer omits the ``biometrics`` key entirely when the
+        # incoming dict is empty / None, so a late-joining client
+        # doesn't see a misleading all-null bundle on the first frame.
+        biometrics_model: BiometricsSummary | None
         if biometrics:
-            payload["biometrics"] = biometrics
+            biometrics_model = BiometricsSummary.model_validate(biometrics)
+        else:
+            biometrics_model = None
+
+        # ── Build typed payload model ───────────────────────────────────
+        payload_model = StateUpdatePayload(
+            state=estimate.state,
+            confidence=estimate.confidence,
+            scores=estimate.scores,
+            signal_quality=estimate.signal_quality,
+            dwell_seconds=estimate.dwell_seconds,
+            reasons=list(estimate.reasons),
+            stress_integral=estimate.stress_integral,
+            calibrated_probabilities=estimate.calibrated_probabilities,
+            classifier_source=estimate.classifier_source,
+            classifier_alpha=estimate.classifier_alpha,
+            source=envelope_source,
+            degraded=degraded,
+            timestamp=_serialize_timestamp(estimate.timestamp),
+            # G1 (audit-prod): stamp the deduped list of
+            # currently-IDENTIFY-ed client types so consumers (desktop
+            # dashboard) can light up the Chrome / Edge / Editor
+            # connection dots without subscribing to a separate event
+            # stream.
+            connected_clients=self.connected_client_types(),
+            capture=capture_status,
+            store=store_health,
+            biometrics=biometrics_model,
+            sequence=self._sequence,
+        )
+
         return WSMessage(
             type=MessageType.STATE_UPDATE,
-            payload=payload,
+            payload=payload_model.model_dump(mode="json"),
             sequence=self._sequence,
             source_client_type="daemon",
         )
@@ -2432,59 +2492,58 @@ class WebSocketServer:
         bar pulse) instead of relying on the dashboard's overlay.
         """
         self._sequence += 1
-        payload: dict[str, Any] = {
-            "intervention_id": plan.intervention_id,
-            "level": plan.level,
-            "headline": plan.headline,
-            "situation_summary": plan.situation_summary,
-            "primary_focus": plan.primary_focus,
-            "micro_steps": [s.model_dump(mode="json") for s in plan.micro_steps],
-            "hide_targets": plan.hide_targets,
-            "ui_plan": plan.ui_plan.model_dump(),
-            "tone": plan.tone,
-            "suggested_actions": [a.model_dump() for a in plan.suggested_actions],
-            "causal_explanation": getattr(plan, "causal_explanation", None),
-            # P0 §3.9: structured causal rationale (top 2-3 signals,
-            # primary first). UI's drilldown panel renders these as
-            # sparkline rows with delta pills.
-            "causal_signals": [
-                s.model_dump(mode="json")
-                for s in getattr(plan, "causal_signals", None) or []
-            ],
-            "consent_level": getattr(plan, "consent_level", None),
-            "plan_warnings": getattr(plan, "plan_warnings", None) or [],
-        }
-        if plan.error_analysis is not None:
-            payload["error_analysis"] = plan.error_analysis.model_dump()
-        if plan.tab_recommendations is not None:
-            payload["tab_recommendations"] = plan.tab_recommendations.model_dump()
+
         # Audit-prod fix (G4 P0): mirror the dashboard's connected-clients
         # snapshot onto the intervention trigger so the WS-mode overlay's
         # action buttons gate on the same authoritative list the
         # STATE_UPDATE flow uses. Without this the WS-mode overlay always
         # renders browser-bound actions disabled.
-        payload["connected_clients"] = self.connected_client_types()
-        # Audit-2 fix: ship plan.metadata so the F27 fallback hint, F20
-        # budget-killed flag, and F29 truncation telemetry reach the
-        # overlay. Prior to this fix the WS broadcast omitted the field
-        # entirely and only the in-process callback path carried it,
-        # silently disabling these UI surfaces in WS-mode.
-        if plan.metadata:
-            payload["metadata"] = dict(plan.metadata)
+        connected = self.connected_client_types()
+
         # P0 §3.12: stamp the focus state when known so receivers can
         # surface OS-level notification cues for users on another Space
         # or in fullscreen. ``None`` means "unknown"; only stamp the
         # flag when we explicitly observed unfocused.
+        desktop_not_focused: bool | None
         if desktop_focused is False:
-            payload["desktop_not_focused"] = True
+            desktop_not_focused = True
+        else:
+            desktop_not_focused = None
+
+        # Phase-4 Debt-1 closure: construct the typed
+        # ``InterventionTriggerPayload`` (an ``InterventionPlan`` subclass
+        # with two optional envelope-level fields appended) by re-dumping
+        # the plan and re-validating. The wire shape stays flat —
+        # ``payload.intervention_id`` resolves directly, no nested
+        # ``payload.plan.intervention_id`` indirection — so the existing
+        # browser-extension consumers don't need changes.
+        plan_dict = plan.model_dump(mode="json")
+        plan_dict["desktop_not_focused"] = desktop_not_focused
+        plan_dict["connected_clients"] = connected
+        payload_model = InterventionTriggerPayload.model_validate(plan_dict)
+
         # F16-srv: stamp a deterministic cid per intervention emission so a
         # later USER_ACTION can be matched against the active emission.
         cid = f"iv_{plan.intervention_id}_{self._sequence}"
         if plan.intervention_id:
             self._active_intervention_cid[plan.intervention_id] = cid
+
+        # Drop ``desktop_not_focused`` when None so the wire shape
+        # matches the legacy "only present when explicitly set"
+        # contract — receivers branch on key-existence rather than
+        # value-truthiness (see test_os_notification_routing). The
+        # ``connected_clients`` field is always present per the G4
+        # closure since the producer always knows its current list,
+        # but we still defensively drop it if the model dumped None.
+        payload_dict = payload_model.model_dump(mode="json")
+        if payload_dict.get("desktop_not_focused") is None:
+            payload_dict.pop("desktop_not_focused", None)
+        if payload_dict.get("connected_clients") is None:
+            payload_dict.pop("connected_clients", None)
+
         return WSMessage(
             type=MessageType.INTERVENTION_TRIGGER,
-            payload=payload,
+            payload=payload_dict,
             sequence=self._sequence,
             correlation_id=cid,
             source_client_type="daemon",

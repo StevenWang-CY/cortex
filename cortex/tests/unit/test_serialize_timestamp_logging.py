@@ -17,8 +17,6 @@ from __future__ import annotations
 
 import logging
 
-import pytest
-
 from cortex.services.api_gateway.websocket_server import _serialize_timestamp
 
 

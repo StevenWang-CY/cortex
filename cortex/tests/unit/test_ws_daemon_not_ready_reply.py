@@ -18,16 +18,13 @@ spec. We test ``FORCE_RECAP``, ``DISMISS_OVERLAY``, ``GOAL_SET``, and
 
 from __future__ import annotations
 
-import asyncio
 import json
-import time
 from unittest.mock import patch
 
 import pytest
 
 from cortex.libs.schemas.ws_message_types import MessageType
 from cortex.services.api_gateway.websocket_server import WebSocketClient, WebSocketServer, WSMessage
-
 
 # ---------------------------------------------------------------------------
 # Helpers

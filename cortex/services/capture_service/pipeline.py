@@ -193,13 +193,31 @@ class CapturePipeline:
 
     @property
     def frames_dropped_total(self) -> int:
-        """B3 (Phase 4.1): cumulative count of evicted frames.
+        """B3 (Phase 4.1): cumulative count of evicted frames at the
+        *output* (pipeline → state-engine) queue.
 
         A nonzero value means downstream (state engine, broadcast loop)
         could not keep up with capture and the pipeline had to drop
         frames to bound queue memory.
+
+        Phase 4 fix #4: this is the AUTHORITATIVE pipeline-level drop
+        counter (exposed by ``/health`` and consumed by the dashboard).
+        :attr:`WebcamCapture.frames_dropped` measures a different stage —
+        *input*-side drops at the webcam → pipeline hand-off queue.
+        Operators reading diagnostics see both via :meth:`get_diagnostics`
+        and can distinguish "capture too fast" from "pipeline too slow".
         """
         return self._frames_dropped_total
+
+    @property
+    def frames_dropped_input(self) -> int:
+        """Phase 4 fix #4: input-side drops, mirrored from the underlying
+        :class:`WebcamCapture`. Counts evictions at the webcam-thread →
+        asyncio-loop queue (i.e. raw capture faster than the pipeline can
+        consume). Distinct from :attr:`frames_dropped_total` which counts
+        evictions at the pipeline → consumer queue.
+        """
+        return int(getattr(self._webcam, "frames_dropped", 0) or 0)
 
     def get_diagnostics(self) -> dict[str, int | float]:
         """B3 (Phase 4.1): operator-facing diagnostics snapshot.
@@ -207,6 +225,11 @@ class CapturePipeline:
         Returns a flat dict suitable for embedding in a /health response
         or a structured log line. Keys are documented above on the
         individual counters.
+
+        Phase 4 fix #4: ``frames_dropped_total`` is the pipeline → consumer
+        drop counter (slow consumer); ``frames_dropped_input`` is the
+        webcam → pipeline drop counter (fast camera, slow pipeline). Both
+        are surfaced so operators can pinpoint which stage is congested.
         """
         return {
             "frames_processed": self._frames_processed,
@@ -214,6 +237,7 @@ class CapturePipeline:
             "frames_no_face": self._frames_no_face,
             "frames_skipped": self._frame_skipper.total_skipped,
             "frames_dropped_total": self._frames_dropped_total,
+            "frames_dropped_input": self.frames_dropped_input,
         }
 
     def _record_frame_drop(self) -> None:
