@@ -8,6 +8,8 @@ Cortex should be for each type of workspace mutation.
 
 from __future__ import annotations
 
+from typing import Any
+
 # Consent levels (mirrors ConsentLevel IntEnum)
 OBSERVE = 0
 SUGGEST = 1
@@ -67,7 +69,62 @@ DEFAULT_ACTION_LEVELS: dict[str, int] = {
     # rather than PREVIEW because no destructive mutation happens —
     # the interstitial is non-destructive and one click bypasses it.
     "distraction_block": REVERSIBLE_ACT,
+
+    # P1: planner/executor ADAPTER-level action names. The executor's
+    # per-action consent gate (``InterventionExecutor.apply``) checks
+    # the consent ladder using ``cmd.action`` — the adapter-level verb
+    # the planner emits — not the canonical policy verbs above. Those
+    # adapter names were previously absent from the vocabulary, so
+    # ``get_minimum_level`` fell through to the PREVIEW default and the
+    # escalation ladder (which tracks per-action-type) could never lift
+    # them above PREVIEW. Registering them here gives them a real
+    # minimum level so approvals recorded against the same canonical key
+    # escalate the gate the executor actually queries. See
+    # ``canonical_action_type`` for the executor/daemon mapping.
+    "hide_tabs_except_active": PREVIEW,
+    "collapse_before_error": PREVIEW,
+    "fold_except_current": PREVIEW,
+    "dim_background": SUGGEST,
 }
+
+
+# ---------------------------------------------------------------------------
+# Adapter-action → canonical policy action-type mapping (P1)
+# ---------------------------------------------------------------------------
+#
+# The intervention planner emits ADAPTER-level command verbs
+# (``cmd.action``: e.g. ``hide_tabs_except_active``) while the consent
+# ladder's escalation history is keyed by action-type. Before the fix the
+# executor gate called ``check(cmd.action, ...)`` while the daemon
+# recorded approvals/rejections under the literal string ``"intervention"``
+# — two different keys, so a user approving N interventions never lifted
+# the gate on the adapter actions the executor actually queries.
+#
+# ``canonical_action_type`` collapses the (small, closed) set of adapter
+# verbs onto the stable policy key used for BOTH the gate check and the
+# approval/rejection recording. Verbs with a 1:1 policy entry map to
+# themselves; the legacy adapter aliases map onto their canonical policy
+# verb. Anything unknown passes through unchanged (so a future verb still
+# gates at its own key rather than silently collapsing into another).
+_ADAPTER_ACTION_ALIASES: dict[str, str] = {
+    # Tab simplification adapter verb → canonical tab-grouping policy verb.
+    "hide_tabs_except_active": "group_tabs",
+    # Terminal collapse adapter verb → canonical code-fold policy verb.
+    "collapse_before_error": "fold_code",
+    # Editor fold adapter verb → canonical code-fold policy verb.
+    "fold_except_current": "fold_code",
+}
+
+
+def canonical_action_type(action: str) -> str:
+    """Map an adapter-level action verb to its canonical policy action-type.
+
+    Used by the executor's per-action consent gate so the check and the
+    daemon-side approval/rejection recording share one stable key, letting
+    the escalation ladder actually lift the gate on a mapped action after
+    enough approvals. Unknown verbs pass through unchanged.
+    """
+    return _ADAPTER_ACTION_ALIASES.get(action, action)
 
 
 class ConsentPolicy:
@@ -104,7 +161,7 @@ class ConsentPolicy:
     def global_max_level(self, value: int) -> None:
         self._global_max = max(0, min(4, value))
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         """Serialize for storage."""
         return {
             "levels": dict(self._levels),
@@ -112,7 +169,7 @@ class ConsentPolicy:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> ConsentPolicy:
+    def from_dict(cls, data: dict[str, Any]) -> ConsentPolicy:
         """Restore from serialized state."""
         return cls(
             overrides=data.get("levels"),

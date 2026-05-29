@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ class BriefingContent:
     action_items: list[str]
     handover_path: str
     raw_markdown: str
-    recent_activities: list[dict] | None = None
+    recent_activities: list[dict[str, Any]] | None = None
 
 
 class MorningBriefing:
@@ -116,7 +117,7 @@ class MorningBriefing:
             ]
 
         # Extract learning activities section
-        recent_activities: list[dict] = []
+        recent_activities: list[dict[str, Any]] = []
         in_activity = False
         for line in lines:
             if "## Learning Activity" in line:
@@ -138,9 +139,9 @@ class MorningBriefing:
             recent_activities=recent_activities if recent_activities else None,
         )
 
-    def to_ws_payload(self, briefing: BriefingContent) -> dict:
+    def to_ws_payload(self, briefing: BriefingContent) -> dict[str, Any]:
         """Convert briefing to WebSocket message payload."""
-        payload: dict = {
+        payload: dict[str, Any] = {
             "title": briefing.title,
             "summary": briefing.summary,
             "action_items": briefing.action_items,

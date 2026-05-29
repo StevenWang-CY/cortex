@@ -191,7 +191,9 @@ class HeadPoseEstimator:
         rotation_mat, _ = cv2.Rodrigues(rotation_vec)
 
         # Decompose rotation matrix to Euler angles
-        pitch, yaw, roll = self._rotation_matrix_to_euler(rotation_mat)
+        pitch, yaw, roll = self._rotation_matrix_to_euler(
+            np.asarray(rotation_mat, dtype=np.float64)
+        )
 
         return pitch, yaw, roll
 

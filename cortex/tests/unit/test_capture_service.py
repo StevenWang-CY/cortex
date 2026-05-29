@@ -318,6 +318,50 @@ class TestFaceTracker:
         assert result.face_stable is True
         assert tracker._face_lost_frames == 0
 
+    def test_fresh_detection_is_not_replayed(self) -> None:
+        """A real mediapipe detection must carry is_replayed=False."""
+        config = CaptureConfig(face_mesh_subsample_n=1)
+        tracker = FaceTracker(config)
+        face_result = self._make_face_result_with_landmarks()
+        tracker._landmarker = MagicMock()
+        tracker._landmarker.detect_for_video.return_value = face_result
+
+        frame = make_synthetic_frame(brightness=128)
+        result = tracker.process_frame(frame)
+        assert result.face_detected is True
+        assert result.is_replayed is False
+
+    def test_subsampled_frame_marked_replayed(self) -> None:
+        """P1-5: with face_mesh_subsample_n>1 the skipped frames replay the
+        cached landmarks and MUST be flagged is_replayed=True so
+        time-integrating consumers (blink duration, angular velocity) can
+        skip them instead of double-counting stale landmarks."""
+        config = CaptureConfig(face_mesh_subsample_n=2)
+        tracker = FaceTracker(config)
+        face_result = self._make_face_result_with_landmarks()
+        tracker._landmarker = MagicMock()
+        tracker._landmarker.detect_for_video.return_value = face_result
+
+        frame = make_synthetic_frame(brightness=128)
+
+        # Frame 1: fresh detection (primes the cache).
+        r1 = tracker.process_frame(frame)
+        assert r1.face_detected is True
+        assert r1.is_replayed is False
+
+        # Frame 2: skipped -> replayed cached result, flagged.
+        r2 = tracker.process_frame(frame)
+        assert r2.is_replayed is True
+        # Replayed landmarks are byte-identical to the fresh ones.
+        assert r2.landmarks_px is not None and r1.landmarks_px is not None
+        assert np.array_equal(r2.landmarks_px, r1.landmarks_px)
+
+        # Frame 3: mediapipe runs again -> fresh, not replayed.
+        r3 = tracker.process_frame(frame)
+        assert r3.is_replayed is False
+        # mediapipe was invoked for frames 1 and 3 only (not the replayed 2).
+        assert tracker._landmarker.detect_for_video.call_count == 2
+
     def test_bounding_box_properties(self) -> None:
         """BoundingBox properties compute correctly."""
         bbox = BoundingBox(x_min=100, y_min=50, x_max=300, y_max=250)

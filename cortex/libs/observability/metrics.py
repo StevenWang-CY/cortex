@@ -14,7 +14,9 @@ WS_COALESCE_DROPS_TOTAL
 
 KEYRING_TIMEOUTS_TOTAL
     Incremented each time a macOS Keychain call exceeds the configured
-    timeout (pre-existing metric, exposed here so it appears in /metrics).
+    timeout. Producer: ``cortex.libs.utils.secrets.get_password_safe`` /
+    ``set_password_safe`` in their ``concurrent.futures.TimeoutError``
+    branches (C6 audit closure — previously a permanent zero).
 
 STATE_TRANSITIONS_TOTAL
     Labelled ``{from_state, to_state}``.  Incremented by the state engine
@@ -35,6 +37,7 @@ import time
 
 import prometheus_client as _prom
 from prometheus_client import CollectorRegistry, Counter, Gauge
+from prometheus_client.metrics_core import Metric
 
 # ---------------------------------------------------------------------------
 # Module-level registry (shared with the default registry so both the ASGI
@@ -87,12 +90,18 @@ _MODULE_IMPORT_TIME: float = time.monotonic()
 
 
 class _UptimeCallback:
-    """Updates DAEMON_UPTIME_SECONDS before each Prometheus scrape."""
+    """Updates DAEMON_UPTIME_SECONDS before each Prometheus scrape.
 
-    def describe(self):  # type: ignore[override]
+    Implements the duck-typed prometheus_client collector interface
+    (``describe`` / ``collect``). Both return an empty metric list — the
+    gauge is registered separately and this collector exists only for the
+    ``collect``-time side effect that refreshes the uptime value.
+    """
+
+    def describe(self) -> list[Metric]:
         return []
 
-    def collect(self):  # type: ignore[override]
+    def collect(self) -> list[Metric]:
         DAEMON_UPTIME_SECONDS.set(time.monotonic() - _MODULE_IMPORT_TIME)
         return []
 

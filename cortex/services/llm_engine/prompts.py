@@ -12,6 +12,8 @@ import logging
 import re
 import threading
 from dataclasses import dataclass, field
+from types import TracebackType
+from typing import Any
 
 from cortex.libs.logging.correlation import get_correlation_id
 from cortex.libs.logging.structured import EventType
@@ -85,7 +87,12 @@ class _TruncationCapture:
         _REPORT_BUFFER.report = self._report
         return self._report
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         if self._previous is None:
             try:
                 del _REPORT_BUFFER.report
@@ -894,7 +901,7 @@ def build_anthropic_messages(
     template_name: str | None = None,
     extra_context: str = "",
     max_context_tokens: int = 180_000,
-) -> tuple[list[dict], list[dict]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Build (system_blocks, user_messages) for ``AsyncAnthropic.messages.create``.
 
     The Anthropic Messages API takes the system prompt as a separate
@@ -932,7 +939,7 @@ def build_anthropic_messages(
     )
     enforced_user = enforced[1]["content"]
 
-    system_blocks: list[dict] = [
+    system_blocks: list[dict[str, Any]] = [
         {
             "type": "text",
             "text": SYSTEM_PROMPT,
@@ -942,7 +949,7 @@ def build_anthropic_messages(
             "cache_control": {"type": "ephemeral"},
         }
     ]
-    messages: list[dict] = [
+    messages: list[dict[str, Any]] = [
         {
             "role": "user",
             "content": [{"type": "text", "text": enforced_user}],

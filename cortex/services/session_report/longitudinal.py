@@ -54,11 +54,13 @@ from datetime import UTC, date, datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Any, Literal
 
-try:  # py3.9+
-    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-except ImportError:  # pragma: no cover — every supported runtime has zoneinfo
-    ZoneInfo = None  # type: ignore[assignment]
-    ZoneInfoNotFoundError = Exception  # type: ignore[assignment,misc]
+# ``zoneinfo`` is stdlib since Python 3.9 and the project requires
+# >=3.11 (see pyproject ``requires-python``), so the import always
+# succeeds. A previous defensive ``try/except ImportError`` that
+# rebound ``ZoneInfo = None`` was dead code on every supported runtime
+# and produced an un-suppressible mypy ``[misc]`` "cannot assign to a
+# type" error, so the import is now unconditional.
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from cortex.libs.schemas.longitudinal import (
     ChronotypeModel,
@@ -132,18 +134,17 @@ def _discover_local_tz() -> tzinfo:
     that path is correct for "no DST in this region" and at worst
     drifts by one hour during a transition.
     """
-    if ZoneInfo is not None:
-        try:
-            target = os.readlink("/etc/localtime")
-            marker = "/zoneinfo/"
-            if marker in target:
-                zone_name = target.split(marker, 1)[1]
-                return ZoneInfo(zone_name)
-        except OSError:
-            # /etc/localtime doesn't exist or isn't a symlink.
-            pass
-        except ZoneInfoNotFoundError:
-            logger.debug("longitudinal: ZoneInfo lookup failed; using fixed offset")
+    try:
+        target = os.readlink("/etc/localtime")
+        marker = "/zoneinfo/"
+        if marker in target:
+            zone_name = target.split(marker, 1)[1]
+            return ZoneInfo(zone_name)
+    except OSError:
+        # /etc/localtime doesn't exist or isn't a symlink.
+        pass
+    except ZoneInfoNotFoundError:
+        logger.debug("longitudinal: ZoneInfo lookup failed; using fixed offset")
     # Fallback: best effort fixed offset for "now".
     fallback = datetime.now().astimezone().tzinfo
     if fallback is None:

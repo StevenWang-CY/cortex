@@ -36,7 +36,13 @@ from cortex.services.state_engine.trigger_policy import TriggerPolicy
 
 
 def make_flow_features() -> FeatureVector:
-    """Create a feature vector indicating FLOW state."""
+    """Create a feature vector indicating FLOW state.
+
+    ``telemetry_seen_count`` is set past the warm-up gate (>=5) because
+    this fixture carries real telemetry values (mouse / tab) — the FLOW
+    telemetry contributions only count once the warm-up gate is cleared
+    (see ``RuleScorer._compute_flow_score``).
+    """
     return FeatureVector(
         timestamp=1.0,
         hr=72.0,  # Within 10% of 72 baseline
@@ -51,6 +57,7 @@ def make_flow_features() -> FeatureVector:
         click_frequency=0.5,
         keystroke_interval_variance=500.0,
         tab_switch_frequency=5.0,
+        telemetry_seen_count=10,
     )
 
 
@@ -268,6 +275,50 @@ class TestRuleScorer:
             assert 0.0 <= scores.hypo <= 1.0
             assert 0.0 <= scores.hyper <= 1.0
             assert 0.0 <= scores.recovery <= 1.0
+
+    def test_flow_not_inflated_by_fabricated_telemetry_when_off(self):
+        """P1: telemetry-off FLOW must NOT accrue from fabricated 0.0 variance.
+
+        Before the warm-up gate, a session with NO telemetry
+        (``telemetry_seen_count == 0``, all telemetry fields at their 0.0
+        defaults) appended a 0.8 FLOW contribution off the fabricated
+        ``mouse_velocity_variance == 0.0 < baseline`` branch — exactly
+        like the unguarded HYPO branches that the audit already fixed.
+        With the gate, the telemetry FLOW branches are skipped until 5+
+        telemetry samples have been seen, so a telemetry-off session
+        scores strictly lower than the identical session with warm
+        telemetry.
+        """
+        scorer = self._make_scorer()
+
+        # Identical physio, but no telemetry has been observed yet.
+        cold = FeatureVector(
+            timestamp=1.0,
+            hr=72.0,
+            hrv_rmssd=55.0,
+            hr_delta=0.0,
+            blink_rate=16.0,
+            blink_rate_delta=0.0,
+            shoulder_drop_ratio=0.02,
+            forward_lean_angle=5.0,
+            # All telemetry at defaults (0.0) and NOT warmed up.
+            mouse_velocity_variance=0.0,
+            tab_switch_frequency=0.0,
+            telemetry_seen_count=0,
+        )
+        cold_flow = scorer.compute_scores(cold).flow
+
+        # Same fixture, but warmed up — the fabricated 0.0 variance now
+        # legitimately counts because telemetry is genuinely flowing.
+        warm = cold.model_copy(update={"telemetry_seen_count": 10})
+        warm_flow = scorer.compute_scores(warm).flow
+
+        # The cold-start session must not be credited the telemetry FLOW
+        # contribution that the fabricated 0.0 variance would have added.
+        assert cold_flow < warm_flow, (
+            f"cold_flow={cold_flow:.3f} should be < warm_flow={warm_flow:.3f}; "
+            "telemetry-off FLOW must not accrue from fabricated 0.0 variance"
+        )
 
 
 class TestSubScores:
@@ -583,20 +634,53 @@ class TestTriggerPolicy:
         assert "quality" in decision.reason.lower()
 
     def test_dismissal_raises_threshold(self):
-        """Dismissals should raise the effective threshold."""
+        """Dismissals should raise the effective threshold.
+
+        Mirrors the real daemon dismiss path, which calls BOTH
+        ``record_dismissal`` (quiet-mode escalation + threshold bump) and
+        ``record_outcome(dismissed=True)`` (adaptive feedback counter).
+        The adaptive feedback offset (+0.01 per net dismissal) is what
+        lifts the effective threshold above the adaptive floor.
+        """
         policy = self._make_policy()
         base_decision = policy.evaluate(
             self._make_hyper_estimate(confidence=0.9), current_time=200.0,
         )
         base_threshold = base_decision.effective_threshold
 
-        # Record a dismissal
+        # Record a dismissal exactly as the daemon does.
         policy.record_dismissal(timestamp=200.0)
+        policy.record_outcome(dismissed=True)
         new_decision = policy.evaluate(
             self._make_hyper_estimate(confidence=0.9), current_time=201.0,
         )
 
         assert new_decision.effective_threshold > base_threshold
+
+    def test_single_dismissal_increments_counter_once(self):
+        """P1: one dismissal must move ``_dismissals_total`` exactly once.
+
+        The daemon dismiss path calls BOTH ``record_dismissal`` and
+        ``record_outcome(dismissed=True)`` for a single user dismissal.
+        Before the fix BOTH methods incremented ``_dismissals_total``,
+        double-counting the adaptive-threshold offset (one dismissal
+        nudged +0.02 while one approval only moved -0.01). The counter is
+        now owned exclusively by ``record_outcome``.
+        """
+        policy = self._make_policy()
+        assert policy._dismissals_total == 0  # noqa: SLF001
+
+        # Simulate one full daemon-side dismissal.
+        policy.record_dismissal(timestamp=200.0)
+        policy.record_outcome(dismissed=True)
+
+        assert policy._dismissals_total == 1  # noqa: SLF001
+
+        # And a symmetric approval moves it back toward zero by the same
+        # magnitude (no asymmetric 0.02 vs 0.01 skew anymore).
+        policy.record_outcome(dismissed=False)
+        assert policy._dismissals_total == 1  # noqa: SLF001
+        assert policy._approvals_total == 1  # noqa: SLF001
 
     def test_quiet_mode_on_repeated_dismissals(self):
         """3 dismissals in 5 min should activate quiet mode."""
@@ -635,6 +719,55 @@ class TestTriggerPolicy:
         policy.reset()
         assert policy.intervention_count == 0
         assert not policy.is_quiet_mode
+
+    def test_schedule_slot_uses_wall_clock_not_monotonic(self):
+        """P1: ``lookup_schedule_slot`` must resolve against wall-clock.
+
+        The bug: ``evaluate`` passed its monotonic ``current_time`` into
+        ``lookup_schedule_slot``, which fed it to
+        ``datetime.fromtimestamp`` — yielding a garbage weekday/hour and
+        mis-gating the weekly schedule. Arm a schedule whose ON/OFF slots
+        differ by weekday+hour and assert the slot resolves to the REAL
+        local now, independent of any monotonic value passed to evaluate.
+        """
+        import datetime as _dt
+
+        policy = self._make_policy()
+
+        now = _dt.datetime.now()
+        today = (
+            "monday", "tuesday", "wednesday", "thursday",
+            "friday", "saturday", "sunday",
+        )[now.weekday()]
+        # Slot index for the current hour (matches _SCHEDULE_SLOT_HOURS).
+        slot_hours = ((6, 12), (12, 14), (14, 18), (18, 24))
+        cur_idx = next(
+            (i for i, (lo, hi) in enumerate(slot_hours) if lo <= now.hour < hi),
+            None,
+        )
+        if cur_idx is None:
+            # Outside any configured slot window (00:00–05:59) — the
+            # lookup returns None regardless, which still proves it used
+            # wall-clock (a monotonic value would have hit a slot).
+            policy.set_weekly_schedule({today: ["off", "off", "off", "off"]})
+            assert policy.lookup_schedule_slot() is None
+            return
+
+        # Mark only the CURRENT weekday+slot as "off"; everything else "on".
+        slots = ["on", "on", "on", "on"]
+        slots[cur_idx] = "off"
+        policy.set_weekly_schedule({today: slots})
+
+        # Direct lookup resolves to the real local weekday/hour slot.
+        assert policy.lookup_schedule_slot() == "off"
+
+        # And through evaluate(): a monotonic current_time (tiny float)
+        # must NOT corrupt the schedule resolution. With the current slot
+        # "off", evaluate must report the weekly-schedule block.
+        est = self._make_hyper_estimate(confidence=0.95, dwell=40.0)
+        decision = policy.evaluate(est, current_time=1234.5)
+        assert decision.should_trigger is False
+        assert decision.reason == "weekly_schedule_off"
 
 
 # =============================================================================

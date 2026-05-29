@@ -197,3 +197,58 @@ class TestBandpassFilterRealtime:
         filtered, zi_out = bandpass_filter_realtime(sig, sos, zi=None)
         assert filtered.shape == sig.shape
         assert zi_out is not None
+
+    def test_steady_state_init_removes_startup_transient(self) -> None:
+        """P2-8: zi=None must seed the filter at steady-state (scaled by the
+        first sample), not zeros, so a DC-offset stream does not produce a
+        large startup transient.
+
+        A constant (DC-only) input has no in-band content, so a correctly
+        steady-state-initialised bandpass output should stay near zero from
+        the very first sample. A zeros-initialised filter instead rings
+        sharply while it settles from 0 up to the DC operating point.
+        """
+        sos = design_bandpass()
+        dc_level = 50.0
+        sig = np.full(300, dc_level, dtype=np.float64)
+
+        filtered, _ = bandpass_filter_realtime(sig, sos, zi=None)
+
+        # With steady-state init the very first samples must not ring.
+        startup = float(np.max(np.abs(filtered[:30])))
+        assert startup < 1.0, f"startup transient too large: {startup:.3f}"
+
+        # Contrast: a zeros-initialised filter (the old behaviour) produces a
+        # much larger transient on the same DC input.
+        n_sections = sos.shape[0]
+        zeros_zi = np.zeros((n_sections, 2))
+        filtered_zeros, _ = bandpass_filter_realtime(sig, sos, zi=zeros_zi)
+        zeros_startup = float(np.max(np.abs(filtered_zeros[:30])))
+        assert zeros_startup > startup
+
+    def test_steady_state_init_preserves_chunk_continuity(self) -> None:
+        """Whole-signal vs chunked must still match: both seed from the same
+        first sample, so the steady-state init does not break continuity."""
+        sos = design_bandpass()
+        sig = make_sinusoid(1.5, fs=30.0, duration_s=5.0) + 3.0  # in-band + DC
+
+        whole, _ = bandpass_filter_realtime(sig, sos)
+
+        zi = None
+        chunks = []
+        for i in range(0, len(sig), 30):
+            out, zi = bandpass_filter_realtime(sig[i : i + 30], sos, zi)
+            chunks.append(out)
+        chunked = np.concatenate(chunks)
+
+        np.testing.assert_allclose(whole, chunked, atol=1e-10)
+
+    def test_empty_chunk_with_none_zi(self) -> None:
+        """An empty first chunk has no first sample; must fall back to zeros
+        without raising."""
+        sos = design_bandpass()
+        filtered, zi_out = bandpass_filter_realtime(
+            np.array([], dtype=np.float64), sos, zi=None
+        )
+        assert filtered.shape == (0,)
+        assert zi_out.shape == (sos.shape[0], 2)

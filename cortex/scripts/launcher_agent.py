@@ -417,7 +417,7 @@ class LauncherHandler(BaseHTTPRequestHandler):
         else:
             self._send_json({"error": "not found"}, 404)
 
-    def log_message(self, format: str, *args) -> None:
+    def log_message(self, format: str, *args: object) -> None:
         """Suppress default stderr logging — use stdout instead."""
         print(f"[{time.strftime('%H:%M:%S')}] {format % args}")
 

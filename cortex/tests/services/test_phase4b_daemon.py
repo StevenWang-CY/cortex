@@ -40,7 +40,10 @@ class _StubAMIP:
     def __init__(self) -> None:
         self.updates: list[tuple[str, float]] = []
 
-    async def update_reward(self, decision_id: str, reward: float) -> None:
+    # NB: the real ``AMIPPolicy.update_reward`` is SYNCHRONOUS (returns
+    # None). The daemon calls it without ``await``; the stub must mirror
+    # that signature or the recorded reward is silently dropped.
+    def update_reward(self, decision_id: str, reward: float) -> None:
         self.updates.append((decision_id, reward))
 
 

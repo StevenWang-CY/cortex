@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 try:
     import onnxruntime as ort
 except Exception:  # pragma: no cover - optional runtime path
-    ort = None  # type: ignore[assignment]
+    ort = None
 
 
 class RPPGAlgorithm(StrEnum):
@@ -39,6 +39,17 @@ class RPPGAlgorithm(StrEnum):
     CHROM = "chrom"
     GREEN = "green"
     TSCAN = "tscan"
+
+
+# P2-7: resolve the default T-SCAN model path relative to the installed
+# ``cortex`` package root, not the process CWD. ``rppg.py`` lives at
+# ``cortex/services/physio_engine/rppg.py`` so three parents up is the
+# ``cortex`` package directory, and the model ships in ``cortex/models/``.
+# A CWD-relative default silently broke the T-SCAN backend whenever the
+# daemon was launched from anywhere other than the repo root.
+_DEFAULT_TSCAN_MODEL_PATH: str = str(
+    Path(__file__).resolve().parent.parent.parent / "models" / "tscan.onnx"
+)
 
 
 _TSCAN_SESSION: ort.InferenceSession | None = None if ort is not None else None
@@ -78,7 +89,7 @@ def _load_tscan_session(model_path: str) -> ort.InferenceSession | None:
 def extract_bvp_tscan(
     rgb_window: NDArray[np.float64],
     *,
-    model_path: str = "cortex/models/tscan.onnx",
+    model_path: str = _DEFAULT_TSCAN_MODEL_PATH,
 ) -> NDArray[np.float64] | None:
     """
     Run TSCAN ONNX inference to produce a BVP signal.
@@ -219,7 +230,7 @@ def _pos_single_window(rgb_window: NDArray[np.float64]) -> NDArray[np.float64]:
     # Zero-mean the output
     bvp -= np.mean(bvp)
 
-    return bvp
+    return np.asarray(bvp, dtype=np.float64)
 
 
 def extract_bvp_chrom(
@@ -276,7 +287,7 @@ def extract_bvp_chrom(
     # Zero-mean
     bvp -= np.mean(bvp)
 
-    return bvp
+    return np.asarray(bvp, dtype=np.float64)
 
 
 def extract_bvp_green(
@@ -322,7 +333,7 @@ def extract_bvp(
     algorithm: RPPGAlgorithm | str = RPPGAlgorithm.POS,
     fs: float = 30.0,
     *,
-    model_path: str = "cortex/models/tscan.onnx",
+    model_path: str = _DEFAULT_TSCAN_MODEL_PATH,
 ) -> NDArray[np.float64]:
     """
     Extract BVP signal using the specified algorithm.

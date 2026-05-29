@@ -15,8 +15,12 @@ Public API: ``dismissed(str)`` Signal, ``show_intervention(payload)`` method.
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QRect, Qt, QTimer, Signal
+
+if TYPE_CHECKING:
+    from PySide6.QtWidgets import QGraphicsOpacityEffect
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -36,7 +40,7 @@ except ImportError:  # pragma: no cover - lightweight stub fallback
     # surface; QToolButton isn't in those stubs. QPushButton supports
     # the same setCheckable/setText/setChecked API we use for the F51
     # "Show more" toggle, so it stands in faithfully.
-    QToolButton = QPushButton  # type: ignore[assignment,misc]
+    QToolButton = QPushButton
 
 # Phase J-4: subtle scale-in (headline) + fade-in (causal row) micro-
 # interactions. QPropertyAnimation / QEasingCurve / QGraphicsOpacityEffect
@@ -50,9 +54,9 @@ try:
     from PySide6.QtWidgets import QGraphicsOpacityEffect
     _ANIMATION_AVAILABLE = True
 except ImportError:  # pragma: no cover - lightweight stubs
-    QEasingCurve = None  # type: ignore[assignment]
-    QPropertyAnimation = None  # type: ignore[assignment]
-    QGraphicsOpacityEffect = None  # type: ignore[assignment]
+    QEasingCurve = None
+    QPropertyAnimation = None
+    QGraphicsOpacityEffect = None
     _ANIMATION_AVAILABLE = False
 
 from cortex.apps.desktop_shell import mac_native
@@ -166,7 +170,7 @@ class BreathingPacer(QWidget):
             try:
                 from cortex.libs.config.settings import get_config
 
-                pattern = tuple(  # type: ignore[assignment]
+                pattern = tuple(
                     get_config().intervention.breathing_pattern
                 )
             except Exception:
@@ -390,7 +394,7 @@ class OverlayWindow(QWidget):
         # back-to-back interventions reuse the same animation objects.
         self._headline_anim: object | None = None
         self._causal_fade_anim: object | None = None
-        self._causal_opacity_effect: object | None = None
+        self._causal_opacity_effect: QGraphicsOpacityEffect | None = None
         # Test affordance: when True, ``_play_show_animations`` records
         # the durations it would use without actually starting the
         # timers. Useful in offscreen tests where the real Qt event loop

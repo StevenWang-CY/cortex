@@ -387,6 +387,62 @@ class TestContextAndLLMEndpoints:
         assert data["fallback_used"] is False
         assert data["plan"]["headline"] == "Do the next thing"
 
+    def test_llm_plan_reports_fallback_used_for_rule_based_plan(self, client: TestClient):
+        """Finding #2: when the planner serves a rule-based fallback
+        (``metadata.source == 'fallback'``), the HTTP route must report
+        ``fallback_used=True`` — pre-fix it hard-coded False on every
+        production branch, masking the degradation from the caller."""
+        class FallbackLLMClient:
+            async def generate_intervention_plan(self, context, state):
+                return InterventionPlan(
+                    level="overlay_only",
+                    situation_summary="Budget exhausted; deterministic plan",
+                    headline="Pause and breathe",
+                    primary_focus="Step away briefly",
+                    micro_steps=["Take three slow breaths"],
+                    ui_plan={"show_overlay": True, "intervention_type": "overlay_only"},
+                    tone="supportive",
+                    metadata={"source": "fallback", "fallback_reason": "budget_killed"},
+                )
+
+        registry.register("llm_engine", FallbackLLMClient())
+        payload = {
+            "state_estimate": _make_state_estimate(),
+            "task_context": {
+                "mode": "coding_debugging",
+                "active_app": "vscode",
+                "complexity_score": 0.7,
+            },
+        }
+        resp = client.post("/llm/plan", json=payload)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["fallback_used"] is True
+        assert data["plan"]["headline"] == "Pause and breathe"
+
+    def test_llm_plan_raising_client_returns_fallback_envelope(self, client: TestClient):
+        """Finding #6: a planner client that RAISES must not surface an
+        unhandled 500. The route maps it to the deterministic-fallback
+        envelope (``plan=None``, ``fallback_used=True``)."""
+        class RaisingLLMClient:
+            async def generate_intervention_plan(self, context, state):
+                raise RuntimeError("anthropic SDK exploded")
+
+        registry.register("llm_engine", RaisingLLMClient())
+        payload = {
+            "state_estimate": _make_state_estimate(),
+            "task_context": {
+                "mode": "coding_debugging",
+                "active_app": "vscode",
+                "complexity_score": 0.7,
+            },
+        }
+        resp = client.post("/llm/plan", json=payload)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["fallback_used"] is True
+        assert data["plan"] is None
+
 
 # =============================================================================
 # Intervention Endpoints (No-engine fallback)

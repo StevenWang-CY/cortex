@@ -88,9 +88,14 @@ describe("P0 §3.3 — SESSION_RECAP validity gate", () => {
         sock.__deliver({
             type: "SESSION_RECAP",
             payload: {
-                // Note: deliberately no ``session_id``.
-                duration_seconds: 1800,
-                flow_percentage: 50,
+                // C4 wrapper, but the report deliberately lacks a
+                // ``session_id`` — must be treated as "no recap".
+                report: {
+                    duration_seconds: 1800,
+                    flow_percentage: 50,
+                },
+                generated_at: "2026-05-29T10:00:00Z",
+                persisted: true,
             },
             timestamp: Date.now() / 1000,
             sequence: 2,
@@ -124,7 +129,8 @@ describe("P0 §3.3 — SESSION_RECAP validity gate", () => {
 
         sock.__deliver({
             type: "SESSION_RECAP",
-            payload: { session_id: "" },
+            // C4 wrapper with an empty-string report.session_id.
+            payload: { report: { session_id: "" }, persisted: true },
             timestamp: Date.now() / 1000,
             sequence: 3,
         });
@@ -154,13 +160,19 @@ describe("P0 §3.3 — SESSION_RECAP validity gate", () => {
 
         sock.__deliver({
             type: "SESSION_RECAP",
+            // C4 wrapper: report nested under ``report``, plus the
+            // ``generated_at`` / ``persisted`` envelope fields.
             payload: {
-                session_id: "test-session-valid-001",
-                duration_seconds: 1800,
-                flow_percentage: 67,
-                breaks_taken: 2,
-                longest_flow_streak_seconds: 600,
-                avg_hr_bpm: 71,
+                report: {
+                    session_id: "test-session-valid-001",
+                    duration_seconds: 1800,
+                    flow_percentage: 67,
+                    breaks_taken: 2,
+                    longest_flow_streak_seconds: 600,
+                    avg_hr_bpm: 71,
+                },
+                generated_at: "2026-05-29T10:00:00Z",
+                persisted: true,
             },
             timestamp: Date.now() / 1000,
             sequence: 4,

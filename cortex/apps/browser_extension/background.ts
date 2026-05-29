@@ -43,6 +43,11 @@ import {
 import type {
     SuggestedAction as SuggestedActionSchema,
     WSMessage as WSMessageSchema,
+    LeetCodeStage as LeetCodeStageSchema,
+    SubmissionResult as SubmissionResultSchema,
+    InterventionTriggerPayload,
+    SessionRecap as SessionRecapSchema,
+    CostResponse as CostResponseSchema,
 } from "./types/generated/cortex_schemas";
 
 // The Pydantic JSON Schema marks default-having fields as optional
@@ -391,8 +396,29 @@ function schedulePersist(): void {
     }, 500);
 }
 
+/**
+ * Shape of the persisted session state written by {@link schedulePersist}.
+ * `chrome.storage.session.get` is typed `{ [key: string]: any }` → `{}` under
+ * `--strict`, so we cast the result to this explicit shape to recover the
+ * per-key element types (Map entries round-trip as `[K, V][]` arrays).
+ */
+interface PersistedSessionState {
+    focusSession?: FocusSession;
+    undoStack?: UndoEntry[];
+    dismissedInterventions?: [string, number][];
+    dismissedUrlPatterns?: [string, number][];
+    quietMode?: boolean;
+    tabLastActivated?: [number, number][];
+    autoFocusArmed?: boolean;
+    autoFocusEndsAt?: number | null;
+    autoFocusPreset?: string;
+    autoFocusCustomDomains?: string[];
+}
+
 async function restoreState(): Promise<void> {
-    const data = await chrome.storage.session.get(PERSIST_KEYS as unknown as string[]);
+    const data = (await chrome.storage.session.get(
+        PERSIST_KEYS as unknown as (keyof PersistedSessionState)[],
+    )) as PersistedSessionState;
     if (data.focusSession) focusSession = data.focusSession;
     if (data.undoStack) {
         undoStack.splice(0, undoStack.length, ...data.undoStack);
@@ -1220,6 +1246,14 @@ async function handleMessage(raw: string): Promise<void> {
                 );
                 break;
             }
+            // Finding 5: typed view of the wire payload against the
+            // generated InterventionTriggerPayload so the OS-notification
+            // path's field reads are caught at compile time on a daemon
+            // rename. The raw object is still ``Record<string, unknown>``
+            // on the wire; the cast is the single boundary point.
+            const triggerPayload = msg.payload as
+                & InterventionTriggerPayload
+                & Record<string, unknown>;
             const iid = plan.intervention_id;
             const now = Date.now();
 
@@ -1299,7 +1333,7 @@ async function handleMessage(raw: string): Promise<void> {
             // suppressed.
             if (plan.desktop_not_focused && !quietMode) {
                 try {
-                    surfaceInterventionOSNotification(msg.payload, inboundCid);
+                    surfaceInterventionOSNotification(triggerPayload, inboundCid);
                 } catch (err) {
                     // chrome.notifications may not be available in odd
                     // test environments; never crash the dispatcher.
@@ -1566,8 +1600,21 @@ async function handleMessage(raw: string): Promise<void> {
             //      explicitly clicked "Dismiss" on this recap; the
             //      daemon may re-broadcast (e.g. on extension reconnect)
             //      but we honour the dismissal.
-            const recapPayload = msg.payload;
-            const sessionIdRaw = recapPayload?.session_id;
+            // C4: the daemon sends the declared SessionRecap wrapper
+            // ``{report: SessionReport, generated_at: str, persisted: bool}``
+            // so schema == wire. The session_id lives at
+            // ``payload.report.session_id`` (NOT ``payload.session_id`` —
+            // that was the pre-C4 flattened shape that drifted from the
+            // SessionRecap schema). We cache + broadcast the full wrapper
+            // unchanged so the popup can read ``payload.report.*`` and
+            // ``payload.persisted``.
+            const recapPayload = msg.payload as
+                | (Partial<SessionRecapSchema> & Record<string, unknown>)
+                | undefined;
+            const recapReport = (recapPayload?.report ?? null) as
+                | { session_id?: unknown }
+                | null;
+            const sessionIdRaw = recapReport?.session_id;
             const hasValidSessionId =
                 typeof sessionIdRaw === "string" && sessionIdRaw.length > 0;
             if (!hasValidSessionId) {
@@ -3721,10 +3768,16 @@ async function undoAction(actionId: string): Promise<boolean> {
             }
             case "group_tabs": {
                 const tabIds = entry.undo_data.tabIds as number[];
-                try {
-                    await chrome.tabs.ungroup(tabIds);
-                } catch {
-                    // Some tabs may be gone
+                if (tabIds.length > 0) {
+                    try {
+                        // chrome.tabs.ungroup wants a non-empty tuple; the
+                        // guard above makes this cast sound.
+                        await chrome.tabs.ungroup(
+                            tabIds as [number, ...number[]],
+                        );
+                    } catch {
+                        // Some tabs may be gone
+                    }
                 }
                 break;
             }
@@ -3958,7 +4011,17 @@ function broadcastToPopup(message: Record<string, unknown>): void {
  * (already F09-sanitised). No biometric values cross the boundary.
  */
 function surfaceInterventionOSNotification(
-    payload: Record<string, unknown>,
+    // Finding 5: bind the read fields to the generated
+    // InterventionTriggerPayload so a daemon-side rename of
+    // ``headline`` / ``primary_focus`` / ``intervention_id`` breaks the
+    // type-check here rather than silently producing an empty
+    // notification. We keep the index signature so the function still
+    // accepts the raw ``Record<string, unknown>`` wire object.
+    payload: Pick<
+        InterventionTriggerPayload,
+        "headline" | "primary_focus" | "intervention_id"
+    > &
+        Record<string, unknown>,
     correlationId: string,
 ): void {
     const headline = String(payload.headline || "Cortex");
@@ -4639,12 +4702,14 @@ chrome.runtime.onMessage.addListener(
                         "cortex.lastRecapTimestamp",
                     ],
                     (data) => {
+                        // C4: the cached recap is the SessionRecap wrapper;
+                        // the session_id lives under ``.report.session_id``.
                         const lastRecap = data?.["cortex.lastRecap"] as
-                            | Record<string, unknown>
+                            | { report?: { session_id?: unknown } }
                             | undefined;
                         const dismissedSessionId =
-                            typeof lastRecap?.session_id === "string"
-                                ? (lastRecap.session_id as string)
+                            typeof lastRecap?.report?.session_id === "string"
+                                ? (lastRecap.report.session_id as string)
                                 : null;
                         const updates: Record<string, unknown> = {};
                         if (dismissedSessionId) {
@@ -4695,18 +4760,38 @@ chrome.runtime.onMessage.addListener(
                 // so the popup doesn't need cross-origin credentials.
                 (async () => {
                     try {
+                        // C1: /api/cost is capability-token-gated. Attach the
+                        // cached local token (same retrieval used by the STOP
+                        // path at ~4233) or the daemon 401s. A token-fetch
+                        // failure is non-fatal — the request still goes out and
+                        // 401s cleanly rather than hanging.
+                        let authToken: string | null = null;
+                        try {
+                            authToken = await getAuthToken();
+                        } catch (e) {
+                            if (DEBUG) {
+                                console.warn(
+                                    `cortex.auth.token_unavailable err=${String(e)}`,
+                                );
+                            }
+                        }
                         const ctrl = new AbortController();
                         const t = setTimeout(() => ctrl.abort(), 1500);
                         const resp = await fetch(
                             `${DAEMON_HTTP_URL}/api/cost`,
-                            { signal: ctrl.signal },
+                            {
+                                signal: ctrl.signal,
+                                headers: authToken
+                                    ? { "X-Cortex-Auth-Token": authToken }
+                                    : undefined,
+                            },
                         );
                         clearTimeout(t);
                         if (!resp.ok) {
                             sendResponse({ ok: false, error: `status_${resp.status}` });
                             return;
                         }
-                        const body = await resp.json();
+                        const body = (await resp.json()) as CostResponseSchema;
                         sendResponse({ ok: true, cost: body });
                     } catch (err) {
                         sendResponse({
@@ -4834,9 +4919,32 @@ chrome.runtime.onMessage.addListener(
 // module under contents/ (audit Phase-I bundle hygiene) so its code
 // never gets pulled into the background service worker bundle.
 
+/**
+ * Storage record written by `contents/leetcode-observer.ts::saveSessionState`
+ * under the `cortex_leetcode_session` key. This is the persisted-state shape,
+ * a subset of the wire-level `LeetCodeContext` plus a `saved_at` timestamp;
+ * `chrome.storage.onChanged` types `newValue` as `any` → `{}` under `--strict`,
+ * so we narrow it explicitly here to catch observer/bridge field drift.
+ */
+interface LeetCodeSession {
+    problem_id: string;
+    title?: string;
+    difficulty?: string;
+    tags?: string[];
+    code_snapshot?: string;
+    stage?: LeetCodeStageSchema;
+    time_elapsed_s?: number;
+    wrong_answer_count?: number;
+    last_submission_result?: SubmissionResultSchema | null;
+    accepted?: boolean;
+    saved_at?: number;
+}
+
 chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== "local" || !changes.cortex_leetcode_session) return;
-    const session = changes.cortex_leetcode_session.newValue;
+    const session = changes.cortex_leetcode_session.newValue as
+        | LeetCodeSession
+        | undefined;
     if (!session?.problem_id) return;
 
     const record: ActivityRecord = {

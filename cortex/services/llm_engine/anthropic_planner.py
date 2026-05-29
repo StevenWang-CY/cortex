@@ -47,7 +47,6 @@ from pydantic import ValidationError
 # guard lives in ``cortex/tests/performance/test_startup_latency.py``.
 from cortex.libs.config.settings import LLMConfig
 from cortex.libs.llm.anthropic_client import (
-    LogicalModel,
     build_anthropic_sdk_client,
     resolve_anthropic_model_id,
 )
@@ -344,17 +343,21 @@ class AnthropicPlanner:
             )
 
         # Resolve each tier's provider-specific model identifier once.
+        # ``model_fast`` / ``model_default`` / ``model_deep`` are already
+        # typed as ``LogicalModelId`` (the same literal ``LogicalModel``
+        # aliases), so no cast is needed — the single-source-of-truth
+        # re-export keeps the two names identical.
         self._models: dict[ModelTier, str] = {
             "fast": resolve_anthropic_model_id(
-                cast(LogicalModel, self._config.model_fast),
+                self._config.model_fast,
                 provider=self._config.provider,
             ),
             "default": resolve_anthropic_model_id(
-                cast(LogicalModel, self._config.model_default),
+                self._config.model_default,
                 provider=self._config.provider,
             ),
             "deep": resolve_anthropic_model_id(
-                cast(LogicalModel, self._config.model_deep),
+                self._config.model_deep,
                 provider=self._config.provider,
             ),
         }
@@ -580,18 +583,29 @@ class AnthropicPlanner:
                     # cost — the shielded call kept billing tokens even
                     # though the caller stopped waiting.
                     try:
+                        # The SDK's ``messages.create`` overloads are typed
+                        # against ``Iterable[MessageParam]`` /
+                        # ``Iterable[TextBlockParam]`` / ``Iterable[ToolParam]``
+                        # TypedDicts. We construct these as plain runtime
+                        # dicts (the SDK accepts them and serialises directly),
+                        # so the static overload can't match without
+                        # re-deriving every nested TypedDict here. Cast to the
+                        # SDK param types — the runtime shape is correct.
                         response = await asyncio.shield(
                             self._sdk.messages.create(
                                 model=model_id,
                                 max_tokens=self._config.max_tokens,
                                 temperature=self._config.temperature,
-                                system=system_blocks,
-                                messages=messages,
-                                tools=[self._plan_tool],
-                                tool_choice={
-                                    "type": "tool",
-                                    "name": _PLAN_TOOL_NAME,
-                                },
+                                system=cast("Any", system_blocks),
+                                messages=cast("Any", messages),
+                                tools=cast("Any", [self._plan_tool]),
+                                tool_choice=cast(
+                                    "Any",
+                                    {
+                                        "type": "tool",
+                                        "name": _PLAN_TOOL_NAME,
+                                    },
+                                ),
                                 timeout=self._config.timeout_seconds,
                             )
                         )

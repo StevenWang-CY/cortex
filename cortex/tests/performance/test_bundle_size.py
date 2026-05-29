@@ -50,7 +50,6 @@ _SOURCE_BUDGETS: dict[str, int] = {
     "popup.tsx": 160_000,
     "newtab.tsx": 80_000,
     "tab-manager.ts": 60_000,
-    "activity-tracker.ts": 40_000,
     "design-tokens.ts": 30_000,
     # Shared constants (NATIVE_HOST_ID etc.) — small surface; sized to
     # accommodate ports + a handful of identifiers without churn.
@@ -60,6 +59,10 @@ _SOURCE_BUDGETS: dict[str, int] = {
     # its 25 KB never gets pulled into the background bundle.
     "contents/ambient.ts": 40_000,
     "contents/leetcode-observer.ts": 40_000,
+    # activity-tracker moved root -> contents/ in the audit so Plasmo
+    # registers it as a real injected content script (PlasmoCSConfig);
+    # previously it was never bundled/injected and emitted no telemetry.
+    "contents/activity-tracker.ts": 40_000,
     # Tabs are also separate bundles.
     "tabs/onboarding.tsx": 80_000,
 }

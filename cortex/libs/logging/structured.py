@@ -10,7 +10,7 @@ import logging
 import sys
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, cast
 
 import structlog
 from pydantic import BaseModel
@@ -209,13 +209,18 @@ class ErrorEvent(BaseModel):
 def add_timestamp(
     logger: structlog.types.WrappedLogger,
     method_name: str,
-    event_dict: dict[str, Any],
-) -> dict[str, Any]:
+    event_dict: structlog.types.EventDict,
+) -> structlog.types.EventDict:
     """Add ISO timestamp to log events.
 
     Phase-4a fix: ``datetime.utcnow()`` is deprecated in Python 3.12+
     and emits a DeprecationWarning that pollutes daemon logs at INFO.
     Use the timezone-aware ``datetime.now(UTC)`` instead.
+
+    Signature uses ``structlog.types.EventDict`` (``MutableMapping[str,
+    Any]``) so it satisfies the ``structlog.types.Processor`` protocol the
+    processor list is typed against — a bare ``dict[str, Any]`` is too
+    narrow and trips mypy --strict's [arg-type] on ``processors.append``.
     """
     event_dict["timestamp"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     return event_dict
@@ -224,8 +229,8 @@ def add_timestamp(
 def add_service_context(
     logger: structlog.types.WrappedLogger,
     method_name: str,
-    event_dict: dict[str, Any],
-) -> dict[str, Any]:
+    event_dict: structlog.types.EventDict,
+) -> structlog.types.EventDict:
     """Add service context to log events."""
     if "service" not in event_dict:
         event_dict["service"] = "cortex"
@@ -245,12 +250,20 @@ def configure_logging(
         json_format: Whether to output JSON (True) or console format (False)
         include_timestamp: Whether to include timestamps
     """
-    # Configure standard library logging
+    # Configure standard library logging. ``basicConfig`` only installs a
+    # handler the first time (it is a no-op once the root logger already
+    # has handlers), so re-invoking ``configure_logging`` with a new level
+    # would otherwise silently keep the old level. C6 (audit): the
+    # function is called once per entrypoint (run_dev, runtime_daemon,
+    # desktop_shell) and must be idempotent — so we also set the root
+    # level explicitly on every call so the last caller wins.
+    numeric_level = getattr(logging, level.upper())
     logging.basicConfig(
         format="%(message)s",
         stream=sys.stdout,
-        level=getattr(logging, level.upper()),
+        level=numeric_level,
     )
+    logging.getLogger().setLevel(numeric_level)
 
     # Build processor chain. ``merge_contextvars`` pulls bound context (e.g.
     # the correlation id from ``cortex.libs.logging.correlation``) into
@@ -301,7 +314,10 @@ def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:
     Returns:
         Configured structlog logger
     """
-    return structlog.get_logger(name or "cortex")
+    # ``structlog.get_logger`` is typed as returning ``Any``; the configured
+    # ``wrapper_class`` (BoundLogger) is what it actually yields once
+    # ``configure_logging`` has run. Cast to keep the declared return type.
+    return cast("structlog.stdlib.BoundLogger", structlog.get_logger(name or "cortex"))
 
 
 # Convenience logging functions

@@ -42,9 +42,9 @@ except ImportError:  # pragma: no cover
 try:
     from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 except ImportError:  # pragma: no cover - test stubs
-    from PySide6.QtGui import QColor, QFont, QPainter, QPen  # type: ignore
+    from PySide6.QtGui import QColor, QFont, QPainter, QPen
 
-    class QPainterPath:  # type: ignore[override]
+    class QPainterPath:
         def addRoundedRect(self, *_a: Any, **_kw: Any) -> None: ...
 
 try:
@@ -62,7 +62,7 @@ try:
         QWidget,
     )
 except ImportError:  # pragma: no cover - test stubs
-    from PySide6.QtWidgets import (  # type: ignore[attr-defined]
+    from PySide6.QtWidgets import (
         QFrame,
         QHBoxLayout,
         QLabel,
@@ -71,14 +71,14 @@ except ImportError:  # pragma: no cover - test stubs
         QWidget,
     )
 
-    class QFileDialog(QWidget):  # type: ignore[override]
+    class QFileDialog(QWidget):
         @staticmethod
         def getSaveFileName(
             *_a: Any, **_kw: Any,
         ) -> tuple[str, str]:
             return ("", "")
 
-    class QMenu(QWidget):  # type: ignore[override]
+    class QMenu(QWidget):
         def addAction(self, *_a: Any, **_kw: Any) -> object:
             class _A:
                 def triggered(self) -> object:
@@ -91,7 +91,7 @@ except ImportError:  # pragma: no cover - test stubs
         def exec(self, *_a: Any, **_kw: Any) -> object:
             return None
 
-    class QScrollArea(QWidget):  # type: ignore[override]
+    class QScrollArea(QWidget):
         def setWidgetResizable(self, *_a: Any, **_kw: Any) -> None: ...
 
         def setWidget(self, *_a: Any, **_kw: Any) -> None: ...
@@ -99,13 +99,13 @@ except ImportError:  # pragma: no cover - test stubs
         def widget(self) -> Any:
             return None
 
-    class QSizePolicy:  # type: ignore[override]
+    class QSizePolicy:
         class Policy:
             Expanding = 0
             Preferred = 0
             Minimum = 0
 
-    class QStackedWidget(QWidget):  # type: ignore[override]
+    class QStackedWidget(QWidget):
         def addWidget(self, *_a: Any, **_kw: Any) -> None: ...
 
         def setCurrentIndex(self, *_a: Any, **_kw: Any) -> None: ...
@@ -304,7 +304,7 @@ class _RenderCacheMixin:
         cache = getattr(self, "_render_cache_dict", None)
         if cache is None:
             cache = {}
-            self._render_cache_dict = cache  # type: ignore[attr-defined]
+            self._render_cache_dict = cache
         return cache
 
     def _set_text_if_changed(self, widget: QLabel, text: str) -> bool:

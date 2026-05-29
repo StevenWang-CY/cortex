@@ -128,3 +128,53 @@ def test_start_twice_raises(baselines_dir: Path) -> None:
 def test_negative_duration_raises() -> None:
     with pytest.raises(ValueError):
         CalibrationRunner(duration_seconds=0, simulate=True)
+
+
+# ---------------------------------------------------------------------------
+# P1 — calibration must NOT silently calibrate against synthetic frames when
+# the live camera is unavailable/contended. ``used_simulation`` lets the
+# desktop wizard surface a visible warning instead of accepting a useless
+# baseline (CLAUDE.md rules #5/#15).
+# ---------------------------------------------------------------------------
+
+
+def test_simulate_runner_marks_used_simulation() -> None:
+    from cortex.services.capture_service.calibration_runner import CalibrationRunner
+
+    runner = CalibrationRunner(duration_seconds=1, simulate=True)
+    assert runner.used_simulation is True
+
+
+def test_live_calibration_invokes_on_fallback_when_camera_unavailable(
+    monkeypatch: pytest.MonkeyPatch, baselines_dir: Path
+) -> None:
+    import cortex.services.capture_service.webcam as webcam_mod
+    from cortex.services.capture_service.calibration_runner import run_live_calibration
+
+    # Camera cannot be opened -> live path must degrade to simulation AND
+    # signal the fallback so the caller can warn the user.
+    monkeypatch.setattr(webcam_mod, "open_video_capture", lambda cfg: (None, None))
+    fired = {"fallback": False}
+
+    asyncio.run(
+        run_live_calibration(
+            1,
+            is_aborted=lambda: True,
+            on_fallback=lambda: fired.__setitem__("fallback", True),
+        )
+    )
+    assert fired["fallback"] is True
+
+
+def test_runner_marks_used_simulation_on_camera_fallback(
+    monkeypatch: pytest.MonkeyPatch, baselines_dir: Path
+) -> None:
+    import cortex.services.capture_service.webcam as webcam_mod
+    from cortex.services.capture_service.calibration_runner import CalibrationRunner
+
+    monkeypatch.setattr(webcam_mod, "open_video_capture", lambda cfg: (None, None))
+    runner = CalibrationRunner(duration_seconds=1, simulate=False)
+    assert runner.used_simulation is False
+    runner.abort()  # exit the simulate loop immediately
+    asyncio.run(runner.start())
+    assert runner.used_simulation is True

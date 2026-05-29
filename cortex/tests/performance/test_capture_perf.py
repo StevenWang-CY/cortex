@@ -152,8 +152,10 @@ def test_quality_scorer_accepts_cached_gray() -> None:
 
 
 def test_face_mesh_subsample_config_default() -> None:
-    """Regression guard: ``face_mesh_subsample_n`` defaults to 2 so the
-    feature ships enabled. Existing installs see the speedup without
-    touching their config files; opting back to 1 (every-frame) is one
-    setting change."""
-    assert CaptureConfig().face_mesh_subsample_n == 2
+    """Regression guard: ``face_mesh_subsample_n`` defaults to 1 (every
+    frame). Audit fix: a default of 2 replayed byte-identical landmarks to
+    blink/head-pose on alternate frames, halving the effective detection
+    rate while downstream code assumed 30 fps (distorted blink duration and
+    angular velocity). Accurate blink timing requires every-frame tracking;
+    raising it to 2 is an explicit opt-in performance trade-off."""
+    assert CaptureConfig().face_mesh_subsample_n == 1

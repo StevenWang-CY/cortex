@@ -150,10 +150,18 @@ class LongitudinalTracker:
         (Python 3.7+ dicts preserve insertion order).
         """
         # Bump to most-recent by re-inserting; for defaultdict this is
-        # cheap because the value type is mutable / float.
-        for d in (self._topic_stress, self._topic_flow, self._topic_hyper):
-            if topic in d:
-                d[topic] = d.pop(topic)
+        # cheap because the value type is mutable / float. The three
+        # per-topic dicts hold DIFFERENT value types (``_topic_stress`` is
+        # ``list[float]``; the other two are ``float``), so re-insert each
+        # individually rather than iterating a heterogeneous tuple — that
+        # would widen the loop variable to a union and break the
+        # round-trip ``d[topic] = d.pop(topic)`` type check.
+        if topic in self._topic_stress:
+            self._topic_stress[topic] = self._topic_stress.pop(topic)
+        if topic in self._topic_flow:
+            self._topic_flow[topic] = self._topic_flow.pop(topic)
+        if topic in self._topic_hyper:
+            self._topic_hyper[topic] = self._topic_hyper.pop(topic)
         # Evict the oldest topic (first key) until we're under cap.
         while len(self._topic_flow) > self._topic_cap:
             oldest = next(iter(self._topic_flow))
@@ -167,7 +175,7 @@ class LongitudinalTracker:
         if accepted:
             self._intervention_accepted += 1
 
-    async def snapshot_daily(self) -> dict:
+    async def snapshot_daily(self) -> dict[str, Any]:
         """
         Create a daily baseline summary from accumulated samples.
 
@@ -214,7 +222,7 @@ class LongitudinalTracker:
         peak = [h for h, r in sorted(rates.items()) if r > threshold]
         return peak[:5]  # Top 5
 
-    async def compute_trend(self) -> dict:
+    async def compute_trend(self) -> dict[str, Any]:
         """
         Compute trends from stored daily baselines.
 

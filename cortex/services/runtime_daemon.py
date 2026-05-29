@@ -27,7 +27,11 @@ import uvicorn
 from cortex.libs.adapters.leetcode_adapter import LeetCodeAdapter
 from cortex.libs.config.settings import CortexConfig, get_config
 from cortex.libs.logging.correlation import get_correlation_id
-from cortex.libs.logging.structured import EventType
+from cortex.libs.logging.structured import (
+    EventType,
+    configure_logging,
+    get_logger,
+)
 from cortex.libs.schemas.features import KinematicFeatures, PhysioFeatures
 from cortex.libs.schemas.intervention import (
     InterventionApplyResult,
@@ -54,6 +58,7 @@ from cortex.services.consent.policy import (
     AUTONOMOUS_ACT,
     REVERSIBLE_ACT,
     ConsentPolicy,
+    canonical_action_type,
 )
 from cortex.services.context_engine import (
     BrowserAdapter,
@@ -118,6 +123,61 @@ from cortex.services.telemetry_engine.window_tracker import WindowTracker
 from cortex.services.throttle.copilot_throttle import CopilotThrottle
 
 logger = logging.getLogger(__name__)
+
+# C6 (audit): structured event sink. ``configure_logging`` (invoked once at
+# daemon startup, see ``start()``) wires the structlog processor chain; this
+# bound logger is the canonical emitter for daemon-owned observability events
+# (QUIET_MODE_ENTERED/EXITED, OS_NOTIFICATION_SENT, FACE_LOST/FACE_REACQUIRED).
+_event_logger = get_logger("cortex.daemon")
+
+
+def _emit_event(event: EventType, **fields: Any) -> None:
+    """Emit a structured observability event (C6).
+
+    Best-effort: a logging failure must never break the capture / state
+    loops, so any exception is swallowed at DEBUG. The correlation id (if
+    one is bound on the current context) is merged automatically by the
+    ``merge_contextvars`` processor configured in ``configure_logging``.
+    """
+    try:
+        _event_logger.info(event.value, **fields)
+    except Exception:
+        logger.debug("structured event %s emit failed", event.value, exc_info=True)
+
+
+def _interpolate_nan_window(window: np.ndarray) -> np.ndarray:
+    """Linear-interpolate over NaN-sentinel rows in an rPPG RGB window.
+
+    ``window`` is shape ``(N, C)`` (N frames, C colour channels). Low-quality
+    frames are appended to ``_rgb_history`` as all-NaN rows so the window
+    stays time-uniform (audit P1); this fills those gaps per-channel via
+    ``np.interp`` so the downstream non-NaN-aware bandpass filter + Welch PSD
+    never see a NaN. A channel that is entirely NaN (no good frame in the
+    window) falls back to zeros, which ``extract_bvp`` already tolerates.
+
+    Returns a finite array of the same shape. A window with no NaNs is
+    returned (a copy is acceptable) unchanged.
+    """
+    if window.size == 0:
+        return window
+    if not np.isnan(window).any():
+        return window
+    out = window.astype(np.float64, copy=True)
+    n_frames = out.shape[0]
+    x = np.arange(n_frames, dtype=np.float64)
+    # Treat a 1-D window as a single channel.
+    channels = out.shape[1] if out.ndim == 2 else 1
+    view = out if out.ndim == 2 else out.reshape(n_frames, 1)
+    for c in range(channels):
+        col = view[:, c]
+        good = ~np.isnan(col)
+        if not good.any():
+            col[:] = 0.0
+            continue
+        if good.all():
+            continue
+        col[~good] = np.interp(x[~good], x[good], col[good])
+    return out
 
 
 def _supervise_background_task(task: asyncio.Task[Any]) -> None:
@@ -351,6 +411,37 @@ class SessionRecorder:
                     logger.warning("SessionRecorder backpressure: dropped %s", event_type)
                 self._overflow_seq += 1
 
+    def _write_record(self, f: Any, item: tuple[str, dict[str, Any], float]) -> None:
+        event_type, payload, ts = item
+        try:
+            line = json.dumps(
+                {"type": event_type, "timestamp": ts, "payload": payload},
+                default=str,
+            )
+            f.write(line + "\n")
+        except Exception:
+            logger.exception("SessionRecorder write failed for %s", event_type)
+
+    def _drain_remaining(self, f: Any) -> None:
+        """Write every record still queued, non-blocking, until empty.
+
+        P2 (audit): ``flush()`` sets ``_stop_event`` AND enqueues the ``None``
+        sentinel. The main loop's top-of-loop ``_stop_event`` check could
+        fire BEFORE the sentinel (and the records queued ahead of it) were
+        consumed, dropping the trailing session window (last user_action,
+        the session_report meta-event, ...). On exit we therefore drain
+        whatever is left so no queued record is lost. The ``None`` sentinel
+        is skipped; everything else is written.
+        """
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                return
+            if item is None:
+                continue
+            self._write_record(f, item)
+
     def _writer_loop(self) -> None:
         try:
             with self._path.open("a", encoding="utf-8", buffering=1) as f:
@@ -360,18 +451,15 @@ class SessionRecorder:
                     except queue.Empty:
                         continue
                     if item is None:
+                        # Graceful flush sentinel: drain anything still
+                        # queued behind it, then exit.
+                        self._drain_remaining(f)
                         return
-                    event_type, payload, ts = item
-                    try:
-                        line = json.dumps(
-                            {"type": event_type, "timestamp": ts, "payload": payload},
-                            default=str,
-                        )
-                        f.write(line + "\n")
-                    except Exception:
-                        logger.exception(
-                            "SessionRecorder write failed for %s", event_type
-                        )
+                    self._write_record(f, item)
+                # P2 (audit): ``_stop_event`` was set (flush). Drain the
+                # records queued before/with the sentinel so the trailing
+                # session window is not lost.
+                self._drain_remaining(f)
         except Exception:
             logger.exception("SessionRecorder writer thread crashed")
 
@@ -414,8 +502,8 @@ class CortexDaemon:
 
         # Desktop UI callback hooks (called from asyncio thread — recipients
         # must handle thread-safety, e.g. via Qt signal emission).
-        self._state_callback: Callable[[dict], None] | None = None
-        self._intervention_callback: Callable[[dict], None] | None = None
+        self._state_callback: Callable[[dict[str, Any]], None] | None = None
+        self._intervention_callback: Callable[[dict[str, Any]], None] | None = None
         # F17 (audit): per-callback monotonic sequence numbers. The
         # in-process bridge (``DaemonBridge``) reads ``_seq`` from the
         # payload and drops frames whose ``_seq`` is not strictly
@@ -543,6 +631,17 @@ class CortexDaemon:
         )
         # P0-2: count of low-quality frames rejected from the rPPG window.
         self._frames_low_quality_rejected: int = 0
+        # C5 (audit): cache the previous frame's blink-suppression score so
+        # the apnea path in ``PulseEstimator.process_window`` can see it
+        # with a 1-frame lag (kinematics for the current frame are computed
+        # AFTER the rPPG window is processed, so the freshest value
+        # available at window-build time is the prior frame's). 0.0 until
+        # the first kinematics update lands.
+        self._last_blink_suppression_score: float = 0.0
+        # C6 (audit): edge-trigger latch for FACE_LOST / FACE_REACQUIRED
+        # structured events. Starts True so the first lost-face frame emits
+        # FACE_LOST exactly once (we assume the user is present at startup).
+        self._face_present_prev: bool = True
         self._latest_physio = PhysioFeatures(
             pulse_bpm=None,
             pulse_quality=0.0,
@@ -616,10 +715,11 @@ class CortexDaemon:
         self._pending_apply_results: dict[
             str, asyncio.Future[Any]
         ] = {}
-        # F05: tracked background tasks (timeout watchers, etc). Mirrors the
-        # F03 pattern from the audit Ledger: any new task spawn must use
-        # ``_spawn_background_task`` so ``stop()`` can drain them cleanly.
-        self._background_tasks: set[asyncio.Task[Any]] = set()
+        # F05: ``_background_tasks`` (declared above at __init__ top) tracks
+        # timeout watchers etc. Mirrors the F03 pattern from the audit
+        # Ledger: any new task spawn must use ``_spawn_background_task`` so
+        # ``stop()`` can drain them cleanly. (No re-annotation here — the
+        # single declaration at __init__ top is the canonical one.)
         self._aggregator = FeatureAggregator(
             self._input_hooks,
             self._window_tracker,
@@ -698,6 +798,18 @@ class CortexDaemon:
             # InMemoryStore preserves consent / helpfulness across
             # restarts.
             self._store = make_default_store(self.config)
+
+        # C7 (audit): mirror the store's own ``degraded`` flag onto the
+        # daemon flag after construction. ``RedisStore`` exposes a public
+        # ``degraded`` property that flips True once Redis is found
+        # unreachable and the persistent in-memory fallback takes over;
+        # ``InMemoryStore`` has no such attribute (it is the non-degraded
+        # DMG-default backend), so ``getattr(..., False)`` keeps the flag
+        # False there. We OR with the existing value so the explicit
+        # except-branch above (construction failure) is never un-set.
+        self._store_degraded = self._store_degraded or bool(
+            getattr(self._store, "degraded", False)
+        )
 
         # Stress integral tracker (biological pomodoros). The standardized
         # deficit math requires the user-specific HRV sigma so the integral
@@ -819,6 +931,25 @@ class CortexDaemon:
         self._last_policy_propensity: dict[str, float] | None = None
         self._amip_decision_ids_by_intervention: dict[str, str] = {}
         self._bandit_decisions_by_intervention: dict[str, tuple[list[float], int]] = {}
+        # P1: canonical consent action-types for each applied intervention,
+        # captured at apply time keyed by intervention_id. On engage/dismiss
+        # the daemon records the approval/rejection under THESE keys (the
+        # same canonical keys the executor's per-action gate checks) instead
+        # of the literal "intervention", so the escalation ladder actually
+        # lifts the gate on the actions the user approved. Empty -> falls
+        # back to ("intervention",) to preserve legacy behaviour.
+        self._consent_actions_by_intervention: dict[str, list[str]] = {}
+        # audit C-note: snapshot of the (trigger-time confidence,
+        # context_complexity) the dismissal-prediction model must be trained
+        # on — captured AT trigger time keyed by intervention_id. The legacy
+        # code trained the model on ``outcome.recovery_confidence`` and the
+        # CURRENT context's complexity at feedback time, which are different
+        # quantities (recovery confidence is a FLOW-recovery score, not the
+        # trigger confidence) and so the dismissal model learned from
+        # mislabelled features. ``(confidence, context_complexity)``.
+        self._dismissal_features_by_intervention: dict[
+            str, tuple[float, float]
+        ] = {}
 
         # Copilot throttle
         self._copilot_throttle = CopilotThrottle(ws_server=self._ws_server)
@@ -969,7 +1100,7 @@ class CortexDaemon:
         # dashboard.
         self._desktop_focused_probe: Callable[[], bool] | None = None
 
-    def set_state_callback(self, fn: Callable[[dict], None]) -> None:
+    def set_state_callback(self, fn: Callable[[dict[str, Any]], None]) -> None:
         """Register a callback invoked on every state update.
 
         The callback receives a deep-copied dict with ``estimate`` and
@@ -979,7 +1110,7 @@ class CortexDaemon:
         """
         self._state_callback = fn
 
-    def set_intervention_callback(self, fn: Callable[[dict], None]) -> None:
+    def set_intervention_callback(self, fn: Callable[[dict[str, Any]], None]) -> None:
         """Register a callback invoked when an intervention is sent.
 
         The callback receives a deep-copied dict of the intervention plan
@@ -1175,6 +1306,20 @@ class CortexDaemon:
 
     async def start(self) -> None:
         """Start the runtime and block until shutdown."""
+        # C6 (audit): configure structlog ONCE here, before any logger use,
+        # replacing the bare ``logging.basicConfig`` the daemon relied on.
+        # Idempotent (see ``configure_logging`` docstring) so the run_dev /
+        # desktop_shell entrypoints can also call it without conflict; the
+        # last caller's level wins. ``json_format`` follows the telemetry
+        # config so a dev terminal gets readable console output.
+        try:
+            configure_logging(
+                level=self.config.logging.level or "INFO",
+                json_format=self.config.logging.format == "json",
+                include_timestamp=self.config.logging.include_timestamp,
+            )
+        except Exception:
+            logger.debug("configure_logging failed; continuing", exc_info=True)
         # F07: ensure the local capability token exists before any service
         # that gates on it (WebSocket SHUTDOWN, launcher /stop) comes up.
         # Generated lazily, persists across restarts.
@@ -1518,11 +1663,18 @@ class CortexDaemon:
                             exc_info=True,
                         )
                         persisted_ok = False
-                    recap_payload = report.model_dump(mode="json")
-                    # Phase-4b TASK E: stamp the persisted flag at the
-                    # envelope level so late-joining surfaces (browser
-                    # popup) can render a "live-only" hint.
-                    recap_payload["persisted"] = persisted_ok
+                    # C4 (audit): send the declared ``SessionRecap`` wrapper
+                    # so schema == wire. The EXT reads ``payload.report.*``
+                    # and ``payload.persisted``; ``generated_at`` is the
+                    # recap-construction instant (distinct from
+                    # ``report.end_time``). Building via the Pydantic model
+                    # guarantees the shape matches the generated TS type.
+                    from cortex.libs.schemas.realtime import SessionRecap
+                    recap_payload = SessionRecap(
+                        report=report,
+                        generated_at=datetime.now(UTC).isoformat(),
+                        persisted=persisted_ok,
+                    ).model_dump(mode="json")
                     self._latest_session_recap = recap_payload
                     try:
                         await asyncio.wait_for(
@@ -1616,6 +1768,16 @@ class CortexDaemon:
             except Exception:
                 logger.debug("midnight scheduler stop raised (non-fatal)", exc_info=True)
             self._midnight_scheduler = None
+
+        # audit fix #10: a daemon stop while Copilot is throttled would leave
+        # the editor's inline suggestions disabled until the next manual
+        # toggle. Force-re-enable on the way out so a stop never strands the
+        # user in a half-throttled editor. Must run BEFORE the WS server
+        # teardown because ``force_enable`` broadcasts a re-enable frame.
+        try:
+            await self._copilot_throttle.force_enable()
+        except Exception:
+            logger.debug("copilot force_enable during stop failed", exc_info=True)
 
         await self._ws_server.stop()
         # Audit-2 fix: drain the session recorder's writer thread before
@@ -1825,21 +1987,61 @@ class CortexDaemon:
         if output.landmarks_px is None:
             return
 
+        # C6 (audit): emit FACE_LOST / FACE_REACQUIRED structured events on
+        # the capture-health transition. SENSING's face_tracker counts
+        # lost-frames internally but does NOT emit the observability event;
+        # the daemon owns that here. Edge-triggered off
+        # ``frame_meta.face_detected`` so we log once per transition, not
+        # once per frame.
+        face_now = bool(output.frame_meta.face_detected)
+        if face_now != self._face_present_prev:
+            if face_now:
+                _emit_event(
+                    EventType.FACE_REACQUIRED,
+                    timestamp=float(output.frame_meta.timestamp),
+                    face_confidence=float(output.frame_meta.face_confidence),
+                )
+            else:
+                _emit_event(
+                    EventType.FACE_LOST,
+                    timestamp=float(output.frame_meta.timestamp),
+                )
+            self._face_present_prev = face_now
+
         roi_frame = self._roi_extractor.extract(output.frame, output.landmarks_px, output.frame_meta.timestamp)
         combined_rgb = roi_frame.combined_rgb()
         if combined_rgb is not None:
-            # P0-2: skip low-quality frames so motion blur / occlusion
-            # artefacts don't corrupt the rPPG window.
+            # P0-2 / audit P1: low-quality frames (motion blur / occlusion)
+            # must NOT contribute their RGB sample to the rPPG window — but
+            # they must STILL advance the window by one slot. ``_rgb_history``
+            # is a fixed-maxlen deque; dropping low-quality frames entirely
+            # made the window span a NON-uniform amount of wall-clock time
+            # (e.g. 300 frames over 14 s instead of 10 s when 30 % of frames
+            # were dropped), which biases the Welch-PSD HR estimate. Append a
+            # NaN-sentinel sample instead so the time axis stays uniform; the
+            # NaN gaps are interpolated away just before ``extract_bvp`` (see
+            # below) so the non-NaN-aware filter never sees a NaN.
             if output.frame_meta.low_quality:
                 self._frames_low_quality_rejected += 1
+                self._rgb_history.append(
+                    np.full(np.shape(combined_rgb), np.nan, dtype=np.float64)
+                )
             else:
-                self._rgb_history.append(combined_rgb)
+                self._rgb_history.append(np.asarray(combined_rgb, dtype=np.float64))
 
         stride_seconds = self.config.signal.rppg.stride_seconds
-        if len(self._rgb_history) >= self._rgb_history.maxlen and (
+        window_maxlen = self._rgb_history.maxlen or 0
+        if len(self._rgb_history) >= window_maxlen and window_maxlen > 0 and (
             output.frame_meta.timestamp - self._last_physio_update
         ) >= stride_seconds:
             rgb_window = np.array(self._rgb_history, dtype=np.float64)
+            # audit P1: interpolate over the NaN-sentinel slots left by
+            # low-quality frames so the window stays time-uniform yet the
+            # downstream (non-NaN-aware) bandpass filter + Welch PSD see a
+            # finite signal. Per-channel linear interpolation; if a whole
+            # channel is NaN (no good frame in the window) it falls back to
+            # zeros, which ``extract_bvp`` already tolerates.
+            rgb_window = _interpolate_nan_window(rgb_window)
             bvp = extract_bvp(
                 rgb_window,
                 algorithm=self.config.signal.rppg.backend,
@@ -1852,6 +2054,12 @@ class CortexDaemon:
                 timestamp=output.frame_meta.timestamp,
                 head_jitter_deg=head_jitter_deg,
                 face_presence_ratio=1.0 if output.frame_meta.face_detected else 0.0,
+                # C5 (audit): forward the prior frame's blink-suppression
+                # score so ``PulseEstimator`` → ``RespirationEstimator``
+                # can run the apnea sustain timer off real fixation data
+                # (1-frame lag is acceptable; kinematics for THIS frame are
+                # computed below, after the window is built).
+                blink_suppression=self._last_blink_suppression_score,
             )
             self._latest_physio = self._pulse_estimator.get_features(output.frame_meta.timestamp)
             registry.register("latest_physio", self._latest_physio)
@@ -1882,6 +2090,13 @@ class CortexDaemon:
         # this to decide whether the signal is fresh enough to drive a
         # state estimate (see ``kinematics_age`` check below).
         self._last_kinematics_ts = float(output.frame_meta.timestamp)
+        # C5 (audit): cache this frame's blink-suppression score so the NEXT
+        # frame's rPPG window build can forward it into the apnea path with
+        # a 1-frame lag. ``blink_suppression_score`` is Optional on
+        # KinematicFeatures (None until the blink detector warms up).
+        self._last_blink_suppression_score = float(
+            blink.blink_suppression_score or 0.0
+        )
         self._feature_fusion.update_kinematics(self._latest_kinematics, timestamp=output.frame_meta.timestamp)
 
     async def _telemetry_loop(self) -> None:
@@ -2041,7 +2256,12 @@ class CortexDaemon:
                     ):
                         try:
                             x = np.asarray(vector.to_array(), dtype=np.float64).reshape(1, -1)
-                            ml_p_hyper = float(self._ml_classifier.predict(x)[0])
+                            # audit P0 (mypy): the real classifier API is
+                            # ``predict_proba`` returning calibrated
+                            # P(HYPER); ``predict`` never existed, so this
+                            # branch raised AttributeError and the ML blend
+                            # was silently skipped on every tick.
+                            ml_p_hyper = float(self._ml_classifier.predict_proba(x)[0])
                             full_at = max(1, self.config.state.ml_alpha_full_at_episodes)
                             ramp = min(1.0, self._ml_labeled_episodes / full_at)
                             ml_alpha = self.config.state.ml_alpha_max * ramp
@@ -2346,12 +2566,26 @@ class CortexDaemon:
                         telemetry = registry.get("latest_telemetry")
                         kinematics = self._latest_kinematics
                         self._zombie_detector.update_baseline(self._scorer.baselines.blink_rate_baseline)
-                        if self._zombie_detector.update(
+                        # audit P2: zombie-reading + rabbit-hole detection feed
+                        # off ``estimate.state`` and ``blink_rate`` — the SAME
+                        # biometric pipeline the standard intervention trigger
+                        # gates on ``signal_quality.acceptable``. Without the
+                        # floor a low-quality frame (face occluded, motion
+                        # blur) produces an unreliable HYPER/blink reading that
+                        # fired a spurious active-recall / goal-drift overlay.
+                        # Apply the same floor here so all HYPER-derived
+                        # interventions share one quality gate.
+                        signal_ok = estimate.signal_quality.acceptable
+                        # Advance the detector's dwell state on every tick so
+                        # its timers stay continuous, but only FIRE the
+                        # intervention when the signal is trustworthy.
+                        zombie_detected = self._zombie_detector.update(
                             state=estimate.state,
                             active_app=active_app,
                             mouse_velocity=telemetry.mouse_velocity_mean if telemetry else 0.0,
                             blink_rate=kinematics.blink_rate,
-                        ):
+                        )
+                        if signal_ok and zombie_detected:
                             logger.info("Zombie reading detected — triggering active recall")
                             await self._trigger_special_intervention(
                                 context, estimate, template_name="active_recall",
@@ -2369,7 +2603,7 @@ class CortexDaemon:
                                 state=estimate.state,
                                 current_time=timestamp,
                             )
-                            if alert is not None:
+                            if signal_ok and alert is not None:
                                 logger.info("Rabbit hole detected — goal drift intervention")
                                 await self._trigger_special_intervention(
                                     context, estimate, template_name="rabbit_hole",
@@ -2539,6 +2773,24 @@ class CortexDaemon:
             # B6 (Phase 4.1): graceful state loop shutdown.
             logger.debug("state loop cancelled")
 
+    @staticmethod
+    def _active_trigger_url(context: Any) -> str | None:
+        """C3 (audit): the active browser tab URL the plan is scoped to.
+
+        Read off the assembled ``context.browser_context.active_tab_url``
+        when present. Returns None on non-browser contexts (editor /
+        terminal focus) or when no browser surface is connected — the EXT
+        treats a null ``trigger_url`` as "no page scope". ``getattr`` keeps
+        the helper tolerant of duck-typed test contexts.
+        """
+        browser_ctx = getattr(context, "browser_context", None)
+        if browser_ctx is None:
+            return None
+        url = getattr(browser_ctx, "active_tab_url", None)
+        if isinstance(url, str) and url.strip():
+            return url
+        return None
+
     async def _trigger_intervention(
         self,
         context: Any,
@@ -2580,6 +2832,10 @@ class CortexDaemon:
             )
             plan = enrich_plan_with_context(plan, context)
             self._self_critique_plan(plan)
+            # C3 (audit): stamp the active-tab URL so the EXT's state-guards
+            # can scope this intervention to the page it was triggered on
+            # (the field is `None` until populated here).
+            plan.trigger_url = self._active_trigger_url(context)
 
             # Staleness check: suppress if student genuinely recovered
             current_state = registry.get("latest_state_estimate")
@@ -2619,14 +2875,22 @@ class CortexDaemon:
                     pattern_hint = self._suggest_break_pattern(
                         self._sample_hrv_for_break(),
                     )
+                    # ``_suggest_break_pattern`` returns a plain ``str``;
+                    # narrow it to the planner's Literal so mypy accepts the
+                    # call (an unrecognised hint maps to None = planner default).
+                    breathing_pattern: Literal["box", "4-7-8", "coherent"] | None
+                    if pattern_hint == "box":
+                        breathing_pattern = "box"
+                    elif pattern_hint == "4-7-8":
+                        breathing_pattern = "4-7-8"
+                    elif pattern_hint == "coherent":
+                        breathing_pattern = "coherent"
+                    else:
+                        breathing_pattern = None
                     plan = promote_biology_break(
                         plan,
                         duration_seconds=240,
-                        breathing_pattern=(
-                            pattern_hint
-                            if pattern_hint in ("box", "4-7-8", "coherent")
-                            else None
-                        ),
+                        breathing_pattern=breathing_pattern,
                         audio_cue=True,
                         reason="stress_integral_crossed_threshold",
                     )
@@ -2729,7 +2993,7 @@ class CortexDaemon:
                 # silently-broken intervention.
                 failed_types = sorted({m.action for m in mutations})
                 reasons = sorted({
-                    m.reason for m in mutations if getattr(m, "reason", None)
+                    m.reason for m in mutations if m.reason is not None
                 })
                 error_reason = (
                     reasons[0] if reasons else "all_mutations_failed"
@@ -2831,6 +3095,44 @@ class CortexDaemon:
                 self._bandit_decisions_by_intervention[plan.intervention_id] = (
                     list(bandit_features), int(bandit_arm_index)
                 )
+            # audit C-note: snapshot the trigger-time confidence + context
+            # complexity so the eventual engaged/dismissed outcome trains the
+            # dismissal model on the SAME features the trigger decision saw.
+            trigger_confidence = float(getattr(estimate, "confidence", 0.0) or 0.0)
+            trigger_complexity = (
+                float(context.complexity_score)
+                if context is not None and hasattr(context, "complexity_score")
+                else 0.0
+            )
+            self._dismissal_features_by_intervention[plan.intervention_id] = (
+                trigger_confidence,
+                trigger_complexity,
+            )
+            # Bound the cache the same way the causal-signals cache is bounded.
+            if len(self._dismissal_features_by_intervention) > 64:
+                oldest_dis = next(iter(self._dismissal_features_by_intervention))
+                self._dismissal_features_by_intervention.pop(oldest_dis, None)
+
+            # P1: snapshot the canonical consent action-types this plan acts
+            # on so engage/dismiss records the user's approval/rejection
+            # under the SAME keys the executor's per-action gate checks
+            # (canonical_action_type collapses both the plan's action_type
+            # vocabulary and the adapter verbs onto one policy key). Without
+            # this the daemon recorded under the literal "intervention",
+            # disjoint from the gated keys, so escalation never lifted.
+            consent_actions = sorted(
+                {
+                    canonical_action_type(a.action_type)
+                    for a in plan.suggested_actions
+                }
+            )
+            if consent_actions:
+                self._consent_actions_by_intervention[plan.intervention_id] = (
+                    consent_actions
+                )
+                if len(self._consent_actions_by_intervention) > 64:
+                    oldest_ca = next(iter(self._consent_actions_by_intervention))
+                    self._consent_actions_by_intervention.pop(oldest_ca, None)
 
             # P0 §3.12: dispatch through OS-level channels when the
             # desktop dashboard is not the active window. The flag is
@@ -2957,6 +3259,8 @@ class CortexDaemon:
                 template_name=template_name,
             )
             plan = enrich_plan_with_context(plan, context)
+            # C3 (audit): scope special interventions to the active tab too.
+            plan.trigger_url = self._active_trigger_url(context)
             self._active_intervention_id = plan.intervention_id
             # P0 §3.6: cache the live plan + merge prior step state on F16 swap.
             # Wave-2 P1: serialise against ``toggle_micro_step`` (same
@@ -3522,6 +3826,27 @@ class CortexDaemon:
             self._quiet_mode_ends_at = ends_at
             self._quiet_mode_source = str(source or "daemon")
 
+            # C6 (audit): emit QUIET_MODE_ENTERED / QUIET_MODE_EXITED on the
+            # real transition. Entering = moving INTO any non-"off" kind;
+            # exiting = moving FROM a non-"off" kind to "off". A kind→kind
+            # change (e.g. snooze_15 → quiet_session) re-emits ENTERED with
+            # the new kind/duration so the observability stream is honest.
+            if kind != "off":
+                _emit_event(
+                    EventType.QUIET_MODE_ENTERED,
+                    kind=kind,
+                    previous_kind=prev_kind,
+                    duration_minutes=minutes if minutes > 0 else None,
+                    ends_at=ends_at,
+                    source=self._quiet_mode_source,
+                )
+            elif prev_kind != "off":
+                _emit_event(
+                    EventType.QUIET_MODE_EXITED,
+                    previous_kind=prev_kind,
+                    source=self._quiet_mode_source,
+                )
+
             # (Re)schedule the auto-decay broadcaster. When the window
             # expires, broadcast a synthetic "off" state so every
             # surface (popup countdown, tray checkmark, dashboard pill)
@@ -3651,16 +3976,27 @@ class CortexDaemon:
         if primary_focus:
             body_parts.append(primary_focus)
         body = " — ".join(body_parts) or "Cortex has a suggestion"
+        intervention_id = getattr(plan, "intervention_id", "") or ""
         try:
-            await asyncio.to_thread(
+            sent = await asyncio.to_thread(
                 send_intervention_notification,
                 title=headline,
                 body=body,
-                intervention_id=getattr(plan, "intervention_id", "") or "",
+                intervention_id=intervention_id,
             )
         except Exception:
             logger.debug(
                 "send_intervention_notification raised", exc_info=True,
+            )
+            return
+        # C6 (audit): emit OS_NOTIFICATION_SENT when the OS actually posted
+        # the notification (the helper returns False on non-mac / missing
+        # PyObjC / permission-denied). No biometric data in the event.
+        if sent:
+            _emit_event(
+                EventType.OS_NOTIFICATION_SENT,
+                intervention_id=intervention_id,
+                channel="macos_unusernotification",
             )
 
     # ------------------------------------------------------------------
@@ -4160,7 +4496,9 @@ class CortexDaemon:
             ) or self._last_policy_decision_id
             if decision_id and self.config.eval.policy == "amip":
                 try:
-                    await self._amip.update_reward(decision_id, -0.2)
+                    # ``AMIPPolicy.update_reward`` is synchronous (returns
+                    # None); awaiting it was a mypy func-returns-value error.
+                    self._amip.update_reward(decision_id, -0.2)
                 except Exception:
                     logger.debug(
                         "auto_focus_dismissed AMIP reward update failed",
@@ -4249,10 +4587,13 @@ class CortexDaemon:
                 )
                 return
             if is_dispatch_request and source_client in ("", "desktop"):
-                action_dict = (
-                    payload.get("action")
-                    if isinstance(payload.get("action"), dict)
-                    else {
+                raw_action = payload.get("action")
+                action_dict: dict[str, Any]
+                if isinstance(raw_action, dict):
+                    # normalise an untyped dict[Any, Any] to dict[str, Any]
+                    action_dict = {str(k): v for k, v in raw_action.items()}
+                else:
+                    action_dict = {
                         "action_id": payload.get("action_id"),
                         "action_type": payload.get("action_type"),
                         "label": payload.get("label", ""),
@@ -4260,7 +4601,6 @@ class CortexDaemon:
                         "target": payload.get("target"),
                         "tab_index": payload.get("tab_index"),
                     }
-                )
                 await self.dispatch_action_to_browser(
                     str(payload.get("intervention_id") or ""),
                     action_dict,
@@ -4319,7 +4659,8 @@ class CortexDaemon:
                                 "decision_id=%s rating=%s reward=%.2f cid=%s",
                                 iid, decision_id, rating, rating_reward, cid,
                             )
-                            await self._amip.update_reward(
+                            # synchronous; see note at the other call site.
+                            self._amip.update_reward(
                                 decision_id, rating_reward,
                             )
                         except Exception:
@@ -4391,14 +4732,42 @@ class CortexDaemon:
             return
         context = self._latest_context
 
+        # audit C-note: train the dismissal model on the TRIGGER-time
+        # confidence + context_complexity snapshot (cached at trigger time),
+        # not ``outcome.recovery_confidence`` / the feedback-time context.
+        # Fall back to the trigger-policy's last evaluated confidence and the
+        # current context only when the snapshot is missing (e.g. a legacy
+        # intervention id from before this cache existed).
+        cached_features = self._dismissal_features_by_intervention.get(
+            intervention_id
+        )
+        if cached_features is not None:
+            trigger_conf, trigger_complexity = cached_features
+        else:
+            trigger_conf = 0.0
+            trigger_complexity = (
+                float(context.complexity_score)
+                if context and hasattr(context, "complexity_score")
+                else 0.0
+            )
+
+        # P1: record approval/rejection under the canonical action-types
+        # this intervention acted on (the executor gates on the same keys),
+        # so escalation actually lifts the gate on approved actions. Falls
+        # back to the legacy "intervention" key when no actions were cached.
+        consent_keys = self._consent_actions_by_intervention.get(
+            intervention_id
+        ) or ["intervention"]
+
         if action == "engaged":
             outcome = await self._restore_manager.engage(intervention_id)
-            # v2.0: Record consent approval (using intervention level as action_type)
-            await self._consent_ladder.record_approval("intervention")
+            # v2.0: Record consent approval under each gated action-type.
+            for consent_key in consent_keys:
+                await self._consent_ladder.record_approval(consent_key)
             self._trigger_policy.record_outcome(
                 dismissed=False,
-                confidence=float(getattr(outcome, "recovery_confidence", 0.0) or 0.0),
-                context_complexity=float(context.complexity_score) if context and hasattr(context, "complexity_score") else 0.0,
+                confidence=trigger_conf,
+                context_complexity=trigger_complexity,
             )
         elif action == "snoozed":
             self._trigger_policy.activate_quiet_mode(duration_minutes=15)
@@ -4419,11 +4788,12 @@ class CortexDaemon:
                 self._trigger_policy.record_dismissal()
                 self._trigger_policy.record_outcome(
                     dismissed=True,
-                    confidence=float(getattr(outcome, "recovery_confidence", 0.0) or 0.0),
-                    context_complexity=float(context.complexity_score) if context and hasattr(context, "complexity_score") else 0.0,
+                    confidence=trigger_conf,
+                    context_complexity=trigger_complexity,
                 )
-                # v2.0: Record consent rejection
-                await self._consent_ladder.record_rejection("intervention")
+                # v2.0: Record consent rejection under each gated action-type.
+                for consent_key in consent_keys:
+                    await self._consent_ladder.record_rejection(consent_key)
 
         if outcome is None:
             self._amip_decision_ids_by_intervention.pop(intervention_id, None)
@@ -4970,14 +5340,23 @@ class CortexDaemon:
     async def _check_morning_briefing(self) -> None:
         """Check for yesterday's handover and generate morning briefing."""
         try:
-            briefing = MorningBriefing(storage_root=self.config.storage.path)
-            content = briefing.check_and_generate()
+            # audit P0 (mypy): real constructor kwarg is ``storage_path``
+            # (not ``storage_root``); ``check_and_generate`` is a coroutine
+            # and MUST be awaited — the un-awaited call returned a coroutine
+            # object on which ``.summary`` always raised AttributeError, so
+            # the morning briefing silently never reached any surface.
+            briefing = MorningBriefing(storage_path=str(self.config.storage.path))
+            content = await briefing.check_and_generate()
             if content is not None:
                 logger.info("Morning briefing available: %s", content.summary[:80])
                 await self._ws_server.send_message("MORNING_BRIEFING", {
                     "summary": content.summary,
                     "action_items": content.action_items,
-                    "left_off_at": content.left_off_at,
+                    # ``BriefingContent`` has no ``left_off_at`` field; the
+                    # wire contract's ``left_off_at`` is the "where you left
+                    # off" headline the popup feeds into START_FOCUS as the
+                    # resume goal — that is the briefing ``title``.
+                    "left_off_at": content.title,
                 })
         except Exception:
             logger.debug("No morning briefing available")
@@ -4988,7 +5367,7 @@ class CortexDaemon:
             snapshot = HandoverSnapshot(str(self.config.storage.path))
 
             # Gather recent activity data for the handover
-            activity_timeline: list[dict] | None = None
+            activity_timeline: list[dict[str, Any]] | None = None
             try:
                 recent = await self._activity_aggregator.get_recent_activities(limit=10)
                 if recent:
@@ -5326,16 +5705,26 @@ class CortexDaemon:
         recap_payload: dict[str, Any]
         try:
             if self._session_report_started and self._session_report is not None:
+                # C4 (audit): wrap the real report in the declared
+                # ``SessionRecap`` envelope (forced recap is never persisted).
+                from cortex.libs.schemas.realtime import SessionRecap
                 report = self._session_report.finish()
-                recap_payload = report.model_dump(mode="json")
+                recap_payload = SessionRecap(
+                    report=report,
+                    generated_at=datetime.now(UTC).isoformat(),
+                    persisted=False,
+                ).model_dump(mode="json")
             else:
+                # No active session: there is no SessionReport to wrap, so we
+                # broadcast a minimal synthetic payload. The popup gates on
+                # ``session_id`` presence and tolerates this shape.
                 recap_payload = {
                     "session_id": "force_recap",
                     "start_time": datetime.now(UTC).isoformat(),
                     "end_time": datetime.now(UTC).isoformat(),
                     "duration_seconds": 0.0,
+                    "persisted": False,
                 }
-            recap_payload["persisted"] = False
             self._latest_session_recap = recap_payload
             await ws.send_message(MessageType.SESSION_RECAP.value, recap_payload)
             return True
@@ -5603,13 +5992,21 @@ class CortexDaemon:
         WARNING and falls back to ``"week"`` so the dashboard never
         renders an empty pane on a stale URL.
         """
-        if window not in ("week", "month"):
+        # Narrow ``window`` to the aggregator's Literal so mypy accepts the
+        # to_thread call. The legacy ``"quarter"`` and any unknown value
+        # fall back to ``"week"``.
+        resolved_window: Literal["week", "month", "quarter"]
+        if window == "month":
+            resolved_window = "month"
+        elif window == "week":
+            resolved_window = "week"
+        else:
             logger.warning(
                 "get_trends: unknown window=%r; falling back to 'week'", window
             )
-            window = "week"
+            resolved_window = "week"
         return await asyncio.to_thread(
-            self._session_aggregator.get_trends, window, refresh=refresh,
+            self._session_aggregator.get_trends, resolved_window, refresh=refresh,
         )
 
     def latest_session_recap(self) -> dict[str, Any] | None:

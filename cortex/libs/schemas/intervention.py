@@ -430,6 +430,22 @@ class InterventionPlan(BaseModel):
     causal_explanation: str = Field(
         "", max_length=500, description="Why Cortex triggered this intervention, referencing specific signals"
     )
+    # C3 (audit): the URL/context of the active tab at trigger time. The
+    # daemon stamps this from the active-tab context when building the
+    # INTERVENTION_TRIGGER; the browser extension's state-guards read
+    # ``plan.trigger_url`` to scope an intervention to the page that
+    # provoked it (e.g. suppress a stale overlay after the user has
+    # navigated away). ``None`` when the daemon had no active-tab URL to
+    # attribute (no browser client connected, or a non-browser trigger).
+    trigger_url: str | None = Field(
+        None,
+        max_length=2048,
+        description=(
+            "URL of the active tab at trigger time, stamped by the daemon "
+            "so surfaces can scope the intervention to its originating "
+            "page. None when no active-tab URL was available."
+        ),
+    )
     # P0 §3.9: structured rationale companion to ``causal_explanation``.
     # Maximum three entries (primary + secondary + tertiary), ranked by
     # |z-score| against the user's baselines. Surfaces in the "Why?"
@@ -651,8 +667,22 @@ class DismissalRecord(BaseModel):
 
     @property
     def age_seconds(self) -> float:
-        """Get age of dismissal in seconds."""
-        return (datetime.now() - self.timestamp).total_seconds()
+        """Get age of dismissal in seconds.
+
+        Robust to a naive OR timezone-aware ``timestamp``. The legacy
+        ``datetime.now() - self.timestamp`` raised
+        ``TypeError: can't subtract offset-naive and offset-aware
+        datetimes`` whenever a caller constructed the record with a
+        tz-aware ``timestamp`` (e.g. ``datetime.now(UTC)``), which is the
+        shape the rest of Cortex's structured-logging layer emits. We
+        compare against ``now`` in the same awareness domain as the
+        stored timestamp so the subtraction is always valid.
+        """
+        if self.timestamp.tzinfo is not None:
+            now = datetime.now(self.timestamp.tzinfo)
+        else:
+            now = datetime.now()
+        return (now - self.timestamp).total_seconds()
 
 
 class InterventionApplied(BaseModel):
@@ -673,9 +703,13 @@ class InterventionApplied(BaseModel):
     intervention_id: str = Field(
         ..., description="Intervention this ack belongs to"
     )
-    phase: Literal["apply", "restore"] = Field(
+    phase: Literal["apply", "restore", "execute_action"] = Field(
         "apply",
-        description="Lifecycle phase being acked",
+        description=(
+            "Lifecycle phase being acked. 'execute_action' is sent by the "
+            "VS Code extension when it acks a non-mutating native action "
+            "(e.g. resume_last_active_file) it executed directly."
+        ),
     )
     success: bool = Field(
         ...,
@@ -736,6 +770,6 @@ class InterventionApplyResult(BaseModel):
         default_factory=list,
         description="Per-action errors reported by the client",
     )
-    phase: Literal["apply", "restore"] = Field(
+    phase: Literal["apply", "restore", "execute_action"] = Field(
         "apply", description="Which lifecycle phase this result belongs to"
     )

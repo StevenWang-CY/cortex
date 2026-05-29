@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from typing import Any
+from typing import Any, Protocol
 
 from cortex.libs.schemas.leetcode import (
     LeetCodeContext,
@@ -21,6 +21,29 @@ from cortex.libs.schemas.leetcode import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _LeetCodeIntervention(Protocol):
+    """Structural interface shared by every stage×mode intervention cell.
+
+    Each concrete intervention (RestatementScratchpad, PatternLadder, …)
+    exposes the same trigger/build pair; the matrix iterates them
+    polymorphically. Declaring the protocol lets ``InterventionMatrix``
+    type its registry as ``list[_LeetCodeIntervention]`` instead of a
+    bare ``list`` (mypy ``type-arg``).
+    """
+
+    def should_trigger(
+        self,
+        mode_estimate: LeetCodeModeEstimate,
+        leetcode_ctx: LeetCodeContext,
+    ) -> bool: ...
+
+    def build_action(
+        self,
+        mode_estimate: LeetCodeModeEstimate,
+        leetcode_ctx: LeetCodeContext,
+    ) -> dict[str, Any]: ...
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +396,7 @@ class InterventionMatrix:
     """
 
     def __init__(self) -> None:
-        self._interventions: list = [
+        self._interventions: list[_LeetCodeIntervention] = [
             RestatementScratchpad(),
             PatternLadder(),
             AmygdalaLockout(),

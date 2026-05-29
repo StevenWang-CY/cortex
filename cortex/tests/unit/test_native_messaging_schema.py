@@ -54,6 +54,32 @@ class TestValidCommands:
         assert isinstance(result.message, LaunchMessage)
         assert result.message.project_root == str(tmp_path.resolve())
 
+    def test_comma_separated_allowlist_extends_roots(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Finding-10: ``CORTEX_NATIVE_HOST_PROJECT_ROOTS`` is COMMA-separated
+        (matching the documented ``.env.example`` example). A two-entry,
+        comma-separated value must register BOTH roots. With the legacy
+        ``:`` split this whole string was treated as one (non-existent)
+        path and neither entry was honoured.
+        """
+        root_a = tmp_path / "alpha"
+        root_b = tmp_path / "beta"
+        root_a.mkdir()
+        root_b.mkdir()
+        monkeypatch.setenv(
+            "CORTEX_NATIVE_HOST_PROJECT_ROOTS",
+            f"{root_a},{root_b}",
+        )
+        # The SECOND entry must be honoured — proves the comma split, not
+        # a single-path interpretation of the whole string.
+        result = parse_native_message(
+            _encode({"command": "launch", "project_root": str(root_b)})
+        )
+        assert result.error is None, result.detail
+        assert isinstance(result.message, LaunchMessage)
+        assert result.message.project_root == str(root_b.resolve())
+
     def test_valid_stop(self) -> None:
         result = parse_native_message(_encode({"command": "stop"}))
         assert result.error is None

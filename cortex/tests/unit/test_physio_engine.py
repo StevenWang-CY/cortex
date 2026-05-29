@@ -520,6 +520,182 @@ class TestSQIValidityThreshold:
         assert features.pulse_variability_proxy is None
 
 
+class TestRespirationGatedOnValidity:
+    """P0-1: respiration_rate_bpm must be gated by sqi_gate_ok.
+
+    PhysioFeatures._enforce_invalid_nulls raises ValueError if a data field
+    (including respiration_rate_bpm) is non-None when valid=False. The daemon
+    swallows that ValueError as a dropped frame, losing physio + kinematics.
+    Before the fix, get_features() passed respiration_rate_bpm UNGATED.
+    """
+
+    def test_poor_sqi_with_populated_respiration_returns_invalid_no_raise(self) -> None:
+        from cortex.services.physio_engine.respiration import RespirationEstimate
+
+        estimator = PulseEstimator(fs=30.0)
+
+        # Low-SQI estimate so the SQI gate fails -> valid=False.
+        est = PulseEstimate(
+            hr_bpm=72.0,
+            hr_confidence=0.5,
+            rmssd_ms=40.0,
+            ibi_count=2,
+            signal_quality=0.3,
+            physio_sqi=0.2,  # below 0.3 gate
+            sqi_components={"nsqi": 0.0, "snr_db": -10.0},
+        )
+        estimator._latest_estimate = est
+
+        # Populate the respiration sub-estimator with a real rate. Pre-fix,
+        # this value flowed into PhysioFeatures unconditionally and tripped
+        # the validator.
+        estimator._resp_estimator._latest = RespirationEstimate(
+            resp_rate_bpm=14.0,
+            confidence=0.8,
+            apnea_detected=False,
+            dominant_freq_hz=0.23,
+        )
+
+        # Must NOT raise (no swallowed dropped frame).
+        features = estimator.get_features(timestamp=10.0)
+        assert features.valid is False
+        assert features.respiration_rate_bpm is None
+
+    def test_good_sqi_passes_respiration_through(self) -> None:
+        from cortex.services.physio_engine.respiration import RespirationEstimate
+
+        estimator = PulseEstimator(fs=30.0)
+        est = PulseEstimate(
+            hr_bpm=72.0,
+            hr_confidence=0.9,
+            rmssd_ms=40.0,
+            ibi_count=12,
+            signal_quality=0.9,
+            physio_sqi=0.8,
+            sqi_components={"nsqi": 0.9, "snr_db": 8.0},
+        )
+        estimator._latest_estimate = est
+        estimator._resp_estimator._latest = RespirationEstimate(
+            resp_rate_bpm=14.0,
+            confidence=0.8,
+            apnea_detected=False,
+            dominant_freq_hz=0.23,
+        )
+
+        features = estimator.get_features(timestamp=10.0)
+        assert features.valid is True
+        assert features.respiration_rate_bpm == 14.0
+
+
+class TestApneaThreadingFromPulseEstimator:
+    """P1 / C5: process_window forwards blink_suppression and frame timestamp
+    to the respiration estimator so screen-apnea is reachable and the sustain
+    timer uses the frame clock, not time.monotonic().
+
+    The respiratory bandpass passband is 0.15-0.4 Hz (9-24 bpm), so the test
+    raises the apnea threshold into the detectable band and uses a clean
+    ~15 bpm respiratory signal that sits below that raised threshold. This
+    keeps the test deterministic instead of fighting the filter's lower
+    cutoff at the default 8 bpm floor.
+    """
+
+    def _breathing_bvp(self, resp_hz: float = 0.25, duration_s: float = 14.0,
+                       fs: float = 30.0) -> np.ndarray:
+        t = np.arange(0, duration_s, 1.0 / fs)
+        cardiac = np.sin(2 * np.pi * 1.2 * t)
+        resp_envelope = 1.0 + 0.4 * np.sin(2 * np.pi * resp_hz * t)
+        return (cardiac * resp_envelope).astype(np.float64)
+
+    def _make_estimator(self) -> PulseEstimator:
+        est = PulseEstimator(fs=30.0)
+        # Raise the apnea threshold into the filter's detectable band so a
+        # real ~15 bpm rate counts as "low"; short sustain for a fast test.
+        est._resp_estimator._apnea_resp_threshold = 18.0
+        est._resp_estimator._apnea_sustain_seconds = 5.0
+        return est
+
+    def test_blink_suppression_and_timestamp_drive_apnea(self) -> None:
+        estimator = self._make_estimator()
+        bvp = self._breathing_bvp(resp_hz=0.25)  # ~15 bpm < 18 threshold
+
+        # Frame 1 at t=0 with high blink suppression: starts the low-resp timer.
+        estimator.process_window(bvp, timestamp=0.0, blink_suppression=0.8)
+        resp = estimator.resp_estimator.latest_estimate
+        assert resp is not None
+        assert resp.resp_rate_bpm is not None
+        assert resp.resp_rate_bpm < 18.0
+        assert resp.confidence > 0.3
+        assert resp.apnea_detected is False  # sustain (5s) not yet elapsed
+
+        # Frame 2 at t=6s (past the 5s sustain) with sustained suppression:
+        # apnea must flip using the frame clock, NOT time.monotonic().
+        estimator.process_window(bvp, timestamp=6.0, blink_suppression=0.8)
+        resp2 = estimator.resp_estimator.latest_estimate
+        assert resp2 is not None
+        assert resp2.apnea_detected is True
+
+    def test_low_blink_suppression_keeps_apnea_off(self) -> None:
+        estimator = self._make_estimator()
+        bvp = self._breathing_bvp(resp_hz=0.25)
+        # No blink suppression -> the apnea visual-focus gate never engages
+        # even though the respiration rate is below threshold.
+        estimator.process_window(bvp, timestamp=0.0, blink_suppression=0.0)
+        estimator.process_window(bvp, timestamp=6.0, blink_suppression=0.0)
+        resp = estimator.resp_estimator.latest_estimate
+        assert resp is not None
+        assert resp.apnea_detected is False
+
+    def test_timestamp_threaded_not_monotonic(self) -> None:
+        """The sustain window must be measured with the supplied frame
+        timestamp, not wall/monotonic time: two frames microseconds apart in
+        real time but 6 frame-seconds apart must trip apnea."""
+        estimator = self._make_estimator()
+        bvp = self._breathing_bvp(resp_hz=0.25)
+        estimator.process_window(bvp, timestamp=100.0, blink_suppression=0.9)
+        # Real elapsed time here is ~0 ms, but the frame clock advanced 6 s.
+        estimator.process_window(bvp, timestamp=106.0, blink_suppression=0.9)
+        resp = estimator.resp_estimator.latest_estimate
+        assert resp is not None
+        assert resp.apnea_detected is True
+
+
+class TestMotionRespirationFusion:
+    """P1: motion-based respiration fusion is now live (was always None).
+
+    A real motion proxy is built from head vertical-position samples fed via
+    push_head_vertical_sample() and fused with the BVP-derived estimate.
+    """
+
+    def test_motion_proxy_feeds_fusion(self) -> None:
+        fs = 30.0
+        estimator = PulseEstimator(fs=fs)
+
+        # Feed a full window of head vertical positions oscillating at the
+        # respiratory rate (0.25 Hz = 15 breaths/min).
+        t = np.arange(0, 10.0, 1.0 / fs)
+        for y in 0.5 + 0.02 * np.sin(2 * np.pi * 0.25 * t):
+            estimator.push_head_vertical_sample(float(y))
+
+        # The internally-derived motion proxy must be non-None now.
+        proxy = estimator._motion_resp_signal()
+        assert proxy is not None
+        assert proxy.shape[0] == len(t)
+
+        # And it must actually reach the respiration estimator: a flat BVP
+        # window (no respiratory content) fused with the oscillating motion
+        # proxy should still yield a respiration estimate near 15 bpm.
+        flat_bvp = (np.sin(2 * np.pi * 1.2 * t)).astype(np.float64)
+        estimator.process_window(flat_bvp, timestamp=10.0)
+        resp = estimator.resp_estimator.latest_estimate
+        assert resp is not None
+        assert resp.resp_rate_bpm is not None
+
+    def test_no_motion_samples_is_bvp_only(self) -> None:
+        estimator = PulseEstimator(fs=30.0)
+        # Without any head-vertical samples the proxy is None (BVP-only path).
+        assert estimator._motion_resp_signal() is None
+
+
 class TestParabolicInterpolation:
     """Tests for parabolic peak interpolation (C-02)."""
 

@@ -84,6 +84,11 @@ def make_default_store(
             port=int(getattr(redis_cfg, "port", 6379)),
             db=int(getattr(redis_cfg, "db", 0)),
             key_prefix=key_prefix,
+            # C7 (audit): if Redis is configured-but-unreachable the store
+            # degrades to a persistent InMemoryStore at the same OS path
+            # the no-Redis branch uses, so consent / calibration state
+            # survives a daemon restart in BOTH deployments.
+            fallback_persist_path=persist_path or _default_persist_path(),
         )
 
     return InMemoryStore(

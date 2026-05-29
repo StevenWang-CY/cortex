@@ -177,12 +177,20 @@ def _bundled_storage_path() -> str:
 
 
 class RedisConfig(BaseModel):
-    """Redis connection configuration."""
+    """Redis connection configuration.
+
+    C7 (audit): ``enabled`` defaults to ``False``. The shipped desktop
+    .app has no Redis service to manage, so the DMG-default deployment
+    runs on the persistent :class:`InMemoryStore` fallback selected by
+    :func:`cortex.libs.store.make_default_store`. Operators who run a
+    Redis instance flip this to ``True`` via
+    ``CORTEX_REDIS__ENABLED=true`` (or ``defaults.yaml``).
+    """
 
     host: str = "localhost"
     port: int = 6379
     db: int = 0
-    enabled: bool = True
+    enabled: bool = False
     key_prefix: str = "cortex"
 
 
@@ -292,11 +300,13 @@ class CaptureConfig(BaseModel):
     max_jitter_px: float = 5.0
     face_lost_tolerance_frames: int = 5
     # audit Phase-I: how often to run MediaPipe FaceLandmarker relative
-    # to the capture cadence. ``1`` = every frame (original behaviour),
-    # ``2`` = every other frame (15 Hz at 30 Hz capture). Downstream
-    # state/telemetry loops run at 2 Hz, so the cheaper 15 Hz mesh path
-    # remains well above Nyquist while halving the mediapipe CPU cost.
-    face_mesh_subsample_n: int = 2
+    # to the capture cadence. ``1`` = every frame, ``2`` = every other
+    # frame (15 Hz at 30 Hz capture). C5 (audit): default reverted to
+    # ``1`` (every frame) — SENSING's apnea / blink-suppression timing
+    # needs the full-rate mesh so the per-frame timestamp threading is
+    # exact; the half-rate path introduced a sub-Nyquist gap on the
+    # respiration estimator that the apnea sustain timer depends on.
+    face_mesh_subsample_n: int = 1
 
 
 class StateWeights(BaseModel):
@@ -714,7 +724,7 @@ class _YamlDefaultsSource(PydanticBaseSettingsSource):
         return load_yaml_defaults()
 
 
-def load_yaml_defaults() -> dict:
+def load_yaml_defaults() -> dict[str, Any]:
     """Load default configuration from YAML file."""
     # In bundled mode, check _MEIPASS first
     if _is_bundled():

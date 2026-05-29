@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -201,7 +202,7 @@ class StressIntegralTracker:
         cutoff = self._history[-1][0] - window_seconds
         return [(t, v) for t, v in self._history if t >= cutoff]
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         """Serialize current state for Redis persistence."""
         return {
             "integral": self._integral,
@@ -215,7 +216,7 @@ class StressIntegralTracker:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> StressIntegralTracker:
+    def from_dict(cls, data: dict[str, Any]) -> StressIntegralTracker:
         """Restore from serialized state."""
         tracker = cls(
             hrv_baseline=data.get("hrv_baseline", 50.0),

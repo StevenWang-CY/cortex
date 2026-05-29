@@ -16,7 +16,7 @@ Design:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +88,14 @@ class FaceTrackingResult:
     landmarks_px: np.ndarray | None  # (N, 2) pixel coordinates or None
     bounding_box: BoundingBox | None
     face_stable: bool  # True if face has been consistently detected (hysteresis passed)
+    # audit Phase-I: True when these landmarks are a byte-for-byte replay
+    # of an earlier frame's mediapipe result (``face_mesh_subsample_n > 1``
+    # skip path). Per-frame consumers that integrate over time — blink
+    # duration (BlinkDetector hardcodes 1000/30 ms per frame) and head
+    # angular velocity — MUST NOT re-process a replayed frame as if it
+    # were a fresh measurement, or those rates are scaled by the subsample
+    # factor. A fresh mediapipe detection always has ``is_replayed=False``.
+    is_replayed: bool = False
 
 
 class FaceTracker:
@@ -205,7 +213,10 @@ class FaceTracker:
         if subsample_n > 1 and self._last_result is not None:
             self._subsample_counter = (self._subsample_counter + 1) % subsample_n
             if self._subsample_counter != 0:
-                return self._last_result
+                # Mark the replayed result so time-integrating consumers
+                # (blink duration, angular velocity) can skip it instead of
+                # double-counting stale landmarks as a fresh measurement.
+                return replace(self._last_result, is_replayed=True)
         else:
             self._subsample_counter = 0
 
@@ -235,7 +246,7 @@ class FaceTracker:
 
     def _process_detected_face(
         self,
-        face_landmarks: list,
+        face_landmarks: list[Any],
         height: int,
         width: int,
     ) -> FaceTrackingResult:

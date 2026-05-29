@@ -148,7 +148,7 @@ class EditorAdapter:
             self._available = False
             return None
 
-    def update_from_payload(self, payload: dict) -> EditorContext | None:
+    def update_from_payload(self, payload: dict[str, Any]) -> EditorContext | None:
         """
         Update context directly from a payload dict (for push-based updates).
 
@@ -163,15 +163,29 @@ class EditorAdapter:
             self._available = True
             self._last_context = ctx
             return ctx
-        except (KeyError, TypeError, ValueError) as e:
+        except (KeyError, TypeError, ValueError, AttributeError) as e:
+            # F-finding #4: surface a malformed payload as a logged None
+            # (AttributeError covers ``.get`` on a non-dict diagnostic
+            # that slips past the isinstance guard) instead of letting
+            # the exception escape and crash the WS push handler.
             logger.warning(f"Failed to parse editor context: {e}")
+            self._available = False
             return None
 
     @staticmethod
-    def _parse_editor_context(payload: dict) -> EditorContext:
+    def _parse_editor_context(payload: dict[str, Any]) -> EditorContext:
         """Parse an EditorContext from a payload dict."""
-        diagnostics = []
-        for d in payload.get("diagnostics", []):
+        diagnostics: list[Diagnostic] = []
+        diagnostics_raw = payload.get("diagnostics", [])
+        # F-finding #4: the editor extension is an untrusted, optional
+        # source — a non-list ``diagnostics`` or a non-dict entry must
+        # degrade gracefully (skip the bad entry) rather than raise an
+        # uncaught AttributeError.
+        if not isinstance(diagnostics_raw, list):
+            diagnostics_raw = []
+        for d in diagnostics_raw:
+            if not isinstance(d, dict):
+                continue
             diagnostics.append(Diagnostic(
                 severity=d.get("severity", "info"),
                 message=d.get("message", ""),
@@ -191,7 +205,7 @@ class EditorAdapter:
         )
 
     @staticmethod
-    def _parse_terminal_context(payload: dict) -> TerminalContext:
+    def _parse_terminal_context(payload: dict[str, Any]) -> TerminalContext:
         return TerminalContext(
             last_n_lines=payload.get("last_n_lines", []),
             detected_errors=payload.get("detected_errors", []),

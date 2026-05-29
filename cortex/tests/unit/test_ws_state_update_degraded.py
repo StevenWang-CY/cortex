@@ -62,6 +62,31 @@ def _fallback_estimate() -> StateEstimate:
     )
 
 
+def _low_signal_estimate() -> StateEstimate:
+    """A REAL classifier estimate (``classifier_source`` populated) but
+    produced on a signal whose fused quality fell below the
+    acceptability floor (``SignalQuality.overall < 0.3``).
+
+    This is the production case finding #3 flagged: the smoother always
+    stamps a ``classifier_source`` ("rule"/"ml"/"ensemble") so the old
+    ``classifier_source is None`` condition NEVER fired here, and the
+    dashboard's degraded banner could not surface a genuinely poor
+    signal. overall = 0.4*0.1 + 0.3*0.1 + 0.3*0.1 = 0.10 < 0.3.
+    """
+    return StateEstimate(
+        state="HYPER",
+        confidence=0.61,
+        scores=StateScores(flow=0.1, hypo=0.1, hyper=0.61, recovery=0.0),
+        reasons=["thrashing"],
+        signal_quality=SignalQuality(
+            physio=0.1, kinematics=0.1, telemetry=0.1,
+        ),
+        timestamp=100.0,
+        dwell_seconds=4.0,
+        classifier_source="rule",
+    )
+
+
 def test_state_update_classifier_payload_marks_source_classifier() -> None:
     """A normal scorer-derived estimate produces ``source=classifier`` and
     ``degraded=False`` on the WS frame so the dashboard banner stays
@@ -80,6 +105,21 @@ def test_state_update_fallback_payload_marks_source_fallback() -> None:
     msg = server._make_state_update(_fallback_estimate())
     assert msg.payload["source"] == "fallback"
     assert msg.payload["degraded"] is True
+
+
+def test_state_update_low_signal_marks_degraded_despite_classifier() -> None:
+    """Finding #3: a real classifier estimate (``classifier_source`` set)
+    whose fused signal quality fell below the acceptability floor MUST
+    still broadcast ``degraded=True`` / ``source=fallback`` so the
+    dashboard banner fires. The old ``classifier_source is None`` test
+    never caught this because the live smoother always names a source."""
+    server = WebSocketServer()
+    msg = server._make_state_update(_low_signal_estimate())
+    assert msg.payload["degraded"] is True
+    assert msg.payload["source"] == "fallback"
+    # The debug-overlay field is preserved — the real engine is still
+    # named even though the envelope is flagged degraded.
+    assert msg.payload["classifier_source"] == "rule"
 
 
 def test_state_update_payload_keeps_classifier_source_field() -> None:

@@ -40,6 +40,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from cortex.libs.utils.atomic_write import atomic_write_json
 from cortex.libs.utils.platform import get_config_dir
@@ -81,11 +82,11 @@ class Goal:
     # average or other derived fields onto a goal record. Reserved for
     # future Phase 4b coordination; the store passes it through
     # transparently.
-    metadata: dict = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     # ---- (de)serialisation helpers ----
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "title": self.title,
@@ -96,7 +97,7 @@ class Goal:
         }
 
     @classmethod
-    def from_dict(cls, raw: dict) -> Goal:
+    def from_dict(cls, raw: dict[str, Any]) -> Goal:
         return cls(
             id=str(raw.get("id") or uuid.uuid4().hex),
             title=str(raw.get("title") or "")[:MAX_TITLE_LENGTH],

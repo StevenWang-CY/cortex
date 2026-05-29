@@ -593,10 +593,43 @@ def _setup_pyside6_mocks() -> bool:
         if not hasattr(qtwidgets, _name):
             setattr(qtwidgets, _name, _passthrough_stub(_name))
 
+    # ``break_overlay`` (imported transitively by ``controller.py``) uses a
+    # handful of QtCore + QtMultimedia symbols not otherwise stubbed. Add
+    # permissive stand-ins so the in-process controller is importable in the
+    # mocked harness (needed for the audit-prod routing tests).
+    class _MockQEventLoop:
+        def __init__(self, *a, **kw): pass
+        def exec(self, *a, **kw): return 0
+        def quit(self, *a, **kw): pass
+    class _MockQUrl:
+        def __init__(self, *a, **kw): pass
+        @staticmethod
+        def fromLocalFile(p): return _MockQUrl()
+    if not hasattr(qtcore, "QEventLoop"):
+        qtcore.QEventLoop = _MockQEventLoop
+    if not hasattr(qtcore, "QUrl"):
+        qtcore.QUrl = _MockQUrl
+
+    # Permissive module-level fallback for any QtGui symbol not explicitly
+    # stubbed (e.g. QKeyEvent / QGuiApplication / QLinearGradient pulled in
+    # transitively by break_overlay). Returns a passthrough widget-ish stub
+    # so ``from PySide6.QtGui import Q…`` resolves under the mocked harness.
+    def _qtgui_getattr(name: str):
+        if name.startswith("Q"):
+            return type(name, (), {"__init__": lambda self, *a, **kw: None})
+        raise AttributeError(name)
+    qtgui.__getattr__ = _qtgui_getattr  # type: ignore[attr-defined]
+
+    qtmultimedia = types.ModuleType("PySide6.QtMultimedia")
+    qtmultimedia.QSoundEffect = type(
+        "QSoundEffect", (), {"__init__": lambda self, *a, **kw: None}
+    )
+
     sys.modules["PySide6"] = pyside6
     sys.modules["PySide6.QtCore"] = qtcore
     sys.modules["PySide6.QtGui"] = qtgui
     sys.modules["PySide6.QtWidgets"] = qtwidgets
+    sys.modules["PySide6.QtMultimedia"] = qtmultimedia
 
     return True
 
@@ -963,3 +996,447 @@ class TestCortexApp:
         assert not app._paused
         app._paused = True
         assert app._paused
+
+
+# ===========================================================================
+# Audit-prod: in-process controller native-action routing (Finding 1)
+# ===========================================================================
+
+
+import asyncio as _asyncio  # noqa: E402
+import threading as _threading  # noqa: E402
+
+from cortex.apps.desktop_shell.controller import (  # noqa: E402
+    CortexAppController,
+)
+
+
+class _RecordingDaemon:
+    """Fake daemon recording which coroutine entry points are awaited so a
+    test can assert native actions never reach ``dispatch_action_to_browser``.
+    """
+
+    def __init__(self) -> None:
+        self.active_intervention_id = "int_1"
+        self.calls: list[tuple[str, tuple, dict]] = []
+
+    async def start_biology_break(self, **kwargs):
+        self.calls.append(("start_biology_break", (), kwargs))
+        return {"ok": True}
+
+    async def _resume_last_active_file(self, params):
+        self.calls.append(("_resume_last_active_file", (params,), {}))
+        return (True, None)
+
+    async def _broadcast_prompt(self, action_type, params):
+        self.calls.append(("_broadcast_prompt", (action_type, params), {}))
+        return (True, None)
+
+    async def dispatch_action_to_browser(self, intervention_id, action):
+        self.calls.append(
+            ("dispatch_action_to_browser", (intervention_id, action), {})
+        )
+        return 1
+
+    async def _handle_user_action(self, payload):
+        self.calls.append(("_handle_user_action", (payload,), {}))
+
+    def names(self) -> list[str]:
+        return [c[0] for c in self.calls]
+
+
+def _run_action_invoked(action_type: str, *, extra: dict | None = None):
+    """Drive ``_on_action_invoked`` against a recording daemon on a real
+    asyncio loop and return the fake daemon after the scheduled coroutine
+    completes."""
+    controller = CortexAppController()
+    daemon = _RecordingDaemon()
+    controller._daemon = daemon
+
+    loop = _asyncio.new_event_loop()
+    done = _threading.Event()
+
+    def _loop_thread():
+        _asyncio.set_event_loop(loop)
+        loop.run_forever()
+
+    t = _threading.Thread(target=_loop_thread, daemon=True)
+    t.start()
+    controller._daemon_loop = loop
+
+    action = {"action_type": action_type, "action_id": "a1", "label": "L"}
+    if extra:
+        action.update(extra)
+    controller._on_action_invoked("int_1", action)
+
+    # The slot scheduled a coroutine via run_coroutine_threadsafe; wait for
+    # the loop to drain by scheduling a sentinel after it.
+    def _drain():
+        loop.call_soon(done.set)
+    loop.call_soon_threadsafe(
+        lambda: loop.call_later(0.05, _drain)
+    )
+    done.wait(timeout=2.0)
+    loop.call_soon_threadsafe(loop.stop)
+    t.join(timeout=2.0)
+    loop.close()
+    return daemon
+
+
+class TestControllerNativeActionRouting:
+
+    def test_take_biology_break_routes_to_daemon_not_browser(self):
+        daemon = _run_action_invoked(
+            "take_biology_break",
+            extra={"metadata": {"duration_seconds": 60, "audio_cue": False}},
+        )
+        names = daemon.names()
+        assert "start_biology_break" in names
+        assert "dispatch_action_to_browser" not in names
+        # The break-break kwargs were threaded through.
+        bb = next(c for c in daemon.calls if c[0] == "start_biology_break")
+        assert bb[2]["duration_seconds"] == 60
+        assert bb[2]["audio_cue"] is False
+
+    def test_resume_last_active_file_routes_to_editor_adapter(self):
+        daemon = _run_action_invoked("resume_last_active_file")
+        names = daemon.names()
+        assert "_resume_last_active_file" in names
+        assert "dispatch_action_to_browser" not in names
+
+    def test_prompt_micro_commit_is_native_log_only(self):
+        daemon = _run_action_invoked(
+            "prompt_micro_commit", extra={"prompt": "ship X", "text": "ship X"}
+        )
+        names = daemon.names()
+        assert "_broadcast_prompt" in names
+        assert "dispatch_action_to_browser" not in names
+
+    def test_suggest_movement_break_is_native_log_only(self):
+        daemon = _run_action_invoked(
+            "suggest_movement_break", extra={"duration_seconds": 60}
+        )
+        names = daemon.names()
+        assert "_broadcast_prompt" in names
+        assert "dispatch_action_to_browser" not in names
+
+    def test_browser_action_still_dispatches_to_browser(self):
+        # A genuine browser action_type MUST reach the browser dispatch.
+        assert "close_tab" in OverlayWindow._BROWSER_ACTION_TYPES
+        daemon = _run_action_invoked("close_tab", extra={"tab_index": 2})
+        names = daemon.names()
+        assert "dispatch_action_to_browser" in names
+        assert "start_biology_break" not in names
+
+    def test_routing_sets_are_unambiguous(self):
+        # Native + browser sets must be disjoint so the controller's
+        # ``in _BROWSER_ACTION_TYPES`` routing decision is unambiguous.
+        overlap = (
+            OverlayWindow._NATIVE_ACTION_TYPES
+            & OverlayWindow._BROWSER_ACTION_TYPES
+        )
+        assert overlap == frozenset()
+        # The native action types the controller handles natively.
+        for at in (
+            "take_biology_break",
+            "resume_last_active_file",
+            "prompt_micro_commit",
+            "suggest_movement_break",
+        ):
+            assert at not in OverlayWindow._BROWSER_ACTION_TYPES
+
+
+class TestControllerOnboardingDashboard:
+
+    def test_complete_onboarding_shows_dashboard(self, tmp_path, monkeypatch):
+        import cortex.apps.desktop_shell.controller as ctrl_mod
+
+        marker = tmp_path / "onboarding_complete"
+        monkeypatch.setattr(
+            ctrl_mod, "onboarding_marker_path", lambda: marker
+        )
+        controller = CortexAppController()
+        shown = {"v": False}
+        controller._show_dashboard = lambda: shown.__setitem__("v", True)
+        controller._onboarding = None
+        controller._complete_onboarding()
+        assert shown["v"] is True
+        assert marker.read_text().strip() == "completed"
+
+
+# ===========================================================================
+# Audit-prod: WS-mode calibration camera contention + simulation fallback
+# (Finding 2) and onboarding dashboard (Finding 4)
+# ===========================================================================
+
+
+class _FakeBridge:
+    def __init__(self) -> None:
+        self.quiet_calls: list[tuple[str, str]] = []
+        self.calibration_progress = MockSignalFactory()
+
+    def send_quiet_mode_toggle(self, kind, *, source="settings_sync"):
+        self.quiet_calls.append((kind, source))
+
+
+class MockSignalFactory:
+    def __init__(self) -> None:
+        self.emitted: list = []
+
+    def connect(self, slot):
+        pass
+
+    def emit(self, *args):
+        self.emitted.append(args)
+
+
+class TestWSCalibrationAndOnboarding:
+
+    def test_ws_complete_onboarding_shows_dashboard(self, tmp_path, monkeypatch):
+        import cortex.apps.desktop_shell.main as main_mod
+
+        marker = tmp_path / "onboarding_complete"
+        monkeypatch.setattr(
+            main_mod, "onboarding_marker_path", lambda: marker
+        )
+        app = CortexApp()
+        app._onboarding = None
+        shown = {"v": False}
+        app._show_dashboard = lambda: shown.__setitem__("v", True)
+        app._complete_onboarding()
+        assert shown["v"] is True
+
+    def test_bridge_send_quiet_mode_toggle_noop_without_socket(self):
+        # No loop/ws → silently no-ops (never raises).
+        bridge = WebSocketBridge()
+        bridge.send_quiet_mode_toggle("pause")  # must not raise
+
+    def test_simulation_fallback_surfaces_visible_error(self):
+        app = CortexApp()
+        bridge = _FakeBridge()
+        app._bridge = bridge
+        errors: list = []
+
+        class _Dash:
+            def show_error(self, title, body, cid=""):
+                errors.append((title, body))
+
+        app._dashboard = _Dash()
+        app._on_calibration_simulation_fallback()
+        # A visible error was raised AND a failed-status progress emitted.
+        assert len(errors) == 1
+        assert "camera" in errors[0][0].lower()
+        assert bridge.calibration_progress.emitted
+        payload = bridge.calibration_progress.emitted[0][0]
+        assert payload["status"] == "failed"
+
+
+# ===========================================================================
+# Audit-prod: mac_native honesty + lazy AppKit (Findings 3, 5, 6)
+# ===========================================================================
+
+
+class TestMacNative:
+
+    def test_apply_vibrancy_returns_false_off_mac(self, monkeypatch):
+        from cortex.apps.desktop_shell import mac_native
+
+        # Off-mac (or AppKit unavailable) the tint cannot be applied, so the
+        # honest return is False — callers must not believe vibrancy applied.
+        monkeypatch.setattr(mac_native, "is_macos", lambda: False)
+        monkeypatch.setattr(mac_native, "_appkit_cache", {})
+        assert mac_native.apply_vibrancy(object()) is False
+
+    def test_menu_action_target_is_lazy(self, monkeypatch):
+        from cortex.apps.desktop_shell import mac_native
+
+        # Finding 6: no eager module-level AppKit-backed class; a lazy
+        # getter exists instead.
+        assert not hasattr(mac_native, "_MenuActionTarget")
+        assert hasattr(mac_native, "_menu_action_target_class")
+        # Off-mac (forced) the lazy build returns None WITHOUT importing
+        # AppKit. Clear the AppKit + memoised target caches first so the
+        # forced-non-mac path is exercised deterministically on any host.
+        monkeypatch.setattr(mac_native, "is_macos", lambda: False)
+        monkeypatch.setattr(mac_native, "_appkit_cache", {})
+        assert mac_native._menu_action_target_class() is None
+
+    def test_install_appearance_observer_off_mac_returns_none(self, monkeypatch):
+        from cortex.apps.desktop_shell import mac_native
+
+        monkeypatch.setattr(mac_native, "is_macos", lambda: False)
+        monkeypatch.setattr(mac_native, "_appkit_cache", {})
+        assert mac_native.install_appearance_observer(lambda _d: None) is None
+
+    def test_appearance_observer_exported(self):
+        from cortex.apps.desktop_shell import mac_native
+
+        assert "install_appearance_observer" in mac_native.__all__
+
+
+# ===========================================================================
+# Audit-prod: onboarding notification auth honesty (Finding 7)
+# ===========================================================================
+
+
+class _StubNotifBtn:
+    def __init__(self) -> None:
+        self.text = ""
+        self.enabled = True
+
+    def setText(self, t):
+        self.text = t
+
+    def setEnabled(self, v):
+        self.enabled = v
+
+
+class TestOnboardingNotificationAuth:
+
+    def _make_window(self):
+        from cortex.apps.desktop_shell.onboarding import OnboardingWindow
+
+        win = OnboardingWindow.__new__(OnboardingWindow)
+        win._notif_btn_ref = _StubNotifBtn()
+        completed: list[str] = []
+        incompleted: list[str] = []
+        win.mark_step_complete = lambda s: completed.append(s)
+        win.mark_step_incomplete = lambda s: incompleted.append(s)
+        return win, completed, incompleted
+
+    def test_denied_does_not_mark_complete(self):
+        win, completed, incompleted = self._make_window()
+        win._apply_notification_auth_result(False)
+        assert "macos_notifications" not in completed
+        assert "macos_notifications" in incompleted
+        assert "retry" in win._notif_btn_ref.text.lower()
+        assert win._notif_btn_ref.enabled is True
+
+    def test_granted_marks_complete(self):
+        win, completed, incompleted = self._make_window()
+        win._apply_notification_auth_result(True)
+        assert "macos_notifications" in completed
+        assert "✓" in win._notif_btn_ref.text
+        assert win._notif_btn_ref.enabled is False
+
+    def test_recheck_downgrades_on_resolved_deny(self, monkeypatch):
+        from cortex.libs.utils import macos_notifications as mn
+
+        win, completed, incompleted = self._make_window()
+        monkeypatch.setitem(mn._auth_state, "granted", False)
+        win._recheck_notification_auth()
+        assert "macos_notifications" in incompleted
+
+    def test_request_notifications_does_not_complete_when_denied(
+        self, monkeypatch
+    ):
+        # End-to-end: a denied/unavailable send must NOT mark the step
+        # complete (pre-fix it did so unconditionally).
+        from cortex.libs.utils import macos_notifications as mn
+
+        monkeypatch.setattr(
+            mn, "send_intervention_notification", lambda **kw: False
+        )
+        win, completed, incompleted = self._make_window()
+        win._on_request_notifications()
+        assert "macos_notifications" not in completed
+        assert "macos_notifications" in incompleted
+
+
+# ===========================================================================
+# Audit-prod: connections honest verify affordance (Finding 8)
+# ===========================================================================
+
+
+class TestConnectionsVerify:
+
+    def _panel(self):
+        from cortex.apps.desktop_shell.connections import ConnectionsPanel
+
+        return ConnectionsPanel.__new__(ConnectionsPanel)
+
+    def test_manifest_check_uses_launcher_host_name(self, tmp_path, monkeypatch):
+        from cortex.apps.desktop_shell import connections as conn
+
+        monkeypatch.setattr(conn.Path, "home", staticmethod(lambda: tmp_path))
+        panel = self._panel()
+        # No manifest present → False.
+        assert panel._native_host_manifest_installed("Chrome") is False
+        # Create the canonical manifest where the installer writes it.
+        manifest = (
+            tmp_path / "Library" / "Application Support" / "Google" / "Chrome"
+            / "NativeMessagingHosts" / "com.cortex.launcher.json"
+        )
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text("{}")
+        assert panel._native_host_manifest_installed("Chrome") is True
+
+    def test_daemon_reachable_false_on_closed_port(self):
+        panel = self._panel()
+        # Port 1 is reserved/unbound → not reachable, returns False fast.
+        assert panel._daemon_reachable(port=1) is False
+
+    def test_verify_reports_each_prerequisite(self, monkeypatch):
+        from cortex.apps.desktop_shell import connections as conn
+
+        panel = self._panel()
+        monkeypatch.setattr(
+            panel, "_native_host_manifest_installed", lambda name: False
+        )
+        monkeypatch.setattr(panel, "_daemon_reachable", lambda: False)
+        warnings: list = []
+        monkeypatch.setattr(
+            conn.QMessageBox, "warning",
+            staticmethod(lambda *a, **kw: warnings.append(a)),
+        )
+        monkeypatch.setattr(
+            conn.QMessageBox, "information",
+            staticmethod(lambda *a, **kw: warnings.append(("info", a))),
+        )
+        panel._verify_browser_connection("Chrome")
+        # Honest path: a warning (not a success "information") was shown
+        # because neither prerequisite is satisfied.
+        assert warnings
+        joined = " ".join(str(x) for x in warnings)
+        assert "NOT installed" in joined or "not reachable" in joined
+
+
+# ===========================================================================
+# Audit-prod: structured logging at startup (Finding 10 / C6)
+# ===========================================================================
+
+
+class TestLoggingStartup:
+
+    def test_main_uses_configure_logging(self, monkeypatch):
+        import cortex.apps.desktop_shell.main as main_mod
+
+        called = {"v": False}
+        monkeypatch.setattr(
+            main_mod, "configure_logging",
+            lambda **kw: called.__setitem__("v", True),
+        )
+        # Stop after logging is configured by raising in the branch.
+        monkeypatch.setattr(main_mod.sys, "argv", ["main"])
+
+        class _StopHere(Exception):
+            pass
+
+        def _boom():
+            raise _StopHere()
+
+        monkeypatch.setattr(main_mod, "CortexApp", lambda: type(
+            "X", (), {"run": lambda self: (_ for _ in ()).throw(_StopHere())}
+        )())
+        try:
+            main_mod.main()
+        except _StopHere:
+            pass
+        except SystemExit:
+            pass
+        assert called["v"] is True
+
+    def test_configure_logging_importable_from_main(self):
+        import cortex.apps.desktop_shell.main as main_mod
+
+        assert hasattr(main_mod, "configure_logging")

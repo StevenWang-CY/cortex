@@ -15,9 +15,18 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from cortex.libs.adapters.registry import AdapterRegistry
+from cortex.libs.observability.metrics import INTERVENTIONS_APPLIED_TOTAL
 from cortex.libs.schemas.intervention import AdapterCommand, InterventionPlan
+from cortex.services.consent.policy import canonical_action_type
 
 logger = logging.getLogger(__name__)
+
+# C6: stable consent-level int → label string for the
+# ``cortex_interventions_applied_total{action_type,consent_level}`` metric.
+_CONSENT_LEVEL_LABELS: dict[int, str] = {
+    0: "observe", 1: "suggest", 2: "preview",
+    3: "reversible_act", 4: "autonomous_act",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +225,20 @@ class InterventionExecutor:
                 return adapter  # type: ignore[return-value]
         return self._adapters.get(name)
 
+    def _record_applied(self, action: str, consent_level_int: int) -> None:
+        """C6: increment ``cortex_interventions_applied_total`` on success.
+
+        Called from every success branch of :meth:`apply` (adapter
+        dispatch, editor-focus hook, prompt-broadcast hook). The
+        ``action_type`` label is the canonical policy verb so the metric
+        aligns with the consent-gate dimension; ``consent_level`` is the
+        human-readable level name.
+        """
+        INTERVENTIONS_APPLIED_TOTAL.labels(
+            action_type=canonical_action_type(action),
+            consent_level=_CONSENT_LEVEL_LABELS.get(consent_level_int, "preview"),
+        ).inc()
+
     async def apply(
         self,
         plan: InterventionPlan,
@@ -298,14 +321,24 @@ class InterventionExecutor:
             # workspace. Permissive when the daemon hasn't wired the
             # gate (legacy callers / test rigs).
             if self._consent_check is not None:
+                # P1: gate against the CANONICAL policy action-type, not the
+                # raw adapter verb. The escalation ladder records approvals
+                # under the same canonical key (see daemon cross-boundary
+                # note), so a user who has approved e.g. tab-grouping N
+                # times actually lifts the gate on ``hide_tabs_except_active``.
+                # Previously the gate keyed on the raw adapter verb that was
+                # absent from the consent vocabulary and could never escalate.
+                consent_key = canonical_action_type(cmd.action)
                 try:
                     permitted = await self._consent_check(
-                        cmd.action, plan_level_int,
+                        consent_key, plan_level_int,
                     )
                 except Exception:
                     logger.exception(
-                        "consent_check raised for action=%s; treating as denied",
+                        "consent_check raised for action=%s (consent_key=%s);"
+                        " treating as denied",
                         cmd.action,
+                        consent_key,
                     )
                     permitted = False
                 if not permitted:
@@ -326,7 +359,9 @@ class InterventionExecutor:
                 try:
                     ok, reason = await self._editor_focus_hook(dict(cmd.params))
                     mutation.success = bool(ok)
-                    if not ok:
+                    if ok:
+                        self._record_applied(cmd.action, plan_level_int)
+                    else:
                         mutation.reason = reason or "editor_focus_failed"
                 except Exception:
                     logger.exception(
@@ -347,7 +382,9 @@ class InterventionExecutor:
                         cmd.action, dict(cmd.params),
                     )
                     mutation.success = bool(ok)
-                    if not ok:
+                    if ok:
+                        self._record_applied(cmd.action, plan_level_int)
+                    else:
                         mutation.reason = reason or "broadcast_failed"
                 except Exception:
                     logger.exception(
@@ -386,7 +423,9 @@ class InterventionExecutor:
             try:
                 success = await adapter.execute(cmd.action, cmd.params)
                 mutation.success = success
-                if not success:
+                if success:
+                    self._record_applied(cmd.action, plan_level_int)
+                else:
                     mutation.reason = "adapter_returned_false"
                     logger.warning(
                         "Adapter '%s' failed to execute '%s'",
@@ -424,6 +463,27 @@ class InterventionExecutor:
 
             adapter = self._get_adapter(m.adapter)
             if adapter is None:
+                # P2: a reversible mutation whose adapter is no longer
+                # registered (e.g. the browser extension disconnected
+                # before the user hit Undo) was previously skipped
+                # silently. That left ``reversals`` empty and made the
+                # RestoreManager report ``workspace_restored=True`` even
+                # though the workspace was NEVER reverted. Emit an
+                # explicit failed reversal so the failure propagates up to
+                # ``RestoreManager._end_intervention`` (which gates
+                # ``workspace_restored`` on every reversal succeeding).
+                logger.warning(
+                    "Cannot reverse '%s' on '%s': adapter not registered",
+                    m.reverse_action,
+                    m.adapter,
+                )
+                reversals.append(Mutation(
+                    adapter=m.adapter,
+                    action=m.reverse_action,  # type: ignore[arg-type]  # is_reversible guard above ensures non-None
+                    timestamp=time.monotonic(),
+                    success=False,
+                    reason="reverse_adapter_missing",
+                ))
                 continue
 
             reversal = Mutation(

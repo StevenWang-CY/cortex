@@ -204,6 +204,14 @@ def get_password_safe(
         return future.result(timeout=timeout)
     except concurrent.futures.TimeoutError:
         _keyring_timeouts_total += 1
+        # C6 (audit): surface the stall on the Prometheus counter the
+        # metrics module advertises as a "guaranteed metric". Without this
+        # increment the counter shipped a permanent zero. Local import
+        # keeps prometheus_client off the hot import path for callers that
+        # never touch the keyring.
+        from cortex.libs.observability.metrics import KEYRING_TIMEOUTS_TOTAL
+
+        KEYRING_TIMEOUTS_TOTAL.inc()
         logger.warning(
             "keyring.get_password for %s/%s timed out after %.1fs; "
             "returning None (caller falls back to env var) "
@@ -279,6 +287,11 @@ def set_password_safe(
         return bool(future.result(timeout=timeout))
     except concurrent.futures.TimeoutError:
         _set_password_timeouts_total += 1
+        # C6 (audit): a stalled WRITE is also a Keychain timeout — count it
+        # on the same Prometheus counter so /metrics reflects every stall.
+        from cortex.libs.observability.metrics import KEYRING_TIMEOUTS_TOTAL
+
+        KEYRING_TIMEOUTS_TOTAL.inc()
         logger.warning(
             "keyring.set_password for %s/%s timed out after %.1fs; "
             "returning False (caller should surface to user) "

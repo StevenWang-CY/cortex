@@ -19,6 +19,7 @@ import signal
 import time
 
 from cortex.libs.config.settings import CortexConfig, get_config
+from cortex.libs.logging import configure_logging
 from cortex.services.capture_service.webcam import describe_requested_camera
 from cortex.services.runtime_daemon import CortexDaemon
 
@@ -141,6 +142,14 @@ def main() -> None:
     """Entry point for cortex-dev command."""
     global _PROFILE_STARTUP_ENABLED
 
+    # C6 (audit): install the structlog processor chain BEFORE any logger
+    # is used so dev-server log records flow through the same pipeline as
+    # the daemon (correlation ids, service context, level routing). This
+    # replaces the bare ``logging.basicConfig`` call that previously left
+    # structlog unconfigured. Console renderer (json_format=False) keeps
+    # the terminal output human-readable for local development.
+    configure_logging(level="INFO", json_format=False)
+
     parser = argparse.ArgumentParser(
         prog="cortex-dev",
         description="Cortex development server",
@@ -157,12 +166,6 @@ def main() -> None:
     args, _unknown = parser.parse_known_args()
     _PROFILE_STARTUP_ENABLED = args.profile_startup
     record_milestone("entrypoint")
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
 
     config = get_config()
     record_milestone("config-loaded")

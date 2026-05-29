@@ -48,6 +48,7 @@ import threading
 import time
 from collections.abc import Callable
 from functools import cache, lru_cache
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +74,7 @@ def _load_user_notifications():  # type: ignore[no-untyped-def]
         _log_unsupported_once("not macOS")
         return None
     try:
-        import UserNotifications  # type: ignore[import-not-found]
+        import UserNotifications
     except Exception:
         _log_unsupported_once("UserNotifications import failed")
         return None
@@ -90,7 +91,7 @@ _auth_state: dict[str, object] = {
 _auth_lock = threading.Lock()
 
 # Delegate / category registration state.
-_delegate_instance = None  # type: ignore[assignment]
+_delegate_instance: Any = None
 _user_action_handler: Callable[[str, str], None] | None = None
 _CATEGORY_ID = "cortex_intervention"
 _ACTION_OPEN = "cortex_open"
@@ -148,7 +149,7 @@ def _on_main_thread(callable_obj) -> None:  # type: ignore[no-untyped-def]
     documented thread-marshal primitive that doesn't require a
     running CFRunLoop on the caller's side."""
     try:
-        import Foundation  # type: ignore[import-not-found]
+        import Foundation
         Foundation.NSOperationQueue.mainQueue().addOperationWithBlock_(callable_obj)
     except Exception:
         # Best-effort fallback: just run in-place. Used by unit tests
@@ -159,19 +160,22 @@ def _on_main_thread(callable_obj) -> None:  # type: ignore[no-untyped-def]
             logger.debug("inline main-thread fallback raised", exc_info=True)
 
 
-def _build_delegate(un):  # type: ignore[no-untyped-def]
+def _build_delegate(un: Any) -> Any:
     """Construct (once) the UNUserNotificationCenterDelegate subclass."""
     global _delegate_instance
     if _delegate_instance is not None:
         return _delegate_instance
     try:
-        from Foundation import NSObject  # type: ignore[import-not-found]
+        from Foundation import NSObject
 
         class _CortexNotificationDelegate(NSObject):  # type: ignore[misc]
             # Tap on banner OR action button.
             def userNotificationCenter_didReceiveNotificationResponse_withCompletionHandler_(  # noqa: D401
-                self, _center, response, completion_handler,
-            ):
+                self,
+                _center: Any,
+                response: Any,
+                completion_handler: Any,
+            ) -> None:
                 # Audit P1 shutdown guard: if the daemon is tearing
                 # down, complete the OS contract (call the completion
                 # handler) but DO NOT dispatch into the daemon — its
@@ -221,8 +225,11 @@ def _build_delegate(un):  # type: ignore[no-untyped-def]
             # Foreground delivery — allow banner + sound when the app
             # is active so the user still sees the cue.
             def userNotificationCenter_willPresentNotification_withCompletionHandler_(  # noqa: D401
-                self, _center, _notification, completion_handler,
-            ):
+                self,
+                _center: Any,
+                _notification: Any,
+                completion_handler: Any,
+            ) -> None:
                 # Audit P1 shutdown guard: suppress the banner if we
                 # are tearing down so the user isn't left with a click
                 # target that routes into a dead daemon.
@@ -245,7 +252,7 @@ def _build_delegate(un):  # type: ignore[no-untyped-def]
         return None
 
 
-def _register_category(un) -> None:  # type: ignore[no-untyped-def]
+def _register_category(un: Any) -> None:
     """Register the ``cortex_intervention`` category with Open/Snooze
     action buttons. Safe to call repeatedly — UN deduplicates by id."""
     try:
@@ -305,7 +312,8 @@ def _ensure_authorized(un) -> bool:  # type: ignore[no-untyped-def]
     """
     with _auth_lock:
         granted = _auth_state.get("granted")
-        checked_at = float(_auth_state.get("checked_at") or 0.0)
+        _checked_raw = _auth_state.get("checked_at")
+        checked_at = float(_checked_raw) if isinstance(_checked_raw, int | float) else 0.0
         already_requested = bool(_auth_state.get("requested"))
         ttl_ok = (time.time() - checked_at) < _AUTH_TTL_SECONDS
     if ttl_ok and granted is False:

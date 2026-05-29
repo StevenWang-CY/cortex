@@ -173,13 +173,13 @@ describe("Phase-4 F2 — INTERVENTION_TRIGGER normalisation", () => {
         expect(norm).not.toBeNull();
         expect(norm!.confidence).toBe(0);
         expect(norm!.trigger_confidence).toBe(0);
-        expect(norm!.actions).toEqual([]);
+        expect(norm!.suggested_actions).toEqual([]);
         expect(norm!.trigger_url).toBeNull();
-        expect(norm!.message).toBe("");
+        expect(norm!.headline).toBe("");
         expect(norm!.desktop_not_focused).toBe(false);
     });
 
-    it("normaliseInterventionPayload preserves valid fields", () => {
+    it("normaliseInterventionPayload preserves valid fields (legacy names)", () => {
         const norm = normaliseInterventionPayload({
             intervention_id: "i_42",
             intervention_type: "guided_mode",
@@ -194,9 +194,34 @@ describe("Phase-4 F2 — INTERVENTION_TRIGGER normalisation", () => {
         expect(norm!.trigger_url).toBe("https://example.com/x");
         expect(norm!.trigger_confidence).toBeCloseTo(0.85);
         expect(norm!.confidence).toBeCloseTo(0.9);
-        expect(norm!.message).toBe("take a breath");
-        expect(norm!.actions).toHaveLength(2); // filters out the "garbage" entry
+        // C3 back-compat: legacy ``message`` / ``actions`` still resolve.
+        expect(norm!.headline).toBe("take a breath");
+        expect(norm!.suggested_actions).toHaveLength(2); // drops "garbage"
         expect(norm!.desktop_not_focused).toBe(true);
+    });
+
+    it("normaliseInterventionPayload reads the real wire field names (C3)", () => {
+        // The actual InterventionTriggerPayload uses ``headline``,
+        // ``suggested_actions`` and ``level`` (not message/actions/
+        // intervention_type). The normaliser must align to those.
+        const norm = normaliseInterventionPayload({
+            intervention_id: "i_wire",
+            level: "simplified_workspace",
+            trigger_url: "https://leetcode.com/problems/two-sum",
+            headline: "One step at a time",
+            suggested_actions: [
+                { action_id: "a1", action_type: "fold_panel" },
+                { action_id: "a2", action_type: "close_tab" },
+            ],
+        });
+        expect(norm).not.toBeNull();
+        // ``level`` populates intervention_type when the legacy field is absent.
+        expect(norm!.intervention_type).toBe("simplified_workspace");
+        expect(norm!.headline).toBe("One step at a time");
+        expect(norm!.suggested_actions).toHaveLength(2);
+        expect(norm!.trigger_url).toBe(
+            "https://leetcode.com/problems/two-sum",
+        );
     });
 
     it("background does not throw on malformed INTERVENTION_TRIGGER", async () => {

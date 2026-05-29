@@ -335,3 +335,58 @@ def test_corrupt_ledger_starts_empty(tmp_path: Path) -> None:
     # Subsequent writes still succeed.
     tracker.record("cid_recover", "claude-sonnet-4-6", 0.5)
     assert tracker.today_total_usd() == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# 11. Finding-7: the ledger rolls over at LOCAL midnight (docstring contract)
+# ---------------------------------------------------------------------------
+
+
+def test_rollover_is_local_midnight_not_utc(tmp_path: Path) -> None:
+    """The ledger key must bucket on the *local* calendar date even when
+    callers pass tz-aware UTC instants (the daemon path does). Two UTC
+    instants that fall on the same local day must land in the same bucket.
+
+    We construct two UTC instants and project both into the runner's local
+    zone; whatever the local offset, an instant and the same instant + a
+    few seconds share a local date, while an instant on a clearly
+    different local calendar day does not.
+    """
+    from datetime import UTC, timedelta
+
+    ledger = tmp_path / "cost_ledger.json"
+    tracker = CostTracker(ledger, warn_usd=5.0, kill_usd=20.0)
+
+    # Pick local noon to stay far from any midnight boundary regardless of
+    # the runner's timezone, then convert to a tz-aware UTC instant — the
+    # shape the daemon actually records with.
+    local_noon = datetime.now().replace(hour=12, minute=0, second=0, microsecond=0)
+    utc_a = local_noon.astimezone(UTC)
+    utc_b = (local_noon + timedelta(seconds=30)).astimezone(UTC)
+    next_local_day = (local_noon + timedelta(days=1)).astimezone(UTC)
+
+    tracker.record("cid", "claude-sonnet-4-6", 4.0, now=utc_a)
+    tracker.record("cid", "claude-sonnet-4-6", 3.0, now=utc_b)
+    # Same local day -> accumulated into one bucket.
+    assert tracker.today_total_usd(now=utc_a) == pytest.approx(7.0)
+    # Next local day -> a fresh, empty bucket.
+    assert tracker.today_total_usd(now=next_local_day) == pytest.approx(0.0)
+
+
+def test_budget_accessors_for_gateway(tmp_path: Path) -> None:
+    """Finding-7 / C-GATEWAY#1: the public budget accessors the api_gateway
+    cost route reads — ``kill_usd`` / ``warn_usd`` properties and the
+    side-effect-free ``budget_exhausted``."""
+    ledger = tmp_path / "cost_ledger.json"
+    tracker = CostTracker(ledger, warn_usd=5.0, kill_usd=20.0)
+    now = datetime(2026, 5, 20, 12, 0, 0)
+
+    assert tracker.kill_usd == pytest.approx(20.0)
+    assert tracker.warn_usd == pytest.approx(5.0)
+    assert tracker.budget_exhausted(now=now) is False
+
+    tracker.record("cid", "claude-sonnet-4-6", 20.0, now=now)
+    assert tracker.budget_exhausted(now=now) is True
+    # Side-effect-free: repeated calls don't emit duplicate KILL logs and
+    # always reflect the current spend.
+    assert tracker.budget_exhausted(now=now) is True

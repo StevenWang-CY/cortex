@@ -204,7 +204,7 @@ class LeetCodeLongitudinalTracker:
     # Serialisation (for Redis persistence)
     # ------------------------------------------------------------------
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         """Serialise tracker state to a plain dict for Redis persistence."""
         return {
             "daily_load_budget": self._daily_load_budget,
@@ -217,7 +217,7 @@ class LeetCodeLongitudinalTracker:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> LeetCodeLongitudinalTracker:
+    def from_dict(cls, data: dict[str, Any]) -> LeetCodeLongitudinalTracker:
         """Reconstruct a tracker from a previously serialised dict."""
         tracker = cls(daily_load_budget=data.get("daily_load_budget", 600.0))
         tracker._current_load = data.get("current_load", 0.0)

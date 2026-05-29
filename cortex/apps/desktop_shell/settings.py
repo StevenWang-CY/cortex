@@ -1072,7 +1072,7 @@ class SettingsDialog(QWidget):
         label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextBrowserInteraction
         )
-        label.linkActivated.connect(  # type: ignore[attr-defined]
+        label.linkActivated.connect(
             lambda _href, t=target: self._open_system_settings(t)
         )
         row_layout.addWidget(label, stretch=1)

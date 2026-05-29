@@ -275,16 +275,29 @@ class RuleScorer:
             else:
                 scores.append(0.0)
 
-        # Low mouse variance (focused, not erratic)
-        if fv.mouse_velocity_variance < self._baselines.mouse_variance_baseline * 1.2:
-            scores.append(0.8)
-        elif fv.mouse_velocity_variance < self._baselines.mouse_variance_baseline * 1.8:
-            scores.append(0.4)
-        else:
-            scores.append(0.0)
+        # Low mouse variance (focused, not erratic).
+        # P1: same telemetry warm-up gate as the HYPO branches
+        # (``_compute_hypo_score`` lines ~189/217). Before 5 telemetry
+        # samples have been seen, ``mouse_velocity_variance`` defaults to
+        # 0.0 (no input-device update has populated it), which is < every
+        # ``mouse_variance_baseline * 1.2`` and would fabricate a 0.8 FLOW
+        # contribution on a telemetry-off / cold-start session. Skip the
+        # branch entirely until telemetry is warm so FLOW does not accrue
+        # from a fake "perfectly steady mouse" reading.
+        if fv.telemetry_seen_count >= 5:
+            if fv.mouse_velocity_variance < self._baselines.mouse_variance_baseline * 1.2:
+                scores.append(0.8)
+            elif fv.mouse_velocity_variance < self._baselines.mouse_variance_baseline * 1.8:
+                scores.append(0.4)
+            else:
+                scores.append(0.0)
 
         # Low correction rate (if available).
-        if fv.correction_rate_per_100_keys is not None:
+        # P1: gate on the warm-up count too. ``correction_rate_per_100_keys``
+        # is ``None`` when the keystroke channel is absent (already skipped
+        # below), but it can also read a fabricated 0.0 during the warm-up
+        # window before enough keystrokes have been observed.
+        if fv.telemetry_seen_count >= 5 and fv.correction_rate_per_100_keys is not None:
             if fv.correction_rate_per_100_keys <= 8.0:
                 scores.append(0.8)
             elif fv.correction_rate_per_100_keys <= 15.0:
@@ -293,12 +306,17 @@ class RuleScorer:
                 scores.append(0.0)
 
         # Moderate tab switching (focused, not thrashing).
-        if 0.5 <= fv.tab_switch_frequency <= 4.0:
-            scores.append(0.8)
-        elif 0.2 <= fv.tab_switch_frequency < 0.5 or 4.0 < fv.tab_switch_frequency <= 6.0:
-            scores.append(0.35)
-        else:
-            scores.append(0.0)
+        # P1: same warm-up gate — a cold-start session reads
+        # ``tab_switch_frequency = 0.0`` and would otherwise feed a 0.0
+        # contribution into the FLOW mean before any window-switch
+        # telemetry has arrived.
+        if fv.telemetry_seen_count >= 5:
+            if 0.5 <= fv.tab_switch_frequency <= 4.0:
+                scores.append(0.8)
+            elif 0.2 <= fv.tab_switch_frequency < 0.5 or 4.0 < fv.tab_switch_frequency <= 6.0:
+                scores.append(0.35)
+            else:
+                scores.append(0.0)
 
         if not scores:
             return 0.3  # Default slight flow assumption

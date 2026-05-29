@@ -144,6 +144,72 @@ def test_aggregate_day_empty_day_uses_defaults(dirs) -> None:
     assert baseline.total_flow_minutes == 0.0
 
 
+def test_aggregate_day_hr_hrv_means_duration_weighted(dirs) -> None:
+    """Realistic multi-session day: HR/HRV baselines are weighted by
+    each session's ``duration_seconds``, NOT a flat arithmetic mean.
+
+    A 2-hour 60 bpm session and a 1-hour 90 bpm session must produce a
+    duration-weighted mean of (60*7200 + 90*3600) / 10800 = 70 bpm,
+    not the naive (60+90)/2 = 75. Same construction for HRV. This is
+    the core aggregation contract from P0 §3.2 (duration weighting) and
+    proves the means are real, not stubbed defaults.
+    """
+    sessions_dir, chronotype_dir = dirs
+    d = date(2026, 5, 20)
+    _write_session_at(
+        sessions_dir, "long", start=_utc_noon(d),
+        duration_seconds=7200, avg_hr_bpm=60.0, avg_hrv_rmssd=40.0,
+    )
+    _write_session_at(
+        sessions_dir, "short", start=_utc_noon(d) + timedelta(hours=3),
+        duration_seconds=3600, avg_hr_bpm=90.0, avg_hrv_rmssd=70.0,
+    )
+    agg = LongitudinalAggregator(sessions_dir, chronotype_dir)
+    baseline = agg.aggregate_day(d)
+    assert baseline.session_count == 2
+    # Duration-weighted, not arithmetic.
+    assert baseline.hr_baseline == pytest.approx(
+        (60.0 * 7200 + 90.0 * 3600) / 10800.0
+    )
+    assert baseline.hrv_baseline == pytest.approx(
+        (40.0 * 7200 + 70.0 * 3600) / 10800.0
+    )
+    # The naive arithmetic mean (75 / 55) must NOT be what we computed.
+    assert baseline.hr_baseline != pytest.approx(75.0)
+    assert baseline.hrv_baseline != pytest.approx(55.0)
+
+
+def test_aggregate_day_local_tz_assigns_session_to_local_date(
+    dirs, monkeypatch,
+) -> None:
+    """Timezone-correctness: a session whose UTC instant is 02:00 on
+    May 21 falls on the LOCAL date May 20 under a -08:00 zone
+    (America/Los_Angeles → 18:00 the previous local day). The
+    aggregator must bucket by local date, so ``aggregate_day(May 20)``
+    sees the session and ``aggregate_day(May 21)`` does not.
+
+    This exercises the ``_safe_local_datetime``/``_local_tz`` path with
+    a real IANA zone rather than the UTC-noon dodge the other tests use.
+    """
+    from zoneinfo import ZoneInfo
+
+    from cortex.services.session_report import longitudinal as L
+
+    la = ZoneInfo("America/Los_Angeles")
+    monkeypatch.setattr(L, "_LOCAL_TZ_CACHE", la)
+
+    sessions_dir, chronotype_dir = dirs
+    # 02:00 UTC on May 21 == 19:00 PDT (UTC-7 in May) on May 20.
+    instant = datetime(2026, 5, 21, 2, 0, tzinfo=UTC)
+    _write_session_at(sessions_dir, "tz", start=instant, duration_seconds=600)
+
+    agg = LongitudinalAggregator(sessions_dir, chronotype_dir)
+    local_day = agg.aggregate_day(date(2026, 5, 20))
+    utc_day = agg.aggregate_day(date(2026, 5, 21))
+    assert local_day.session_count == 1, "session must bucket to its LOCAL date"
+    assert utc_day.session_count == 0, "session must NOT bucket to its UTC date"
+
+
 # ─── refresh_chronotype + trend slope ─────────────────────────────────
 
 

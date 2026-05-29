@@ -13,6 +13,7 @@ import { CX, STATE_COLORS, STATE_LABELS, CX_KEYFRAMES } from "./design-tokens";
 import { newCorrelationId } from "./lib/correlation";
 import { getLastRuntimeError } from "./lib/chrome-runtime";
 import { DAEMON_HTTP_URL } from "./config";
+import { getAuthToken } from "./lib/auth";
 import type {
     BreakRecommendation as BreakRecommendationSchema,
     CausalSignal as CausalSignalSchema,
@@ -120,6 +121,7 @@ export function safeSendMessage(
 import type {
     DailyBaseline,
     SessionReport,
+    SessionRecap,
     SuggestedAction,
     TabRecommendation,
     TabRecommendations,
@@ -795,6 +797,10 @@ function CortexPopup(): React.ReactElement {
     // can render a one-line install hint.
     const [recap, setRecap] = useState<SessionReport | null>(null);
     const [recapTimestamp, setRecapTimestamp] = useState<number | null>(null);
+    // C4: ``persisted`` from the SessionRecap wrapper — false when the
+    // broadcast raced ahead of the atomic disk write, so the card can
+    // signal that history may lag the live recap.
+    const [recapPersisted, setRecapPersisted] = useState<boolean | null>(null);
     const [historyStatus, setHistoryStatus] = useState<string>("");
     // Phase 4d Task H / §3.24: in-app bug report.
     const [bugReportOpen, setBugReportOpen] = useState(false);
@@ -1016,13 +1022,18 @@ function CortexPopup(): React.ReactElement {
         // P0 §3.3: pull the cached recap so we can render the card
         // immediately. Only adopt it if it's still inside the 24h TTL.
         safeSendMessage({ type: "GET_CACHED_RECAP" }, (raw) => {
+            // C4: the cached recap is the SessionRecap wrapper
+            // ``{report, generated_at, persisted}``; the renderable
+            // SessionReport is at ``recap.report``.
             const resp = raw as
-                | { recap: SessionReport | null; timestamp: number | null }
+                | { recap: SessionRecap | null; timestamp: number | null }
                 | undefined;
-            if (!resp || !resp.recap) return;
-            const ts = resp.timestamp ?? 0;
+            const report = resp?.recap?.report ?? null;
+            if (!report) return;
+            const ts = resp?.timestamp ?? 0;
             if (ts > 0 && Date.now() - ts > RECAP_TTL_MS) return;
-            setRecap(resp.recap);
+            setRecap(report as SessionReport);
+            setRecapPersisted(resp?.recap?.persisted ?? null);
             setRecapTimestamp(ts);
             // Card is now visible to the user — clear the toolbar badge.
             safeSendMessage({ type: "RECAP_VIEWED" });
@@ -1287,12 +1298,20 @@ function CortexPopup(): React.ReactElement {
                 // over WS. Adopt it immediately so a popup that was
                 // already open re-renders without waiting for the next
                 // mount, then clear the badge — the user is looking.
-                const next = msg.payload as SessionReport;
+                //
+                // C4: the payload is the SessionRecap wrapper
+                // ``{report, generated_at, persisted}``; read the
+                // renderable SessionReport from ``payload.report`` and the
+                // durability flag from ``payload.persisted``.
+                const wrapper = msg.payload as SessionRecap | undefined;
+                const next = wrapper?.report ?? null;
+                if (!next) break;
                 const ts =
                     typeof msg.timestamp === "number"
                         ? (msg.timestamp as number)
                         : Date.now();
-                setRecap(next);
+                setRecap(next as SessionReport);
+                setRecapPersisted(wrapper?.persisted ?? null);
                 setRecapTimestamp(ts);
                 safeSendMessage({ type: "RECAP_VIEWED" });
                 break;
@@ -1354,18 +1373,38 @@ function CortexPopup(): React.ReactElement {
         }
         setBugReportStatus("submitting");
         setBugReportError("");
+        // C2: FeedbackRequest carries both ``user_agent`` (browser UA) and
+        // ``app_version`` (the extension manifest version). The gateway
+        // persists both in the stored feedback record.
+        let appVersion = "";
+        try {
+            appVersion = chrome?.runtime?.getManifest?.()?.version ?? "";
+        } catch { /* chrome.runtime not available in some test envs */ }
         const body = {
             description,
             include_logs: bugReportIncludeLogs,
             user_agent: typeof navigator !== "undefined"
                 ? navigator.userAgent
                 : "",
+            app_version: appVersion,
             timestamp: Date.now() / 1000,
         };
         try {
+            // C1: /api/feedback is capability-token-gated. Attach the cached
+            // local token or the daemon 401s. Token-fetch failure is
+            // non-fatal — the POST still goes out and 401s cleanly.
+            let authToken: string | null = null;
+            try {
+                authToken = await getAuthToken();
+            } catch { /* native host unavailable; request 401s cleanly */ }
             const resp = await fetch(`${DAEMON_HTTP_URL}/api/feedback`, {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
+                headers: authToken
+                    ? {
+                          "Content-Type": "application/json",
+                          "X-Cortex-Auth-Token": authToken,
+                      }
+                    : { "Content-Type": "application/json" },
                 body: JSON.stringify(body),
             });
             if (resp.ok) {
@@ -1431,6 +1470,19 @@ function CortexPopup(): React.ReactElement {
                 return;
             }
             if (!Array.isArray(queue) || queue.length === 0) return;
+            // C1: the drain re-POSTs to the token-gated /api/feedback. Fetch
+            // the token once for the whole drain; without it every queued
+            // item 401s and is re-queued forever.
+            let authToken: string | null = null;
+            try {
+                authToken = await getAuthToken();
+            } catch { /* native host unavailable; items stay queued */ }
+            const drainHeaders: Record<string, string> = authToken
+                ? {
+                      "Content-Type": "application/json",
+                      "X-Cortex-Auth-Token": authToken,
+                  }
+                : { "Content-Type": "application/json" };
             const remaining: unknown[] = [];
             for (const item of queue) {
                 if (cancelled) {
@@ -1440,7 +1492,7 @@ function CortexPopup(): React.ReactElement {
                 try {
                     const resp = await fetch(`${DAEMON_HTTP_URL}/api/feedback`, {
                         method: "POST",
-                        headers: { "Content-Type": "application/json" },
+                        headers: drainHeaders,
                         body: JSON.stringify(item),
                     });
                     if (!resp.ok) remaining.push(item);
@@ -1694,6 +1746,17 @@ function CortexPopup(): React.ReactElement {
                             {breaks === 1 ? "" : "s"} {"·"} longest
                             streak {recapStreakMin}m
                         </div>
+                        {recapPersisted === false && (
+                            // C4: the broadcast raced ahead of the atomic
+                            // disk write. Signal that "View on desktop" may
+                            // briefly lag until the session file lands.
+                            <div
+                                style={S.recapStat}
+                                data-testid="recap-not-persisted"
+                            >
+                                Saving to history…
+                            </div>
+                        )}
                         {hr != null && (
                             // P0 §3.3 hardening: the schema field is
                             // ``avg_hr_bpm`` (mean across the session,

@@ -156,7 +156,9 @@ def check_accessibility_permission() -> bool:
         # pyobjc is only available on macOS
         from ApplicationServices import AXIsProcessTrusted
 
-        return AXIsProcessTrusted()
+        # pyobjc is untyped (returns Any); coerce to a real bool so the
+        # declared ``-> bool`` return type holds under mypy --strict.
+        return bool(AXIsProcessTrusted())
     except ImportError:
         # If pyobjc isn't installed, assume permission is granted
         return True
@@ -181,8 +183,9 @@ def check_camera_permission() -> bool:
         status = AVFoundation.AVCaptureDevice.authorizationStatusForMediaType_(
             AVFoundation.AVMediaTypeVideo
         )
-        # 3 = AVAuthorizationStatusAuthorized
-        return status == 3
+        # 3 = AVAuthorizationStatusAuthorized. ``status`` is Any (untyped
+        # pyobjc), so coerce the comparison result to a real bool.
+        return bool(status == 3)
     except ImportError:
         return True
     except Exception:

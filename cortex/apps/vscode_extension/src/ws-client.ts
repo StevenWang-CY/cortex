@@ -661,10 +661,20 @@ export class CortexWSClient {
      * The ack lets the daemon overwrite ``Mutation.success`` with the
      * actual client outcome, so ``InterventionOutcome.workspace_restored``
      * is truthful instead of theatrical.
+     *
+     * ``phase`` values:
+     *   - ``"apply"``   — the UIPlan apply ack (folds, overlay). Resolves
+     *     the daemon's pending ``await_apply_confirmation`` future.
+     *   - ``"restore"`` — the unfold/restore ack.
+     *   - ``"execute_action"`` — a discrete EXECUTE_ACTION catalog item
+     *     (e.g. ``resume_last_active_file``) the editor ran directly. A
+     *     distinct phase so the daemon's ``(intervention_id, phase)`` dedup
+     *     key does NOT collapse this ack into the UIPlan ``"apply"`` ack for
+     *     the same intervention; the resume outcome is recorded on its own.
      */
     sendInterventionApplied(
         interventionId: string,
-        phase: "apply" | "restore",
+        phase: "apply" | "restore" | "execute_action",
         success: boolean,
         appliedActions: string[],
         errors: string[],

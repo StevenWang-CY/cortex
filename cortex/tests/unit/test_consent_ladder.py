@@ -19,9 +19,19 @@ from cortex.services.consent.policy import ConsentPolicy
 # Helpers
 # ---------------------------------------------------------------------------
 
+_LOOP = asyncio.new_event_loop()
+
+
 def _run(coro):
-    """Run an async coroutine synchronously."""
-    return asyncio.get_event_loop().run_until_complete(coro)
+    """Run an async coroutine synchronously on a dedicated module loop.
+
+    NOT asyncio.get_event_loop() (deprecated; returns a closed/foreign loop
+    once pytest-asyncio tears down the default loop earlier in the same
+    process, which made these tests fail only when run alongside async
+    tests — CLAUDE.md rule #16). A single persistent loop also keeps any
+    loop-bound store primitives consistent across calls.
+    """
+    return _LOOP.run_until_complete(coro)
 
 
 @pytest.fixture
@@ -226,3 +236,59 @@ class TestReset:
         assert isinstance(states, dict)
         assert "close_tab" in states
         assert "show_overlay" in states
+
+
+# ---------------------------------------------------------------------------
+# P1: adapter-action → canonical consent-type escalation reaches the gate
+# the executor actually queries.
+# ---------------------------------------------------------------------------
+
+class TestAdapterActionEscalation:
+    """The executor gates on ``canonical_action_type(cmd.action)`` and the
+    daemon records approvals under the SAME canonical key. Approving the
+    mapped action N times must lift the gate the executor queries — the
+    pre-fix code escalated a stray ``"intervention"`` key that the gate
+    never read.
+    """
+
+    @pytest.mark.asyncio
+    async def test_canonical_mapping_is_stable(self):
+        from cortex.services.consent.policy import canonical_action_type
+
+        # Legacy adapter verbs collapse onto their canonical policy verb.
+        assert canonical_action_type("hide_tabs_except_active") == "group_tabs"
+        assert canonical_action_type("collapse_before_error") == "fold_code"
+        assert canonical_action_type("fold_except_current") == "fold_code"
+        # Unknown / already-canonical verbs pass through unchanged.
+        assert canonical_action_type("group_tabs") == "group_tabs"
+        assert canonical_action_type("brand_new_verb") == "brand_new_verb"
+
+    @pytest.mark.asyncio
+    async def test_approvals_to_mapped_action_escalate_executor_gate(self):
+        """N approvals recorded under the canonical key escalate the gate
+        the executor checks for the raw adapter verb."""
+        from cortex.services.consent.policy import canonical_action_type
+
+        ladder = ConsentLadder(policy=ConsentPolicy(), store=None)
+
+        adapter_verb = "hide_tabs_except_active"
+        canonical = canonical_action_type(adapter_verb)  # "group_tabs"
+
+        # The executor would gate the adapter verb at this canonical key.
+        start_level = await ladder.get_level(canonical)
+        assert start_level == PREVIEW  # group_tabs minimum
+
+        # Daemon records approvals under the canonical key (cross-boundary).
+        for _ in range(5):
+            await ladder.record_approval(canonical)
+
+        # The gate the executor queries (via canonical_action_type) is now
+        # escalated — the user has earned REVERSIBLE_ACT for tab grouping.
+        escalated = await ladder.get_level(canonical)
+        assert escalated == start_level + 1
+
+        # And a REVERSIBLE_ACT request for the adapter verb's canonical key
+        # is now allowed where it previously would have been downgraded.
+        decision = await ladder.check(canonical, requested_level=REVERSIBLE_ACT)
+        assert decision.allowed
+        assert decision.effective_level == REVERSIBLE_ACT

@@ -90,7 +90,7 @@ class ConsentLadder:
         self._escalation_threshold = escalation_threshold
 
         # In-memory state: action_type → {level, approvals, rejections}
-        self._action_states: dict[str, dict] = {}
+        self._action_states: dict[str, dict[str, Any]] = {}
         self._loaded = False
 
         # F24: serialize concurrent reads and writes against the
@@ -148,7 +148,7 @@ class ConsentLadder:
         except Exception:
             logger.exception("Failed to persist consent state")
 
-    def _get_state(self, action_type: str) -> dict:
+    def _get_state(self, action_type: str) -> dict[str, Any]:
         """Get or create state for an action type."""
         if action_type not in self._action_states:
             self._action_states[action_type] = {
@@ -299,7 +299,7 @@ class ConsentLadder:
 
             await self._persist()
 
-    def _prune_old_timestamps(self, state: dict) -> None:
+    def _prune_old_timestamps(self, state: dict[str, Any]) -> None:
         now = time.time()
         cutoff = now - _RECENCY_WINDOW_SECONDS
         approvals = [t for t in state.get("approval_timestamps", []) if t >= cutoff]
@@ -307,7 +307,7 @@ class ConsentLadder:
         state["approval_timestamps"] = approvals
         state["rejection_timestamps"] = rejections
 
-    def _weighted_recent_approvals(self, state: dict, now: float) -> float:
+    def _weighted_recent_approvals(self, state: dict[str, Any], now: float) -> float:
         total = 0.0
         for ts in state.get("approval_timestamps", []):
             age = max(0.0, now - float(ts))
@@ -320,14 +320,14 @@ class ConsentLadder:
         await self._ensure_loaded()
         async with self._get_lock():
             state = self._get_state(action_type)
-            return state["level"]
+            return int(state["level"])
 
     async def get_level_name(self, action_type: str) -> str:
         """Get human-readable consent level name."""
         level = await self.get_level(action_type)
         return _LEVEL_NAMES.get(level, "unknown")
 
-    async def get_all_states(self) -> dict[str, dict]:
+    async def get_all_states(self) -> dict[str, dict[str, Any]]:
         """Get all action consent states for display."""
         await self._ensure_loaded()
         # F24: deep-copy under the lock so the caller cannot observe a

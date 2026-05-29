@@ -223,9 +223,9 @@ class ContextualBandit:
             return None
         return idx
 
-    def get_arm_stats(self) -> list[dict]:
+    def get_arm_stats(self) -> list[dict[str, Any]]:
         """Get statistics for each arm."""
-        stats = []
+        stats: list[dict[str, Any]] = []
         for a in range(self._n_arms):
             A_inv = np.linalg.inv(self._A[a])
             theta = A_inv @ self._b[a]
@@ -236,7 +236,7 @@ class ContextualBandit:
             })
         return stats
 
-    def _to_dict(self) -> dict:
+    def _to_dict(self) -> dict[str, Any]:
         """Serialize for storage."""
         return {
             "n_arms": self._n_arms,
@@ -248,7 +248,7 @@ class ContextualBandit:
             "arm_labels": ARM_LABELS[:self._n_arms],
         }
 
-    def _from_dict(self, data: dict) -> None:
+    def _from_dict(self, data: dict[str, Any]) -> None:
         """Restore from serialized state."""
         n_arms = data.get("n_arms", N_ARMS)
         n_features = data.get("n_features", N_FEATURES)

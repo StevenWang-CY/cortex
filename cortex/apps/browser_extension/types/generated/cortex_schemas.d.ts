@@ -958,6 +958,10 @@ export interface InterventionPlan {
    */
   causal_explanation?: string;
   /**
+   * URL of the active tab at trigger time, stamped by the daemon so surfaces can scope the intervention to its originating page. None when no active-tab URL was available.
+   */
+  trigger_url?: string | null;
+  /**
    * 2-3 dominant signals behind the trigger; first is primary
    *
    * @maxItems 3
@@ -2209,9 +2213,9 @@ export interface InterventionApplied {
    */
   intervention_id: string;
   /**
-   * Lifecycle phase being acked
+   * Lifecycle phase being acked. 'execute_action' is sent by the VS Code extension when it acks a non-mutating native action (e.g. resume_last_active_file) it executed directly.
    */
-  phase?: "apply" | "restore";
+  phase?: "apply" | "restore" | "execute_action";
   /**
    * True iff every requested mutation succeeded on this client
    */
@@ -2268,7 +2272,7 @@ export interface InterventionApplyResult {
   /**
    * Which lifecycle phase this result belongs to
    */
-  phase?: "apply" | "restore";
+  phase?: "apply" | "restore" | "execute_action";
 }
 /**
  * Output from the destructive struggle detector.
@@ -2763,6 +2767,10 @@ export interface InterventionTriggerPayload {
    */
   causal_explanation?: string;
   /**
+   * URL of the active tab at trigger time, stamped by the daemon so surfaces can scope the intervention to its originating page. None when no active-tab URL was available.
+   */
+  trigger_url?: string | null;
+  /**
    * 2-3 dominant signals behind the trigger; first is primary
    *
    * @maxItems 3
@@ -2911,7 +2919,7 @@ export interface QuietModeTogglePayload {
 export interface SessionRecap {
   report: SessionReport1;
   /**
-   * When the recap envelope was constructed (wall-clock). Distinct from ``report.end_time`` which is the session end.
+   * ISO-8601 instant the recap envelope was constructed (wall-clock). C4 (audit): typed as ``str`` so the daemon's ``SessionRecap(generated_at=<iso8601 str>, ...)`` wrapper matches the schema exactly and the generated TypeScript type is a plain ``string``. Distinct from ``report.end_time`` which is the session end.
    */
   generated_at?: string;
   /**

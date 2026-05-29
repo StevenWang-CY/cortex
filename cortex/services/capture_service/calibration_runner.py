@@ -220,21 +220,33 @@ async def run_live_calibration(
     config: Any | None = None,
     is_aborted: Callable[[], bool] | None = None,
     on_progress: ProgressCallback | None = None,
+    on_fallback: Callable[[], None] | None = None,
 ) -> dict[str, list[float]]:
     """Async live capture loop. Falls back to simulate mode if the
     webcam / OpenCV / pipeline modules are unavailable.
+
+    ``on_fallback`` is invoked exactly once if the live path degrades to
+    the simulation loop (no camera / OpenCV / pipeline / physio data), so
+    the caller can surface a visible "calibrated against synthetic data"
+    warning instead of silently accepting a useless baseline (CLAUDE.md
+    rules #5/#15 — never let a contended camera masquerade as a real one).
 
     The function `await asyncio.sleep(0)` after each frame so the event
     loop stays responsive — the wizard's progress callback delivery and
     the abort flag check both run on the same loop.
     """
+    async def _fallback() -> dict[str, list[float]]:
+        if on_fallback is not None:
+            on_fallback()
+        return await run_simulate_calibration(
+            duration_seconds, is_aborted=is_aborted, on_progress=on_progress
+        )
+
     try:
         import cv2  # local import per CLAUDE.md rule
     except ImportError:
         logger.warning("OpenCV unavailable, falling back to simulation")
-        return await run_simulate_calibration(
-            duration_seconds, is_aborted=is_aborted, on_progress=on_progress
-        )
+        return await _fallback()
 
     if config is None:
         config = get_config()
@@ -250,9 +262,7 @@ async def run_live_calibration(
             "Cannot open webcam device %s, falling back to simulation",
             describe_requested_camera(config.capture),
         )
-        return await run_simulate_calibration(
-            duration_seconds, is_aborted=is_aborted, on_progress=on_progress
-        )
+        return await _fallback()
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.capture.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.capture.height)
@@ -273,9 +283,7 @@ async def run_live_calibration(
             "Full calibration pipeline unavailable, falling back to simulation"
         )
         cap.release()
-        return await run_simulate_calibration(
-            duration_seconds, is_aborted=is_aborted, on_progress=on_progress
-        )
+        return await _fallback()
 
     tracker = FaceTracker(config.capture)
     extractor = RoiExtractor(config.landmarks)
@@ -297,9 +305,7 @@ async def run_live_calibration(
             "Face tracker failed to initialize (%s), falling back to simulation", exc
         )
         cap.release()
-        return await run_simulate_calibration(
-            duration_seconds, is_aborted=is_aborted, on_progress=on_progress
-        )
+        return await _fallback()
 
     hooks_started = input_hooks.start()
     if not hooks_started:
@@ -360,9 +366,11 @@ async def run_live_calibration(
                 await asyncio.sleep(0)
                 continue
 
-            tracking = tracker.process_frame(frame)
-            face_ok = bool(tracking.face_detected and tracking.landmarks_px is not None)
-            if not face_ok:
+            frame_u8 = np.asarray(frame, dtype=np.uint8)
+            tracking = tracker.process_frame(frame_u8)
+            landmarks_px = tracking.landmarks_px
+            face_ok = bool(tracking.face_detected and landmarks_px is not None)
+            if not face_ok or landmarks_px is None:
                 if elapsed - last_progress_time >= progress_interval:
                     _emit_progress(
                         on_progress,
@@ -378,20 +386,20 @@ async def run_live_calibration(
                 await asyncio.sleep(0)
                 continue
 
-            roi_frame = extractor.extract(frame, tracking.landmarks_px, elapsed)
+            roi_frame = extractor.extract(frame_u8, landmarks_px, elapsed)
             combined_rgb = roi_frame.combined_rgb()
             if combined_rgb is not None:
                 rgb_window.append(combined_rgb)
                 if len(rgb_window) > max_window:
                     rgb_window.pop(0)
 
-            blink_state = blink_detector.update(tracking.landmarks_px, elapsed)
+            blink_state = blink_detector.update(landmarks_px, elapsed)
             if blink_state.blink_rate is not None:
                 samples["blink_rate"].append(blink_state.blink_rate)
 
             ear_mid_y = float(
-                (tracking.landmarks_px[234][1] + tracking.landmarks_px[454][1]) / 2.0
-            ) / float(frame.shape[0])
+                (landmarks_px[234][1] + landmarks_px[454][1]) / 2.0
+            ) / float(frame_u8.shape[0])
             samples["shoulder_y"].append(ear_mid_y)
 
             if (
@@ -459,9 +467,7 @@ async def run_live_calibration(
 
     if not samples["hr"] and not samples["blink_rate"] and not samples["shoulder_y"]:
         logger.warning("No physiological data captured, falling back to defaults")
-        return await run_simulate_calibration(
-            duration_seconds, is_aborted=is_aborted, on_progress=on_progress
-        )
+        return await _fallback()
 
     return samples
 
@@ -562,6 +568,12 @@ class CalibrationRunner:
             raise ValueError("duration_seconds must be positive")
         self.duration_seconds = int(duration_seconds)
         self.simulate = bool(simulate)
+        # True if calibration ran against synthetic frames — either because
+        # ``simulate=True`` was requested OR the live path degraded to the
+        # simulation loop (no camera / OpenCV / pipeline / physio data). The
+        # desktop wizard reads this to surface a visible warning instead of
+        # silently accepting a useless baseline.
+        self.used_simulation = bool(simulate)
         self._config = config
         self._aborted = False
         self._started = False
@@ -617,11 +629,15 @@ class CalibrationRunner:
                     on_progress=wrapped_cb,
                 )
             else:
+                def _mark_simulated() -> None:
+                    self.used_simulation = True
+
                 self._samples = await run_live_calibration(
                     self.duration_seconds,
                     config=self._config,
                     is_aborted=lambda: self._aborted,
                     on_progress=wrapped_cb,
+                    on_fallback=_mark_simulated,
                 )
         except Exception:
             logger.exception("calibration capture loop crashed")

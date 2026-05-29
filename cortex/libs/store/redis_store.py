@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import logging
 import time
+from pathlib import Path
+from typing import Any, cast
 
 import redis.asyncio as aioredis
 
@@ -38,6 +40,7 @@ class RedisStore:
         port: int = 6379,
         db: int = 0,
         key_prefix: str = "cortex",
+        fallback_persist_path: Path | None = None,
     ) -> None:
         """Initialise the Redis store.
 
@@ -46,13 +49,40 @@ class RedisStore:
             port: Redis server port.
             db: Redis database index.
             key_prefix: Prefix prepended to every key.
+            fallback_persist_path: Path the in-memory fallback persists to
+                when Redis turns out to be unreachable. C7 (audit): without
+                this the fallback was purely in-memory, so a Redis-enabled
+                deployment that lost its Redis silently dropped consent /
+                calibration state on every daemon restart. ``None`` resolves
+                to :func:`cortex.libs.store._default_persist_path` lazily
+                (deferred import keeps this module free of the package
+                ``__init__`` import cycle).
         """
         self._host = host
         self._port = port
         self._db = db
         self._prefix = key_prefix
+        self._fallback_persist_path = fallback_persist_path
         self._client: aioredis.Redis | None = None
         self._fallback: InMemoryStore | None = None
+
+    @property
+    def degraded(self) -> bool:
+        """True once Redis was found unreachable and the in-memory fallback
+        is in use.
+
+        C7 (audit): the daemon mirrors this onto its ``_store_degraded``
+        flag after construction so the dashboard can surface a soft
+        "running without Redis — state won't survive a restart cleanly"
+        hint. The fallback DOES persist to disk (see
+        ``fallback_persist_path``), but ``degraded`` still signals the
+        intended Redis backend is absent.
+
+        ``False`` until the first operation has probed Redis (the connection
+        is lazy); it flips to ``True`` the moment ``_get_client`` records a
+        failed connection and constructs the fallback.
+        """
+        return self._fallback is not None
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -81,17 +111,34 @@ class RedisStore:
                 db=self._db,
                 decode_responses=True,
             )
-            await client.ping()
+            # redis.asyncio is partially untyped: ``ping`` is annotated
+            # ``Awaitable[bool] | bool`` so awaiting the union directly trips
+            # mypy's [misc] check. Cast to the awaitable arm — the async
+            # client always returns a coroutine here.
+            await cast("Any", client.ping())
             self._client = client
             logger.info("Connected to Redis at %s:%s/%s", self._host, self._port, self._db)
             return self._client
         except Exception:
+            persist_path = self._fallback_persist_path
+            if persist_path is None:
+                # Deferred import breaks the package ``__init__`` ↔
+                # ``redis_store`` import cycle. The helper is cheap and
+                # only hit on the (rare) Redis-unreachable path.
+                from cortex.libs.store import _default_persist_path
+
+                persist_path = _default_persist_path()
             logger.warning(
-                "Redis unavailable at %s:%s – falling back to InMemoryStore",
+                "Redis unavailable at %s:%s – falling back to a persistent "
+                "InMemoryStore at %s",
                 self._host,
                 self._port,
+                persist_path,
             )
-            self._fallback = InMemoryStore(key_prefix=self._prefix)
+            self._fallback = InMemoryStore(
+                key_prefix=self._prefix,
+                persist_path=persist_path,
+            )
             return None
 
     def _fallback_store(self) -> InMemoryStore:
@@ -160,7 +207,7 @@ class RedisStore:
     # JSON
     # ------------------------------------------------------------------
 
-    async def get_json(self, key: str) -> dict | None:
+    async def get_json(self, key: str) -> dict[str, Any] | None:
         """Retrieve a JSON dict from Redis.
 
         Args:
@@ -176,9 +223,9 @@ class RedisStore:
         raw = await client.get(self._key(key))
         if raw is None:
             return None
-        return json.loads(raw)
+        return cast("dict[str, Any]", json.loads(raw))
 
-    async def set_json(self, key: str, value: dict, ttl_seconds: int | None = None) -> None:
+    async def set_json(self, key: str, value: dict[str, Any], ttl_seconds: int | None = None) -> None:
         """Store a dict as a JSON string, optionally with a TTL.
 
         Args:
@@ -214,7 +261,7 @@ class RedisStore:
         if client is None:
             return await self._fallback_store().increment(key)
 
-        return await client.incr(self._key(key))
+        return int(await client.incr(self._key(key)))
 
     async def get_float(self, key: str) -> float | None:
         """Retrieve a stored float.
@@ -261,7 +308,7 @@ class RedisStore:
             return await self._fallback_store().health_check()
 
         try:
-            return await client.ping()
+            return bool(await cast("Any", client.ping()))
         except Exception:
             return False
 

@@ -262,21 +262,46 @@ class RestoreManager:
         """End an intervention, restore workspace, and log outcome."""
         iid = active.intervention_id
 
-        # Restore workspace via executor
+        # Restore workspace via executor.
+        #
+        # P2: ``workspace_restored`` must reflect whether the reverse pass
+        # ACTUALLY ran, not merely whether nothing failed. The previous
+        # ``len(failed) == 0`` reported ``True`` whenever ``reverse()``
+        # returned an empty list — which happens both when there was
+        # genuinely nothing to undo AND when a reversible mutation was
+        # silently skipped (adapter missing). The executor now emits an
+        # explicit failed reversal for the adapter-missing case, so an
+        # empty ``reversals`` list now unambiguously means "the executor
+        # had no reversible mutations recorded for this intervention" —
+        # i.e. nothing was mutated, so the workspace is trivially in its
+        # original state. We therefore only claim ``workspace_restored``
+        # when no reversal failed AND there was no executor wired only to
+        # have its reverse raise.
         workspace_restored = False
         restore_errors: list[str] = []
 
-        if self._executor is not None:
+        if self._executor is None:
+            # No executor wired: we genuinely cannot have mutated the
+            # workspace, so it is trivially in its original state.
+            workspace_restored = True
+        else:
             try:
                 reversals = await self._executor.reverse(iid)
                 failed = [r for r in reversals if not r.success]
+                # Restored == every attempted reversal succeeded. An empty
+                # ``reversals`` list means there were no reversible
+                # mutations to undo (overlay-only plan or all originals
+                # failed), which is still a restored workspace.
                 workspace_restored = len(failed) == 0
                 restore_errors = [
-                    f"{r.adapter}:{r.action} failed" for r in failed
+                    f"{r.adapter}:{r.action} failed"
+                    + (f" ({r.reason})" if r.reason else "")
+                    for r in failed
                 ]
             except Exception as exc:
                 logger.exception("Error restoring workspace for %s", iid)
                 restore_errors.append(str(exc))
+                workspace_restored = False
 
         duration = active.duration_at(now)
         is_recovery = user_action in ("natural_recovery", "engaged")

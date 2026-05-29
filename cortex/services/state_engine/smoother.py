@@ -26,6 +26,7 @@ import numpy as np
 from cortex.libs.config.settings import StateConfig
 from cortex.libs.logging.correlation import get_correlation_id
 from cortex.libs.logging.structured import log_state_transition
+from cortex.libs.observability.metrics import STATE_TRANSITIONS_TOTAL
 from cortex.libs.schemas.state import (
     SignalQuality,
     StateEstimate,
@@ -186,6 +187,16 @@ class ScoreSmoother:
                 trigger_reasons=self._generate_reasons(),
             )
             self._transitions.append(transition)
+            # C6: increment the Prometheus state-transition counter at the
+            # real commit site (this is the single place ``_current_state``
+            # actually changes after hysteresis + dwell confirmation), so
+            # ``cortex_state_transitions_total{from_state,to_state}``
+            # reflects confirmed transitions only — never the raw
+            # per-frame dominant flicker.
+            STATE_TRANSITIONS_TOTAL.labels(
+                from_state=self._current_state.value,
+                to_state=confirmed_state.value,
+            ).inc()
             # P2-16: emit structured STATE_TRANSITION event via structlog so
             # the event stream carries from_state, to_state, dwell_seconds,
             # confidence, and correlation_id for observability dashboards.

@@ -76,7 +76,7 @@ def _appkit() -> Any | None:
         _appkit_cache["AppKit"] = None
         return None
     try:
-        import AppKit  # type: ignore[import-not-found]
+        import AppKit
 
         _appkit_cache["AppKit"] = AppKit
         return AppKit
@@ -93,7 +93,7 @@ def _objc() -> Any | None:
         _appkit_cache["objc"] = None
         return None
     try:
-        import objc  # type: ignore[import-not-found]
+        import objc
 
         _appkit_cache["objc"] = objc
         return objc
@@ -118,7 +118,7 @@ def _ns_window_for(widget: Any) -> Any | None:
         return None
     try:
         # NSView pointer comes back from winId(); ask its window.
-        view = _objc().objc_object(c_void_p=wid)  # type: ignore[union-attr]
+        view = _objc().objc_object(c_void_p=wid)
         return view.window() if view is not None else None
     except Exception as exc:  # pragma: no cover - mac-only path
         logger.debug("Cannot resolve NSWindow for widget: %s", exc)
@@ -131,15 +131,28 @@ def _ns_window_for(widget: Any) -> Any | None:
 
 
 def apply_vibrancy(widget: Any, material: Material = "window_background") -> bool:
-    """Install an ``NSVisualEffectView`` behind the widget's NSWindow content.
+    """Tint the widget's NSWindow background to the system window colour.
 
-    Returns True on success, False if AppKit unavailable or widget not realized.
-    The widget should already be ``show()``-n so its ``winId()`` is non-zero.
+    NOTE: this does NOT install an ``NSVisualEffectView`` — true vibrancy
+    (the blurred translucent material) is intentionally disabled. Two
+    earlier revisions tried to slot an ``NSVisualEffectView`` under Qt's
+    contentView via ``setContentView_`` / sibling subview swaps; both
+    orphaned the Qt view (windows registered as ``count=0`` to the
+    WindowServer and the Dock icon bounced forever with no visible
+    window). The safe behaviour is to leave the contentView untouched and
+    only tint the window background so the unified titlebar + Qt content
+    read as one continuous surface. The ``material`` argument is accepted
+    for call-site compatibility but ignored; the native look is carried by
+    the surrounding chrome (titlebar transparency, SF Pro fonts,
+    NSStatusItem, HIG palette + radii).
 
-    The terracotta brand surfaces (state badge, intervention card, etc.) stay
-    on top of the vibrant material because Qt views are added as subviews of
-    the effect view (the AppKit "back to front" stacking rule).
+    Returns:
+        True when the background tint was actually applied, False when
+        AppKit is unavailable, the widget is not yet realized, or the
+        tint call raised. Callers must NOT interpret a True result as
+        "vibrancy installed" — it means "background tint applied".
     """
+    del material  # accepted for API compatibility; tint-only path ignores it
     AppKit = _appkit()
     if AppKit is None:
         return False
@@ -147,31 +160,13 @@ def apply_vibrancy(widget: Any, material: Material = "window_background") -> boo
     if window is None:
         return False
     try:
-        # Qt owns the NSWindow's contentView for its drawing surface. Two
-        # earlier revisions tried to slot an NSVisualEffectView under it via
-        # ``setContentView_`` / sibling subview swaps; both orphaned the
-        # Qt view (windows registered as ``count=0`` to the WindowServer
-        # and the Dock icon bounced forever with no visible window).
-        #
-        # The safe path is to *not* touch the contentView at all — instead
-        # tint the window background so the unified titlebar + Qt content
-        # stay on the same surface. The native look is carried by the
-        # surrounding chrome (titlebar transparency, SF Pro fonts,
-        # NSStatusItem, HIG palette + radii); the true ``NSVisualEffect``
-        # blur is a polish item we re-enable when we have the AppKit/Qt
-        # interop nailed down. Returning True here is intentional so
-        # callers don't log a false failure.
-        del material
         # Make the titlebar share the window background colour so the
         # transparency from ``apply_unified_titlebar`` reads as one
         # continuous surface rather than a stripe.
-        try:
-            window.setBackgroundColor_(AppKit.NSColor.windowBackgroundColor())
-        except Exception:
-            pass
+        window.setBackgroundColor_(AppKit.NSColor.windowBackgroundColor())
         return True
     except Exception as exc:  # pragma: no cover - mac-only
-        logger.debug("apply_vibrancy soft-fallback failed: %s", exc)
+        logger.debug("apply_vibrancy background tint failed: %s", exc)
         return False
 
 
@@ -363,11 +358,17 @@ def install_appearance_observer(callback: Callable[[bool], None]) -> Callable[[]
     if AppKit is None or objc is None:
         return None
     try:
-        from Foundation import NSDistributedNotificationCenter  # type: ignore[import-not-found]
+        from Foundation import NSDistributedNotificationCenter
 
         center = NSDistributedNotificationCenter.defaultCenter()
 
-        class _Observer(AppKit.NSObject):  # type: ignore[misc]
+        # Bind the ObjC base class to a local name so the class statement
+        # references a plain name (a dotted ``AppKit.NSObject`` base is
+        # unresolvable to mypy and raises [name-defined]; the local is
+        # typed ``Any`` and resolves at runtime on macOS).
+        _NSObject: Any = AppKit.NSObject
+
+        class _Observer(_NSObject):
             def appearanceChanged_(self, _note: Any) -> None:
                 try:
                     callback(is_dark_appearance())
@@ -482,12 +483,15 @@ class StatusBarItem:
         AppKit = self._appkit
         if AppKit is None or self._menu is None:
             return
+        target_cls = _menu_action_target_class()
+        if target_cls is None:
+            return
         try:
-            target = _MenuActionTarget.alloc().init()
-            target.callback = callback  # type: ignore[attr-defined]
+            target = target_cls.alloc().init()
+            target.callback = callback
             item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
                 title,
-                _objc().selector(target.fire_, signature=b"v@:@"),  # type: ignore[union-attr]
+                _objc().selector(target.fire_, signature=b"v@:@"),
                 key,
             )
             item.setTarget_(target)
@@ -511,14 +515,20 @@ class StatusBarItem:
             self._item.setVisible_(bool(visible))
 
 
-# Objective-C selector target shim. Defined at module scope so the runtime
-# can register it once.
+# Objective-C selector target shim. Built lazily (NOT at import time) so the
+# module imports cleanly off-mac and never eagerly imports AppKit — the whole
+# AppKit surface is gated behind ``_appkit()``. The constructed ObjC class is
+# memoised in ``_appkit_cache`` so the runtime registers it exactly once.
 def _make_action_target_class() -> Any | None:
     AppKit = _appkit()
     if AppKit is None:
         return None
     try:
-        class _Target(AppKit.NSObject):  # type: ignore[misc]
+        # Local-name base (see ``install_appearance_observer``): a dotted
+        # ``AppKit.NSObject`` base is unresolvable to mypy.
+        _NSObject: Any = AppKit.NSObject
+
+        class _Target(_NSObject):
             def fire_(self, _sender: Any) -> None:
                 cb = getattr(self, "callback", None)
                 if cb is None:
@@ -533,7 +543,18 @@ def _make_action_target_class() -> Any | None:
         return None
 
 
-_MenuActionTarget = _make_action_target_class()
+def _menu_action_target_class() -> Any | None:
+    """Lazily build + memoise the ``_Target`` ObjC selector shim.
+
+    Replaces the eager module-level ``_MenuActionTarget`` which forced an
+    AppKit import at import time (contradicting the lazy-import design and
+    breaking the non-mac import path). Cached in ``_appkit_cache`` so the
+    ObjC runtime registers the class exactly once."""
+    if "menu_action_target" in _appkit_cache:
+        return _appkit_cache["menu_action_target"]
+    target = _make_action_target_class()
+    _appkit_cache["menu_action_target"] = target
+    return target
 
 
 def _hex_to_nscolor(hex_color: str) -> Any | None:

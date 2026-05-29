@@ -22,6 +22,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
 
 from cortex.libs.config.settings import TelemetryConfig
 
@@ -143,8 +144,10 @@ class InputHooks:
     def __init__(self, config: TelemetryConfig | None = None) -> None:
         self._config = config or TelemetryConfig()
         self._buffers = InputEventBuffers()
-        self._mouse_listener = None
-        self._keyboard_listener = None
+        # pynput ``Listener`` instances (typed ``Any`` because pynput
+        # ships no stubs and is an optional import — see ``start``).
+        self._mouse_listener: Any | None = None
+        self._keyboard_listener: Any | None = None
         self._running = False
         self._last_move_time = 0.0
         self._move_interval = 1.0 / self._config.mouse_sample_hz
@@ -251,7 +254,7 @@ class InputHooks:
 
     def get_events_in_window(
         self, window_seconds: float | None = None, current_time: float | None = None,
-    ) -> dict[str, list]:
+    ) -> dict[str, list[Any]]:
         """
         Get all events within the specified time window.
 

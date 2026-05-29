@@ -202,10 +202,10 @@ class LeetCodeModeResolver:
         if mode == LeetCodeMode.AMYGDALA_HIJACK:
             # Use aai_score itself as a proxy for detector confidence
             detector_conf = min(aai_score, 1.0)
-            return (state_confidence * detector_conf) ** 0.5
+            return float((state_confidence * detector_conf) ** 0.5)
 
         if mode == LeetCodeMode.DESTRUCTIVE_STRUGGLE:
-            return (state_confidence * destructive.confidence) ** 0.5
+            return float((state_confidence * destructive.confidence) ** 0.5)
 
         if mode == LeetCodeMode.FATIGUE:
             # No separate detector confidence; use stress as proxy

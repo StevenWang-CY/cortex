@@ -104,8 +104,20 @@ export interface InterventionPlanShape {
     trigger_url: string | null;
     trigger_confidence: number;
     confidence: number;
-    message: string;
-    actions: Array<Record<string, unknown>>;
+    /**
+     * C3: the human-facing overlay headline. On the wire this is the
+     * ``headline`` field of ``InterventionTriggerPayload`` (the old
+     * ``message`` name never existed on the Pydantic model). We read
+     * ``headline`` first and fall back to a legacy ``message`` key so
+     * pre-C3 fixtures still resolve.
+     */
+    headline: string;
+    /**
+     * C3: executable actions the user can approve. The wire field is
+     * ``suggested_actions`` (the old ``actions`` name was a drift bug).
+     * We read ``suggested_actions`` first, then a legacy ``actions`` key.
+     */
+    suggested_actions: Array<Record<string, unknown>>;
     desktop_not_focused: boolean;
 }
 
@@ -132,15 +144,17 @@ export function normaliseInterventionPayload(
     if (typeof p.intervention_id !== "string" || p.intervention_id === "") {
         return null;
     }
-    // ``intervention_type`` is REQUIRED on the Pydantic side but
-    // legacy daemons / test fixtures sometimes omit it. We default to
-    // the safest tone ("overlay_only" — least invasive) rather than
-    // dropping the frame; this preserves backwards-compat with
-    // pre-F2 fixtures while still flagging payloads that lack the
-    // required ``intervention_id`` discriminator.
+    // C3: the wire discriminator for intervention severity is ``level``
+    // (overlay_only | simplified_workspace | guided_mode). Older fixtures
+    // used ``intervention_type``. We read ``intervention_type`` first
+    // (back-compat), then ``level`` (the real wire field), and finally
+    // fall back to the safest tone ("overlay_only" — least invasive)
+    // rather than dropping the frame.
     const interventionType =
         typeof p.intervention_type === "string" && p.intervention_type !== ""
             ? p.intervention_type
+            : typeof p.level === "string" && p.level !== ""
+            ? p.level
             : "overlay_only";
     const triggerUrl =
         typeof p.trigger_url === "string" ? p.trigger_url : null;
@@ -153,20 +167,31 @@ export function normaliseInterventionPayload(
         typeof p.confidence === "number" && Number.isFinite(p.confidence)
             ? p.confidence
             : 0;
-    const message = typeof p.message === "string" ? p.message : "";
-    const actions = Array.isArray(p.actions)
-        ? (p.actions.filter(
-              (a) => typeof a === "object" && a !== null,
-          ) as Array<Record<string, unknown>>)
+    // C3: real wire field is ``headline``; ``message`` is a legacy alias.
+    const headline =
+        typeof p.headline === "string"
+            ? p.headline
+            : typeof p.message === "string"
+            ? p.message
+            : "";
+    // C3: real wire field is ``suggested_actions``; ``actions`` is the
+    // legacy alias. Prefer the wire name, fall back to the legacy one.
+    const rawActions = Array.isArray(p.suggested_actions)
+        ? p.suggested_actions
+        : Array.isArray(p.actions)
+        ? p.actions
         : [];
+    const suggestedActions = rawActions.filter(
+        (a) => typeof a === "object" && a !== null,
+    ) as Array<Record<string, unknown>>;
     return {
         intervention_id: p.intervention_id,
         intervention_type: interventionType,
         trigger_url: triggerUrl,
         trigger_confidence: triggerConfidence,
         confidence,
-        message,
-        actions,
+        headline,
+        suggested_actions: suggestedActions,
         desktop_not_focused: p.desktop_not_focused === true,
     };
 }

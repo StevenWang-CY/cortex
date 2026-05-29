@@ -24,7 +24,20 @@ describe("Audit-2 activity-tracker blocklist", () => {
     it("module imports without crashing", async () => {
         // jsdom doesn't actually run content scripts; we just need the
         // module to be importable so the patterns are evaluated.
-        const mod = await import("../activity-tracker");
+        const mod = await import("../contents/activity-tracker");
         expect(mod).toBeTruthy();
+    });
+
+    // EXT-3: the tracker must live under contents/ and export a
+    // PlasmoCSConfig matching <all_urls>, otherwise Plasmo never bundles
+    // it as a content script and ACTIVITY_UPDATE is never emitted on any
+    // page. The exported ``config`` is the contract Plasmo's analyzer
+    // reads; assert it stays present + correct so a future refactor that
+    // drops the export fails CI rather than silently disabling tracking.
+    it("exports a PlasmoCSConfig matching all urls", async () => {
+        const mod = await import("../contents/activity-tracker");
+        expect(mod.config).toBeDefined();
+        expect(mod.config.matches).toContain("<all_urls>");
+        expect(mod.config.run_at).toBe("document_idle");
     });
 });

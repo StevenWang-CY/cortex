@@ -295,7 +295,13 @@ class WindowTracker:
             import ctypes
             from ctypes import wintypes
 
-            user32 = ctypes.windll.user32
+            # ``ctypes.windll`` exists only on Windows; ``getattr`` keeps
+            # this branch importable (and mypy-clean) on macOS/Linux where
+            # the attribute is absent from the platform's ctypes module.
+            windll = getattr(ctypes, "windll", None)
+            if windll is None:
+                return None
+            user32 = windll.user32
             hwnd = user32.GetForegroundWindow()
 
             if not hwnd:

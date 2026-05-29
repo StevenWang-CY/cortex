@@ -14,6 +14,7 @@ Message types (JSON-over-WebSocket):
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -583,12 +584,13 @@ class WebSocketServer:
         try:
             import http
 
-            from websockets.http11 import Response  # type: ignore
+            from websockets.datastructures import Headers
+            from websockets.http11 import Response
 
             return Response(
-                http.HTTPStatus.FORBIDDEN,
+                http.HTTPStatus.FORBIDDEN.value,
                 "Forbidden",
-                [],
+                Headers(),
                 b"",
             )
         except Exception:
@@ -1491,10 +1493,11 @@ class WebSocketServer:
         except (TypeError, ValueError):
             limit = 30
         try:
-            if asyncio.iscoroutinefunction(cb):
-                resp = await cb(since, limit)
-            else:
-                resp = cb(since, limit)
+            # The callback is declared ``Callable[..., Awaitable[...]]``;
+            # a defensively-registered sync callable is also tolerated by
+            # awaiting only when the returned value is awaitable.
+            result = cb(since, limit)
+            resp = await result if inspect.isawaitable(result) else result
         except Exception:
             logger.exception(
                 "session-list callback raised for client %s", client.client_id,
@@ -1558,10 +1561,8 @@ class WebSocketServer:
             )
             return
         try:
-            if asyncio.iscoroutinefunction(cb):
-                resp = await cb(session_id)
-            else:
-                resp = cb(session_id)
+            result = cb(session_id)
+            resp = await result if inspect.isawaitable(result) else result
         except Exception:
             logger.exception(
                 "session-detail callback raised for client %s", client.client_id,
@@ -1619,10 +1620,8 @@ class WebSocketServer:
         window = payload.get("window") if isinstance(payload.get("window"), str) else "week"
         refresh = bool(payload.get("refresh") or False)
         try:
-            if asyncio.iscoroutinefunction(cb):
-                resp = await cb(window, refresh=refresh)
-            else:
-                resp = cb(window, refresh=refresh)
+            result = cb(window, refresh=refresh)
+            resp = await result if inspect.isawaitable(result) else result
         except Exception:
             logger.exception(
                 "trends callback raised for client %s", client.client_id,
@@ -2290,9 +2289,10 @@ class WebSocketServer:
 
         # F22: clean up dead connections with explicit close + reason.
         for client_id, reason in dead_clients:
-            client = self._clients.pop(client_id, None)
-            if client is not None:
-                await self._close_slow_consumer(client, reason)
+            dead = self._clients.get(client_id)
+            if dead is not None:
+                del self._clients[client_id]
+                await self._close_slow_consumer(dead, reason)
             logger.debug("Removed dead client: %s (%s)", client_id, reason)
 
         return sent
@@ -2356,14 +2356,25 @@ class WebSocketServer:
         # banner reads ``payload.get("degraded")`` / ``payload.get("source")``
         # off the STATE_UPDATE payload; before this stamp the banner could
         # never fire through the WS path because the producer omitted the
-        # fields. ``degraded`` is True when no real classifier ran
-        # (``classifier_source is None``) — that is the same condition the
-        # ``/state/infer`` fallback branch uses to flag synthetic
-        # confidence. ``source`` is the literal pair ``classifier`` /
+        # fields. ``source`` is the literal pair ``classifier`` /
         # ``fallback`` so the reader can branch without conflating with
         # the debug-overlay ``classifier_source`` field (``rule`` / ``ml`` /
         # ``ensemble``).
-        degraded = estimate.classifier_source is None
+        #
+        # P1 fix (finding #3): ``degraded`` must reflect a REAL degradation
+        # condition, not a flag that is always False in production. The
+        # live smoother always stamps ``classifier_source`` ("rule" /
+        # "ml" / "ensemble") so ``classifier_source is None`` alone never
+        # fired for a genuinely poor signal. We now degrade when EITHER:
+        #   (a) no real classifier ran (``classifier_source is None`` —
+        #       the synthetic ``/state/infer`` fallback path), OR
+        #   (b) the fused signal quality fell below the acceptability
+        #       floor (``SignalQuality.acceptable`` → ``overall >= 0.3``),
+        #       meaning the estimate is being produced on noise the UI
+        #       should not present as authoritative.
+        no_classifier = estimate.classifier_source is None
+        signal_too_low = not estimate.signal_quality.acceptable
+        degraded = no_classifier or signal_too_low
         envelope_source: Literal["classifier", "fallback"] = (
             "fallback" if degraded else "classifier"
         )

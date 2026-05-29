@@ -256,9 +256,26 @@ def test_session_recap_persisted_false_survives_roundtrip() -> None:
 
 def test_session_recap_carries_explicit_generated_at() -> None:
     report = _make_report()
-    when = datetime(2026, 5, 27, 10, 0, tzinfo=UTC)
+    # C4 (audit): generated_at is an ISO-8601 *string* so the daemon's
+    # SessionRecap(generated_at=<iso8601 str>, ...) wrapper matches the
+    # schema and the generated TS type is a plain `string`.
+    when = datetime(2026, 5, 27, 10, 0, tzinfo=UTC).isoformat()
     msg = SessionRecap(report=report, generated_at=when)
     assert msg.generated_at == when
+    assert isinstance(msg.generated_at, str)
+
+
+def test_session_recap_generated_at_is_str_by_default() -> None:
+    """C4: the default-factory produces a str, not a datetime, so the
+    wire shape (schema == wire) is a JSON string in both paths."""
+    report = _make_report()
+    msg = SessionRecap(report=report)
+    assert isinstance(msg.generated_at, str)
+    # Round-trips through model_dump(mode="json") unchanged.
+    blob = msg.model_dump(mode="json")
+    assert isinstance(blob["generated_at"], str)
+    restored = SessionRecap.model_validate(blob)
+    assert restored.generated_at == msg.generated_at
 
 
 # ─── InterventionApplied ───────────────────────────────────────────────

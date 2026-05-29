@@ -23,6 +23,7 @@ bounded by ``maxlen`` and ephemeral by design.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -71,6 +72,12 @@ class InMemoryStore:
         self._expiry: dict[str, float] = {}
         self._timeseries: dict[str, deque[tuple[float, float]]] = {}
         self._persist_path: Path | None = persist_path
+        # Guards the read-modify-write-persist sequence in ``increment``
+        # so the operation is genuinely atomic across concurrent awaiters
+        # — see ``increment``'s docstring. Created lazily on first use so
+        # the store can be constructed outside a running event loop
+        # (Pydantic-free; ``asyncio.Lock`` only needs a loop when awaited).
+        self._increment_lock: asyncio.Lock | None = None
 
         # Best-effort load of the prior state. A corrupted on-disk file
         # is logged and skipped rather than crashing the daemon — the
@@ -197,7 +204,7 @@ class InMemoryStore:
     # JSON
     # ------------------------------------------------------------------
 
-    async def get_json(self, key: str) -> dict | None:
+    async def get_json(self, key: str) -> dict[str, Any] | None:
         """Retrieve a JSON-serialisable dict, or ``None`` if missing/expired.
 
         Args:
@@ -209,9 +216,10 @@ class InMemoryStore:
         ik = self._key(key)
         if self._is_expired(ik):
             return None
-        return self._data.get(ik)
+        value: dict[str, Any] | None = self._data.get(ik)
+        return value
 
-    async def set_json(self, key: str, value: dict, ttl_seconds: int | None = None) -> None:
+    async def set_json(self, key: str, value: dict[str, Any], ttl_seconds: int | None = None) -> None:
         """Store a dict value, optionally with a TTL.
 
         Args:
@@ -234,19 +242,31 @@ class InMemoryStore:
     async def increment(self, key: str) -> int:
         """Atomically increment an integer counter and return the new value.
 
+        Atomic across concurrent awaiters: the read-modify-write-persist
+        sequence is serialised by an :class:`asyncio.Lock`. Without the
+        lock a future refactor that introduced an ``await`` between the
+        read and the write (e.g. an async persist backend) would expose a
+        lost-update race where two awaiters both read ``n`` and both write
+        ``n+1``. The lock makes the docstring's "atomically" claim hold
+        unconditionally rather than incidentally.
+
         Args:
             key: Logical key name.
 
         Returns:
             The value after incrementing.
         """
-        ik = self._key(key)
-        self._is_expired(ik)
-        current = self._data.get(ik, 0)
-        new_val = int(current) + 1
-        self._data[ik] = new_val
-        self._maybe_persist()
-        return new_val
+        if self._increment_lock is None:
+            # First-use lazy init binds the lock to the running loop.
+            self._increment_lock = asyncio.Lock()
+        async with self._increment_lock:
+            ik = self._key(key)
+            self._is_expired(ik)
+            current = self._data.get(ik, 0)
+            new_val = int(current) + 1
+            self._data[ik] = new_val
+            self._maybe_persist()
+            return new_val
 
     async def get_float(self, key: str) -> float | None:
         """Retrieve a stored float, or ``None`` if missing/expired.

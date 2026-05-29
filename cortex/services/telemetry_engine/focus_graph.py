@@ -20,6 +20,7 @@ import hashlib
 import logging
 import time
 from dataclasses import dataclass
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -273,7 +274,7 @@ class FocusGraphBuilder:
         n: int = 5,
         window_seconds: float | None = None,
         current_time: float | None = None,
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """
         Get the most-visited nodes in the analysis window.
 
@@ -289,7 +290,7 @@ class FocusGraphBuilder:
             return []
 
         # Aggregate by node
-        node_info: dict[str, dict] = {}
+        node_info: dict[str, dict[str, Any]] = {}
         for i, event in enumerate(recent):
             if event.node_id not in node_info:
                 node_info[event.node_id] = {
@@ -317,7 +318,7 @@ class FocusGraphBuilder:
         n: int = 10,
         window_seconds: float | None = None,
         current_time: float | None = None,
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """Get recent transitions for LLM context."""
         if current_time is None:
             current_time = time.monotonic()

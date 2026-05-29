@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.signal import butter, sosfilt, sosfiltfilt
+from scipy.signal import butter, sosfilt, sosfilt_zi, sosfiltfilt
 
 
 def design_bandpass(
@@ -51,7 +51,7 @@ def design_bandpass(
         )
 
     sos = butter(order, [low_hz / nyquist, high_hz / nyquist], btype="band", output="sos")
-    return sos
+    return np.asarray(sos, dtype=np.float64)
 
 
 def bandpass_filter(
@@ -91,7 +91,7 @@ def bandpass_filter(
             f"Need at least {min_samples} samples."
         )
 
-    return sosfiltfilt(sos, signal)
+    return np.asarray(sosfiltfilt(sos, signal), dtype=np.float64)
 
 
 def bandpass_filter_realtime(
@@ -109,15 +109,38 @@ def bandpass_filter_realtime(
     Args:
         signal: 1D input signal chunk.
         sos: Second-order sections from design_bandpass().
-        zi: Filter state from previous call. None initializes to zeros.
+        zi: Filter state from previous call. None initializes the state to
+            the filter's steady-state response scaled by the first sample
+            (see below).
 
     Returns:
         Tuple of (filtered_signal, new_filter_state).
     """
     if zi is None:
-        # Initialize filter state to zeros — shape is (n_sections, 2)
-        n_sections = sos.shape[0]
-        zi = np.zeros((n_sections, 2))
+        # P2-8: seed the state with the filter's steady-state response
+        # (sosfilt_zi) scaled by the first input sample, rather than zeros.
+        # A zero initial state forces the filter to ramp up from 0 to the
+        # signal's operating point over the first ~order samples, injecting
+        # a large transient at the start of every stream. Scaling the
+        # steady-state ``zi`` by the first sample starts the filter already
+        # settled at the incoming DC level, so the transient disappears.
+        # An empty chunk has no first sample, so fall back to zeros.
+        steady = sosfilt_zi(sos)
+        if signal.size > 0:
+            zi = steady * float(signal[0])
+        else:
+            zi = np.zeros_like(steady)
+
+    # ``sosfilt`` cannot reshape a zero-length input, so short-circuit an
+    # empty chunk: there is nothing to filter and the state is unchanged.
+    if signal.size == 0:
+        return (
+            np.asarray(signal, dtype=np.float64),
+            np.asarray(zi, dtype=np.float64),
+        )
 
     filtered, zi_out = sosfilt(sos, signal, zi=zi)
-    return filtered, zi_out
+    return (
+        np.asarray(filtered, dtype=np.float64),
+        np.asarray(zi_out, dtype=np.float64),
+    )

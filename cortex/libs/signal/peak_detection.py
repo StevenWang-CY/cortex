@@ -129,7 +129,7 @@ def detect_bvp_peaks(
         prominence=min_prominence,
     )
 
-    return peaks
+    return np.asarray(peaks, dtype=np.intp)
 
 
 def compute_ibi_series(

@@ -795,71 +795,121 @@ async def build_context(
 # =============================================================================
 
 
+def _plan_served_fallback(plan: Any) -> bool:
+    """P1 fix: derive whether a returned plan is a rule-based fallback.
+
+    The route previously hard-coded ``fallback_used=False`` on every
+    production branch, so a plan the planner served from its
+    deterministic fallback (budget-killed, circuit-open, parse-error,
+    retries-exhausted) reported ``fallback_used=False`` over HTTP — the
+    exact opposite of the truth, and inconsistent with the WS surface
+    which carries ``metadata.source``.
+
+    We reuse :func:`classify_plan_failure_mode` (the single source of
+    truth that already folds in ``metadata.source == 'fallback'`` and
+    every ``metadata.fallback_reason`` value): any classification other
+    than ``"ok"`` means the planner did not return a live LLM plan.
+    """
+    try:
+        from cortex.services.llm_engine.anthropic_planner import (
+            classify_plan_failure_mode,
+        )
+        return classify_plan_failure_mode(plan) != "ok"
+    except Exception:
+        # Classifier import / inspection failed — fall back to the raw
+        # metadata flag so a missing planner module doesn't mislabel a
+        # genuine fallback as a live plan.
+        meta = getattr(plan, "metadata", None) or {}
+        try:
+            return str(meta.get("source") or "") == "fallback"
+        except Exception:
+            return False
+
+
 @router.post("/llm/plan", response_model=LLMPlanResponse)
 async def request_llm_plan(
     body: LLMPlanRequest, request: Request,
 ) -> LLMPlanResponse:
-    """Request intervention plan from LLM engine."""
+    """Request intervention plan from LLM engine.
+
+    P1 fix (finding #6): the planner call is wrapped in defensive
+    error handling. A raising client now returns a 503-style fallback
+    envelope (``plan=None``, ``fallback_used=True``) instead of bubbling
+    an unhandled exception into an opaque 500. P1 fix (finding #2):
+    ``fallback_used`` is derived from the returned plan's classification
+    rather than hard-coded False.
+    """
     reg = _get_registry(request)
 
     llm_engine = reg.get("llm_engine")
-    if llm_engine is not None:
-        if hasattr(llm_engine, "generate_intervention_plan"):
-            # B8 (Phase 4.1): tag the chosen planner branch so operators
-            # can diff log distributions across deploys when one branch
-            # silently degrades to the wrong fallback.
+    try:
+        if llm_engine is not None:
+            if hasattr(llm_engine, "generate_intervention_plan"):
+                # B8 (Phase 4.1): tag the chosen planner branch so
+                # operators can diff log distributions across deploys
+                # when one branch silently degrades to the wrong fallback.
+                logger.info(
+                    "LLM planner branch selected",
+                    extra={"planner_method": "llm_engine.generate_intervention_plan"},
+                )
+                plan = await llm_engine.generate_intervention_plan(
+                    body.task_context,
+                    body.state_estimate,
+                )
+                # B11 (Phase 4.1): inspect the discriminated failure_mode
+                # and log a structured entry tagged with the result. The
+                # same classification drives ``fallback_used`` so the
+                # wire field matches the operator log.
+                fallback_used = _plan_served_fallback(plan)
+                logger.info(
+                    "LLM planner result classified",
+                    extra={
+                        "planner_method": "llm_engine.generate_intervention_plan",
+                        "fallback_used": fallback_used,
+                    },
+                )
+                return LLMPlanResponse(plan=plan, fallback_used=fallback_used)
+            if hasattr(llm_engine, "generate_plan"):
+                logger.info(
+                    "LLM planner branch selected",
+                    extra={"planner_method": "llm_engine.generate_plan"},
+                )
+                plan = await llm_engine.generate_plan(
+                    body.state_estimate, body.task_context,
+                )
+                return LLMPlanResponse(
+                    plan=plan, fallback_used=_plan_served_fallback(plan),
+                )
+
+        # v0.2.1: only "llm_client" is registered — the legacy remote_qwen /
+        # local_ollama service keys were removed as part of the Anthropic SDK
+        # migration. Keep the call as a single-key lookup for symmetry with
+        # the helper signature.
+        llm_client = _get_first_service(reg, "llm_client")
+        if llm_client is not None and hasattr(llm_client, "generate_intervention_plan"):
             logger.info(
                 "LLM planner branch selected",
-                extra={"planner_method": "llm_engine.generate_intervention_plan"},
+                extra={"planner_method": "llm_client.generate_intervention_plan"},
             )
-            plan = await llm_engine.generate_intervention_plan(
+            plan = await llm_client.generate_intervention_plan(
                 body.task_context,
                 body.state_estimate,
             )
-            # B11 (Phase 4.1): inspect the discriminated failure_mode
-            # and log a structured entry tagged with the result. Hands
-            # downstream callers a stable signal to branch on (e.g.,
-            # 'parse_error' triggers a retry hint to the operator).
-            try:
-                from cortex.services.llm_engine.anthropic_planner import (
-                    classify_plan_failure_mode,
-                )
-                failure_mode = classify_plan_failure_mode(plan)
-            except Exception:
-                failure_mode = "ok"
-            logger.info(
-                "LLM planner result classified",
-                extra={
-                    "planner_method": "llm_engine.generate_intervention_plan",
-                    "failure_mode": failure_mode,
-                },
+            return LLMPlanResponse(
+                plan=plan, fallback_used=_plan_served_fallback(plan),
             )
-            return LLMPlanResponse(plan=plan)
-        if hasattr(llm_engine, "generate_plan"):
-            logger.info(
-                "LLM planner branch selected",
-                extra={"planner_method": "llm_engine.generate_plan"},
-            )
-            plan = await llm_engine.generate_plan(
-                body.state_estimate, body.task_context,
-            )
-            return LLMPlanResponse(plan=plan)
-
-    # v0.2.1: only "llm_client" is registered — the legacy remote_qwen /
-    # local_ollama service keys were removed as part of the Anthropic SDK
-    # migration. Keep the call as a single-key lookup for symmetry with
-    # the helper signature.
-    llm_client = _get_first_service(reg, "llm_client")
-    if llm_client is not None and hasattr(llm_client, "generate_intervention_plan"):
-        logger.info(
-            "LLM planner branch selected",
-            extra={"planner_method": "llm_client.generate_intervention_plan"},
+    except Exception:
+        # Finding #6: a raising planner client must not surface an
+        # unhandled 500. Map it to the deterministic-fallback envelope so
+        # the caller sees ``fallback_used=True`` with no plan — the same
+        # shape the no-engine path returns — and the cause is captured in
+        # the WARN log with the bound correlation id for triage.
+        logger.warning(
+            "LLM planner raised; serving fallback envelope",
+            extra={"cid": get_correlation_id() or "-"},
+            exc_info=True,
         )
-        plan = await llm_client.generate_intervention_plan(
-            body.task_context,
-            body.state_estimate,
-        )
-        return LLMPlanResponse(plan=plan)
+        return LLMPlanResponse(plan=None, fallback_used=True)
 
     logger.info(
         "LLM planner branch selected",
@@ -990,11 +1040,14 @@ async def _maybe_await_confirmation(
     if daemon is None or not hasattr(daemon, "await_apply_confirmation"):
         return None
     try:
-        return await daemon.await_apply_confirmation(
-            intervention_id,
-            timeout_seconds=timeout_seconds,
-            correlation_id=correlation_id,
+        confirmation: InterventionApplyResult | None = (
+            await daemon.await_apply_confirmation(
+                intervention_id,
+                timeout_seconds=timeout_seconds,
+                correlation_id=correlation_id,
+            )
         )
+        return confirmation
     except Exception:
         # B9 (Phase 4.1): elevate to WARNING with structured fields so
         # operators see when the apply-confirmation future was
@@ -1084,10 +1137,24 @@ async def get_stress_integral(request: Request) -> StressIntegralResponse:
 
 
 class HelpfulnessSummaryResponse(BaseModel):
-    """Summary of helpfulness metrics."""
+    """Summary of helpfulness metrics.
+
+    P2 fix (finding #5): the response model now declares EVERY key the
+    source :class:`~cortex.services.eval.helpfulness.HelpfulnessSummary`
+    TypedDict produces, so ``HelpfulnessSummaryResponse(**summary)`` no
+    longer silently drops ``total_tracked`` / ``positive_rate``. These
+    two are backward-compat aliases the WS dashboard and unit tests
+    already consume; surfacing them on the HTTP envelope keeps the two
+    transports in sync instead of letting the HTTP shape drift to a
+    silent subset of the canonical contract.
+    """
     total_interventions: int = 0
+    # Backward-compat alias for ``total_interventions`` (WS dashboard).
+    total_tracked: int = 0
     mean_reward: float = 0.0
     engagement_rate: float = 0.0
+    # Fraction of recent rewards that were strictly positive.
+    positive_rate: float = 0.0
     recent_rewards: list[float] = Field(default_factory=list)
     timestamp: float = Field(
         default_factory=time.time,
@@ -1113,7 +1180,7 @@ async def get_helpfulness_summary(request: Request) -> HelpfulnessSummaryRespons
 
 class ConsentLevelResponse(BaseModel):
     """Current consent state."""
-    levels: dict[str, dict] = Field(default_factory=dict)
+    levels: dict[str, dict[str, Any]] = Field(default_factory=dict)
     timestamp: float = Field(
         default_factory=time.time,
         description="Wall-clock seconds since epoch (UTC).",
@@ -1134,7 +1201,7 @@ class ConsentResetRequest(BaseModel):
 class ConsentResetResponse(BaseModel):
     """Result of consent reset."""
     reset: bool = False
-    levels: dict[str, dict] = Field(default_factory=dict)
+    levels: dict[str, dict[str, Any]] = Field(default_factory=dict)
     timestamp: float = Field(
         default_factory=time.time,
         description="Wall-clock seconds since epoch (UTC).",
@@ -1247,6 +1314,32 @@ def _resolve_active_provider(registry: Any) -> str | None:
     return str(provider) if provider else None
 
 
+def _resolve_daily_cost_budget(registry: Any) -> float:
+    """Resolve today's USD budget cap from ``config.llm.daily_cost_budget_usd``.
+
+    P1 fix: the HTTP ``/api/cost`` route previously probed non-existent
+    public attributes on :class:`CostTracker`
+    (``daily_budget_usd`` / ``kill_usd`` / ``budget_usd``) which always
+    resolved to ``None`` → ``budget_today`` was permanently 0.0, breaking
+    the "same numbers as WS" contract. The WS path
+    (:meth:`CortexDaemon.get_cost_response`) reads the budget from
+    ``config.llm.daily_cost_budget_usd``; this helper mirrors that exact
+    resolution so the two surfaces agree. Returns 0.0 (unlimited) when no
+    daemon / config is wired or the value is non-numeric.
+    """
+    daemon = registry.get("daemon") if hasattr(registry, "get") else None
+    if daemon is None:
+        return 0.0
+    cfg = getattr(daemon, "config", None)
+    llm_cfg = getattr(cfg, "llm", None) if cfg is not None else None
+    if llm_cfg is None:
+        return 0.0
+    try:
+        return float(getattr(llm_cfg, "daily_cost_budget_usd", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 @router.get("/api/cost", response_model=CostResponse)
 async def get_cost(request: Request) -> CostResponse:
     """Phase 4.4 T2: snapshot today's BYOK LLM spend.
@@ -1257,10 +1350,13 @@ async def get_cost(request: Request) -> CostResponse:
     unconditionally without branching on HTTP status.
 
     Uses the canonical ``CostResponse`` from ``cortex.libs.schemas.realtime``
-    (same envelope as the WS COST_RESPONSE). Field mapping from tracker:
-    - ``today_total_usd()`` → ``cost_today``
-    - ``budget_today`` is always 0.0 (the HTTP snapshot has no per-day
-      budget visible from the tracker alone; the WS path may carry more).
+    (same envelope as the WS COST_RESPONSE). Field mapping:
+    - ``tracker.today_total_usd()`` → ``cost_today``
+    - ``config.llm.daily_cost_budget_usd`` → ``budget_today`` (0.0 means
+      unlimited) — identical to the WS path's
+      :meth:`CortexDaemon.get_cost_response`.
+    - ``tracker.check_budget() == "KILL"`` → ``budget_exhausted``, again
+      matching the WS path so the two surfaces never disagree.
     """
     reg = _get_registry(request)
     tracker = _resolve_cost_tracker(reg)
@@ -1281,19 +1377,29 @@ async def get_cost(request: Request) -> CostResponse:
     except Exception:
         logger.debug("/api/cost: today_total_usd failed", exc_info=True)
 
-    # budget_today: read from tracker if exposed, else 0.0 (unlimited).
-    budget_today = 0.0
-    for attr in ("daily_budget_usd", "kill_usd", "budget_usd"):
-        val = getattr(tracker, attr, None)
-        if isinstance(val, (int, float)):
-            budget_today = float(val)
-            break
+    # budget_today: resolve from config (same source the WS path uses in
+    # ``CortexDaemon.get_cost_response``). The CostTracker has NO public
+    # ``daily_budget_usd`` / ``kill_usd`` / ``budget_usd`` attribute — the
+    # cap lives in ``config.llm.daily_cost_budget_usd``. Probing the
+    # tracker for those names always failed, so this surface reported a
+    # permanent 0.0 budget that contradicted the WS COST_RESPONSE. 0.0
+    # means unlimited.
+    budget_today = _resolve_daily_cost_budget(reg)
 
-    # budget_exhausted: check tracker flag or derive from budget.
+    # budget_exhausted: derive from the tracker's authoritative budget
+    # state machine — the WS path uses ``check_budget() == "KILL"``. We
+    # mirror it exactly so HTTP and WS agree on the kill flag, falling
+    # back to the spend-vs-cap comparison only when the tracker does not
+    # expose ``check_budget`` (alt providers / test doubles).
     budget_exhausted = False
-    flag = getattr(tracker, "budget_exhausted", None)
-    if isinstance(flag, bool):
-        budget_exhausted = flag
+    check_budget = getattr(tracker, "check_budget", None)
+    if callable(check_budget):
+        try:
+            budget_exhausted = bool(check_budget() == "KILL")
+        except Exception:
+            logger.debug("/api/cost: check_budget failed", exc_info=True)
+            if budget_today > 0.0:
+                budget_exhausted = cost_today >= budget_today
     elif budget_today > 0.0:
         budget_exhausted = cost_today >= budget_today
 
@@ -1347,7 +1453,7 @@ async def get_cost(request: Request) -> CostResponse:
 
 class ProjectListResponse(BaseModel):
     """List of configured projects."""
-    projects: list[dict] = Field(default_factory=list)
+    projects: list[dict[str, Any]] = Field(default_factory=list)
 
 
 @router.get("/api/projects", response_model=ProjectListResponse)
@@ -1466,7 +1572,8 @@ async def get_sessions(
     if daemon is None or not hasattr(daemon, "list_sessions"):
         return SessionListResponse()
     try:
-        return await daemon.list_sessions(since, limit)
+        sessions: SessionListResponse = await daemon.list_sessions(since, limit)
+        return sessions
     except Exception:
         logger.exception("GET /api/sessions failed")
         return SessionListResponse()
@@ -1542,7 +1649,8 @@ async def get_trends_route(
         # state without crashing.
         return TrendsResponse(window=window)
     try:
-        return await daemon.get_trends(window, refresh=refresh)
+        trends: TrendsResponse = await daemon.get_trends(window, refresh=refresh)
+        return trends
     except Exception:
         logger.exception("GET /api/trends failed (window=%s)", window)
         return TrendsResponse(window=window)
@@ -1563,6 +1671,13 @@ class FeedbackRequest(BaseModel):
     description: str = Field(..., min_length=10, max_length=500)
     include_logs: bool = Field(default=False)
     app_version: str = Field(default="", max_length=64)
+    # C2: the extension popup sends BOTH ``user_agent`` (navigator.userAgent)
+    # and ``app_version`` (manifest version). The daemon persists
+    # ``user_agent`` in the stored feedback record so support can tell
+    # which browser / OS a report came from without round-tripping the
+    # user. Bounded so a hostile / oversized UA string can't bloat the
+    # on-disk record.
+    user_agent: str = Field(default="", max_length=512)
 
 
 class FeedbackResponse(BaseModel):
@@ -1629,6 +1744,9 @@ async def submit_feedback(
         "description": body.description,
         "include_logs": bool(body.include_logs),
         "app_version": body.app_version or "",
+        # C2: persist the originating browser/OS user-agent so support can
+        # triage a report without round-tripping the user.
+        "user_agent": body.user_agent or "",
     }
 
     if body.include_logs:

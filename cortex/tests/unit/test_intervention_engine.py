@@ -516,6 +516,65 @@ async def test_executor_reverse():
 
 
 @pytest.mark.asyncio
+async def test_executor_reverse_reports_failure_when_adapter_missing():
+    """P2: a reversible mutation whose adapter vanished must surface a
+    FAILED reversal, not be silently skipped.
+
+    The bug: when the adapter for a reversible mutation was no longer
+    registered, ``reverse()`` did ``continue`` silently, leaving an empty
+    reversals list, which made the RestoreManager report
+    ``workspace_restored=True`` even though nothing was reverted.
+    """
+    executor = InterventionExecutor()
+    executor._allow_unwired_consent = True
+    executor.register_adapter("editor", MockAdapter())
+
+    plan = _make_plan()
+    # fold_except_current is in _REVERSE_ACTIONS → reversible.
+    commands = [AdapterCommand(adapter="editor", action="fold_except_current")]
+    mutations = await executor.apply(plan, commands)
+    assert mutations[0].success is True
+    assert mutations[0].is_reversible is True
+
+    # The editor adapter disconnects before the user hits Undo.
+    executor._adapters.pop("editor", None)  # noqa: SLF001
+
+    reversals = await executor.reverse(plan.intervention_id)
+    # The reversal is now an EXPLICIT failure (not a silent skip).
+    assert len(reversals) == 1
+    assert reversals[0].success is False
+    assert reversals[0].reason == "reverse_adapter_missing"
+
+
+@pytest.mark.asyncio
+async def test_restore_reports_not_restored_when_reverse_failed():
+    """P2: RestoreManager must propagate the reverse failure.
+
+    With the adapter gone, the reversal fails, so the outcome must report
+    ``workspace_restored=False`` and carry the failure in restore_errors.
+    """
+    executor = InterventionExecutor()
+    executor._allow_unwired_consent = True
+    executor.register_adapter("editor", MockAdapter())
+
+    plan = _make_plan()
+    commands = [AdapterCommand(adapter="editor", action="fold_except_current")]
+    await executor.apply(plan, commands)
+
+    manager = RestoreManager(executor, timeout_seconds=300.0)
+    snap = WorkspaceSnapshot(intervention_id=plan.intervention_id, timestamp=100.0)
+    manager.start_intervention(plan.intervention_id, snap, started_at=100.0)
+
+    # Adapter disconnects before the dismissal-driven restore runs.
+    executor._adapters.pop("editor", None)  # noqa: SLF001
+
+    outcome = await manager.dismiss(plan.intervention_id, current_time=160.0)
+    assert outcome is not None
+    assert outcome.workspace_restored is False
+    assert any("reverse_adapter_missing" in e for e in outcome.restore_errors)
+
+
+@pytest.mark.asyncio
 async def test_executor_active_interventions():
     executor = InterventionExecutor()
     executor._allow_unwired_consent = True  # P1-7 test escape hatch

@@ -13,9 +13,33 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
-from typing import Any
+from typing import Any, TypedDict
 
 logger = logging.getLogger(__name__)
+
+
+class HelpfulnessSummary(TypedDict):
+    """Explicit wire contract for :meth:`HelpfulnessTracker.get_summary`.
+
+    The HTTP surface (``GET /api/helpfulness/summary`` in
+    ``api_gateway/routes.py``) maps this dict onto its
+    ``HelpfulnessSummaryResponse`` model. That model declares
+    ``total_interventions`` / ``mean_reward`` / ``engagement_rate`` /
+    ``recent_rewards`` and silently drops anything extra. The two
+    ``*_tracked`` / ``positive_rate`` keys below are deliberate
+    backward-compat aliases consumed by the WS dashboard and the unit
+    tests (``test_helpfulness.py::TestGetSummary``); they are NOT part
+    of the HTTP response model. Keeping the contract as a ``TypedDict``
+    makes every key — and the intentional superset over the HTTP model
+    — explicit and type-checked at the call site.
+    """
+
+    total_interventions: int
+    total_tracked: int
+    mean_reward: float
+    engagement_rate: float
+    positive_rate: float
+    recent_rewards: list[float]
 
 # P0 §3.8: 200-character cap on the optional 👎 free-text feedback so
 # the helpfulness store never balloons even under adversarial input.
@@ -233,7 +257,7 @@ class HelpfulnessTracker:
         complexity: float = 0.0,
         tab_count: int = 0,
         error_count: int = 0,
-    ) -> dict | None:
+    ) -> dict[str, Any] | None:
         """
         End tracking and compute the helpfulness reward.
 
@@ -365,8 +389,14 @@ class HelpfulnessTracker:
             return 0.0
         return sum(self._recent_rewards) / len(self._recent_rewards)
 
-    async def get_summary(self) -> dict:
-        """Get helpfulness summary statistics."""
+    async def get_summary(self) -> HelpfulnessSummary:
+        """Get helpfulness summary statistics.
+
+        Returns the explicit :class:`HelpfulnessSummary` contract. The
+        HTTP route (``GET /api/helpfulness/summary``) consumes a subset
+        of these keys; ``total_tracked`` / ``positive_rate`` are
+        backward-compat aliases for the WS dashboard and unit tests.
+        """
         total = len(self._recent_rewards)
         engagement_rate = (
             sum(1 for engaged in self._recent_engaged if engaged) / total
@@ -376,11 +406,11 @@ class HelpfulnessTracker:
             sum(1 for r in self._recent_rewards if r > 0) / total
             if total > 0 else 0.0
         )
-        return {
-            "total_interventions": total,
-            "total_tracked": total,  # backward compatibility
-            "mean_reward": self.mean_reward,
-            "engagement_rate": engagement_rate,
-            "positive_rate": positive_rate,  # backward compatibility
-            "recent_rewards": list(self._recent_rewards[-20:]),
-        }
+        return HelpfulnessSummary(
+            total_interventions=total,
+            total_tracked=total,  # backward compatibility
+            mean_reward=self.mean_reward,
+            engagement_rate=engagement_rate,
+            positive_rate=positive_rate,  # backward compatibility
+            recent_rewards=list(self._recent_rewards[-20:]),
+        )

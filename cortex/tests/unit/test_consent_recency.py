@@ -7,9 +7,15 @@ import asyncio
 from cortex.services.consent.ladder import PREVIEW, ConsentLadder
 from cortex.services.consent.policy import ConsentPolicy
 
+_LOOP = asyncio.new_event_loop()
+
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # Dedicated module loop, NOT asyncio.get_event_loop() (deprecated; it
+    # returns a closed/foreign loop once pytest-asyncio tears down the
+    # default loop earlier in the same process, which made these tests fail
+    # only when run alongside async tests — CLAUDE.md rule #16).
+    return _LOOP.run_until_complete(coro)
 
 
 def test_old_approvals_outside_30_day_window_do_not_escalate(monkeypatch):

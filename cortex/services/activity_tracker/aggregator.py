@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from collections import Counter
 from datetime import UTC, datetime, timedelta
+from typing import Any, Protocol
 
 from cortex.libs.schemas.activity import ActivitySummary, ActivityTimeline
 
@@ -19,10 +20,25 @@ logger = logging.getLogger(__name__)
 _TIMELINE_TTL = 90 * 86400
 
 
+class _JsonStore(Protocol):
+    """Structural interface for the JSON-blob store the aggregator needs.
+
+    Both ``InMemoryStore`` and ``RedisStore`` satisfy this; typing the
+    dependency as a Protocol (rather than bare ``object``) lets mypy see
+    the ``get_json`` / ``set_json`` methods the aggregator calls.
+    """
+
+    async def get_json(self, key: str) -> dict[str, Any] | None: ...
+
+    async def set_json(
+        self, key: str, value: dict[str, Any], ttl_seconds: int | None = ...,
+    ) -> None: ...
+
+
 class ActivityAggregator:
     """Aggregates browser activity syncs into daily timelines."""
 
-    def __init__(self, store: object) -> None:
+    def __init__(self, store: _JsonStore) -> None:
         """
         Args:
             store: A store instance with get_json/set_json methods
@@ -44,7 +60,7 @@ class ActivityAggregator:
         """B15 (Phase 4.1): operator-facing diagnostics snapshot."""
         return {"malformed_records": self._malformed_records}
 
-    async def ingest(self, activities: list[dict]) -> None:
+    async def ingest(self, activities: list[dict[str, Any]]) -> None:
         """Ingest a batch of activity summaries from the browser extension.
 
         Each activity is upserted into today's timeline. Duplicate content_ids

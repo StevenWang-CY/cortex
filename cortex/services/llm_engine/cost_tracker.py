@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -48,8 +48,30 @@ _RETENTION_DAYS: int = 90
 
 
 def _today_iso(now: datetime | None = None) -> str:
-    """Return the local-midnight calendar date as ``YYYY-MM-DD``."""
-    return (now or datetime.now(UTC)).date().isoformat()
+    """Return the local-midnight calendar date as ``YYYY-MM-DD``.
+
+    F20 fix: the ledger rolls over at *local* midnight (matching this
+    function's docstring, the module docstring, and the COST_RESPONSE
+    schema's "resets at local midnight" contract). A tz-aware ``now`` is
+    first converted to the local zone via ``astimezone()`` so a caller
+    that passes ``datetime.now(UTC)`` still buckets into the local day;
+    a naive ``now`` is assumed to already be local wall-clock.
+    """
+    return _local_date(now).isoformat()
+
+
+def _local_date(now: datetime | None = None) -> date:
+    """Return the *local* calendar date for ``now`` (or local now).
+
+    Centralises the tz-normalisation so the daily-bucket key
+    (:func:`_today_iso`) and the retention prune both pivot on the same
+    local-midnight boundary. A tz-aware instant is converted to local
+    wall-clock; a naive instant is assumed local already.
+    """
+    moment = now if now is not None else datetime.now()
+    if moment.tzinfo is not None:
+        moment = moment.astimezone()
+    return moment.date()
 
 
 def _prune_old(
@@ -261,7 +283,7 @@ class CostTracker:
         if usd < 0:
             raise ValueError(f"usd must be non-negative; got {usd!r}")
         cid_key = cid or "-"
-        moment = now or datetime.now(UTC)
+        moment = now or datetime.now()
         today = _today_iso(moment)
         with self._lock:
             day = self._day(today)
@@ -277,8 +299,9 @@ class CostTracker:
                 int(by_cid[cid_key].get("calls", 0)) + 1
             )
             # Prune in-memory at every write so a long-running daemon
-            # never accumulates beyond the retention window.
-            self._days = _prune_old(self._days, today=moment.date())
+            # never accumulates beyond the retention window. Pivot on the
+            # *local* date so it matches the bucket key (_today_iso).
+            self._days = _prune_old(self._days, today=_local_date(moment))
             self._flush()
         logger.info(
             "%s cid=%s model=%s usd=%.6f cancelled=%s day_total=%.6f",
@@ -289,6 +312,33 @@ class CostTracker:
             cancelled,
             self.today_total_usd(now=moment),
         )
+
+    @property
+    def kill_usd(self) -> float:
+        """The hard per-day USD budget cap (the ``KILL`` threshold).
+
+        Public accessor the api_gateway ``GET /api/cost`` route reads to
+        populate :attr:`CostResponse.budget_today` without reaching into
+        a private attribute. ``0`` is never returned here — the
+        constructor rejects a non-positive cap — but the COST_RESPONSE
+        contract documents ``0`` as "unlimited" for the no-tracker path.
+        """
+        return self._kill_usd
+
+    @property
+    def warn_usd(self) -> float:
+        """The soft per-day USD budget cap (the ``WARN`` threshold)."""
+        return self._warn_usd
+
+    def budget_exhausted(self, *, now: datetime | None = None) -> bool:
+        """True when today's spend has reached the hard ``kill_usd`` cap.
+
+        Mirrors the ``KILL`` arm of :meth:`check_budget` but is
+        side-effect-free (no one-shot log emission), so the api_gateway
+        cost route and the dashboard meter can poll it freely to set
+        :attr:`CostResponse.budget_exhausted`.
+        """
+        return self.today_total_usd(now=now) >= self._kill_usd
 
     def today_total_usd(self, *, now: datetime | None = None) -> float:
         """Return the running spend for the current local day."""
@@ -328,7 +378,7 @@ class CostTracker:
         ``WARN`` and ``KILL`` events are emitted at most once per day so
         a high-frequency caller does not spam the log aggregator.
         """
-        moment = now or datetime.now(UTC)
+        moment = now or datetime.now()
         today = _today_iso(moment)
         total = self.today_total_usd(now=moment)
         if total >= self._kill_usd:

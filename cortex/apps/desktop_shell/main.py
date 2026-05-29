@@ -19,6 +19,7 @@ import logging
 import signal
 import sys
 import threading
+from collections.abc import Callable
 from typing import Any
 
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
@@ -32,6 +33,7 @@ from cortex.apps.desktop_shell.settings import SettingsDialog
 from cortex.apps.desktop_shell.tray import CortexTrayIcon
 from cortex.libs.auth import load_or_create_token
 from cortex.libs.config.settings import APIConfig, get_config
+from cortex.libs.logging import configure_logging
 
 logger = logging.getLogger(__name__)
 
@@ -276,6 +278,27 @@ class WebSocketBridge(QObject):
         })
         asyncio.run_coroutine_threadsafe(self._send(msg), self._loop)
 
+    def send_quiet_mode_toggle(
+        self, kind: str, *, source: str = "settings_sync",
+    ) -> None:
+        """P0 §3.4: ask the daemon to enter/leave a quiet/pause mode.
+
+        ``kind="pause"`` makes the daemon release the camera so the
+        in-process ``CalibrationRunner`` can open a single live handle
+        without contention; ``kind="off"`` resumes capture. Used by the
+        WS-mode calibration flow to avoid the daemon and the calibration
+        runner fighting over one camera (which silently degraded the
+        runner to synthetic frames)."""
+        if self._loop is None or self._ws is None:
+            return
+        msg = json.dumps({
+            "type": "QUIET_MODE_TOGGLE",
+            "payload": {"kind": str(kind), "source": str(source)},
+            "timestamp": 0,
+            "sequence": 0,
+        })
+        asyncio.run_coroutine_threadsafe(self._send(msg), self._loop)
+
     async def _send(self, msg: str) -> None:
         """Send a message over the WebSocket."""
         if self._ws is not None:
@@ -486,10 +509,12 @@ class CortexApp:
         self._active_intervention_id: str | None = None
         # P0 §3.4: in-flight CalibrationRunner. None when idle.
         self._calibration_runner: Any = None
-        # P0 §3.4: in-flight CalibrationRunner. None when idle.
-        self._calibration_runner: Any = None
-        # P0 §3.4: in-flight CalibrationRunner. None when idle.
-        self._calibration_runner: Any = None
+        # E.4: Connect Extensions panel, lazily created (Any-typed to keep
+        # the heavy ConnectionsPanel import lazy in ``_show_connections``).
+        self._connections_panel: Any = None
+        # P2 (audit-prod): teardown handle for the light/dark appearance
+        # observer; kept alive for the app lifetime.
+        self._appearance_teardown: Callable[[], None] | None = None
 
     def run(self) -> int:
         """Run the application. Returns exit code."""
@@ -703,10 +728,45 @@ class CortexApp:
         except Exception:
             logger.debug("native chrome init failed", exc_info=True)
 
+        # P2 (audit-prod): wire the appearance observer so the native
+        # window background re-adapts when the user flips light/dark in
+        # System Settings without a restart. Previously exported +
+        # documented but never installed.
+        self._install_appearance_observer()
+
         if not onboarding_marker_path().exists():
             self._onboarding.show()
 
         return self._app.exec()
+
+    def _install_appearance_observer(self) -> None:
+        """Install the macOS light/dark appearance observer and keep the
+        teardown handle alive for the app lifetime. On a theme flip the
+        native NSWindow background (which follows the system colour) is
+        re-applied to every top-level window via ``QTimer.singleShot(0)``
+        so the Qt widgets are touched on the main thread."""
+        def _on_flip(_is_dark: bool) -> None:
+            def _retint() -> None:
+                for window in (self._dashboard, self._settings,
+                               self._overlay, self._onboarding):
+                    if window is None:
+                        continue
+                    try:
+                        mac_native.apply_vibrancy(window)
+                        mac_native.apply_unified_titlebar(window)
+                    except Exception:
+                        logger.debug("appearance retint failed", exc_info=True)
+            try:
+                QTimer.singleShot(0, _retint)
+            except Exception:
+                _retint()
+        try:
+            self._appearance_teardown = mac_native.install_appearance_observer(
+                _on_flip
+            )
+        except Exception:
+            logger.debug("install_appearance_observer failed", exc_info=True)
+            self._appearance_teardown = None
 
     @Slot(dict)
     def _on_state_update(self, payload: dict) -> None:
@@ -1119,13 +1179,52 @@ class CortexApp:
         self._calibration_runner = runner
 
         async def _drive() -> None:
+            # P0 §3.4: in WS mode the daemon is a separate process that
+            # holds the single camera handle. Opening a 2nd handle here
+            # for calibration causes AVFoundation contention and the
+            # runner silently falls back to synthetic frames. Ask the
+            # daemon to release the camera (quiet-mode ``pause``) before
+            # we open ours, and resume it in ``finally``.
+            paused_daemon = False
             try:
+                if self._bridge is not None:
+                    try:
+                        self._bridge.send_quiet_mode_toggle(
+                            "pause", source="settings_sync",
+                        )
+                        paused_daemon = True
+                        # Give the daemon a beat to actually release the
+                        # camera before the runner opens it.
+                        await asyncio.sleep(1.0)
+                    except Exception:
+                        logger.debug(
+                            "pausing daemon for calibration failed",
+                            exc_info=True,
+                        )
                 await runner.start(on_progress=_progress_cb)
+                # P1 (audit-prod): never silently accept synthetic frames.
+                # The runner was constructed for LIVE capture; if it fell
+                # back to simulation the baselines would be garbage, so
+                # surface a VISIBLE error and abort rather than writing
+                # them.
+                if bool(getattr(runner, "used_simulation", False)):
+                    self._on_calibration_simulation_fallback()
+                    return
                 await runner.finish()
             except Exception:
                 logger.exception("calibration run failed")
             finally:
                 self._calibration_runner = None
+                if paused_daemon and self._bridge is not None:
+                    try:
+                        self._bridge.send_quiet_mode_toggle(
+                            "off", source="settings_sync",
+                        )
+                    except Exception:
+                        logger.debug(
+                            "resuming daemon after calibration failed",
+                            exc_info=True,
+                        )
 
         def _worker() -> None:
             loop = asyncio.new_event_loop()
@@ -1166,13 +1265,62 @@ class CortexApp:
                     except Exception:
                         logger.debug("freshness refresh failed", exc_info=True)
 
+    def _on_calibration_simulation_fallback(self) -> None:
+        """P1 (audit-prod): the live calibration runner degraded to
+        synthetic frames (camera busy / unavailable). Surface a VISIBLE
+        error instead of writing baselines computed from fake data.
+
+        Called from the calibration worker thread; the
+        ``calibration_progress`` signal is queue-connected to the Qt
+        main thread so the onboarding card + dashboard updates marshal
+        safely. The ``status="failed"`` payload re-enables the Begin
+        button and prevents the card from flipping to 'calibrated'."""
+        payload = {
+            "elapsed_seconds": 0.0,
+            "total_seconds": 0.0,
+            "current_hr": None,
+            "current_hrv": None,
+            "current_sqi": None,
+            "lighting_ok": False,
+            "motion_ok": False,
+            "face_ok": False,
+            "pct_complete": 0.0,
+            "status": "failed",
+        }
+        if self._bridge is not None and hasattr(
+            self._bridge, "calibration_progress"
+        ):
+            try:
+                self._bridge.calibration_progress.emit(payload)
+            except Exception:
+                logger.debug(
+                    "simulation-fallback progress emit failed", exc_info=True
+                )
+        if self._dashboard is not None and hasattr(self._dashboard, "show_error"):
+            try:
+                self._dashboard.show_error(
+                    "Calibration could not use your camera",
+                    "Cortex fell back to simulated data, so the baselines "
+                    "were not saved. Close other apps using the camera "
+                    "(or unplug an iPhone Continuity Camera) and try again.",
+                )
+            except Exception:
+                logger.debug("simulation-fallback toast failed", exc_info=True)
+
     def _complete_onboarding(self) -> None:
-        """Mark onboarding complete for future launches."""
+        """Mark onboarding complete for future launches.
+
+        P2 (audit-prod): WS-mode previously left the user in a tray-only
+        state after onboarding — ``_complete_onboarding`` hid the wizard
+        but never opened the dashboard, so the first-run journey dead-
+        ended. Show the dashboard so the user lands on the live surface
+        (matching the in-process controller's behaviour)."""
         marker = onboarding_marker_path()
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text("completed\n")
         if self._onboarding is not None:
             self._onboarding.hide()
+        self._show_dashboard()
 
     def _toggle_pause(self) -> None:
         """Toggle pause/resume state."""
@@ -1228,7 +1376,13 @@ def main() -> None:
     :class:`CortexAppController`.  In dev mode, falls back to the
     WebSocket-based :class:`CortexApp` unless ``--in-process`` is passed.
     """
-    logging.basicConfig(level=logging.INFO)
+    # C6 (audit): install the structured-logging pipeline once, before any
+    # logger is used, replacing the bare ``logging.basicConfig`` so the
+    # desktop shell emits the same JSON event stream as the daemon and
+    # run_dev entrypoints. Console format (json_format=False) keeps dev
+    # terminals readable; the in-process controller invokes the same call
+    # on the daemon side.
+    configure_logging(level="INFO", json_format=False)
 
     use_in_process = getattr(sys, "frozen", False) or "--in-process" in sys.argv
 

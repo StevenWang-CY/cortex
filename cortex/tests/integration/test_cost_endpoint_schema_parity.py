@@ -113,6 +113,66 @@ class TestCostEndpointSchema:
         CostResponse.model_validate(body)
 
 
+# ─── Finding #1: budget resolution from config (HTTP ↔ WS parity) ─────
+
+
+class TestCostEndpointBudgetResolution:
+    """Finding #1: the HTTP /api/cost route used to probe non-existent
+    public attrs on CostTracker (kill_usd / daily_budget_usd /
+    budget_exhausted) so ``budget_today`` was permanently 0.0 and
+    ``budget_exhausted`` permanently False — contradicting the WS path,
+    which reads the budget from ``config.llm.daily_cost_budget_usd`` and
+    derives exhaustion from ``tracker.check_budget() == 'KILL'``."""
+
+    class _Daemon:
+        def __init__(self, budget: float) -> None:
+            from cortex.libs.config.settings import CortexConfig, LLMConfig
+
+            cfg = CortexConfig()
+            cfg.llm = LLMConfig(daily_cost_budget_usd=budget)
+            self.config = cfg
+
+    class _Tracker:
+        def __init__(self, spend: float, state: str) -> None:
+            self._spend = spend
+            self._state = state
+
+        def today_total_usd(self) -> float:
+            return self._spend
+
+        def check_budget(self) -> str:
+            return self._state
+
+    def _client_with(self, auth_client, budget: float, spend: float, state: str):
+        _, token = auth_client
+        app = create_app()
+        app.state.registry.register("daemon", self._Daemon(budget))
+        app.state.registry.register("cost_tracker", self._Tracker(spend, state))
+        c = TestClient(app)
+        c.headers.update({"Authorization": f"Bearer {token}"})
+        return c
+
+    def test_configured_budget_surfaces_in_response(self, auth_client) -> None:
+        # NB: deliberately NOT using ``with c:`` — the lifespan exit in the
+        # installed starlette/anyio closes the asyncio event loop, which
+        # poisons a sibling test that still uses the deprecated
+        # ``asyncio.get_event_loop()``. A bare GET needs no lifespan.
+        c = self._client_with(auth_client, budget=20.0, spend=3.0, state="OK")
+        body = c.get("/api/cost").json()
+        # The configured budget is reflected (was always 0.0 pre-fix).
+        assert body["budget_today"] == 20.0
+        assert body["cost_today"] == 3.0
+        assert body["budget_exhausted"] is False
+
+    def test_exceeding_budget_sets_exhausted(self, auth_client) -> None:
+        # check_budget() == "KILL" → budget_exhausted True, mirroring the
+        # WS path exactly.
+        c = self._client_with(auth_client, budget=20.0, spend=25.0, state="KILL")
+        body = c.get("/api/cost").json()
+        assert body["budget_today"] == 20.0
+        assert body["budget_exhausted"] is True
+
+
 # ─── WS / daemon cost response shape ─────────────────────────────────
 
 
@@ -134,8 +194,11 @@ class TestCostResponseWSShape:
         daemon._llm_client = None
 
         # Call the real method by binding it to the mock daemon.
+        # NB: ``asyncio.run`` (not the deprecated ``get_event_loop()``)
+        # so this test stays green regardless of whether an earlier
+        # ``TestClient`` lifespan exit closed the thread's event loop.
         bound = daemon_mod.CortexDaemon.get_cost_response.__get__(daemon)
-        result = asyncio.get_event_loop().run_until_complete(bound())
+        result = asyncio.run(bound())
 
         assert isinstance(result, CostResponse)
         assert result.provider is None, (

@@ -39,14 +39,43 @@ jobs:
       - name: Lint
         run: ruff check cortex/
 
-      - name: Typecheck
-        run: mypy cortex/ --strict
+      - name: Typecheck (mypy --strict — blocking, full project)
+        # Audit fix: previously the blocking scope was a curated subset
+        # (libs/design + libs/llm) and the full tree ran with
+        # ``|| true``. Tag release builds (release.yml) ran the full
+        # ``mypy cortex/ --strict`` gate, so a PR could land green and
+        # break the next release. Promote the strict full-project gate
+        # to block PR merges as well so the two CI surfaces stay
+        # aligned and tag-time surprises stop happening.
+        #
+        # ``--config-file cortex/pyproject.toml`` is REQUIRED: the job
+        # runs from the repo root where mypy would otherwise never
+        # discover ``[tool.mypy]`` (it lives under ``cortex/``). Without
+        # it the pydantic plugin + per-module overrides are silently
+        # dropped and the gate reports false errors. Kept byte-identical
+        # with release.yml's pre-release gate.
+        run: mypy --config-file cortex/pyproject.toml cortex/ --strict
 
       - name: Schema codegen drift
         run: python -m cortex.scripts.generate_ts_schemas --check
 
-      - name: Tests
-        run: pytest cortex/tests/
+      - name: Test (pytest)
+        # ci-pytest-split (audit): a single ``pytest cortex/tests/``
+        # SEGFAULTs during collection because PySide6/shiboken loads
+        # after scipy/pyobjc have already initialised their own copies of
+        # the same native libs. Split into TWO invocations: the whole suite
+        # EXCEPT the PySide6 desktop_shell test (covers unit, integration,
+        # services, state_engine, eval, physio, performance), then the
+        # desktop_shell test isolated in its own interpreter. The earlier
+        # three-way split silently dropped integration/state_engine/eval/
+        # physio/performance coverage. ``QT_QPA_PLATFORM`` stays offscreen
+        # for both. Kept byte-identical with the other workflow's gate
+        # (enforced by the ci-release-parity job).
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          pytest cortex/tests/ --ignore=cortex/tests/unit/test_desktop_shell.py
+          pytest cortex/tests/unit/test_desktop_shell.py
 
   build-dmg:
     name: Build macOS .dmg

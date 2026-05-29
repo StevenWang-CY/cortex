@@ -32,16 +32,16 @@ from pathlib import Path
 try:
     from PySide6.QtCore import QRectF  # noqa: F401 — re-exported for older Qt fallback
 except ImportError:  # pragma: no cover - older Qt fallback
-    pass  # type: ignore[assignment]
+    pass
 
 from PySide6.QtCore import Qt, QTimer, Signal
 
 try:
     from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 except ImportError:  # pragma: no cover - test stubs
-    from PySide6.QtGui import QColor, QPainter, QPen  # type: ignore[assignment]
+    from PySide6.QtGui import QColor, QPainter, QPen
 
-    QPainterPath = None  # type: ignore[assignment,misc]
+    QPainterPath = None
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -380,7 +380,7 @@ def request_camera_permission() -> None:
 
 def request_accessibility_permission() -> None:
     try:
-        import ApplicationServices  # type: ignore[import-not-found]
+        import ApplicationServices
         options = {ApplicationServices.kAXTrustedCheckOptionPrompt: True}
         ApplicationServices.AXIsProcessTrustedWithOptions(options)
     except Exception:
@@ -685,7 +685,7 @@ class OnboardingWindow(QWidget):
         try:
             from PySide6.QtWidgets import QScrollArea
         except ImportError:  # pragma: no cover
-            QScrollArea = None  # type: ignore[assignment]
+            QScrollArea = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -928,37 +928,97 @@ class OnboardingWindow(QWidget):
     # ------------------------------------------------------------------
 
     def _on_request_notifications(self) -> None:
-        """P0 §3.12: trigger the macOS notification permission prompt.
+        """P0 §3.12: trigger the macOS notification permission prompt and
+        reflect the REAL authorization result.
 
         Sends a single welcoming notification through
         ``send_intervention_notification``; the helper internally calls
-        ``requestAuthorization`` if the user hasn't granted yet, and
-        the welcome notification surfaces once permission is granted.
-        On non-mac / missing PyObjC the call is a no-op — we still
-        mark the step complete because the underlying capability isn't
-        available anyway.
+        ``requestAuthorization`` if the user hasn't granted yet. Its bool
+        return is True only when the notification was actually scheduled
+        (i.e. we believe permission is granted) and False on any failure
+        path — non-mac, missing PyObjC, or a fresh deny.
+
+        P2 (audit-prod): previously this marked the step complete
+        unconditionally, so a user who denied the prompt still saw
+        "Notifications enabled ✓". We now only mark complete + show the
+        success affordance when the helper reports success; otherwise we
+        reflect the denied/unavailable state honestly and leave the step
+        incomplete so the user can retry.
+
+        Because macOS resolves the authorization prompt asynchronously,
+        the FIRST request returns optimistically (the OS prompt is still
+        on screen); we schedule a short deferred re-check that reconciles
+        the UI once the user has responded.
         """
         try:
             from cortex.libs.utils.macos_notifications import (
                 send_intervention_notification,
             )
-            send_intervention_notification(
+            granted = bool(send_intervention_notification(
                 title="Cortex notifications enabled",
                 body="You'll see interventions here when the dashboard isn't active.",
                 intervention_id="cortex_welcome",
-            )
+            ))
         except Exception:
             logger.debug(
                 "send_intervention_notification welcome failed", exc_info=True,
             )
-        self.mark_step_complete("macos_notifications")
-        # Visually mark the section as complete.
-        if hasattr(self, "_notif_btn_ref"):
+            granted = False
+
+        self._apply_notification_auth_result(granted)
+        # macOS resolves the permission prompt asynchronously; on the
+        # first request the helper answers optimistically. Re-probe once
+        # the user has had a moment to respond so a denial is reflected.
+        if granted:
             try:
-                self._notif_btn_ref.setText("Notifications enabled ✓")
-                self._notif_btn_ref.setEnabled(False)
+                QTimer.singleShot(2500, self._recheck_notification_auth)
             except Exception:
-                pass
+                logger.debug(
+                    "notification auth re-check schedule failed", exc_info=True,
+                )
+
+    def _apply_notification_auth_result(self, granted: bool) -> None:
+        """Reflect the resolved notification-authorization state in the
+        wizard: mark the step complete + show the success affordance when
+        granted, or reflect denied/unavailable and leave it incomplete."""
+        if granted:
+            self.mark_step_complete("macos_notifications")
+            if hasattr(self, "_notif_btn_ref"):
+                try:
+                    self._notif_btn_ref.setText("Notifications enabled ✓")
+                    self._notif_btn_ref.setEnabled(False)
+                except Exception:
+                    pass
+        else:
+            self.mark_step_incomplete("macos_notifications")
+            if hasattr(self, "_notif_btn_ref"):
+                try:
+                    self._notif_btn_ref.setText("Notifications unavailable — retry")
+                    self._notif_btn_ref.setEnabled(True)
+                except Exception:
+                    pass
+
+    def _recheck_notification_auth(self) -> None:
+        """Deferred reconciliation of the async macOS auth prompt result.
+
+        Re-queries authorization WITHOUT posting another notification: a
+        denied result flips the step back to incomplete and updates the
+        button. Falls back to leaving the optimistic state intact when no
+        resolved-status accessor is available on the platform helper."""
+        try:
+            from cortex.libs.utils import macos_notifications as _mn
+        except Exception:
+            return
+        # ``_auth_state["granted"]`` is the resolved authorization status
+        # the OS completion handler writes: True (allowed), False
+        # (denied), or None (not yet resolved). Only a definite False
+        # downgrades the step — None means "still pending", keep optimistic.
+        try:
+            resolved = _mn._auth_state.get("granted")
+        except Exception:
+            return
+        if resolved is False:
+            self._apply_notification_auth_result(False)
 
     def _on_finish(self) -> None:
         """Click handler for the Get Started button. Persists every step

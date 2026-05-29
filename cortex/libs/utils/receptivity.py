@@ -49,7 +49,7 @@ def is_microphone_in_use() -> bool | None:
         _log_unsupported_once("not macOS")
         return None
     try:
-        import CoreAudio  # type: ignore[import-not-found]
+        import CoreAudio
     except ImportError:
         _log_unsupported_once("CoreAudio framework missing")
         return None
@@ -84,7 +84,7 @@ def is_app_fullscreen() -> bool | None:
         _log_unsupported_once("not macOS")
         return None
     try:
-        import Quartz  # type: ignore[import-not-found]
+        import Quartz
     except ImportError:
         _log_unsupported_once("Quartz framework missing")
         return None

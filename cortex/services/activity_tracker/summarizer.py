@@ -8,6 +8,7 @@ students remember where they left off and what concepts were being covered.
 from __future__ import annotations
 
 import logging
+from typing import Any, Protocol
 
 from cortex.libs.schemas.activity import ActivitySummary
 
@@ -15,6 +16,21 @@ logger = logging.getLogger(__name__)
 
 # Cache TTL: 7 days
 _RECAP_TTL = 7 * 86400
+
+
+class _JsonStore(Protocol):
+    """Structural interface for the JSON-blob store the summarizer needs.
+
+    Both ``InMemoryStore`` and ``RedisStore`` satisfy this; typing the
+    dependency as a Protocol (rather than bare ``object``) lets mypy see
+    the ``get_json`` / ``set_json`` methods called below.
+    """
+
+    async def get_json(self, key: str) -> dict[str, Any] | None: ...
+
+    async def set_json(
+        self, key: str, value: dict[str, Any], ttl_seconds: int | None = ...,
+    ) -> None: ...
 
 _RECAP_PROMPT = """\
 The student was studying "{title}" on {platform}. \
@@ -27,7 +43,7 @@ and what concept was being covered. Be specific and helpful."""
 class ActivitySummarizer:
     """Generates and caches LLM context recaps for activities."""
 
-    def __init__(self, store: object, llm_config: object | None = None) -> None:
+    def __init__(self, store: _JsonStore, llm_config: object | None = None) -> None:
         """
         Args:
             store: A store instance with get_json/set_json methods.
@@ -45,7 +61,7 @@ class ActivitySummarizer:
         cache_key = f"activity:resume_context:{activity.content_id}"
         cached = await self._store.get_json(cache_key)
         if cached and isinstance(cached, dict) and cached.get("recap"):
-            return cached["recap"]
+            return str(cached["recap"])
 
         recap = await self._generate_recap(activity)
 

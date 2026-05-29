@@ -438,6 +438,29 @@ class ConnectionsPanel(QWidget):
         )
         return btn
 
+    def _secondary_button(self, text: str) -> QPushButton:
+        """Outlined secondary action (e.g. 'Verify connection')."""
+        btn = QPushButton(text)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setMinimumHeight(30)
+        btn.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
+        try:
+            btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        except Exception:
+            pass
+        btn.setStyleSheet(
+            "QPushButton {"
+            "  padding: 5px 14px;"
+            f"  border-radius: {RADIUS_BUTTON}px;"
+            "  background: transparent;"
+            f"  color: {BRAND_ACCENT};"
+            f"  border: 1px solid {BRAND_ACCENT};"
+            "}"
+            "QPushButton:hover { background: rgba(0,0,0,0.04); }"
+            "QPushButton:disabled { color: rgba(0,0,0,0.30); border-color: rgba(0,0,0,0.18); }"
+        )
+        return btn
+
     def _make_browser_card(
         self,
         name: str,
@@ -482,11 +505,30 @@ class ConnectionsPanel(QWidget):
         set_accessible_name(btn, f"Connect {name}")
         set_accessible_description(
             btn,
-            f"Install Cortex native messaging host for {name} and load "
-            "the browser extension.",
+            f"Install Cortex native messaging host for {name} and open "
+            f"{name}'s extensions page so you can load the Cortex extension.",
         )
         self._tab_order_chain.append(btn)
         layout.addWidget(btn)
+
+        # Honest verification affordance: loading an unpacked extension is
+        # a manual step the desktop shell cannot perform, so after the
+        # guide the user clicks "Verify connection" to confirm the pieces
+        # the shell CAN check — the native-messaging manifest is installed
+        # and the daemon is reachable for the extension to connect to.
+        verify_btn = self._secondary_button("Verify connection")
+        verify_btn.setEnabled(installed and not translocated)
+        verify_btn.clicked.connect(
+            lambda checked=False, n=name: self._verify_browser_connection(n)
+        )
+        set_accessible_name(verify_btn, f"Verify {name} connection")
+        set_accessible_description(
+            verify_btn,
+            f"Check that the Cortex native messaging host is installed for "
+            f"{name} and that the Cortex daemon is running.",
+        )
+        self._tab_order_chain.append(verify_btn)
+        layout.addWidget(verify_btn)
 
         return card
 
@@ -589,13 +631,91 @@ class ConnectionsPanel(QWidget):
 
         QMessageBox.information(
             self,
-            f"Connect {name}",
-            "Extension path copied to clipboard!\n\n"
+            f"Finish connecting {name}",
+            "The native messaging host is installed and the extension "
+            "path is copied to your clipboard.\n\n"
+            "Loading an unpacked extension is a manual step Cortex cannot "
+            "do for you — follow these steps in the window that just "
+            "opened:\n\n"
             "1. Enable Developer Mode (top-right toggle)\n"
             "2. Click 'Load unpacked'\n"
-            "3. Paste the path (Cmd+V)\n"
-            "4. Click the reload icon on the Cortex card",
+            "3. Paste the path (Cmd+V) and choose the folder\n"
+            "4. Pin the Cortex extension\n\n"
+            "When you're done, click 'Verify connection' to confirm.",
         )
+
+    def _verify_browser_connection(self, name: str) -> None:
+        """Honestly report what the desktop shell CAN confirm about the
+        browser connection: the native-messaging manifest is installed
+        for this browser, and the Cortex daemon is reachable for the
+        extension to connect to. Loading the unpacked extension is a
+        manual step the shell cannot observe directly, so we never claim
+        the extension is 'connected' — we report each verifiable piece."""
+        manifest_ok = self._native_host_manifest_installed(name)
+        daemon_ok = self._daemon_reachable()
+
+        if manifest_ok and daemon_ok:
+            QMessageBox.information(
+                self,
+                f"Verify {name}",
+                "Native messaging host: installed ✓\n"
+                "Cortex daemon: running ✓\n\n"
+                "Both prerequisites are in place. If the Cortex extension "
+                "is loaded and pinned, it will connect automatically. The "
+                "extension popup shows the live connection status.",
+            )
+            return
+
+        lines = [
+            f"Native messaging host: {'installed ✓' if manifest_ok else 'NOT installed ✗'}",
+            f"Cortex daemon: {'running ✓' if daemon_ok else 'not reachable ✗'}",
+            "",
+        ]
+        if not manifest_ok:
+            lines.append(
+                "Click 'Connect' to (re)install the native messaging host, "
+                "then fully quit and relaunch the browser."
+            )
+        if not daemon_ok:
+            lines.append(
+                "Start Cortex (the daemon listens on port 9473) so the "
+                "extension has something to connect to."
+            )
+        QMessageBox.warning(self, f"Verify {name}", "\n".join(lines))
+
+    def _native_host_manifest_installed(self, name: str) -> bool:
+        """Return True iff the Cortex native-messaging manifest exists in
+        the browser's NativeMessagingHosts directory for this user.
+
+        Host name + profile roots mirror
+        ``cortex.scripts.install_native_host`` exactly so a successful
+        install is reflected here."""
+        host_name = "com.cortex.launcher"
+        support = Path.home() / "Library" / "Application Support"
+        if "edge" in name.lower():
+            roots = [support / "Microsoft Edge"]
+        else:
+            roots = [
+                support / "Google" / "Chrome",
+                support / "Chromium",
+            ]
+        for root in roots:
+            manifest = root / "NativeMessagingHosts" / f"{host_name}.json"
+            if manifest.exists():
+                return True
+        return False
+
+    def _daemon_reachable(self, *, host: str = "127.0.0.1", port: int = 9473) -> bool:
+        """Best-effort TCP reachability probe for the daemon WebSocket
+        port. A successful connect means the extension has somewhere to
+        connect to. 250 ms timeout so the UI never stalls."""
+        import socket
+
+        try:
+            with socket.create_connection((host, port), timeout=0.25):
+                return True
+        except OSError:
+            return False
 
     def _connect_editor(self, cli_path: str, editor_name: str) -> None:
         # Resolve VSIX via glob so the desktop shell tracks whatever version

@@ -109,6 +109,16 @@ class PulseEstimator:
         self._latest_timestamp: float = 0.0
         self._ibi_history: deque[tuple[float, float]] = deque(maxlen=2000)
 
+        # Rolling head vertical-position history (normalized 0-1 image
+        # coordinate) used to derive a motion-based respiratory proxy that
+        # is fused with the BVP-derived respiration estimate. Sized to one
+        # ~10 s window at the configured frame rate so the breathing band
+        # (0.15-0.4 Hz) is resolvable.
+        self._head_vertical_window_len = max(4, int(round(fs * 10.0)))
+        self._head_vertical_history: deque[float] = deque(
+            maxlen=self._head_vertical_window_len
+        )
+
         # Respiration estimator (runs alongside cardiac estimation)
         self._resp_estimator = RespirationEstimator(fs=fs)
 
@@ -117,6 +127,34 @@ class PulseEstimator:
         """Get the most recent pulse estimate."""
         return self._latest_estimate
 
+    def push_head_vertical_sample(self, y_normalized: float) -> None:
+        """Record one frame's head vertical position for the motion proxy.
+
+        ``y_normalized`` is the head/nose vertical position normalized to
+        the [0, 1] image height (0 = top of frame). Respiratory motion
+        modulates this slowly (chest/head bob), so a rolling buffer of these
+        samples gives an independent respiratory signal that is fused with
+        the BVP-derived estimate inside :meth:`process_window`. Callers that
+        do not feed this (or supply an explicit ``motion_resp_signal``)
+        simply fall back to BVP-only respiration.
+        """
+        self._head_vertical_history.append(float(y_normalized))
+
+    def _motion_resp_signal(self) -> NDArray[np.float64] | None:
+        """Build a motion-derived respiratory proxy from head vertical history.
+
+        Returns a detrended 1-D signal long enough for the respiratory
+        bandpass filter, or None when too few samples have been collected.
+        """
+        if len(self._head_vertical_history) < self._head_vertical_window_len:
+            return None
+        samples = np.asarray(self._head_vertical_history, dtype=np.float64)
+        if samples.size < 4 or float(np.std(samples)) < 1e-9:
+            return None
+        # Remove the DC component; the respiratory bandpass downstream
+        # isolates the breathing band from this displacement series.
+        return samples - float(np.mean(samples))
+
     def process_window(
         self,
         bvp_window: NDArray[np.float64],
@@ -124,6 +162,7 @@ class PulseEstimator:
         *,
         head_jitter_deg: float = 0.0,
         face_presence_ratio: float = 1.0,
+        blink_suppression: float = 0.0,
         motion_resp_signal: NDArray[np.float64] | None = None,
     ) -> PulseEstimate:
         """
@@ -138,7 +177,17 @@ class PulseEstimator:
 
         Args:
             bvp_window: Raw BVP signal, shape (N,). Should be ~10 seconds.
-            timestamp: Timestamp of the window center.
+            timestamp: Timestamp of the window center. Also threaded into
+                the respiration estimator so the screen-apnea sustain
+                timer uses the frame clock, not ``time.monotonic()``.
+            head_jitter_deg: Inter-frame head jitter in degrees (motion penalty).
+            face_presence_ratio: Fraction of the window with the face present.
+            blink_suppression: Latest blink-suppression score (0-1). High
+                values indicate visual fixation; forwarded to the
+                respiration estimator to gate screen-apnea detection (C5).
+            motion_resp_signal: Optional motion-derived respiratory proxy
+                (e.g. head vertical displacement), fused with the BVP-derived
+                respiration estimate when available.
 
         Returns:
             PulseEstimate with HR, HRV, and quality metrics.
@@ -239,11 +288,26 @@ class PulseEstimator:
         self._latest_estimate = estimate
         self._latest_timestamp = timestamp
 
-        # Also estimate respiration from the same BVP window
+        # Also estimate respiration from the same BVP window. C5: forward
+        # the caller-supplied blink_suppression (1-frame lag is acceptable;
+        # the daemon caches the previous frame's score) and the frame
+        # timestamp so the apnea sustain timer is driven by the frame clock
+        # rather than wall/monotonic time.
+        #
+        # Motion fusion: an explicit motion_resp_signal wins; otherwise the
+        # estimator derives one from the head vertical-position history fed
+        # via push_head_vertical_sample(). When neither is available the
+        # respiration estimator runs BVP-only.
+        motion_proxy = (
+            motion_resp_signal
+            if motion_resp_signal is not None
+            else self._motion_resp_signal()
+        )
         self._resp_estimator.process_bvp_window(
             bvp_window,
-            blink_suppression=0.0,
-            motion_proxy_signal=motion_resp_signal,
+            blink_suppression=blink_suppression,
+            motion_proxy_signal=motion_proxy,
+            timestamp=timestamp,
         )
 
         return estimate
@@ -337,7 +401,11 @@ class PulseEstimator:
             physio_sqi=est.physio_sqi,
             physio_sqi_components=dict(est.sqi_components),
             hr_delta_5s=hr_delta if sqi_gate_ok else None,
-            respiration_rate_bpm=resp_rate,
+            # P0-1: respiration_rate_bpm is a data field — it MUST be None
+            # when valid is False or PhysioFeatures._enforce_invalid_nulls
+            # raises ValueError, which the daemon swallows as a dropped
+            # frame (losing physio + kinematics for that stride).
+            respiration_rate_bpm=resp_rate if sqi_gate_ok else None,
             valid=sqi_gate_ok,
         )
 
@@ -350,6 +418,7 @@ class PulseEstimator:
         """Reset all state."""
         self._hr_history.clear()
         self._ibi_history.clear()
+        self._head_vertical_history.clear()
         self._latest_estimate = None
         self._latest_timestamp = 0.0
         self._resp_estimator.reset()

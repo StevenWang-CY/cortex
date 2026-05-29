@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -101,7 +102,7 @@ class PerUserLogisticClassifier:
             return self.calibrator.predict(logits)
         return 1.0 / (1.0 + np.exp(-np.clip(logits, -20.0, 20.0)))
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "n_features": self.n_features,
             "l2": self.l2,
@@ -112,7 +113,7 @@ class PerUserLogisticClassifier:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> PerUserLogisticClassifier:
+    def from_dict(cls, data: dict[str, Any]) -> PerUserLogisticClassifier:
         n_features = int(data.get("n_features", 0))
         model = cls(n_features=n_features, l2=float(data.get("l2", 1e-3)))
         model.weights = np.asarray(data.get("weights", [0.0] * n_features), dtype=np.float64)

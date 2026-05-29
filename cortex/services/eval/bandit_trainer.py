@@ -19,6 +19,7 @@ import argparse
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -27,10 +28,10 @@ from cortex.services.eval.bandit import N_ARMS, N_FEATURES, ContextualBandit
 logger = logging.getLogger(__name__)
 
 
-def load_training_data(data_dir: str) -> list[dict]:
+def load_training_data(data_dir: str) -> list[dict[str, Any]]:
     """Load helpfulness records from JSONL session files."""
     data_path = Path(data_dir)
-    records = []
+    records: list[dict[str, Any]] = []
 
     for jsonl_file in sorted(data_path.glob("*.jsonl")):
         with jsonl_file.open("r", encoding="utf-8") as f:
@@ -49,7 +50,7 @@ def load_training_data(data_dir: str) -> list[dict]:
     return records
 
 
-def train_bandit(records: list[dict], alpha: float = 1.0, epochs: int = 3) -> ContextualBandit:
+def train_bandit(records: list[dict[str, Any]], alpha: float = 1.0, epochs: int = 3) -> ContextualBandit:
     """
     Train a contextual bandit on historical data.
 
@@ -92,7 +93,7 @@ def train_bandit(records: list[dict], alpha: float = 1.0, epochs: int = 3) -> Co
     return bandit
 
 
-def evaluate_bandit(bandit: ContextualBandit, records: list[dict]) -> dict:
+def evaluate_bandit(bandit: ContextualBandit, records: list[dict[str, Any]]) -> dict[str, Any]:
     """Evaluate the trained bandit on held-out data."""
     correct = 0
     total = 0

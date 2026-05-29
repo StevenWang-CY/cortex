@@ -35,7 +35,7 @@ def _load_sequences(root: Path) -> list[tuple[np.ndarray, np.ndarray]]:
 
 
 def _estimate_hr_from_rgb(rgb_trace: np.ndarray, fs: float = 30.0) -> float | None:
-    bvp = extract_bvp(rgb_trace, fs=fs, method="pos")
+    bvp = extract_bvp(rgb_trace, algorithm="pos", fs=fs)
     hr, conf = estimate_hr_welch(bvp, fs=fs)
     if hr is None or conf <= 0.0:
         return None

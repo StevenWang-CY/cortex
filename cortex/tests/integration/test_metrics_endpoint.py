@@ -26,6 +26,30 @@ def metrics_app() -> FastAPI:
     return app
 
 
+def test_metrics_tokenless_through_full_app() -> None:
+    """Finding #4: through the REAL ``create_app()`` wiring (not just the
+    raw ``health_router``), ``GET /metrics`` MUST return 200 WITHOUT any
+    capability token — the Prometheus scrape convention, matching the
+    handler docstring. The previous wiring re-mounted ``/metrics`` behind
+    ``require_capability_token`` and returned 401 to tokenless scrapers.
+    """
+    from cortex.services.api_gateway.app import create_app, registry
+
+    registry.reset()
+    app = create_app()
+    try:
+        with TestClient(app) as client:
+            # No Authorization / X-Cortex-Auth-Token header at all.
+            r = client.get("/metrics")
+        assert r.status_code == 200, (
+            f"tokenless /metrics expected 200, got {r.status_code}: {r.text[:200]}"
+        )
+        assert "text/plain" in r.headers.get("content-type", "")
+        assert "cortex_daemon_uptime_seconds" in r.text
+    finally:
+        registry.reset()
+
+
 def test_metrics_returns_200(metrics_app: FastAPI) -> None:
     with TestClient(metrics_app) as client:
         r = client.get("/metrics")

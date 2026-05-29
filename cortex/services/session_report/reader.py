@@ -309,10 +309,10 @@ class SessionReader:
 
         if since is not None:
             try:
-                cursor = float(since)
+                cursor: float | None = float(since)
             except (TypeError, ValueError):
                 cursor = None
-            else:
+            if cursor is not None:
                 # P0 §3.1 fix #9: guard fromtimestamp against extreme
                 # ``since`` values. A caller-supplied epoch second that
                 # exceeds the platform's representable range raises

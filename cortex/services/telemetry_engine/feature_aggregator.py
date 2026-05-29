@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 
 import numpy as np
 
@@ -78,7 +79,7 @@ class FeatureAggregator:
         input_hooks: InputHooks,
         window_tracker: WindowTracker | None = None,
         config: TelemetryConfig | None = None,
-        tab_count_provider: callable | None = None,
+        tab_count_provider: Callable[[], int | None] | None = None,
     ) -> None:
         self._hooks = input_hooks
         self._window_tracker = window_tracker

@@ -145,7 +145,10 @@ def read_with_version(path: Path) -> dict[str, Any]:
         FileNotFoundError: if the file does not exist.
         json.JSONDecodeError: if the file is not valid JSON.
     """
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict):
+        raise UnsupportedSchemaError(path, None, SCHEMA_VERSION)
+    raw: dict[str, Any] = loaded
     found: int | None = raw.get("_schema_version")
     if found is None or found > SCHEMA_VERSION:
         raise UnsupportedSchemaError(path, found, SCHEMA_VERSION)

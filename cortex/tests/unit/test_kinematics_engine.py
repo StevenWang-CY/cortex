@@ -647,6 +647,46 @@ class TestPostureAnalyzerFace:
         features = analyzer.get_posture_features()
         assert features["slump_score"] is None
 
+    def test_lean_responds_to_ear_nose_geometry(self):
+        """P1-4: the forward-lean origin uses the ear-midpoint AND nose tip.
+
+        Pre-fix, update_with_face computed the ear midpoint and read the
+        nose tip then DISCARDED both (dead statements) and used the
+        forehead->chin axis instead. Moving ONLY the ear and nose landmarks
+        (forehead/chin fixed) must now change the reported lean angle,
+        proving the documented ear/nose geometry is actually used.
+        """
+        analyzer = self._make_analyzer()
+        base = self._make_upright_face_landmarks()
+        state_base = analyzer.update_with_face(base, timestamp=0.0)
+
+        # Shift ears UP and nose DOWN/forward without touching forehead(10)
+        # or chin(152). With the old forehead->chin geometry this would be a
+        # no-op; with the ear/nose geometry it changes the lean origin.
+        moved = base.copy()
+        moved[234] = [base[234][0] - 30.0, base[234][1] - 40.0]  # left ear up
+        moved[454] = [base[454][0] + 30.0, base[454][1] - 40.0]  # right ear up
+        moved[1] = [base[1][0] + 40.0, base[1][1] + 30.0]        # nose fwd/down
+        state_moved = analyzer.update_with_face(moved, timestamp=0.033)
+
+        assert state_base.forward_lean_angle is not None
+        assert state_moved.forward_lean_angle is not None
+        assert state_moved.forward_lean_angle != state_base.forward_lean_angle
+
+    def test_nose_tip_shift_alone_changes_lean(self):
+        """Moving only the nose tip must shift the lean origin (nose is used)."""
+        analyzer = self._make_analyzer()
+        base = self._make_upright_face_landmarks()
+        s0 = analyzer.update_with_face(base, timestamp=0.0)
+
+        nose_only = base.copy()
+        nose_only[1] = [base[1][0] + 60.0, base[1][1]]  # nose laterally forward
+        s1 = analyzer.update_with_face(nose_only, timestamp=0.033)
+
+        assert s0.forward_lean_angle is not None
+        assert s1.forward_lean_angle is not None
+        assert s1.forward_lean_angle > s0.forward_lean_angle
+
 
 class TestPostureAnalyzerPose:
     """Test posture analysis with full Pose landmarks."""

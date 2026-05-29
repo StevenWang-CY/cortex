@@ -86,11 +86,25 @@ class CopilotThrottle:
             )
             return True
 
-        if state == "FLOW" and confidence >= self._flow_threshold and self._is_throttled:
+        # P1: re-enable on ANY confirmed transition OUT of HYPER, not just
+        # a clean FLOW recovery. The previous code only un-throttled on
+        # ``state == "FLOW"`` with sufficient confidence; on the common
+        # FLOW→HYPER→HYPO and HYPER→RECOVERY paths the user never returns
+        # straight to FLOW, so suggestions stayed silenced forever. The
+        # state machine only enters the throttle from HYPER, so leaving
+        # HYPER (to FLOW / HYPO / RECOVERY) is the correct release edge.
+        # FLOW still carries the confidence gate (a low-confidence FLOW
+        # blip shouldn't toggle), while HYPO / RECOVERY release
+        # unconditionally — leaving HYPER at all means the overwhelm that
+        # justified throttling is over.
+        if self._is_throttled and state != "HYPER":
+            if state == "FLOW" and confidence < self._flow_threshold:
+                return False
             await self._enable_suggestions()
             self._is_throttled = False
             logger.info(
-                "Copilot un-throttled: FLOW at %.0f%% confidence",
+                "Copilot un-throttled: left HYPER for %s at %.0f%% confidence",
+                state,
                 confidence * 100,
             )
             return True

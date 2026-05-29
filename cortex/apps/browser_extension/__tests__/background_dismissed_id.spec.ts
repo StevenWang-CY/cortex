@@ -62,9 +62,13 @@ describe("P0 §3.3 — dismissedRecapSessionId suppression", () => {
         // Seed a valid recap so DISMISS_RECAP has something to read.
         sock.__deliver({
             type: "SESSION_RECAP",
+            // C4 wrapper shape.
             payload: {
-                session_id: "dismiss-me-001",
-                duration_seconds: 300,
+                report: {
+                    session_id: "dismiss-me-001",
+                    duration_seconds: 300,
+                },
+                persisted: true,
             },
             timestamp: Date.now() / 1000,
             sequence: 1,
@@ -97,8 +101,11 @@ describe("P0 §3.3 — dismissedRecapSessionId suppression", () => {
         sock.__deliver({
             type: "SESSION_RECAP",
             payload: {
-                session_id: "ghost-session-7",
-                duration_seconds: 600,
+                report: {
+                    session_id: "ghost-session-7",
+                    duration_seconds: 600,
+                },
+                persisted: true,
             },
             timestamp: Date.now() / 1000,
             sequence: 1,
@@ -121,8 +128,11 @@ describe("P0 §3.3 — dismissedRecapSessionId suppression", () => {
         sock.__deliver({
             type: "SESSION_RECAP",
             payload: {
-                session_id: "ghost-session-7",
-                duration_seconds: 600,
+                report: {
+                    session_id: "ghost-session-7",
+                    duration_seconds: 600,
+                },
+                persisted: true,
             },
             timestamp: Date.now() / 1000,
             sequence: 2,
@@ -162,8 +172,11 @@ describe("P0 §3.3 — dismissedRecapSessionId suppression", () => {
         sock.__deliver({
             type: "SESSION_RECAP",
             payload: {
-                session_id: "session-A",
-                duration_seconds: 300,
+                report: {
+                    session_id: "session-A",
+                    duration_seconds: 300,
+                },
+                persisted: true,
             },
             timestamp: Date.now() / 1000,
             sequence: 1,
@@ -184,9 +197,12 @@ describe("P0 §3.3 — dismissedRecapSessionId suppression", () => {
         sock.__deliver({
             type: "SESSION_RECAP",
             payload: {
-                session_id: "session-B-fresh",
-                duration_seconds: 900,
-                flow_percentage: 71,
+                report: {
+                    session_id: "session-B-fresh",
+                    duration_seconds: 900,
+                    flow_percentage: 71,
+                },
+                persisted: true,
             },
             timestamp: Date.now() / 1000,
             sequence: 2,

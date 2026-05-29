@@ -20,6 +20,7 @@ import asyncio
 import logging
 import time
 from collections import deque
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 import cv2
@@ -151,7 +152,7 @@ class CapturePipeline:
         )
 
         # Pipeline task
-        self._pipeline_task: asyncio.Task | None = None
+        self._pipeline_task: asyncio.Task[None] | None = None
         self._running = False
 
         # Metrics
@@ -335,7 +336,7 @@ class CapturePipeline:
         except TimeoutError:
             return None
 
-    async def __aiter__(self):
+    async def __aiter__(self) -> AsyncIterator[PipelineOutput]:
         """Async iterate over pipeline outputs."""
         while self._running:
             output = await self.get_output(timeout=0.5)

@@ -124,7 +124,7 @@ class BrowserAdapter:
             self._available = False
             return None
 
-    def update_from_payload(self, payload: dict) -> BrowserContext | None:
+    def update_from_payload(self, payload: dict[str, Any]) -> BrowserContext | None:
         """
         Update context directly from a payload dict.
 
@@ -139,18 +139,32 @@ class BrowserAdapter:
             self._available = True
             self._last_context = ctx
             return ctx
-        except (KeyError, TypeError, ValueError) as e:
+        except (KeyError, TypeError, ValueError, AttributeError) as e:
+            # F-finding #4: surface a malformed payload as a logged None
+            # (AttributeError covers ``.get`` on a non-dict that slips
+            # past the isinstance guards) instead of crashing the caller.
             logger.warning(f"Failed to parse browser context: {e}")
+            self._available = False
             return None
 
     @staticmethod
-    def _parse_browser_context(payload: dict) -> BrowserContext:
+    def _parse_browser_context(payload: dict[str, Any]) -> BrowserContext:
         """Parse a BrowserContext from a payload dict."""
         tabs_raw = payload.get("all_tabs", [])
+        # F-finding #4: the browser extension is an untrusted, optional
+        # source — a non-list ``all_tabs`` or a non-dict tab entry must
+        # degrade gracefully (skip the bad entry / treat as no tabs)
+        # rather than raise an uncaught ``AttributeError`` that escapes
+        # ``update_from_payload``'s except clause and crashes the WS
+        # push handler.
+        if not isinstance(tabs_raw, list):
+            tabs_raw = []
         tabs: list[TabInfo] = []
         type_counts: dict[str, int] = {}
 
         for t in tabs_raw:
+            if not isinstance(t, dict):
+                continue
             url = t.get("url", "")
             tab_type = t.get("tab_type") or classify_tab_type(url)
             is_active = t.get("is_active", False)

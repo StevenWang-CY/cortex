@@ -19,13 +19,14 @@ Configuration: APIConfig (host=127.0.0.1; ports from
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import APIRouter, Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.routing import APIRoute
-from starlette.middleware.base import BaseHTTPMiddleware
+from fastapi.responses import Response
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
 from cortex.libs.config.settings import APIConfig, CortexConfig
 from cortex.libs.logging.correlation import correlation_scope
@@ -86,7 +87,7 @@ registry = ServiceRegistry()
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     Application lifespan handler.
 
@@ -138,7 +139,9 @@ def create_app(
     # both ``contextvars`` and structlog, and echoes it back on the
     # response so the calling UI can quote it in error toasts.
     class _CorrelationMiddleware(BaseHTTPMiddleware):
-        async def dispatch(self, request: Request, call_next):
+        async def dispatch(
+            self, request: Request, call_next: RequestResponseEndpoint,
+        ) -> Response:
             incoming = request.headers.get(_REQUEST_ID_HEADER)
             with correlation_scope(incoming) as cid:
                 response = await call_next(request)
@@ -184,42 +187,25 @@ def create_app(
     # liveness-only and visible in code review.
     from cortex.services.api_gateway.routes import (
         health_router,
-        prometheus_metrics,
         router,
     )
 
-    # SECURITY (audit Debt-2): ``/metrics`` exposes the full Prometheus
-    # registry which includes labelled state-transition counters and
-    # daemon uptime — useful for monitoring but also useful for a
-    # localhost web page fingerprinting the daemon when it has no auth
-    # gate. ``/health`` MUST stay un-authenticated (it's the launcher's
-    # liveness probe and runs before the UI has a capability token),
-    # so we mount the unauthenticated routes through a fresh router
-    # that excludes ``/metrics``, and mount ``/metrics`` on a dedicated
-    # router behind the same capability-token gate the rest of
-    # ``router`` uses.
+    # SECURITY (audit Debt-2 + finding #4): ``/metrics`` and ``/health``
+    # both live on the UNAUTHENTICATED ``health_router``. This is the
+    # standard Prometheus contract — a scraper is tokenless, and the
+    # daemon binds only to ``127.0.0.1`` (see ``APIConfig.host``), so the
+    # exposition surface is reachable only from the same machine.
     #
-    # NOTE: we deliberately do NOT mutate ``health_router.routes`` —
-    # that would corrupt the global singleton for tests that import it
-    # directly. Instead we copy the non-/metrics routes into a fresh
-    # ``unauthenticated_router`` and leave the source ``health_router``
-    # untouched.
-    unauthenticated_router = APIRouter()
-    for r in health_router.routes:
-        if isinstance(r, APIRoute) and r.path != "/metrics":
-            unauthenticated_router.routes.append(r)
-    metrics_router = APIRouter()
-    metrics_router.add_api_route(
-        "/metrics",
-        prometheus_metrics,
-        methods=["GET"],
-    )
-
-    app.include_router(unauthenticated_router)
-    app.include_router(
-        metrics_router,
-        dependencies=[Depends(require_capability_token)],
-    )
+    # Finding #4 resolved a real contradiction here: the
+    # ``prometheus_metrics`` handler docstring promised a public scrape
+    # AND the integration suite (``test_metrics_endpoint.py``) asserts a
+    # tokenless 200, yet the previous wiring re-mounted ``/metrics``
+    # behind ``require_capability_token`` — so an actual Prometheus
+    # scraper got a 401. We now mount the entire ``health_router``
+    # (``/health`` + ``/metrics``) without the gate, matching the
+    # handler docstring, the tests, and Prometheus' tokenless-scrape
+    # convention. Every other route stays on the gated ``router``.
+    app.include_router(health_router)
     app.include_router(router, dependencies=[Depends(require_capability_token)])
 
     logger.info(f"API Gateway configured on {cfg.host}:{cfg.port}")

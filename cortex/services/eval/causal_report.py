@@ -39,8 +39,8 @@ def _load_policy_log(path: Path) -> tuple[dict[str, dict[str, Any]], dict[str, f
 
 
 def _ips_snips(decisions: dict[str, dict[str, Any]], rewards: dict[str, float]) -> dict[str, dict[str, float]]:
-    per_arm_num = defaultdict(float)
-    per_arm_den = defaultdict(float)
+    per_arm_num: defaultdict[str, float] = defaultdict(float)
+    per_arm_den: defaultdict[str, float] = defaultdict(float)
     for did, dec in decisions.items():
         if did not in rewards:
             continue

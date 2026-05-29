@@ -16,6 +16,7 @@ Usage:
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import shutil
@@ -60,6 +61,52 @@ BROWSER_PROFILES = {
 _CORTEX_KEYWORDS = ["cortex", "somatic", "biofeedback", "workspace engine"]
 
 
+def _find_bundled_framework_python(project_root: str) -> str | None:
+    """Resolve the PyInstaller-bundled framework Python inside ``.app``.
+
+    PyInstaller emits ``Python.framework`` under
+    ``Contents/Frameworks/Python.framework/Versions/<X.Y>/bin/pythonX.Y``.
+    The minor version (``<X.Y>``) tracks whatever interpreter built the
+    bundle, so it MUST NOT be hardcoded — bumping the Python pin in
+    pyproject.toml would silently break native-messaging launch. We glob
+    the ``Versions/*`` directory and pick the highest matching
+    ``pythonX.Y`` binary so the path keeps resolving across version bumps.
+
+    Returns an absolute path to an executable Python, or ``None`` if no
+    bundled framework Python is present (caller falls back to system
+    Python discovery).
+    """
+    versions_dir = os.path.join(
+        project_root,
+        "Contents",
+        "Frameworks",
+        "Python.framework",
+        "Versions",
+    )
+    if not os.path.isdir(versions_dir):
+        return None
+
+    candidates: list[tuple[tuple[int, ...], str]] = []
+    for version_dir in glob.glob(os.path.join(versions_dir, "*")):
+        version_name = os.path.basename(version_dir)
+        # Skip the ``Current`` symlink and any non version-numbered entries.
+        if not version_name[:1].isdigit():
+            continue
+        python_bin = os.path.join(version_dir, "bin", f"python{version_name}")
+        if os.path.isfile(python_bin) and os.access(python_bin, os.X_OK):
+            try:
+                sort_key = tuple(int(p) for p in version_name.split("."))
+            except ValueError:
+                sort_key = (0,)
+            candidates.append((sort_key, os.path.abspath(python_bin)))
+
+    if not candidates:
+        return None
+    # Highest version wins when multiple framework versions coexist.
+    candidates.sort()
+    return candidates[-1][1]
+
+
 def _find_python(project_root: str | None = None) -> str:
     """Find an absolute Python path for the native-host shebang.
 
@@ -86,18 +133,9 @@ def _find_python(project_root: str | None = None) -> str:
         # Python, and only use ``/usr/bin/python3`` when we can verify
         # it executes (not just exists).
         if requested_app_bundle and project_root:
-            framework_py = os.path.join(
-                project_root,
-                "Contents",
-                "Frameworks",
-                "Python.framework",
-                "Versions",
-                "3.11",
-                "bin",
-                "python3.11",
-            )
-            if os.path.isfile(framework_py) and os.access(framework_py, os.X_OK):
-                return os.path.abspath(framework_py)
+            framework_py = _find_bundled_framework_python(project_root)
+            if framework_py is not None:
+                return framework_py
         for candidate in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3"):
             if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
                 return candidate

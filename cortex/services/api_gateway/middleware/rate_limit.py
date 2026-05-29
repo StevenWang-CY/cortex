@@ -31,11 +31,12 @@ import logging
 import math
 import time
 from collections import defaultdict, deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
+from starlette.types import ASGIApp
 
 from cortex.libs.logging.correlation import get_correlation_id
 from cortex.libs.logging.structured import EventType
@@ -87,11 +88,11 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
     def __init__(
         self,
-        app,
+        app: ASGIApp,
         *,
         limits: dict[str, int] | None = None,
         window_seconds: float = WINDOW_SECONDS,
-        time_func=time.monotonic,
+        time_func: Callable[[], float] = time.monotonic,
     ) -> None:
         super().__init__(app)
         self._limits: dict[str, int] = dict(limits) if limits is not None else dict(DEFAULT_LIMITS)
@@ -115,7 +116,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
     # -- BaseHTTPMiddleware contract --------------------------------------
 
-    async def dispatch(self, request: Request, call_next) -> Response:
+    async def dispatch(
+        self, request: Request, call_next: RequestResponseEndpoint,
+    ) -> Response:
         route = _normalise_route(request.url.path, limits=self._limits)
         if route is None:
             return await call_next(request)

@@ -14,8 +14,10 @@ schema:
 * ``launch``  — optional ``project_root`` constrained to an allowlist
   of canonical directories (``~/Desktop``, ``~/Documents``,
   ``~/Projects``, ``/Applications/Cortex.app``, plus any directory
-  named in ``$CORTEX_NATIVE_HOST_PROJECT_ROOTS`` — a colon-separated
-  list to support bespoke developer setups).
+  named in ``$CORTEX_NATIVE_HOST_PROJECT_ROOTS`` — a comma-separated
+  list to support bespoke developer setups; comma matches the
+  documented example in ``.env.example`` and avoids ambiguity with the
+  ``:`` that Unix uses as the PATH separator).
 * ``stop``    — no extra fields.
 * ``status``  — no extra fields.
 * ``get_auth_token`` — no extra fields. The native host returns the
@@ -55,10 +57,13 @@ def _expand(path: str) -> Path:
 def _default_project_root_allowlist() -> tuple[Path, ...]:
     """Canonical install / project locations the daemon may launch from.
 
-    ``$CORTEX_NATIVE_HOST_PROJECT_ROOTS`` is a colon-separated env var
+    ``$CORTEX_NATIVE_HOST_PROJECT_ROOTS`` is a comma-separated env var
     that power users can set to extend the list (e.g. for a custom
     Code workspace tree under ``~/work/`` that lives outside the four
     default roots). Empty entries and unresolvable paths are dropped.
+    Comma matches the documented example in ``.env.example`` and avoids
+    colliding with the ``:`` Unix uses as its PATH separator (which a
+    real absolute path never contains).
     """
     home = Path.home()
     roots: list[Path] = [
@@ -68,7 +73,7 @@ def _default_project_root_allowlist() -> tuple[Path, ...]:
         Path("/Applications/Cortex.app"),
     ]
     extra = os.environ.get("CORTEX_NATIVE_HOST_PROJECT_ROOTS", "")
-    for entry in extra.split(":"):
+    for entry in extra.split(","):
         entry = entry.strip()
         if not entry:
             continue

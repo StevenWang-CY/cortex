@@ -335,6 +335,46 @@ def test_feedback_endpoint_persists_scrubbed_payload(
     assert record["report_id"] == body["report_id"]
 
 
+def test_feedback_endpoint_persists_user_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C2: POST /api/feedback persists the ``user_agent`` the popup sends
+    (navigator.userAgent) into the stored record so support can triage by
+    browser/OS without round-tripping the user."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(
+        "cortex.libs.utils.platform.get_config_dir",
+        lambda: tmp_path,
+    )
+
+    from cortex.libs.auth import load_or_create_token
+    from cortex.libs.config.settings import APIConfig
+    from cortex.services.api_gateway.app import create_app
+
+    token = load_or_create_token()
+    app = create_app(config=APIConfig())
+    client = TestClient(app)
+    ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/120.0"
+    resp = client.post(
+        "/api/feedback",
+        json={
+            "description": "y" * 15,
+            "include_logs": False,
+            "app_version": "2.0.0",
+            "user_agent": ua,
+        },
+        headers={"X-Cortex-Auth-Token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    import json
+    files = list((tmp_path / "feedback").glob("*.json"))
+    assert len(files) == 1
+    record = json.loads(files[0].read_text())
+    assert record["user_agent"] == ua
+    assert record["app_version"] == "2.0.0"
+
+
 def test_feedback_endpoint_scrub_helpers_redact_paths_and_tokens() -> None:
     from cortex.services.api_gateway.routes import _scrub_log_tail
 

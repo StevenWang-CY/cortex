@@ -18,6 +18,7 @@ import logging
 import signal
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
 
@@ -114,7 +115,7 @@ class DaemonBridge(QObject):
     _LAST_STATE_SEQ_DEFAULT: int = 0
     _LAST_INTERVENTION_SEQ_DEFAULT: int = 0
 
-    def __init__(self) -> None:  # type: ignore[override]
+    def __init__(self) -> None:
         super().__init__()
         self._last_state_seq: int = self._LAST_STATE_SEQ_DEFAULT
         self._last_intervention_seq: int = self._LAST_INTERVENTION_SEQ_DEFAULT
@@ -296,6 +297,9 @@ class CortexAppController:
         # legacy back-compat signal that fans in to the same handler) is
         # then a no-op instead of re-scheduling ``daemon.stop()``.
         self._stopping: bool = False
+        # P2 (audit-prod): teardown handle for the light/dark appearance
+        # observer; kept alive for the controller lifetime.
+        self._appearance_teardown: Callable[[], None] | None = None
 
     # -- public API -----------------------------------------------------------
 
@@ -612,7 +616,7 @@ class CortexAppController:
         # PyInstaller bundles don't always get proper activation, so the
         # dashboard window can be created but hidden behind other windows.
         try:
-            from AppKit import (  # type: ignore[import-untyped]
+            from AppKit import (
                 NSApp,
                 NSApplicationActivationPolicyRegular,
             )
@@ -646,10 +650,43 @@ class CortexAppController:
                 self._onboarding.show()
                 self._onboarding.raise_()
                 self._onboarding.activateWindow()
+            # P2 (audit-prod): wire the light/dark appearance observer so
+            # the native window background re-adapts on a System Settings
+            # theme flip without a restart.
+            self._install_appearance_observer()
 
         QTimer.singleShot(200, _initial_show)
 
         return self._app.exec()
+
+    def _install_appearance_observer(self) -> None:
+        """Install the macOS light/dark appearance observer; re-apply the
+        native window chrome (background + titlebar) to every top-level
+        window on a theme flip. The retint is marshalled to the Qt main
+        thread via ``QTimer.singleShot(0, ...)`` because the observer
+        callback fires on the AppKit notification queue."""
+        def _on_flip(_is_dark: bool) -> None:
+            def _retint() -> None:
+                for window in (self._dashboard, self._settings,
+                               self._overlay, self._onboarding):
+                    if window is None:
+                        continue
+                    try:
+                        mac_native.apply_vibrancy(window)
+                        mac_native.apply_unified_titlebar(window)
+                    except Exception:
+                        logger.debug("appearance retint failed", exc_info=True)
+            try:
+                QTimer.singleShot(0, _retint)
+            except Exception:
+                _retint()
+        try:
+            self._appearance_teardown = mac_native.install_appearance_observer(
+                _on_flip
+            )
+        except Exception:
+            logger.debug("install_appearance_observer failed", exc_info=True)
+            self._appearance_teardown = None
 
     # -- Daemon lifecycle -----------------------------------------------------
 
@@ -791,7 +828,7 @@ class CortexAppController:
 
         _wrapped_send_message._cortex_broadcast_wrapped = True  # type: ignore[attr-defined]
         try:
-            ws_server.send_message = _wrapped_send_message  # type: ignore[method-assign]
+            ws_server.send_message = _wrapped_send_message
         except Exception:
             logger.debug(
                 "Failed to install ws_server.send_message wrapper",
@@ -1110,16 +1147,57 @@ class CortexAppController:
             return
         action_type = str(action.get("action_type") or "")
         action_id = str(action.get("action_id") or "")
-        executed_natively = False
+        # Native vs browser routing is authoritative on the overlay's
+        # frozensets so a single source of truth governs which clicks
+        # reach ``dispatch_action_to_browser``. Anything NOT in
+        # ``OverlayWindow._BROWSER_ACTION_TYPES`` must execute natively
+        # (or via a daemon-local helper) — previously every native type
+        # except copy/timer fell through to the browser dispatch path
+        # and was dropped (the SuggestedAction-bound extension never
+        # recognised ``take_biology_break`` / ``resume_last_active_file``
+        # / ``prompt_micro_commit`` / ``suggest_movement_break``).
+        is_browser_action = action_type in OverlayWindow._BROWSER_ACTION_TYPES
+        executed_natively = not is_browser_action
+        # A daemon-local coroutine to run for the native action types
+        # that need real daemon-side work (a break session, an editor
+        # focus, or a prompt broadcast). ``None`` means "log only".
+        native_coro: Any = None
         try:
             if action_type == "copy_to_clipboard":
                 self._copy_to_clipboard(str(action.get("target") or ""))
-                executed_natively = True
             elif action_type == "start_timer":
                 # ``target`` may carry a duration label; just log it. The
                 # timer surface is best handled by the daemon's existing
                 # break-scheduler, not a fresh QTimer in the controller.
-                executed_natively = True
+                pass
+            elif action_type == "take_biology_break":
+                # P0 §3.7: the breathing session is a full-screen Qt
+                # overlay driven by the daemon (it owns the HRV context).
+                # Route to ``start_biology_break`` — NEVER the browser.
+                meta = action.get("metadata")
+                meta = meta if isinstance(meta, dict) else {}
+                duration = int(meta.get("duration_seconds", 240) or 240)
+                pattern = meta.get("breathing_pattern")
+                native_coro = self._daemon.start_biology_break(
+                    intervention_id=str(intervention_id or ""),
+                    duration_seconds=duration,
+                    breathing_pattern=pattern if isinstance(pattern, str) else None,
+                    audio_cue=bool(meta.get("audio_cue", True)),
+                    reason=str(meta.get("reason", "user_requested_break"))[:120],
+                )
+            elif action_type == "resume_last_active_file":
+                # Editor/native adapter — focus the last active file in
+                # the connected VS Code / editor adapter.
+                native_coro = self._daemon._resume_last_active_file(dict(action))
+            elif action_type in ("prompt_micro_commit", "suggest_movement_break"):
+                # Native inline widgets (confirmed in the overlay). Mirror
+                # the engagement to peer surfaces via a prompt broadcast,
+                # then record natively. Nothing is dispatched to chrome.
+                params = {
+                    k: v for k, v in action.items()
+                    if k not in ("action_type", "action_id", "label", "reason")
+                }
+                native_coro = self._daemon._broadcast_prompt(action_type, params)
         except Exception:
             logger.debug("Native action execution failed", exc_info=True)
 
@@ -1145,7 +1223,18 @@ class CortexAppController:
         }
 
         async def _dispatch_then_record() -> None:
-            if not executed_natively:
+            if executed_natively:
+                # Native action types run a daemon-local coroutine (break
+                # session / editor focus / prompt broadcast) when one was
+                # prepared; copy_to_clipboard / start_timer are log-only.
+                if native_coro is not None:
+                    try:
+                        await native_coro
+                    except Exception:
+                        logger.debug(
+                            "native action coroutine failed", exc_info=True,
+                        )
+            else:
                 try:
                     await self._daemon.dispatch_action_to_browser(
                         intervention_id, action_copy,
@@ -1398,10 +1487,15 @@ class CortexAppController:
             if focus_window is None:
                 from PySide6.QtWidgets import QApplication
                 app = QApplication.instance()
-                if app is None:
+                # ``QApplication.instance()`` is typed to return the base
+                # ``QCoreApplication`` (no ``focusWindow``); the running
+                # instance is a ``QApplication``, so narrow by attribute
+                # presence before reading the focused window.
+                focus_fn = getattr(app, "focusWindow", None)
+                if app is None or focus_fn is None:
                     self._dashboard_is_focused = False
                     return
-                focus_window = app.focusWindow()
+                focus_window = focus_fn()
             if focus_window is None:
                 # Backgrounded entirely — fire OS notifications.
                 self._dashboard_is_focused = False
@@ -1457,7 +1551,7 @@ class CortexAppController:
         )
         pattern: Literal["box", "4-7-8", "coherent"]
         if breathing_pattern in ("box", "4-7-8", "coherent"):
-            pattern = breathing_pattern  # type: ignore[assignment]
+            pattern = breathing_pattern
         else:
             pattern = "box"
 
@@ -1716,7 +1810,7 @@ class CortexAppController:
             self._dashboard.activateWindow()
             # Force macOS to bring the app + window to front
             try:
-                from AppKit import NSApp  # type: ignore[import-untyped]
+                from AppKit import NSApp
 
                 NSApp.activateIgnoringOtherApps_(True)
                 # Raise the key window directly

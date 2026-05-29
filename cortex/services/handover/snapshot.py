@@ -40,9 +40,9 @@ class HandoverSnapshot:
         editor_context: dict[str, Any] | None = None,
         terminal_context: dict[str, Any] | None = None,
         browser_context: dict[str, Any] | None = None,
-        diagnostics: list[dict] | None = None,
+        diagnostics: list[dict[str, Any]] | None = None,
         llm_client: Any = None,
-        activity_timeline: list[dict] | None = None,
+        activity_timeline: list[dict[str, Any]] | None = None,
     ) -> Path:
         """
         Capture workspace state and write the handover brief.
@@ -238,9 +238,12 @@ class HandoverSnapshot:
             "about the file, function, and error they were working on.\n\n"
             f"{context_text}"
         )
-        # Use a simple generate method if available
+        # Use a simple generate method if available. ``llm_client`` is
+        # untyped (``Any``), so coerce the result to ``str`` to honour
+        # this method's declared return contract.
         if hasattr(llm_client, "generate_text"):
-            return await llm_client.generate_text(prompt)
+            result = await llm_client.generate_text(prompt)
+            return str(result) if result is not None else ""
         return ""
 
     def get_latest_handover(self) -> Path | None:

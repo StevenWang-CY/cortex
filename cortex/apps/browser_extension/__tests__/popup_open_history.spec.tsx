@@ -73,15 +73,22 @@ async function renderPopup(): Promise<Harness> {
     };
 }
 
+// C4: both GET_CACHED_RECAP's ``recap`` field and the SESSION_RECAP_READY
+// broadcast payload carry the SessionRecap WRAPPER now — the renderable
+// SessionReport lives at ``.report``, plus the ``persisted`` envelope flag.
 const FAKE_RECAP = {
-    session_id: "test-session-0",
-    start_time: "2026-05-25T10:00:00Z",
-    end_time: "2026-05-25T10:38:00Z",
-    duration_seconds: 38 * 60,
-    flow_percentage: 58,
-    breaks_taken: 1,
-    longest_flow_streak_seconds: 14 * 60,
-    avg_hr_bpm: 72,
+    report: {
+        session_id: "test-session-0",
+        start_time: "2026-05-25T10:00:00Z",
+        end_time: "2026-05-25T10:38:00Z",
+        duration_seconds: 38 * 60,
+        flow_percentage: 58,
+        breaks_taken: 1,
+        longest_flow_streak_seconds: 14 * 60,
+        avg_hr_bpm: 72,
+    },
+    generated_at: "2026-05-25T10:38:01Z",
+    persisted: true,
 };
 
 describe("popup view history link + recap card", () => {

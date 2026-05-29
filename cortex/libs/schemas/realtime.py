@@ -21,7 +21,7 @@ parser, matching the rest of the schemas in this package.
 from __future__ import annotations
 
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -340,12 +340,15 @@ class SessionRecap(BaseModel):
     report: SessionReport = Field(
         ..., description="The full on-disk session report"
     )
-    generated_at: datetime = Field(
-        default_factory=datetime.now,
+    generated_at: str = Field(
+        default_factory=lambda: datetime.now(UTC).isoformat(),
         description=(
-            "When the recap envelope was constructed (wall-clock). "
-            "Distinct from ``report.end_time`` which is the session "
-            "end."
+            "ISO-8601 instant the recap envelope was constructed "
+            "(wall-clock). C4 (audit): typed as ``str`` so the daemon's "
+            "``SessionRecap(generated_at=<iso8601 str>, ...)`` wrapper "
+            "matches the schema exactly and the generated TypeScript "
+            "type is a plain ``string``. Distinct from "
+            "``report.end_time`` which is the session end."
         ),
     )
     persisted: bool = Field(

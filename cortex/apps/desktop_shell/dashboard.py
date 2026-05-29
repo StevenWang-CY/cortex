@@ -25,9 +25,12 @@ from __future__ import annotations
 import collections
 import logging
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import Qt, QTimer, Signal
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 try:
     from PySide6.QtCore import QRectF
@@ -41,11 +44,11 @@ except ImportError:  # pragma: no cover - compatibility for lightweight test moc
 try:
     from PySide6.QtGui import QKeySequence, QShortcut
 except ImportError:  # pragma: no cover - compatibility for lightweight test mocks
-    class QKeySequence:  # type: ignore[override]
+    class QKeySequence:
         def __init__(self, *_args: object, **_kwargs: object) -> None:
             return
 
-    class QShortcut:  # type: ignore[override]
+    class QShortcut:
         def __init__(self, *_args: object, **_kwargs: object) -> None:
             class _S:
                 def connect(self, *_a: object, **_k: object) -> None:
@@ -55,7 +58,7 @@ except ImportError:  # pragma: no cover - compatibility for lightweight test moc
         def setContext(self, *_args: object, **_kwargs: object) -> None:
             return
 
-    class QPainterPath:  # type: ignore[override]
+    class QPainterPath:
         def addRoundedRect(self, *_args: object, **_kwargs: object) -> None:
             return
 
@@ -85,7 +88,7 @@ try:
         QWidget,
     )
 except ImportError:  # pragma: no cover - compatibility for lightweight test mocks
-    from PySide6.QtWidgets import (  # type: ignore[attr-defined]
+    from PySide6.QtWidgets import (
         QFrame,
         QGridLayout,
         QHBoxLayout,
@@ -96,7 +99,7 @@ except ImportError:  # pragma: no cover - compatibility for lightweight test moc
         QWidget,
     )
 
-    class QComboBox(QWidget):  # type: ignore[override]
+    class QComboBox(QWidget):
         """Lightweight stub for unit-test harnesses."""
 
         def __init__(self, *_a: object, **_kw: object) -> None:
@@ -146,7 +149,7 @@ except ImportError:  # pragma: no cover - compatibility for lightweight test moc
 
             return _S()
 
-    class QDialog(QWidget):  # type: ignore[override]
+    class QDialog(QWidget):
         """Lightweight QDialog stub for unit tests."""
 
         def __init__(self, *_a: object, **_kw: object) -> None:
@@ -155,7 +158,7 @@ except ImportError:  # pragma: no cover - compatibility for lightweight test moc
         def exec(self) -> int:
             return 0
 
-    class QFileDialog(QWidget):  # type: ignore[override]
+    class QFileDialog(QWidget):
         """Lightweight QFileDialog stub for unit tests."""
 
         @staticmethod
@@ -164,7 +167,7 @@ except ImportError:  # pragma: no cover - compatibility for lightweight test moc
         ) -> tuple[str, str]:
             return ("", "")
 
-    class QMenu(QWidget):  # type: ignore[override]
+    class QMenu(QWidget):
         """Lightweight stub: tests don't exercise the menu surface."""
 
         def addAction(self, *_args: object, **_kwargs: object) -> object:
@@ -179,7 +182,7 @@ except ImportError:  # pragma: no cover - compatibility for lightweight test moc
         def exec(self, *_args: object, **_kwargs: object) -> None:
             return
 
-    class QButtonGroup:  # type: ignore[override]
+    class QButtonGroup:
         def __init__(self, *_args: object, **_kwargs: object) -> None:
             return
 
@@ -189,23 +192,23 @@ except ImportError:  # pragma: no cover - compatibility for lightweight test moc
         def setExclusive(self, *_args: object, **_kwargs: object) -> None:
             return
 
-    class QLineEdit(QLabel):  # type: ignore[override]
+    class QLineEdit(QLabel):
         def setPlaceholderText(self, *_args: object, **_kwargs: object) -> None:
             return
 
-    class QScrollArea(QWidget):  # type: ignore[override]
+    class QScrollArea(QWidget):
         def setWidgetResizable(self, *_args: object, **_kwargs: object) -> None:
             return
 
         def setWidget(self, *_args: object, **_kwargs: object) -> None:
             return
 
-    class QSizePolicy:  # type: ignore[override]
+    class QSizePolicy:
         class Policy:
             Expanding = 0
             Preferred = 0
 
-    class QStackedWidget(QWidget):  # type: ignore[override]
+    class QStackedWidget(QWidget):
         def addWidget(self, *_args: object, **_kwargs: object) -> None:
             return
 
@@ -302,7 +305,7 @@ _CONCEPTS_GLOSSARY: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 
-def _baseline_default_path() -> object:
+def _baseline_default_path() -> Path:
     """Resolve `storage/baselines/default.json` via the active config.
     Lazy-imported so the dashboard stays importable under test stubs."""
     from pathlib import Path
@@ -326,65 +329,6 @@ def _baseline_age_days(now: float | None = None) -> float | None:
     except OSError:
         return None
 
-
-# ---------------------------------------------------------------------------
-# P0 §3.4 — Baseline freshness helpers (shared with the Settings dialog).
-# ---------------------------------------------------------------------------
-
-
-def _baseline_default_path() -> object:
-    """Resolve `storage/baselines/default.json` via the active config.
-    Lazy-imported so the dashboard stays importable under test stubs."""
-    from pathlib import Path
-
-    try:
-        from cortex.libs.config.settings import get_config
-
-        return Path(get_config().storage.path) / "baselines" / "default.json"
-    except Exception:
-        return Path("storage") / "baselines" / "default.json"
-
-
-def _baseline_age_days(now: float | None = None) -> float | None:
-    """Age of the default baseline file in days, or None if missing."""
-    target = _baseline_default_path()
-    try:
-        if not target.exists():
-            return None
-        current = now if now is not None else time.time()
-        return max(0.0, (current - target.stat().st_mtime) / 86400.0)
-    except OSError:
-        return None
-
-
-# ---------------------------------------------------------------------------
-# P0 §3.4 — Baseline freshness helpers (shared with the Settings dialog).
-# ---------------------------------------------------------------------------
-
-
-def _baseline_default_path() -> object:
-    """Resolve `storage/baselines/default.json` via the active config.
-    Lazy-imported so the dashboard stays importable under test stubs."""
-    from pathlib import Path
-
-    try:
-        from cortex.libs.config.settings import get_config
-
-        return Path(get_config().storage.path) / "baselines" / "default.json"
-    except Exception:
-        return Path("storage") / "baselines" / "default.json"
-
-
-def _baseline_age_days(now: float | None = None) -> float | None:
-    """Age of the default baseline file in days, or None if missing."""
-    target = _baseline_default_path()
-    try:
-        if not target.exists():
-            return None
-        current = now if now is not None else time.time()
-        return max(0.0, (current - target.stat().st_mtime) / 86400.0)
-    except OSError:
-        return None
 
 _MAX_HR_HISTORY = 120
 _MAX_TIMELINE_EVENTS = 50
@@ -403,8 +347,12 @@ _STOP_SAFETY_TIMEOUT_MS = 10_000
 _RECAP_WATCHDOG_MS = 6_000
 
 # Resolved semantic colors. These hex strings are dev-mode fallbacks; on
-# macOS, ``mac_native`` re-tints widgets at runtime when the user toggles
-# light/dark mode (see :func:`mac_native.install_appearance_observer`).
+# macOS, the window chrome (background tint + titlebar) re-adapts to the
+# user's light/dark setting at runtime via the appearance observer wired
+# at app startup (see :func:`mac_native.install_appearance_observer`,
+# invoked from ``CortexApp.run`` / ``CortexAppController``). These Qt
+# stylesheet token values stay fixed; the native NSWindow background
+# colour follows the system appearance.
 _WINDOW_BG = SEMANTIC_LIGHT["window_bg"]
 _CONTROL_BG = SEMANTIC_LIGHT["control_bg"]
 _GROUPED_BG = SEMANTIC_LIGHT["grouped_bg"]

@@ -9,9 +9,22 @@
  * Sends ACTIVITY_UPDATE messages to the background script every 5s.
  * Lightweight: polls position, no heavy DOM observation.
  *
- * @plasmo content_script
- * @match <all_urls>
+ * Bundle registration (audit finding EXT-3): this module lives under
+ * ``contents/`` and exports a ``PlasmoCSConfig`` so Plasmo emits it as a
+ * content script in the built manifest. A bare ``@plasmo content_script``
+ * JSDoc tag on a root-level file is NOT honoured by Plasmo's analyzer — only
+ * files under ``contents/`` with an exported ``config`` (or the legacy
+ * ``*.content.ts`` naming) are bundled, so without this the tracker never
+ * injected and no ACTIVITY_UPDATE was ever emitted.
  */
+
+import type { PlasmoCSConfig } from "plasmo";
+
+export const config: PlasmoCSConfig = {
+    matches: ["<all_urls>"],
+    run_at: "document_idle",
+    all_frames: false,
+};
 
 // ---------------------------------------------------------------------------
 // Types

@@ -37,7 +37,6 @@ _FACEMESH_LEFT_EAR = 234
 _FACEMESH_RIGHT_EAR = 454
 _FACEMESH_NOSE_TIP = 1
 _FACEMESH_CHIN = 152
-_FACEMESH_FOREHEAD = 10
 
 
 @dataclass(frozen=True)
@@ -216,30 +215,35 @@ class PostureAnalyzer:
             PostureState with lean estimates (no shoulder drop).
         """
         # Extract key landmarks
-        left_ear = face_landmarks_px[_FACEMESH_LEFT_EAR]
-        right_ear = face_landmarks_px[_FACEMESH_RIGHT_EAR]
-        face_landmarks_px[_FACEMESH_NOSE_TIP]
-        chin = face_landmarks_px[_FACEMESH_CHIN]
-        forehead = face_landmarks_px[_FACEMESH_FOREHEAD]
+        left_ear = face_landmarks_px[_FACEMESH_LEFT_EAR][:2]
+        right_ear = face_landmarks_px[_FACEMESH_RIGHT_EAR][:2]
+        nose_tip = face_landmarks_px[_FACEMESH_NOSE_TIP][:2]
+        chin = face_landmarks_px[_FACEMESH_CHIN][:2]
 
-        # Ear midpoint
-        (left_ear + right_ear) / 2.0
+        # Ear midpoint — anatomically the pitch-rotation axis of the head,
+        # so it is the reference origin for the forward-lean vector. The
+        # nose tip refines the origin toward the facial plane (it shifts
+        # forward as the head pitches), making the lean estimate respond to
+        # the full ear → nose → chin geometry rather than face height alone.
+        ear_midpoint = (left_ear + right_ear) / 2.0
+        lean_origin = (ear_midpoint + nose_tip) / 2.0
 
-        # Forward lean: angle between vertical and ear-midpoint → chin vector
-        # In upright posture, chin is roughly below ear midpoint
-        # Forward lean shifts chin forward (rightward in some views)
-        #
-        # Use the forehead-chin line angle relative to vertical
-        face_vector = chin - forehead  # Points from forehead to chin
+        # Forward lean: angle between the vertical axis and the
+        # (ear/nose origin) → chin vector. In an upright pose the chin sits
+        # roughly below the origin, so the vector is near vertical (~0°).
+        # Leaning forward pitches the head down, swinging the chin
+        # downward-and-forward relative to the ears and increasing this
+        # angle.
+        face_vector = chin - lean_origin  # origin → chin
         vertical = np.array([0.0, 1.0])  # Pointing down in image coords
 
         # Compute angle between face vector and vertical
-        face_len = np.linalg.norm(face_vector)
+        face_len = float(np.linalg.norm(face_vector))
         if face_len < 1e-6:
             lean_angle = 0.0
         else:
-            cos_angle = np.dot(face_vector, vertical) / face_len
-            cos_angle = np.clip(cos_angle, -1.0, 1.0)
+            cos_angle = float(np.dot(face_vector, vertical)) / face_len
+            cos_angle = float(np.clip(cos_angle, -1.0, 1.0))
             lean_angle = float(np.degrees(np.arccos(cos_angle)))
 
         # Adjust for baseline if available

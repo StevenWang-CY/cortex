@@ -17,6 +17,7 @@ import signal
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 from cortex.libs.utils.shell_allowlist import validate_command
 from cortex.services.launcher.project_config import ProjectConfig
@@ -82,7 +83,7 @@ class ProjectLauncher:
         )
         # P1-1: track spawned background subprocess tasks so stop()/aclose()
         # can cancel them and avoid leaving zombie processes.
-        self._spawned: set[asyncio.Task] = set()
+        self._spawned: set[asyncio.Task[None]] = set()
 
     async def stop(self) -> None:
         """Cancel and reap all tracked background subprocess tasks."""
@@ -101,7 +102,7 @@ class ProjectLauncher:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def launch(self, project_name: str) -> dict:
+    async def launch(self, project_name: str) -> dict[str, Any]:
         """
         Launch a project by name.
 
@@ -121,7 +122,7 @@ class ProjectLauncher:
         if config is None:
             return {"success": False, "error": f"Project '{project_name}' not found"}
 
-        results: dict = {"success": True, "steps": []}
+        results: dict[str, Any] = {"success": True, "steps": []}
 
         # Step 1: Open VS Code workspace
         if config.vscode_workspace:
@@ -175,7 +176,7 @@ class ProjectLauncher:
         logger.info("Saved project config: %s", name)
         return config
 
-    def list_projects(self) -> list[dict]:
+    def list_projects(self) -> list[dict[str, Any]]:
         """List all available project configs."""
         configs = ProjectConfig.list_projects(self._storage_path)
         return [c.model_dump() for c in configs]
@@ -234,7 +235,7 @@ class ProjectLauncher:
             logger.debug("Failed to open URL: %s", url)
             return False
 
-    async def _run_terminal_command(self, command: str) -> dict:
+    async def _run_terminal_command(self, command: str) -> dict[str, Any]:
         """Run a terminal command in the background.
 
         Audit F12: the legacy implementation passed ``command`` straight

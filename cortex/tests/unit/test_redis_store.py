@@ -1,4 +1,4 @@
-"""Tests for InMemoryStore (no Redis required)."""
+"""Tests for InMemoryStore + C7 Redis-fallback durability (no Redis required)."""
 
 from __future__ import annotations
 
@@ -7,11 +7,19 @@ import time
 
 import pytest
 
+from cortex.libs.store import _default_persist_path, make_default_store
 from cortex.libs.store.memory_store import InMemoryStore
+from cortex.libs.store.redis_store import RedisStore
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # ``asyncio.run`` spins up a fresh event loop per call, so these
+    # synchronous wrappers stay robust under pytest-asyncio AUTO mode
+    # (which closes the policy loop after any ``async def`` test runs).
+    # The legacy ``asyncio.get_event_loop().run_until_complete`` pattern
+    # raised "Event loop is closed" once a sibling async test had run in
+    # the same session.
+    return asyncio.run(coro)
 
 
 @pytest.fixture
@@ -151,3 +159,117 @@ class TestMiscellaneous:
 
     def test_get_float_missing(self, store):
         assert _run(store.get_float("missing")) is None
+
+
+# ---------------------------------------------------------------------------
+# Finding-9: increment atomicity across concurrent awaiters
+# ---------------------------------------------------------------------------
+
+
+class TestIncrementConcurrency:
+    def test_concurrent_increments_lose_no_updates(self, store):
+        """1000 concurrent ``increment`` coroutines must produce exactly
+        1000 — no lost updates. The asyncio.Lock guards the
+        read-modify-write-persist sequence so the docstring's
+        "atomically" claim holds even if a future await is introduced
+        inside the critical section."""
+
+        async def hammer() -> int:
+            await asyncio.gather(*(store.increment("hot") for _ in range(1000)))
+            return await store.increment("hot") - 1  # final count w/o the probe
+
+        # _run uses asyncio.run -> single fresh loop; gather schedules all
+        # 1000 coroutines onto it concurrently.
+        final = _run(hammer())
+        assert final == 1000
+
+
+# ---------------------------------------------------------------------------
+# C7 (audit): Redis durability — default store + degraded fallback
+# ---------------------------------------------------------------------------
+
+
+class _RedisDisabledCfg:
+    """Duck-typed config stub: Redis sub-config with enabled=False."""
+
+    class _Redis:
+        enabled = False
+        key_prefix = "cortex"
+
+    redis = _Redis()
+
+
+class _RedisEnabledUnreachableCfg:
+    """Duck-typed config stub: Redis enabled but pointed at a dead port."""
+
+    class _Redis:
+        enabled = True
+        host = "127.0.0.1"
+        # Port 1 is never a live Redis; the connection attempt fails fast.
+        port = 1
+        db = 0
+        key_prefix = "cortex"
+
+    redis = _Redis()
+
+
+class TestC7DefaultStorePersists:
+    def test_default_config_returns_persistent_in_memory_store(self, tmp_path):
+        """C7 (a): with Redis disabled (the new default), make_default_store
+        returns an InMemoryStore wired to a persist_path so consent /
+        calibration state survives a daemon restart."""
+        persist = tmp_path / "store.json"
+        store = make_default_store(_RedisDisabledCfg(), persist_path=persist)
+        assert isinstance(store, InMemoryStore)
+
+        _run(store.set_json("consent_ladder_state", {"level": "reversible_act"}))
+        assert persist.exists()
+
+        # Simulate a daemon restart: a fresh store at the same path must
+        # resume the prior value.
+        reborn = make_default_store(_RedisDisabledCfg(), persist_path=persist)
+        assert _run(reborn.get_json("consent_ladder_state")) == {
+            "level": "reversible_act"
+        }
+
+    def test_default_persist_path_used_when_none_supplied(self):
+        """No explicit persist_path -> the OS-appropriate default path is
+        used (never an ephemeral in-memory-only store)."""
+        store = make_default_store(_RedisDisabledCfg())
+        assert isinstance(store, InMemoryStore)
+        assert store._persist_path == _default_persist_path()
+
+
+class TestC7RedisFallbackDurability:
+    def test_enabled_but_unreachable_falls_back_and_persists(self, tmp_path):
+        """C7 (b): Redis enabled-but-unreachable -> the RedisStore degrades
+        to a PERSISTENT InMemoryStore. State survives a simulated restart
+        and ``degraded`` is True."""
+        persist = tmp_path / "redis_fallback.json"
+        store = make_default_store(
+            _RedisEnabledUnreachableCfg(), persist_path=persist
+        )
+        assert isinstance(store, RedisStore)
+        # Before any op the connection is lazy, so not yet degraded.
+        assert store.degraded is False
+
+        # First op probes Redis (fails), constructs the persistent fallback.
+        _run(store.set_json("consent_ladder_state", {"level": "preview"}))
+        assert store.degraded is True
+        assert persist.exists()
+
+        # Simulated restart: a brand-new RedisStore at the same dead port +
+        # persist path must resume the prior value from disk.
+        reborn = make_default_store(
+            _RedisEnabledUnreachableCfg(), persist_path=persist
+        )
+        assert _run(reborn.get_json("consent_ladder_state")) == {"level": "preview"}
+        assert reborn.degraded is True
+
+    def test_degraded_flag_starts_false_before_any_operation(self, tmp_path):
+        store = RedisStore(
+            host="127.0.0.1",
+            port=1,
+            fallback_persist_path=tmp_path / "fb.json",
+        )
+        assert store.degraded is False

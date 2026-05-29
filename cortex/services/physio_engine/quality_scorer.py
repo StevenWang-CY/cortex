@@ -194,9 +194,14 @@ class QualityScorer:
             fallback_assessment = self.assess_quality(fallback_bvp, fs, fallback)
 
             if fallback_assessment.overall_quality > _QUALITY_POOR:
+                prev_quality = (
+                    self._latest_assessment.overall_quality
+                    if self._latest_assessment is not None
+                    else 0.0
+                )
                 logger.info(
                     f"Switching rPPG algorithm: {self._current.value} → {fallback.value} "
-                    f"(quality: {self._latest_assessment.overall_quality:.2f} → "
+                    f"(quality: {prev_quality:.2f} → "
                     f"{fallback_assessment.overall_quality:.2f})"
                 )
                 self._current = fallback

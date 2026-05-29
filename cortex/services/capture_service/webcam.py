@@ -657,7 +657,11 @@ class WebcamCapture:
 
         # Open camera
         self._cap, self._camera_selection = open_video_capture(self._config)
-        if self._cap is None or not self._cap.isOpened():
+        if (
+            self._cap is None
+            or not self._cap.isOpened()
+            or self._camera_selection is None
+        ):
             raise RuntimeError(
                 f"Cannot open webcam device {describe_requested_camera(self._config)}"
             )

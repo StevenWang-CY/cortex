@@ -167,9 +167,9 @@ def show_summary(events: list[dict]) -> None:
 
     if transitions:
         print(f"\n  State Transitions: {len(transitions)}")
-        for t in transitions:
-            data = t.get("data", {})
-            ts = _format_timestamp(t.get("ts", 0), start_ts)
+        for tr in transitions:
+            data = tr.get("data", {})
+            ts = _format_timestamp(tr.get("ts", 0), start_ts)
             from_s = data.get("from_state", "?")
             to_s = data.get("to_state", "?")
             print(f"    [{ts}] {from_s} -> {to_s}")

@@ -38,7 +38,7 @@ from PySide6.QtCore import (
 try:
     from PySide6.QtGui import QKeyEvent
 except ImportError:  # pragma: no cover - test stubs
-    QKeyEvent = object  # type: ignore[assignment,misc]
+    QKeyEvent = object
 
 try:
     from PySide6.QtWidgets import (
@@ -50,7 +50,7 @@ try:
         QWidget,
     )
 except ImportError:  # pragma: no cover - lightweight stubs
-    from PySide6.QtWidgets import (  # type: ignore[attr-defined]
+    from PySide6.QtWidgets import (
         QFrame,
         QHBoxLayout,
         QLabel,

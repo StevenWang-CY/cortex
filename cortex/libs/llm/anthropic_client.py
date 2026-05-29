@@ -26,11 +26,13 @@ from typing import Literal, cast
 
 from anthropic import AsyncAnthropic, AsyncAnthropicBedrock, AsyncAnthropicVertex
 
-LogicalModel = Literal[
-    "claude-opus-4-7",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5",
-]
+# F-audit single-source-of-truth: the canonical logical-model literal lives
+# in :mod:`cortex.libs.config.settings` as ``LogicalModelId``. This module
+# re-exports it under the historical name ``LogicalModel`` so the two
+# definitions can never drift (a new tier added in settings is immediately
+# visible to the resolver tables below). ``cortex.libs.config.settings``
+# does not import this module, so there is no import cycle.
+from cortex.libs.config.settings import LogicalModelId as LogicalModel
 
 Provider = Literal["bedrock", "vertex", "direct"]
 
@@ -142,3 +144,16 @@ def build_anthropic_sdk_client(
             "ANTHROPIC_API_KEY missing; cannot build direct Anthropic client.",
         )
     return AsyncAnthropic(api_key=api_key)
+
+
+# ``LogicalModel`` is re-exported from ``cortex.libs.config.settings`` (it
+# is the canonical ``LogicalModelId`` literal). The explicit ``__all__``
+# entry makes the re-export visible under mypy --strict's
+# ``no_implicit_reexport`` so downstream callers can keep importing the
+# historical name from this module.
+__all__ = [
+    "LogicalModel",
+    "Provider",
+    "build_anthropic_sdk_client",
+    "resolve_anthropic_model_id",
+]

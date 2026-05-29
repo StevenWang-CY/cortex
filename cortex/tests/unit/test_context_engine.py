@@ -272,6 +272,40 @@ class TestEditorAdapter:
         adapter = EditorAdapter()
         assert not adapter.available
 
+    def test_malformed_diagnostics_entry_skipped_not_crash(self):
+        """F-finding #4: a non-dict entry inside ``diagnostics`` (from
+        the untrusted, optional editor extension) must be skipped, not
+        raise an uncaught ``AttributeError`` that escapes
+        ``update_from_payload`` and crashes the WS push handler.
+        """
+        adapter = EditorAdapter()
+        ctx = adapter.update_from_payload(
+            {
+                "file_path": "/src/x.py",
+                "diagnostics": [
+                    "garbage",  # non-dict — must be skipped
+                    {"severity": "error", "message": "boom", "line": 3},
+                    42,  # non-dict — must be skipped
+                ],
+            }
+        )
+        assert ctx is not None
+        # Only the one well-formed diagnostic survives.
+        assert ctx.error_count == 1
+        assert ctx.file_path == "/src/x.py"
+
+    def test_malformed_diagnostics_not_a_list_degrades_gracefully(self):
+        """``diagnostics`` arriving as a non-list degrades to "no
+        diagnostics" without raising or discarding the rest of the
+        payload."""
+        adapter = EditorAdapter()
+        ctx = adapter.update_from_payload(
+            {"file_path": "/src/y.py", "diagnostics": "not-a-list"}
+        )
+        assert ctx is not None
+        assert ctx.diagnostics == []
+        assert ctx.file_path == "/src/y.py"
+
 
 # =============================================================================
 # Browser Adapter Tests
@@ -324,6 +358,42 @@ class TestBrowserAdapter:
     def test_unavailable_without_ws(self):
         adapter = BrowserAdapter()
         assert not adapter.available
+
+    def test_malformed_all_tabs_not_a_list_degrades_gracefully(self):
+        """F-finding #4: a malformed payload from the (untrusted,
+        optional) browser extension must NOT raise an uncaught
+        ``AttributeError`` that crashes the WS push handler. ``all_tabs``
+        arriving as a non-list degrades to "no tabs" rather than losing
+        the whole (otherwise-valid) payload.
+        """
+        adapter = BrowserAdapter()
+        # Before the fix this raised AttributeError ('str' has no .get).
+        ctx = adapter.update_from_payload(
+            {"active_tab_title": "Home", "all_tabs": "not-a-list"}
+        )
+        assert ctx is not None
+        assert ctx.tab_count == 0
+        assert ctx.active_tab_title == "Home"
+
+    def test_malformed_tab_entry_skipped_not_crash(self):
+        """A single non-dict entry inside ``all_tabs`` must not discard
+        the whole payload nor raise — the bad entry is skipped and the
+        valid tabs still parse.
+        """
+        adapter = BrowserAdapter()
+        ctx = adapter.update_from_payload(
+            {
+                "all_tabs": [
+                    "garbage",  # non-dict — must be skipped
+                    {"title": "Real", "url": "https://docs.python.org/3"},
+                    12345,  # non-dict — must be skipped
+                ]
+            }
+        )
+        assert ctx is not None
+        # Only the one well-formed tab survives.
+        assert ctx.tab_count == 1
+        assert adapter.available
 
 
 # =============================================================================

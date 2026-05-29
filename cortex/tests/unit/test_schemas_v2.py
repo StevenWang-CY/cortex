@@ -8,6 +8,7 @@ import pytest
 
 from cortex.libs.schemas.features import FeatureVector
 from cortex.libs.schemas.intervention import (
+    DismissalRecord,
     ErrorAnalysis,
     InterventionOutcome,
     InterventionPlan,
@@ -127,6 +128,61 @@ class TestInterventionPlan:
                 consent_level=level,
             )
             assert plan.consent_level == level
+
+    def test_trigger_url_defaults_none(self, plan):
+        """C3 (audit): trigger_url is a new optional field; absent on a
+        plan the daemon hasn't stamped it on."""
+        assert plan.trigger_url is None
+
+    def test_trigger_url_roundtrips(self):
+        """C3: the daemon stamps the active-tab URL; surfaces read it back
+        through model_dump/validate unchanged."""
+        plan = InterventionPlan(
+            level="overlay_only",
+            situation_summary="summary",
+            headline="headline",
+            primary_focus="focus",
+            micro_steps=["step"],
+            ui_plan=UIPlan(),
+            trigger_url="https://news.example.com/article",
+        )
+        blob = plan.model_dump(mode="json")
+        assert blob["trigger_url"] == "https://news.example.com/article"
+        restored = InterventionPlan.model_validate(blob)
+        assert restored.trigger_url == "https://news.example.com/article"
+
+
+# ---------------------------------------------------------------------------
+# DismissalRecord — Finding-11: tz-aware/naive age_seconds
+# ---------------------------------------------------------------------------
+
+
+class TestDismissalRecordAge:
+    def test_age_seconds_with_aware_timestamp_does_not_raise(self):
+        """Finding-11: a tz-aware timestamp (the shape the structured
+        logging layer emits) previously raised TypeError when subtracting
+        from a naive datetime.now()."""
+        from datetime import UTC
+
+        rec = DismissalRecord(
+            intervention_id="int_1",
+            timestamp=datetime.now(UTC),
+            state_at_dismissal="HYPER",
+            confidence_at_dismissal=0.9,
+        )
+        age = rec.age_seconds  # must not raise
+        assert age >= 0.0
+        assert age < 5.0  # just created
+
+    def test_age_seconds_with_naive_timestamp(self):
+        rec = DismissalRecord(
+            intervention_id="int_2",
+            timestamp=datetime.now(),
+            state_at_dismissal="HYPER",
+            confidence_at_dismissal=0.9,
+        )
+        assert rec.age_seconds >= 0.0
+        assert rec.age_seconds < 5.0
 
 
 # ---------------------------------------------------------------------------

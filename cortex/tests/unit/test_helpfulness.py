@@ -8,9 +8,15 @@ import pytest
 
 from cortex.services.eval.helpfulness import HelpfulnessTracker
 
+_LOOP = asyncio.new_event_loop()
+
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # Dedicated module loop, NOT asyncio.get_event_loop() (deprecated; it
+    # returns a closed/foreign loop once pytest-asyncio tears down the
+    # default loop earlier in the same process, which made these tests fail
+    # only when run alongside async tests — CLAUDE.md rule #16).
+    return _LOOP.run_until_complete(coro)
 
 
 @pytest.fixture
@@ -164,3 +170,46 @@ class TestGetSummary:
 
         summary = _run(tracker.get_summary())
         assert abs(tracker.mean_reward - summary["mean_reward"]) < 1e-9
+
+    def test_summary_contract_is_explicit_superset_of_http_model(self, tracker):
+        """The get_summary() contract (HelpfulnessSummary TypedDict) is a
+        deliberate SUPERSET of the HTTP HelpfulnessSummaryResponse model.
+
+        F-finding #2: get_summary() previously returned an undeclared
+        ``dict`` whose extra keys (``total_tracked`` / ``positive_rate``)
+        silently drifted from the api_gateway response model. The
+        contract is now explicit; this test locks in BOTH the HTTP-model
+        keys and the backward-compat aliases so neither side can drift
+        without the suite turning red.
+        """
+        from cortex.services.eval.helpfulness import HelpfulnessSummary
+
+        summary = _run(tracker.get_summary())
+        # Every key the HTTP response model maps directly from get_summary.
+        http_model_keys = {
+            "total_interventions",
+            "mean_reward",
+            "engagement_rate",
+            "recent_rewards",
+        }
+        # Backward-compat aliases consumed by WS dashboard + these tests.
+        compat_keys = {"total_tracked", "positive_rate"}
+        actual_keys = set(summary.keys())
+        assert http_model_keys <= actual_keys, (
+            "get_summary must provide every HTTP-model field"
+        )
+        assert compat_keys <= actual_keys, (
+            "get_summary must keep the backward-compat aliases"
+        )
+        # The TypedDict's declared keys must match exactly what we emit —
+        # this is what makes the contract "explicit" rather than ad-hoc.
+        assert set(HelpfulnessSummary.__annotations__.keys()) == actual_keys
+        # The HTTP model ignores extra keys, so constructing it from the
+        # summary must succeed (round-trips the documented superset).
+        from cortex.services.api_gateway.routes import (
+            HelpfulnessSummaryResponse,
+        )
+
+        resp = HelpfulnessSummaryResponse(**summary)
+        assert resp.total_interventions == summary["total_interventions"]
+        assert resp.mean_reward == summary["mean_reward"]

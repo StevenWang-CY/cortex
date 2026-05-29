@@ -818,7 +818,7 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
 
         // P1 (audit Phase 4d, Task B): reconnect button on the
         // daemon-offline empty state. Asks the host to call
-        // ``CortexWSClient.connect()`` via a dedicated command rather
+        // 'CortexWSClient.connect()' via a dedicated command rather
         // than via the activity-bar palette command, so the panel can
         // recover without leaving the webview.
         const reconnectBtn = document.getElementById('reconnect-btn');
@@ -989,7 +989,7 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
         });
 
         // P0 §3.6: micro-step checkbox toggle. Each click posts a
-        // ``microStepToggled`` message to the extension, which forwards
+        // 'microStepToggled' message to the extension, which forwards
         // it as MICRO_STEP_TOGGLED via the WS client. The daemon
         // rebroadcasts INTERVENTION_TRIGGER so the strikethrough state
         // converges across every connected surface.

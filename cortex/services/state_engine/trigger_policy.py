@@ -496,7 +496,16 @@ class TriggerPolicy:
         # intervention outright; ``quiet`` slots are honoured by upstream
         # PREVIEW-only callers (the receptivity gate already passed). A
         # ``None`` slot (no schedule armed) preserves legacy behaviour.
-        slot_value = self.lookup_schedule_slot(when=current_time)
+        #
+        # P1: the schedule slot lookup MUST use wall-clock day-of-week /
+        # hour, NOT ``current_time``. ``current_time`` is the monotonic
+        # cooldown clock (line ~398, ``time.monotonic()``); feeding it
+        # into ``datetime.fromtimestamp`` yields a garbage weekday/hour
+        # (monotonic epoch is process-boot-relative, not UNIX wall time)
+        # and mis-gates the weekly schedule. Pass no ``when`` so the
+        # lookup resolves against ``datetime.now()`` (local wall clock),
+        # decoupled from the cooldown clock.
+        slot_value = self.lookup_schedule_slot()
         if slot_value == "off":
             return TriggerDecision(
                 should_trigger=False,
@@ -1004,7 +1013,15 @@ class TriggerPolicy:
         """
         now = time.monotonic() if timestamp is None else timestamp
         self._dismissals.append(DismissalEvent(timestamp=now))
-        self._dismissals_total += 1
+        # P1: do NOT increment ``_dismissals_total`` here. The daemon's
+        # dismiss path calls BOTH ``record_dismissal()`` (quiet-mode
+        # escalation + threshold bumps) AND ``record_outcome(dismissed=
+        # True)`` (adaptive feedback counter) for a single dismissal —
+        # incrementing in both double-counted the adaptive-threshold
+        # offset, making one dismissal nudge the threshold by +0.02 while
+        # one approval only moved it -0.01. ``_dismissals_total`` is the
+        # symmetric counterpart of ``_approvals_total`` and is owned
+        # exclusively by ``record_outcome``.
 
         # Add threshold bump (+0.05 for 1 hour)
         expiry = now + self._config.dismissal_decay_hours * 3600.0

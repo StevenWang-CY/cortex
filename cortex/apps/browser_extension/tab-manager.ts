@@ -30,6 +30,26 @@ export interface TabSnapshot {
     activeTabId: number | null;
 }
 
+/**
+ * The set of tab-group colors accepted by `chrome.tabGroups.update`.
+ *
+ * `@types/chrome` 0.1.42 removed the old `chrome.tabGroups.ColorEnum`
+ * alias; the wire-level color value is now the string-literal union derived
+ * from the `chrome.tabGroups.Color` enum (`` `${chrome.tabGroups.Color}` ``).
+ * We expose it as a named local type so call sites stay readable.
+ */
+export type TabGroupColor = `${chrome.tabGroups.Color}`;
+
+/**
+ * Narrow a `number[]` to the non-empty tuple shape (`[number, ...number[]]`)
+ * that `chrome.tabs.group` / `chrome.tabs.ungroup` require for their `tabIds`
+ * parameter. Callers MUST guarantee the array is non-empty before calling;
+ * the cast is sound because every call site guards `length === 0` first.
+ */
+function asNonEmptyTabIds(tabIds: number[]): [number, ...number[]] {
+    return tabIds as [number, ...number[]];
+}
+
 // --- Classification ---
 
 const DOC_PATTERNS =
@@ -229,7 +249,9 @@ function scheduleSnapshotPersist(): void {
 
 async function restoreSnapshots(): Promise<void> {
     try {
-        const data = await chrome.storage.session.get("cortex_tab_mgr_snapshots");
+        const data = (await chrome.storage.session.get(
+            "cortex_tab_mgr_snapshots",
+        )) as { cortex_tab_mgr_snapshots?: [string, TabSnapshot][] };
         if (data.cortex_tab_mgr_snapshots) {
             snapshots.clear();
             for (const [k, v] of data.cortex_tab_mgr_snapshots) {
@@ -282,7 +304,7 @@ export async function hideNonActiveTabs(
 
         let groupId: number | null = null;
         try {
-            groupId = await chrome.tabs.group({ tabIds: toHide });
+            groupId = await chrome.tabs.group({ tabIds: asNonEmptyTabIds(toHide) });
             await chrome.tabGroups.update(groupId, {
                 collapsed: true,
                 title: "Cortex: Hidden",
@@ -324,7 +346,7 @@ export async function restoreHiddenTabs(
         // Ungroup the tabs (restores them to normal state)
         if (snapshot.hiddenTabIds.length > 0) {
             try {
-                await chrome.tabs.ungroup(snapshot.hiddenTabIds);
+                await chrome.tabs.ungroup(asNonEmptyTabIds(snapshot.hiddenTabIds));
             } catch {
                 // Some tabs may have been closed by the user
             }
@@ -371,11 +393,11 @@ export function hasActiveHiding(): boolean {
 export async function groupSpecificTabs(
     tabIds: number[],
     groupName: string,
-    color: chrome.tabGroups.ColorEnum = "blue",
+    color: TabGroupColor = "blue",
 ): Promise<number | null> {
     if (tabIds.length === 0) return null;
     try {
-        const groupId = await chrome.tabs.group({ tabIds });
+        const groupId = await chrome.tabs.group({ tabIds: asNonEmptyTabIds(tabIds) });
         await chrome.tabGroups.update(groupId, {
             collapsed: true,
             title: groupName,

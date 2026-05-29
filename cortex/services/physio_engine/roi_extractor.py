@@ -178,7 +178,9 @@ class RoiExtractor:
         if landmarks_px.size == 0:
             self._latest_head_jitter_px = 0.0
             return
-        center = np.mean(landmarks_px, axis=0, dtype=np.float64)
+        center = np.asarray(
+            np.mean(landmarks_px, axis=0, dtype=np.float64), dtype=np.float64
+        )
         if self._prev_face_center is None:
             self._latest_head_jitter_px = 0.0
         else:
