@@ -56,7 +56,7 @@ dependencies = [
 
     # Signal Processing & Numerics
     "scipy>=1.12.0",
-    "numpy>=1.26.0",
+    "numpy>=2.4.6",
 
     # Input Telemetry
     "pynput>=1.7.6",
