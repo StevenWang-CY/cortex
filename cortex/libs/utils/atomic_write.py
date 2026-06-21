@@ -18,6 +18,7 @@ import errno
 import json
 import logging
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -38,14 +39,27 @@ def atomic_write_text(
     if the temp write or rename fails. Callers that want to swallow the
     error must do so explicitly so the failure is logged at a meaningful
     layer (not buried at the bottom of a try/except chain).
+
+    Uses a unique temp file per call (via :func:`tempfile.mkstemp`) so that
+    concurrent writers to the same destination do not share a single temp fd
+    and interleave bytes.  The temp file lives in the same directory as the
+    destination so that ``os.replace`` is always an in-directory rename
+    (guaranteed atomic on POSIX) rather than a cross-device copy.
     """
     if ensure_dir:
         path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    # Write + fsync + rename. Open with low-level os APIs so fsync sees a
-    # real fd; ``Path.write_text`` does not expose the descriptor.
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    # Unique temp file in the same directory — no two concurrent calls share
+    # an fd, eliminating byte interleaving and partial-overwrite races.
+    fd, tmp_str = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=path.name + ".",
+        suffix=".tmp",
+    )
+    tmp = Path(tmp_str)
     try:
+        # Write + fsync + rename. Using the fd returned by mkstemp keeps the
+        # existing durability semantics; ``Path.write_text`` does not expose
+        # the descriptor.
         with os.fdopen(fd, "w", encoding=encoding) as fp:
             fp.write(text)
             fp.flush()

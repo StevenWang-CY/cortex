@@ -46,21 +46,21 @@ class TestLeetCodeAdapterProperties:
         assert adapter.name == "leetcode"
 
     def test_capabilities_include_expected_actions(self):
+        # Only the 5 actions actually emitted by InterventionMatrix are advertised.
+        # The 10 previously listed actions (lock_editor, intercept_submit, etc.)
+        # were dead code with no browser handler — they were pruned (LEETCODE-CAPS).
         adapter = LeetCodeAdapter()
         caps = adapter.capabilities
         expected = [
-            "lock_editor",
-            "intercept_submit",
-            "gate_solutions",
             "show_scratchpad",
             "show_pattern_ladder",
             "show_lockout",
-            "show_consolidation",
             "show_submission_gate",
             "show_solution_friction",
         ]
         for action in expected:
             assert action in caps, f"Missing capability: {action}"
+        assert len(caps) == 5, f"Expected exactly 5 capabilities, got {len(caps)}: {caps}"
 
 
 class TestLeetCodeAdapterExecute:

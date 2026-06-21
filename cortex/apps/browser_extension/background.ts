@@ -1708,6 +1708,34 @@ async function handleMessage(raw: string): Promise<void> {
             break;
         }
 
+        case "INTERVENTION_FAILED": {
+            // P1-FC-INTERVENTION-FAILED: the daemon's InterventionExecutor
+            // returned only failed mutations — the workspace was NOT
+            // changed. This message previously had no consumer on the
+            // browser surface, so a total mutation failure was silently
+            // invisible. Relay it to the popup so the intervention card
+            // flips to an error state and disables its CTA.
+            broadcastToPopup({
+                type: "INTERVENTION_FAILED",
+                payload: msg.payload,
+            });
+            break;
+        }
+
+        case "INTERVENTION_PROMPT": {
+            // P1-FC-INTERVENTION-PROMPT: cross-surface micro-commit /
+            // movement-break prompt. Consumed inline on the desktop
+            // overlay but previously DROPPED on the browser, so a
+            // popup-open user got no awareness of an active prompt.
+            // Forward it so the popup can render the prompt text inline
+            // above the action card (informational).
+            broadcastToPopup({
+                type: "INTERVENTION_PROMPT",
+                payload: msg.payload,
+            });
+            break;
+        }
+
         default: {
             // audit-w2 (audit contract sweep): the schema catalogue in
             // ``ws_message_types.py`` registers wire types the daemon

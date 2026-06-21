@@ -703,6 +703,18 @@ function CortexPopup(): React.ReactElement {
     const [errAnalysis, setErrAnalysis] = useState<Record<string, string> | null>(null);
     const [interventionId, setInterventionId] = useState<string>("");
     const [applied, setApplied] = useState(false);
+    // P1-FC-INTERVENTION-FAILED: when the daemon reports that an
+    // intervention's mutations ALL failed (workspace NOT changed), the
+    // card flips to an error state and the apply CTA is disabled. Holds
+    // the user-facing reason string, or null when not failed.
+    const [interventionError, setInterventionError] = useState<string | null>(
+        null,
+    );
+    // P1-FC-INTERVENTION-PROMPT: cross-surface micro-commit / movement-
+    // break prompt text rendered informationally above the action card.
+    const [interventionPrompt, setInterventionPrompt] = useState<string | null>(
+        null,
+    );
     const [causalExplanation, setCausalExplanation] = useState<string>("");
     // P0 §3.6: micro-step checklist. The wire payload may carry either
     // the legacy ``string[]`` shape or the new ``{text, status, …}[]``
@@ -1163,6 +1175,10 @@ function CortexPopup(): React.ReactElement {
                 setWhyOpen(false);
                 setWhyError(null);
                 setApplied(false);
+                // A fresh intervention clears any prior failure/prompt
+                // state so the card starts clean.
+                setInterventionError(null);
+                setInterventionPrompt(null);
                 break;
             }
             case "INTERVENTION_RESTORE":
@@ -1185,7 +1201,41 @@ function CortexPopup(): React.ReactElement {
                 // remained on screen and clicking its CTA dispatched
                 // EXECUTE_ACTION with a dangling intervention_id.
                 setBreakRec(null);
+                setInterventionError(null);
+                setInterventionPrompt(null);
                 break;
+            case "INTERVENTION_FAILED": {
+                // P1-FC-INTERVENTION-FAILED: the daemon's executor returned
+                // only failed mutations — the workspace was NOT changed.
+                // Flip the card to an error state and disable the apply
+                // CTA so the user isn't told to engage with a broken plan.
+                const p = msg.payload as Record<string, unknown>;
+                const reason = String(p.error_reason || "").trim();
+                const failed = Array.isArray(p.failed_action_types)
+                    ? (p.failed_action_types as unknown[]).map((a) =>
+                          String(a).replace(/_/g, " "),
+                      )
+                    : [];
+                const body = reason
+                    ? reason
+                    : failed.length > 0
+                      ? `Couldn't apply: ${failed.join(", ")}.`
+                      : "Couldn't apply — check extension permissions";
+                setInterventionError(body);
+                // Treat the failed intervention as "applied" so the CTA is
+                // disabled; the error banner explains why.
+                setApplied(true);
+                break;
+            }
+            case "INTERVENTION_PROMPT": {
+                // P1-FC-INTERVENTION-PROMPT: cross-surface prompt sync. Show
+                // the prompt text inline above the action card so a
+                // popup-open user has awareness of the active prompt.
+                const p = msg.payload as Record<string, unknown>;
+                const prompt = String(p.prompt || "").trim();
+                setInterventionPrompt(prompt.length > 0 ? prompt : null);
+                break;
+            }
             case "BREAK_RECOMMENDATION": {
                 // P0 §3.7: BREAK_RECOMMENDATION pulse relayed from
                 // background.ts. Typed against the generated
@@ -1622,7 +1672,15 @@ function CortexPopup(): React.ReactElement {
     const realCausal = causalExplanation && causalExplanation.length > 20
         && /\d/.test(causalExplanation) ? causalExplanation : "";
 
-    const hasIntervention = activeActions.length > 0 || tabRecs || realErrAnalysis || microSteps.length > 0;
+    const hasIntervention =
+        activeActions.length > 0 ||
+        tabRecs ||
+        realErrAnalysis ||
+        microSteps.length > 0 ||
+        // P1-FC: a failure banner or an active cross-surface prompt must
+        // keep the card on screen even if no actionable items remain.
+        interventionError !== null ||
+        interventionPrompt !== null;
 
     // P0 §3.6: optimistic-toggle handler. The handler updates local
     // state immediately so the user sees the strikethrough flip without
@@ -2096,6 +2154,53 @@ function CortexPopup(): React.ReactElement {
             {/* Intervention preview */}
             {hasIntervention && (
                 <div style={S.interventionCard}>
+                    {/* P1-FC-INTERVENTION-FAILED: total-mutation-failure
+                        banner. The daemon reported the workspace was NOT
+                        changed; the apply CTA below is disabled while this
+                        is set so the user isn't told to engage a broken
+                        plan. */}
+                    {interventionError && (
+                        <div
+                            data-testid="intervention-error-banner"
+                            role="alert"
+                            style={{
+                                marginBottom: 12,
+                                padding: "8px 10px",
+                                background: "rgba(228, 122, 110, 0.12)",
+                                border: "1px solid rgba(228, 122, 110, 0.4)",
+                                borderRadius: CX.radiusSm,
+                                color: "#E47A6E",
+                                fontSize: 12,
+                                fontFamily: CX.font,
+                                lineHeight: 1.4,
+                            }}
+                        >
+                            {interventionError}
+                        </div>
+                    )}
+
+                    {/* P1-FC-INTERVENTION-PROMPT: informational prompt text
+                        relayed cross-surface (micro-commit / movement
+                        break). Rendered above the action card so a
+                        popup-open user has awareness of the active prompt. */}
+                    {interventionPrompt && (
+                        <div
+                            data-testid="intervention-prompt"
+                            style={{
+                                marginBottom: 12,
+                                padding: "8px 10px",
+                                background: "rgba(255, 255, 255, 0.04)",
+                                borderRadius: CX.radiusSm,
+                                color: CX.textSecondary,
+                                fontSize: 12,
+                                fontFamily: CX.font,
+                                lineHeight: 1.4,
+                            }}
+                        >
+                            {interventionPrompt}
+                        </div>
+                    )}
+
                     {/* Causal explanation */}
                     {realCausal && (
                         <div style={S.causalText}>{realCausal}</div>
@@ -2305,8 +2410,12 @@ function CortexPopup(): React.ReactElement {
                     {rec.length > 0 && (
                         <>
                             <button
-                                style={applied ? { ...S.primaryBtn, ...S.doneBtnStyle } : S.primaryBtn}
-                                disabled={applied}
+                                style={
+                                    applied || interventionError
+                                        ? { ...S.primaryBtn, ...S.doneBtnStyle }
+                                        : S.primaryBtn
+                                }
+                                disabled={applied || interventionError !== null}
                                 onClick={() => {
                                     sendWithCid(
                                         {
@@ -2332,7 +2441,9 @@ function CortexPopup(): React.ReactElement {
                                     );
                                 }}
                             >
-                                {applied
+                                {interventionError
+                                    ? "Couldn't apply"
+                                    : applied
                                     ? "Done"
                                     : closeTabs.length > 0
                                         ? `Close ${closeTabs.length} tab${closeTabs.length !== 1 ? "s" : ""}`

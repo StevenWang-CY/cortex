@@ -3056,7 +3056,7 @@ export interface StateUpdatePayload {
    */
   timestamp?: number | string | null;
   /**
-   * Deduped list of currently-IDENTIFY-ed client types (``chrome``, ``edge``, ``vscode``, ``desktop``). Used by the dashboard to light up connection dots without a separate event stream.
+   * Deduped list of currently-IDENTIFY-ed client types (``chrome``, ``edge``, ``vscode``). Used by the dashboard to light up connection dots without a separate event stream. ``desktop`` and ``unknown`` are intentionally EXCLUDED by the producer (WebSocketServer.connected_client_types) — the dashboard IS the desktop surface, so it never needs a self-connection dot.
    */
   connected_clients?: string[];
   capture?: CaptureStatus1;
@@ -3238,7 +3238,7 @@ export interface WhyDetail {
    */
   causal_signals?: [] | [CausalSignal] | [CausalSignal, CausalSignal] | [CausalSignal, CausalSignal, CausalSignal];
   /**
-   * Set when the daemon cannot supply a rationale (e.g. the intervention has already been GC'd from the active cache). Known values: 'not_found' | 'internal' | None (success).
+   * Set when the daemon cannot supply a rationale (e.g. the intervention has already been GC'd from the active cache). Known values: 'not_found' | 'internal' | 'handler_not_registered' (no WHY callback wired) | None (success).
    */
   error?: string | null;
 }

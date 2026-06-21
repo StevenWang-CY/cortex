@@ -47,7 +47,11 @@ _SOURCE_BUDGETS: dict[str, int] = {
     # below are sized for the *post-P0* footprint + ~10-15% headroom
     # so ordinary follow-up feature work does not need to bump them.
     "background.ts": 240_000,
-    "popup.tsx": 160_000,
+    # Bumped 160_000 -> 176_000 when the audit added the INTERVENTION_FAILED
+    # error banner + INTERVENTION_PROMPT inline cross-surface sync consumers
+    # (previously the daemon broadcast both with zero popup consumers). Keeps
+    # the documented ~10% headroom over the post-feature footprint.
+    "popup.tsx": 176_000,
     "newtab.tsx": 80_000,
     "tab-manager.ts": 60_000,
     "design-tokens.ts": 30_000,

@@ -239,7 +239,9 @@ class WhyDetail(BaseModel):
         description=(
             "Set when the daemon cannot supply a rationale (e.g. the "
             "intervention has already been GC'd from the active cache). "
-            "Known values: 'not_found' | 'internal' | None (success)."
+            "Known values: 'not_found' | 'internal' | "
+            "'handler_not_registered' (no WHY callback wired) | None "
+            "(success)."
         ),
     )
 
@@ -723,9 +725,12 @@ class StateUpdatePayload(BaseModel):
         default_factory=list,
         description=(
             "Deduped list of currently-IDENTIFY-ed client types "
-            "(``chrome``, ``edge``, ``vscode``, ``desktop``). Used by "
-            "the dashboard to light up connection dots without a "
-            "separate event stream."
+            "(``chrome``, ``edge``, ``vscode``). Used by the dashboard "
+            "to light up connection dots without a separate event "
+            "stream. ``desktop`` and ``unknown`` are intentionally "
+            "EXCLUDED by the producer "
+            "(WebSocketServer.connected_client_types) — the dashboard IS "
+            "the desktop surface, so it never needs a self-connection dot."
         ),
     )
     # ``default_factory=CaptureStatus`` follows the established project

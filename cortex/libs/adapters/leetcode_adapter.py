@@ -31,21 +31,11 @@ class LeetCodeAdapter(CortexAdapter):
     """
 
     _CAPABILITIES: list[str] = [
-        "lock_editor",
-        "intercept_submit",
-        "gate_solutions",
         "show_scratchpad",
         "show_pattern_ladder",
         "show_lockout",
-        "show_consolidation",
         "show_submission_gate",
         "show_solution_friction",
-        "show_session_briefing",
-        "ai_restatement_check",
-        "ai_comprehension_check",
-        "ai_hypothesis_check",
-        "ai_stuck_analysis",
-        "ai_session_briefing",
     ]
 
     def __init__(self) -> None:

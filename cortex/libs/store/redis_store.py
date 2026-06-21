@@ -20,6 +20,16 @@ from cortex.libs.store.memory_store import InMemoryStore
 
 logger = logging.getLogger(__name__)
 
+#: Redis exceptions that indicate the connection itself is gone (as
+#: opposed to a logical/data error like a bad command). On any of these
+#: the store drops the live client and degrades to the in-memory
+#: fallback. ``TimeoutError`` here is ``redis.asyncio.TimeoutError``
+#: (a ``RedisError`` subclass), not the builtin.
+_CONNECTION_ERRORS: tuple[type[BaseException], ...] = (
+    aioredis.ConnectionError,
+    aioredis.TimeoutError,
+)
+
 
 class RedisStore:
     """Async Redis-backed key-value / timeseries store.
@@ -120,26 +130,53 @@ class RedisStore:
             logger.info("Connected to Redis at %s:%s/%s", self._host, self._port, self._db)
             return self._client
         except Exception:
-            persist_path = self._fallback_persist_path
-            if persist_path is None:
-                # Deferred import breaks the package ``__init__`` ↔
-                # ``redis_store`` import cycle. The helper is cheap and
-                # only hit on the (rare) Redis-unreachable path.
-                from cortex.libs.store import _default_persist_path
-
-                persist_path = _default_persist_path()
-            logger.warning(
-                "Redis unavailable at %s:%s – falling back to a persistent "
-                "InMemoryStore at %s",
-                self._host,
-                self._port,
-                persist_path,
-            )
-            self._fallback = InMemoryStore(
-                key_prefix=self._prefix,
-                persist_path=persist_path,
-            )
+            self._build_fallback()
             return None
+
+    def _build_fallback(self) -> InMemoryStore:
+        """Construct (once) and return the persistent in-memory fallback.
+
+        Idempotent: if a fallback already exists it is returned as-is.
+        Shared by ``_get_client``'s connect-time failure arm and the
+        per-op runtime-degrade path (P2-BE-REDIS-RUNTIME-DEGRADE) so both
+        reach the SAME persistent store at the SAME path.
+        """
+        if self._fallback is not None:
+            return self._fallback
+        persist_path = self._fallback_persist_path
+        if persist_path is None:
+            # Deferred import breaks the package ``__init__`` ↔
+            # ``redis_store`` import cycle. The helper is cheap and
+            # only hit on the (rare) Redis-unreachable path.
+            from cortex.libs.store import _default_persist_path
+
+            persist_path = _default_persist_path()
+        logger.warning(
+            "Redis unavailable at %s:%s – falling back to a persistent "
+            "InMemoryStore at %s",
+            self._host,
+            self._port,
+            persist_path,
+        )
+        self._fallback = InMemoryStore(
+            key_prefix=self._prefix,
+            persist_path=persist_path,
+        )
+        return self._fallback
+
+    def _degrade(self) -> InMemoryStore:
+        """Drop a now-dead live client and switch to the fallback.
+
+        P2-BE-REDIS-RUNTIME-DEGRADE: the connect-time path only built the
+        fallback on the FIRST (ping) failure. After a successful ping the
+        per-op calls had no exception handling, so a mid-session Redis
+        death raised straight to the caller and ``degraded`` never
+        flipped. This drops the stale ``_client`` and constructs the same
+        persistent fallback used at connect time, then returns it so the
+        in-flight op can be retried.
+        """
+        self._client = None
+        return self._build_fallback()
 
     def _fallback_store(self) -> InMemoryStore:
         """Return the in-memory fallback once the Redis client has been
@@ -175,7 +212,11 @@ class RedisStore:
 
         ik = self._key(key)
         member = f"{timestamp}:{value}"
-        await client.zadd(ik, {member: timestamp})
+        try:
+            await client.zadd(ik, {member: timestamp})
+        except _CONNECTION_ERRORS:
+            logger.warning("Redis zadd failed mid-session; degrading to fallback")
+            return await self._degrade().append_timeseries(key, timestamp, value)
 
     async def get_timeseries(self, key: str, window_seconds: float) -> list[tuple[float, float]]:
         """Return timeseries entries within the last *window_seconds*.
@@ -193,9 +234,15 @@ class RedisStore:
 
         ik = self._key(key)
         min_score = time.time() - window_seconds
-        members: list[tuple[str, float]] = await client.zrangebyscore(
-            ik, min=min_score, max="+inf", withscores=True
-        )
+        try:
+            members: list[tuple[str, float]] = await client.zrangebyscore(
+                ik, min=min_score, max="+inf", withscores=True
+            )
+        except _CONNECTION_ERRORS:
+            logger.warning(
+                "Redis zrangebyscore failed mid-session; degrading to fallback"
+            )
+            return await self._degrade().get_timeseries(key, window_seconds)
         results: list[tuple[float, float]] = []
         for member, score in members:
             parts = str(member).split(":", 1)
@@ -220,7 +267,11 @@ class RedisStore:
         if client is None:
             return await self._fallback_store().get_json(key)
 
-        raw = await client.get(self._key(key))
+        try:
+            raw = await client.get(self._key(key))
+        except _CONNECTION_ERRORS:
+            logger.warning("Redis get failed mid-session; degrading to fallback")
+            return await self._degrade().get_json(key)
         if raw is None:
             return None
         return cast("dict[str, Any]", json.loads(raw))
@@ -239,10 +290,14 @@ class RedisStore:
 
         ik = self._key(key)
         payload = json.dumps(value)
-        if ttl_seconds is not None:
-            await client.set(ik, payload, ex=ttl_seconds)
-        else:
-            await client.set(ik, payload)
+        try:
+            if ttl_seconds is not None:
+                await client.set(ik, payload, ex=ttl_seconds)
+            else:
+                await client.set(ik, payload)
+        except _CONNECTION_ERRORS:
+            logger.warning("Redis set failed mid-session; degrading to fallback")
+            return await self._degrade().set_json(key, value, ttl_seconds)
 
     # ------------------------------------------------------------------
     # Numeric helpers
@@ -261,7 +316,11 @@ class RedisStore:
         if client is None:
             return await self._fallback_store().increment(key)
 
-        return int(await client.incr(self._key(key)))
+        try:
+            return int(await client.incr(self._key(key)))
+        except _CONNECTION_ERRORS:
+            logger.warning("Redis incr failed mid-session; degrading to fallback")
+            return await self._degrade().increment(key)
 
     async def get_float(self, key: str) -> float | None:
         """Retrieve a stored float.
@@ -276,7 +335,11 @@ class RedisStore:
         if client is None:
             return await self._fallback_store().get_float(key)
 
-        raw = await client.get(self._key(key))
+        try:
+            raw = await client.get(self._key(key))
+        except _CONNECTION_ERRORS:
+            logger.warning("Redis get_float failed mid-session; degrading to fallback")
+            return await self._degrade().get_float(key)
         return float(raw) if raw is not None else None
 
     async def set_float(self, key: str, value: float) -> None:
@@ -290,7 +353,11 @@ class RedisStore:
         if client is None:
             return await self._fallback_store().set_float(key, value)
 
-        await client.set(self._key(key), str(value))
+        try:
+            await client.set(self._key(key), str(value))
+        except _CONNECTION_ERRORS:
+            logger.warning("Redis set_float failed mid-session; degrading to fallback")
+            return await self._degrade().set_float(key, value)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -309,6 +376,11 @@ class RedisStore:
 
         try:
             return bool(await cast("Any", client.ping()))
+        except _CONNECTION_ERRORS:
+            # Runtime Redis death during a health probe: degrade so the
+            # fallback (always healthy) answers and ``degraded`` flips.
+            logger.warning("Redis ping failed mid-session; degrading to fallback")
+            return await self._degrade().health_check()
         except Exception:
             return False
 

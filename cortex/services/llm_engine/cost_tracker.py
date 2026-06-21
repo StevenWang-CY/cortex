@@ -120,10 +120,20 @@ class CostTracker:
         warn_usd: float = 5.0,
         kill_usd: float = 20.0,
     ) -> None:
-        if warn_usd <= 0 or kill_usd <= 0:
-            raise ValueError("warn_usd and kill_usd must be positive USD amounts")
-        if kill_usd < warn_usd:
-            raise ValueError("kill_usd must be >= warn_usd")
+        # P2-BE-COST-BUDGET-ZERO: a non-positive threshold means "unlimited"
+        # (the documented ``daily_cost_budget_usd == 0`` => 'unlimited'
+        # contract on GET /api/cost). Previously this raised ValueError,
+        # which the planner's ``except (OSError, ValueError)`` swallowed —
+        # silently dropping the tracker entirely, so '0 = unlimited' became
+        # 'no spend accounting AND no kill-switch'. Now we KEEP recording
+        # spend and simply never WARN/KILL on a disabled (<= 0) threshold.
+        # A negative is normalised to 0.0 (the canonical "disabled" sentinel).
+        warn_usd = float(warn_usd) if warn_usd > 0 else 0.0
+        kill_usd = float(kill_usd) if kill_usd > 0 else 0.0
+        # Only enforce the ordering invariant when BOTH caps are active;
+        # an unlimited kill (0) above any warn is always coherent.
+        if kill_usd > 0 and warn_usd > 0 and kill_usd < warn_usd:
+            raise ValueError("kill_usd must be >= warn_usd when both are set")
         self._ledger_path = ledger_path
         self._warn_usd = float(warn_usd)
         self._kill_usd = float(kill_usd)
@@ -319,9 +329,10 @@ class CostTracker:
 
         Public accessor the api_gateway ``GET /api/cost`` route reads to
         populate :attr:`CostResponse.budget_today` without reaching into
-        a private attribute. ``0`` is never returned here — the
-        constructor rejects a non-positive cap — but the COST_RESPONSE
-        contract documents ``0`` as "unlimited" for the no-tracker path.
+        a private attribute. ``0`` here means "unlimited" — the tracker
+        keeps recording spend but never fires ``KILL`` — matching the
+        COST_RESPONSE contract's documented ``0 == unlimited`` semantics
+        (P2-BE-COST-BUDGET-ZERO).
         """
         return self._kill_usd
 
@@ -338,7 +349,9 @@ class CostTracker:
         cost route and the dashboard meter can poll it freely to set
         :attr:`CostResponse.budget_exhausted`.
         """
-        return self.today_total_usd(now=now) >= self._kill_usd
+        # P2-BE-COST-BUDGET-ZERO: a disabled (<= 0) kill cap is "unlimited"
+        # — never exhausted regardless of spend.
+        return self._kill_usd > 0 and self.today_total_usd(now=now) >= self._kill_usd
 
     def today_total_usd(self, *, now: datetime | None = None) -> float:
         """Return the running spend for the current local day."""
@@ -381,7 +394,9 @@ class CostTracker:
         moment = now or datetime.now()
         today = _today_iso(moment)
         total = self.today_total_usd(now=moment)
-        if total >= self._kill_usd:
+        # P2-BE-COST-BUDGET-ZERO: a disabled (<= 0) threshold is "unlimited"
+        # — keep recording spend but never escalate to WARN/KILL.
+        if self._kill_usd > 0 and total >= self._kill_usd:
             if self._killed_today != today:
                 self._killed_today = today
                 logger.error(
@@ -391,7 +406,7 @@ class CostTracker:
                     self._kill_usd,
                 )
             return "KILL"
-        if total >= self._warn_usd:
+        if self._warn_usd > 0 and total >= self._warn_usd:
             if self._warned_today != today:
                 self._warned_today = today
                 logger.warning(
@@ -404,4 +419,83 @@ class CostTracker:
         return "OK"
 
 
-__all__ = ["BudgetState", "CostTracker"]
+# ---------------------------------------------------------------------------
+# Shared CostResponse probes (P2-CONTRACT-2)
+# ---------------------------------------------------------------------------
+#
+# The HTTP ``GET /api/cost`` route and the WS ``COST_RESPONSE`` broadcast
+# (``CortexDaemon.get_cost_response``) MUST populate the same CostResponse
+# keys, or the two surfaces drift (the schema's docstring promises they are
+# identical). Previously the HTTP route probed ``prompt_tokens`` /
+# ``completion_tokens`` / ``model`` while the WS path left them null. These
+# two helpers are the single source of truth both surfaces call so the keys
+# can never diverge again.
+
+
+def _probe_int_attr(obj: Any, names: tuple[str, ...]) -> int | None:
+    """Return the first int-valued attribute among ``names``.
+
+    Each candidate may be a plain int or a zero-arg callable returning an
+    int. Any probe that raises is skipped (best-effort, never fatal).
+    """
+    for attr in names:
+        val = getattr(obj, attr, None)
+        if isinstance(val, bool):  # bool is an int subclass — reject it
+            continue
+        if isinstance(val, int):
+            return val
+        if callable(val):
+            try:
+                got = val()
+            except Exception:
+                logger.debug("cost token probe raised", exc_info=True, extra={"attr": attr})
+                continue
+            if isinstance(got, int) and not isinstance(got, bool):
+                return got
+    return None
+
+
+def probe_token_totals(tracker: Any) -> tuple[int | None, int | None]:
+    """Best-effort (prompt_tokens, completion_tokens) for today.
+
+    Returns ``(None, None)`` when the tracker exposes no token counters
+    (the current ``CostTracker`` does not), so both CostResponse surfaces
+    report the same value. Kept as a free function so the HTTP route and
+    the WS daemon path share one implementation.
+    """
+    if tracker is None:
+        return (None, None)
+    prompt_tokens = _probe_int_attr(tracker, ("prompt_tokens_today", "total_prompt_tokens"))
+    completion_tokens = _probe_int_attr(
+        tracker, ("completion_tokens_today", "total_completion_tokens")
+    )
+    return (prompt_tokens, completion_tokens)
+
+
+def probe_active_model(llm_client: Any) -> str | None:
+    """Best-effort active model id from an LLM client (or None).
+
+    Mirrors the api_gateway ``_resolve_active_model`` probe order so the WS
+    COST_RESPONSE and the HTTP /api/cost route resolve the SAME model string.
+    """
+    if llm_client is None:
+        return None
+    for attr in ("model", "_model", "model_id", "_model_id"):
+        val = getattr(llm_client, attr, None)
+        if isinstance(val, str) and val:
+            return val
+    cfg = getattr(llm_client, "config", None)
+    if cfg is not None:
+        for attr in ("model", "model_id"):
+            val = getattr(cfg, attr, None)
+            if isinstance(val, str) and val:
+                return val
+    return None
+
+
+__all__ = [
+    "BudgetState",
+    "CostTracker",
+    "probe_active_model",
+    "probe_token_totals",
+]

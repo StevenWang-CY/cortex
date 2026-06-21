@@ -121,20 +121,53 @@ class ConsentLadder:
         return self._lock
 
     async def _ensure_loaded(self) -> None:
-        """Load consent state from store if available."""
+        """Load consent state from store if available.
+
+        P1-BE-CONSENT-RACE: the load runs under the SAME ``self._lock``
+        that the mutating methods (``record_approval``/``record_rejection``
+        /``reset``) hold, and ``self._loaded`` is flipped to ``True`` only
+        AFTER the awaited store read completes. The pre-fix code set
+        ``self._loaded = True`` *before* the ``await`` and *outside* the
+        lock, so two concurrent first-callers interleaved:
+
+          * caller A enters, sees ``_loaded`` False, sets it True, awaits
+            ``get_json`` (yields control);
+          * caller B (e.g. a ``record_approval`` that already mutated
+            ``_action_states``) runs to completion;
+          * caller A resumes and *overwrites* ``_action_states`` with the
+            stale ``get_json`` payload — silently dropping B's recorded
+            approval. Consent gates autonomous workspace mutation, so a
+            lost approval is a correctness/safety bug.
+
+        Acquiring the lock here serialises the load against every mutator.
+        Callers MUST invoke this once at the top of each public entrypoint
+        *before* taking ``self._lock`` themselves — never while already
+        holding it (``asyncio.Lock`` is not re-entrant; that would
+        deadlock). The double check inside the lock makes a concurrent
+        second caller a cheap no-op once the first has loaded.
+        """
         if self._loaded:
             return
-        self._loaded = True
-        if self._store is None:
-            return
-        try:
-            data = await self._store.get_json("consent_ladder_state")
-            if data and isinstance(data, dict):
-                self._action_states = data.get("action_states", {})
-                if "global_max" in data:
-                    self._policy.global_max_level = data["global_max"]
-        except Exception:
-            logger.debug("No stored consent state found, using defaults")
+        async with self._lock:
+            # Re-check under the lock: a racing caller may have completed
+            # the load while we were waiting to acquire it.
+            if self._loaded:
+                return
+            if self._store is None:
+                self._loaded = True
+                return
+            try:
+                data = await self._store.get_json("consent_ladder_state")
+                if data and isinstance(data, dict):
+                    self._action_states = data.get("action_states", {})
+                    if "global_max" in data:
+                        self._policy.global_max_level = data["global_max"]
+            except Exception:
+                logger.debug("No stored consent state found, using defaults")
+            # Flip the flag only after the await resolves so a concurrent
+            # caller cannot observe ``_loaded`` True against an as-yet
+            # unpopulated ``_action_states``.
+            self._loaded = True
 
     async def _persist(self) -> None:
         """Persist consent state to store."""

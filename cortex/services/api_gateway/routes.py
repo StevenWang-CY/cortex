@@ -1403,42 +1403,13 @@ async def get_cost(request: Request) -> CostResponse:
     elif budget_today > 0.0:
         budget_exhausted = cost_today >= budget_today
 
-    prompt_tokens: int | None = None
-    completion_tokens: int | None = None
-    for attr in ("prompt_tokens_today", "total_prompt_tokens"):
-        val = getattr(tracker, attr, None)
-        if isinstance(val, int):
-            prompt_tokens = val
-            break
-        if callable(val):
-            try:
-                got = val()
-                if isinstance(got, int):
-                    prompt_tokens = got
-                    break
-            except Exception:
-                logger.debug(
-                    "cost tracker attr probe raised",
-                    exc_info=True,
-                    extra={"attr": attr},
-                )
-    for attr in ("completion_tokens_today", "total_completion_tokens"):
-        val = getattr(tracker, attr, None)
-        if isinstance(val, int):
-            completion_tokens = val
-            break
-        if callable(val):
-            try:
-                got = val()
-                if isinstance(got, int):
-                    completion_tokens = got
-                    break
-            except Exception:
-                logger.debug(
-                    "cost tracker attr probe raised",
-                    exc_info=True,
-                    extra={"attr": attr},
-                )
+    # P2-CONTRACT-2: probe token totals via the SAME shared helper the WS
+    # COST_RESPONSE path (CortexDaemon.get_cost_response) uses, so the HTTP
+    # and WS surfaces can never diverge on these keys. Imported locally to
+    # match the lazy llm_engine import pattern used elsewhere in this module.
+    from cortex.services.llm_engine.cost_tracker import probe_token_totals
+
+    prompt_tokens, completion_tokens = probe_token_totals(tracker)
 
     return CostResponse(
         cost_today=cost_today,

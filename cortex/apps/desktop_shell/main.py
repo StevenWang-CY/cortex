@@ -50,6 +50,14 @@ class WebSocketBridge(QObject):
     intervention_restored = Signal(dict)
     settings_synced = Signal(dict)
     connection_changed = Signal(bool)
+    # P1-FC-INTERVENTION-FAILED: daemon broadcast of a total mutation
+    # failure (workspace NOT changed). Routed to the dashboard toast so
+    # the failure is not silently invisible in WS mode too.
+    intervention_failed = Signal(dict)
+    # P1-FC-INTERVENTION-PROMPT: cross-surface micro-commit / movement-
+    # break prompt broadcast. Logged for parity (the overlay shows it
+    # inline); kept here so the dispatch map is complete.
+    intervention_prompt = Signal(dict)
     # P0 §3.1 / §3.2 / §3.3: history / trends / recap inbound payloads.
     session_list_received = Signal(dict)
     session_detail_received = Signal(dict)
@@ -465,6 +473,13 @@ class WebSocketBridge(QObject):
             self.intervention_triggered.emit(payload)
         elif msg_type == "INTERVENTION_RESTORE":
             self.intervention_restored.emit(payload)
+        # P1-FC-INTERVENTION-FAILED / -PROMPT: surface the daemon's
+        # total-failure broadcast (toast) and the cross-surface prompt
+        # (informational) in WS mode as well.
+        elif msg_type == "INTERVENTION_FAILED":
+            self.intervention_failed.emit(payload if isinstance(payload, dict) else {})
+        elif msg_type == "INTERVENTION_PROMPT":
+            self.intervention_prompt.emit(payload if isinstance(payload, dict) else {})
         elif msg_type == "SETTINGS_SYNC":
             self.settings_synced.emit(payload)
         # P0 §3.1 / §3.2 / §3.3: history / trends / recap inbound dispatch.
@@ -607,6 +622,9 @@ class CortexApp:
         self._bridge.state_updated.connect(self._on_state_update)
         self._bridge.intervention_triggered.connect(self._on_intervention)
         self._bridge.intervention_restored.connect(self._on_restore)
+        # P1-FC-INTERVENTION-FAILED / -PROMPT: route to the toast + log.
+        self._bridge.intervention_failed.connect(self._on_intervention_failed)
+        self._bridge.intervention_prompt.connect(self._on_intervention_prompt)
         self._bridge.settings_synced.connect(self._on_settings_synced)
         self._bridge.connection_changed.connect(self._on_connection_changed)
         # P0 §3.1 / §3.2 / §3.3: route inbound history / trends / recap
@@ -870,8 +888,14 @@ class CortexApp:
                     executed_natively = True
             except Exception:
                 logger.debug("Clipboard copy failed", exc_info=True)
-        elif action_type == "start_timer":
-            executed_natively = True
+        # P2-FE-START-TIMER: 'start_timer' is a real LLM-emitted native
+        # action that previously set executed_natively=True here, which
+        # made the ACTION_EXECUTE a pure log (request_dispatch=False) — so
+        # the button did nothing in WS mode. WS mode has no in-process
+        # break overlay, so we mirror the take_biology_break path: leave
+        # executed_natively False and let send_action_execute reach the
+        # daemon with request_dispatch=True. The daemon drives its
+        # break/countdown overlay (a plain countdown for start_timer).
 
         # Audit-prod fix: ACTION_EXECUTE (with request_dispatch) must
         # arrive at the daemon BEFORE the engaged USER_ACTION. The
@@ -900,6 +924,45 @@ class CortexApp:
         self._active_intervention_id = None
         if self._overlay is not None:
             self._overlay.hide()
+
+    @Slot(dict)
+    def _on_intervention_failed(self, payload: dict) -> None:
+        """P1-FC-INTERVENTION-FAILED: surface a total mutation failure in
+        the dashboard toast so the user knows the workspace was NOT
+        changed instead of the failure being silently invisible.
+
+        Payload (per :attr:`MessageType.INTERVENTION_FAILED`):
+        ``{intervention_id, error_reason, failed_action_types}``.
+        """
+        data = payload if isinstance(payload, dict) else {}
+        reason = str(data.get("error_reason") or "").strip()
+        failed = data.get("failed_action_types")
+        if not reason:
+            if isinstance(failed, (list, tuple)) and failed:
+                pretty = ", ".join(str(a).replace("_", " ") for a in failed)
+                reason = f"Couldn't apply: {pretty}."
+            else:
+                reason = "Couldn't apply the intervention."
+        cid = str(data.get("intervention_id") or "")
+        if self._dashboard is not None and hasattr(self._dashboard, "show_error"):
+            try:
+                self._dashboard.show_error(
+                    "Intervention couldn't be applied", reason, cid,
+                )
+            except Exception:
+                logger.debug("intervention_failed toast failed", exc_info=True)
+
+    @Slot(dict)
+    def _on_intervention_prompt(self, payload: dict) -> None:
+        """P1-FC-INTERVENTION-PROMPT: the overlay renders the prompt
+        inline; in WS mode we log it for parity with the in-process
+        controller so the dispatch map is complete."""
+        data = payload if isinstance(payload, dict) else {}
+        logger.info(
+            "INTERVENTION_PROMPT action_type=%s prompt=%r",
+            data.get("action_type"),
+            str(data.get("prompt") or "")[:120],
+        )
 
     @Slot(dict)
     def _on_settings_synced(self, payload: dict) -> None:

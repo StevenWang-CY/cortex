@@ -59,12 +59,12 @@ jobs:
 
   ci-release-parity:
     # ci-parity-guard (audit): ci.yml's ``python`` job and release.yml's
-    # ``ci-gate`` job MUST run the identical mypy + pytest invocations,
-    # otherwise a PR can pass CI and then break the tag build (exactly the
-    # drift this whole remediation closed). This job parses both workflow
-    # files and fails if the mypy ``run:`` or the pytest ``run:`` blocks
-    # diverge. Keeps the two surfaces honest with zero extra deps beyond
-    # PyYAML (already a dev dependency).
+    # ``ci-gate`` job MUST run the identical ruff + mypy + pytest
+    # invocations, otherwise a PR can pass CI and then break the tag build
+    # (exactly the drift this whole remediation closed). This job parses
+    # both workflow files and fails if the ruff ``Lint``, mypy, or pytest
+    # ``run:`` blocks diverge. Keeps the two surfaces honest with zero
+    # extra deps beyond PyYAML (already a dev dependency).
     name: ci-release-parity (mypy/pytest drift gate)
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -77,7 +77,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Assert ci.yml and release.yml share mypy + pytest steps
+      - name: Assert ci.yml and release.yml share ruff + mypy + pytest steps
         run: |
           python - <<'PY'
           import sys
@@ -102,6 +102,9 @@ jobs:
           pytest_name = "Test (pytest)"
 
           problems = []
+          # ── name-matched steps (mypy + pytest): the display names are
+          #    identical across both files, so we look each up by name and
+          #    compare the ``run:`` command verbatim. ──
           for name in (mypy_name, pytest_name):
               c = ci_steps.get(name)
               r = rel_steps.get(name)
@@ -116,12 +119,44 @@ jobs:
                       f"  release.yml: {r!r}"
                   )
 
+          # ── command-matched step (ruff Lint): the two files use DIFFERENT
+          #    display names ("Lint (ruff)" in ci.yml vs "Lint" in
+          #    release.yml). Matching by name would make a harmless rename a
+          #    false "missing step", so instead we LOCATE the lint step in
+          #    each job by its command shape (a ``run:`` whose first non-
+          #    blank token is ``ruff``) and compare the full command. A real
+          #    flag divergence (e.g. one side adds ``--select``/``--fix`` or
+          #    changes the target path) still fails the gate. ──
+          def find_ruff_run(steps_by_name):
+              hits = [
+                  run for run in steps_by_name.values()
+                  if run.strip().split(None, 1)[0:1] == ["ruff"]
+              ]
+              return hits
+
+          ci_ruff = find_ruff_run(ci_steps)
+          rel_ruff = find_ruff_run(rel_steps)
+          if not ci_ruff:
+              problems.append("ci.yml python job has no ruff Lint step")
+          if not rel_ruff:
+              problems.append("release.yml ci-gate job has no ruff Lint step")
+          if len(ci_ruff) > 1:
+              problems.append(f"ci.yml python job has >1 ruff step: {ci_ruff!r}")
+          if len(rel_ruff) > 1:
+              problems.append(f"release.yml ci-gate job has >1 ruff step: {rel_ruff!r}")
+          if ci_ruff and rel_ruff and ci_ruff[0] != rel_ruff[0]:
+              problems.append(
+                  "ruff Lint command diverges between ci.yml and release.yml:\n"
+                  f"  ci.yml:      {ci_ruff[0]!r}\n"
+                  f"  release.yml: {rel_ruff[0]!r}"
+              )
+
           if problems:
               print("ci/release parity FAILED:")
               for p in problems:
                   print(" -", p)
               sys.exit(1)
-          print("ci.yml and release.yml mypy + pytest steps are in sync.")
+          print("ci.yml and release.yml ruff + mypy + pytest steps are in sync.")
           PY
 
   design-tokens-check:

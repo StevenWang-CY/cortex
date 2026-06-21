@@ -20,6 +20,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 import numpy as np
 import uvicorn
@@ -65,6 +66,7 @@ from cortex.services.context_engine import (
     ContextAssembler,
     EditorAdapter,
     TerminalAdapter,
+    classify_tab_type,
 )
 from cortex.services.eval.amip import AMIPPolicy
 from cortex.services.eval.bandit import ContextualBandit
@@ -2063,7 +2065,13 @@ class CortexDaemon:
             )
             self._latest_physio = self._pulse_estimator.get_features(output.frame_meta.timestamp)
             registry.register("latest_physio", self._latest_physio)
-            self._feature_fusion.update_physio(self._latest_physio, timestamp=output.frame_meta.timestamp)
+            # P1-PIPE-CLOCK: feature_fusion staleness math (_compute_signal_quality)
+            # subtracts this stamp from time.monotonic() at fuse() time, so it MUST
+            # be a monotonic instant. frame_meta.timestamp is a time.time() EPOCH
+            # (~1.7e9); using it made staleness hugely negative and the staleness
+            # penalties dead. _last_physio_update below is a SEPARATE epoch var used
+            # for the epoch-vs-epoch rPPG-stride gate at :2035 — leave it on epoch.
+            self._feature_fusion.update_physio(self._latest_physio, timestamp=time.monotonic())
             self._last_physio_update = output.frame_meta.timestamp
 
         blink = self._blink_detector.update(output.landmarks_px, output.frame_meta.timestamp)
@@ -2089,7 +2097,12 @@ class CortexDaemon:
         # kinematics features were derived from. The state loop reads
         # this to decide whether the signal is fresh enough to drive a
         # state estimate (see ``kinematics_age`` check below).
-        self._last_kinematics_ts = float(output.frame_meta.timestamp)
+        # P1-PIPE-CLOCK: the state loop compares this against
+        # time.monotonic() (timestamp - _last_kinematics_ts at :2288), so
+        # it MUST be a monotonic instant — frame_meta.timestamp is a
+        # time.time() epoch, which made kinematics_age hugely negative and
+        # the >2.0s stale guard unreachable.
+        self._last_kinematics_ts = time.monotonic()
         # C5 (audit): cache this frame's blink-suppression score so the NEXT
         # frame's rPPG window build can forward it into the apnea path with
         # a 1-frame lag. ``blink_suppression_score`` is Optional on
@@ -2097,7 +2110,10 @@ class CortexDaemon:
         self._last_blink_suppression_score = float(
             blink.blink_suppression_score or 0.0
         )
-        self._feature_fusion.update_kinematics(self._latest_kinematics, timestamp=output.frame_meta.timestamp)
+        # P1-PIPE-CLOCK: monotonic stamp for fusion staleness math (see
+        # update_physio above). frame_meta.timestamp is an epoch and would
+        # make _compute_signal_quality's staleness penalty dead code.
+        self._feature_fusion.update_kinematics(self._latest_kinematics, timestamp=time.monotonic())
 
     async def _telemetry_loop(self) -> None:
         try:
@@ -3022,6 +3038,20 @@ class CortexDaemon:
                 return
             self._restore_manager.start_intervention(plan.intervention_id, snapshot)
             self._trigger_policy.record_intervention()
+            # P1-PIPE-REPORT: a plan was approved by the trigger policy AND
+            # delivered to the user (mutations applied, restore session
+            # started). Count it on the session report so the persisted
+            # SessionReport.interventions_triggered reflects real deliveries
+            # rather than the constant 0 that fed the longitudinal HYPER
+            # proxy. Mirrors record_intervention()'s placement so the two
+            # counters move together.
+            try:
+                self._session_report.increment_interventions_triggered()
+            except Exception:
+                logger.debug(
+                    "session_report increment_interventions_triggered failed",
+                    exc_info=True,
+                )
             self._active_intervention_id = plan.intervention_id
             # Phase-4b TASK C: stamp the applied count onto the trigger
             # payload so the overlay can show "2 of 3 actions applied"
@@ -4769,6 +4799,18 @@ class CortexDaemon:
                 confidence=trigger_conf,
                 context_complexity=trigger_complexity,
             )
+            # P1-PIPE-REPORT: the user accepted (engaged with) a delivered
+            # intervention. Count it so SessionReport.interventions_accepted
+            # is real instead of the constant 0 the longitudinal aggregator
+            # used to fall back on. Sits in the engage branch alongside the
+            # _helpfulness.record_user_action close below.
+            try:
+                self._session_report.increment_interventions_accepted()
+            except Exception:
+                logger.debug(
+                    "session_report increment_interventions_accepted failed",
+                    exc_info=True,
+                )
         elif action == "snoozed":
             self._trigger_policy.activate_quiet_mode(duration_minutes=15)
             outcome = await self._restore_manager.snooze(intervention_id)
@@ -4948,6 +4990,15 @@ class CortexDaemon:
         except Exception:
             logger.debug("Failed to handle tab relevance feedback", exc_info=True)
 
+    # P1-PIPE-REPORT: tab types classify_tab_type() returns that count as a
+    # distraction for the per-session ``top_distraction_domains`` rollup the
+    # longitudinal task-pattern aggregator reads. Work-relevant types
+    # (documentation/stackoverflow/search/code_host/goal_relevant) are NOT
+    # distractions and are excluded.
+    _DISTRACTION_TAB_TYPES = frozenset(
+        {"distraction", "social", "video_platform"}
+    )
+
     async def _handle_activity_sync(self, payload: dict[str, Any]) -> None:
         """Handle ACTIVITY_SYNC from browser extension — aggregate into daily timeline."""
         activities = payload.get("activities")
@@ -4957,6 +5008,40 @@ class CortexDaemon:
                 logger.debug("Ingested %d activities from browser", len(activities))
             except Exception:
                 logger.debug("Activity sync ingestion failed", exc_info=True)
+            # P1-PIPE-REPORT: feed the SAME activities into the session
+            # report so SessionReport.top_activities and
+            # top_distraction_domains are populated from real input. Before
+            # this wiring both producers had ZERO call sites, so every
+            # persisted report carried empty lists and the longitudinal
+            # chronotype ``task_patterns`` rollup (which reads
+            # top_distraction_domains) was permanently empty.
+            for activity in activities:
+                if not isinstance(activity, dict):
+                    continue
+                url = str(activity.get("url") or "")
+                title = str(activity.get("title") or "")
+                try:
+                    dwell = float(activity.get("duration_spent_s") or 0.0)
+                except (TypeError, ValueError):
+                    dwell = 0.0
+                tab_type = classify_tab_type(url) if url else "other"
+                try:
+                    self._session_report.record_activity(
+                        title=title or url or "untitled",
+                        tab_type=tab_type,
+                        dwell_s=dwell,
+                    )
+                    if tab_type in self._DISTRACTION_TAB_TYPES and url:
+                        hostname = urlparse(url).netloc.lower()
+                        if hostname.startswith("www."):
+                            hostname = hostname[4:]
+                        if hostname:
+                            self._session_report.record_distraction(hostname)
+                except Exception:
+                    logger.debug(
+                        "session_report activity recording failed",
+                        exc_info=True,
+                    )
 
     async def _send_leetcode_ws_message(self, message: dict[str, Any]) -> None:
         """Send a LeetCode-specific command to browser clients only."""
@@ -5499,6 +5584,10 @@ class CortexDaemon:
         :attr:`MessageType.COST_RESPONSE` broadcasts.
         """
         from cortex.libs.schemas.realtime import CostResponse
+        from cortex.services.llm_engine.cost_tracker import (
+            probe_active_model,
+            probe_token_totals,
+        )
 
         cost_today = 0.0
         budget_today = 0.0
@@ -5523,11 +5612,20 @@ class CortexDaemon:
                 budget_exhausted = bool(tracker.check_budget() == "KILL")
             except Exception:
                 logger.debug("get_cost_response: check_budget failed", exc_info=True)
+        # P2-CONTRACT-2: populate prompt_tokens/completion_tokens/model via the
+        # SAME shared probes the HTTP GET /api/cost route uses, so the WS
+        # COST_RESPONSE and the HTTP envelope can never disagree on these keys
+        # (the CostResponse schema promises the two surfaces are identical).
+        prompt_tokens, completion_tokens = probe_token_totals(tracker)
+        model = probe_active_model(self._llm_client)
         return CostResponse(
             cost_today=cost_today,
             budget_today=budget_today,
             provider=provider,
             budget_exhausted=budget_exhausted,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            model=model,
         )
 
     async def _broadcast_cost_response(self) -> None:

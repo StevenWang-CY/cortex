@@ -248,3 +248,85 @@ def test_hex_to_nscolor_returns_none_without_appkit(monkeypatch: pytest.MonkeyPa
     from cortex.apps.desktop_shell import mac_native
 
     assert mac_native._hex_to_nscolor("#D97757") is None
+
+
+# ---------------------------------------------------------------------------
+# P2-FEAT-SCREENSHARE — screen_share_active()
+# ---------------------------------------------------------------------------
+
+
+def _install_fake_quartz(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    ids: tuple[int, ...],
+    captured: set[int] = frozenset(),  # type: ignore[assignment]
+    mirrored: set[int] = frozenset(),  # type: ignore[assignment]
+) -> None:
+    quartz = types.ModuleType("Quartz")
+
+    def _get_active(_max: int, _l: Any, _c: Any) -> tuple[int, tuple[int, ...], int]:
+        return (0, ids, len(ids))
+
+    quartz.CGGetActiveDisplayList = _get_active  # type: ignore[attr-defined]
+    quartz.CGMainDisplayID = lambda: ids[0] if ids else 1  # type: ignore[attr-defined]
+    quartz.CGDisplayIsCaptured = lambda d: d in captured  # type: ignore[attr-defined]
+    quartz.CGDisplayIsInMirrorSet = lambda d: d in mirrored  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "Quartz", quartz)
+
+
+def test_screen_share_active_false_off_mac(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "cortex.apps.desktop_shell.mac_native.is_macos", lambda: False,
+    )
+    from cortex.apps.desktop_shell import mac_native
+
+    assert mac_native.screen_share_active() is False
+
+
+def test_screen_share_active_false_when_no_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "cortex.apps.desktop_shell.mac_native.is_macos", lambda: True,
+    )
+    _install_fake_quartz(monkeypatch, ids=(1, 2))
+    from cortex.apps.desktop_shell import mac_native
+
+    assert mac_native.screen_share_active() is False
+
+
+def test_screen_share_active_true_when_display_captured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "cortex.apps.desktop_shell.mac_native.is_macos", lambda: True,
+    )
+    _install_fake_quartz(monkeypatch, ids=(1, 2), captured={2})
+    from cortex.apps.desktop_shell import mac_native
+
+    assert mac_native.screen_share_active() is True
+
+
+def test_screen_share_active_true_when_mirrored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "cortex.apps.desktop_shell.mac_native.is_macos", lambda: True,
+    )
+    _install_fake_quartz(monkeypatch, ids=(1,), mirrored={1})
+    from cortex.apps.desktop_shell import mac_native
+
+    assert mac_native.screen_share_active() is True
+
+
+def test_screen_share_active_false_when_quartz_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "cortex.apps.desktop_shell.mac_native.is_macos", lambda: True,
+    )
+    # Force the guarded ``import Quartz`` to fail.
+    monkeypatch.setitem(sys.modules, "Quartz", None)
+    from cortex.apps.desktop_shell import mac_native
+
+    assert mac_native.screen_share_active() is False

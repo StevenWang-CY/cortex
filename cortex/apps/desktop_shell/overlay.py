@@ -15,13 +15,25 @@ Public API: ``dismissed(str)`` Signal, ``show_intervention(payload)`` method.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QRect, Qt, QTimer, Signal
 
 if TYPE_CHECKING:
     from PySide6.QtWidgets import QGraphicsOpacityEffect
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
+
+# FE-3 multi-monitor placement: ``QGuiApplication.screenAt`` /
+# ``QCursor.pos`` let us land the overlay on the display under the
+# cursor instead of trusting ``self.screen()`` on a still-hidden window.
+# The legacy desktop_shell test stub does not ship these symbols, so the
+# import is guarded; ``_target_screen`` falls back to ``self.screen()``
+# when either is unavailable.
+try:
+    from PySide6.QtGui import QCursor, QGuiApplication
+except ImportError:  # pragma: no cover - lightweight stubs
+    QCursor = None
+    QGuiApplication = None
 from PySide6.QtWidgets import (
     QCheckBox,
     QFrame,
@@ -994,7 +1006,12 @@ class OverlayWindow(QWidget):
             self._pacer.stop()
             self._pacer.hide()
 
-        screen = self.screen()
+        # FE-3 (P2-FE-MULTIMON): place the overlay on the display under
+        # the cursor, not whatever ``self.screen()`` reports for the
+        # still-hidden window (which on multi-monitor often resolves to
+        # the wrong display). Falls back gracefully on single-monitor and
+        # on the legacy stub where QGuiApplication/QCursor are absent.
+        screen = self._target_screen()
         if screen is not None:
             geo = screen.availableGeometry()
             self.resize(min(460, geo.width() - 40), min(620, geo.height() - 40))
@@ -1033,6 +1050,20 @@ class OverlayWindow(QWidget):
         except Exception:
             logger.debug("apply_causal_signals failed", exc_info=True)
 
+        # P2-FEAT-SCREENSHARE (cortex.md:927): suppress the always-on-top
+        # intervention overlay while the screen is being shared/recorded
+        # so private nudges aren't broadcast to a meeting. Conservative —
+        # only suppress when detection is BOTH positive AND available;
+        # ``screen_share_active`` returns False on any uncertainty. The
+        # card content was still prepared above, so the next, non-shared
+        # intervention shows instantly.
+        if self._screen_share_active():
+            logger.info(
+                "Overlay suppressed for intervention %s — screen sharing active",
+                self._intervention_id,
+            )
+            return
+
         self.show()
         self.raise_()
         self.activateWindow()
@@ -1046,6 +1077,48 @@ class OverlayWindow(QWidget):
         self._play_show_animations()
 
         logger.info(f"Overlay shown for intervention {self._intervention_id}")
+
+    def _target_screen(self) -> Any:
+        """FE-3 (P2-FE-MULTIMON): the screen the overlay should land on.
+
+        Prefers the display under the cursor (``QGuiApplication.screenAt(
+        QCursor.pos())``) so a multi-monitor user sees the nudge where
+        they are looking, not on whatever display the still-hidden window
+        happens to report. Falls back to ``self.screen()`` and then the
+        primary screen. Returns ``None`` only when none of those resolve
+        (e.g. headless) — callers already guard against ``None``.
+        """
+        screen = None
+        if QGuiApplication is not None and QCursor is not None:
+            try:
+                screen = QGuiApplication.screenAt(QCursor.pos())
+            except Exception:
+                logger.debug("screenAt(cursor) failed", exc_info=True)
+                screen = None
+        if screen is None:
+            try:
+                screen = self.screen()
+            except Exception:
+                screen = None
+        if screen is None and QGuiApplication is not None:
+            try:
+                screen = QGuiApplication.primaryScreen()
+            except Exception:
+                logger.debug("primaryScreen() failed", exc_info=True)
+                screen = None
+        return screen
+
+    def _screen_share_active(self) -> bool:
+        """P2-FEAT-SCREENSHARE: True when a display is being captured /
+        recorded / mirrored. Thin wrapper around
+        :func:`mac_native.screen_share_active` so tests can monkeypatch
+        the detector on the instance and so any failure degrades to
+        "not sharing" (show the overlay) rather than hiding it."""
+        try:
+            return bool(mac_native.screen_share_active())
+        except Exception:
+            logger.debug("screen_share_active probe failed", exc_info=True)
+            return False
 
     # ------------------------------------------------------------------
     # Phase J-4: micro-interactions

@@ -557,6 +557,63 @@ def _menu_action_target_class() -> Any | None:
     return target
 
 
+def screen_share_active() -> bool:
+    """P2-FEAT-SCREENSHARE (cortex.md:927): True when ANY active display
+    is being captured/recorded or is in a mirror/AirPlay set.
+
+    Enumerates the active displays via ``Quartz.CGGetActiveDisplayList``
+    and returns True if any reports ``CGDisplayIsCaptured`` (a real
+    screen-capture/recording session, e.g. macOS Screen Recording, the
+    share-screen path of conferencing apps that take a display stream) or
+    ``CGDisplayIsInMirrorSet`` (mirroring / AirPlay to a second display).
+
+    Honesty note: this detects *true* display capture/recording plus
+    mirroring/AirPlay. Some conferencing apps read frames via
+    ScreenCaptureKit window/region streams that the OS does NOT always
+    flag as a captured display — that is a documented macOS limitation,
+    not a stub. We follow the guarded-Quartz pattern from
+    ``cortex.libs.utils.receptivity`` and return ``False`` on any
+    failure or on non-mac platforms (safe default: assume not sharing,
+    so a detection gap never hides interventions).
+    """
+    if not is_macos():
+        return False
+    try:
+        import Quartz
+    except ImportError:
+        logger.debug("Quartz framework missing; screen_share_active → False")
+        return False
+
+    try:
+        # CGGetActiveDisplayList(max, list_out, count_out) — call once
+        # with a generous cap. pyobjc returns (err, ids_tuple, count).
+        max_displays = 16
+        err, display_ids, count = Quartz.CGGetActiveDisplayList(
+            max_displays, None, None,
+        )
+        if err != 0 or not display_ids:
+            # Fall back to the main display only.
+            try:
+                main = Quartz.CGMainDisplayID()
+            except Exception:
+                return False
+            display_ids = (main,)
+            count = 1
+        for did in list(display_ids)[: int(count) or len(display_ids)]:
+            try:
+                if Quartz.CGDisplayIsCaptured(did):
+                    return True
+                if Quartz.CGDisplayIsInMirrorSet(did):
+                    return True
+            except Exception:
+                # A single display probe failing must not mask the others.
+                continue
+        return False
+    except Exception:
+        logger.debug("screen_share_active probe failed", exc_info=True)
+        return False
+
+
 def _hex_to_nscolor(hex_color: str) -> Any | None:
     AppKit = _appkit()
     if AppKit is None:
@@ -581,6 +638,7 @@ __all__ = [
     "install_appearance_observer",
     "is_dark_appearance",
     "is_macos",
+    "screen_share_active",
     "system_accent_hex",
     "system_font",
 ]

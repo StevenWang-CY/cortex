@@ -1607,7 +1607,12 @@ class WebSocketServer:
                 {
                     "window": "week",
                     "daily": [],
-                    "chronotype": None,
+                    # P2-CONTRACT-3: TrendsResponse.chronotype is non-null
+                    # (default_factory=ChronotypeModel). A null here makes a
+                    # client that revalidates the frame via
+                    # TrendsResponse.model_validate fail; an empty object
+                    # round-trips to a default ChronotypeModel.
+                    "chronotype": {},
                     "error": "handler_not_registered",
                 },
                 target_client_types=(

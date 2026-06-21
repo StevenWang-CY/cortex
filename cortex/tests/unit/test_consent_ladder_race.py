@@ -22,6 +22,7 @@ Each case fails on ``main`` (``36cc15f``):
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 import pytest
 
@@ -187,3 +188,97 @@ async def test_lock_released_on_exception() -> None:
     assert decision.allowed is True
     # And the lock should be available again.
     assert not ladder._lock.locked(), "lock must be released after exception"
+
+
+# ---------------------------------------------------------------------------
+# Case 4: P1-BE-CONSENT-RACE — lazy load must not clobber a concurrent
+# record_approval (lost-write reproduces before the fix, passes after).
+# ---------------------------------------------------------------------------
+
+
+class _SlowStubStore:
+    """Awaitable store stub whose ``get_json`` yields control mid-load.
+
+    This models the production store's network round-trip: between the
+    ``await`` suspension point inside ``_ensure_loaded`` and its
+    resolution, another coroutine (a ``record_approval``) gets to run.
+    The pre-fix ``_ensure_loaded`` set ``_loaded=True`` and read the
+    store OUTSIDE the lock, so the resolved (empty) payload overwrote the
+    just-recorded approval — a silent lost write on the gate that
+    authorises autonomous workspace mutation.
+    """
+
+    def __init__(self) -> None:
+        # First-call payload: a cold store with NO prior approvals. The
+        # bug manifests as this empty payload clobbering an approval that
+        # a concurrent writer slipped in while get_json was suspended.
+        self._payload: dict[str, Any] = {"action_states": {}, "global_max": 4}
+        self.get_calls = 0
+        self.set_calls = 0
+        # Released by the test to let the suspended get_json resolve only
+        # AFTER the concurrent record_approval has had a chance to run.
+        self.release = asyncio.Event()
+
+    async def get_json(self, key: str) -> dict[str, Any]:
+        self.get_calls += 1
+        # Suspend here so a concurrent record_approval can interleave.
+        await self.release.wait()
+        return self._payload
+
+    async def set_json(
+        self, key: str, value: dict[str, Any], ttl_seconds: int | None = None
+    ) -> None:
+        self.set_calls += 1
+        # Mirror a real store: subsequent loads see what was persisted.
+        self._payload = value
+
+
+@pytest.mark.asyncio
+async def test_lazy_load_does_not_clobber_concurrent_approval() -> None:
+    """A record_approval racing the very first lazy load must survive.
+
+    Sequence the bug deterministically:
+      1. start ``check()`` — it triggers ``_ensure_loaded`` which awaits
+         the stub ``get_json`` and SUSPENDS (release Event not yet set);
+      2. while suspended, run ``record_approval("close_tab")`` to
+         completion — it records one approval into ``_action_states``;
+      3. release the Event so the suspended load resolves with the cold
+         (empty) payload.
+
+    Pre-fix: step 3 overwrites ``_action_states`` with the empty payload,
+    erasing the approval from step 2 -> ``total_approvals == 0``.
+    Post-fix: ``_ensure_loaded`` holds ``self._lock`` across the await,
+    so step 2 cannot interleave inside the load; the approval survives
+    -> ``total_approvals == 1``.
+    """
+    store = _SlowStubStore()
+    ladder = ConsentLadder(policy=ConsentPolicy(), store=store)
+
+    # Kick off a check(); it will block inside _ensure_loaded on get_json.
+    check_task = asyncio.create_task(
+        ladder.check("close_tab", requested_level=SUGGEST)
+    )
+
+    # Let the check task run up to its suspension point on release.wait().
+    while store.get_calls == 0:
+        await asyncio.sleep(0)
+
+    # Now race a writer in. Post-fix this blocks on self._lock (held by
+    # the in-flight load); pre-fix it runs to completion against the
+    # not-yet-overwritten _action_states.
+    writer_task = asyncio.create_task(ladder.record_approval("close_tab"))
+
+    # Give the writer a few scheduler turns to (pre-fix) complete.
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    # Release the suspended load and drain everything.
+    store.release.set()
+    await asyncio.gather(check_task, writer_task)
+
+    states = await ladder.get_all_states()
+    assert "close_tab" in states, "approval state was lost entirely"
+    assert states["close_tab"]["total_approvals"] == 1, (
+        "the concurrent record_approval was clobbered by the lazy load "
+        f"(lost write): got {states['close_tab']['total_approvals']!r}"
+    )

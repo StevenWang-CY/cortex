@@ -244,6 +244,54 @@ class DaemonBridge(QObject):
                 "break_recommendation_received emit failed", exc_info=True,
             )
 
+    def on_intervention_failed(self, payload: dict) -> None:
+        """P1-FC-INTERVENTION-FAILED: a total mutation failure was
+        broadcast by the daemon (``InterventionExecutor.apply`` returned
+        only failed mutations, so the workspace was NOT changed). Surface
+        it to the user via the existing error-toast path rather than
+        letting the failure be silently invisible.
+
+        Payload shape (per :attr:`MessageType.INTERVENTION_FAILED`):
+        ``{intervention_id, error_reason, failed_action_types}``.
+        """
+        try:
+            data = payload if isinstance(payload, dict) else {}
+            reason = str(data.get("error_reason") or "").strip()
+            failed = data.get("failed_action_types")
+            if not reason:
+                if isinstance(failed, (list, tuple)) and failed:
+                    pretty = ", ".join(
+                        str(a).replace("_", " ") for a in failed
+                    )
+                    reason = f"Couldn't apply: {pretty}."
+                else:
+                    reason = "Couldn't apply the intervention."
+            cid = str(data.get("intervention_id") or "")
+            self.on_error("Intervention couldn't be applied", reason, cid)
+        except Exception:
+            logger.debug("on_intervention_failed dispatch failed", exc_info=True)
+
+    def on_intervention_prompt(self, payload: dict) -> None:
+        """P1-FC-INTERVENTION-PROMPT: the daemon broadcast a cross-surface
+        prompt (micro-commit / movement-break). The desktop overlay shows
+        this inline already; this handler exists so the controller's
+        dispatch map is complete and the prompt is at minimum logged for
+        debug parity with the other surfaces. It deliberately does NOT
+        duplicate the inline overlay widget.
+
+        Payload shape (per :attr:`MessageType.INTERVENTION_PROMPT`):
+        ``{action_type, prompt, timeout_seconds, metadata}``.
+        """
+        try:
+            data = payload if isinstance(payload, dict) else {}
+            logger.info(
+                "INTERVENTION_PROMPT action_type=%s prompt=%r",
+                data.get("action_type"),
+                str(data.get("prompt") or "")[:120],
+            )
+        except Exception:
+            logger.debug("on_intervention_prompt dispatch failed", exc_info=True)
+
     def on_error(self, title: str, body: str, cid: str = "") -> None:
         """Phase J-2: surface a daemon error in the dashboard toast.
 
@@ -792,6 +840,12 @@ class CortexAppController:
                 MessageType.STOP_FOCUS_AUTO.value: bridge.on_stop_focus_auto,
                 # P0 §3.7 desktop dispatch.
                 MessageType.BREAK_RECOMMENDATION.value: bridge.on_break_recommendation,
+                # P1-FC-INTERVENTION-FAILED: total mutation failure → toast.
+                MessageType.INTERVENTION_FAILED.value: bridge.on_intervention_failed,
+                # P1-FC-INTERVENTION-PROMPT: cross-surface prompt sync. The
+                # desktop overlay renders the prompt inline already; this
+                # entry only completes the dispatch map (informational).
+                MessageType.INTERVENTION_PROMPT.value: bridge.on_intervention_prompt,
             }
         except Exception:
             logger.debug("MessageType import failed; broadcast observer disabled", exc_info=True)
@@ -899,7 +953,7 @@ class CortexAppController:
             try:
                 bridge.on_session_list(
                     {"items": [], "next_cursor": None, "total_known": 0,
-                     "error": "schedule_failed"}
+                     "error": "internal"}
                 )
             except Exception:
                 logger.debug(
@@ -954,7 +1008,7 @@ class CortexAppController:
             logger.exception("get_session schedule failed")
             try:
                 bridge.on_session_detail(
-                    {"report": None, "error": "schedule_failed"}
+                    {"report": None, "error": "internal"}
                 )
             except Exception:
                 logger.debug(
@@ -1001,7 +1055,7 @@ class CortexAppController:
         except Exception:
             logger.exception("get_trends schedule failed")
             try:
-                bridge.on_trends({"window": win, "error": "schedule_failed"})
+                bridge.on_trends({"window": win, "error": "internal"})
             except Exception:
                 logger.debug(
                     "trends error envelope dispatch failed", exc_info=True
@@ -1166,10 +1220,22 @@ class CortexAppController:
             if action_type == "copy_to_clipboard":
                 self._copy_to_clipboard(str(action.get("target") or ""))
             elif action_type == "start_timer":
-                # ``target`` may carry a duration label; just log it. The
-                # timer surface is best handled by the daemon's existing
-                # break-scheduler, not a fresh QTimer in the controller.
-                pass
+                # P2-FE-START-TIMER: a real LLM-emitted native action.
+                # Reuse the existing break/countdown overlay
+                # (BreakOverlayWindow, driven by the daemon's break
+                # controller) as a plain countdown — no breathing pattern
+                # and no audio cue. The duration comes from the action
+                # metadata; absent that we fall back to a 5-minute timer.
+                meta = action.get("metadata")
+                meta = meta if isinstance(meta, dict) else {}
+                duration = int(meta.get("duration_seconds", 300) or 300)
+                native_coro = self._daemon.start_biology_break(
+                    intervention_id=str(intervention_id or ""),
+                    duration_seconds=duration,
+                    breathing_pattern=None,
+                    audio_cue=False,
+                    reason=str(meta.get("reason", "user_requested_timer"))[:120],
+                )
             elif action_type == "take_biology_break":
                 # P0 §3.7: the breathing session is a full-screen Qt
                 # overlay driven by the daemon (it owns the HRV context).
@@ -1225,8 +1291,9 @@ class CortexAppController:
         async def _dispatch_then_record() -> None:
             if executed_natively:
                 # Native action types run a daemon-local coroutine (break
-                # session / editor focus / prompt broadcast) when one was
-                # prepared; copy_to_clipboard / start_timer are log-only.
+                # session / countdown timer / editor focus / prompt
+                # broadcast) when one was prepared; copy_to_clipboard is
+                # log-only (handled synchronously above).
                 if native_coro is not None:
                     try:
                         await native_coro

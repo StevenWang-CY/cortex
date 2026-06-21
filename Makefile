@@ -42,10 +42,9 @@ dev: ## Start the daemon (FastAPI :9472, WebSocket :9473)
 
 # ─── Tests / quality ──────────────────────────────────────────────────
 
-test: ## Full pytest suite (desktop_shell isolated to avoid PySide6 sys.modules pollution)
-	$(PYTEST) cortex/tests/unit/ --ignore=cortex/tests/unit/test_desktop_shell.py
-	$(PYTEST) cortex/tests/unit/test_desktop_shell.py
-	$(PYTEST) cortex/tests/services/
+test: ## Full pytest suite — mirrors ci.yml exactly (unit+integration+services+state_engine+eval+physio+performance; desktop_shell isolated)
+	QT_QPA_PLATFORM=offscreen $(PYTEST) cortex/tests/ --ignore=cortex/tests/unit/test_desktop_shell.py
+	QT_QPA_PLATFORM=offscreen $(PYTEST) cortex/tests/unit/test_desktop_shell.py
 
 test-unit: ## Unit tests only (desktop_shell pass runs last to avoid PySide6 sys.modules pollution)
 	$(PYTEST) cortex/tests/unit/ --ignore=cortex/tests/unit/test_desktop_shell.py
@@ -60,8 +59,8 @@ lint: ## ruff
 format: ## ruff --fix
 	$(RUFF) check --fix cortex/
 
-typecheck: ## mypy (config-driven; strict checks live in pyproject.toml)
-	$(MYPY) --config-file cortex/pyproject.toml cortex/
+typecheck: ## mypy --strict (byte-identical to ci.yml/release.yml ci-gate)
+	$(MYPY) --config-file cortex/pyproject.toml cortex/ --strict
 
 codegen: ## Regenerate cortex_schemas.d.ts from Pydantic models
 	$(PY) -m cortex.scripts.generate_ts_schemas

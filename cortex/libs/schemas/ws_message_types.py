@@ -328,7 +328,7 @@ class MessageType(str, Enum):  # noqa: UP042 — pydantic-to-typescript requires
     keyboard shortcut, or the existing F26 frustration-spiral path).
     Payload mirrors :class:`cortex.libs.schemas.realtime.QuietModeState`:
     ``{kind: "snooze_15" | "quiet_session" | "pause" | "off",
-    duration_minutes: float | None, ends_at: float | None,
+    duration_minutes: int | None, ends_at: float | None,
     source: "dashboard" | "overlay" | "tray" | "shortcut" | "popup" |
     "vscode" | "os_notification" | "settings_sync" | "daemon" |
     "daemon_decay"}`` where ``ends_at`` is a unix timestamp (seconds)."""

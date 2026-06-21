@@ -95,8 +95,21 @@ def dirs(tmp_path: Path) -> tuple[Path, Path]:
 # ─── aggregate_day ────────────────────────────────────────────────────
 
 
-def test_aggregate_day_sums_minutes_and_counts_sessions(dirs) -> None:
+def test_aggregate_day_sums_minutes_and_counts_sessions(dirs, monkeypatch) -> None:
     sessions_dir, chronotype_dir = dirs
+    # Timezone-hermetic: this test stages sessions at 12:00/14:00/16:00 UTC
+    # and asserts all three land on the same local day. Under the host's
+    # real zone (e.g. UTC+8, Asia/Shanghai) 16:00 UTC == 00:00 the next
+    # local day, so the live ``_local_tz()`` would bucket the third session
+    # onto May 21 and ``session_count`` would be 2. Pin the local-tz cache to
+    # UTC (same technique as ``test_aggregate_day_local_tz_assigns_session_to_local_date``
+    # at line ~199) so the assertion is deterministic on every host. Product
+    # bucketing (start_time.astimezone(_local_tz()).date()) is correct and
+    # left untouched.
+    from cortex.services.session_report import longitudinal as L
+
+    monkeypatch.setattr(L, "_LOCAL_TZ_CACHE", UTC)
+
     d = date(2026, 5, 20)
     # 3 sessions: flow 600+1200+300s, hyper 60+120+30s
     _write_session_at(
