@@ -64,6 +64,158 @@ class PulseEstimate:
     sqi_components: dict[str, float] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class StabilizedPulse:
+    """Output of :class:`PulseStabilizer` for one window."""
+
+    valid: bool
+    bpm: float | None
+    held: bool = False  # True when the value is a hold-through-dropout carry
+
+
+class PulseStabilizer:
+    """Temporal stabilizer for the per-window pulse validity + BPM (B2).
+
+    The raw SQI gate (``nsqi & snr & physio_sqi``) is *stateless*, so a
+    single marginal window — a blink, micro-motion, a lighting flicker —
+    flips the reading from a live BPM to "acquiring" and back at the ~1 Hz
+    stride rate. Users sitting still see a constant flicker. This wraps the
+    raw per-window decision with three standard, literature-grounded
+    post-processing steps:
+
+    * **Schmitt-trigger lock** — *enter* the locked state only after
+      ``enter_windows`` consecutive raw-valid windows; *leave* only when
+      signal quality collapses below a **release** floor (``snr_release_db``
+      / ``sqi_release``) that sits well under the enter thresholds. Marginal
+      dips inside the hysteresis band do not unlock.
+    * **Last-valid hold** — while locked, a raw-invalid window keeps emitting
+      the last good (smoothed) BPM for up to ``grace_seconds`` before the
+      reading is honestly released. This is what removes the flicker.
+    * **BPM smoothing + slew limit** — report a trailing **median** of recent
+      valid BPMs (pyVHR-style window statistics) and reject window-to-window
+      jumps above ``max_slew_bpm_per_s`` (physiologically implausible),
+      killing single-window spectral outliers.
+
+    Refs: Wang et al. 2017 (POS); de Haan & Jeanne 2013 (CHROM); pyVHR
+    (PeerJ CS 2022) post-processing; PMC13000236 "Adaptive physiology-
+    informed correction" (temporal consistency / slew limiting).
+
+    Pure and deterministic — fully unit-testable in isolation.
+    """
+
+    def __init__(
+        self,
+        *,
+        enter_windows: int = 1,
+        grace_seconds: float = 4.0,
+        snr_release_db: float = 0.0,
+        sqi_release: float = 0.20,
+        smoothing_seconds: float = 6.0,
+        max_slew_bpm_per_s: float = 12.0,
+        bpm_floor: float = 30.0,
+        bpm_ceil: float = 220.0,
+    ) -> None:
+        self._enter_windows = max(1, int(enter_windows))
+        self._grace_seconds = max(0.0, float(grace_seconds))
+        self._snr_release_db = float(snr_release_db)
+        self._sqi_release = float(sqi_release)
+        self._smoothing_seconds = max(0.0, float(smoothing_seconds))
+        self._max_slew = max(0.0, float(max_slew_bpm_per_s))
+        self._bpm_floor = float(bpm_floor)
+        self._bpm_ceil = float(bpm_ceil)
+        self.reset()
+
+    def reset(self) -> None:
+        self._locked = False
+        self._consecutive_valid = 0
+        self._last_valid_ts: float | None = None
+        self._last_reported_bpm: float | None = None
+        self._prev_slew_bpm: float | None = None
+        self._prev_input_ts: float | None = None
+        # (timestamp, slew-limited bpm) inputs feeding the trailing median.
+        self._bpm_hist: deque[tuple[float, float]] = deque()
+
+    # -- internals ---------------------------------------------------------
+    def _apply_slew(self, timestamp: float, bpm: float) -> float:
+        """Clamp ``bpm`` to within the physiological slew of the prior input."""
+        if (
+            self._max_slew <= 0.0
+            or self._prev_slew_bpm is None
+            or self._prev_input_ts is None
+        ):
+            return bpm
+        dt = max(1e-3, timestamp - self._prev_input_ts)
+        max_delta = self._max_slew * dt
+        delta = bpm - self._prev_slew_bpm
+        if abs(delta) > max_delta:
+            return self._prev_slew_bpm + float(np.sign(delta)) * max_delta
+        return bpm
+
+    def _trim(self, now: float) -> None:
+        cutoff = now - self._smoothing_seconds
+        while self._bpm_hist and self._bpm_hist[0][0] < cutoff:
+            self._bpm_hist.popleft()
+
+    def _smoothed(self) -> float | None:
+        if not self._bpm_hist:
+            return None
+        vals = [b for _, b in self._bpm_hist]
+        return float(np.clip(np.median(vals), self._bpm_floor, self._bpm_ceil))
+
+    # -- public ------------------------------------------------------------
+    def update(
+        self,
+        *,
+        timestamp: float,
+        raw_valid: bool,
+        bpm: float | None,
+        snr_db: float | None = None,
+        sqi: float | None = None,
+    ) -> StabilizedPulse:
+        """Fold one window's raw decision into the stabilized output."""
+        if raw_valid and bpm is not None:
+            self._consecutive_valid += 1
+            self._last_valid_ts = timestamp
+            bpm_in = self._apply_slew(timestamp, float(bpm))
+            self._prev_slew_bpm = bpm_in
+            self._prev_input_ts = timestamp
+            self._bpm_hist.append((timestamp, bpm_in))
+            self._trim(timestamp)
+            if not self._locked and self._consecutive_valid >= self._enter_windows:
+                self._locked = True
+            if self._locked:
+                reported = self._smoothed()
+                self._last_reported_bpm = reported
+                return StabilizedPulse(valid=True, bpm=reported, held=False)
+            # Valid window but not yet locked → still acquiring.
+            return StabilizedPulse(valid=False, bpm=None, held=False)
+
+        # Raw window failed the gate (or no estimate at all).
+        self._consecutive_valid = 0
+        if self._locked and self._last_valid_ts is not None:
+            within_grace = (timestamp - self._last_valid_ts) <= self._grace_seconds
+            # Treat a missing snr/sqi (e.g. face briefly lost → no estimate)
+            # as "not collapsed": rely on the grace timer to bound the hold.
+            collapsed = (
+                (snr_db is not None and snr_db < self._snr_release_db)
+                or (sqi is not None and sqi < self._sqi_release)
+            )
+            if within_grace and not collapsed:
+                self._trim(timestamp)
+                held = self._last_reported_bpm
+                if held is None:
+                    held = self._smoothed()
+                if held is not None:
+                    return StabilizedPulse(valid=True, bpm=held, held=True)
+        # Release: genuine signal loss.
+        self._locked = False
+        self._bpm_hist.clear()
+        self._last_reported_bpm = None
+        self._prev_slew_bpm = None
+        self._prev_input_ts = None
+        return StabilizedPulse(valid=False, bpm=None, held=False)
+
+
 class PulseEstimator:
     """
     Estimates heart rate and HRV from BVP signal windows.
@@ -88,6 +240,7 @@ class PulseEstimator:
         min_cardiac_snr_db: float = 2.0,
         hrv_min_window_seconds: float = 60.0,
         hrv_min_valid_ibi: int = 30,
+        stabilizer: PulseStabilizer | None = None,
     ) -> None:
         self._fs = fs
         self._low_hz = low_hz
@@ -97,6 +250,10 @@ class PulseEstimator:
         self._min_cardiac_snr_db = min_cardiac_snr_db
         self._hrv_min_window_seconds = hrv_min_window_seconds
         self._hrv_min_valid_ibi = hrv_min_valid_ibi
+        # B2: temporal stabilizer (hysteresis hold + BPM smoothing). When
+        # None the estimator behaves exactly as before (stateless per-window
+        # gate) — preserved so existing callers / tests are unaffected.
+        self._stabilizer = stabilizer
 
         # Rolling HR history for delta computation
         # Store (timestamp, hr_bpm) pairs
@@ -160,6 +317,7 @@ class PulseEstimator:
         bvp_window: NDArray[np.float64],
         timestamp: float = 0.0,
         *,
+        fs: float | None = None,
         head_jitter_deg: float = 0.0,
         face_presence_ratio: float = 1.0,
         blink_suppression: float = 0.0,
@@ -192,6 +350,18 @@ class PulseEstimator:
         Returns:
             PulseEstimate with HR, HRV, and quality metrics.
         """
+        # B1 (sampling-rate correctness): adopt the per-window effective fps
+        # derived by the daemon from real frame timestamps. Welch HR =
+        # dominant_freq × 60, so an honest fs is what makes the BPM correct;
+        # trusting a hardcoded 30 fps on a camera running ~24-28 fps inflates
+        # every reading. Every fs-dependent call below reads ``self._fs``, so
+        # updating it once here (plus the respiration sub-estimator) threads
+        # the corrected rate through the whole window. Ignored when the
+        # caller passes nothing (tests / legacy callers keep the default).
+        if fs is not None and fs > 0:
+            self._fs = float(fs)
+            self._resp_estimator.set_fs(float(fs))
+
         n_samples = len(bvp_window)
         min_filter_samples = 3 * (2 * self._filter_order + 1)
 
@@ -353,6 +523,36 @@ class PulseEstimator:
         est = self._latest_estimate
 
         if est is None or est.hr_bpm is None:
+            # No usable estimate this window. The stabilizer (B2) may still
+            # HOLD a recent valid BPM through a brief dropout — one bad
+            # window or a momentary face loss — so the reading does not
+            # flicker. With no fresh estimate there is no snr/sqi to pass,
+            # so the hold is bounded purely by the grace timer.
+            if self._stabilizer is not None:
+                stab = self._stabilizer.update(
+                    timestamp=timestamp,
+                    raw_valid=False,
+                    bpm=None,
+                    snr_db=None,
+                    sqi=None,
+                )
+                if stab.valid and stab.bpm is not None:
+                    return PhysioFeatures(
+                        pulse_bpm=stab.bpm,
+                        pulse_quality=0.0,
+                        pulse_variability_proxy=None,
+                        hrv_sdnn=None,
+                        hrv_pnn50=None,
+                        hrv_sd1=None,
+                        hrv_sd2=None,
+                        hrv_lf_hf_ratio=None,
+                        hrv_sample_entropy=None,
+                        physio_sqi=None,
+                        physio_sqi_components={},
+                        hr_delta_5s=None,
+                        respiration_rate_bpm=None,
+                        valid=True,
+                    )
             return PhysioFeatures(
                 pulse_bpm=None,
                 pulse_quality=0.0,
@@ -366,6 +566,7 @@ class PulseEstimator:
                 physio_sqi=None,
                 physio_sqi_components={},
                 hr_delta_5s=None,
+                respiration_rate_bpm=None,
                 valid=False,
             )
 
@@ -383,30 +584,50 @@ class PulseEstimator:
             and snr_db >= self._min_cardiac_snr_db
             and est.physio_sqi >= 0.3
         )
-        hrv_ready = len(self._get_rolling_ibi(timestamp)) >= self._hrv_min_valid_ibi
 
-        pulse_bpm = est.hr_bpm if sqi_gate_ok else None
-        hrv_rmssd = est.rmssd_ms if (sqi_gate_ok and hrv_ready) else None
+        # B2: fold the raw per-window gate through the temporal stabilizer.
+        # ``eff_valid`` drives the reported validity (with hysteresis +
+        # hold); ``eff_bpm`` is the smoothed/held BPM. ``fresh`` stays True
+        # only when THIS window passed the raw gate, so derived data (HRV,
+        # respiration, hr_delta) is emitted from genuinely fresh estimates
+        # — never carried during a hold.
+        if self._stabilizer is not None:
+            stab = self._stabilizer.update(
+                timestamp=timestamp,
+                raw_valid=sqi_gate_ok,
+                bpm=est.hr_bpm,
+                snr_db=snr_db,
+                sqi=est.physio_sqi,
+            )
+            eff_valid = stab.valid
+            eff_bpm = stab.bpm
+        else:
+            eff_valid = sqi_gate_ok
+            eff_bpm = est.hr_bpm if sqi_gate_ok else None
+
+        fresh = sqi_gate_ok
+        hrv_ready = len(self._get_rolling_ibi(timestamp)) >= self._hrv_min_valid_ibi
+        fresh_hrv = fresh and hrv_ready
 
         return PhysioFeatures(
-            pulse_bpm=pulse_bpm,
+            pulse_bpm=eff_bpm if eff_valid else None,
             pulse_quality=est.physio_sqi,
-            pulse_variability_proxy=hrv_rmssd,
-            hrv_sdnn=est.sdnn_ms if (sqi_gate_ok and hrv_ready) else None,
-            hrv_pnn50=est.pnn50 if (sqi_gate_ok and hrv_ready) else None,
-            hrv_sd1=est.sd1_ms if (sqi_gate_ok and hrv_ready) else None,
-            hrv_sd2=est.sd2_ms if (sqi_gate_ok and hrv_ready) else None,
-            hrv_lf_hf_ratio=est.lf_hf_ratio if (sqi_gate_ok and hrv_ready) else None,
-            hrv_sample_entropy=est.sample_entropy if (sqi_gate_ok and hrv_ready) else None,
+            pulse_variability_proxy=est.rmssd_ms if (eff_valid and fresh_hrv) else None,
+            hrv_sdnn=est.sdnn_ms if (eff_valid and fresh_hrv) else None,
+            hrv_pnn50=est.pnn50 if (eff_valid and fresh_hrv) else None,
+            hrv_sd1=est.sd1_ms if (eff_valid and fresh_hrv) else None,
+            hrv_sd2=est.sd2_ms if (eff_valid and fresh_hrv) else None,
+            hrv_lf_hf_ratio=est.lf_hf_ratio if (eff_valid and fresh_hrv) else None,
+            hrv_sample_entropy=est.sample_entropy if (eff_valid and fresh_hrv) else None,
             physio_sqi=est.physio_sqi,
             physio_sqi_components=dict(est.sqi_components),
-            hr_delta_5s=hr_delta if sqi_gate_ok else None,
+            hr_delta_5s=hr_delta if (eff_valid and fresh) else None,
             # P0-1: respiration_rate_bpm is a data field — it MUST be None
             # when valid is False or PhysioFeatures._enforce_invalid_nulls
             # raises ValueError, which the daemon swallows as a dropped
             # frame (losing physio + kinematics for that stride).
-            respiration_rate_bpm=resp_rate if sqi_gate_ok else None,
-            valid=sqi_gate_ok,
+            respiration_rate_bpm=resp_rate if (eff_valid and fresh) else None,
+            valid=eff_valid,
         )
 
     @property
@@ -422,6 +643,8 @@ class PulseEstimator:
         self._latest_estimate = None
         self._latest_timestamp = 0.0
         self._resp_estimator.reset()
+        if self._stabilizer is not None:
+            self._stabilizer.reset()
 
     def _update_ibi_history(self, ibi_ms: NDArray[np.float64], timestamp: float) -> None:
         if ibi_ms.size == 0:

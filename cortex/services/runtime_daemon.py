@@ -100,7 +100,7 @@ from cortex.services.kinematics_engine.posture import PostureAnalyzer
 from cortex.services.launcher.launcher import ProjectLauncher
 from cortex.services.llm_engine import create_llm_client
 from cortex.services.llm_engine.parser import enrich_plan_with_context
-from cortex.services.physio_engine.pulse_estimator import PulseEstimator
+from cortex.services.physio_engine.pulse_estimator import PulseEstimator, PulseStabilizer
 from cortex.services.physio_engine.roi_extractor import RoiExtractor
 from cortex.services.physio_engine.rppg import extract_bvp
 from cortex.services.session_report.generator import SessionReportGenerator
@@ -530,12 +530,30 @@ class CortexDaemon:
 
         self._capture_pipeline = CapturePipeline(self.config.capture)
         self._roi_extractor = RoiExtractor(self.config.landmarks)
+        _rppg_cfg = self.config.signal.rppg
+        # B2: the temporal stabilizer removes the ~1 Hz "Reading your
+        # pulse…" flicker (Schmitt-trigger lock + last-valid hold + BPM
+        # median/slew smoothing). Disabled → estimator keeps its old
+        # stateless per-window behavior.
+        _stabilizer = (
+            PulseStabilizer(
+                enter_windows=_rppg_cfg.lock_enter_windows,
+                grace_seconds=_rppg_cfg.lock_grace_seconds,
+                snr_release_db=_rppg_cfg.snr_release_db,
+                sqi_release=_rppg_cfg.sqi_release,
+                smoothing_seconds=_rppg_cfg.bpm_smoothing_seconds,
+                max_slew_bpm_per_s=_rppg_cfg.bpm_max_slew_bpm_per_s,
+            )
+            if _rppg_cfg.stabilize
+            else None
+        )
         self._pulse_estimator = PulseEstimator(
             fs=float(self.config.capture.fps),
-            nsqi_threshold=self.config.signal.rppg.nsqi_threshold,
-            min_cardiac_snr_db=self.config.signal.rppg.min_cardiac_snr_db,
-            hrv_min_window_seconds=float(self.config.signal.rppg.hrv_min_window_seconds),
-            hrv_min_valid_ibi=self.config.signal.rppg.hrv_min_valid_ibi,
+            nsqi_threshold=_rppg_cfg.nsqi_threshold,
+            min_cardiac_snr_db=_rppg_cfg.min_cardiac_snr_db,
+            hrv_min_window_seconds=float(_rppg_cfg.hrv_min_window_seconds),
+            hrv_min_valid_ibi=_rppg_cfg.hrv_min_valid_ibi,
+            stabilizer=_stabilizer,
         )
         self._blink_detector = BlinkDetector(
             blink_config=self.config.signal.blink,
@@ -628,9 +646,17 @@ class CortexDaemon:
         self._last_leetcode_hrv_rmssd: float | None = None
         self._leetcode_action_signatures: dict[str, float] = {}
 
-        self._rgb_history: deque[np.ndarray] = deque(
-            maxlen=max(1, self.config.signal.rppg.window_seconds * self.config.capture.fps)
+        _rgb_maxlen = max(
+            1, self.config.signal.rppg.window_seconds * self.config.capture.fps
         )
+        self._rgb_history: deque[np.ndarray] = deque(maxlen=_rgb_maxlen)
+        # B1 (sampling-rate correctness): real frame timestamps kept in
+        # lock-step with ``_rgb_history`` so the rPPG window's *effective*
+        # fps is derived from wall-clock spacing, not the configured 30. A
+        # MacBook/Continuity camera commonly delivers ~24-28 fps; feeding a
+        # wrong fs into the Welch PSD scales BPM by the same factor and
+        # drifts the spectral peak across the SQI gate.
+        self._rgb_ts_history: deque[float] = deque(maxlen=_rgb_maxlen)
         # P0-2: count of low-quality frames rejected from the rPPG window.
         self._frames_low_quality_rejected: int = 0
         # C5 (audit): cache the previous frame's blink-suppression score so
@@ -1405,6 +1431,13 @@ class CortexDaemon:
         self._tasks.append(
             asyncio.create_task(self._retention_sweep_loop(), name="cortex-retention-loop")
         )
+        # Task C: periodic checkpoint so the in-progress session is visible
+        # in the History tab (which reads the on-disk store) while running.
+        self._tasks.append(
+            asyncio.create_task(
+                self._session_checkpoint_loop(), name="cortex-session-checkpoint-loop"
+            )
+        )
 
         # P0 §3.2: kick off chronotype backfill on a worker thread so
         # cold-start doesn't block the daemon loop. The aggregator is
@@ -1984,6 +2017,32 @@ class CortexDaemon:
             # B6 (Phase 4.1): graceful task shutdown; intentional.
             logger.debug("capture loop cancelled")
 
+    def _effective_rppg_fps(self) -> float:
+        """Effective sampling rate of the current rPPG window (B1).
+
+        Computed from the real frame timestamps held in ``_rgb_ts_history``
+        as ``(n - 1) / (t_last - t_first)`` — the true mean frame rate over
+        the window, which is what the Welch PSD needs to map a spectral peak
+        to BPM. Clamped to ``[fps_clamp_min, fps_clamp_max]``; outside that
+        band (or with too few / degenerate timestamps, or when disabled) we
+        fall back to the configured capture fps. Refs: MDPI Sensors
+        25(2):588 (2025); rPPG-in-the-wild, Behavior Research Methods 2024.
+        """
+        cfg = self.config.signal.rppg
+        fallback = float(self.config.capture.fps)
+        if not cfg.use_measured_fps:
+            return fallback
+        ts = self._rgb_ts_history
+        if len(ts) < 2:
+            return fallback
+        span = float(ts[-1]) - float(ts[0])
+        if span <= 1e-3:
+            return fallback
+        cand = (len(ts) - 1) / span
+        if cfg.fps_clamp_min <= cand <= cfg.fps_clamp_max:
+            return float(cand)
+        return fallback
+
     async def _process_capture_output(self, output: PipelineOutput) -> None:
         registry.register("latest_frame_meta", output.frame_meta)
         if output.landmarks_px is None:
@@ -2030,6 +2089,10 @@ class CortexDaemon:
                 )
             else:
                 self._rgb_history.append(np.asarray(combined_rgb, dtype=np.float64))
+            # B1: stamp every appended slot (NaN sentinel or real) so the
+            # timestamp deque stays index-aligned with ``_rgb_history`` and
+            # the window's effective fps reflects true frame spacing.
+            self._rgb_ts_history.append(float(output.frame_meta.timestamp))
 
         stride_seconds = self.config.signal.rppg.stride_seconds
         window_maxlen = self._rgb_history.maxlen or 0
@@ -2044,16 +2107,24 @@ class CortexDaemon:
             # channel is NaN (no good frame in the window) it falls back to
             # zeros, which ``extract_bvp`` already tolerates.
             rgb_window = _interpolate_nan_window(rgb_window)
+            # B1: derive the window's effective fps from the real frame
+            # timestamps (n-1 intervals over the wall-clock span). Self-
+            # correcting and smooth over the ~10 s window; clamped to a
+            # plausible camera band, else we fall back to the configured
+            # rate. This is the single number that makes the Welch BPM
+            # correct (HR = dominant_freq × 60).
+            fs_eff = self._effective_rppg_fps()
             bvp = extract_bvp(
                 rgb_window,
                 algorithm=self.config.signal.rppg.backend,
-                fs=float(self.config.capture.fps),
+                fs=fs_eff,
                 model_path=self.config.signal.rppg.model_path,
             )
             head_jitter_deg = float(roi_frame.head_jitter_px) * (45.0 / max(1.0, float(self.config.capture.width)))
             self._pulse_estimator.process_window(
                 bvp,
                 timestamp=output.frame_meta.timestamp,
+                fs=fs_eff,
                 head_jitter_deg=head_jitter_deg,
                 face_presence_ratio=1.0 if output.frame_meta.face_detected else 0.0,
                 # C5 (audit): forward the prior frame's blink-suppression
@@ -2227,6 +2298,71 @@ class CortexDaemon:
         except asyncio.CancelledError:
             # B6 (Phase 4.1): graceful retention-sweep shutdown.
             logger.debug("retention sweep loop cancelled")
+
+    def _write_session_file(self, report: Any) -> bool:
+        """Atomically write a session report to its on-disk file (Task C).
+
+        Shared shape with the stop()-time write, minus the storage-budget
+        enforcement and recap broadcast: a checkpoint overwrites the SAME
+        ``session_<id>.json`` each time (no net growth), and the final
+        stop() write enforces the budget. Returns True on success. Runs the
+        blocking file I/O on the caller's thread (the checkpoint loop hands
+        it to ``asyncio.to_thread``).
+        """
+        try:
+            from cortex.libs.utils.atomic_write import atomic_write_json
+
+            sessions_dir = Path(self.config.storage.path).expanduser() / "sessions"
+            sessions_dir.mkdir(parents=True, exist_ok=True)
+            session_path = sessions_dir / f"session_{report.session_id}.json"
+            atomic_write_json(session_path, report.model_dump(mode="json"))
+            return True
+        except Exception:
+            logger.debug("session checkpoint write failed", exc_info=True)
+            return False
+
+    async def _session_checkpoint_loop(self) -> None:
+        """Persist the in-progress session periodically (Task C).
+
+        Without this, sessions were only written on stop(), so the History
+        tab showed "No sessions yet" for a session that the dashboard's live
+        counter was actively tracking. Each tick snapshots the current
+        session (non-mutating — see ``SessionReportGenerator.snapshot``) to
+        its session file once it crosses a minimum duration, then invalidates
+        the reader cache so the next history query surfaces it. Cancelled in
+        stop() BEFORE the finalize write, so there is no write race.
+        """
+        interval = float(
+            getattr(self.config.storage, "session_checkpoint_seconds", 90.0)
+        )
+        min_seconds = float(
+            getattr(self.config.storage, "session_checkpoint_min_seconds", 30.0)
+        )
+        if interval <= 0:
+            return
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    if not self._session_report_started:
+                        continue
+                    snap = self._session_report.snapshot()
+                    if float(getattr(snap, "duration_seconds", 0.0)) < min_seconds:
+                        continue
+                    wrote = await asyncio.to_thread(self._write_session_file, snap)
+                    if wrote:
+                        # Refresh the listing cache on the main thread so the
+                        # next History query picks up the checkpoint.
+                        self._session_reader.invalidate(snap.session_id)
+                        logger.debug(
+                            "session checkpoint written id=%s dur=%.0fs",
+                            snap.session_id,
+                            float(getattr(snap, "duration_seconds", 0.0)),
+                        )
+                except Exception:
+                    logger.debug("session checkpoint iteration failed", exc_info=True)
+        except asyncio.CancelledError:
+            logger.debug("session checkpoint loop cancelled")
 
     async def _causal_report_loop(self) -> None:
         """Generate nightly causal report from AMIP policy logs."""

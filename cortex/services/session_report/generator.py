@@ -248,7 +248,32 @@ class SessionReportGenerator:
             end_timestamp: Optional epoch timestamp for the session end.
                 If None, uses time.time(). Pass explicitly in tests with
                 synthetic timestamps.
+
+        Non-mutating: the open state segment is folded into LOCAL copies, so
+        calling this (or :meth:`snapshot`) never double-counts and is safe to
+        invoke repeatedly — required by the periodic session checkpoint
+        (Task C), which snapshots an in-progress session without ending it.
         """
+        return self._compose_report(comparison, end_timestamp)
+
+    def snapshot(
+        self,
+        end_timestamp: float | None = None,
+    ) -> SessionReport:
+        """Build a report for the in-progress session WITHOUT ending it.
+
+        Used by the daemon's periodic checkpoint loop so an active session
+        is persisted to disk (and therefore visible in the History tab)
+        while Cortex is still running. Identical to :meth:`finish` minus the
+        7-day comparison, and equally non-mutating.
+        """
+        return self._compose_report(None, end_timestamp)
+
+    def _compose_report(
+        self,
+        comparison: ComparisonStats | None,
+        end_timestamp: float | None,
+    ) -> SessionReport:
         import time as _time
 
         end_ts = end_timestamp if end_timestamp is not None else _time.time()
@@ -257,24 +282,31 @@ class SessionReportGenerator:
 
         duration = (end_time - start).total_seconds()
 
-        # Finalize current state — close the last segment's duration
+        # Finalize current state on LOCAL COPIES so this method never
+        # mutates the running accumulators (idempotent / checkpoint-safe).
+        state_durations = dict(self._state_durations)
+        hourly_total = dict(self._hourly_total)
+        hourly_flow = dict(self._hourly_flow)
+        flow_streaks = list(self._flow_streaks)
         if self._current_state is not None:
             dt = end_ts - self._current_state_start
             if dt > 0:
-                self._state_durations[self._current_state] += dt
+                state_durations[self._current_state] = (
+                    state_durations.get(self._current_state, 0.0) + dt
+                )
                 hour = datetime.fromtimestamp(self._current_state_start, tz=UTC).hour
-                self._hourly_total[hour] += dt
+                hourly_total[hour] = hourly_total.get(hour, 0.0) + dt
                 if self._current_state == "FLOW":
-                    self._hourly_flow[hour] += dt
+                    hourly_flow[hour] = hourly_flow.get(hour, 0.0) + dt
         if self._current_state == "FLOW" and self._current_flow_start is not None:
             streak = end_ts - self._current_flow_start
             if streak > 0:
-                self._flow_streaks.append(streak)
+                flow_streaks.append(streak)
 
-        flow_s = self._state_durations.get("FLOW", 0.0)
-        hyper_s = self._state_durations.get("HYPER", 0.0)
-        hypo_s = self._state_durations.get("HYPO", 0.0)
-        recovery_s = self._state_durations.get("RECOVERY", 0.0)
+        flow_s = state_durations.get("FLOW", 0.0)
+        hyper_s = state_durations.get("HYPER", 0.0)
+        hypo_s = state_durations.get("HYPO", 0.0)
+        recovery_s = state_durations.get("RECOVERY", 0.0)
 
         flow_pct = (flow_s / duration * 100.0) if duration > 0 else 0.0
 
@@ -282,9 +314,9 @@ class SessionReportGenerator:
         golden_start: int | None = None
         golden_end: int | None = None
         best_ratio = 0.0
-        for hour, total in self._hourly_total.items():
+        for hour, total in hourly_total.items():
             if total > 0:
-                ratio = self._hourly_flow.get(hour, 0.0) / total
+                ratio = hourly_flow.get(hour, 0.0) / total
                 if ratio > best_ratio:
                     best_ratio = ratio
                     golden_start = hour
@@ -309,7 +341,7 @@ class SessionReportGenerator:
             time_in_hypo_seconds=hypo_s,
             time_in_recovery_seconds=recovery_s,
             flow_percentage=round(flow_pct, 1),
-            longest_flow_streak_seconds=max(self._flow_streaks) if self._flow_streaks else 0.0,
+            longest_flow_streak_seconds=max(flow_streaks) if flow_streaks else 0.0,
             peak_stress_integral=self._peak_stress,
             breaks_taken=self._breaks_taken,
             breaks_recommended=self._breaks_recommended,

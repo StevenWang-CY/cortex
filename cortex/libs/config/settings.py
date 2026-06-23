@@ -535,6 +535,34 @@ class RPPGSignalConfig(BaseModel):
     hrv_min_window_seconds: int = 60
     hrv_min_valid_ibi: int = 30
 
+    # --- Sampling-rate correctness (B1) -----------------------------------
+    # rPPG HR estimation via Welch PSD assumes a known, *constant* sampling
+    # rate; feeding the configured 30 fps when the camera actually delivers
+    # ~24-28 fps biases every BPM (a true 72 reads ~90) and drifts the
+    # spectral peak across the SQI gate. We derive the effective fps from
+    # real frame timestamps per window and clamp it to a plausible camera
+    # band; outside this band (or with too few timestamps) we fall back to
+    # the configured fps. Refs: MDPI Sensors 25(2):588 (2025); rPPG-in-the-
+    # wild, Behavior Research Methods (2024).
+    use_measured_fps: bool = True
+    fps_clamp_min: float = 10.0
+    fps_clamp_max: float = 60.0
+
+    # --- Temporal stabilizer (B2) -----------------------------------------
+    # The per-window SQI gate is otherwise stateless, so a single marginal
+    # window (micro-motion, blink, light flicker) flips the reading to
+    # "acquiring" and back at ~1 Hz. A Schmitt-trigger + last-valid hold +
+    # BPM smoothing removes the flicker while staying honest about genuine
+    # signal loss. Ref: PMC13000236 "Adaptive physiology-informed
+    # correction"; pyVHR window-statistics post-processing.
+    stabilize: bool = True
+    lock_enter_windows: int = 1          # consecutive valid windows to lock
+    lock_grace_seconds: float = 4.0      # hold last BPM through brief dropouts
+    snr_release_db: float = 0.0          # unlock only below this SNR …
+    sqi_release: float = 0.20            # … or this composite SQI (hysteresis)
+    bpm_smoothing_seconds: float = 6.0   # trailing median/EMA window
+    bpm_max_slew_bpm_per_s: float = 12.0  # reject implausible window-to-window jumps
+
 
 class BlinkSignalConfig(BaseModel):
     """Blink detection configuration."""
@@ -615,6 +643,17 @@ class StorageConfig(BaseModel):
     # Set to 0 to evict every existing session before each write — used in
     # tests as the lowest-bound smoke test of the eviction path.
     max_total_size_mb: int = 500
+    # Task C: sessions used to be written ONLY on daemon stop(), so the
+    # History tab (which reads the on-disk session store) showed nothing for
+    # an actively-running session even though the dashboard's live counter
+    # did. The daemon now snapshots the in-progress session to its session
+    # file every ``session_checkpoint_seconds`` once it crosses
+    # ``session_checkpoint_min_seconds`` — so today's activity appears in
+    # History while Cortex runs, and survives an unclean shutdown. The final
+    # stop() write overwrites the same file. Set the interval to 0 to
+    # disable periodic checkpoints.
+    session_checkpoint_seconds: float = 90.0
+    session_checkpoint_min_seconds: float = 30.0
 
 
 class DebugConfig(BaseModel):

@@ -139,7 +139,7 @@ def extract_bvp_tscan(
 def extract_bvp_pos(
     rgb_window: NDArray[np.float64],
     fs: float = 30.0,
-    window_length: int = 45,
+    window_length: int | None = None,
 ) -> NDArray[np.float64]:
     """
     POS (Plane Orthogonal to Skin) rPPG algorithm.
@@ -154,12 +154,22 @@ def extract_bvp_pos(
         rgb_window: RGB traces, shape (N, 3) where columns are [R, G, B].
                     Values are mean pixel intensities (0-255 range).
         fs: Sampling frequency in Hz.
-        window_length: Sub-window length in samples for overlap-add processing.
-                      Default 45 (~1.5s at 30fps).
+        window_length: Sub-window length in samples for overlap-add
+                      processing. When ``None`` (the default) it is derived
+                      from ``fs`` as ~1.6 s — the interval specified in the
+                      POS paper (Wang et al. 2017) — so the sub-window stays
+                      time-correct off-30 fps instead of the old hardcoded
+                      45 samples (which was 1.5 s only at exactly 30 fps and
+                      stretched/shrank at any other rate).
 
     Returns:
         BVP signal of shape (N,).
     """
+    if window_length is None:
+        # POS single-window length ≈ 1.6 s (Wang 2017, §III). Clamp to a
+        # sane floor so very low fs / short windows still process.
+        window_length = max(8, int(round(1.6 * fs)))
+
     n_samples = rgb_window.shape[0]
 
     if n_samples < window_length:

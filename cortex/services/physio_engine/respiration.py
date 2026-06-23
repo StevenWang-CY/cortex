@@ -87,6 +87,18 @@ class RespirationEstimator:
         """Get the most recent respiration estimate."""
         return self._latest
 
+    def set_fs(self, fs: float) -> None:
+        """Update the working sampling rate.
+
+        Called per-window by :class:`PulseEstimator` once the effective fps
+        is derived from real frame timestamps (B1). The respiratory Welch
+        PSD reads ``self._fs`` directly, so keeping it in sync with the true
+        rate prevents the same frequency→rate bias that affects the cardiac
+        band. No fs-derived buffers exist here, so this is a plain reassign.
+        """
+        if fs and fs > 0:
+            self._fs = float(fs)
+
     def process_bvp_window(
         self,
         bvp_window: NDArray[np.float64],

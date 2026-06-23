@@ -133,6 +133,20 @@ signal:
     max_head_jitter_deg: 7.5
     hrv_min_window_seconds: 60
     hrv_min_valid_ibi: 30
+    # Sampling-rate correctness (B1): derive fps from real frame
+    # timestamps instead of trusting the configured rate.
+    use_measured_fps: true
+    fps_clamp_min: 10.0
+    fps_clamp_max: 60.0
+    # Temporal stabilizer (B2): Schmitt-trigger + last-valid hold + BPM
+    # smoothing to stop the "Reading your pulse…" flicker.
+    stabilize: true
+    lock_enter_windows: 1
+    lock_grace_seconds: 4.0
+    snr_release_db: 0.0
+    sqi_release: 0.20
+    bpm_smoothing_seconds: 6.0
+    bpm_max_slew_bpm_per_s: 12.0
 
   blink:
     ear_threshold: 0.21

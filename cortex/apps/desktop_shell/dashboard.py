@@ -454,6 +454,32 @@ QToolTip {{
     padding: 4px 8px;
     border-radius: 6px;
 }}
+/* Popup menus must paint an OPAQUE surface. The main window uses
+   vibrancy (translucent) and this stylesheet cascades to child
+   ``QMenu`` popups; without an explicit background they render
+   see-through on macOS and the items bleed onto the widgets behind
+   the popup (observed: recent-goals menu over the Biometrics card).
+   Defining it globally hardens every present and future menu. */
+QMenu {{
+    background-color: {_CONTROL_BG};
+    color: {_LABEL};
+    border: 1px solid {_SEPARATOR};
+    border-radius: 8px;
+    padding: 4px;
+}}
+QMenu::item {{
+    padding: 6px 12px;
+    border-radius: 5px;
+}}
+QMenu::item:selected {{
+    background-color: {BRAND_ACCENT};
+    color: #FFFFFF;
+}}
+QMenu::separator {{
+    height: 1px;
+    background-color: {_SEPARATOR};
+    margin: 4px 8px;
+}}
 """
 
 
@@ -1561,6 +1587,31 @@ class _ConsumerTab(QWidget):
             return
         try:
             menu = QMenu(self._goal_input)
+            menu.setObjectName("RecentGoalsMenu")
+            # Force an opaque surface directly on the popup instance. The
+            # global QMenu rule already covers this, but the popup is a
+            # separate top-level window on macOS and the app-wide cascade
+            # can miss it under vibrancy — without an opaque background the
+            # menu renders see-through and its items bleed onto the card
+            # behind it. Setting the stylesheet on the instance guarantees
+            # the paint regardless of cascade.
+            try:
+                menu.setAttribute(
+                    Qt.WidgetAttribute.WA_TranslucentBackground, False
+                )
+            except Exception:
+                pass
+            menu.setStyleSheet(
+                f"QMenu#RecentGoalsMenu {{"
+                f" background-color: {_CONTROL_BG};"
+                f" color: {_LABEL};"
+                f" border: 1px solid {_SEPARATOR};"
+                f" border-radius: 8px; padding: 4px; }}"
+                f"QMenu#RecentGoalsMenu::item {{"
+                f" padding: 6px 12px; border-radius: 5px; }}"
+                f"QMenu#RecentGoalsMenu::item:selected {{"
+                f" background-color: {BRAND_ACCENT}; color: #FFFFFF; }}"
+            )
             menu.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
             for g in goals:
                 title = g.title
