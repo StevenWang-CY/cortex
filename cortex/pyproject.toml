@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cortex"
-version = "0.2.1"
+version = "0.2.2"
 description = "Real-time biofeedback workspace engine for detecting cognitive overwhelm"
 readme = "README.md"
 license = "MIT"

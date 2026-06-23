@@ -4,6 +4,61 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.2.2] — 2026-06-23
+
+Patch release closing a full multi-phase production audit: real,
+test-backed fixes for latent correctness, contract, and pipeline gaps
+found by walking every backend module, frontend surface, data pipeline,
+and API contract. No behavioural feature was removed; every fix makes a
+claimed feature actually work from real input.
+
+### Fixed
+
+* **Signal-quality staleness was dead code.** Feature fusion stamped the
+  physio/kinematics channels with a wall-clock (`time.time()`) epoch but
+  compared it against a `time.monotonic()` clock at fuse time, so the
+  staleness penalty could never engage. All fusion-staleness stamps are
+  now monotonic.
+* **Session-report rollups were fabricated.** The four `SessionReport`
+  producers (intervention triggered/accepted counters, activity and
+  distraction recorders) had zero call sites, so chronotype trends fell
+  back to a crude HYPER proxy and task-patterns were always empty. They
+  are now wired to the real intervention-deliver / engage / activity-sync
+  paths.
+* **Consent-ladder lost-write race.** Lazy load now runs under the lock
+  and flips its loaded flag only after the awaited store read, so a
+  concurrent approval can no longer be clobbered by a stale read.
+* **Redis loss mid-session.** The store now degrades to its in-memory
+  fallback (and flips `degraded`) on a runtime Redis failure, not only at
+  connect time.
+* **Atomic writes** use a unique temp file so concurrent writers can no
+  longer interleave and corrupt the destination.
+* **`daily_cost_budget_usd = 0`** ("unlimited") now keeps recording spend
+  and simply never fires the kill-switch, instead of raising and silently
+  disabling the entire cost tracker.
+* **Intervention failures were invisible.** `INTERVENTION_FAILED` (every
+  workspace mutation failed) is now surfaced on every surface — desktop
+  toast, WS-mode bridge, and a browser-popup error banner; the apply CTA
+  is disabled while it is set. `INTERVENTION_PROMPT` now syncs to the
+  popup, and the `start_timer` overlay action drives a real countdown
+  instead of doing nothing.
+* **Screen-share safety.** Always-on-top intervention overlays are
+  suppressed while the display is being captured or mirrored
+  (`CGDisplayIsCaptured` / `CGDisplayIsInMirrorSet`), and the overlay now
+  appears on the screen under the cursor on multi-monitor setups.
+* **Contract drift.** The WebSocket cost frame now carries the same
+  token/model keys as `GET /api/cost`; the no-handler trends frame sends a
+  schema-valid object; schedule-failure paths emit a valid error literal;
+  and several payload docstrings were realigned to their producers.
+
+### Removed / housekeeping
+
+* Pruned advertised LeetCode capabilities to the ones the intervention
+  matrix can actually emit; removed a dead schema-versioning helper and an
+  orphaned, drifted top-level `tests/` directory.
+* `make typecheck` now runs `--strict` and `make test` mirrors CI exactly;
+  the CI ↔ release parity guard also compares the lint step.
+
 ## [v0.2.1] — 2026-05-19
 
 The v0.2.x series replaces the v0.1.x release with an

@@ -1,7 +1,7 @@
 {
   "name": "cortex-browser-extension",
   "displayName": "Cortex — Somatic Workspace Engine",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Real-time biofeedback workspace engine for Chrome.",
   "scripts": {
     "dev": "plasmo dev",
