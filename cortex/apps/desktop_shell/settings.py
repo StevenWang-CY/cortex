@@ -44,6 +44,7 @@ from cortex.apps.desktop_shell.a11y import (
     set_accessible_description,
     set_accessible_name,
 )
+from cortex.apps.desktop_shell.components import install_elide, wrap_capped
 from cortex.apps.desktop_shell.tokens import (
     BRAND_ACCENT,
     BRAND_ACCENT_HOVER,
@@ -103,6 +104,25 @@ _COMBO_QSS = (
     "}"
     f"QComboBox:hover {{ border-color: rgba(0,0,0,0.20); }}"
     "QComboBox::drop-down { border: none; width: 22px; }"
+    "QComboBox QAbstractItemView {"
+    f"  background: {_CONTROL_BG};"
+    f"  border: 0.5px solid {_SEPARATOR};"
+    f"  border-radius: {RADIUS_BUTTON}px;"
+    f"  color: {_LABEL};"
+    "  padding: 4px 0;"
+    "  outline: none;"
+    "}"
+    "QComboBox QAbstractItemView::item {"
+    "  min-height: 24px;"
+    "  padding: 4px 12px;"
+    "}"
+    "QComboBox QAbstractItemView::item:selected {"
+    f"  background: rgba(217, 119, 87, 0.12);"
+    f"  color: {_LABEL};"
+    "}"
+    "QComboBox QAbstractItemView::item:hover {"
+    f"  background: rgba(217, 119, 87, 0.08);"
+    "}"
 )
 
 _SPINBOX_QSS = (
@@ -118,12 +138,15 @@ _SPINBOX_QSS = (
 
 _SLIDER_QSS = (
     f"QSlider::groove:horizontal {{ background: {_GROUPED_BG};"
-    " height: 4px; border-radius: 2px; }}"
+    " height: 6px; border-radius: 3px; }}"
     f"QSlider::handle:horizontal {{ background: {BRAND_ACCENT};"
-    " width: 16px; height: 16px; margin: -6px 0; border-radius: 8px; }}"
+    " width: 18px; height: 18px; margin: -6px 0; border-radius: 9px;"
+    " border: 0.5px solid rgba(0,0,0,0.12);"
+    " /* subtle drop shadow via border trick */ }}"
     f"QSlider::handle:horizontal:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
+    f"QSlider::handle:horizontal:pressed {{ background: {BRAND_ACCENT_HOVER}; }}"
     f"QSlider::sub-page:horizontal {{ background: {BRAND_ACCENT};"
-    " border-radius: 2px; }}"
+    " border-radius: 3px; }}"
 )
 
 _PAGE_TITLE_QSS = (
@@ -382,6 +405,7 @@ class SettingsDialog(QWidget):
         self._baseline_freshness_label.setStyleSheet(
             f"color: {_LABEL_SECONDARY}; background: transparent; border: none;"
         )
+        install_elide(self._baseline_freshness_label)
         recal_row.addWidget(self._baseline_freshness_label)
         recal_row.addStretch()
 
@@ -528,10 +552,10 @@ class SettingsDialog(QWidget):
             "can disarm at any time."
         )
         fp_help.setFont(mac_native.system_font(FS_CAPTION, "regular"))
-        fp_help.setWordWrap(True)
         fp_help.setStyleSheet(
             f"color: {_LABEL_SECONDARY}; background: transparent;"
         )
+        wrap_capped(fp_help, 340)
         fp_inner.addWidget(fp_help)
 
         preset_row = QHBoxLayout()
@@ -603,10 +627,10 @@ class SettingsDialog(QWidget):
             "don't miss them from another Space or fullscreen app."
         )
         notif_help.setFont(mac_native.system_font(FS_CAPTION, "regular"))
-        notif_help.setWordWrap(True)
         notif_help.setStyleSheet(
             f"color: {_LABEL_SECONDARY}; background: transparent;"
         )
+        wrap_capped(notif_help, 340)
         notif_inner.addWidget(notif_help)
 
         layout.addWidget(notif_card)
@@ -709,6 +733,7 @@ class SettingsDialog(QWidget):
         self._budget_today_label.setStyleSheet(
             f"color: {_LABEL_SECONDARY}; background: transparent;"
         )
+        wrap_capped(self._budget_today_label, 320)
         budget_inner.addWidget(self._budget_today_label)
 
         budget_help = QLabel(

@@ -61,6 +61,7 @@ from cortex.apps.desktop_shell.a11y import (
     set_accessible_description,
     set_accessible_name,
 )
+from cortex.apps.desktop_shell.components import wrap_capped
 from cortex.apps.desktop_shell.tokens import (
     BRAND_ACCENT,
     BRAND_ACCENT_DIM,
@@ -741,11 +742,11 @@ class OnboardingWindow(QWidget):
             "Grant permissions, choose your LLM backend, and connect your "
             "browser and editor. This only takes a minute."
         )
-        subtitle.setWordWrap(True)
         subtitle.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         subtitle.setStyleSheet(
             f"color: {_LABEL_SECONDARY}; background: transparent;"
         )
+        wrap_capped(subtitle, 340)
         layout.addWidget(subtitle)
         layout.addSpacing(SP3)
 
@@ -799,11 +800,11 @@ class OnboardingWindow(QWidget):
             "context about your tabs and code. You can also do this "
             "later from the menu bar → Connect Extensions."
         )
-        hint.setWordWrap(True)
         hint.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         hint.setStyleSheet(
             f"color: {_LABEL_SECONDARY}; border: none;"
         )
+        wrap_capped(hint, 340)
         ext_layout.addWidget(hint)
 
         connect_btn = QPushButton("Open Connections")
@@ -1229,7 +1230,6 @@ class OnboardingWindow(QWidget):
                 "We will skip your iPhone camera and use the MacBook camera."
             )
             callout.setObjectName("CortexContinuityCallout")
-            callout.setWordWrap(True)
             callout.setFont(mac_native.system_font(FS_CAPTION, "medium"))
             callout.setStyleSheet(
                 "QLabel#CortexContinuityCallout {"
@@ -1239,6 +1239,7 @@ class OnboardingWindow(QWidget):
                 "  padding: 6px 10px;"
                 "}"
             )
+            wrap_capped(callout, 320)
             set_accessible_name(callout, "Continuity Camera skip notice")
             layout.addWidget(callout)
             frame._cortex_continuity_callout = callout  # type: ignore[attr-defined]
@@ -1359,16 +1360,16 @@ class OnboardingWindow(QWidget):
         self._cal_progress_bar.setRange(0, 100)
         self._cal_progress_bar.setValue(0)
         self._cal_progress_bar.setTextVisible(False)
-        self._cal_progress_bar.setFixedHeight(6)
+        self._cal_progress_bar.setFixedHeight(4)
         self._cal_progress_bar.setStyleSheet(
             "QProgressBar {"
             f"  background: {_GROUPED_BG};"
             "  border: none;"
-            "  border-radius: 3px;"
+            "  border-radius: 2px;"
             "}"
             "QProgressBar::chunk {"
             f"  background: {BRAND_ACCENT};"
-            "  border-radius: 3px;"
+            "  border-radius: 2px;"
             "}"
         )
         layout.addWidget(self._cal_progress_bar)

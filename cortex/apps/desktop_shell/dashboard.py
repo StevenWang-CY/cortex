@@ -408,6 +408,34 @@ def _system(point_size: float, weight: str = "regular") -> str:
     return '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif'
 
 
+def _make_history_icon(color_hex: str, size: int = 13) -> object:
+    """Draw a small downward pull-down chevron as a ``QIcon``.
+
+    Used for the goal field's trailing recent-goals affordance. Painted
+    (not a font glyph) so it renders crisply on every Qt backend
+    regardless of SF Symbols availability in unsigned bundles.
+    """
+    from PySide6.QtCore import QPointF
+    from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    try:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pen = QPen(QColor(color_hex))
+        pen.setWidthF(1.5)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        w = float(size)
+        painter.drawLine(QPointF(w * 0.26, w * 0.40), QPointF(w * 0.50, w * 0.62))
+        painter.drawLine(QPointF(w * 0.50, w * 0.62), QPointF(w * 0.74, w * 0.40))
+    finally:
+        painter.end()
+    return QIcon(pm)
+
+
 # ---------------------------------------------------------------------------
 # Global stylesheet — minimal, semantic
 # ---------------------------------------------------------------------------
@@ -804,10 +832,12 @@ class _ConsumerTab(QWidget):
         self._focus_protection_pill.clicked.connect(
             self.auto_focus_disarm_requested.emit,
         )
-        header.addWidget(
-            self._focus_protection_pill,
-            alignment=Qt.AlignmentFlag.AlignVCenter,
-        )
+        # UI redesign: the ambient chips (focus-protection, cost, break,
+        # baseline) move OUT of the top bar into a footer meta strip (built
+        # near the Stop button below) so the header reads as brand + state +
+        # quiet only. The widgets keep their attribute names so every render
+        # slot (apply_auto_focus_state / cost update / apply_break_recommendation
+        # / refresh_baseline_freshness) updates them unchanged.
 
         # P0 §3.15: LLM cost meter pill. Subdued unless near budget. The
         # daemon publishes the running daily total via a COST_RESPONSE
@@ -834,9 +864,7 @@ class _ConsumerTab(QWidget):
             )
         except Exception:
             pass
-        header.addWidget(
-            self._cost_pill, alignment=Qt.AlignmentFlag.AlignVCenter,
-        )
+        # (added to the footer meta strip below, not the header)
         # Cache the last applied cost so we don't restyle on every poll.
         self._cost_last_value: float = -1.0
         self._cost_budget_warned: bool = False
@@ -872,10 +900,7 @@ class _ConsumerTab(QWidget):
             self._break_pill.clicked.connect(self._on_break_pill_clicked)
         except Exception:
             logger.debug("break pill connect failed", exc_info=True)
-        header.addWidget(
-            self._break_pill,
-            alignment=Qt.AlignmentFlag.AlignVCenter,
-        )
+        # (added to the footer meta strip below, not the header)
 
         # P0 §3.4 — baseline freshness pill. Hidden when the baseline
         # file doesn't exist (so we don't shame the user mid-onboarding)
@@ -889,10 +914,30 @@ class _ConsumerTab(QWidget):
         self._baseline_pill.setStyleSheet(
             f"color: {_LABEL_TERTIARY}; background: {_GROUPED_BG};"
             f" border-radius: {RADIUS_PILL}px; padding: 3px 10px;"
-            " margin-left: 8px;"
         )
-        header.addWidget(
+        # (added to the footer meta strip below, not the header)
+
+        # UI redesign: footer meta strip — the four ambient chips
+        # (focus-protection, break, baseline, cost) right-aligned in a
+        # single subtle row. Each is hidden until its render slot reveals
+        # it; cost shows "$—" quietly. This declutters the top bar while
+        # keeping every signal reachable. Widget objects + attribute names
+        # are unchanged, so all render slots keep working.
+        self._meta_strip = QHBoxLayout()
+        self._meta_strip.setContentsMargins(0, 0, 0, SP3)
+        self._meta_strip.setSpacing(SP2)
+        self._meta_strip.addStretch()
+        self._meta_strip.addWidget(
+            self._focus_protection_pill, alignment=Qt.AlignmentFlag.AlignVCenter
+        )
+        self._meta_strip.addWidget(
+            self._break_pill, alignment=Qt.AlignmentFlag.AlignVCenter
+        )
+        self._meta_strip.addWidget(
             self._baseline_pill, alignment=Qt.AlignmentFlag.AlignVCenter
+        )
+        self._meta_strip.addWidget(
+            self._cost_pill, alignment=Qt.AlignmentFlag.AlignVCenter
         )
 
         root.addLayout(header)
@@ -1018,33 +1063,27 @@ class _ConsumerTab(QWidget):
         self._schedule_goal_emit = _schedule_goal_emit
         self._fire_goal_emit = _fire_goal_emit
 
-        # P0 §3.13: recent-goals dropdown above the input. Hidden when
-        # the store is empty (first-time users see a clean blank field);
-        # surfaces the most recent ~8 goals when populated.
-        self._recent_goals_combo = QComboBox()
+        # P0 §3.13 / UI redesign: recent goals live behind a trailing
+        # pull-down glyph INSIDE the goal field — the macOS "field with a
+        # built-in menu" pattern (Safari address bar / NSComboButton),
+        # replacing the stock QComboBox that read as dated. One clean
+        # control; the menu renders with native vibrancy. The affordance
+        # is hidden until the on-disk store has at least one goal so a
+        # first-run user still sees a blank field.
+        self._goal_history_action = None
         try:
-            self._recent_goals_combo.setEditable(False)
-            self._recent_goals_combo.setFont(
-                mac_native.system_font(FS_FOOTNOTE, "regular")
+            from PySide6.QtGui import QAction  # noqa: F401  (presence check)
+
+            icon = _make_history_icon(_LABEL_SECONDARY)
+            action = self._goal_input.addAction(
+                icon, QLineEdit.ActionPosition.TrailingPosition
             )
-            self._recent_goals_combo.setMinimumHeight(28)
-            self._recent_goals_combo.setStyleSheet(
-                "QComboBox {"
-                "  padding: 2px 8px;"
-                f"  border: 0.5px solid {_SEPARATOR};"
-                "  border-radius: 6px;"
-                f"  color: {_LABEL_SECONDARY};"
-                f"  background: {_GROUPED_BG};"
-                "}"
-                f"QComboBox:focus {{ border: 1.5px solid {BRAND_ACCENT}; }}"
-            )
-            self._recent_goals_combo.activated.connect(
-                self._on_recent_goal_picked,
-            )
+            action.setToolTip("Recent goals")
+            action.triggered.connect(self._open_recent_goals_menu)
+            action.setVisible(False)
+            self._goal_history_action = action
         except Exception:
-            logger.debug("recent goals combo init failed", exc_info=True)
-        self._recent_goals_combo.setVisible(False)
-        root.addWidget(self._recent_goals_combo)
+            logger.debug("recent-goals affordance init failed", exc_info=True)
         root.addWidget(self._goal_input)
         # Populate from disk on first paint (silently).
         try:
@@ -1310,6 +1349,11 @@ class _ConsumerTab(QWidget):
         root.addLayout(today_row)
         root.addStretch()
 
+        # UI redesign: footer meta strip (ambient chips: focus-protection,
+        # break, baseline, cost) sits just above the Stop button, pushed to
+        # the bottom by the stretch above so the top bar stays uncluttered.
+        root.addLayout(self._meta_strip)
+
         # ── Stop button (HIG destructive role) ─────────────────────────
         root.addSpacing(SP4)
         self._stop_btn = QPushButton("Stop Cortex")
@@ -1477,72 +1521,79 @@ class _ConsumerTab(QWidget):
     # ── P0 §3.13: recent goals dropdown ─────────────────────────────
 
     def _refresh_recent_goals_dropdown(self) -> None:
-        """Re-populate the recent-goals combo from disk.
+        """Show/hide the goal field's recent-goals affordance based on
+        whether the on-disk store has any goals.
 
         Idempotent — safe to call from the input return-pressed handler
         (after each new goal is persisted) and from the constructor.
+        Kept under its historical name (call sites unchanged); the inline
+        pull-down affordance replaced the old combobox.
         """
-        combo = getattr(self, "_recent_goals_combo", None)
-        if combo is None:
+        action = getattr(self, "_goal_history_action", None)
+        if action is None:
             return
         try:
             from cortex.libs.store.goal_store import load_goals
             goals = load_goals()
         except Exception:
-            logger.debug("load_goals failed; hiding dropdown", exc_info=True)
-            try:
-                combo.setVisible(False)
-            except Exception:
-                pass
-            return
+            logger.debug("load_goals failed; hiding affordance", exc_info=True)
+            goals = []
         try:
-            combo.clear()
+            action.setVisible(bool(goals))
         except Exception:
+            logger.debug("recent goals affordance toggle failed", exc_info=True)
+
+    def _open_recent_goals_menu(self) -> None:
+        """Open a native menu of recent goals below the goal field.
+
+        Built fresh on each open from the on-disk store so it always
+        reflects the latest history. Selecting an item fills the field and
+        emits ``goal_set`` — identical downstream wiring to the old
+        combobox path.
+        """
+        try:
+            from cortex.libs.store.goal_store import load_goals
+            goals = load_goals()[:8]
+        except Exception:
+            logger.debug("load_goals failed; no menu", exc_info=True)
             return
         if not goals:
-            try:
-                combo.setVisible(False)
-            except Exception:
-                pass
             return
         try:
-            combo.addItem("Recent goals…", "")
-            for g in goals[:8]:
-                combo.addItem(g.title[:80], g.id)
-            combo.setCurrentIndex(0)
-            combo.setVisible(True)
+            menu = QMenu(self._goal_input)
+            menu.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
+            for g in goals:
+                title = g.title
+                label = (title[:46] + "…") if len(title) > 47 else title
+                act = menu.addAction(label)
+                act.setData(g.id)
+                act.triggered.connect(
+                    lambda _checked=False, gid=g.id, t=title:
+                    self._on_recent_goal_chosen(str(gid), t)
+                )
+            field = self._goal_input
+            pos = field.mapToGlobal(field.rect().bottomLeft())
+            menu.exec(pos)
         except Exception:
-            logger.debug("recent goals populate failed", exc_info=True)
+            logger.debug("recent goals menu failed", exc_info=True)
 
-    def _on_recent_goal_picked(self, index: int) -> None:
-        """User clicked a goal in the recent-goals dropdown — copy the
-        title into the QLineEdit and emit ``goal_set`` so the daemon
-        picks it up. Index 0 ("Recent goals…") is a no-op header.
+    def _on_recent_goal_chosen(self, goal_id: str, title: str) -> None:
+        """Apply a goal chosen from the recent-goals menu: fill the field,
+        mark it used (so it sorts to the top next time), and emit
+        ``goal_set`` so the daemon picks it up.
         """
-        if index <= 0:
-            return
-        combo = getattr(self, "_recent_goals_combo", None)
-        if combo is None:
-            return
         try:
-            text = combo.itemText(index)
-            goal_id = combo.itemData(index) or ""
-        except Exception:
-            return
-        try:
-            self._goal_input.setText(text)
+            self._goal_input.setText(title)
         except Exception:
             logger.debug("goal_input setText failed", exc_info=True)
-        # Mark the goal as used in the store (bumps last_used_at +
-        # sessions_count) so the dropdown is sorted correctly next open.
         if goal_id:
             try:
                 from cortex.libs.store.goal_store import mark_used
-                mark_used(str(goal_id))
+                mark_used(goal_id)
             except Exception:
                 logger.debug("mark_used failed", exc_info=True)
         try:
-            self.goal_set.emit(text)
+            self.goal_set.emit(title)
         except Exception:
             logger.debug("goal_set emit failed", exc_info=True)
 

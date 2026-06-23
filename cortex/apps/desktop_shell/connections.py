@@ -40,6 +40,7 @@ from cortex.apps.desktop_shell.tokens import (
     BRAND_DISPLAY_FONT,
     CX_TEXT_SECONDARY,
     CX_TEXT_TERTIARY,
+    FONT_MONO,
     FS_BODY,
     FS_CAPTION,
     FS_FOOTNOTE,
@@ -318,7 +319,7 @@ class ConnectionsPanel(QWidget):
         warn_layout.addWidget(warn_title)
         warn_body = QLabel(
             "Cortex is running in a temporary sandbox. Move it to Applications, "
-            "run `xattr -cr /Applications/Cortex.app` in Terminal, then relaunch."
+            "then run this command in Terminal and relaunch:"
         )
         warn_body.setWordWrap(True)
         warn_body.setFont(mac_native.system_font(FS_CAPTION, "regular"))
@@ -326,6 +327,20 @@ class ConnectionsPanel(QWidget):
             f"color: {_LABEL}; border: none; background: transparent;"
         )
         warn_layout.addWidget(warn_body)
+        warn_cmd = QLabel("xattr -cr /Applications/Cortex.app")
+        warn_cmd.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        warn_cmd.setStyleSheet(
+            f"font-family: {FONT_MONO};"
+            f"font-size: {FS_CAPTION}px;"
+            f"color: {_LABEL};"
+            f"background: rgba(0,0,0,0.06);"
+            f"border: 0.5px solid rgba(0,0,0,0.10);"
+            f"border-radius: {RADIUS_BUTTON}px;"
+            "padding: 4px 8px;"
+        )
+        warn_layout.addWidget(warn_cmd)
         self._transloc_warning.setVisible(False)
         layout.addWidget(self._transloc_warning)
 

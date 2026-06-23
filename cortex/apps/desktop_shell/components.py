@@ -34,12 +34,14 @@ from __future__ import annotations
 import logging
 from typing import Final
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
+from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -63,6 +65,120 @@ from cortex.apps.desktop_shell.tokens import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Text-overflow helpers (UI-redesign overlap hardening)
+# ─────────────────────────────────────────────────────────────────────────
+#
+# Two complementary tools so no label can ever overlap a neighbour or clip
+# its container:
+#
+# * ``wrap_capped`` — multi-line word-wrap with an optional hard max width.
+#   Use for paragraphs / help copy / descriptions where reflowing onto a
+#   second line is acceptable and preferable to truncation.
+# * ``install_elide`` — single-line tail-elision (``"This month's flo…"``)
+#   that recomputes on every resize. Use for headers / pills / inline
+#   values where wrapping would break the row rhythm. The FULL text is
+#   preserved in the accessible name + tooltip so nothing is lost to
+#   sighted-mouse or VoiceOver users; only the on-screen glyphs shorten.
+
+
+def wrap_capped(label: QLabel, max_width: int | None = None) -> QLabel:
+    """Enable word-wrap on ``label`` (+ an optional hard ``max_width``).
+
+    Returns the label for fluent use. Safe against lightweight Qt stubs —
+    any AttributeError from a test double is swallowed.
+    """
+    try:
+        label.setWordWrap(True)
+        if max_width is not None:
+            label.setMaximumWidth(int(max_width))
+    except Exception:  # pragma: no cover - lightweight stub
+        logger.debug("wrap_capped: widget does not support wrap/max-width")
+    return label
+
+
+class _ElideFilter(QObject):
+    """Event filter that keeps a single-line ``QLabel`` tail-elided to its
+    current width. Installed by :func:`install_elide`; one filter per label.
+
+    The full text is the source of truth (``set_full_text`` updates it);
+    the label's *displayed* text is always the elided projection. The
+    accessible name and tooltip mirror the full text so assistive tech and
+    hover-discovery never lose information.
+    """
+
+    def __init__(self, label: QLabel, mode: Qt.TextElideMode) -> None:
+        super().__init__(label)
+        self._label = label
+        self._mode = mode
+        self._full = label.text()
+        # Allow the label to shrink below its natural text width so the
+        # layout can hand it a constrained rect (otherwise the minimum
+        # size hint pins it to the full string and it clips instead).
+        try:
+            label.setMinimumWidth(0)
+            sp = label.sizePolicy()
+            sp.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+            label.setSizePolicy(sp)
+        except Exception:  # pragma: no cover - lightweight stub
+            pass
+        label.installEventFilter(self)
+        self._apply()
+
+    def set_full_text(self, text: str) -> None:
+        self._full = text or ""
+        self._apply()
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.Resize:
+            self._apply()
+        return False
+
+    def _apply(self) -> None:
+        try:
+            fm = QFontMetrics(self._label.font())
+            avail = max(0, self._label.width())
+            elided = fm.elidedText(self._full, self._mode, avail)
+            if elided != self._label.text():
+                # blockSignals so a downstream textChanged consumer (rare on
+                # QLabel) doesn't see the cosmetic elision as a real edit.
+                self._label.setText(elided)
+            # Keep full text reachable for mouse-hover + VoiceOver even when
+            # the on-screen text is shortened.
+            if elided != self._full:
+                self._label.setToolTip(self._full)
+                try:
+                    self._label.setAccessibleName(self._full)
+                except Exception:
+                    pass
+        except Exception:  # pragma: no cover - lightweight stub
+            logger.debug("elide filter apply failed", exc_info=True)
+
+
+def install_elide(
+    label: QLabel,
+    mode: Qt.TextElideMode | None = None,
+) -> _ElideFilter | None:
+    """Make ``label`` tail-elide (default) to its width on every resize.
+
+    Returns the filter so callers can push new text via
+    ``filter.set_full_text(...)``; returns ``None`` if the widget can't host
+    the filter (lightweight test stub). The full string stays in the
+    tooltip + accessible name.
+
+    ``mode`` defaults to ``ElideRight`` but is resolved lazily HERE (not as a
+    default-argument value) so importing this module under a lightweight Qt
+    stub — which has no ``Qt.TextElideMode`` — never raises at import time.
+    """
+    try:
+        if mode is None:
+            mode = Qt.TextElideMode.ElideRight
+        return _ElideFilter(label, mode)
+    except Exception:  # pragma: no cover - lightweight stub
+        logger.debug("install_elide: could not attach filter")
+        return None
 
 
 # 8 s default: long enough to read a two-line error + copy the cid, short
@@ -313,4 +429,9 @@ class Toast(QFrame):
         self.dismissed.emit()
 
 
-__all__ = ["DEFAULT_TOAST_DURATION_MS", "Toast"]
+__all__ = [
+    "DEFAULT_TOAST_DURATION_MS",
+    "Toast",
+    "install_elide",
+    "wrap_capped",
+]

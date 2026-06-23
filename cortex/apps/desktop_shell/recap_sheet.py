@@ -60,6 +60,7 @@ except ImportError:  # pragma: no cover - lightweight stubs
     )
 
 from cortex.apps.desktop_shell import mac_native
+from cortex.apps.desktop_shell.components import install_elide
 from cortex.apps.desktop_shell.tokens import (
     BRAND_ACCENT,
     BRAND_ACCENT_HOVER,
@@ -156,11 +157,13 @@ class _Stat(QFrame):
         self._caption.setStyleSheet(
             f"color: {_LABEL_TERTIARY}; background: transparent;"
         )
+        install_elide(self._caption)
         self._value = QLabel(value)
         self._value.setFont(mac_native.system_font(FS_BODY, "semibold"))
         self._value.setStyleSheet(
             f"color: {_LABEL}; background: transparent;"
         )
+        install_elide(self._value)
         layout.addWidget(self._caption)
         layout.addWidget(self._value)
 

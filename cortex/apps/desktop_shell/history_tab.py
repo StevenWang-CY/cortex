@@ -114,6 +114,7 @@ except ImportError:  # pragma: no cover - test stubs
             return 0
 
 from cortex.apps.desktop_shell import mac_native
+from cortex.apps.desktop_shell.components import install_elide, wrap_capped  # noqa: F401
 from cortex.apps.desktop_shell.tokens import (
     BRAND_ACCENT,
     BRAND_ACCENT_DIM,
@@ -466,6 +467,7 @@ class _SessionRow(_RenderCacheMixin, QFrame):
         )
         top.addWidget(self._date_label, stretch=1)
         top.addWidget(self._duration_label, stretch=0)
+        install_elide(self._date_label)
 
         # Bottom line: flow %, peak stress, top distraction.
         bottom = QHBoxLayout()
@@ -506,6 +508,7 @@ class _SessionRow(_RenderCacheMixin, QFrame):
         bottom.addWidget(self._flow_label, stretch=0)
         bottom.addWidget(self._peak_label, stretch=0)
         bottom.addWidget(self._domain_label, stretch=1)
+        install_elide(self._domain_label)
 
         layout.addLayout(top)
         layout.addLayout(bottom)
@@ -589,6 +592,7 @@ class _TodayPanel(_RenderCacheMixin, QWidget):
         header.addWidget(self._header_title, stretch=1)
         header.addWidget(self._count_chip, stretch=0)
         outer.addLayout(header)
+        install_elide(self._header_title)
 
         # Scroll area with the rows.
         scroll = QScrollArea()
@@ -1679,20 +1683,37 @@ class _TrendsPanel(_RenderCacheMixin, QWidget):
         outer.setContentsMargins(SP4, SP3, SP4, SP3)
         outer.setSpacing(SP3)
 
-        # Header row.
-        header = QHBoxLayout()
-        header.setContentsMargins(0, 0, 0, 0)
-        header.setSpacing(SP3)
+        # Header: two rows so "This month's flow" never truncates.
+        # Row 1: title (left, stretch=1) + trend pill (right).
+        # Row 2: "Updated …" caption (left, stretch=1) + Refresh btn (right).
         header_title = "This week's flow" if window == "week" else "This month's flow"
         self._header_label = QLabel(header_title)
         self._header_label.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
         self._header_label.setStyleSheet(
             f"color: {_LABEL}; background: transparent;"
         )
-        # Phase 4.B fix (#19): "Updated <relative>" caption. Lives on
-        # the right side of the header row, immediately left of the
-        # trend pill, so the staleness signal is visible without
-        # extra scrolling. Default text is rebuilt by apply_payload.
+        self._trend_pill = QLabel("Trend: stable")
+        self._trend_pill.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
+        self._trend_pill.setStyleSheet(
+            f"color: {_LABEL_SECONDARY};"
+            f" background: {_GROUPED_BG};"
+            f" border: 0.5px solid {_SEPARATOR};"
+            f" border-radius: {RADIUS_PILL}px;"
+            "  padding: 1px 9px;"
+        )
+        self._trend_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        header_row1 = QHBoxLayout()
+        header_row1.setContentsMargins(0, 0, 0, 0)
+        header_row1.setSpacing(SP3)
+        header_row1.addWidget(self._header_label, stretch=1)
+        header_row1.addWidget(self._trend_pill, stretch=0)
+        outer.addLayout(header_row1)
+        install_elide(self._header_label)
+
+        # Phase 4.B fix (#19): "Updated <relative>" caption + Refresh button.
+        # Moved to row 2 so title is never starved. Default text rebuilt by
+        # apply_payload.
         self._updated_label = QLabel("Not yet aggregated")
         self._updated_label.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         self._updated_label.setStyleSheet(
@@ -1725,21 +1746,14 @@ class _TrendsPanel(_RenderCacheMixin, QWidget):
         # cue without competing with the trend pill or the bars below.
         self._refresh_btn.setStyleSheet(self._refresh_btn_qss(enabled=True))
         self._refresh_btn.clicked.connect(self._on_refresh_clicked)
-        self._trend_pill = QLabel("Trend: stable")
-        self._trend_pill.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
-        self._trend_pill.setStyleSheet(
-            f"color: {_LABEL_SECONDARY};"
-            f" background: {_GROUPED_BG};"
-            f" border: 0.5px solid {_SEPARATOR};"
-            f" border-radius: {RADIUS_PILL}px;"
-            "  padding: 1px 9px;"
-        )
-        self._trend_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        header.addWidget(self._header_label, stretch=1)
-        header.addWidget(self._updated_label, stretch=0)
-        header.addWidget(self._refresh_btn, stretch=0)
-        header.addWidget(self._trend_pill, stretch=0)
-        outer.addLayout(header)
+
+        header_row2 = QHBoxLayout()
+        header_row2.setContentsMargins(0, 0, 0, 0)
+        header_row2.setSpacing(SP3)
+        header_row2.addWidget(self._updated_label, stretch=1)
+        header_row2.addWidget(self._refresh_btn, stretch=0)
+        outer.addLayout(header_row2)
+        install_elide(self._updated_label)
 
         # Empty-state. Phase 4.B fix (#21): parametrise the minimum
         # sample threshold so the Month panel doesn't claim trends

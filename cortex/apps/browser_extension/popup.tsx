@@ -2,7 +2,7 @@
  * Cortex Chrome Extension — Popup UI
  *
  * Design: Cortex Visual Identity Guide — dark, calm, Linear/Claude-inspired.
- * Inter + JetBrains Mono typography, indigo accent, 4px grid spacing.
+ * Inter + JetBrains Mono typography, terracotta accent, 4px grid spacing.
  * No emoji glyphs in user-visible UI — text labels only. No motivational
  * copy. Sentence case everywhere. (Inline comments may still reference
  * the legacy thumbs-up / thumbs-down emoji for historical clarity.)
@@ -879,6 +879,31 @@ function CortexPopup(): React.ReactElement {
                 to { transform: translateY(0); opacity: 1; }
             }
             .cortex-goal-input:focus-visible {
+                outline: 2px solid ${CX.accent};
+                outline-offset: 2px;
+            }
+            /* Primary button — hover / active / keyboard focus */
+            .cortex-primary-btn:hover:not(:disabled) {
+                opacity: 0.85;
+            }
+            .cortex-primary-btn:active:not(:disabled) {
+                opacity: 0.72;
+                transform: scale(0.985);
+            }
+            .cortex-primary-btn:focus-visible {
+                outline: 2px solid ${CX.accent};
+                outline-offset: 2px;
+            }
+            /* Ghost button — hover / active / keyboard focus */
+            .cortex-ghost-btn:hover:not(:disabled) {
+                background: ${CX.accentDim};
+                border-color: ${CX.borderEmphasis};
+            }
+            .cortex-ghost-btn:active:not(:disabled) {
+                background: rgba(217, 119, 87, 0.20);
+                transform: scale(0.985);
+            }
+            .cortex-ghost-btn:focus-visible {
                 outline: 2px solid ${CX.accent};
                 outline-offset: 2px;
             }
@@ -1856,7 +1881,7 @@ function CortexPopup(): React.ReactElement {
                         >{"\u00d7"}</button>
                     </div>
                     <div style={{ marginTop: 8 }}>
-                        <button style={S.ghostBtn} onClick={() => {
+                        <button className="cortex-ghost-btn" style={S.ghostBtn} onClick={() => {
                             const leftOff = (briefing.left_off_at ?? "").trim();
                             if (leftOff !== "") {
                                 sendWithCid({ type: "START_FOCUS", goal: leftOff });
@@ -1947,6 +1972,7 @@ function CortexPopup(): React.ReactElement {
                                 <div style={S.disconnectedTitle} data-testid={testId}>{title}</div>
                                 <div style={S.disconnectedBody}>{body}</div>
                                 <button
+                                    className="cortex-primary-btn"
                                     style={{
                                         ...S.primaryBtn,
                                         marginTop: 16,
@@ -2410,6 +2436,7 @@ function CortexPopup(): React.ReactElement {
                     {rec.length > 0 && (
                         <>
                             <button
+                                className="cortex-primary-btn"
                                 style={
                                     applied || interventionError
                                         ? { ...S.primaryBtn, ...S.doneBtnStyle }

@@ -1253,7 +1253,13 @@ class OverlayWindow(QWidget):
         full_text = f"Why this? {causal}"
         self._causal_full_text = full_text
         if len(causal) > self._CAUSAL_TRUNCATE_THRESHOLD:
-            preview = causal[: self._CAUSAL_TRUNCATE_THRESHOLD].rstrip()
+            # Word-boundary truncation: cut at the last space before the
+            # threshold so we never split mid-token.
+            _slice = causal[: self._CAUSAL_TRUNCATE_THRESHOLD]
+            _last_space = _slice.rfind(" ")
+            if _last_space > 0:
+                _slice = _slice[:_last_space]
+            preview = _slice.rstrip()
             self._causal_preview_text = f"Why this? {preview}…"
             self._causal_toggle.setChecked(False)
             self._causal_toggle.setText("Show more")
