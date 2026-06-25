@@ -110,7 +110,7 @@ Releases = "https://github.com/StevenWang-CY/cortex/releases"
 dev = [
     # Testing
     "pytest>=8.0.0",
-    "pytest-cov>=4.1.0",
+    "pytest-cov>=7.1.0",
     "pytest-asyncio>=1.4.0",
     "pytest-mock>=3.12.0",
 
