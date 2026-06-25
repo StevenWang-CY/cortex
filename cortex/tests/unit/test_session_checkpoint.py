@@ -18,25 +18,29 @@ These tests pin the two guarantees the fix depends on:
 
 from __future__ import annotations
 
-import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 from cortex.libs.utils.atomic_write import atomic_write_json
 from cortex.services.session_report.generator import SessionReportGenerator
 from cortex.services.session_report.reader import SessionReader
 
-# Anchor synthetic state timestamps to wall-clock so the report's
-# ``duration_seconds`` (end_time − start_time, where start_time is stamped by
-# ``start()`` at real now()) is positive — as it always is in the daemon.
-_T0 = time.time()
-_FLOW_AT = _T0
-_HYPER_AT = _T0 + 30.0  # 30 s of FLOW closed
-_SNAP_AT = _T0 + 90.0  # +60 s of open HYPER
+# Fully deterministic synthetic timeline. ``start()`` stamps ``_start_time``
+# at real now(); we pin it to ``_FLOW_AT`` so the report's
+# ``duration_seconds`` (= end_time − start_time) is a fixed +90 s regardless
+# of when the test runs in the suite — the earlier version anchored on real
+# wall-clock and went negative once the full suite took >90 s to reach here.
+_FLOW_AT = 1_900_000_000.0  # fixed epoch (well within datetime range)
+_HYPER_AT = _FLOW_AT + 30.0  # 30 s of FLOW closed
+_SNAP_AT = _FLOW_AT + 90.0  # +60 s of open HYPER
 
 
 def _seeded_generator() -> SessionReportGenerator:
     g = SessionReportGenerator()
     g.start()
+    # Pin the session start to the synthetic FLOW timestamp so duration is
+    # deterministic (white-box: the daemon stamps this from real time).
+    g._start_time = datetime.fromtimestamp(_FLOW_AT, tz=UTC)
     g.record_state("FLOW", _FLOW_AT)
     g.record_state("HYPER", _HYPER_AT)
     return g
@@ -103,7 +107,7 @@ def test_final_write_overwrites_checkpoint(tmp_path: Path) -> None:
     reader.invalidate(snap.session_id)
     assert reader.list_sessions(since=None, limit=30).total_known == 1
 
-    final = g.finish(end_timestamp=_T0 + 200.0)  # session ran longer
+    final = g.finish(end_timestamp=_FLOW_AT + 200.0)  # session ran longer
     atomic_write_json(path, final.model_dump(mode="json"))
     reader.invalidate(final.session_id)
     resp = reader.list_sessions(since=None, limit=30)
