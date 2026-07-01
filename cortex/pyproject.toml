@@ -62,7 +62,7 @@ dependencies = [
     "pynput>=1.7.6",
 
     # Desktop UI
-    "PySide6>=6.6.0",
+    "PySide6>=6.11.1",
 
     # macOS Keychain for BYOK storage
     "keyring>=24.3.0",
