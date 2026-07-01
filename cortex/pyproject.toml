@@ -68,7 +68,7 @@ dependencies = [
     "keyring>=24.3.0",
 
     # HTTP Client
-    "httpx>=0.26.0",
+    "httpx>=0.28.1",
 
     # Anthropic SDK — production LLM path (AWS Bedrock primary,
     # direct Anthropic / Vertex as escape hatches behind the same
