@@ -95,7 +95,7 @@ dependencies = [
     "prometheus-client>=0.19.0",
 
     # Redis
-    "redis[hiredis]>=5.0.0",
+    "redis[hiredis]>=8.0.1",
 ]
 
 [project.urls]
