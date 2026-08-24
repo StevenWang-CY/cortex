@@ -92,6 +92,7 @@ class NumericObservation(TimedObservation):
     missing_reason: MissingReason | str | None
     quality: float
     head_jitter_deg: float = 0.0
+    head_vertical_face_units: float | None = None
 
     @property
     def is_valid(self) -> bool:
@@ -108,6 +109,8 @@ class PreparedObservationWindow:
 
     ready: bool
     values: NDArray[np.float64] | None
+    sample_times_mono_ns: NDArray[np.int64] | None
+    head_vertical_face_units: NDArray[np.float64] | None
     sample_rate_hz: float
     valid_fraction: float
     temporal_coverage: float
@@ -212,6 +215,8 @@ def prepare_observation_window(
         return PreparedObservationWindow(
             ready=False,
             values=None,
+            sample_times_mono_ns=None,
+            head_vertical_face_units=None,
             sample_rate_hz=0.0,
             valid_fraction=valid_fraction,
             temporal_coverage=temporal_coverage,
@@ -243,22 +248,61 @@ def prepare_observation_window(
             * sample_rate_hz
         )) + 1,
     )
-    grid = np.linspace(
-        float(valid_times[0]), float(valid_times[-1]), grid_count, dtype=np.float64
+    # Interpolate in a window-relative clock to preserve nanosecond deltas.
+    # Casting an absolute, long-running monotonic timestamp directly to
+    # float64 progressively loses low bits.
+    origin_ns = int(valid_times[0])
+    valid_relative_ns = (valid_times - origin_ns).astype(np.float64)
+    grid_relative_ns = np.linspace(
+        0.0,
+        float(int(valid_times[-1]) - origin_ns),
+        grid_count,
+        dtype=np.float64,
     )
+    grid_mono_ns = origin_ns + np.rint(grid_relative_ns).astype(np.int64)
     matrix = np.stack([np.asarray(item.value, dtype=np.float64) for item in valid_items])
     if matrix.ndim == 1:
         matrix = matrix.reshape(-1, 1)
     resampled = np.empty((grid_count, matrix.shape[1]), dtype=np.float64)
-    valid_times_f = valid_times.astype(np.float64)
     for channel in range(matrix.shape[1]):
         resampled[:, channel] = np.interp(
-            grid, valid_times_f, matrix[:, channel]
+            grid_relative_ns, valid_relative_ns, matrix[:, channel]
         )
+
+    head_values: NDArray[np.float64] | None = None
+    head_items = [
+        item
+        for item in valid_items
+        if item.head_vertical_face_units is not None
+        and np.isfinite(item.head_vertical_face_units)
+    ]
+    if len(head_items) >= 2:
+        head_times = np.asarray(
+            [item.observed_at_mono_ns for item in head_items], dtype=np.int64
+        )
+        head_gaps_ms = float(np.max(np.diff(head_times))) / 1_000_000.0
+        endpoint_gap_ms = max(
+            (int(head_times[0]) - int(valid_times[0])) / 1_000_000.0,
+            (int(valid_times[-1]) - int(head_times[-1])) / 1_000_000.0,
+        )
+        if max(head_gaps_ms, endpoint_gap_ms) <= max_interpolation_gap_ms:
+            raw_head_values: list[float] = []
+            for item in head_items:
+                value = item.head_vertical_face_units
+                if value is not None:
+                    raw_head_values.append(float(value))
+            head_values_raw = np.asarray(raw_head_values, dtype=np.float64)
+            head_values = np.interp(
+                grid_relative_ns,
+                (head_times - origin_ns).astype(np.float64),
+                head_values_raw,
+            )
 
     return PreparedObservationWindow(
         ready=True,
         values=resampled,
+        sample_times_mono_ns=grid_mono_ns,
+        head_vertical_face_units=head_values,
         sample_rate_hz=float(sample_rate_hz),
         valid_fraction=valid_fraction,
         temporal_coverage=temporal_coverage,
@@ -305,6 +349,8 @@ def _unavailable_window(
     return PreparedObservationWindow(
         ready=False,
         values=None,
+        sample_times_mono_ns=None,
+        head_vertical_face_units=None,
         sample_rate_hz=0.0,
         valid_fraction=0.0,
         temporal_coverage=0.0,

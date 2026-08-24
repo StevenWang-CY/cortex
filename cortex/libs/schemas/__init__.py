@@ -124,6 +124,19 @@ from cortex.libs.schemas.observations import (
     ObservationSource,
     ObservationValidity,
 )
+from cortex.libs.schemas.physiology import (
+    BeatCandidate,
+    BeatEvent,
+    BeatRejectionReason,
+    BeatStatus,
+    EstimateUncertainty,
+    EvidenceStatus,
+    InterBeatInterval,
+    PhysiologyMetric,
+    PulseWindowSummary,
+    SignalAlgorithmIdentity,
+    SignalEstimate,
+)
 from cortex.libs.schemas.protocol import (
     AuthOkPayload,
     AuthRequestPayload,
@@ -198,6 +211,18 @@ __all__ = [
     "KinematicFeatures",
     "TelemetryFeatures",
     "FeatureVector",
+    # Physiology evidence
+    "EvidenceStatus",
+    "PhysiologyMetric",
+    "BeatStatus",
+    "BeatRejectionReason",
+    "SignalAlgorithmIdentity",
+    "EstimateUncertainty",
+    "SignalEstimate",
+    "BeatCandidate",
+    "BeatEvent",
+    "InterBeatInterval",
+    "PulseWindowSummary",
     # Scheduled sensor observations
     "ObservationSource",
     "ObservationValidity",

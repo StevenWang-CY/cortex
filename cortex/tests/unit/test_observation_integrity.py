@@ -189,6 +189,37 @@ def test_variable_24_fps_trace_meets_80_percent_coverage_boundary() -> None:
     assert result.values is not None and np.isfinite(result.values).all()
 
 
+def test_irregular_capture_times_produce_explicit_uniform_monotonic_grid() -> None:
+    trace = _numeric_trace()
+    jitter_pattern_ns = (-3_000_000, 2_000_000, 1_000_000, 0)
+    irregular: list[NumericObservation] = []
+    for index, item in enumerate(trace):
+        jitter_ns = jitter_pattern_ns[index % len(jitter_pattern_ns)]
+        irregular.append(
+            NumericObservation(
+                observed_at_unix_ms=item.observed_at_unix_ms,
+                observed_at_mono_ns=item.observed_at_mono_ns + jitter_ns,
+                boot_id=item.boot_id,
+                sequence=item.sequence,
+                value=item.value,
+                validity=item.validity,
+                missing_reason=item.missing_reason,
+                quality=item.quality,
+                head_vertical_face_units=(
+                    0.5 + 0.01 * np.sin(2 * np.pi * index / 120.0)
+                ),
+            )
+        )
+    result = _prepare(irregular)
+    assert result.ready is True
+    assert result.sample_times_mono_ns is not None
+    grid_diffs = np.diff(result.sample_times_mono_ns)
+    assert bool((grid_diffs > 0).all())
+    assert int(np.ptp(grid_diffs)) <= 1
+    assert result.head_vertical_face_units is not None
+    assert len(result.head_vertical_face_units) == len(result.sample_times_mono_ns)
+
+
 def test_removing_valid_observations_never_improves_readiness_or_quality() -> None:
     trace = _numeric_trace()
     previous = _prepare(trace)

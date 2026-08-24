@@ -139,8 +139,7 @@ def _pipeline_output(ts: float = 0.0, face: bool = True, low_quality: bool = Fal
 async def _drive_frames(
     daemon: Any, blink_scores: list[float], n_per_frame: int
 ) -> list[float]:
-    """Feed enough frames to fill the rPPG window, capturing the
-    ``blink_suppression`` kwarg seen by process_window on each call."""
+    """Fill the rPPG window and capture legacy pulse keyword arguments."""
     captured: list[float] = []
     fake_roi = MagicMock()
     fake_roi.combined_rgb.return_value = np.ones(3, dtype=np.float64)
@@ -169,6 +168,17 @@ async def _drive_frames(
     fake_posture = SimpleNamespace(
         slump_score=None, forward_lean_score=None, shoulder_drop_ratio=None
     )
+    pulse_summary = MagicMock()
+    pulse_summary.hr = SimpleNamespace(value=72.0)
+    pulse_summary.quality = 0.8
+    pulse_summary.model_dump.return_value = {}
+    pulse_result = SimpleNamespace(
+        waveform=np.zeros(n_per_frame, dtype=np.float64),
+        summary=pulse_summary,
+        hrv_estimates={},
+        beat_events=(),
+        intervals=(),
+    )
 
     with (
         patch.object(daemon, "_roi_extractor") as roi_x,
@@ -178,7 +188,11 @@ async def _drive_frames(
         patch.object(daemon, "_feature_fusion"),
         patch.object(daemon._pulse_estimator, "process_window", side_effect=_fake_process_window),
         patch.object(daemon._pulse_estimator, "get_features", return_value=daemon._latest_physio),
-        patch("cortex.services.runtime_daemon.extract_bvp", return_value=np.zeros(n_per_frame)),
+        patch.object(
+            daemon._physiology_v2.pulse,
+            "process_window",
+            return_value=pulse_result,
+        ),
         patch("cortex.services.runtime_daemon.registry"),
     ):
         roi_x.extract.return_value = fake_roi
@@ -194,22 +208,17 @@ async def _drive_frames(
 
 
 @pytest.mark.asyncio
-async def test_blink_suppression_forwarded_with_one_frame_lag(daemon) -> None:  # type: ignore[no-untyped-def]
-    """C5: process_window sees the PRIOR frame's blink-suppression score."""
+async def test_blink_suppression_is_not_repurposed_as_medical_signal(daemon) -> None:  # type: ignore[no-untyped-def]
+    """Blink focus is not threaded into the retired breath-pause heuristic."""
     # Distinct ascending scores (capped at 1.0 — KinematicFeatures bounds
     # blink_suppression_score to [0, 1]) so the 1-frame lag is observable.
     scores = [min(1.0, 0.1 * (i + 1)) for i in range(400)]
     n_per_frame = daemon._rgb_history.maxlen or 1
     captured = await _drive_frames(daemon, scores, n_per_frame)
     assert captured, "process_window was never invoked"
-    # The first process_window call fires once the window is full (after
-    # `maxlen` frames). The blink_suppression it receives is the score from
-    # the PRIOR frame, i.e. strictly less than the current-frame score, and
-    # never the default sentinel -1.0.
-    assert all(v >= 0.0 for v in captured), captured
-    # 1-frame lag: the value forwarded equals the score cached on the prior
-    # frame, never 0.0 once the detector has warmed up.
-    assert max(captured) > 0.0
+    assert all(v == -1.0 for v in captured), captured
+    assert daemon._latest_physio.pulse_evidence is not None
+    assert daemon._latest_physio.pulse_bpm == daemon._latest_physio.pulse_evidence.value
 
 
 # ─── C6: FACE_LOST / FACE_REACQUIRED structured events ───────────────────

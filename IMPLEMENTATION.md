@@ -1465,6 +1465,29 @@ tests plus Chrome build, and 12 VS Code tests plus VSIX packaging.
 
 ### WP-3 — rPPG, beat stream, HRV, and respiration v2 (`XL`)
 
+**Implementation status (2026-08-24): complete for the production signal
+architecture; external evidence promotion remains gated by WP-11.** A fixed,
+checksum-verifiable POS/CHROM/GREEN backend registry now feeds a measured-time
+pipeline with exact code/configuration provenance, explicit quality and
+uncertainty, and fail-closed publication states. TS-CAN and its nonexistent
+checkpoint path were removed instead of silently falling back. Absolute beat
+candidates are reconciled across overlapping windows into an idempotent,
+chronological ledger; IBIs are derived only from named accepted beats and
+retain explicit refractory, boundary, plausibility, and local-artifact
+rejections. HRV readiness is metric-specific, fingerprints its own
+implementation and upstream dependency, and remains unavailable by default.
+Respiration uses independent color-envelope and face-normalized motion channels
+over 30–60 second windows, requires quality plus cross-channel agreement, and
+has no apnea or diagnostic behavior. It remains unavailable by default.
+Heart-rate results remain labelled experimental—not supported—until the
+preregistered simultaneous-reference gate is passed. Completion evidence:
+2,194 non-PySide Python tests passed with five dataset/platform skips; every
+PySide-bearing module passed in isolation; focused v2/observation/runtime tests,
+strict mypy on the touched signal/runtime surface, Ruff, generated-schema drift,
+178 browser tests plus TypeScript/Chrome build, and 12 VS Code tests plus VSIX
+packaging all pass. Optional UBFC/PURE replays are checksum- and
+subject-split-enforced and skip when licensed datasets are not locally supplied.
+
 **Files:**
 
 - `cortex/services/physio_engine/rppg.py`
@@ -1877,10 +1900,10 @@ Move one cohesive flow at a time behind the kernel after characterization tests.
 
 ### P1 — Correctness and durable safety
 
-- [ ] P1-01 observation envelopes and missingness gates
-- [ ] P1-02 motion ordering and time-correct MediaPipe/kinematics
-- [ ] P1-03 unique beat/IBI stream
-- [ ] P1-04 respiration redesign or feature removal
+- [x] P1-01 observation envelopes and missingness gates
+- [x] P1-02 motion ordering and time-correct MediaPipe/kinematics
+- [x] P1-03 unique beat/IBI stream
+- [x] P1-04 respiration redesign or feature removal
 - [ ] P1-05 calibrated profile provenance and live reload
 - [ ] P1-06 evidence-normalized inference with unknown state
 - [ ] P1-07 manifest/authorization/receipt intervention protocol

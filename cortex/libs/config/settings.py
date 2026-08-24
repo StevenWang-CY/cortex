@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -311,11 +311,9 @@ class CaptureConfig(BaseModel):
     observation_buffer_max_items: int = Field(3600, ge=2)
     # audit Phase-I: how often to run MediaPipe FaceLandmarker relative
     # to the capture cadence. ``1`` = every frame, ``2`` = every other
-    # frame (15 Hz at 30 Hz capture). C5 (audit): default reverted to
-    # ``1`` (every frame) — SENSING's apnea / blink-suppression timing
-    # needs the full-rate mesh so the per-frame timestamp threading is
-    # exact; the half-rate path introduced a sub-Nyquist gap on the
-    # respiration estimator that the apnea sustain timer depends on.
+    # frame (15 Hz at 30 Hz capture). The default remains ``1`` because
+    # elapsed-time blink and motion exposure require the full observation
+    # cadence; downsampling must occur after timestamps are recorded.
     face_mesh_subsample_n: int = 1
 
 
@@ -541,24 +539,58 @@ class TelemetryConfig(BaseModel):
 class RPPGSignalConfig(BaseModel):
     """rPPG signal processing configuration."""
 
-    window_seconds: int = 10
-    stride_seconds: int = 1
-    backend: Literal["pos", "chrom", "green", "tscan"] = "pos"
-    model_path: str = "cortex/models/tscan.onnx"
-    bandpass_low: float = 0.7
-    bandpass_high: float = 3.5
-    bandpass_order: int = 4
-    welch_resolution: float = 0.1
+    window_seconds: int = Field(10, ge=8, le=60)
+    stride_seconds: int = Field(1, ge=1)
+    backend: Literal["pos", "chrom", "green"] = "pos"
+    backend_expected_sha256: str | None = Field(
+        None,
+        pattern=r"^[0-9a-f]{64}$",
+        description="Optional expected checksum of the packaged backend implementation",
+    )
+    dynamic_backend_selection: bool = Field(
+        False,
+        description="Requires separate held-out validation before it may be enabled",
+    )
+    bandpass_low: float = Field(0.7, gt=0.0)
+    bandpass_high: float = Field(3.5, gt=0.0)
+    bandpass_order: int = Field(4, ge=1, le=8)
     nsqi_threshold: float = 0.293
     min_cardiac_snr_db: float = 2.0
-    min_resp_snr_db: float = 1.5
-    max_face_loss_ratio: float = 0.20
-    max_head_jitter_deg: float = 7.5
+    max_head_jitter_deg: float = Field(7.5, gt=0.0)
     min_valid_coverage: float = Field(0.80, ge=0.0, le=1.0)
     max_interpolation_gap_ms: float = Field(250.0, gt=0.0)
     max_motion_rejected_fraction: float = Field(0.10, ge=0.0, le=1.0)
-    hrv_min_window_seconds: int = 60
-    hrv_min_valid_ibi: int = 30
+    hrv_min_window_seconds: int = Field(180, ge=180)
+    hrv_min_valid_ibi: int = Field(120, ge=120)
+    experimental_hrv_enabled: bool = False
+    respiration_window_seconds: int = Field(45, ge=30, le=60)
+    respiration_low_hz: float = Field(0.08, gt=0.0)
+    respiration_high_hz: float = Field(0.50, gt=0.0)
+    respiration_min_channel_quality: float = Field(0.35, ge=0.0, le=1.0)
+    respiration_max_channel_disagreement_bpm: float = Field(3.0, gt=0.0)
+    experimental_respiration_enabled: bool = False
+
+    @field_validator("respiration_high_hz")
+    @classmethod
+    def _respiration_band_is_ordered(cls, value: float, info: Any) -> float:
+        low = float(info.data.get("respiration_low_hz", 0.0))
+        if value <= low:
+            raise ValueError("respiration_high_hz must exceed respiration_low_hz")
+        return value
+
+    @model_validator(mode="after")
+    def _signal_bands_and_windows_are_coherent(self) -> RPPGSignalConfig:
+        if self.stride_seconds > self.window_seconds:
+            raise ValueError("rPPG stride_seconds cannot exceed window_seconds")
+        if self.bandpass_high <= self.bandpass_low:
+            raise ValueError("bandpass_high must exceed bandpass_low")
+        if self.fps_clamp_max <= self.fps_clamp_min:
+            raise ValueError("fps_clamp_max must exceed fps_clamp_min")
+        if self.bandpass_high >= self.fps_clamp_min / 2.0:
+            raise ValueError("cardiac band must remain below the minimum Nyquist rate")
+        if self.respiration_high_hz >= self.fps_clamp_min / 2.0:
+            raise ValueError("respiration band must remain below the minimum Nyquist rate")
+        return self
 
     # --- Sampling-rate correctness (B1) -----------------------------------
     # rPPG HR estimation via Welch PSD assumes a known, *constant* sampling
@@ -569,7 +601,6 @@ class RPPGSignalConfig(BaseModel):
     # band; outside this band (or with too few timestamps) we fall back to
     # the configured fps. Refs: MDPI Sensors 25(2):588 (2025); rPPG-in-the-
     # wild, Behavior Research Methods (2024).
-    use_measured_fps: bool = True
     fps_clamp_min: float = 10.0
     fps_clamp_max: float = 60.0
 

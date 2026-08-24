@@ -12,6 +12,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, model_validator
 
+from cortex.libs.schemas.physiology import SignalEstimate
+
 
 class FrameMeta(BaseModel):
     """Metadata for a captured webcam frame."""
@@ -126,6 +128,18 @@ class PhysioFeatures(BaseModel):
         ge=0.0,
         le=60.0,
         description="Compatibility field; unavailable in product pending validation",
+    )
+    pulse_evidence: SignalEstimate | None = Field(
+        None,
+        description="Algorithm/version/quality/uncertainty contract for pulse",
+    )
+    hrv_evidence: dict[str, SignalEstimate] = Field(
+        default_factory=dict,
+        description="Metric-specific HRV readiness; unavailable metrics stay explicit",
+    )
+    respiration_evidence: SignalEstimate | None = Field(
+        None,
+        description="Agreement-gated breathing-rate proxy evidence contract",
     )
     valid: bool = Field(..., description="Whether physiological features are valid")
 

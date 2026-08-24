@@ -130,24 +130,28 @@ signal:
     window_seconds: 10
     stride_seconds: 1
     backend: pos
-    model_path: cortex/models/tscan.onnx
+    backend_expected_sha256: null
+    dynamic_backend_selection: false
     bandpass_low: 0.7
     bandpass_high: 3.5
     bandpass_order: 4
-    welch_resolution: 0.1
     nsqi_threshold: 0.293
     min_cardiac_snr_db: 2.0
-    min_resp_snr_db: 1.5
-    max_face_loss_ratio: 0.20
     max_head_jitter_deg: 7.5
     min_valid_coverage: 0.80
     max_interpolation_gap_ms: 250.0
     max_motion_rejected_fraction: 0.10
-    hrv_min_window_seconds: 60
-    hrv_min_valid_ibi: 30
+    hrv_min_window_seconds: 180
+    hrv_min_valid_ibi: 120
+    experimental_hrv_enabled: false
+    respiration_window_seconds: 45
+    respiration_low_hz: 0.08
+    respiration_high_hz: 0.50
+    respiration_min_channel_quality: 0.35
+    respiration_max_channel_disagreement_bpm: 3.0
+    experimental_respiration_enabled: false
     # Sampling-rate correctness (B1): derive fps from real frame
     # timestamps instead of trusting the configured rate.
-    use_measured_fps: true
     fps_clamp_min: 10.0
     fps_clamp_max: 60.0
     # Temporal stabilizer (B2): Schmitt-trigger + last-valid hold + BPM

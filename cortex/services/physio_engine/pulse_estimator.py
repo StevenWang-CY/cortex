@@ -1,18 +1,15 @@
 """
 Physio Engine — Pulse Estimator
 
-Consumes 10-second BVP windows and produces physiological features:
+Legacy pulse-only compatibility estimator over 10-second BVP windows:
 - Instantaneous heart rate (BPM) via Welch PSD peak detection
-- IBI series → RMSSD (HRV proxy)
 - HR delta (5-second gradient for trend detection)
 
 Bridges the signal processing library (libs/signal/) with the physio engine
 by applying bandpass filtering and then delegating to the peak detection
 and HRV computation utilities.
 
-Output rate per spec:
-- HR updated every 1 second (each stride)
-- HRV updated every 5 seconds (requires longer window for stable IBI)
+Absolute beats, HRV readiness, and respiration are owned by the v2 pipeline.
 """
 
 from __future__ import annotations
@@ -27,14 +24,10 @@ from numpy.typing import NDArray
 from cortex.libs.schemas.features import PhysioFeatures
 from cortex.libs.signal.filters import bandpass_filter
 from cortex.libs.signal.peak_detection import (
-    compute_hrv_metrics,
-    compute_ibi_series,
     compute_physio_sqi,
     compute_signal_quality,
-    detect_bvp_peaks,
     estimate_hr_welch,
 )
-from cortex.services.physio_engine.respiration import RespirationEstimator
 
 logger = logging.getLogger(__name__)
 
@@ -218,7 +211,7 @@ class PulseStabilizer:
 
 class PulseEstimator:
     """
-    Estimates heart rate and HRV from BVP signal windows.
+    Estimates window-level heart rate from BVP signal windows.
 
     Maintains a rolling history of HR estimates for computing the
     5-second HR delta (trend detection for state scoring).
@@ -249,13 +242,16 @@ class PulseEstimator:
         self._filter_order = filter_order
         self._nsqi_threshold = nsqi_threshold
         self._min_cardiac_snr_db = min_cardiac_snr_db
-        self._hrv_min_window_seconds = hrv_min_window_seconds
-        self._hrv_min_valid_ibi = hrv_min_valid_ibi
+        del hrv_min_window_seconds, hrv_min_valid_ibi
         # HRV and camera-derived respiration have not passed the reference-
         # sensor validation gates required for product publication. Keep the
         # algorithms available to explicit research harnesses, but make the
         # ordinary runtime output contract fail closed to ``None``.
-        self._publish_experimental_metrics = publish_experimental_metrics
+        if publish_experimental_metrics:
+            logger.warning(
+                "Legacy overlapping-window HRV/respiration is retired; use the "
+                "absolute-time v2 research pipeline"
+            )
         # B2: temporal stabilizer (hysteresis hold + BPM smoothing). When
         # None the estimator behaves exactly as before (stateless per-window
         # gate) — preserved so existing callers / tests are unaffected.
@@ -270,53 +266,11 @@ class PulseEstimator:
         # Latest estimates
         self._latest_estimate: PulseEstimate | None = None
         self._latest_timestamp: float = 0.0
-        self._ibi_history: deque[tuple[float, float]] = deque(maxlen=2000)
-
-        # Rolling head vertical-position history (normalized 0-1 image
-        # coordinate) used to derive a motion-based respiratory proxy that
-        # is fused with the BVP-derived respiration estimate. Sized to one
-        # ~10 s window at the configured frame rate so the breathing band
-        # (0.15-0.4 Hz) is resolvable.
-        self._head_vertical_window_len = max(4, int(round(fs * 10.0)))
-        self._head_vertical_history: deque[float] = deque(
-            maxlen=self._head_vertical_window_len
-        )
-
-        # Respiration estimator (runs alongside cardiac estimation)
-        self._resp_estimator = RespirationEstimator(fs=fs)
 
     @property
     def latest_estimate(self) -> PulseEstimate | None:
         """Get the most recent pulse estimate."""
         return self._latest_estimate
-
-    def push_head_vertical_sample(self, y_normalized: float) -> None:
-        """Record one frame's head vertical position for the motion proxy.
-
-        ``y_normalized`` is the head/nose vertical position normalized to
-        the [0, 1] image height (0 = top of frame). Respiratory motion
-        modulates this slowly (chest/head bob), so a rolling buffer of these
-        samples gives an independent respiratory signal that is fused with
-        the BVP-derived estimate inside :meth:`process_window`. Callers that
-        do not feed this (or supply an explicit ``motion_resp_signal``)
-        simply fall back to BVP-only respiration.
-        """
-        self._head_vertical_history.append(float(y_normalized))
-
-    def _motion_resp_signal(self) -> NDArray[np.float64] | None:
-        """Build a motion-derived respiratory proxy from head vertical history.
-
-        Returns a detrended 1-D signal long enough for the respiratory
-        bandpass filter, or None when too few samples have been collected.
-        """
-        if len(self._head_vertical_history) < self._head_vertical_window_len:
-            return None
-        samples = np.asarray(self._head_vertical_history, dtype=np.float64)
-        if samples.size < 4 or float(np.std(samples)) < 1e-9:
-            return None
-        # Remove the DC component; the respiratory bandpass downstream
-        # isolates the breathing band from this displacement series.
-        return samples - float(np.mean(samples))
 
     def process_window(
         self,
@@ -330,43 +284,37 @@ class PulseEstimator:
         motion_resp_signal: NDArray[np.float64] | None = None,
     ) -> PulseEstimate:
         """
-        Process a BVP signal window to estimate HR and HRV.
+        Process a BVP signal window to estimate HR.
 
         Steps:
         1. Apply Butterworth bandpass filter (0.7–3.5 Hz)
         2. Estimate HR via Welch PSD
-        3. Detect peaks for IBI extraction
-        4. Compute RMSSD from IBI series
-        5. Score signal quality
+        3. Score signal quality
 
         Args:
             bvp_window: Raw BVP signal, shape (N,). Should be ~10 seconds.
-            timestamp: Timestamp of the window center. Also threaded into
-                the respiration estimator so the screen-apnea sustain
-                timer uses the frame clock, not ``time.monotonic()``.
+            timestamp: Timestamp of the window center for pulse trend history.
             head_jitter_deg: Inter-frame head jitter in degrees (motion penalty).
             face_presence_ratio: Fraction of the window with the face present.
-            blink_suppression: Latest blink-suppression score (0-1). High
-                values indicate visual fixation; forwarded to the
-                respiration estimator to gate screen-apnea detection (C5).
-            motion_resp_signal: Optional motion-derived respiratory proxy
-                (e.g. head vertical displacement), fused with the BVP-derived
-                respiration estimate when available.
+            blink_suppression: Deprecated compatibility argument; ignored.
+            motion_resp_signal: Deprecated compatibility argument; ignored.
 
         Returns:
-            PulseEstimate with HR, HRV, and quality metrics.
+            PulseEstimate with HR and quality; retired metrics remain None.
         """
+        # Kept in the signature for compatibility. The legacy estimator is
+        # now pulse-only; v2 consumes the absolute-time head-motion channel.
+        del blink_suppression, motion_resp_signal
         # B1 (sampling-rate correctness): adopt the per-window effective fps
         # derived by the daemon from real frame timestamps. Welch HR =
         # dominant_freq × 60, so an honest fs is what makes the BPM correct;
         # trusting a hardcoded 30 fps on a camera running ~24-28 fps inflates
         # every reading. Every fs-dependent call below reads ``self._fs``, so
-        # updating it once here (plus the respiration sub-estimator) threads
-        # the corrected rate through the whole window. Ignored when the
+        # updating it once here threads the corrected rate through the whole
+        # window. Ignored when the
         # caller passes nothing (tests / legacy callers keep the default).
         if fs is not None and fs > 0:
             self._fs = float(fs)
-            self._resp_estimator.set_fs(float(fs))
 
         n_samples = len(bvp_window)
         min_filter_samples = 3 * (2 * self._filter_order + 1)
@@ -404,10 +352,9 @@ class PulseEstimator:
             filtered, fs=self._fs, low_hz=self._low_hz, high_hz=self._high_hz,
         )
 
-        # Step 3/4: IBI and experimental HRV metrics are computed only in
-        # an explicitly constructed research estimator. The shipped daemon
-        # never enables this path, so unsupported measures are unavailable
-        # rather than silently approximated from a ten-second webcam window.
+        # Step 3/4: the legacy overlapping-window IBI accumulator has been
+        # removed. It duplicated and reordered intervals on every one-second
+        # stride. The v2 absolute beat ledger is the sole HRV research path.
         hrv: dict[str, float | None] = {
             "rmssd": None,
             "sdnn": None,
@@ -418,14 +365,6 @@ class PulseEstimator:
             "sample_entropy": None,
         }
         ibi_count = 0
-        if self._publish_experimental_metrics:
-            peaks = detect_bvp_peaks(filtered, fs=self._fs)
-            ibi = compute_ibi_series(peaks, fs=self._fs, signal=filtered)
-            self._update_ibi_history(ibi, timestamp)
-            rolling_ibi = self._get_rolling_ibi(timestamp)
-            if rolling_ibi.size >= self._hrv_min_valid_ibi:
-                hrv = compute_hrv_metrics(rolling_ibi)
-            ibi_count = len(ibi)
 
         # Step 5: Signal quality and composite SQI.
         quality = compute_signal_quality(
@@ -464,29 +403,6 @@ class PulseEstimator:
             self._hr_history.append((timestamp, hr_bpm))
         self._latest_estimate = estimate
         self._latest_timestamp = timestamp
-
-        # Also estimate respiration from the same BVP window. C5: forward
-        # the caller-supplied blink_suppression (1-frame lag is acceptable;
-        # the daemon caches the previous frame's score) and the frame
-        # timestamp so the apnea sustain timer is driven by the frame clock
-        # rather than wall/monotonic time.
-        #
-        # Motion fusion: an explicit motion_resp_signal wins; otherwise the
-        # estimator derives one from the head vertical-position history fed
-        # via push_head_vertical_sample(). When neither is available the
-        # respiration estimator runs BVP-only.
-        if self._publish_experimental_metrics:
-            motion_proxy = (
-                motion_resp_signal
-                if motion_resp_signal is not None
-                else self._motion_resp_signal()
-            )
-            self._resp_estimator.process_bvp_window(
-                bvp_window,
-                blink_suppression=blink_suppression,
-                motion_proxy_signal=motion_proxy,
-                timestamp=timestamp,
-            )
 
         return estimate
 
@@ -580,12 +496,6 @@ class PulseEstimator:
 
         hr_delta = self.compute_hr_delta(timestamp)
 
-        resp_rate = None
-        if self._publish_experimental_metrics:
-            resp_est = self._resp_estimator.latest_estimate
-            if resp_est is not None:
-                resp_rate = resp_est.resp_rate_bpm
-
         nsqi = est.sqi_components.get("nsqi", 0.0)
         snr_db = est.sqi_components.get("snr_db", -99.0)
         sqi_gate_ok = (
@@ -615,11 +525,7 @@ class PulseEstimator:
             eff_bpm = est.hr_bpm if sqi_gate_ok else None
 
         fresh = sqi_gate_ok
-        hrv_ready = (
-            self._publish_experimental_metrics
-            and len(self._get_rolling_ibi(timestamp)) >= self._hrv_min_valid_ibi
-        )
-        fresh_hrv = fresh and hrv_ready
+        fresh_hrv = False
 
         return PhysioFeatures(
             pulse_bpm=eff_bpm if eff_valid else None,
@@ -638,43 +544,14 @@ class PulseEstimator:
             # when valid is False or PhysioFeatures._enforce_invalid_nulls
             # raises ValueError, which the daemon swallows as a dropped
             # frame (losing physio + kinematics for that stride).
-            respiration_rate_bpm=resp_rate if (eff_valid and fresh) else None,
+            respiration_rate_bpm=None,
             valid=eff_valid,
         )
-
-    @property
-    def resp_estimator(self) -> RespirationEstimator:
-        """Access the respiration sub-estimator."""
-        return self._resp_estimator
 
     def reset(self) -> None:
         """Reset all state."""
         self._hr_history.clear()
-        self._ibi_history.clear()
-        self._head_vertical_history.clear()
         self._latest_estimate = None
         self._latest_timestamp = 0.0
-        self._resp_estimator.reset()
         if self._stabilizer is not None:
             self._stabilizer.reset()
-
-    def _update_ibi_history(self, ibi_ms: NDArray[np.float64], timestamp: float) -> None:
-        if ibi_ms.size == 0:
-            return
-        # Approximate each IBI timestamp relative to the current window endpoint.
-        running = float(timestamp)
-        for value in reversed(ibi_ms.tolist()):
-            self._ibi_history.appendleft((running, float(value)))
-            running -= max(0.2, float(value) / 1000.0)
-        self._prune_ibi_history(timestamp)
-
-    def _prune_ibi_history(self, now: float) -> None:
-        cutoff = now - self._hrv_min_window_seconds
-        while self._ibi_history and self._ibi_history[0][0] < cutoff:
-            self._ibi_history.popleft()
-
-    def _get_rolling_ibi(self, now: float) -> NDArray[np.float64]:
-        self._prune_ibi_history(now)
-        if not self._ibi_history:
-            return np.array([], dtype=np.float64)
-        return np.array([ibi for _, ibi in self._ibi_history], dtype=np.float64)

@@ -4,9 +4,9 @@ Physio Engine — rPPG Blood Volume Pulse Extraction
 Implements three rPPG algorithms for extracting blood volume pulse (BVP)
 signals from RGB face traces:
 
-1. POS (Plane Orthogonal to Skin) — primary, best accuracy (MAE < 3 BPM)
-2. CHROM (Chrominance-Based) — fallback, better cross-skin-tone performance
-3. Green-Channel — simplest baseline reference
+1. POS (Plane Orthogonal to Skin) — configured default
+2. CHROM (Chrominance-Based) — classical alternative
+3. Green-Channel — simple baseline reference
 
 All algorithms consume RGB trace windows (10s at 30fps = 300 samples x 3 channels)
 and produce a 1D BVP signal suitable for heart rate estimation.
@@ -18,19 +18,10 @@ References:
 
 from __future__ import annotations
 
-import logging
 from enum import StrEnum
-from pathlib import Path
 
 import numpy as np
 from numpy.typing import NDArray
-
-logger = logging.getLogger(__name__)
-
-try:
-    import onnxruntime as ort
-except Exception:  # pragma: no cover - optional runtime path
-    ort = None
 
 
 class RPPGAlgorithm(StrEnum):
@@ -38,22 +29,6 @@ class RPPGAlgorithm(StrEnum):
     POS = "pos"
     CHROM = "chrom"
     GREEN = "green"
-    TSCAN = "tscan"
-
-
-# P2-7: resolve the default T-SCAN model path relative to the installed
-# ``cortex`` package root, not the process CWD. ``rppg.py`` lives at
-# ``cortex/services/physio_engine/rppg.py`` so three parents up is the
-# ``cortex`` package directory, and the model ships in ``cortex/models/``.
-# A CWD-relative default silently broke the T-SCAN backend whenever the
-# daemon was launched from anywhere other than the repo root.
-_DEFAULT_TSCAN_MODEL_PATH: str = str(
-    Path(__file__).resolve().parent.parent.parent / "models" / "tscan.onnx"
-)
-
-
-_TSCAN_SESSION: ort.InferenceSession | None = None if ort is not None else None
-_TSCAN_MODEL_PATH: str | None = None
 
 
 def _normalize_backend(algorithm: RPPGAlgorithm | str) -> RPPGAlgorithm:
@@ -61,79 +36,11 @@ def _normalize_backend(algorithm: RPPGAlgorithm | str) -> RPPGAlgorithm:
         return algorithm
     try:
         return RPPGAlgorithm(str(algorithm).lower())
-    except ValueError:
-        logger.warning("Unknown rPPG backend '%s', falling back to POS", algorithm)
-        return RPPGAlgorithm.POS
-
-
-def _load_tscan_session(model_path: str) -> ort.InferenceSession | None:
-    global _TSCAN_SESSION, _TSCAN_MODEL_PATH
-    if ort is None:
-        logger.warning("onnxruntime unavailable; TSCAN backend disabled")
-        return None
-    path = str(Path(model_path))
-    if _TSCAN_SESSION is not None and _TSCAN_MODEL_PATH == path:
-        return _TSCAN_SESSION
-    if not Path(path).exists():
-        logger.warning("TSCAN model missing at '%s'; falling back to POS", path)
-        return None
-    try:
-        _TSCAN_SESSION = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
-        _TSCAN_MODEL_PATH = path
-        return _TSCAN_SESSION
-    except Exception as exc:  # pragma: no cover - model-specific runtime
-        logger.warning("Failed loading TSCAN model '%s': %s", path, exc)
-        return None
-
-
-def extract_bvp_tscan(
-    rgb_window: NDArray[np.float64],
-    *,
-    model_path: str = _DEFAULT_TSCAN_MODEL_PATH,
-) -> NDArray[np.float64] | None:
-    """
-    Run TSCAN ONNX inference to produce a BVP signal.
-
-    If the model is unavailable or input/output shapes mismatch, returns None.
-    The caller should fall back to POS/CHROM.
-    """
-    session = _load_tscan_session(model_path)
-    if session is None:
-        return None
-    if rgb_window.ndim != 2 or rgb_window.shape[1] != 3:
-        return None
-
-    inp = session.get_inputs()[0]
-    x = rgb_window.astype(np.float32)
-    # Center and scale for stable model input.
-    x = (x - np.mean(x, axis=0, keepdims=True)) / (np.std(x, axis=0, keepdims=True) + 1e-6)
-
-    shape = inp.shape
-    rank = len(shape)
-    if rank == 2:
-        model_input = x
-    elif rank == 3:
-        model_input = x[None, ...]  # [1, T, 3]
-    elif rank == 4:
-        # Best-effort channel-first temporal layout [1, 3, T, 1].
-        model_input = np.transpose(x, (1, 0))[None, :, :, None]
-    else:
-        logger.warning("Unsupported TSCAN input rank: %s", rank)
-        return None
-
-    try:
-        outputs = session.run(None, {inp.name: model_input})
-    except Exception as exc:  # pragma: no cover - model/runtime specific
-        logger.warning("TSCAN inference failed: %s", exc)
-        return None
-
-    if not outputs:
-        return None
-    y = np.asarray(outputs[0], dtype=np.float64).reshape(-1)
-    if y.size < 2:
-        return None
-    y = y - np.mean(y)
-    return y
+    except ValueError as exc:
+        supported = ", ".join(item.value for item in RPPGAlgorithm)
+        raise ValueError(
+            f"Unsupported rPPG backend {algorithm!r}; supported backends: {supported}"
+        ) from exc
 
 
 def extract_bvp_pos(
@@ -250,8 +157,9 @@ def extract_bvp_chrom(
     """
     CHROM (Chrominance-Based) rPPG algorithm.
 
-    Better cross-skin-tone performance than POS. Uses fixed chrominance
-    projection coefficients derived from skin color model.
+    Classical alternative using fixed chrominance projection coefficients.
+    Cortex makes no comparative subgroup-performance claim until the
+    subject-disjoint validation protocol is complete.
 
     Steps:
     1. Temporally normalize each channel
@@ -309,7 +217,7 @@ def extract_bvp_green(
 
     Simplest approach: uses the green channel directly since hemoglobin
     absorption peaks near 540nm (green wavelength). Serves as a reference
-    and lowest-quality fallback.
+    and an interpretable baseline. It is never selected silently.
 
     Args:
         rgb_window: RGB traces, shape (N, 3) with [R, G, B] columns.
@@ -342,8 +250,6 @@ def extract_bvp(
     rgb_window: NDArray[np.float64],
     algorithm: RPPGAlgorithm | str = RPPGAlgorithm.POS,
     fs: float = 30.0,
-    *,
-    model_path: str = _DEFAULT_TSCAN_MODEL_PATH,
 ) -> NDArray[np.float64]:
     """
     Extract BVP signal using the specified algorithm.
@@ -365,11 +271,5 @@ def extract_bvp(
         return extract_bvp_chrom(rgb_window, fs)
     elif backend == RPPGAlgorithm.GREEN:
         return extract_bvp_green(rgb_window, fs)
-    elif backend == RPPGAlgorithm.TSCAN:
-        tscan_bvp = extract_bvp_tscan(rgb_window, model_path=model_path)
-        if tscan_bvp is not None:
-            return tscan_bvp
-        # HEURISTIC fallback path.
-        return extract_bvp_pos(rgb_window, fs)
     else:
         raise ValueError(f"Unknown algorithm: {backend}")

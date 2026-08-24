@@ -54,6 +54,7 @@ from cortex.libs.schemas.observations import (
     ObservationSource,
     ObservationValidity,
 )
+from cortex.libs.schemas.physiology import SignalEstimate
 from cortex.libs.schemas.session_history import (
     SessionDetailResponse,
     SessionListResponse,
@@ -124,7 +125,7 @@ from cortex.services.llm_engine import create_llm_client
 from cortex.services.llm_engine.parser import enrich_plan_with_context
 from cortex.services.physio_engine.pulse_estimator import PulseEstimator, PulseStabilizer
 from cortex.services.physio_engine.roi_extractor import RoiExtractor
-from cortex.services.physio_engine.rppg import extract_bvp
+from cortex.services.physio_engine.v2.engine import PhysiologyEngineV2
 from cortex.services.session_report.generator import SessionReportGenerator
 from cortex.services.session_report.longitudinal import LongitudinalAggregator
 from cortex.services.session_report.reader import SessionReader
@@ -205,6 +206,33 @@ def _interpolate_nan_window(window: np.ndarray) -> np.ndarray:
             continue
         col[~good] = np.interp(x[~good], x[good], col[good])
     return out
+
+
+def _face_normalized_vertical_position(landmarks_px: Any) -> float | None:
+    """Return face-centre vertical position in units of observed face height.
+
+    Pixel displacement is camera-resolution and distance dependent. Dividing
+    by the current face height yields a dimensionless motion channel suitable
+    for detrending; invalid/degenerate landmark sets abstain explicitly.
+    """
+
+    try:
+        landmarks = np.asarray(landmarks_px, dtype=np.float64)
+    except (TypeError, ValueError):
+        return None
+    if (
+        landmarks.ndim != 2
+        or landmarks.shape[0] < 3
+        or landmarks.shape[1] < 2
+        or not bool(np.isfinite(landmarks[:, :2]).all())
+    ):
+        return None
+    vertical = landmarks[:, 1]
+    lower, upper = np.percentile(vertical, [5.0, 95.0])
+    face_height = float(upper - lower)
+    if face_height < 1.0:
+        return None
+    return float(np.median(vertical) / face_height)
 
 
 def _supervise_background_task(task: asyncio.Task[Any]) -> None:
@@ -594,6 +622,7 @@ class CortexDaemon:
             hrv_min_valid_ibi=_rppg_cfg.hrv_min_valid_ibi,
             stabilizer=_stabilizer,
         )
+        self._physiology_v2 = PhysiologyEngineV2(_rppg_cfg)
         self._blink_detector = BlinkDetector(
             blink_config=self.config.signal.blink,
             landmarks_config=self.config.landmarks,
@@ -689,18 +718,22 @@ class CortexDaemon:
         self._last_leetcode_hrv_rmssd: float | None = None
         self._leetcode_action_signatures: dict[str, float] = {}
 
-        _rgb_window_seconds = float(self.config.signal.rppg.window_seconds)
+        _rgb_window_seconds = max(
+            float(self.config.signal.rppg.window_seconds),
+            float(self.config.signal.rppg.respiration_window_seconds),
+        )
+        _rgb_buffer_age_seconds = (
+            _rgb_window_seconds
+            + self.config.signal.rppg.max_interpolation_gap_ms / 1000.0
+            + 1.0
+        )
         self._rgb_observations: ObservationBuffer[NumericObservation] = (
             ObservationBuffer(
-                max_age_seconds=(
-                    _rgb_window_seconds
-                    + self.config.signal.rppg.max_interpolation_gap_ms / 1000.0
-                    + 1.0
-                ),
+                max_age_seconds=_rgb_buffer_age_seconds,
                 max_items=max(
                     self.config.capture.observation_buffer_max_items,
                     int(
-                        _rgb_window_seconds
+                        _rgb_buffer_age_seconds
                         * self.config.signal.rppg.fps_clamp_max
                     ) + 2,
                 ),
@@ -711,16 +744,10 @@ class CortexDaemon:
         self._legacy_capture_mono_origin_ns = self._clock.monotonic_ns()
         self._active_camera_identity_key: str | None = None
         self._active_camera_source_instance_id: str | None = None
+        self._latest_respiration_evidence: SignalEstimate | None = None
         self._camera_calibration_valid = True
         # P0-2: count of low-quality frames rejected from the rPPG window.
         self._frames_low_quality_rejected: int = 0
-        # C5 (audit): cache the previous frame's blink-suppression score so
-        # the apnea path in ``PulseEstimator.process_window`` can see it
-        # with a 1-frame lag (kinematics for the current frame are computed
-        # AFTER the rPPG window is processed, so the freshest value
-        # available at window-build time is the prior frame's). 0.0 until
-        # the first kinematics update lands.
-        self._last_blink_suppression_score: float = 0.0
         # C6 (audit): edge-trigger latch for FACE_LOST / FACE_REACQUIRED
         # structured events. Starts True so the first lost-face frame emits
         # FACE_LOST exactly once (we assume the user is present at startup).
@@ -2149,8 +2176,6 @@ class CortexDaemon:
 
         cfg = self.config.signal.rppg
         fallback = float(self.config.capture.fps)
-        if not cfg.use_measured_fps:
-            return fallback
         times = np.asarray(
             [item.observed_at_mono_ns for item in self._rgb_observations.snapshot()],
             dtype=np.int64,
@@ -2255,6 +2280,8 @@ class CortexDaemon:
     def _reset_camera_dependent_state(self, *, invalidate_calibration: bool) -> None:
         self._rgb_observations.clear()
         self._pulse_estimator.reset()
+        self._physiology_v2.reset()
+        self._latest_respiration_evidence = None
         self._blink_detector.reset()
         self._head_pose.reset()
         if invalidate_calibration:
@@ -2363,6 +2390,19 @@ class CortexDaemon:
             fps_clamp_max=cfg.fps_clamp_max,
         )
 
+    def _prepare_respiration_window(self) -> PreparedObservationWindow:
+        cfg = self.config.signal.rppg
+        return prepare_observation_window(
+            self._rgb_observations.snapshot(),
+            window_seconds=float(cfg.respiration_window_seconds),
+            nominal_fps=float(self.config.capture.fps),
+            min_valid_fraction=cfg.min_valid_coverage,
+            max_interpolation_gap_ms=cfg.max_interpolation_gap_ms,
+            max_motion_fraction=cfg.max_motion_rejected_fraction,
+            fps_clamp_min=cfg.fps_clamp_min,
+            fps_clamp_max=cfg.fps_clamp_max,
+        )
+
     def _publish_unavailable_physio(
         self,
         prepared: PreparedObservationWindow,
@@ -2455,6 +2495,11 @@ class CortexDaemon:
             missing_reason=missing_reason,
             quality=observation.quality if rgb_value is not None else 0.0,
             head_jitter_deg=head_jitter_deg,
+            head_vertical_face_units=(
+                _face_normalized_vertical_position(landmarks_px)
+                if rgb_value is not None and landmarks_px is not None
+                else None
+            ),
         )
         try:
             self._rgb_observations.append(numeric)
@@ -2485,26 +2530,130 @@ class CortexDaemon:
             >= stride_ns
         ):
             prepared = self._prepare_rppg_window()
-            if prepared.ready and prepared.values is not None:
-                bvp = extract_bvp(
+            if (
+                prepared.ready
+                and prepared.values is not None
+                and prepared.sample_times_mono_ns is not None
+            ):
+                pulse_result = self._physiology_v2.pulse.process_window(
                     prepared.values,
-                    algorithm=self.config.signal.rppg.backend,
-                    fs=prepared.sample_rate_hz,
-                    model_path=self.config.signal.rppg.model_path,
+                    prepared.sample_times_mono_ns,
+                    sample_rate_hz=prepared.sample_rate_hz,
+                    boot_id=observation.boot_id,
+                    observation_quality=prepared.quality,
+                    head_jitter_deg=prepared.mean_head_jitter_deg,
+                    face_presence_ratio=prepared.valid_fraction,
                 )
                 unix_seconds_at_observation = observation.observed_at_unix_ms / 1000.0
                 self._pulse_estimator.process_window(
-                    bvp,
+                    pulse_result.waveform,
                     timestamp=unix_seconds_at_observation,
                     fs=prepared.sample_rate_hz,
                     head_jitter_deg=prepared.mean_head_jitter_deg,
                     face_presence_ratio=prepared.valid_fraction,
-                    blink_suppression=self._last_blink_suppression_score,
                 )
-                self._latest_physio = self._pulse_estimator.get_features(
+                legacy_physio_shadow = self._pulse_estimator.get_features(
                     unix_seconds_at_observation
                 )
+                registry.register(
+                    "legacy_physio_shadow",
+                    legacy_physio_shadow.model_dump(mode="json"),
+                )
+                if pulse_result.summary.hr.value is None:
+                    # The acquisition-aware v2 gate is authoritative for
+                    # availability even while the legacy stabilizer remains
+                    # the displayed pulse implementation. A clean-looking
+                    # spectrum cannot override failed observation evidence.
+                    self._latest_physio = PhysioFeatures(
+                        pulse_bpm=None,
+                        pulse_quality=pulse_result.summary.quality,
+                        pulse_variability_proxy=None,
+                        physio_sqi=pulse_result.summary.quality,
+                        physio_sqi_components={
+                            "observation_quality": prepared.quality,
+                            "valid_fraction": prepared.valid_fraction,
+                            "artifact_fraction": prepared.artifact_fraction,
+                        },
+                        hr_delta_5s=None,
+                        valid=False,
+                    )
+                else:
+                    # The compatibility fields and their evidence must refer
+                    # to the same estimate.  The legacy stabilizer is retained
+                    # only as a shadow comparison during migration; publishing
+                    # its value beside v2 provenance would create an
+                    # unverifiable hybrid result.
+                    self._latest_physio = PhysioFeatures(
+                        pulse_bpm=pulse_result.summary.hr.value,
+                        pulse_quality=pulse_result.summary.quality,
+                        pulse_variability_proxy=None,
+                        physio_sqi=pulse_result.summary.quality,
+                        physio_sqi_components={
+                            "observation_quality": prepared.quality,
+                            "valid_fraction": prepared.valid_fraction,
+                            "artifact_fraction": prepared.artifact_fraction,
+                        },
+                        hr_delta_5s=None,
+                        respiration_rate_bpm=None,
+                        valid=True,
+                    )
+                respiration_window = self._prepare_respiration_window()
+                if (
+                    respiration_window.ready
+                    and respiration_window.values is not None
+                    and respiration_window.sample_times_mono_ns is not None
+                ):
+                    respiration_result = (
+                        self._physiology_v2.respiration.process_window(
+                            respiration_window.values,
+                            respiration_window.sample_times_mono_ns,
+                            sample_rate_hz=respiration_window.sample_rate_hz,
+                            boot_id=observation.boot_id,
+                            head_vertical_face_units=(
+                                respiration_window.head_vertical_face_units
+                            ),
+                        )
+                    )
+                    self._latest_respiration_evidence = respiration_result.fused
+                    registry.register(
+                        "latest_respiration_evidence",
+                        {
+                            "fused": respiration_result.fused.model_dump(mode="json"),
+                            "channels": {
+                                name: estimate.model_dump(mode="json")
+                                for name, estimate in respiration_result.channels.items()
+                            },
+                        },
+                    )
+                self._latest_physio = self._latest_physio.model_copy(
+                    update={
+                        "pulse_evidence": pulse_result.summary.hr,
+                        "hrv_evidence": {
+                            metric.value: estimate
+                            for metric, estimate in pulse_result.hrv_estimates.items()
+                        },
+                        "respiration_evidence": self._latest_respiration_evidence,
+                    }
+                )
                 registry.register("latest_physio", self._latest_physio)
+                registry.register(
+                    "latest_pulse_evidence",
+                    {
+                        "summary": pulse_result.summary.model_dump(mode="json"),
+                        "beats": [
+                            item.model_dump(mode="json")
+                            for item in pulse_result.beat_events[-32:]
+                        ],
+                        "intervals": [
+                            item.model_dump(mode="json")
+                            for item in pulse_result.intervals[-32:]
+                        ],
+                        "hrv": {
+                            metric.value: estimate.model_dump(mode="json")
+                            for metric, estimate in pulse_result.hrv_estimates.items()
+                        },
+                    },
+                )
                 registry.register(
                     "physio_window_readiness",
                     {
@@ -2555,9 +2704,6 @@ class CortexDaemon:
         )
         registry.register("latest_kinematics", self._latest_kinematics)
         self._last_kinematics_ts = mono_seconds
-        self._last_blink_suppression_score = float(
-            blink.blink_suppression_score or 0.0
-        )
         self._feature_fusion.update_kinematics(
             self._latest_kinematics,
             timestamp=mono_seconds,

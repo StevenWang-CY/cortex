@@ -50,7 +50,6 @@ class RuleScorer:
         self._weights = self._config.weights
         # Optional tab category context for same-category discount
         self._tab_categories: list[str] | None = None
-        self._apnea_low_since: float | None = None
 
     @property
     def baselines(self) -> UserBaselines:
@@ -218,15 +217,6 @@ class RuleScorer:
             scores.append(0.3)
         elif fv.telemetry_seen_count >= 5:
             scores.append(0.0)
-
-        # Screen apnea indicator (low respiration + fixation)
-        apnea = self.score_screen_apnea(
-            fv.respiration_rate,
-            fv.blink_rate,
-            timestamp=fv.timestamp,
-        )
-        if apnea > 0.3:
-            scores.append(apnea)
 
         if not scores:
             return 0.0
@@ -403,40 +393,6 @@ class RuleScorer:
             score *= 0.3
 
         return score
-
-    def score_screen_apnea(
-        self,
-        respiration_rate: float | None,
-        blink_rate: float | None,
-        *,
-        timestamp: float | None = None,
-    ) -> float:
-        """
-        Score screen apnea: respiration_rate < 8 AND blink suppression.
-        Returns 0-1 indicating screen apnea severity.
-        """
-        if respiration_rate is None:
-            return 0.0
-
-        resp_score = 0.0
-        if respiration_rate < self._baselines.resp_baseline * 0.5:  # < half baseline
-            resp_score = 1.0
-        elif respiration_rate < self._baselines.resp_baseline * 0.7:
-            resp_score = (self._baselines.resp_baseline * 0.7 - respiration_rate) / (self._baselines.resp_baseline * 0.2)
-
-        # Combine with blink suppression (low blink = fixating = apnea risk)
-        blink_score = self.score_blink_suppression(blink_rate)
-
-        # Both must be present for screen apnea
-        if resp_score > 0.3 and blink_score > 0.3:
-            now = float(timestamp or 0.0)
-            if self._apnea_low_since is None:
-                self._apnea_low_since = now
-            elapsed = max(0.0, now - self._apnea_low_since)
-            sustain = min(1.0, elapsed / 30.0)  # HEURISTIC: sustained >=30s.
-            return float(np.clip((0.6 * resp_score + 0.4 * blink_score) * sustain, 0.0, 1.0))
-        self._apnea_low_since = None
-        return 0.0
 
     def score_posture_collapse(
         self, forward_lean: float | None, shoulder_drop: float | None,

@@ -546,7 +546,6 @@ async def run_live_calibration(
                         prepared.values,
                         fs=prepared.sample_rate_hz,
                         algorithm=config.signal.rppg.backend,
-                        model_path=config.signal.rppg.model_path,
                     )
                     pulse_estimator.process_window(
                         bvp,

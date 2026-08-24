@@ -3,13 +3,27 @@
 //
 // Source of truth: cortex/libs/schemas/*.py (Pydantic v2 models).
 // Schema package: cortex-wire/2.0
-// Source SHA-256: a248432b41510738780e7f70e435682bf23870023a8d9a161a5c96897bfc54e8
+// Source SHA-256: d1a3a0dfe256b05444d728e6a3cbcd54633d9cc76194164269033380a3592851
 // Drift-gate: a pre-commit hook and the GitHub Actions CI run
 //   `python -m cortex.scripts.generate_ts_schemas --check`
 // and fail if this file is out of sync with the Python models.
 //
 // Debt-1 closure (audit/findings.md) — closes F42, F43, F44, F45.
 
+export type BeatStatus = "provisional" | "accepted" | "rejected";
+/**
+ * Closed reasons for excluding a beat or derived interval.
+ */
+export type BeatRejectionReason =
+  | "low_quality"
+  | "refractory_conflict"
+  | "window_boundary"
+  | "ibi_too_short"
+  | "ibi_too_long"
+  | "ibi_local_outlier";
+/**
+ * Closed catalog of sensor/source families.
+ */
 export type ObservationSource = "camera" | "mouse" | "keyboard" | "browser" | "editor" | "window";
 /**
  * Whether a scheduled observation contains a usable measurement.
@@ -35,6 +49,23 @@ export type MissingReason =
  * Classified user state
  */
 export type UserState = "FLOW" | "HYPO" | "HYPER" | "RECOVERY";
+/**
+ * Closed metric catalog; unsupported metrics remain explicit.
+ */
+export type PhysiologyMetric =
+  | "heart_rate"
+  | "rmssd"
+  | "sdnn"
+  | "pnn50"
+  | "sd1"
+  | "sd2"
+  | "lf_hf_ratio"
+  | "sample_entropy"
+  | "respiration_rate";
+/**
+ * Publication/readiness state of a physiological estimate.
+ */
+export type EvidenceStatus = "supported" | "experimental" | "unavailable" | "rejected";
 /**
  * Wire-level message type; see ``MessageType``.
  */
@@ -259,6 +290,32 @@ export interface BanditWeights {
    * Human-readable arm names
    */
   arm_labels?: string[];
+}
+/**
+ * Peak observation located on the process monotonic clock.
+ */
+export interface BeatCandidate {
+  candidate_id: string;
+  absolute_mono_ns: number;
+  prominence: number;
+  quality: number;
+  source_window_id: string;
+  near_window_boundary?: boolean;
+}
+/**
+ * Canonical, overlap-reconciled beat and its provenance.
+ */
+export interface BeatEvent {
+  beat_id: string;
+  absolute_mono_ns: number;
+  status: BeatStatus;
+  rejection_reason?: BeatRejectionReason | null;
+  quality: number;
+  prominence: number;
+  /**
+   * @minItems 1
+   */
+  source_window_ids: [string, ...string[]];
 }
 /**
  * Context from browser extension.
@@ -832,6 +889,15 @@ export interface DualClockModel {
   timestamp?: number | null;
 }
 /**
+ * Bounded interval around a numeric estimate.
+ */
+export interface EstimateUncertainty {
+  lower: number;
+  upper: number;
+  confidence_level: number;
+  method: string;
+}
+/**
  * Identity, ordering, causality, and dual-clock metadata for a wire event.
  */
 export interface EventMetadata {
@@ -1282,6 +1348,21 @@ export interface HelpfulnessSummaryResponse {
   engagement_rate?: number;
   positive_rate?: number;
   recent_rewards?: number[];
+}
+/**
+ * Interval derived only from two named canonical beats.
+ */
+export interface InterBeatInterval {
+  ibi_id: string;
+  left_beat_id: string;
+  right_beat_id: string;
+  start_mono_ns: number;
+  end_mono_ns: number;
+  duration_ms: number;
+  status: BeatStatus;
+  rejection_reason?: BeatRejectionReason | null;
+  correction?: "none";
+  quality: number;
 }
 export interface InterventionApplyRequest {
   plan: InterventionPlan;
@@ -2102,9 +2183,53 @@ export interface PhysioFeatures {
    */
   respiration_rate_bpm?: number | null;
   /**
+   * Algorithm/version/quality/uncertainty contract for pulse
+   */
+  pulse_evidence?: SignalEstimate | null;
+  /**
+   * Metric-specific HRV readiness; unavailable metrics stay explicit
+   */
+  hrv_evidence?: {
+    [k: string]: SignalEstimate;
+  };
+  /**
+   * Agreement-gated breathing-rate proxy evidence contract
+   */
+  respiration_evidence?: SignalEstimate | null;
+  /**
    * Whether physiological features are valid
    */
   valid: boolean;
+}
+/**
+ * One metric estimate with its evidence and release status.
+ */
+export interface SignalEstimate {
+  metric: PhysiologyMetric;
+  value?: number | null;
+  unit: string;
+  status: EvidenceStatus;
+  quality: number;
+  algorithm: SignalAlgorithmIdentity;
+  uncertainty?: EstimateUncertainty | null;
+  unavailable_reason?: string | null;
+  window_start_mono_ns: number;
+  window_end_mono_ns: number;
+  boot_id: string;
+}
+/**
+ * Exact implementation and optional model asset used for an estimate.
+ */
+export interface SignalAlgorithmIdentity {
+  name: string;
+  version: string;
+  implementation_sha256: string;
+  asset_sha256?: string | null;
+  configuration_sha256?: string | null;
+  parameters?: {
+    [k: string]: string | number | boolean;
+  };
+  selection_mode?: "fixed" | "validated_dynamic";
 }
 export interface ProjectListResponse {
   schema_version?: "1.0" | "2.0";
@@ -2127,6 +2252,24 @@ export interface ProtocolErrorPayload {
   code: "unsupported_protocol" | "malformed_protocol";
   offered_protocol_versions?: string[];
   supported_protocol_versions?: ("1.0" | "2.0")[];
+}
+/**
+ * Serializable summary of a processed window (waveform stays local).
+ */
+export interface PulseWindowSummary {
+  window_id: string;
+  boot_id: string;
+  window_start_mono_ns: number;
+  window_end_mono_ns: number;
+  sample_rate_hz: number;
+  sample_count: number;
+  algorithm: SignalAlgorithmIdentity;
+  quality: number;
+  hr: SignalEstimate;
+  candidate_count: number;
+  accepted_beat_count: number;
+  provisional_beat_count: number;
+  rejected_beat_count: number;
 }
 /**
  * ``{"command":"raise_dashboard", "target":"desktop"}``.
