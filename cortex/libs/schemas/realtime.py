@@ -601,20 +601,49 @@ class BiometricsSummary(BaseModel):
             "always populated."
         ),
     )
+    head_neck_flexion_score: float | None = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Camera-relative head/neck flexion proxy versus the user's "
+            "camera-bound neutral pose; unavailable when calibration is invalid."
+        ),
+    )
+    head_neck_flexion_angle: float | None = Field(
+        None,
+        description=(
+            "Camera-relative pitch delta in degrees versus the calibrated neutral pose. "
+            "This is not an upper-body posture or shoulder measurement."
+        ),
+    )
+    head_neck_flexion_dwell_seconds: float | None = Field(
+        None,
+        ge=0.0,
+        description="Contiguous valid exposure above the configured proxy threshold.",
+    )
+    head_neck_proxy_available: bool = Field(
+        False,
+        description=(
+            "True only while camera identity, face scale, and neutral-pose "
+            "calibration remain compatible."
+        ),
+    )
     forward_lean: float | None = Field(
         None,
         description=(
-            "Forward-lean score rescaled to 0..1. Browser-side posture "
-            "alert threshold (0.6) is compared against this rescaled "
-            "value, not raw degrees."
+            "Deprecated compatibility field. New consumers must use "
+            "head_neck_flexion_score; Cortex does not measure torso posture."
         ),
+        deprecated=True,
     )
     forward_lean_angle: float | None = Field(
         None,
         description=(
-            "Forward-lean angle in degrees (legacy / debug). Consumers "
-            "preferring a score should read ``forward_lean`` instead."
+            "Deprecated compatibility field. New consumers must use "
+            "head_neck_flexion_angle."
         ),
+        deprecated=True,
     )
     respiration_rate: float | None = Field(
         None, description="Compatibility field; unavailable in product"

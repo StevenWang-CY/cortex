@@ -16,9 +16,11 @@ import queue
 import threading
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
+from uuid import uuid4
 
 import numpy as np
 import uvicorn
@@ -40,6 +42,15 @@ from cortex.libs.logging.structured import (
     configure_logging,
     get_logger,
 )
+from cortex.libs.schemas.calibration import (
+    CALIBRATION_FEATURE_SCHEMA_VERSION,
+    CALIBRATION_PROTOCOL_VERSION,
+    CalibrationMetricMaturity,
+    CalibrationMetricName,
+    CalibrationProfile,
+    CalibrationProvenance,
+    CalibrationUpdated,
+)
 from cortex.libs.schemas.features import KinematicFeatures, PhysioFeatures
 from cortex.libs.schemas.intervention import (
     InterventionApplyResult,
@@ -54,7 +65,7 @@ from cortex.libs.schemas.observations import (
     ObservationSource,
     ObservationValidity,
 )
-from cortex.libs.schemas.physiology import SignalEstimate
+from cortex.libs.schemas.physiology import SignalAlgorithmIdentity, SignalEstimate
 from cortex.libs.schemas.session_history import (
     SessionDetailResponse,
     SessionListResponse,
@@ -70,6 +81,15 @@ from cortex.libs.utils import receptivity
 from cortex.services.activity_tracker.aggregator import ActivityAggregator
 from cortex.services.api_gateway.app import create_app, registry
 from cortex.services.api_gateway.websocket_server import WebSocketServer
+from cortex.services.capture_service.calibration_store import (
+    CalibrationProfileStore,
+    calibration_profile_sha256,
+)
+from cortex.services.capture_service.feature_factory import (
+    ProductionCameraFeatureComponents,
+    build_production_camera_feature_components,
+    production_calibration_algorithm_identities,
+)
 from cortex.services.capture_service.observation_buffer import (
     NumericObservation,
     ObservationBuffer,
@@ -117,15 +137,10 @@ from cortex.services.janitor.retention import (
 from cortex.services.janitor.retention import (
     sweep_once_async as run_retention_sweep_async,
 )
-from cortex.services.kinematics_engine.blink_detector import BlinkDetector
-from cortex.services.kinematics_engine.head_pose import HeadPoseEstimator
-from cortex.services.kinematics_engine.posture import PostureAnalyzer
 from cortex.services.launcher.launcher import ProjectLauncher
 from cortex.services.llm_engine import create_llm_client
 from cortex.services.llm_engine.parser import enrich_plan_with_context
 from cortex.services.physio_engine.pulse_estimator import PulseEstimator, PulseStabilizer
-from cortex.services.physio_engine.roi_extractor import RoiExtractor
-from cortex.services.physio_engine.v2.engine import PhysiologyEngineV2
 from cortex.services.session_report.generator import SessionReportGenerator
 from cortex.services.session_report.longitudinal import LongitudinalAggregator
 from cortex.services.session_report.reader import SessionReader
@@ -148,6 +163,108 @@ from cortex.services.telemetry_engine.window_tracker import WindowTracker
 from cortex.services.throttle.copilot_throttle import CopilotThrottle
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _PreparedCalibrationGraph:
+    """Fully validated replacement graph built before the commit boundary."""
+
+    profile: CalibrationProfile
+    baselines: UserBaselines
+    camera_features: ProductionCameraFeatureComponents
+    pulse_estimator: PulseEstimator
+    rgb_observations: ObservationBuffer[NumericObservation]
+    feature_fusion: FeatureFusion
+    scorer: RuleScorer
+    smoother: ScoreSmoother
+    stress_tracker: StressIntegralTracker
+    zombie_detector: ZombieReadingDetector
+    shutdown_detector: ShutdownDetector
+    causal_attributor: CausalAttributor
+    camera_calibration_valid: bool
+
+
+def _build_legacy_pulse_estimator(config: CortexConfig) -> PulseEstimator:
+    """Construct the compatibility pulse path from the canonical config."""
+
+    rppg = config.signal.rppg
+    stabilizer = (
+        PulseStabilizer(
+            enter_windows=rppg.lock_enter_windows,
+            grace_seconds=rppg.lock_grace_seconds,
+            snr_release_db=rppg.snr_release_db,
+            sqi_release=rppg.sqi_release,
+            smoothing_seconds=rppg.bpm_smoothing_seconds,
+            max_slew_bpm_per_s=rppg.bpm_max_slew_bpm_per_s,
+        )
+        if rppg.stabilize
+        else None
+    )
+    return PulseEstimator(
+        fs=float(config.capture.fps),
+        nsqi_threshold=rppg.nsqi_threshold,
+        min_cardiac_snr_db=rppg.min_cardiac_snr_db,
+        hrv_min_window_seconds=float(rppg.hrv_min_window_seconds),
+        hrv_min_valid_ibi=rppg.hrv_min_valid_ibi,
+        stabilizer=stabilizer,
+    )
+
+
+def _build_rgb_observation_buffer(
+    config: CortexConfig,
+) -> ObservationBuffer[NumericObservation]:
+    """Build the bounded camera-signal history used by runtime inference."""
+
+    window_seconds = max(
+        float(config.signal.rppg.window_seconds),
+        float(config.signal.rppg.respiration_window_seconds),
+    )
+    max_age_seconds = (
+        window_seconds
+        + config.signal.rppg.max_interpolation_gap_ms / 1000.0
+        + 1.0
+    )
+    return ObservationBuffer(
+        max_age_seconds=max_age_seconds,
+        max_items=max(
+            config.capture.observation_buffer_max_items,
+            int(max_age_seconds * config.signal.rppg.fps_clamp_max) + 2,
+        ),
+    )
+
+
+def _validate_runtime_calibration_profile(
+    profile: CalibrationProfile,
+    *,
+    expected_algorithms: dict[str, SignalAlgorithmIdentity],
+) -> None:
+    """Fail closed before any persisted calibration can influence runtime."""
+
+    if profile.provenance != CalibrationProvenance.MEASURED.value:
+        raise ValueError("only measured calibration profiles may be applied")
+    if not profile.is_approved:
+        raise ValueError("calibration profile must be approved before application")
+    if profile.feature_schema_version != CALIBRATION_FEATURE_SCHEMA_VERSION:
+        raise ValueError("calibration feature schema is incompatible")
+    if profile.protocol_version != CALIBRATION_PROTOCOL_VERSION:
+        raise ValueError("calibration protocol version is incompatible")
+
+    algorithm_key_by_metric = {
+        CalibrationMetricName.BLINK_RATE_PER_MIN.value: "blink",
+        CalibrationMetricName.MOUSE_VELOCITY_PX_PER_S.value: "telemetry",
+        CalibrationMetricName.MOUSE_VELOCITY_VARIANCE.value: "telemetry",
+        CalibrationMetricName.NEUTRAL_HEAD_PITCH_DEG.value: "head_pose",
+        CalibrationMetricName.NEUTRAL_FACE_SCALE_PX.value: "head_pose",
+    }
+    for summary in profile.metrics:
+        algorithm_key = algorithm_key_by_metric.get(str(summary.metric))
+        if algorithm_key is None or summary.value is None:
+            continue
+        if summary.algorithm != expected_algorithms[algorithm_key]:
+            raise ValueError(
+                "calibration algorithm identity is incompatible for "
+                f"{summary.metric}"
+            )
 
 
 def _daemon_clock(owner: object) -> Clock:
@@ -554,6 +671,20 @@ class CortexDaemon:
     ) -> None:
         self.config = config or get_config()
         self._clock = clock or SYSTEM_CLOCK
+        self._calibration_store = CalibrationProfileStore(
+            self.config.storage.path,
+            clock=self._clock,
+        )
+        loaded_calibration_profile: CalibrationProfile | None = None
+        self._active_calibration_profile: CalibrationProfile | None = None
+        try:
+            loaded_calibration_profile = self._calibration_store.load_active()
+        except Exception:
+            logger.exception(
+                "Active calibration profile failed validation; starting uncalibrated"
+            )
+        self._baseline_snapshot = UserBaselines()
+        self._inference_publication_paused = False
         self._shutdown = asyncio.Event()
         self._tasks: list[asyncio.Task[Any]] = []
         # F03: every dynamically-spawned background task (intervention
@@ -596,45 +727,42 @@ class CortexDaemon:
             self.config.capture,
             clock=self._clock,
         )
-        self._roi_extractor = RoiExtractor(self.config.landmarks)
-        _rppg_cfg = self.config.signal.rppg
-        # B2: the temporal stabilizer removes the ~1 Hz "Reading your
-        # pulse…" flicker (Schmitt-trigger lock + last-valid hold + BPM
-        # median/slew smoothing). Disabled → estimator keeps its old
-        # stateless per-window behavior.
-        _stabilizer = (
-            PulseStabilizer(
-                enter_windows=_rppg_cfg.lock_enter_windows,
-                grace_seconds=_rppg_cfg.lock_grace_seconds,
-                snr_release_db=_rppg_cfg.snr_release_db,
-                sqi_release=_rppg_cfg.sqi_release,
-                smoothing_seconds=_rppg_cfg.bpm_smoothing_seconds,
-                max_slew_bpm_per_s=_rppg_cfg.bpm_max_slew_bpm_per_s,
-            )
-            if _rppg_cfg.stabilize
-            else None
+        camera_features = build_production_camera_feature_components(self.config)
+        if loaded_calibration_profile is not None:
+            try:
+                _validate_runtime_calibration_profile(
+                    loaded_calibration_profile,
+                    expected_algorithms=(
+                        production_calibration_algorithm_identities(
+                            self.config,
+                            components=camera_features,
+                        )
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "Active calibration profile is incompatible; "
+                    "starting uncalibrated"
+                )
+            else:
+                self._active_calibration_profile = loaded_calibration_profile
+                self._baseline_snapshot = (
+                    loaded_calibration_profile.to_user_baselines()
+                )
+        self._roi_extractor = camera_features.roi_extractor
+        self._pulse_estimator = _build_legacy_pulse_estimator(self.config)
+        self._physiology_v2 = camera_features.physiology
+        self._blink_detector = camera_features.blink
+        self._blink_detector.baseline_blink_rate = (
+            self._baseline_snapshot.blink_rate_baseline
         )
-        self._pulse_estimator = PulseEstimator(
-            fs=float(self.config.capture.fps),
-            nsqi_threshold=_rppg_cfg.nsqi_threshold,
-            min_cardiac_snr_db=_rppg_cfg.min_cardiac_snr_db,
-            hrv_min_window_seconds=float(_rppg_cfg.hrv_min_window_seconds),
-            hrv_min_valid_ibi=_rppg_cfg.hrv_min_valid_ibi,
-            stabilizer=_stabilizer,
-        )
-        self._physiology_v2 = PhysiologyEngineV2(_rppg_cfg)
-        self._blink_detector = BlinkDetector(
-            blink_config=self.config.signal.blink,
-            landmarks_config=self.config.landmarks,
-        )
-        self._blink_detector.baseline_blink_rate = self._load_baselines().blink_rate_baseline
-        self._head_pose = HeadPoseEstimator(
-            frame_width=self.config.capture.width,
-            frame_height=self.config.capture.height,
-        )
-        self._posture = PostureAnalyzer(self.config.signal.posture)
+        self._head_pose = camera_features.head_pose
+        self._posture = camera_features.head_neck_proxy
         self._feature_fusion = FeatureFusion(clock=self._clock)
-        self._scorer = RuleScorer(config=self.config.state, baselines=self._load_baselines())
+        self._scorer = RuleScorer(
+            config=self.config.state,
+            baselines=self._baseline_snapshot,
+        )
         self._smoother = ScoreSmoother(self.config.state, clock=self._clock)
 
         # C.2: optional per-user ML classifier. If a previously-trained
@@ -693,6 +821,9 @@ class CortexDaemon:
         self._ws_server = WebSocketServer(self.config.api, clock=self._clock)
         self._ws_server.set_user_action_callback(self._handle_user_action)
         self._ws_server.set_settings_callback(self.apply_settings)
+        self._ws_server.set_calibration_reload_callback(
+            self.activate_calibration_profile
+        )
         self._ws_server.set_shutdown_callback(self._request_shutdown)
         self._ws_server.set_leetcode_context_callback(self._handle_leetcode_context_update)
         self._ws_server.set_intervention_applied_callback(self._handle_intervention_applied)
@@ -718,34 +849,19 @@ class CortexDaemon:
         self._last_leetcode_hrv_rmssd: float | None = None
         self._leetcode_action_signatures: dict[str, float] = {}
 
-        _rgb_window_seconds = max(
-            float(self.config.signal.rppg.window_seconds),
-            float(self.config.signal.rppg.respiration_window_seconds),
-        )
-        _rgb_buffer_age_seconds = (
-            _rgb_window_seconds
-            + self.config.signal.rppg.max_interpolation_gap_ms / 1000.0
-            + 1.0
-        )
         self._rgb_observations: ObservationBuffer[NumericObservation] = (
-            ObservationBuffer(
-                max_age_seconds=_rgb_buffer_age_seconds,
-                max_items=max(
-                    self.config.capture.observation_buffer_max_items,
-                    int(
-                        _rgb_buffer_age_seconds
-                        * self.config.signal.rppg.fps_clamp_max
-                    ) + 2,
-                ),
-            )
+            _build_rgb_observation_buffer(self.config)
         )
         self._legacy_capture_sequence = 0
         self._legacy_capture_source_instance_id = self._clock.boot_id
         self._legacy_capture_mono_origin_ns = self._clock.monotonic_ns()
         self._active_camera_identity_key: str | None = None
+        self._active_camera_geometry: tuple[int, int] | None = None
         self._active_camera_source_instance_id: str | None = None
         self._latest_respiration_evidence: SignalEstimate | None = None
-        self._camera_calibration_valid = True
+        # A profile is camera-bound. Readiness remains false until the first
+        # live, post-open identity confirms that binding.
+        self._camera_calibration_valid = False
         # P0-2: count of low-quality frames rejected from the rPPG window.
         self._frames_low_quality_rejected: int = 0
         # C6 (audit): edge-trigger latch for FACE_LOST / FACE_REACQUIRED
@@ -927,7 +1043,7 @@ class CortexDaemon:
         # deficit math requires the user-specific HRV sigma so the integral
         # is in z-score units, not raw ms·s. Without sigma the AMIP safety
         # floor (keyed off stress_ratio ≥ 1.0) effectively never tripped.
-        _baselines_for_stress = self._load_baselines()
+        _baselines_for_stress = self._baseline_snapshot
         _hrv_sigma = 1.0
         try:
             _hrv_sigma = float(
@@ -961,13 +1077,18 @@ class CortexDaemon:
         )
 
         # Zombie reading detector
-        self._zombie_detector = ZombieReadingDetector()
+        self._zombie_detector = ZombieReadingDetector(
+            blink_baseline=self._baseline_snapshot.blink_rate_baseline
+        )
 
         # Rabbit hole detector
         self._rabbit_hole = RabbitHoleDetector()
 
         # Shutdown detector (morning handover)
-        self._shutdown_detector = ShutdownDetector()
+        self._shutdown_detector = ShutdownDetector(
+            hrv_baseline=self._baseline_snapshot.hrv_baseline,
+            config=self.config.handover,
+        )
 
         # Consent ladder
         self._consent_policy = ConsentPolicy()
@@ -2092,22 +2213,239 @@ class CortexDaemon:
         return events[-1].app_name
 
     def _load_baselines(self) -> UserBaselines:
-        baseline_path = Path(self.config.storage.path) / "baselines" / "default.json"
-        if not baseline_path.exists():
-            return UserBaselines()
+        """Return the one startup/live-applied immutable profile view."""
+
+        return self._baseline_snapshot
+
+    def reload_active_calibration(
+        self,
+        expected_profile_id: str | None = None,
+    ) -> CalibrationUpdated:
+        """Reload the already-active pointer, primarily for startup recovery."""
+
+        profile = self._calibration_store.load_active()
+        if profile is None:
+            raise ValueError("no active calibration profile exists")
+        if expected_profile_id is not None and str(profile.profile_id) != str(
+            expected_profile_id
+        ):
+            raise ValueError("active calibration profile does not match request")
+        return self.apply_calibration_profile(profile)
+
+    def activate_calibration_profile(
+        self,
+        profile_id: str,
+        *,
+        expected_sha256: str | None = None,
+    ) -> CalibrationUpdated:
+        """Validate, persistently activate, and live-apply one staged profile.
+
+        Replacement services are constructed before the active pointer changes.
+        ``CalibrationProfileStore.activate`` commits the pointer last, and the
+        following graph swap is synchronous and assignment-only.  Consequently
+        a validation/construction/persistence error leaves both the previous
+        pointer and previous live graph in place.
+        """
+
+        profile = self._calibration_store.load_profile(profile_id)
+        actual_sha256 = calibration_profile_sha256(profile)
+        if expected_sha256 is not None and actual_sha256 != expected_sha256:
+            raise ValueError("staged calibration profile checksum mismatch")
+        prepared = self._prepare_calibration_profile(profile)
+        self._calibration_store.activate(profile)
+        return self._commit_calibration_graph(prepared)
+
+    def apply_calibration_profile(
+        self,
+        profile: CalibrationProfile,
+    ) -> CalibrationUpdated:
+        """Apply an already-authoritative profile with no await/interleaving.
+
+        All validation and replacement-object construction happens before the
+        first live reference changes.  Because runtime domain work is owned by
+        one asyncio loop and this method contains no await, consumers observe
+        either the prior component graph or the complete replacement graph.
+        """
+
+        return self._commit_calibration_graph(
+            self._prepare_calibration_profile(profile)
+        )
+
+    def _prepare_calibration_profile(
+        self,
+        profile: CalibrationProfile,
+    ) -> _PreparedCalibrationGraph:
+        """Validate and construct a complete replacement without mutating live state."""
+
+        new_components = build_production_camera_feature_components(self.config)
+        expected_algorithms = production_calibration_algorithm_identities(
+            self.config,
+            components=new_components,
+        )
+        _validate_runtime_calibration_profile(
+            profile,
+            expected_algorithms=expected_algorithms,
+        )
+        new_baselines = profile.to_user_baselines()
+        new_components.blink.baseline_blink_rate = new_baselines.blink_rate_baseline
+        values = profile.baselines
+        camera_valid = bool(
+            profile.camera is not None
+            and self._active_camera_identity_key is not None
+            and profile.camera.identity_key == self._active_camera_identity_key
+            and self._active_camera_geometry
+            == (profile.camera.width, profile.camera.height)
+            and values.neutral_head_pitch_deg is not None
+            and values.neutral_face_scale_px is not None
+        )
+        if (
+            camera_valid
+            and profile.camera is not None
+            and values.neutral_head_pitch_deg is not None
+            and values.neutral_face_scale_px is not None
+        ):
+            new_components.head_neck_proxy.apply_calibration(
+                neutral_pitch_deg=values.neutral_head_pitch_deg,
+                neutral_face_scale=values.neutral_face_scale_px,
+                camera_identity_key=profile.camera.identity_key,
+            )
+        new_fusion = FeatureFusion(clock=self._clock)
+        new_scorer = RuleScorer(config=self.config.state, baselines=new_baselines)
+        new_smoother = ScoreSmoother(self.config.state, clock=self._clock)
+        hrv_sigma = float(
+            new_baselines.metric_distributions.get("hrv_rmssd", {}).get(
+                "std",
+                1.0,
+            )
+        )
+        new_stress = StressIntegralTracker(
+            hrv_baseline=new_baselines.hrv_baseline,
+            hrv_sigma=max(1.0, hrv_sigma),
+        )
+        new_zombie = ZombieReadingDetector(
+            blink_baseline=new_baselines.blink_rate_baseline
+        )
+        new_shutdown = ShutdownDetector(
+            hrv_baseline=new_baselines.hrv_baseline,
+            config=self.config.handover,
+        )
+
+        return _PreparedCalibrationGraph(
+            profile=profile,
+            baselines=new_baselines,
+            camera_features=new_components,
+            pulse_estimator=_build_legacy_pulse_estimator(self.config),
+            rgb_observations=_build_rgb_observation_buffer(self.config),
+            feature_fusion=new_fusion,
+            scorer=new_scorer,
+            smoother=new_smoother,
+            stress_tracker=new_stress,
+            zombie_detector=new_zombie,
+            shutdown_detector=new_shutdown,
+            causal_attributor=CausalAttributor(),
+            camera_calibration_valid=camera_valid,
+        )
+
+    def _commit_calibration_graph(
+        self,
+        prepared: _PreparedCalibrationGraph,
+    ) -> CalibrationUpdated:
+        """Swap a prepared graph atomically and publish its domain event."""
+
+        profile = prepared.profile
+        previous_id = (
+            self._active_calibration_profile.profile_id
+            if self._active_calibration_profile is not None
+            else None
+        )
+        self._inference_publication_paused = True
         try:
-            loaded = UserBaselines.model_validate_json(baseline_path.read_text())
-            if not loaded.metric_distributions:
-                # Backward-compatible migration for legacy baseline files.
-                loaded.metric_distributions = {
-                    "hr": {"mu": loaded.hr_baseline, "sigma": loaded.hr_std, "p10": loaded.hr_baseline, "p90": loaded.hr_baseline},
-                    "hrv_rmssd": {"mu": loaded.hrv_baseline, "sigma": max(6.0, loaded.hrv_baseline * 0.2), "p10": loaded.hrv_baseline, "p90": loaded.hrv_baseline},
-                    "blink_rate": {"mu": loaded.blink_rate_baseline, "sigma": max(3.0, loaded.blink_rate_baseline * 0.2), "p10": loaded.blink_rate_baseline, "p90": loaded.blink_rate_baseline},
+            self._rgb_observations = prepared.rgb_observations
+            self._roi_extractor = prepared.camera_features.roi_extractor
+            self._pulse_estimator = prepared.pulse_estimator
+            self._physiology_v2 = prepared.camera_features.physiology
+            self._blink_detector = prepared.camera_features.blink
+            self._head_pose = prepared.camera_features.head_pose
+            self._posture = prepared.camera_features.head_neck_proxy
+            self._feature_fusion = prepared.feature_fusion
+            self._scorer = prepared.scorer
+            self._smoother = prepared.smoother
+            self._stress_tracker = prepared.stress_tracker
+            self._zombie_detector = prepared.zombie_detector
+            self._shutdown_detector = prepared.shutdown_detector
+            self._causal_attributor = prepared.causal_attributor
+            self._active_calibration_profile = profile
+            self._baseline_snapshot = prepared.baselines
+            self._camera_calibration_valid = prepared.camera_calibration_valid
+            self._latest_respiration_evidence = None
+            self._latest_estimate = None
+            self._latest_biometrics = None
+            self._latest_broadcast_snapshot = None
+            self._last_physio_update = 0.0
+            self._last_physio_update_mono_ns = 0
+            self._last_kinematics_ts = 0.0
+        finally:
+            self._inference_publication_paused = False
+
+        applied_metrics = tuple(
+            str(summary.metric)
+            for summary in profile.metrics
+            if summary.maturity
+            in {
+                CalibrationMetricMaturity.OBSERVED.value,
+                CalibrationMetricMaturity.SUPPORTED.value,
+            }
+            and summary.metric
+            in {
+                CalibrationMetricName.BLINK_RATE_PER_MIN.value,
+                CalibrationMetricName.MOUSE_VELOCITY_PX_PER_S.value,
+                CalibrationMetricName.MOUSE_VELOCITY_VARIANCE.value,
+                CalibrationMetricName.NEUTRAL_HEAD_PITCH_DEG.value,
+                CalibrationMetricName.NEUTRAL_FACE_SCALE_PX.value,
+            }
+            and (
+                summary.metric
+                not in {
+                    CalibrationMetricName.NEUTRAL_HEAD_PITCH_DEG.value,
+                    CalibrationMetricName.NEUTRAL_FACE_SCALE_PX.value,
                 }
-            return loaded
-        except Exception:
-            logger.exception("Failed to load baselines from %s", baseline_path)
-            return UserBaselines()
+                or prepared.camera_calibration_valid
+            )
+        )
+        event = CalibrationUpdated(
+            event_id=uuid4(),
+            profile_id=profile.profile_id,
+            previous_profile_id=previous_id,
+            observed_at_unix_ms=self._clock.unix_ms(),
+            observed_at_mono_ns=self._clock.monotonic_ns(),
+            boot_id=self._clock.boot_id,
+            camera_calibration_valid=prepared.camera_calibration_valid,
+            applied_metrics=applied_metrics,
+            reset_components=(
+                "physiology",
+                "blink",
+                "head_pose",
+                "head_neck_proxy",
+                "feature_fusion",
+                "rule_scorer",
+                "score_smoother",
+                "stress_integral",
+                "zombie_detector",
+                "shutdown_detector",
+                "causal_attribution",
+            ),
+        )
+        registry.register("active_calibration_profile", profile.model_dump(mode="json"))
+        registry.register("calibration_updated", event.model_dump(mode="json"))
+        registry.register(
+            "camera_calibration_valid",
+            prepared.camera_calibration_valid,
+        )
+        _emit_event(
+            EventType.CALIBRATION_UPDATED,
+            **event.model_dump(mode="json"),
+        )
+        return event
 
     async def _request_context(self, client_type: str) -> dict[str, Any]:
         return await self._ws_server.request_context(client_type)
@@ -2325,28 +2663,95 @@ class CortexDaemon:
         observation: ObservationEnvelope[CameraFrameObservation],
     ) -> None:
         old_key = self._active_camera_identity_key
+        old_geometry = self._active_camera_geometry
+        new_geometry = (identity.width, identity.height)
         source_id = str(observation.source_instance_id)
-        physical_changed = old_key is not None and old_key != identity.identity_key
+        profile_camera = (
+            self._active_calibration_profile.camera
+            if self._active_calibration_profile is not None
+            and self._active_calibration_profile.camera is not None
+            else None
+        )
+        profile_camera_key = (
+            profile_camera.identity_key if profile_camera is not None else None
+        )
+        profile_geometry = (
+            (profile_camera.width, profile_camera.height)
+            if profile_camera is not None
+            else None
+        )
+        physical_changed = old_key is not None and (
+            old_key != identity.identity_key or old_geometry != new_geometry
+        )
+        initial_profile_mismatch = (
+            old_key is None
+            and profile_camera is not None
+            and (
+                profile_camera_key != identity.identity_key
+                or profile_geometry != new_geometry
+            )
+        )
         source_changed = (
             self._active_camera_source_instance_id is not None
             and self._active_camera_source_instance_id != source_id
         )
-        if physical_changed:
+        if physical_changed or initial_profile_mismatch:
             self._reset_camera_dependent_state(invalidate_calibration=True)
+            self._camera_calibration_valid = (
+                self._apply_camera_bound_posture_calibration(
+                    identity
+                )
+            )
             _emit_event(
                 EventType.CAMERA_IDENTITY_CHANGED,
-                previous_identity_key=old_key,
+                previous_identity_key=old_key or profile_camera_key,
                 camera_identity_key=identity.identity_key,
                 observed_at_unix_ms=observation.observed_at_unix_ms,
+            )
+        elif (
+            old_key is None
+            and profile_camera_key == identity.identity_key
+            and profile_geometry == new_geometry
+        ):
+            self._camera_calibration_valid = (
+                self._apply_camera_bound_posture_calibration(
+                    identity
+                )
             )
         elif source_changed:
             # Same camera reopened: preserve its calibration, but never bridge
             # signal windows or temporal detector state across acquisitions.
             self._reset_camera_dependent_state(invalidate_calibration=False)
         self._active_camera_identity_key = identity.identity_key
+        self._active_camera_geometry = new_geometry
         self._active_camera_source_instance_id = source_id
         registry.register("camera_identity", identity.model_dump(mode="json"))
         registry.register("camera_calibration_valid", self._camera_calibration_valid)
+
+    def _apply_camera_bound_posture_calibration(
+        self,
+        identity: CameraIdentity,
+    ) -> bool:
+        """Apply the active neutral-pose values only to their measured camera."""
+
+        profile = self._active_calibration_profile
+        if profile is None or profile.camera is None:
+            return False
+        values = profile.baselines
+        if (
+            profile.camera.identity_key != identity.identity_key
+            or profile.camera.width != identity.width
+            or profile.camera.height != identity.height
+            or values.neutral_head_pitch_deg is None
+            or values.neutral_face_scale_px is None
+        ):
+            return False
+        self._posture.apply_calibration(
+            neutral_pitch_deg=values.neutral_head_pitch_deg,
+            neutral_face_scale=values.neutral_face_scale_px,
+            camera_identity_key=identity.identity_key,
+        )
+        return self._posture.is_calibrated
 
     def _handle_face_transition(
         self,
@@ -2682,11 +3087,19 @@ class CortexDaemon:
             or landmarks_px is None
             or bool(getattr(getattr(output, "tracking", None), "is_replayed", False))
         ):
+            self._blink_detector.observe_missing(mono_seconds)
+            self._head_pose.observe_missing(mono_seconds)
+            self._posture.observe_missing(mono_seconds)
             return
 
         blink = self._blink_detector.update(landmarks_px, mono_seconds)
         pose = self._head_pose.update(landmarks_px, mono_seconds)
-        posture = self._posture.update_with_face(landmarks_px, mono_seconds)
+        posture = self._posture.update(
+            pitch_deg=pose.pitch,
+            face_scale=self._posture.face_scale(landmarks_px),
+            timestamp=mono_seconds,
+            camera_identity_key=identity.identity_key,
+        )
         self._latest_kinematics = KinematicFeatures(
             blink_rate=blink.blink_rate,
             blink_rate_delta=blink.blink_rate_delta,
@@ -2694,12 +3107,20 @@ class CortexDaemon:
             perclos_60s=blink.perclos_60s,
             mean_blink_duration_ms=blink.mean_blink_duration_ms,
             ear_variance=blink.ear_variance,
+            blink_valid_exposure_seconds=blink.valid_exposure_seconds,
             head_pitch=pose.pitch,
             head_yaw=pose.yaw,
             head_roll=pose.roll,
-            slump_score=posture.slump_score,
-            forward_lean_score=posture.forward_lean_score,
-            shoulder_drop_ratio=posture.shoulder_drop_ratio,
+            head_angular_velocity_deg_per_s=pose.angular_velocity_deg_per_s,
+            head_is_jittery=pose.is_jittery,
+            head_is_frozen=pose.is_frozen,
+            head_neck_flexion_angle=posture.head_neck_flexion_angle,
+            head_neck_flexion_score=posture.head_neck_flexion_score,
+            head_neck_flexion_dwell_seconds=posture.sustained_flexion_seconds,
+            head_neck_proxy_available=posture.proxy_available,
+            slump_score=None,
+            forward_lean_score=None,
+            shoulder_drop_ratio=None,
             confidence=output.frame_meta.face_confidence,
         )
         registry.register("latest_kinematics", self._latest_kinematics)
@@ -2908,6 +3329,9 @@ class CortexDaemon:
     async def _state_loop(self) -> None:
         try:
             while True:
+                if self._inference_publication_paused:
+                    await asyncio.sleep(0.05)
+                    continue
                 event_time = EventTime.from_clock(self._clock)
                 timestamp = event_time.observed_at_mono_ns / 1_000_000_000.0
                 try:
@@ -3049,26 +3473,32 @@ class CortexDaemon:
                             self._session_report.record_hr(float(vector.hr))
                     except Exception:
                         logger.debug("session_report record failed", exc_info=True)
-                    # Audit-2 fix: publish ``forward_lean`` as a 0-1 score
-                    # (rescaled from the underlying 0-45° angle). The
-                    # browser extension's posture alert threshold (0.6)
-                    # was previously compared against raw degrees, so
-                    # every user got a posture toast within 3 min of
-                    # session start regardless of actual posture. The
-                    # raw angle is still surfaced as ``forward_lean_angle``
-                    # for any consumer that prefers degrees.
-                    _lean_angle = vector.forward_lean_angle
-                    _lean_score: float | None
-                    if _lean_angle is None:
-                        _lean_score = None
-                    else:
-                        _lean_score = max(0.0, min(1.0, float(_lean_angle) / 45.0))
+                    # The camera measures only a camera-relative head/neck
+                    # pitch proxy.  Publish its calibrated semantics directly;
+                    # the old torso/shoulder-named fields stay unavailable so
+                    # no consumer can mistake the proxy for body posture.
                     biometrics = {
                         "heart_rate": vector.hr,
                         "hr_delta": vector.hr_delta,
                         "blink_rate": vector.blink_rate,
-                        "forward_lean": _lean_score,
-                        "forward_lean_angle": _lean_angle,
+                        "head_neck_flexion_score": (
+                            vector.head_neck_flexion_score
+                            if vector.head_neck_proxy_available
+                            else None
+                        ),
+                        "head_neck_flexion_angle": (
+                            vector.head_neck_flexion_angle
+                            if vector.head_neck_proxy_available
+                            else None
+                        ),
+                        "head_neck_flexion_dwell_seconds": (
+                            vector.head_neck_flexion_dwell_seconds
+                        ),
+                        "head_neck_proxy_available": (
+                            vector.head_neck_proxy_available
+                        ),
+                        "forward_lean": None,
+                        "forward_lean_angle": None,
                         "thrashing_score": vector.thrashing_score,
                     }
                     # B.3: cache for the dedicated broadcast loop instead of

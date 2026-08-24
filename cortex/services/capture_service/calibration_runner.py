@@ -1,115 +1,180 @@
-"""P0 §3.4 — In-process calibration runner.
+"""Production-path, provenance-bearing calibration.
 
-Wraps the existing live + simulate calibration loops from
-:mod:`cortex.scripts.calibrate` so the Qt onboarding wizard, the
-Settings "Recalibrate" button, and the developer-facing CLI all drive
-the same code path. Pre-3.4 the CLI was the only entry point and the
-wizard subprocessed it — that broke TCC inheritance and meant the
-wizard had no live feedback to show the user during the 2-minute sit.
-
-Design:
-
-* `CalibrationRunner(duration_seconds, simulate, config)` — constructor;
-  no work happens until `start()` is awaited.
-* `await runner.start(on_progress=...)` — drives one capture loop. The
-  callback fires at ~2 Hz with a `CalibrationProgress` dataclass so the
-  UI can update the ECG trace, status pills, and progress bar.
-* `await runner.finish()` — runs `compute_baselines` over the captured
-  samples and atomically writes
-  `storage/baselines/baseline_<timestamp>.json` + `default.json`.
-* `runner.abort()` — cooperative cancellation; the start() loop checks
-  the flag each tick and exits cleanly, releasing the camera handle.
-
-Hard invariants (CLAUDE.md):
-
-* No subprocess. The wizard drives the runner in-process so the daemon's
-  webcam handle / TCC context is reused.
-* `cv2` is imported inside functions, never at module top-level — keeps
-  the runner importable in environments without OpenCV (e.g. test
-  harnesses, CI Linux runners).
-* `default.json` is written via `atomic_write_json`; the prior file is
-  never overwritten on a failed or partial run (rule 28 / §3.4 risk
-  note "Existing baselines must not be silently overwritten if the new
-  run fails").
+The runner owns a fresh :class:`CapturePipeline` only while calibration is in
+progress and builds its estimators through the same production factory as the
+runtime daemon.  Physiological rest and representative-work behavior are
+separate protocol phases.  Missing data remains missing, overlapping windows
+are assigned a conservative effective sample count, and simulation can only
+produce a namespaced demo profile—never an active calibration.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import random
+import statistics
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
+from uuid import uuid4
 
-from cortex.application.clock import (
-    SYSTEM_CLOCK,
-    Clock,
-    monotonic_seconds,
-    utc_datetime,
+import numpy as np
+
+from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds, utc_datetime
+from cortex.libs.config.settings import CortexConfig, get_config
+from cortex.libs.schemas.calibration import (
+    CALIBRATION_FEATURE_SCHEMA_VERSION,
+    CALIBRATION_PROTOCOL_VERSION,
+    CalibrationBaselineValues,
+    CalibrationCameraIdentity,
+    CalibrationDistribution,
+    CalibrationMetricMaturity,
+    CalibrationMetricName,
+    CalibrationMetricSummary,
+    CalibrationProfile,
+    CalibrationProvenance,
+    CalibrationReferenceTask,
 )
-from cortex.libs.config.settings import get_config
-from cortex.libs.schemas.observations import MissingReason, ObservationValidity
+from cortex.libs.schemas.observations import (
+    CameraIdentity,
+    MissingReason,
+    ObservationValidity,
+)
+from cortex.libs.schemas.physiology import SignalAlgorithmIdentity
 from cortex.libs.schemas.state import UserBaselines
-from cortex.libs.schemas.temporal import EventTime
 from cortex.libs.utils.atomic_write import atomic_write_json
+from cortex.services.capture_service.calibration_store import (
+    CalibrationProfileStore,
+    calibration_profile_sha256,
+)
 
 logger = logging.getLogger(__name__)
 
 
 DEFAULT_DURATION_SECONDS = 120
-PROGRESS_HZ = 2.0  # 2 callbacks per second matches the spec's "live feedback at 2 Hz"
-
+PROGRESS_HZ = 2.0
+FEATURE_SCHEMA_VERSION = CALIBRATION_FEATURE_SCHEMA_VERSION
 
 CalibrationStatus = Literal[
     "initializing",
     "running",
+    "review_required",
+    "applying",
     "completed",
     "aborted",
     "failed",
 ]
+CalibrationPhase = Literal[
+    "camera_quality_check",
+    "physiological_rest",
+    "representative_work",
+    "review",
+    "commit",
+]
+
+
+class CalibrationCaptureUnavailable(RuntimeError):
+    """Raised when live, quality-gated capture cannot be established."""
 
 
 @dataclass(frozen=True)
 class CalibrationProgress:
-    """Snapshot of an in-flight calibration run.
-
-    Pushed through the ``on_progress`` callback at ~2 Hz. The UI reads
-    `current_hr`/`current_hrv`/`current_sqi` to drive the live numerics,
-    `lighting_ok`/`motion_ok`/`face_ok` to flip the three status pills,
-    and `pct_complete` to fill the progress bar.
-    """
+    """One honest progress snapshot for desktop and CLI transports."""
 
     elapsed_seconds: float
     total_seconds: float
     current_hr: float | None
-    current_hrv: float | None
+    current_hrv: None
     current_sqi: float | None
     lighting_ok: bool
     motion_ok: bool
     face_ok: bool
     pct_complete: float
     status: CalibrationStatus
+    phase: CalibrationPhase
+    phase_instruction: str
+    valid_duration_seconds: float
+    missing_fraction: float
 
 
 ProgressCallback = Callable[[CalibrationProgress], None]
 
 
-# ---------------------------------------------------------------------------
-# Reusable inner loops — extracted from cortex/scripts/calibrate.py so the
-# CLI script and the runner share one implementation.
-# ---------------------------------------------------------------------------
+@dataclass
+class CalibrationCapture:
+    """Process-local collection result; raw frames and landmarks are absent."""
+
+    samples: dict[str, list[float]]
+    camera: CameraIdentity | None
+    phase_valid_duration_seconds: dict[str, float]
+    phase_scheduled_count: dict[str, int]
+    phase_valid_count: dict[str, int]
+    phase_quality: dict[str, list[float]]
+    algorithms: dict[str, SignalAlgorithmIdentity]
 
 
 def _empty_samples() -> dict[str, list[float]]:
+    """Canonical samples plus decode-only aliases used by old tooling."""
+
+    heart_rate: list[float] = []
+    respiration_rate: list[float] = []
+    blink_rate: list[float] = []
+    open_eye_ratio: list[float] = []
+    mouse_velocity: list[float] = []
+    mouse_variance: list[float] = []
+    neutral_pitch: list[float] = []
+    neutral_face_scale: list[float] = []
+    quality: list[float] = []
     return {
-        "hr": [],
+        "heart_rate_rest": heart_rate,
+        "respiration_rate_rest": respiration_rate,
+        "blink_rate_work": blink_rate,
+        "open_eye_ratio_work": open_eye_ratio,
+        "mouse_velocity_work": mouse_velocity,
+        "mouse_variance_work": mouse_variance,
+        "neutral_head_pitch": neutral_pitch,
+        "neutral_face_scale": neutral_face_scale,
+        "quality": quality,
+        # Compatibility aliases.  They share the same list objects and are
+        # never iterated as additional independent evidence.
+        "hr": heart_rate,
         "hrv": [],
-        "blink_rate": [],
-        "mouse_velocity": [],
-        "mouse_variance": [],
-        "shoulder_y": [],
+        "resp": respiration_rate,
+        "blink_rate": blink_rate,
+        "mouse_velocity": mouse_velocity,
+        "mouse_variance": mouse_variance,
     }
+
+
+def _phase_for_elapsed(elapsed: float, total: float) -> CalibrationPhase:
+    fraction = 1.0 if total <= 0 else float(np.clip(elapsed / total, 0.0, 1.0))
+    if fraction < 0.10:
+        return "camera_quality_check"
+    if fraction < 0.55:
+        return "physiological_rest"
+    return "representative_work"
+
+
+_PHASE_INSTRUCTIONS: dict[CalibrationPhase, str] = {
+    "camera_quality_check": "Center your face and adjust lighting; keep your camera still.",
+    "physiological_rest": "Sit naturally and breathe normally; no special breathing pattern is needed.",
+    "representative_work": "Use your mouse and keyboard as you normally would while working.",
+    "review": "Review what was measured, unavailable, and experimental before saving.",
+    "commit": "Saving the approved measured profile and applying it live.",
+}
+
+
+def _fraction_missing(*, scheduled: int, valid: int) -> float:
+    if scheduled <= 0:
+        return 1.0
+    return float(np.clip(1.0 - valid / scheduled, 0.0, 1.0))
+
+
+def _latest(samples: dict[str, list[float]], name: str) -> float | None:
+    values = samples.get(name, [])
+    return values[-1] if values else None
 
 
 def _emit_progress(
@@ -117,46 +182,116 @@ def _emit_progress(
     *,
     elapsed: float,
     total: float,
-    samples: dict[str, list[float]],
+    capture: CalibrationCapture,
+    phase: CalibrationPhase,
     lighting_ok: bool,
     motion_ok: bool,
     face_ok: bool,
     status: CalibrationStatus,
+    instruction: str | None = None,
 ) -> None:
-    """Compute the current snapshot from the running sample buffers and
-    invoke the user callback. Defensive: any callback exception is
-    swallowed so a buggy UI handler can't kill the capture loop."""
     if callback is None:
         return
-    hr = samples["hr"][-1] if samples["hr"] else None
-    hrv = samples["hrv"][-1] if samples["hrv"] else None
-    pct = 0.0 if total <= 0 else min(100.0, (elapsed / total) * 100.0)
-    # SQI proxy: as the recent HR samples settle, variance drops and SQI
-    # climbs toward 1.0. Until we have at least 4 HR samples we report
-    # None so the UI can show "—" rather than a misleading "0.92".
-    sqi: float | None = None
-    if len(samples["hr"]) >= 4:
-        recent = samples["hr"][-8:]
-        spread = max(recent) - min(recent)
-        # Lower spread → higher SQI. Clamp to [0.4, 0.99] so we don't
-        # promise certainty we can't deliver.
-        sqi = max(0.4, min(0.99, 1.0 - (spread / 30.0)))
+    scheduled = sum(capture.phase_scheduled_count.values())
+    valid = sum(capture.phase_valid_count.values())
     snapshot = CalibrationProgress(
-        elapsed_seconds=elapsed,
-        total_seconds=total,
-        current_hr=hr,
-        current_hrv=hrv,
-        current_sqi=sqi,
+        elapsed_seconds=max(0.0, elapsed),
+        total_seconds=max(0.0, total),
+        current_hr=_latest(capture.samples, "heart_rate_rest"),
+        # HRV is intentionally unavailable pending reference validation.
+        current_hrv=None,
+        current_sqi=_latest(capture.samples, "quality"),
         lighting_ok=lighting_ok,
         motion_ok=motion_ok,
         face_ok=face_ok,
-        pct_complete=pct,
+        pct_complete=(0.0 if total <= 0 else float(np.clip(elapsed / total * 100.0, 0.0, 100.0))),
         status=status,
+        phase=phase,
+        phase_instruction=instruction or _PHASE_INSTRUCTIONS[phase],
+        valid_duration_seconds=sum(capture.phase_valid_duration_seconds.values()),
+        missing_fraction=_fraction_missing(scheduled=scheduled, valid=valid),
     )
     try:
         callback(snapshot)
     except Exception:
         logger.debug("calibration progress callback raised", exc_info=True)
+
+
+def _empty_capture() -> CalibrationCapture:
+    phases = (
+        "camera_quality_check",
+        "physiological_rest",
+        "representative_work",
+    )
+    return CalibrationCapture(
+        samples=_empty_samples(),
+        camera=None,
+        phase_valid_duration_seconds=dict.fromkeys(phases, 0.0),
+        phase_scheduled_count=dict.fromkeys(phases, 0),
+        phase_valid_count=dict.fromkeys(phases, 0),
+        phase_quality={phase: [] for phase in phases},
+        algorithms={},
+    )
+
+
+async def _collect_simulated_calibration(
+    duration_seconds: int,
+    *,
+    is_aborted: Callable[[], bool] | None,
+    on_progress: ProgressCallback | None,
+    clock: Clock,
+) -> CalibrationCapture:
+    rng = random.Random(42)
+    capture = _empty_capture()
+    total_ticks = max(1, int(duration_seconds * PROGRESS_HZ))
+    interval = 1.0 / PROGRESS_HZ
+    previous_elapsed = 0.0
+    _emit_progress(
+        on_progress,
+        elapsed=0.0,
+        total=float(duration_seconds),
+        capture=capture,
+        phase="camera_quality_check",
+        lighting_ok=True,
+        motion_ok=True,
+        face_ok=True,
+        status="initializing",
+    )
+    for tick in range(total_ticks):
+        if is_aborted is not None and is_aborted():
+            break
+        elapsed = min(float(duration_seconds), tick * interval)
+        phase = _phase_for_elapsed(elapsed, float(duration_seconds))
+        capture.phase_scheduled_count[phase] += 1
+        capture.phase_valid_count[phase] += 1
+        capture.phase_valid_duration_seconds[phase] += max(0.0, elapsed - previous_elapsed)
+        capture.phase_quality[phase].append(0.95)
+        capture.samples["quality"].append(0.95)
+        if phase in {"camera_quality_check", "physiological_rest"}:
+            capture.samples["neutral_head_pitch"].append(rng.gauss(2.0, 0.7))
+            capture.samples["neutral_face_scale"].append(rng.gauss(180.0, 2.0))
+        if phase == "physiological_rest":
+            capture.samples["heart_rate_rest"].append(rng.gauss(70.0, 3.0))
+            capture.samples["respiration_rate_rest"].append(rng.gauss(15.0, 1.0))
+        if phase == "representative_work":
+            capture.samples["blink_rate_work"].append(rng.gauss(17.0, 2.0))
+            capture.samples["open_eye_ratio_work"].append(rng.gauss(0.32, 0.01))
+            capture.samples["mouse_velocity_work"].append(rng.gauss(500.0, 100.0))
+            capture.samples["mouse_variance_work"].append(rng.gauss(10_000.0, 2_000.0))
+        previous_elapsed = elapsed
+        _emit_progress(
+            on_progress,
+            elapsed=elapsed,
+            total=float(duration_seconds),
+            capture=capture,
+            phase=phase,
+            lighting_ok=True,
+            motion_ok=True,
+            face_ok=True,
+            status="running",
+        )
+        await asyncio.sleep(interval)
+    return capture
 
 
 async def run_simulate_calibration(
@@ -166,455 +301,455 @@ async def run_simulate_calibration(
     on_progress: ProgressCallback | None = None,
     clock: Clock | None = None,
 ) -> dict[str, list[float]]:
-    """Async simulation loop — same data shape as the live path.
+    """Compatibility wrapper returning demo samples without persisting them."""
 
-    Generates resting-state synthetic samples at 2 Hz and yields control
-    back to the event loop between ticks so the Qt main thread keeps
-    repainting (the runner is awaited from a worker coroutine, not the
-    GUI thread, but `await asyncio.sleep(...)` is still the right
-    discipline so we don't block the daemon's other tasks).
-    """
-    import random
-
-    random.seed(42)
-    active_clock = clock or SYSTEM_CLOCK
-    samples = _empty_samples()
-    total_ticks = max(1, int(duration_seconds * PROGRESS_HZ))
-    tick_interval = 1.0 / PROGRESS_HZ
-    start = monotonic_seconds(active_clock)
-    _emit_progress(
-        on_progress,
-        elapsed=0.0,
-        total=float(duration_seconds),
-        samples=samples,
-        lighting_ok=True,
-        motion_ok=True,
-        face_ok=True,
-        status="initializing",
+    capture = await _collect_simulated_calibration(
+        duration_seconds,
+        is_aborted=is_aborted,
+        on_progress=on_progress,
+        clock=clock or SYSTEM_CLOCK,
     )
-    for _ in range(total_ticks):
-        if is_aborted is not None and is_aborted():
-            return samples
+    return capture.samples
 
-        # Resting HR ~70 BPM with low variance.
-        hr = 70.0 + random.gauss(0, 3.0)
-        samples["hr"].append(max(40.0, min(120.0, hr)))
-        hrv = 50.0 + random.gauss(0, 8.0)
-        samples["hrv"].append(max(10.0, min(200.0, hrv)))
-        samples["blink_rate"].append(max(5.0, min(30.0, 17.0 + random.gauss(0, 2.0))))
-        samples["mouse_velocity"].append(max(100.0, min(2000.0, 500.0 + random.gauss(0, 100.0))))
-        samples["mouse_variance"].append(max(1000.0, min(100000.0, 10000.0 + random.gauss(0, 2000.0))))
-        samples["shoulder_y"].append(max(0.0, min(1.0, 0.5 + random.gauss(0, 0.02))))
 
-        elapsed = monotonic_seconds(active_clock) - start
+async def _collect_live_calibration(
+    duration_seconds: int,
+    *,
+    config: CortexConfig,
+    is_aborted: Callable[[], bool] | None,
+    on_progress: ProgressCallback | None,
+    on_unavailable: Callable[[], None] | None,
+    clock: Clock,
+) -> CalibrationCapture:
+    # Heavy/native dependencies remain lazy so schema/store/CLI help work in
+    # headless test environments.
+    from cortex.services.capture_service.feature_factory import (
+        build_production_camera_feature_components,
+        production_calibration_algorithm_identities,
+    )
+    from cortex.services.capture_service.observation_buffer import (
+        NumericObservation,
+        ObservationBuffer,
+        prepare_observation_window,
+    )
+    from cortex.services.capture_service.pipeline import CapturePipeline
+    from cortex.services.telemetry_engine.feature_aggregator import FeatureAggregator
+    from cortex.services.telemetry_engine.input_hooks import InputHooks
+
+    capture = _empty_capture()
+    components = build_production_camera_feature_components(config)
+    pipeline = CapturePipeline(config.capture, clock=clock)
+    input_hooks = InputHooks(config.telemetry, clock=clock)
+    aggregator = FeatureAggregator(input_hooks, config=config.telemetry, clock=clock)
+    rgb_window_seconds = max(
+        float(config.signal.rppg.window_seconds),
+        float(config.signal.rppg.respiration_window_seconds),
+    )
+    observations: ObservationBuffer[NumericObservation] = ObservationBuffer(
+        max_age_seconds=(
+            rgb_window_seconds + config.signal.rppg.max_interpolation_gap_ms / 1000.0 + 1.0
+        ),
+        max_items=max(
+            config.capture.observation_buffer_max_items,
+            int(rgb_window_seconds * config.signal.rppg.fps_clamp_max) + 2,
+        ),
+    )
+    capture.algorithms = production_calibration_algorithm_identities(
+        config,
+        components=components,
+    )
+
+    try:
+        await pipeline.start()
+    except Exception as exc:
+        if on_unavailable is not None:
+            on_unavailable()
+        raise CalibrationCaptureUnavailable(
+            "live camera capture could not start; no calibration was saved"
+        ) from exc
+
+    hooks_started = input_hooks.start()
+    start_ns = clock.monotonic_ns()
+    last_progress_elapsed = -1.0
+    last_physio_ns = 0
+    previous_valid_ns: int | None = None
+    previous_phase: CalibrationPhase | None = None
+    active_phase: CalibrationPhase | None = None
+    latest_lighting_ok = False
+    latest_motion_ok = False
+    latest_face_ok = False
+    try:
         _emit_progress(
             on_progress,
-            elapsed=elapsed,
+            elapsed=0.0,
             total=float(duration_seconds),
-            samples=samples,
-            lighting_ok=True,
-            motion_ok=True,
-            face_ok=True,
-            status="running",
+            capture=capture,
+            phase="camera_quality_check",
+            lighting_ok=False,
+            motion_ok=False,
+            face_ok=False,
+            status="initializing",
         )
-        await asyncio.sleep(tick_interval)
+        while True:
+            if is_aborted is not None and is_aborted():
+                break
+            elapsed = (clock.monotonic_ns() - start_ns) / 1_000_000_000.0
+            if elapsed >= duration_seconds:
+                break
+            output = await pipeline.get_output(timeout=0.5)
+            if output is None:
+                if elapsed - last_progress_elapsed >= 1.0 / PROGRESS_HZ:
+                    phase = _phase_for_elapsed(elapsed, float(duration_seconds))
+                    _emit_progress(
+                        on_progress,
+                        elapsed=elapsed,
+                        total=float(duration_seconds),
+                        capture=capture,
+                        phase=phase,
+                        lighting_ok=False,
+                        motion_ok=False,
+                        face_ok=False,
+                        status="running",
+                    )
+                    last_progress_elapsed = elapsed
+                continue
 
-    return samples
+            observation = output.observation
+            mono_ns = observation.observed_at_mono_ns
+            mono_seconds = mono_ns / 1_000_000_000.0
+            elapsed = (mono_ns - start_ns) / 1_000_000_000.0
+            if elapsed < 0:
+                continue
+            phase = _phase_for_elapsed(elapsed, float(duration_seconds))
+            if active_phase != phase:
+                observations.clear()
+                components.physiology.reset()
+                if phase == "representative_work":
+                    components.blink.reset()
+                    input_hooks.reset()
+                previous_valid_ns = None
+                previous_phase = None
+                active_phase = phase
+
+            capture.phase_scheduled_count[phase] += 1
+            capture.camera = output.camera_identity
+            latest_face_ok = bool(
+                observation.validity == ObservationValidity.VALID.value
+                and output.landmarks_px is not None
+            )
+            latest_lighting_ok = output.quality.brightness_score >= 0.2
+            latest_motion_ok = output.quality.motion_score >= 0.3
+            valid = latest_face_ok and output.frame is not None
+            rgb_value: np.ndarray | None = None
+            head_jitter_deg = 0.0
+            if valid:
+                assert output.landmarks_px is not None
+                assert output.frame is not None
+                roi = components.roi_extractor.extract(
+                    output.frame,
+                    output.landmarks_px,
+                    mono_seconds,
+                )
+                combined = roi.combined_rgb()
+                if combined is not None and bool(np.isfinite(combined).all()):
+                    rgb_value = np.asarray(combined, dtype=np.float64)
+                    head_jitter_deg = float(roi.head_jitter_px) * (
+                        45.0 / max(1.0, float(config.capture.width))
+                    )
+                else:
+                    valid = False
+
+            numeric = NumericObservation(
+                observed_at_unix_ms=observation.observed_at_unix_ms,
+                observed_at_mono_ns=mono_ns,
+                boot_id=observation.boot_id,
+                sequence=observation.sequence,
+                value=rgb_value if valid else None,
+                validity=(
+                    ObservationValidity.VALID.value if valid else ObservationValidity.REJECTED.value
+                ),
+                missing_reason=(
+                    None
+                    if valid
+                    else observation.missing_reason or MissingReason.ARTIFACT
+                ),
+                quality=observation.quality if valid else 0.0,
+                head_jitter_deg=head_jitter_deg,
+            )
+            observations.append(numeric)
+
+            if not valid or output.landmarks_px is None:
+                components.blink.observe_missing(mono_seconds)
+                components.head_pose.observe_missing(mono_seconds)
+                previous_valid_ns = None
+            else:
+                capture.phase_valid_count[phase] += 1
+                capture.phase_quality[phase].append(observation.quality)
+                capture.samples["quality"].append(observation.quality)
+                if (
+                    previous_valid_ns is not None
+                    and previous_phase == phase
+                    and mono_ns - previous_valid_ns
+                    <= int(config.signal.blink.max_valid_gap_ms * 1_000_000)
+                ):
+                    capture.phase_valid_duration_seconds[phase] += (
+                        mono_ns - previous_valid_ns
+                    ) / 1_000_000_000.0
+                previous_valid_ns = mono_ns
+                previous_phase = phase
+
+                blink = components.blink.update(output.landmarks_px, mono_seconds)
+                pose = components.head_pose.update(output.landmarks_px, mono_seconds)
+                if phase in {"camera_quality_check", "physiological_rest"}:
+                    if not pose.is_jittery and observation.quality >= 0.5:
+                        capture.samples["neutral_head_pitch"].append(pose.pitch)
+                        try:
+                            scale = components.head_neck_proxy.face_scale(output.landmarks_px)
+                        except ValueError:
+                            scale = None
+                        if scale is not None:
+                            capture.samples["neutral_face_scale"].append(scale)
+                if phase == "representative_work":
+                    if blink.blink_rate is not None:
+                        capture.samples["blink_rate_work"].append(blink.blink_rate)
+                    if not blink.is_closed:
+                        capture.samples["open_eye_ratio_work"].append(blink.ear_mean)
+
+            stride_ns = int(config.signal.rppg.stride_seconds * 1_000_000_000)
+            if phase == "physiological_rest" and (
+                last_physio_ns == 0 or mono_ns - last_physio_ns >= stride_ns
+            ):
+                cfg = config.signal.rppg
+                prepared = prepare_observation_window(
+                    observations.snapshot(),
+                    window_seconds=float(cfg.window_seconds),
+                    nominal_fps=float(config.capture.fps),
+                    min_valid_fraction=cfg.min_valid_coverage,
+                    max_interpolation_gap_ms=cfg.max_interpolation_gap_ms,
+                    max_motion_fraction=cfg.max_motion_rejected_fraction,
+                    fps_clamp_min=cfg.fps_clamp_min,
+                    fps_clamp_max=cfg.fps_clamp_max,
+                )
+                last_physio_ns = mono_ns
+                if (
+                    prepared.ready
+                    and prepared.values is not None
+                    and prepared.sample_times_mono_ns is not None
+                ):
+                    pulse = components.physiology.pulse.process_window(
+                        prepared.values,
+                        prepared.sample_times_mono_ns,
+                        sample_rate_hz=prepared.sample_rate_hz,
+                        boot_id=observation.boot_id,
+                        observation_quality=prepared.quality,
+                        head_jitter_deg=prepared.mean_head_jitter_deg,
+                        face_presence_ratio=prepared.valid_fraction,
+                    )
+                    capture.algorithms["physiology"] = pulse.summary.algorithm
+                    if pulse.summary.hr.value is not None:
+                        capture.samples["heart_rate_rest"].append(pulse.summary.hr.value)
+
+                    resp_window = prepare_observation_window(
+                        observations.snapshot(),
+                        window_seconds=float(cfg.respiration_window_seconds),
+                        nominal_fps=float(config.capture.fps),
+                        min_valid_fraction=cfg.min_valid_coverage,
+                        max_interpolation_gap_ms=cfg.max_interpolation_gap_ms,
+                        max_motion_fraction=cfg.max_motion_rejected_fraction,
+                        fps_clamp_min=cfg.fps_clamp_min,
+                        fps_clamp_max=cfg.fps_clamp_max,
+                    )
+                    if (
+                        resp_window.ready
+                        and resp_window.values is not None
+                        and resp_window.sample_times_mono_ns is not None
+                    ):
+                        respiration = components.physiology.respiration.process_window(
+                            resp_window.values,
+                            resp_window.sample_times_mono_ns,
+                            sample_rate_hz=resp_window.sample_rate_hz,
+                            boot_id=observation.boot_id,
+                            head_vertical_face_units=(resp_window.head_vertical_face_units),
+                        )
+                        if respiration.fused.value is not None:
+                            capture.samples["respiration_rate_rest"].append(respiration.fused.value)
+
+            if (
+                phase == "representative_work"
+                and hooks_started
+                and elapsed - last_progress_elapsed >= 1.0 / PROGRESS_HZ
+            ):
+                telemetry = aggregator.build_features(
+                    window_seconds=min(
+                        config.telemetry.window_seconds,
+                        max(1.0, capture.phase_valid_duration_seconds[phase]),
+                    ),
+                    current_time=monotonic_seconds(clock),
+                )
+                # A zero value can be a valid observation.  Input permission,
+                # not numeric magnitude, decides availability.
+                capture.samples["mouse_velocity_work"].append(telemetry.mouse_velocity_mean)
+                capture.samples["mouse_variance_work"].append(telemetry.mouse_velocity_variance)
+
+            if elapsed - last_progress_elapsed >= 1.0 / PROGRESS_HZ:
+                _emit_progress(
+                    on_progress,
+                    elapsed=elapsed,
+                    total=float(duration_seconds),
+                    capture=capture,
+                    phase=phase,
+                    lighting_ok=latest_lighting_ok,
+                    motion_ok=latest_motion_ok,
+                    face_ok=latest_face_ok,
+                    status="running",
+                )
+                last_progress_elapsed = elapsed
+    finally:
+        try:
+            input_hooks.stop()
+        except Exception:
+            logger.debug("input hooks failed to stop", exc_info=True)
+        try:
+            await pipeline.stop()
+        except Exception:
+            logger.debug("calibration capture pipeline failed to stop", exc_info=True)
+
+    if capture.camera is None:
+        if on_unavailable is not None:
+            on_unavailable()
+        raise CalibrationCaptureUnavailable(
+            "no camera observations were captured; no calibration was saved"
+        )
+    if sum(capture.phase_valid_count.values()) == 0:
+        raise CalibrationCaptureUnavailable(
+            "no quality-gated face observations were captured; no calibration was saved"
+        )
+    return capture
 
 
 async def run_live_calibration(
     duration_seconds: int,
     *,
-    config: Any | None = None,
+    config: CortexConfig | None = None,
     is_aborted: Callable[[], bool] | None = None,
     on_progress: ProgressCallback | None = None,
     on_fallback: Callable[[], None] | None = None,
     clock: Clock | None = None,
 ) -> dict[str, list[float]]:
-    """Async live capture loop. Falls back to simulate mode if the
-    webcam / OpenCV / pipeline modules are unavailable.
+    """Compatibility wrapper; live failure raises instead of fabricating data."""
 
-    ``on_fallback`` is invoked exactly once if the live path degrades to
-    the simulation loop (no camera / OpenCV / pipeline / physio data), so
-    the caller can surface a visible "calibrated against synthetic data"
-    warning instead of silently accepting a useless baseline (CLAUDE.md
-    rules #5/#15 — never let a contended camera masquerade as a real one).
+    capture = await _collect_live_calibration(
+        duration_seconds,
+        config=config or get_config(),
+        is_aborted=is_aborted,
+        on_progress=on_progress,
+        on_unavailable=on_fallback,
+        clock=clock or SYSTEM_CLOCK,
+    )
+    return capture.samples
 
-    The function `await asyncio.sleep(0)` after each frame so the event
-    loop stays responsive — the wizard's progress callback delivery and
-    the abort flag check both run on the same loop.
-    """
-    active_clock = clock or SYSTEM_CLOCK
 
-    async def _fallback() -> dict[str, list[float]]:
-        if on_fallback is not None:
-            on_fallback()
-        return await run_simulate_calibration(
-            duration_seconds,
-            is_aborted=is_aborted,
-            on_progress=on_progress,
-            clock=active_clock,
-        )
-
-    try:
-        import cv2  # local import per CLAUDE.md rule
-    except ImportError:
-        logger.warning("OpenCV unavailable, falling back to simulation")
-        return await _fallback()
-
-    if config is None:
-        config = get_config()
-
-    from cortex.services.capture_service.webcam import (
-        describe_requested_camera,
-        open_video_capture,
+def _distribution(values: list[float]) -> CalibrationDistribution | None:
+    finite = np.asarray([value for value in values if np.isfinite(value)], dtype=np.float64)
+    if finite.size == 0:
+        return None
+    return CalibrationDistribution(
+        mean=float(np.mean(finite)),
+        std=float(np.std(finite, ddof=1)) if finite.size >= 2 else 0.0,
+        p10=float(np.percentile(finite, 10)),
+        median=float(np.median(finite)),
+        p90=float(np.percentile(finite, 90)),
     )
 
-    cap, _selection = open_video_capture(config.capture)
-    if cap is None:
-        logger.warning(
-            "Cannot open webcam device %s, falling back to simulation",
-            describe_requested_camera(config.capture),
-        )
-        return await _fallback()
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.capture.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.capture.height)
-
-    samples = _empty_samples()
-    try:
-        import numpy as np
-
-        from cortex.services.capture_service.face_tracker import FaceTracker
-        from cortex.services.capture_service.observation_buffer import (
-            NumericObservation,
-            ObservationBuffer,
-            prepare_observation_window,
-        )
-        from cortex.services.capture_service.quality import FrameQualityScorer
-        from cortex.services.kinematics_engine.blink_detector import BlinkDetector
-        from cortex.services.physio_engine.pulse_estimator import PulseEstimator
-        from cortex.services.physio_engine.roi_extractor import RoiExtractor
-        from cortex.services.physio_engine.rppg import extract_bvp
-        from cortex.services.telemetry_engine.feature_aggregator import FeatureAggregator
-        from cortex.services.telemetry_engine.input_hooks import InputHooks
-    except Exception:
-        logger.warning(
-            "Full calibration pipeline unavailable, falling back to simulation"
-        )
-        cap.release()
-        return await _fallback()
-
-    tracker = FaceTracker(config.capture)
-    quality_scorer = FrameQualityScorer(config.capture)
-    extractor = RoiExtractor(config.landmarks)
-    blink_detector = BlinkDetector(
-        blink_config=config.signal.blink,
-        landmarks_config=config.landmarks,
-    )
-    pulse_estimator = PulseEstimator(fs=float(config.capture.fps))
-    input_hooks = InputHooks(config.telemetry, clock=active_clock)
-    aggregator = FeatureAggregator(
-        input_hooks,
-        config=config.telemetry,
-        clock=active_clock,
-    )
-    rgb_observations: ObservationBuffer[NumericObservation] = ObservationBuffer(
-        max_age_seconds=(
-            float(config.signal.rppg.window_seconds)
-            + config.signal.rppg.max_interpolation_gap_ms / 1000.0
-            + 1.0
-        ),
-        max_items=config.capture.observation_buffer_max_items,
-    )
-    sequence = 0
-    last_physio_mono_ns = 0
-    saw_successful_read = False
-
-    try:
-        tracker.initialize()
-    except Exception as exc:
-        logger.warning(
-            "Face tracker failed to initialize (%s), falling back to simulation", exc
-        )
-        cap.release()
-        return await _fallback()
-
-    hooks_started = input_hooks.start()
-    if not hooks_started:
-        logger.info(
-            "Mouse/keyboard telemetry unavailable; calibration will use camera signals only"
-        )
-
-    _emit_progress(
-        on_progress,
-        elapsed=0.0,
-        total=float(duration_seconds),
-        samples=samples,
-        lighting_ok=False,
-        motion_ok=False,
-        face_ok=False,
-        status="initializing",
+def _quality_percentiles(values: list[float]) -> tuple[float, float, float]:
+    finite = np.asarray([value for value in values if np.isfinite(value)], dtype=np.float64)
+    if finite.size == 0:
+        return 0.0, 0.0, 0.0
+    return (
+        float(np.percentile(finite, 10)),
+        float(np.median(finite)),
+        float(np.percentile(finite, 90)),
     )
 
-    start = monotonic_seconds(active_clock)
-    last_progress_time = 0.0
-    progress_interval = 1.0 / PROGRESS_HZ
-    lighting_ok = False
-    face_ok = False
-    motion_ok = True  # default True; flips False on detected jitter
 
-    try:
-        while True:
-            if is_aborted is not None and is_aborted():
-                break
-
-            try:
-                ret, frame = cap.read()
-            except Exception:
-                logger.warning("Calibration camera read raised", exc_info=True)
-                ret, frame = False, None
-            event_time = EventTime.from_clock(active_clock)
-            current_sequence = sequence
-            sequence += 1
-            elapsed = event_time.observed_at_mono_ns / 1_000_000_000.0 - start
-            if elapsed >= duration_seconds:
-                break
-
-            if not ret or frame is None:
-                rgb_observations.append(
-                    NumericObservation(
-                        observed_at_unix_ms=event_time.observed_at_unix_ms,
-                        observed_at_mono_ns=event_time.observed_at_mono_ns,
-                        boot_id=event_time.boot_id,
-                        sequence=current_sequence,
-                        value=None,
-                        validity=ObservationValidity.MISSING.value,
-                        missing_reason=(
-                            MissingReason.CAMERA_WARMUP
-                            if not saw_successful_read
-                            else MissingReason.SOURCE_DISCONNECTED
-                        ),
-                        quality=0.0,
-                    )
-                )
-                face_ok = False
-                lighting_ok = False
-                if elapsed - last_progress_time >= progress_interval:
-                    _emit_progress(
-                        on_progress,
-                        elapsed=elapsed,
-                        total=float(duration_seconds),
-                        samples=samples,
-                        lighting_ok=lighting_ok,
-                        motion_ok=motion_ok,
-                        face_ok=face_ok,
-                        status="running",
-                    )
-                    last_progress_time = elapsed
-                await asyncio.sleep(0)
-                continue
-            saw_successful_read = True
-
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            frame_u8 = np.asarray(frame, dtype=np.uint8)
-            tracking = tracker.process_frame(
-                frame_u8,
-                capture_mono_ns=event_time.observed_at_mono_ns,
-            )
-            quality = quality_scorer.score(
-                frame_u8,
-                tracking.nose_displacement_px,
-                gray_frame=gray,
-                motion_face_widths_per_second=(
-                    tracking.motion_face_widths_per_second
-                ),
-            )
-            lighting_ok = quality.brightness_score >= 0.2
-            motion_ok = quality.motion_score >= 0.3
-            landmarks_px = tracking.landmarks_px
-            face_ok = bool(tracking.face_detected and landmarks_px is not None)
-            observation_validity = ObservationValidity.VALID.value
-            missing_reason: MissingReason | None = None
-            if tracking.detector_timestamp_adjusted:
-                observation_validity = ObservationValidity.REJECTED.value
-                missing_reason = MissingReason.ARTIFACT
-            elif not face_ok or landmarks_px is None:
-                observation_validity = ObservationValidity.MISSING.value
-                missing_reason = MissingReason.NO_FACE
-            elif not quality.passed:
-                observation_validity = ObservationValidity.REJECTED.value
-                missing_reason = quality_scorer.rejection_reason(quality)
-
-            rgb_value = None
-            roi_frame = None
-            if observation_validity == ObservationValidity.VALID.value:
-                assert landmarks_px is not None
-                roi_frame = extractor.extract(
-                    frame_u8,
-                    landmarks_px,
-                    event_time.observed_at_mono_ns / 1_000_000_000.0,
-                )
-                combined_rgb = roi_frame.combined_rgb()
-                if combined_rgb is not None and bool(np.isfinite(combined_rgb).all()):
-                    rgb_value = np.asarray(combined_rgb, dtype=np.float64)
-                else:
-                    observation_validity = ObservationValidity.REJECTED.value
-                    missing_reason = MissingReason.OCCLUDED
-
-            rgb_observations.append(
-                NumericObservation(
-                    observed_at_unix_ms=event_time.observed_at_unix_ms,
-                    observed_at_mono_ns=event_time.observed_at_mono_ns,
-                    boot_id=event_time.boot_id,
-                    sequence=current_sequence,
-                    value=rgb_value,
-                    validity=observation_validity,
-                    missing_reason=missing_reason,
-                    quality=(
-                        min(
-                            quality.brightness_score,
-                            quality.blur_score,
-                            quality.motion_score,
-                            tracking.confidence,
-                        )
-                        if rgb_value is not None
-                        else 0.0
-                    ),
-                    head_jitter_deg=(
-                        float(roi_frame.head_jitter_px)
-                        * (45.0 / max(1.0, float(config.capture.width)))
-                        if roi_frame is not None and rgb_value is not None
-                        else 0.0
-                    ),
-                )
-            )
-
-            if observation_validity != ObservationValidity.VALID.value:
-                if elapsed - last_progress_time >= progress_interval:
-                    _emit_progress(
-                        on_progress,
-                        elapsed=elapsed,
-                        total=float(duration_seconds),
-                        samples=samples,
-                        lighting_ok=lighting_ok,
-                        motion_ok=motion_ok,
-                        face_ok=face_ok,
-                        status="running",
-                    )
-                    last_progress_time = elapsed
-                await asyncio.sleep(0)
-                continue
-
-            assert landmarks_px is not None
-            observation_mono_seconds = (
-                event_time.observed_at_mono_ns / 1_000_000_000.0
-            )
-            blink_state = blink_detector.update(
-                landmarks_px, observation_mono_seconds
-            )
-            if blink_state.blink_rate is not None:
-                samples["blink_rate"].append(blink_state.blink_rate)
-
-            ear_mid_y = float(
-                (landmarks_px[234][1] + landmarks_px[454][1]) / 2.0
-            ) / float(frame_u8.shape[0])
-            samples["shoulder_y"].append(ear_mid_y)
-
-            stride_ns = int(config.signal.rppg.stride_seconds * 1_000_000_000)
-            if (
-                last_physio_mono_ns == 0
-                or event_time.observed_at_mono_ns - last_physio_mono_ns >= stride_ns
-            ):
-                prepared = prepare_observation_window(
-                    rgb_observations.snapshot(),
-                    window_seconds=float(config.signal.rppg.window_seconds),
-                    nominal_fps=float(config.capture.fps),
-                    min_valid_fraction=config.signal.rppg.min_valid_coverage,
-                    max_interpolation_gap_ms=(
-                        config.signal.rppg.max_interpolation_gap_ms
-                    ),
-                    max_motion_fraction=(
-                        config.signal.rppg.max_motion_rejected_fraction
-                    ),
-                    fps_clamp_min=config.signal.rppg.fps_clamp_min,
-                    fps_clamp_max=config.signal.rppg.fps_clamp_max,
-                )
-                last_physio_mono_ns = event_time.observed_at_mono_ns
-                if prepared.ready and prepared.values is not None:
-                    bvp = extract_bvp(
-                        prepared.values,
-                        fs=prepared.sample_rate_hz,
-                        algorithm=config.signal.rppg.backend,
-                    )
-                    pulse_estimator.process_window(
-                        bvp,
-                        timestamp=observation_mono_seconds,
-                        fs=prepared.sample_rate_hz,
-                        head_jitter_deg=prepared.mean_head_jitter_deg,
-                        face_presence_ratio=prepared.valid_fraction,
-                    )
-                    physio = pulse_estimator.get_features(observation_mono_seconds)
-                    if physio.valid and physio.pulse_bpm is not None:
-                        samples["hr"].append(physio.pulse_bpm)
-                    if physio.pulse_variability_proxy is not None:
-                        samples["hrv"].append(physio.pulse_variability_proxy)
-
-            telemetry = aggregator.build_features(
-                window_seconds=min(config.telemetry.window_seconds, max(1.0, elapsed)),
-                current_time=monotonic_seconds(active_clock),
-            )
-            if telemetry.mouse_velocity_mean > 0.0:
-                samples["mouse_velocity"].append(telemetry.mouse_velocity_mean)
-            if telemetry.mouse_velocity_variance > 0.0:
-                samples["mouse_variance"].append(telemetry.mouse_velocity_variance)
-
-            # Motion check: if recent shoulder_y stddev is large, the
-            # user is moving too much for a stable baseline.
-            if len(samples["shoulder_y"]) >= 4:
-                recent = samples["shoulder_y"][-8:]
-                spread = max(recent) - min(recent)
-                motion_ok = spread < 0.05
-
-            if elapsed - last_progress_time >= progress_interval:
-                _emit_progress(
-                    on_progress,
-                    elapsed=elapsed,
-                    total=float(duration_seconds),
-                    samples=samples,
-                    lighting_ok=lighting_ok,
-                    motion_ok=motion_ok,
-                    face_ok=face_ok,
-                    status="running",
-                )
-                last_progress_time = elapsed
-
-            await asyncio.sleep(0)
-    finally:
-        try:
-            input_hooks.stop()
-        except Exception:
-            logger.debug("input_hooks.stop() raised", exc_info=True)
-        try:
-            cap.release()
-        except Exception:
-            logger.debug("cap.release() raised", exc_info=True)
-        try:
-            tracker.release()
-        except Exception:
-            logger.debug("tracker.release() raised", exc_info=True)
-
-    # Fill missing telemetry baselines conservatively (matches the prior CLI).
-    if not samples["mouse_velocity"]:
-        samples["mouse_velocity"].append(500.0)
-    if not samples["mouse_variance"]:
-        samples["mouse_variance"].append(10000.0)
-
-    if not samples["hr"] and not samples["blink_rate"] and not samples["shoulder_y"]:
-        logger.warning("No physiological data captured, falling back to defaults")
-        return await _fallback()
-
-    return samples
+def _metric_summary(
+    capture: CalibrationCapture,
+    *,
+    metric: CalibrationMetricName,
+    sample_key: str,
+    unit: str,
+    task: CalibrationReferenceTask,
+    maturity: CalibrationMetricMaturity,
+    algorithm_key: str,
+    effective_window_seconds: float,
+) -> CalibrationMetricSummary:
+    samples = capture.samples[sample_key]
+    distribution = _distribution(samples)
+    evidence_phases = (
+        ("camera_quality_check", "physiological_rest")
+        if task == CalibrationReferenceTask.NEUTRAL_HEAD_POSE
+        else (task.value,)
+    )
+    valid_duration = sum(
+        capture.phase_valid_duration_seconds.get(phase, 0.0)
+        for phase in evidence_phases
+    )
+    scheduled = sum(
+        capture.phase_scheduled_count.get(phase, 0) for phase in evidence_phases
+    )
+    valid = sum(capture.phase_valid_count.get(phase, 0) for phase in evidence_phases)
+    quality_values = [
+        value
+        for phase in evidence_phases
+        for value in capture.phase_quality.get(phase, [])
+    ]
+    q10, q50, q90 = _quality_percentiles(quality_values)
+    algorithm = capture.algorithms.get(algorithm_key)
+    if algorithm is None:
+        algorithm = SignalAlgorithmIdentity(
+            name=f"{algorithm_key}-unavailable",
+            version="2.0.0",
+            implementation_sha256="0" * 64,
+            configuration_sha256="0" * 64,
+            selection_mode="fixed",
+        )
+    if distribution is None:
+        return CalibrationMetricSummary(
+            metric=metric,
+            unit=unit,
+            reference_task=task,
+            maturity=CalibrationMetricMaturity.UNAVAILABLE,
+            sample_count=0,
+            effective_sample_count=0.0,
+            valid_duration_seconds=valid_duration,
+            missing_fraction=_fraction_missing(scheduled=scheduled, valid=valid),
+            quality_p10=q10,
+            quality_median=q50,
+            quality_p90=q90,
+            algorithm=algorithm,
+            unavailable_reason="no independent quality-gated observations",
+        )
+    effective_count = min(
+        float(len(samples)),
+        valid_duration / max(0.001, effective_window_seconds),
+    )
+    return CalibrationMetricSummary(
+        metric=metric,
+        unit=unit,
+        reference_task=task,
+        maturity=maturity,
+        value=distribution.mean,
+        distribution=distribution,
+        sample_count=len(samples),
+        effective_sample_count=effective_count,
+        valid_duration_seconds=valid_duration,
+        missing_fraction=_fraction_missing(scheduled=scheduled, valid=valid),
+        quality_p10=q10,
+        quality_median=q50,
+        quality_p90=q90,
+        algorithm=algorithm,
+    )
 
 
 def compute_baselines(
@@ -622,94 +757,76 @@ def compute_baselines(
     *,
     clock: Clock | None = None,
 ) -> UserBaselines:
-    """Compute baseline statistics. Same implementation as the legacy
-    CLI; re-exported here so the CLI can import it from one place."""
-    import statistics
+    """Decode-only legacy view derived only from present observations."""
 
-    import numpy as np
+    def _values(primary: str, alias: str) -> list[float]:
+        return samples.get(primary) or samples.get(alias, [])
 
-    def _safe_mean(data: list[float], default: float) -> float:
-        return statistics.mean(data) if data else default
-
-    def _safe_stdev(data: list[float], default: float) -> float:
-        return statistics.stdev(data) if len(data) >= 2 else default
-
-    def _distribution(data: list[float], default_mu: float, default_sigma: float) -> dict[str, float]:
-        if not data:
-            return {"mu": default_mu, "sigma": default_sigma, "p10": default_mu, "p90": default_mu}
-        arr = sorted(data)
-        return {
-            "mu": float(statistics.mean(arr)),
-            "sigma": float(statistics.stdev(arr)) if len(arr) >= 2 else float(default_sigma),
-            "p10": float(np.percentile(arr, 10)),
-            "p90": float(np.percentile(arr, 90)),
-        }
-
-    hr_values = samples.get("hr", [])
-    hrv_values = samples.get("hrv", [])
-    blink_values = samples.get("blink_rate", [])
-    mouse_vel = samples.get("mouse_velocity", [])
-    mouse_var = samples.get("mouse_variance", [])
-    shoulder_values = samples.get("shoulder_y", [])
-
-    return UserBaselines(
-        hr_baseline=_safe_mean(hr_values, 72.0),
-        hr_std=_safe_stdev(hr_values, 5.0),
-        hrv_baseline=_safe_mean(hrv_values, 50.0),
-        blink_rate_baseline=_safe_mean(blink_values, 17.0),
-        mouse_velocity_baseline=_safe_mean(mouse_vel, 500.0),
-        mouse_variance_baseline=_safe_mean(mouse_var, 10000.0),
-        shoulder_neutral_y=_safe_mean(shoulder_values, 0.5),
-        calibrated_at=utc_datetime(clock or SYSTEM_CLOCK),
-        metric_distributions={
-            "hr": _distribution(hr_values, 72.0, 5.0),
-            "hrv_rmssd": _distribution(hrv_values, 50.0, 10.0),
-            "blink_rate": _distribution(blink_values, 17.0, 4.0),
-            "mouse_velocity": _distribution(mouse_vel, 500.0, 120.0),
-            "mouse_variance": _distribution(mouse_var, 10000.0, 2500.0),
-            "resp_rate": _distribution(samples.get("resp", []), 15.0, 3.0),
-        },
-        circadian_hr_cosinor={},
-        rolling_rebaseline_seconds=60.0,
-        ew_decay_half_life_days=7.0,
-    )
+    values: dict[str, object] = {}
+    hr = _values("heart_rate_rest", "hr")
+    blink = _values("blink_rate_work", "blink_rate")
+    mouse_velocity = _values("mouse_velocity_work", "mouse_velocity")
+    mouse_variance = _values("mouse_variance_work", "mouse_variance")
+    respiration = _values("respiration_rate_rest", "resp")
+    if hr:
+        values["hr_baseline"] = statistics.mean(hr)
+        values["hr_std"] = max(1.0, min(20.0, statistics.stdev(hr) if len(hr) > 1 else 1.0))
+    if blink:
+        values["blink_rate_baseline"] = statistics.mean(blink)
+    if mouse_velocity:
+        values["mouse_velocity_baseline"] = statistics.mean(mouse_velocity)
+    if mouse_variance:
+        values["mouse_variance_baseline"] = statistics.mean(mouse_variance)
+    if respiration:
+        values["resp_baseline"] = statistics.mean(respiration)
+    if any((hr, blink, mouse_velocity, mouse_variance, respiration)):
+        values["calibrated_at"] = utc_datetime(clock or SYSTEM_CLOCK)
+    return UserBaselines.model_validate(values)
 
 
-# ---------------------------------------------------------------------------
-# Public runner
-# ---------------------------------------------------------------------------
+def baselines_dir(config: CortexConfig | None = None) -> Path:
+    """Legacy compatibility directory; active provenance lives in calibration/."""
 
-
-def baselines_dir(config: Any | None = None) -> Path:
-    """Resolve the on-disk baselines directory (`storage/baselines/`)."""
     cfg = config or get_config()
-    return Path(cfg.storage.path) / "baselines"
+    return Path(cfg.storage.path).expanduser() / "baselines"
 
 
-def default_baseline_path(config: Any | None = None) -> Path:
-    """Path to `storage/baselines/default.json` — the canonical baseline
-    the state engine reads on startup."""
+def default_baseline_path(config: CortexConfig | None = None) -> Path:
     return baselines_dir(config) / "default.json"
 
 
+def calibration_review_payload(profile: CalibrationProfile) -> dict[str, object]:
+    """Small transport-neutral review model with no sensitive raw samples."""
+
+    return {
+        "profile_id": str(profile.profile_id),
+        "provenance": str(profile.provenance),
+        "camera_name": profile.camera.device_name if profile.camera else None,
+        "metrics": [
+            {
+                "name": str(metric.metric),
+                "value": metric.value,
+                "unit": metric.unit,
+                "maturity": str(metric.maturity),
+                "reference_task": str(metric.reference_task),
+                "valid_duration_seconds": metric.valid_duration_seconds,
+                "missing_fraction": metric.missing_fraction,
+                "quality_median": metric.quality_median,
+            }
+            for metric in profile.metrics
+        ],
+        "notes": list(profile.notes),
+    }
+
+
 class CalibrationRunner:
-    """Drives one calibration session.
-
-    Lifecycle:
-
-        runner = CalibrationRunner(duration_seconds=120, simulate=False)
-        await runner.start(on_progress=ui_callback)
-        baselines = await runner.finish()  # writes default.json atomically
-
-    `abort()` is safe to call from any thread; the cooperative flag is
-    checked on every tick of the inner loop.
-    """
+    """Collect, review, and explicitly commit one calibration profile."""
 
     def __init__(
         self,
         duration_seconds: int = DEFAULT_DURATION_SECONDS,
         simulate: bool = False,
-        config: Any | None = None,
+        config: CortexConfig | None = None,
         *,
         output_path: Path | str | None = None,
         clock: Clock | None = None,
@@ -717,24 +834,23 @@ class CalibrationRunner:
         if duration_seconds <= 0:
             raise ValueError("duration_seconds must be positive")
         self.duration_seconds = int(duration_seconds)
-        self._clock = clock or SYSTEM_CLOCK
         self.simulate = bool(simulate)
-        # True if calibration ran against synthetic frames — either because
-        # ``simulate=True`` was requested OR the live path degraded to the
-        # simulation loop (no camera / OpenCV / pipeline / physio data). The
-        # desktop wizard reads this to surface a visible warning instead of
-        # silently accepting a useless baseline.
         self.used_simulation = bool(simulate)
-        self._config = config
+        self._clock = clock or SYSTEM_CLOCK
+        self._config = config or get_config()
+        self._store = CalibrationProfileStore(
+            self._config.storage.path,
+            clock=self._clock,
+        )
+        self._output_override = Path(output_path).expanduser() if output_path else None
+        self._profile_id = uuid4()
+        self._capture: CalibrationCapture | None = None
         self._aborted = False
         self._started = False
         self._finished = False
-        self._samples: dict[str, list[float]] | None = None
+        self._committed_profile: CalibrationProfile | None = None
         self._last_progress: CalibrationProgress | None = None
-        # If `output_path` is provided it is used as the timestamped
-        # destination *instead of* the auto-generated baseline_<ts>.json.
-        # `default.json` is always written alongside on success.
-        self._output_override = Path(output_path) if output_path else None
+        self._progress_callback: ProgressCallback | None = None
 
     @property
     def last_progress(self) -> CalibrationProgress | None:
@@ -742,64 +858,48 @@ class CalibrationRunner:
 
     @property
     def is_running(self) -> bool:
-        return self._started and not self._finished and not self._aborted
+        return self._started and self._capture is None and not self._aborted
 
     def abort(self) -> None:
-        """Cooperative abort. The next loop tick exits cleanly and the
-        camera handle is released in the `finally` block."""
         self._aborted = True
 
-    def _on_progress(
-        self, user_cb: ProgressCallback | None
-    ) -> ProgressCallback:
-        """Wrap the user callback so we can also retain the latest
-        progress snapshot for introspection (used by tests)."""
+    def _on_progress(self, user_callback: ProgressCallback | None) -> ProgressCallback:
         def _inner(progress: CalibrationProgress) -> None:
             self._last_progress = progress
-            if user_cb is not None:
-                user_cb(progress)
+            if user_callback is not None:
+                user_callback(progress)
+
         return _inner
 
-    async def start(
-        self,
-        on_progress: ProgressCallback | None = None,
-    ) -> None:
-        """Run the capture loop end-to-end. Returns when the duration
-        elapses or `abort()` flips the cooperative flag."""
+    async def start(self, on_progress: ProgressCallback | None = None) -> None:
         if self._started:
             raise RuntimeError("CalibrationRunner.start() already called")
         self._started = True
-
-        wrapped_cb = self._on_progress(on_progress)
-
+        self._progress_callback = self._on_progress(on_progress)
         try:
             if self.simulate:
-                self._samples = await run_simulate_calibration(
+                self._capture = await _collect_simulated_calibration(
                     self.duration_seconds,
                     is_aborted=lambda: self._aborted,
-                    on_progress=wrapped_cb,
+                    on_progress=self._progress_callback,
                     clock=self._clock,
                 )
             else:
-                def _mark_simulated() -> None:
-                    self.used_simulation = True
-
-                self._samples = await run_live_calibration(
+                self._capture = await _collect_live_calibration(
                     self.duration_seconds,
                     config=self._config,
                     is_aborted=lambda: self._aborted,
-                    on_progress=wrapped_cb,
-                    on_fallback=_mark_simulated,
+                    on_progress=self._progress_callback,
+                    on_unavailable=None,
                     clock=self._clock,
                 )
         except Exception:
-            logger.exception("calibration capture loop crashed")
-            self._samples = None
             _emit_progress(
-                wrapped_cb,
+                self._progress_callback,
                 elapsed=float(self.duration_seconds),
                 total=float(self.duration_seconds),
-                samples=_empty_samples(),
+                capture=self._capture or _empty_capture(),
+                phase="review",
                 lighting_ok=False,
                 motion_ok=False,
                 face_ok=False,
@@ -807,64 +907,310 @@ class CalibrationRunner:
             )
             raise
 
-        status: CalibrationStatus = "aborted" if self._aborted else "completed"
-        elapsed = float(self.duration_seconds)
-        if self._last_progress is not None:
-            elapsed = self._last_progress.elapsed_seconds
+        if self._aborted:
+            _emit_progress(
+                self._progress_callback,
+                elapsed=self._last_progress.elapsed_seconds if self._last_progress else 0.0,
+                total=float(self.duration_seconds),
+                capture=self._capture,
+                phase="review",
+                lighting_ok=False,
+                motion_ok=False,
+                face_ok=False,
+                status="aborted",
+            )
+            return
         _emit_progress(
-            wrapped_cb,
-            elapsed=elapsed,
+            self._progress_callback,
+            elapsed=float(self.duration_seconds),
             total=float(self.duration_seconds),
-            samples=self._samples or _empty_samples(),
-            lighting_ok=self._last_progress.lighting_ok if self._last_progress else True,
-            motion_ok=self._last_progress.motion_ok if self._last_progress else True,
-            face_ok=self._last_progress.face_ok if self._last_progress else True,
-            status=status,
+            capture=self._capture,
+            phase="review",
+            lighting_ok=True,
+            motion_ok=True,
+            face_ok=True,
+            status="review_required",
         )
 
-    async def finish(self) -> UserBaselines:
-        """Compute baselines and atomically write them to disk.
-
-        Writes happen *only on success*: a runner that hasn't been
-        started, has been aborted, or crashed mid-flight will raise
-        rather than overwriting the prior `default.json`.
-        """
-        if not self._started:
-            raise RuntimeError(
-                "CalibrationRunner.finish() called before start(); "
-                "the runner has no samples to compute baselines from"
-            )
+    def preview_profile(self) -> CalibrationProfile:
+        if not self._started or self._capture is None:
+            raise RuntimeError("calibration has no completed capture to review")
         if self._aborted:
-            raise RuntimeError(
-                "CalibrationRunner was aborted; refusing to overwrite "
-                "default.json with a partial run"
-            )
-        if self._samples is None:
-            raise RuntimeError(
-                "CalibrationRunner.start() returned no samples; "
-                "refusing to overwrite default.json"
-            )
+            raise RuntimeError("aborted calibration cannot produce a profile")
+        provenance = (
+            CalibrationProvenance.DEMO if self.used_simulation else CalibrationProvenance.MEASURED
+        )
+        capture = self._capture
+        rppg_window = float(self._config.signal.rppg.window_seconds)
+        telemetry_window = float(self._config.telemetry.window_seconds)
+        metrics = (
+            _metric_summary(
+                capture,
+                metric=CalibrationMetricName.HEART_RATE_BPM,
+                sample_key="heart_rate_rest",
+                unit="bpm",
+                task=CalibrationReferenceTask.PHYSIOLOGICAL_REST,
+                maturity=CalibrationMetricMaturity.EXPERIMENTAL,
+                algorithm_key="physiology",
+                effective_window_seconds=rppg_window,
+            ),
+            _metric_summary(
+                capture,
+                metric=CalibrationMetricName.RESPIRATION_RATE_BPM,
+                sample_key="respiration_rate_rest",
+                unit="breaths/min",
+                task=CalibrationReferenceTask.PHYSIOLOGICAL_REST,
+                maturity=CalibrationMetricMaturity.EXPERIMENTAL,
+                algorithm_key="physiology",
+                effective_window_seconds=float(self._config.signal.rppg.respiration_window_seconds),
+            ),
+            _metric_summary(
+                capture,
+                metric=CalibrationMetricName.BLINK_RATE_PER_MIN,
+                sample_key="blink_rate_work",
+                unit="blinks/min",
+                task=CalibrationReferenceTask.REPRESENTATIVE_WORK,
+                maturity=CalibrationMetricMaturity.OBSERVED,
+                algorithm_key="blink",
+                effective_window_seconds=(self._config.signal.blink.min_valid_exposure_seconds),
+            ),
+            _metric_summary(
+                capture,
+                metric=CalibrationMetricName.OPEN_EYE_RATIO,
+                sample_key="open_eye_ratio_work",
+                unit="ratio",
+                task=CalibrationReferenceTask.REPRESENTATIVE_WORK,
+                maturity=CalibrationMetricMaturity.OBSERVED,
+                algorithm_key="blink",
+                effective_window_seconds=1.0,
+            ),
+            _metric_summary(
+                capture,
+                metric=CalibrationMetricName.MOUSE_VELOCITY_PX_PER_S,
+                sample_key="mouse_velocity_work",
+                unit="px/s",
+                task=CalibrationReferenceTask.REPRESENTATIVE_WORK,
+                maturity=CalibrationMetricMaturity.OBSERVED,
+                algorithm_key="telemetry",
+                effective_window_seconds=telemetry_window,
+            ),
+            _metric_summary(
+                capture,
+                metric=CalibrationMetricName.MOUSE_VELOCITY_VARIANCE,
+                sample_key="mouse_variance_work",
+                unit="(px/s)^2",
+                task=CalibrationReferenceTask.REPRESENTATIVE_WORK,
+                maturity=CalibrationMetricMaturity.OBSERVED,
+                algorithm_key="telemetry",
+                effective_window_seconds=telemetry_window,
+            ),
+            _metric_summary(
+                capture,
+                metric=CalibrationMetricName.NEUTRAL_HEAD_PITCH_DEG,
+                sample_key="neutral_head_pitch",
+                unit="deg",
+                task=CalibrationReferenceTask.NEUTRAL_HEAD_POSE,
+                maturity=CalibrationMetricMaturity.OBSERVED,
+                algorithm_key="head_pose",
+                effective_window_seconds=1.0,
+            ),
+            _metric_summary(
+                capture,
+                metric=CalibrationMetricName.NEUTRAL_FACE_SCALE_PX,
+                sample_key="neutral_face_scale",
+                unit="px",
+                task=CalibrationReferenceTask.NEUTRAL_HEAD_POSE,
+                maturity=CalibrationMetricMaturity.OBSERVED,
+                algorithm_key="head_pose",
+                effective_window_seconds=1.0,
+            ),
+        )
 
-        baselines = compute_baselines(self._samples, clock=self._clock)
-        await asyncio.to_thread(self._write_baselines, baselines)
+        values_by_name = {
+            str(metric.metric): metric.value
+            for metric in metrics
+            if metric.maturity != CalibrationMetricMaturity.UNAVAILABLE.value
+        }
+        camera = None
+        if capture.camera is not None:
+            camera = CalibrationCameraIdentity(
+                identity_key=capture.camera.identity_key,
+                device_name=capture.camera.device_name,
+                source=capture.camera.source,
+                width=capture.camera.width,
+                height=capture.camera.height,
+            )
+        return CalibrationProfile(
+            profile_id=self._profile_id,
+            provenance=provenance,
+            created_at_unix_ms=self._clock.unix_ms(),
+            approved_at_unix_ms=None,
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+            protocol_version=CALIBRATION_PROTOCOL_VERSION,
+            camera=camera,
+            metrics=metrics,
+            baselines=CalibrationBaselineValues(
+                heart_rate_bpm=values_by_name.get(CalibrationMetricName.HEART_RATE_BPM.value),
+                respiration_rate_bpm=values_by_name.get(
+                    CalibrationMetricName.RESPIRATION_RATE_BPM.value
+                ),
+                blink_rate_per_min=values_by_name.get(
+                    CalibrationMetricName.BLINK_RATE_PER_MIN.value
+                ),
+                open_eye_ratio=values_by_name.get(CalibrationMetricName.OPEN_EYE_RATIO.value),
+                mouse_velocity_px_per_s=values_by_name.get(
+                    CalibrationMetricName.MOUSE_VELOCITY_PX_PER_S.value
+                ),
+                mouse_velocity_variance=values_by_name.get(
+                    CalibrationMetricName.MOUSE_VELOCITY_VARIANCE.value
+                ),
+                neutral_head_pitch_deg=values_by_name.get(
+                    CalibrationMetricName.NEUTRAL_HEAD_PITCH_DEG.value
+                ),
+                neutral_face_scale_px=values_by_name.get(
+                    CalibrationMetricName.NEUTRAL_FACE_SCALE_PX.value
+                ),
+            ),
+            notes=(
+                "Webcam heart and respiration estimates remain experimental and are not applied to production scoring.",
+                "No raw frames, landmarks, keys, or workspace content are stored.",
+            ),
+        )
+
+    async def finish(self, *, approved_by_user: bool) -> CalibrationProfile:
+        """Stage an explicitly approved, live measured profile for activation.
+
+        Persisting the immutable candidate and changing the active pointer are
+        deliberately separate operations.  The running daemon first validates
+        the candidate and constructs every replacement dependency, then commits
+        the pointer and swaps the prepared graph without an await boundary.  A
+        rejected candidate therefore cannot leave persistence and the live
+        process disagreeing about which profile is active.
+        """
+
+        if not approved_by_user:
+            raise ValueError("calibration commit requires explicit user approval")
+        if self._finished:
+            raise RuntimeError("CalibrationRunner.finish() already called")
+        profile = self.preview_profile()
+        if profile.provenance != CalibrationProvenance.MEASURED.value:
+            raise RuntimeError("simulation is demo-only and can never become active calibration")
+        approved = profile.model_copy(update={"approved_at_unix_ms": self._clock.unix_ms()})
+        await asyncio.to_thread(self._store.save_inactive, approved)
+        if self._output_override is not None:
+            await asyncio.to_thread(
+                atomic_write_json,
+                self._output_override,
+                approved.model_dump(mode="json"),
+            )
         self._finished = True
-        return baselines
+        self._committed_profile = approved
+        assert self._capture is not None
+        _emit_progress(
+            self._progress_callback,
+            elapsed=float(self.duration_seconds),
+            total=float(self.duration_seconds),
+            capture=self._capture,
+            phase="commit",
+            lighting_ok=True,
+            motion_ok=True,
+            face_ok=True,
+            status="applying",
+        )
+        return approved
+
+    def activate_for_next_start(self, profile_id: str | None = None) -> None:
+        """Activate a staged profile when no live daemon is available.
+
+        This is intentionally an offline/CLI escape hatch.  Desktop transports
+        must ask the daemon to activate the candidate so all dependent services
+        switch in the same transaction.  The CLI reports that this path takes
+        effect on the next daemon start rather than pretending a running daemon
+        was reconfigured.
+        """
+
+        profile = self._committed_profile
+        if profile is None or self._capture is None:
+            raise RuntimeError("no committed calibration is awaiting activation")
+        if profile_id is not None and str(profile.profile_id) != str(profile_id):
+            raise ValueError("calibration profile does not match staged commit")
+        self._store.activate(profile)
+
+    def mark_failed(self, reason: str) -> None:
+        """Publish a terminal failure without claiming an unverified outcome."""
+
+        if self._capture is None:
+            raise RuntimeError("no calibration capture is available")
+        _emit_progress(
+            self._progress_callback,
+            elapsed=float(self.duration_seconds),
+            total=float(self.duration_seconds),
+            capture=self._capture,
+            phase="commit",
+            lighting_ok=True,
+            motion_ok=True,
+            face_ok=True,
+            status="failed",
+            instruction=(
+                "Calibration application was not confirmed. "
+                f"{str(reason).strip()}"
+            ).strip(),
+        )
+
+    def is_committed_profile_active(self, profile_id: str | None = None) -> bool:
+        """Reconcile a lost acknowledgement against the authoritative pointer."""
+
+        profile = self._committed_profile
+        if profile is None:
+            return False
+        if profile_id is not None and str(profile.profile_id) != str(profile_id):
+            return False
+        try:
+            active = self._store.load_active()
+        except (OSError, ValueError):
+            return False
+        return bool(
+            active is not None
+            and active.profile_id == profile.profile_id
+            and calibration_profile_sha256(active)
+            == calibration_profile_sha256(profile)
+        )
+
+    def mark_applied(self, profile_id: str | None = None) -> None:
+        """Emit completion only after the running daemon confirms the swap."""
+
+        profile = self._committed_profile
+        if profile is None or self._capture is None:
+            raise RuntimeError("no committed calibration is awaiting application")
+        if profile_id is not None and str(profile.profile_id) != str(profile_id):
+            raise ValueError("applied calibration profile does not match commit")
+        _emit_progress(
+            self._progress_callback,
+            elapsed=float(self.duration_seconds),
+            total=float(self.duration_seconds),
+            capture=self._capture,
+            phase="commit",
+            lighting_ok=True,
+            motion_ok=True,
+            face_ok=True,
+            status="completed",
+        )
+
+    async def save_demo(self) -> CalibrationProfile:
+        """Persist a demo artifact in its isolated namespace, never active."""
+
+        profile = self.preview_profile()
+        if profile.provenance != CalibrationProvenance.DEMO.value:
+            raise RuntimeError("save_demo is available only for simulation")
+        await asyncio.to_thread(self._store.save_demo, profile)
+        return profile
 
     def _write_baselines(self, baselines: UserBaselines) -> Path:
-        """Atomically persist `baseline_<ts>.json` + `default.json`."""
-        data = baselines.model_dump(mode="json")
-        base_dir = baselines_dir(self._config)
-        base_dir.mkdir(parents=True, exist_ok=True)
+        """Decode-only helper retained for old external tooling."""
 
-        if self._output_override is not None:
-            timestamped = self._output_override
-            timestamped.parent.mkdir(parents=True, exist_ok=True)
-        else:
-            timestamp = utc_datetime(self._clock).strftime("%Y%m%d_%H%M%S")
-            timestamped = base_dir / f"baseline_{timestamp}.json"
-
-        atomic_write_json(timestamped, data)
-        default_path = base_dir / "default.json"
-        if timestamped != default_path:
-            atomic_write_json(default_path, data)
-        return timestamped
+        destination = self._output_override or (
+            baselines_dir(self._config)
+            / f"baseline_{utc_datetime(self._clock).strftime('%Y%m%d_%H%M%S')}.json"
+        )
+        atomic_write_json(destination, baselines.model_dump(mode="json"))
+        return destination

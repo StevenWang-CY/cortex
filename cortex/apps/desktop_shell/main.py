@@ -21,9 +21,10 @@ import sys
 import threading
 from collections.abc import Callable
 from typing import Any
+from uuid import uuid4
 
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from cortex.apps.desktop_shell import mac_native
 from cortex.apps.desktop_shell.dashboard import DashboardWindow
@@ -67,6 +68,10 @@ class WebSocketBridge(QObject):
     # the WebSocket — the runner is in-process). Lives here so the
     # CortexApp's wiring sites have a single thread-safe queueing point.
     calibration_progress = Signal(dict)
+    calibration_review = Signal(dict)
+    calibration_updated = Signal(dict)
+    calibration_update_failed = Signal(dict)
+    calibration_apply_waiting = Signal(str)
 
     def __init__(self, host: str = "127.0.0.1", port: int = 9473) -> None:
         super().__init__()
@@ -286,6 +291,33 @@ class WebSocketBridge(QObject):
         })
         asyncio.run_coroutine_threadsafe(self._send(msg), self._loop)
 
+    def send_calibration_reload(
+        self,
+        profile_id: str,
+        profile_sha256: str,
+    ) -> bool:
+        """Ask the daemon to activate a staged measured profile.
+
+        ``False`` is an immediate, observable delivery failure; successful
+        queueing is acknowledged later by exactly one CALIBRATION_UPDATED or
+        CALIBRATION_UPDATE_FAILED frame.
+        """
+
+        if self._loop is None or self._ws is None:
+            return False
+        msg = json.dumps({
+            "type": "CALIBRATION_RELOAD",
+            "payload": {
+                "profile_id": str(profile_id),
+                "profile_sha256": str(profile_sha256),
+            },
+            "timestamp": 0,
+            "sequence": 0,
+            "correlation_id": f"calibration_{uuid4()}",
+        })
+        asyncio.run_coroutine_threadsafe(self._send(msg), self._loop)
+        return True
+
     def send_quiet_mode_toggle(
         self, kind: str, *, source: str = "settings_sync",
     ) -> None:
@@ -482,6 +514,14 @@ class WebSocketBridge(QObject):
             self.intervention_prompt.emit(payload if isinstance(payload, dict) else {})
         elif msg_type == "SETTINGS_SYNC":
             self.settings_synced.emit(payload)
+        elif msg_type == "CALIBRATION_UPDATED":
+            self.calibration_updated.emit(
+                payload if isinstance(payload, dict) else {}
+            )
+        elif msg_type == "CALIBRATION_UPDATE_FAILED":
+            self.calibration_update_failed.emit(
+                payload if isinstance(payload, dict) else {}
+            )
         # P0 §3.1 / §3.2 / §3.3: history / trends / recap inbound dispatch.
         elif msg_type == "SESSION_LIST":
             self.session_list_received.emit(payload if isinstance(payload, dict) else {})
@@ -524,6 +564,8 @@ class CortexApp:
         self._active_intervention_id: str | None = None
         # P0 §3.4: in-flight CalibrationRunner. None when idle.
         self._calibration_runner: Any = None
+        self._pending_calibration_profile_id: str | None = None
+        self._calibration_apply_timer: QTimer | None = None
         # E.4: Connect Extensions panel, lazily created (Any-typed to keep
         # the heavy ConnectionsPanel import lazy in ``_show_connections``).
         self._connections_panel: Any = None
@@ -543,6 +585,12 @@ class CortexApp:
         self._overlay = OverlayWindow()
         self._settings = SettingsDialog()
         self._onboarding = OnboardingWindow()
+        self._calibration_apply_timer = QTimer()
+        self._calibration_apply_timer.setSingleShot(True)
+        self._calibration_apply_timer.setInterval(15_000)
+        self._calibration_apply_timer.timeout.connect(
+            self._on_calibration_apply_timeout
+        )
 
         # Create tray icon
         self._tray = CortexTrayIcon(self._app)
@@ -652,13 +700,13 @@ class CortexApp:
             self._bridge.calibration_progress.connect(
                 self._on_calibration_progress
             )
-
-        # P0 §3.4: queue calibration progress onto the Qt main thread so
-        # the onboarding card and dashboard freshness pill stay in sync
-        # with the worker-thread runner.
-        if self._bridge is not None and hasattr(self._bridge, "calibration_progress"):
-            self._bridge.calibration_progress.connect(
-                self._on_calibration_progress
+            self._bridge.calibration_review.connect(self._on_calibration_review)
+            self._bridge.calibration_updated.connect(self._on_calibration_updated)
+            self._bridge.calibration_update_failed.connect(
+                self._on_calibration_update_failed
+            )
+            self._bridge.calibration_apply_waiting.connect(
+                self._on_calibration_apply_waiting
             )
 
         # Connect overlay dismiss to user action
@@ -823,6 +871,17 @@ class CortexApp:
             self._tray.set_connected(connected)
         if self._dashboard is not None:
             self._dashboard.set_connected(connected)
+        if not connected and self._pending_calibration_profile_id is not None:
+            self._on_calibration_update_failed(
+                {
+                    "code": "calibration_connection_lost",
+                    "message": (
+                        "The daemon connection closed before calibration was "
+                        "acknowledged. Cortex could not confirm a live change."
+                    ),
+                    "profile_id": self._pending_calibration_profile_id,
+                }
+            )
 
     @Slot(str)
     def _on_overlay_dismissed(self, intervention_id: str) -> None:
@@ -1216,6 +1275,7 @@ class CortexApp:
         """
         from cortex.services.capture_service.calibration_runner import (
             CalibrationRunner,
+            calibration_review_payload,
         )
 
         if getattr(self, "_calibration_runner", None) is not None:
@@ -1234,6 +1294,16 @@ class CortexApp:
                 "face_ok": bool(getattr(progress, "face_ok", False)),
                 "pct_complete": float(getattr(progress, "pct_complete", 0.0)),
                 "status": str(getattr(progress, "status", "running")),
+                "phase": str(getattr(progress, "phase", "camera_quality_check")),
+                "phase_instruction": str(
+                    getattr(progress, "phase_instruction", "")
+                ),
+                "valid_duration_seconds": float(
+                    getattr(progress, "valid_duration_seconds", 0.0)
+                ),
+                "missing_fraction": float(
+                    getattr(progress, "missing_fraction", 1.0)
+                ),
             }
             try:
                 if hasattr(self._bridge, "calibration_progress"):
@@ -1259,6 +1329,7 @@ class CortexApp:
             # daemon to release the camera (quiet-mode ``pause``) before
             # we open ours, and resume it in ``finally``.
             paused_daemon = False
+            ready_for_review = False
             try:
                 if self._bridge is not None:
                     try:
@@ -1283,11 +1354,20 @@ class CortexApp:
                 if bool(getattr(runner, "used_simulation", False)):
                     self._on_calibration_simulation_fallback()
                     return
-                await runner.finish()
+                if runner.last_progress is not None and (
+                    runner.last_progress.status == "review_required"
+                ):
+                    profile = runner.preview_profile()
+                    if self._bridge is not None:
+                        self._bridge.calibration_review.emit(
+                            calibration_review_payload(profile)
+                        )
+                    ready_for_review = True
             except Exception:
                 logger.exception("calibration run failed")
             finally:
-                self._calibration_runner = None
+                if not ready_for_review:
+                    self._calibration_runner = None
                 if paused_daemon and self._bridge is not None:
                     try:
                         self._bridge.send_quiet_mode_toggle(
@@ -1315,6 +1395,217 @@ class CortexApp:
             name="cortex-calibration",
             daemon=True,
         ).start()
+
+    def _on_calibration_review(self, payload: dict) -> None:
+        """Let the user inspect evidence before replacing the active pointer."""
+
+        metrics = payload.get("metrics", [])
+        lines: list[str] = []
+        if isinstance(metrics, list):
+            for item in metrics:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name", "metric")).replace("_", " ").title()
+                value = item.get("value")
+                unit = str(item.get("unit", ""))
+                maturity = str(item.get("maturity", "unavailable"))
+                rendered = "Unavailable" if value is None else f"{float(value):.2f} {unit}"
+                valid_seconds = float(item.get("valid_duration_seconds", 0.0))
+                missing_pct = float(item.get("missing_fraction", 1.0)) * 100.0
+                quality = float(item.get("quality_median", 0.0))
+                lines.append(
+                    f"{name}: {rendered} · {maturity}\n"
+                    f"  {valid_seconds:.0f}s valid · median quality {quality:.2f} "
+                    f"· {missing_pct:.0f}% missing/rejected"
+                )
+        box = QMessageBox(self._onboarding or self._dashboard)
+        box.setWindowTitle("Review calibration")
+        box.setIcon(QMessageBox.Icon.Information)
+        provenance = str(payload.get("provenance", "unknown"))
+        camera_name = str(payload.get("camera_name") or "Current camera")
+        box.setText("Apply this measured calibration profile?")
+        box.setInformativeText(
+            f"Source: {provenance} · Camera: {camera_name}. "
+            "Observed work and head/neck baselines can be applied. Webcam "
+            "heart and breathing estimates remain experimental and will not affect scoring."
+        )
+        box.setDetailedText("\n".join(lines) or "No metrics were available.")
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard
+        )
+        save_button = box.button(QMessageBox.StandardButton.Save)
+        if save_button is not None:
+            save_button.setText("Save measured profile")
+        if box.exec() == QMessageBox.StandardButton.Save:
+            self._commit_calibration()
+        else:
+            self._discard_calibration()
+
+    def _commit_calibration(self) -> None:
+        runner = self._calibration_runner
+        if runner is None:
+            return
+
+        async def _commit() -> None:
+            profile_id: str | None = None
+            try:
+                from cortex.services.capture_service.calibration_store import (
+                    calibration_profile_sha256,
+                )
+
+                profile = await runner.finish(approved_by_user=True)
+                if self._bridge is None:
+                    raise RuntimeError("daemon bridge unavailable for calibration reload")
+                profile_id = str(profile.profile_id)
+                self._bridge.calibration_apply_waiting.emit(profile_id)
+                queued = self._bridge.send_calibration_reload(
+                    profile_id,
+                    calibration_profile_sha256(profile),
+                )
+                if not queued:
+                    raise RuntimeError("daemon is not connected")
+            except Exception as exc:
+                logger.exception("calibration commit failed")
+                if self._bridge is not None:
+                    self._bridge.calibration_update_failed.emit(
+                        {
+                            "code": "calibration_delivery_failed",
+                            "message": (
+                                "Calibration could not be sent to the daemon; "
+                                "the previous profile remains active."
+                            ),
+                            "profile_id": profile_id,
+                        }
+                    )
+                else:
+                    try:
+                        runner.mark_failed(str(exc))
+                    except Exception:
+                        logger.debug(
+                            "calibration failure progress failed",
+                            exc_info=True,
+                        )
+                    self._calibration_runner = None
+
+        def _worker() -> None:
+            asyncio.run(_commit())
+
+        threading.Thread(
+            target=_worker,
+            name="cortex-calibration-commit",
+            daemon=True,
+        ).start()
+
+    def _on_calibration_updated(self, payload: dict) -> None:
+        runner = self._calibration_runner
+        if runner is None:
+            return
+        try:
+            profile_id = str(payload.get("profile_id", ""))
+            if (
+                self._pending_calibration_profile_id is not None
+                and profile_id != self._pending_calibration_profile_id
+            ):
+                raise ValueError("received a stale calibration acknowledgement")
+            runner.mark_applied(profile_id)
+        except Exception:
+            logger.exception("calibration update acknowledgement did not match commit")
+            return
+        if self._calibration_apply_timer is not None:
+            self._calibration_apply_timer.stop()
+        self._pending_calibration_profile_id = None
+        self._calibration_runner = None
+
+    def _on_calibration_apply_waiting(self, profile_id: str) -> None:
+        """Start the bounded acknowledgement window on the Qt thread."""
+
+        if self._calibration_runner is None:
+            return
+        self._pending_calibration_profile_id = str(profile_id)
+        if self._calibration_apply_timer is not None:
+            self._calibration_apply_timer.start()
+
+    def _on_calibration_apply_timeout(self) -> None:
+        profile_id = self._pending_calibration_profile_id
+        if profile_id is None:
+            return
+        self._on_calibration_update_failed(
+            {
+                "code": "calibration_apply_timeout",
+                "message": (
+                    "The daemon did not confirm calibration in time. "
+                    "Cortex could not confirm a live change."
+                ),
+                "profile_id": profile_id,
+            }
+        )
+
+    def _on_calibration_update_failed(self, payload: dict) -> None:
+        """Resolve every rejected/disconnected/timed-out calibration visibly."""
+
+        profile_id = payload.get("profile_id")
+        pending = self._pending_calibration_profile_id
+        if profile_id is not None and pending is not None and str(profile_id) != pending:
+            logger.warning("Ignoring stale calibration failure for %s", profile_id)
+            return
+        runner = self._calibration_runner
+        reconciliation_id = str(profile_id or pending or "") or None
+        if (
+            runner is not None
+            and reconciliation_id is not None
+            and runner.is_committed_profile_active(reconciliation_id)
+        ):
+            # The daemon may have committed and swapped the profile while its
+            # acknowledgement was lost. The checksum-bound active pointer is
+            # authoritative, so reconcile that outcome as success.
+            self._on_calibration_updated(
+                {"profile_id": reconciliation_id}
+            )
+            return
+        if self._calibration_apply_timer is not None:
+            self._calibration_apply_timer.stop()
+        self._pending_calibration_profile_id = None
+        message = str(
+            payload.get(
+                "message",
+                "Calibration application could not be confirmed.",
+            )
+        )
+        if runner is not None:
+            try:
+                runner.mark_failed(message)
+            except Exception:
+                logger.debug("calibration failure progress failed", exc_info=True)
+        self._calibration_runner = None
+        QMessageBox.warning(
+            self._onboarding or self._dashboard,
+            "Calibration not applied",
+            message,
+        )
+
+    def _discard_calibration(self) -> None:
+        runner = self._calibration_runner
+        if runner is not None:
+            runner.abort()
+        self._calibration_runner = None
+        self._on_calibration_progress(
+            {
+                "elapsed_seconds": 0.0,
+                "total_seconds": 0.0,
+                "current_hr": None,
+                "current_hrv": None,
+                "current_sqi": None,
+                "lighting_ok": False,
+                "motion_ok": False,
+                "face_ok": False,
+                "pct_complete": 0.0,
+                "status": "aborted",
+                "phase": "review",
+                "phase_instruction": "Profile discarded; the previous calibration is unchanged.",
+                "valid_duration_seconds": 0.0,
+                "missing_fraction": 1.0,
+            }
+        )
 
     def _on_calibration_progress(self, payload: dict) -> None:
         """Queue-connected slot — receives calibration progress on the

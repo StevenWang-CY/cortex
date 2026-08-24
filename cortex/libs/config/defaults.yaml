@@ -167,13 +167,19 @@ signal:
   blink:
     ear_threshold: 0.21
     ear_recovery: 0.25
-    min_frames: 3
+    min_closed_ms: 80.0
+    max_closed_ms: 1000.0
+    min_valid_exposure_seconds: 15.0
+    history_window_seconds: 60.0
+    max_valid_gap_ms: 250.0
     perclos_threshold: 0.2
     personalize_ear_percentile: 0.15
 
   posture:
-    shoulder_drop_threshold: 0.15
-    forward_lean_threshold: 20.0  # degrees
+    head_neck_flexion_threshold_deg: 20.0
+    head_neck_sustain_seconds: 30.0
+    face_scale_change_tolerance: 0.25
+    max_valid_gap_ms: 250.0
 
 # MediaPipe FaceMesh landmark indices for ROI extraction
 landmarks:
@@ -182,7 +188,6 @@ landmarks:
   right_cheek: [280, 330, 345, 346, 347, 348, 349, 350]
   left_eye: [33, 160, 158, 133, 153, 144]
   right_eye: [362, 385, 387, 263, 373, 380]
-  shoulders: [11, 12]  # MediaPipe Pose landmarks
 
 storage:
   path: ./storage

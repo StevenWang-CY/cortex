@@ -456,7 +456,7 @@ async def test_stop_releases_camera_even_when_not_running_and_release_raises() -
     assert capture._cap is None
 
 
-def test_runtime_camera_change_invalidates_dependent_calibration() -> None:
+def test_runtime_camera_identity_never_implies_calibration_without_profile() -> None:
     from cortex.services.runtime_daemon import CortexDaemon
 
     daemon = CortexDaemon(config=get_config())
@@ -479,7 +479,7 @@ def test_runtime_camera_change_invalidates_dependent_calibration() -> None:
     first = _identity()
     second = _identity(name="Logitech BRIO")
     daemon._handle_camera_identity(first, envelope(first, 0))
-    assert daemon._camera_calibration_valid is True
+    assert daemon._camera_calibration_valid is False
     daemon._handle_camera_identity(second, envelope(second, 1))
     assert daemon._camera_calibration_valid is False
     assert len(daemon._rgb_observations) == 0

@@ -166,18 +166,23 @@ _SECTION_HEADING_QSS = (
 )
 
 
-def _baseline_default_path() -> Path:
-    """Return the path to `storage/baselines/default.json`.
+def _active_calibration_measured_at() -> float | None:
+    """Return the canonical active profile's measurement time in seconds."""
 
-    Lazy-imported config so the settings dialog stays importable even
-    when the config layer is mocked out by the test harness.
-    """
     try:
         from cortex.libs.config.settings import get_config
+        from cortex.services.capture_service.calibration_store import (
+            CalibrationProfileStore,
+        )
 
-        return Path(get_config().storage.path) / "baselines" / "default.json"
+        config = get_config()
+        profile = CalibrationProfileStore(config.storage.path).load_active()
+        if profile is None:
+            return None
+        return profile.created_at_unix_ms / 1000.0
     except Exception:
-        return Path("storage") / "baselines" / "default.json"
+        logger.debug("active calibration metadata unavailable", exc_info=True)
+        return None
 
 
 def _format_relative_time(mtime: float, now: float | None = None) -> str:
@@ -205,17 +210,15 @@ def _format_relative_time(mtime: float, now: float | None = None) -> str:
 def _format_baseline_freshness_label(path: Path | None = None) -> str:
     """Label text used by the Sensing section's recalibrate row.
 
-    Returns "Last calibrated: <relative time>" when a baseline file is
-    present, or a softer prompt to calibrate when it isn't.
+    The optional path remains only for compatibility with older callers; the
+    immutable active profile is authoritative rather than a compatibility
+    file's modification time.
     """
-    target = path or _baseline_default_path()
-    try:
-        if not target.exists():
-            return "Last calibrated: never · calibrate for personal baselines"
-        mtime = target.stat().st_mtime
-        return f"Last calibrated: {_format_relative_time(mtime)}"
-    except OSError:
-        return "Last calibrated: unknown"
+    del path
+    measured_at = _active_calibration_measured_at()
+    if measured_at is None:
+        return "No measured profile active · calibrate when ready"
+    return f"Measured profile: {_format_relative_time(measured_at)}"
 
 
 class SettingsDialog(QWidget):
@@ -409,7 +412,7 @@ class SettingsDialog(QWidget):
         recal_row.addWidget(self._baseline_freshness_label)
         recal_row.addStretch()
 
-        self._recalibrate_btn = QPushButton("Recalibrate baselines")
+        self._recalibrate_btn = QPushButton("Recalibrate profile")
         self._recalibrate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._recalibrate_btn.setMinimumHeight(28)
         self._recalibrate_btn.setFont(
@@ -425,10 +428,10 @@ class SettingsDialog(QWidget):
             f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
         )
         self._recalibrate_btn.clicked.connect(self.recalibrate_requested.emit)
-        set_accessible_name(self._recalibrate_btn, "Recalibrate baselines")
+        set_accessible_name(self._recalibrate_btn, "Recalibrate measured profile")
         set_accessible_description(
             self._recalibrate_btn,
-            "Re-run the 2-minute calibration capture to refresh your personal baselines.",
+            "Run the guided quality, rest, and representative-work protocol; review evidence before replacing the active profile.",
         )
         recal_row.addWidget(self._recalibrate_btn)
         sensing_inner.addLayout(recal_row)

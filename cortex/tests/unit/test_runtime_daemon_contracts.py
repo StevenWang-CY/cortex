@@ -162,11 +162,22 @@ async def _drive_frames(
             perclos_60s=None,
             mean_blink_duration_ms=None,
             ear_variance=None,
+            valid_exposure_seconds=0.0,
         )
 
-    fake_pose = SimpleNamespace(pitch=None, yaw=None, roll=None)
+    fake_pose = SimpleNamespace(
+        pitch=0.0,
+        yaw=0.0,
+        roll=0.0,
+        angular_velocity_deg_per_s=0.0,
+        is_jittery=False,
+        is_frozen=False,
+    )
     fake_posture = SimpleNamespace(
-        slump_score=None, forward_lean_score=None, shoulder_drop_ratio=None
+        head_neck_flexion_angle=None,
+        head_neck_flexion_score=None,
+        sustained_flexion_seconds=0.0,
+        proxy_available=False,
     )
     pulse_summary = MagicMock()
     pulse_summary.hr = SimpleNamespace(value=72.0)
@@ -198,7 +209,8 @@ async def _drive_frames(
         roi_x.extract.return_value = fake_roi
         blink_d.update.side_effect = _fake_blink_update
         pose_d.update.return_value = fake_pose
-        posture_d.update_with_face.return_value = fake_posture
+        posture_d.face_scale.return_value = 100.0
+        posture_d.update.return_value = fake_posture
         # Window needs maxlen frames before process_window fires. Stride is
         # satisfied because _last_physio_update starts at 0.0.
         n = (daemon._rgb_history.maxlen or 1) + 2
@@ -234,10 +246,21 @@ async def test_face_lost_and_reacquired_events(daemon) -> None:  # type: ignore[
     fake_blink = SimpleNamespace(
         blink_rate=None, blink_rate_delta=None, blink_suppression_score=None,
         perclos_60s=None, mean_blink_duration_ms=None, ear_variance=None,
+        valid_exposure_seconds=0.0,
     )
-    fake_pose = SimpleNamespace(pitch=None, yaw=None, roll=None)
+    fake_pose = SimpleNamespace(
+        pitch=0.0,
+        yaw=0.0,
+        roll=0.0,
+        angular_velocity_deg_per_s=0.0,
+        is_jittery=False,
+        is_frozen=False,
+    )
     fake_posture = SimpleNamespace(
-        slump_score=None, forward_lean_score=None, shoulder_drop_ratio=None
+        head_neck_flexion_angle=None,
+        head_neck_flexion_score=None,
+        sustained_flexion_seconds=0.0,
+        proxy_available=False,
     )
     events: list[str] = []
 
@@ -257,7 +280,8 @@ async def test_face_lost_and_reacquired_events(daemon) -> None:  # type: ignore[
         roi_x.extract.return_value = fake_roi
         blink_d.update.return_value = fake_blink
         pose_d.update.return_value = fake_pose
-        posture_d.update_with_face.return_value = fake_posture
+        posture_d.face_scale.return_value = 100.0
+        posture_d.update.return_value = fake_posture
         for i, face in enumerate(seq):
             await daemon._process_capture_output(_pipeline_output(ts=float(i + 1), face=face))
 

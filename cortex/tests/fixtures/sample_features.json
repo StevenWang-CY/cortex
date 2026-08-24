@@ -82,7 +82,6 @@
     "blink_rate_baseline": 17.0,
     "mouse_velocity_baseline": 500.0,
     "mouse_variance_baseline": 10000.0,
-    "shoulder_neutral_y": 0.5,
     "calibrated_at": "2024-01-15T10:30:00Z"
   }
 }

@@ -29,7 +29,7 @@ const STEPS = [
         items: [
             ["Tabs & Tab Groups", "Read tab titles and URLs to understand your workspace context. Group and collapse distracting tabs during interventions."],
             ["Storage", "Persist your focus sessions, daily stats, and preferences locally on your machine."],
-            ["Webcam (optional)", "Detect blink rate and posture via your camera. All processing is local — no video is stored or transmitted."],
+            ["Webcam (optional)", "Estimate blink timing and a camera-relative head/neck position proxy. Cortex does not measure shoulders or diagnose posture; video is processed locally and is not stored."],
         ],
         hint: "All data stays on your machine. Nothing is sent to external servers.",
     },

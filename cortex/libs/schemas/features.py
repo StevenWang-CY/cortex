@@ -196,17 +196,56 @@ class KinematicFeatures(BaseModel):
     ear_variance: float | None = Field(
         None, ge=0.0, description="Variance of eye aspect ratio over rolling window"
     )
+    blink_valid_exposure_seconds: float = Field(
+        0.0,
+        ge=0.0,
+        description="Eye-visible monotonic exposure contributing to blink metrics",
+    )
     head_pitch: float | None = Field(None, description="Head pitch angle in degrees")
     head_yaw: float | None = Field(None, description="Head yaw angle in degrees")
     head_roll: float | None = Field(None, description="Head roll angle in degrees")
+    head_angular_velocity_deg_per_s: float | None = Field(
+        None,
+        ge=0.0,
+        description="Elapsed-time head angular velocity in degrees per second",
+    )
+    head_is_jittery: bool | None = None
+    head_is_frozen: bool | None = None
+    head_neck_flexion_angle: float | None = Field(
+        None,
+        ge=0.0,
+        le=90.0,
+        description="Camera-relative head/neck flexion proxy in degrees",
+    )
+    head_neck_flexion_score: float | None = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Calibrated head/neck flexion proxy score",
+    )
+    head_neck_flexion_dwell_seconds: float = Field(
+        0.0,
+        ge=0.0,
+        description="Contiguous valid time above the flexion threshold",
+    )
+    head_neck_proxy_available: bool = False
     slump_score: float | None = Field(
-        None, ge=0.0, le=1.0, description="Posture slump score (0-1)"
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Deprecated compatibility field; no body-posture model runs",
     )
     forward_lean_score: float | None = Field(
-        None, ge=0.0, le=1.0, description="Forward lean indicator (0-1)"
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Deprecated compatibility alias for head/neck flexion",
     )
     shoulder_drop_ratio: float | None = Field(
-        None, ge=0.0, le=1.0, description="Shoulder drop ratio from baseline"
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Unavailable compatibility field; shoulders are not measured",
     )
     confidence: float = Field(
         ..., ge=0.0, le=1.0, description="Overall kinematic feature confidence"
@@ -318,11 +357,25 @@ class FeatureVector(BaseModel):
     ear_variance: float | None = Field(
         None, ge=0.0, description="EAR variance over rolling window"
     )
+    blink_valid_exposure_seconds: float = Field(0.0, ge=0.0)
+    head_angular_velocity_deg_per_s: float | None = Field(None, ge=0.0)
+    head_is_jittery: bool | None = None
+    head_is_frozen: bool | None = None
+    head_neck_flexion_angle: float | None = Field(None, ge=0.0, le=90.0)
+    head_neck_flexion_score: float | None = Field(None, ge=0.0, le=1.0)
+    head_neck_flexion_dwell_seconds: float = Field(0.0, ge=0.0)
+    head_neck_proxy_available: bool = False
     shoulder_drop_ratio: float | None = Field(
-        None, ge=0.0, le=1.0, description="Shoulder drop from baseline"
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Unavailable compatibility field; shoulders are not measured",
     )
     forward_lean_angle: float | None = Field(
-        None, ge=0.0, le=90.0, description="Forward lean angle in degrees"
+        None,
+        ge=0.0,
+        le=90.0,
+        description="Deprecated alias for camera-relative head/neck flexion",
     )
 
     # Telemetry features (8-12)
@@ -418,7 +471,7 @@ class FeatureVector(BaseModel):
     @property
     def has_kinematics(self) -> bool:
         """Check if kinematic features are available."""
-        return self.blink_rate is not None or self.shoulder_drop_ratio is not None
+        return self.blink_rate is not None or self.head_neck_proxy_available
 
     @property
     def has_telemetry(self) -> bool:

@@ -535,12 +535,12 @@ async function restoreState(): Promise<void> {
 restoreState();
 
 // Health alert state
-let lastPostureAlert = 0;
+let lastHeadNeckAlert = 0;
 let lastBlinkAlert = 0;
 let lowBlinkStart = 0;
-let leaningStart = 0;
+let headNeckFlexionStart = 0;
 const HEALTH_ALERT_COOLDOWN = 300_000; // 5 min between alerts
-const POSTURE_ALERT_THRESHOLD = 180_000; // 3 min leaning
+const HEAD_NECK_ALERT_THRESHOLD = 180_000; // 3 min beyond calibrated neutral range
 const BLINK_ALERT_THRESHOLD = 180_000;  // 3 min low blink rate
 
 // Break recommendation state
@@ -3890,10 +3890,14 @@ async function undoAllRecent(): Promise<void> {
     }
 }
 
-// --- Health Alerts (Posture & Eye Strain) ---
+// --- Comfort Alerts (Head/Neck Proxy & Eye Strain) ---
 
 function checkHealthAlerts(payload: Record<string, unknown>): void {
-    const bio = payload.biometrics as Record<string, number | null> | undefined;
+    const bio = payload.biometrics as {
+        blink_rate?: number | null;
+        head_neck_flexion_score?: number | null;
+        head_neck_proxy_available?: boolean;
+    } | undefined;
     if (!bio) return;
     const now = Date.now();
 
@@ -3916,27 +3920,31 @@ function checkHealthAlerts(payload: Record<string, unknown>): void {
         lowBlinkStart = 0;
     }
 
-    // Forward lean → posture. Audit-2 fix: ``forward_lean`` is the
-    // 0-1 normalized score the daemon now publishes (rescaled from the
-    // raw 0-45° angle). The 0.6 threshold corresponds to ~27° forward
-    // tilt sustained for 3 min, which is a real slump signal — not the
-    // 5-20° natural sitting range that previously fired on every user.
-    const lean = bio.forward_lean;
-    if (lean !== null && lean !== undefined && lean > 0.6) {
-        if (leaningStart === 0) leaningStart = now;
+    // Camera-relative head/neck proxy. This is intentionally not called
+    // posture: no torso or shoulder landmarks are measured. The daemon marks
+    // the proxy unavailable after a camera/scale/calibration mismatch.
+    const proxyAvailable = bio.head_neck_proxy_available === true;
+    const flexion = bio.head_neck_flexion_score;
+    if (
+        proxyAvailable &&
+        flexion !== null &&
+        flexion !== undefined &&
+        flexion > 0.6
+    ) {
+        if (headNeckFlexionStart === 0) headNeckFlexionStart = now;
         if (
-            now - leaningStart > POSTURE_ALERT_THRESHOLD &&
-            now - lastPostureAlert > HEALTH_ALERT_COOLDOWN
+            now - headNeckFlexionStart > HEAD_NECK_ALERT_THRESHOLD &&
+            now - lastHeadNeckAlert > HEALTH_ALERT_COOLDOWN
         ) {
-            lastPostureAlert = now;
+            lastHeadNeckAlert = now;
             showHealthNotification(
-                "Posture check",
-                "You've been leaning forward. Sit back, relax your shoulders, and straighten up.",
+                "Head and neck comfort check",
+                "Your camera-relative head angle has stayed beyond your calibrated neutral range. Adjust only if a different position feels more comfortable.",
             );
-            leaningStart = 0;
+            headNeckFlexionStart = 0;
         }
     } else {
-        leaningStart = 0;
+        headNeckFlexionStart = 0;
     }
 }
 

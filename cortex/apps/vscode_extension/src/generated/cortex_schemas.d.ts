@@ -3,7 +3,7 @@
 //
 // Source of truth: cortex/libs/schemas/*.py (Pydantic v2 models).
 // Schema package: cortex-wire/2.0
-// Source SHA-256: d1a3a0dfe256b05444d728e6a3cbcd54633d9cc76194164269033380a3592851
+// Source SHA-256: 3d67721d3d0dd1462da5aa256a42899fe5c5fa92b12b543a58c68c00d8c892aa
 // Drift-gate: a pre-commit hook and the GitHub Actions CI run
 //   `python -m cortex.scripts.generate_ts_schemas --check`
 // and fail if this file is out of sync with the Python models.
@@ -21,6 +21,31 @@ export type BeatRejectionReason =
   | "ibi_too_short"
   | "ibi_too_long"
   | "ibi_local_outlier";
+export type CalibrationMetricName =
+  | "heart_rate_bpm"
+  | "respiration_rate_bpm"
+  | "blink_rate_per_min"
+  | "open_eye_ratio"
+  | "mouse_velocity_px_per_s"
+  | "mouse_velocity_variance"
+  | "neutral_head_pitch_deg"
+  | "neutral_face_scale_px";
+/**
+ * Protocol context in which a metric was acquired.
+ */
+export type CalibrationReferenceTask =
+  | "camera_quality_check"
+  | "physiological_rest"
+  | "representative_work"
+  | "neutral_head_pose";
+/**
+ * Whether a measurement may influence production behavior.
+ */
+export type CalibrationMetricMaturity = "observed" | "supported" | "experimental" | "unavailable";
+/**
+ * Origin of calibration observations.
+ */
+export type CalibrationProvenance = "measured" | "demo";
 /**
  * Closed catalog of sensor/source families.
  */
@@ -77,6 +102,7 @@ export type MessageType =
   | "USER_RATING"
   | "CONTEXT_RESPONSE"
   | "SETTINGS_SYNC"
+  | "CALIBRATION_RELOAD"
   | "ACTIVITY_SYNC"
   | "TAB_RELEVANCE_FEEDBACK"
   | "LEETCODE_CONTEXT_UPDATE"
@@ -99,6 +125,8 @@ export type MessageType =
   | "AUTH_OK"
   | "PROTOCOL_ERROR"
   | "STATE_UPDATE"
+  | "CALIBRATION_UPDATED"
+  | "CALIBRATION_UPDATE_FAILED"
   | "INTERVENTION_TRIGGER"
   | "INTERVENTION_RESTORE"
   | "CONTEXT_REQUEST"
@@ -212,6 +240,15 @@ export interface ActionConsentState {
    * When last rejected
    */
   last_rejection?: string | null;
+}
+/**
+ * Atomic pointer to the one active immutable measured profile.
+ */
+export interface ActiveCalibrationPointer {
+  schema_version?: "1.0";
+  profile_id: string;
+  profile_sha256: string;
+  activated_at_unix_ms: number;
 }
 /**
  * Summary of a single activity during the session.
@@ -398,6 +435,104 @@ export interface TabInfo {
    * Seconds since this tab was last the active tab (None if unknown).
    */
   last_activated_ago_seconds?: number | null;
+}
+/**
+ * Named profile values; absence remains absence rather than a default.
+ */
+export interface CalibrationBaselineValues {
+  heart_rate_bpm?: number | null;
+  respiration_rate_bpm?: number | null;
+  blink_rate_per_min?: number | null;
+  open_eye_ratio?: number | null;
+  mouse_velocity_px_per_s?: number | null;
+  mouse_velocity_variance?: number | null;
+  neutral_head_pitch_deg?: number | null;
+  neutral_face_scale_px?: number | null;
+}
+/**
+ * Stable camera and geometry binding; backend indices are excluded.
+ */
+export interface CalibrationCameraIdentity {
+  identity_key: string;
+  device_name?: string | null;
+  source: string;
+  width: number;
+  height: number;
+}
+/**
+ * Finite distribution summary without retaining raw observations.
+ */
+export interface CalibrationDistribution {
+  mean: number;
+  std: number;
+  p10: number;
+  median: number;
+  p90: number;
+}
+/**
+ * Evidence and provenance for one persisted calibration metric.
+ */
+export interface CalibrationMetricSummary {
+  metric: CalibrationMetricName;
+  unit: string;
+  reference_task: CalibrationReferenceTask;
+  maturity: CalibrationMetricMaturity;
+  value?: number | null;
+  distribution?: CalibrationDistribution | null;
+  sample_count: number;
+  effective_sample_count: number;
+  valid_duration_seconds: number;
+  missing_fraction: number;
+  quality_p10: number;
+  quality_median: number;
+  quality_p90: number;
+  algorithm: SignalAlgorithmIdentity;
+  unavailable_reason?: string | null;
+}
+/**
+ * Exact implementation and optional model asset used for an estimate.
+ */
+export interface SignalAlgorithmIdentity {
+  name: string;
+  version: string;
+  implementation_sha256: string;
+  asset_sha256?: string | null;
+  configuration_sha256?: string | null;
+  parameters?: {
+    [k: string]: string | number | boolean;
+  };
+  selection_mode?: "fixed" | "validated_dynamic";
+}
+/**
+ * One immutable, versioned calibration artifact.
+ */
+export interface CalibrationProfile {
+  schema_version?: "2.0";
+  profile_id: string;
+  provenance: CalibrationProvenance;
+  created_at_unix_ms: number;
+  approved_at_unix_ms?: number | null;
+  feature_schema_version: string;
+  protocol_version: string;
+  camera?: CalibrationCameraIdentity | null;
+  metrics: CalibrationMetricSummary[];
+  baselines: CalibrationBaselineValues;
+  notes?: string[];
+}
+/**
+ * Domain event emitted after all dependent services switch together.
+ */
+export interface CalibrationUpdated {
+  schema_version?: "1.0";
+  event_id: string;
+  profile_id: string;
+  previous_profile_id?: string | null;
+  observed_at_unix_ms: number;
+  observed_at_mono_ns: number;
+  boot_id: string;
+  camera_calibration_valid: boolean;
+  applied_metrics: string[];
+  reset_components: string[];
 }
 /**
  * Serializable metadata for one camera-derived observation.
@@ -989,12 +1124,20 @@ export interface FeatureVector {
    * EAR variance over rolling window
    */
   ear_variance?: number | null;
+  blink_valid_exposure_seconds?: number;
+  head_angular_velocity_deg_per_s?: number | null;
+  head_is_jittery?: boolean | null;
+  head_is_frozen?: boolean | null;
+  head_neck_flexion_angle?: number | null;
+  head_neck_flexion_score?: number | null;
+  head_neck_flexion_dwell_seconds?: number;
+  head_neck_proxy_available?: boolean;
   /**
-   * Shoulder drop from baseline
+   * Unavailable compatibility field; shoulders are not measured
    */
   shoulder_drop_ratio?: number | null;
   /**
-   * Forward lean angle in degrees
+   * Deprecated alias for camera-relative head/neck flexion
    */
   forward_lean_angle?: number | null;
   /**
@@ -1917,6 +2060,10 @@ export interface KinematicFeatures {
    */
   ear_variance?: number | null;
   /**
+   * Eye-visible monotonic exposure contributing to blink metrics
+   */
+  blink_valid_exposure_seconds?: number;
+  /**
    * Head pitch angle in degrees
    */
   head_pitch?: number | null;
@@ -1929,15 +2076,34 @@ export interface KinematicFeatures {
    */
   head_roll?: number | null;
   /**
-   * Posture slump score (0-1)
+   * Elapsed-time head angular velocity in degrees per second
+   */
+  head_angular_velocity_deg_per_s?: number | null;
+  head_is_jittery?: boolean | null;
+  head_is_frozen?: boolean | null;
+  /**
+   * Camera-relative head/neck flexion proxy in degrees
+   */
+  head_neck_flexion_angle?: number | null;
+  /**
+   * Calibrated head/neck flexion proxy score
+   */
+  head_neck_flexion_score?: number | null;
+  /**
+   * Contiguous valid time above the flexion threshold
+   */
+  head_neck_flexion_dwell_seconds?: number;
+  head_neck_proxy_available?: boolean;
+  /**
+   * Deprecated compatibility field; no body-posture model runs
    */
   slump_score?: number | null;
   /**
-   * Forward lean indicator (0-1)
+   * Deprecated compatibility alias for head/neck flexion
    */
   forward_lean_score?: number | null;
   /**
-   * Shoulder drop ratio from baseline
+   * Unavailable compatibility field; shoulders are not measured
    */
   shoulder_drop_ratio?: number | null;
   /**
@@ -2216,20 +2382,6 @@ export interface SignalEstimate {
   window_start_mono_ns: number;
   window_end_mono_ns: number;
   boot_id: string;
-}
-/**
- * Exact implementation and optional model asset used for an estimate.
- */
-export interface SignalAlgorithmIdentity {
-  name: string;
-  version: string;
-  implementation_sha256: string;
-  asset_sha256?: string | null;
-  configuration_sha256?: string | null;
-  parameters?: {
-    [k: string]: string | number | boolean;
-  };
-  selection_mode?: "fixed" | "validated_dynamic";
 }
 export interface ProjectListResponse {
   schema_version?: "1.0" | "2.0";
@@ -2837,10 +2989,6 @@ export interface UserBaselines {
    */
   mouse_variance_baseline?: number;
   /**
-   * Neutral shoulder Y position (normalized)
-   */
-  shoulder_neutral_y?: number;
-  /**
    * Baseline respiration rate (breaths/min)
    */
   resp_baseline?: number;
@@ -3320,11 +3468,29 @@ export interface BiometricsSummary {
    */
   perclos?: number | null;
   /**
-   * Forward-lean score rescaled to 0..1. Browser-side posture alert threshold (0.6) is compared against this rescaled value, not raw degrees.
+   * Camera-relative head/neck flexion proxy versus the user's camera-bound neutral pose; unavailable when calibration is invalid.
+   */
+  head_neck_flexion_score?: number | null;
+  /**
+   * Camera-relative pitch delta in degrees versus the calibrated neutral pose. This is not an upper-body posture or shoulder measurement.
+   */
+  head_neck_flexion_angle?: number | null;
+  /**
+   * Contiguous valid exposure above the configured proxy threshold.
+   */
+  head_neck_flexion_dwell_seconds?: number | null;
+  /**
+   * True only while camera identity, face scale, and neutral-pose calibration remain compatible.
+   */
+  head_neck_proxy_available?: boolean;
+  /**
+   * @deprecated
+   * Deprecated compatibility field. New consumers must use head_neck_flexion_score; Cortex does not measure torso posture.
    */
   forward_lean?: number | null;
   /**
-   * Forward-lean angle in degrees (legacy / debug). Consumers preferring a score should read ``forward_lean`` instead.
+   * @deprecated
+   * Deprecated compatibility field. New consumers must use head_neck_flexion_angle.
    */
   forward_lean_angle?: number | null;
   /**

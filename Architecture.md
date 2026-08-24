@@ -94,7 +94,9 @@ All additions are backward-compatible (additive fields only).
 
 - `cortex/services/capture_service/*`: camera selection (incl. Continuity Camera filtering), frame capture.
 - `cortex/services/physio_engine/*`: rPPG, SQI, pulse, respiration, ROI.
-- `cortex/services/kinematics_engine/*`: blink/EAR/PERCLOS, head pose, posture from face landmarks.
+- `cortex/services/kinematics_engine/*`: elapsed-time blink/EAR/PERCLOS,
+  head pose, and a calibrated camera-relative head/neck flexion proxy. Cortex
+  does not infer shoulder or upper-body posture from face landmarks.
 - `cortex/services/telemetry_engine/*`: keyboard / mouse / scroll variability + correction/scroll-back rates.
 - `cortex/services/state_engine/*`: scoring, smoothing, trigger, detectors, ML classifier, persisted dismissal model (F21) and quiet-mode escalation memory (F26).
 - `cortex/services/context_engine/*`: workspace context fusion (editor / terminal / browser tab snapshots) used to build the prompt envelope.

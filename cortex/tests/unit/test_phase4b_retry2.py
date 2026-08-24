@@ -83,7 +83,7 @@ class TestFeatureFusionPhysioGating:
             fusion.update_telemetry(tel, timestamp=float(i))
         assert fusion.fuse(timestamp=7.0)[0].telemetry_seen_count == 7
 
-    def test_forward_lean_angle_none_when_kinematics_score_none(self):
+    def test_deprecated_posture_fields_do_not_fabricate_shoulder_data(self):
         fusion = FeatureFusion()
         kin = KinematicFeatures(
             blink_rate=15.0,
@@ -94,7 +94,7 @@ class TestFeatureFusionPhysioGating:
         fusion.update_kinematics(kin, timestamp=0.0)
         vec, _ = fusion.fuse(timestamp=0.0)
         assert vec.forward_lean_angle is None
-        assert vec.shoulder_drop_ratio == 0.2
+        assert vec.shoulder_drop_ratio is None
 
 
 # ---------------------------------------------------------------------------

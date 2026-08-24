@@ -113,9 +113,9 @@ class TestCalibrate:
         assert "hrv" in samples
         assert "blink_rate" in samples
         assert "mouse_velocity" in samples
-        assert "shoulder_y" in samples
-        # 2 seconds * 2 Hz = 4 samples
-        assert len(samples["hr"]) == 4
+        assert "neutral_head_pitch" in samples
+        assert "shoulder_y" not in samples
+        assert samples["hr"]
 
     def test_compute_baselines(self):
         from cortex.scripts.calibrate import compute_baselines
@@ -126,12 +126,13 @@ class TestCalibrate:
             "blink_rate": [16.0, 18.0, 17.0, 15.0],
             "mouse_velocity": [480.0, 520.0, 500.0, 510.0],
             "mouse_variance": [9000.0, 11000.0, 10000.0, 10500.0],
-            "shoulder_y": [0.48, 0.52, 0.50, 0.49],
+            "neutral_head_pitch": [1.0, 2.0, 1.5, 2.5],
         }
 
         baselines = compute_baselines(samples)
         assert baselines.hr_baseline == pytest.approx(71.0, abs=0.1)
-        assert baselines.hrv_baseline == pytest.approx(49.0, abs=0.1)
+        # The compatibility view does not promote unvalidated HRV samples.
+        assert baselines.hrv_baseline == 50.0
         assert baselines.blink_rate_baseline == pytest.approx(16.5, abs=0.1)
         assert baselines.is_calibrated  # calibrated_at is set
 
@@ -144,7 +145,7 @@ class TestCalibrate:
             "blink_rate": [],
             "mouse_velocity": [],
             "mouse_variance": [],
-            "shoulder_y": [],
+            "neutral_head_pitch": [],
         }
 
         baselines = compute_baselines(samples)
@@ -161,7 +162,7 @@ class TestCalibrate:
             "blink_rate": [16.0, 18.0],
             "mouse_velocity": [480.0, 520.0],
             "mouse_variance": [9000.0, 11000.0],
-            "shoulder_y": [0.48, 0.52],
+            "neutral_head_pitch": [1.0, 2.0],
         }
         baselines = compute_baselines(samples)
 

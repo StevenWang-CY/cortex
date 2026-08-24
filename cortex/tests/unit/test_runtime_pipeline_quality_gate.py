@@ -51,12 +51,21 @@ def _stub_kinematics() -> tuple[object, object, object]:
         perclos_60s=None,
         mean_blink_duration_ms=None,
         ear_variance=None,
+        valid_exposure_seconds=0.0,
     )
-    fake_pose = SimpleNamespace(pitch=None, yaw=None, roll=None)
+    fake_pose = SimpleNamespace(
+        pitch=0.0,
+        yaw=0.0,
+        roll=0.0,
+        angular_velocity_deg_per_s=0.0,
+        is_jittery=False,
+        is_frozen=False,
+    )
     fake_posture = SimpleNamespace(
-        slump_score=None,
-        forward_lean_score=None,
-        shoulder_drop_ratio=None,
+        head_neck_flexion_angle=None,
+        head_neck_flexion_score=None,
+        sustained_flexion_seconds=0.0,
+        proxy_available=False,
     )
     return fake_blink, fake_pose, fake_posture
 
@@ -77,7 +86,8 @@ async def _run_outputs(daemon: object, outputs: list[object]) -> None:
         mock_roi_extractor.extract.return_value = fake_roi
         mock_blink.update.return_value = fake_blink
         mock_pose.update.return_value = fake_pose
-        mock_posture.update_with_face.return_value = fake_posture
+        mock_posture.face_scale.return_value = 100.0
+        mock_posture.update.return_value = fake_posture
         mock_fusion.update_kinematics.return_value = None
         mock_fusion.update_physio.return_value = None
         with patch("cortex.services.runtime_daemon.registry") as mock_reg:

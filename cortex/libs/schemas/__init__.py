@@ -57,6 +57,19 @@ from cortex.libs.schemas.api import (
     StatusResponse,
     StressIntegralResponse,
 )
+from cortex.libs.schemas.calibration import (
+    ActiveCalibrationPointer,
+    CalibrationBaselineValues,
+    CalibrationCameraIdentity,
+    CalibrationDistribution,
+    CalibrationMetricMaturity,
+    CalibrationMetricName,
+    CalibrationMetricSummary,
+    CalibrationProfile,
+    CalibrationProvenance,
+    CalibrationReferenceTask,
+    CalibrationUpdated,
+)
 from cortex.libs.schemas.consent import (
     ActionConsentState,
     ConsentDecision,
@@ -205,6 +218,18 @@ __all__ = [
     "LaunchProjectResponse",
     "FeedbackRequest",
     "FeedbackResponse",
+    # Calibration
+    "CalibrationProvenance",
+    "CalibrationReferenceTask",
+    "CalibrationMetricMaturity",
+    "CalibrationMetricName",
+    "CalibrationDistribution",
+    "CalibrationMetricSummary",
+    "CalibrationCameraIdentity",
+    "CalibrationBaselineValues",
+    "CalibrationProfile",
+    "ActiveCalibrationPointer",
+    "CalibrationUpdated",
     # Features
     "FrameMeta",
     "PhysioFeatures",

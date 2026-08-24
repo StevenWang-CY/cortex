@@ -25,12 +25,9 @@ from __future__ import annotations
 import collections
 import logging
 import time
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from PySide6.QtCore import Qt, QTimer, Signal
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 try:
     from PySide6.QtCore import QRectF
@@ -304,8 +301,9 @@ _CONCEPTS_GLOSSARY: dict[str, str] = {
         "score. It is not measurement confidence or an accuracy guarantee."
     ),
     "calibration": (
-        "Calibration: a legacy research capture of advisory baseline values. "
-        "It does not validate a metric or create calibrated probabilities."
+        "Calibration: a versioned, quality-gated measured profile with explicit "
+        "provenance. It personalizes supported baselines but does not validate a "
+        "metric or create calibrated state probabilities."
     ),
 }
 
@@ -315,29 +313,31 @@ _CONCEPTS_GLOSSARY: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 
-def _baseline_default_path() -> Path:
-    """Resolve `storage/baselines/default.json` via the active config.
-    Lazy-imported so the dashboard stays importable under test stubs."""
-    from pathlib import Path
-
+def _active_calibration_measured_at() -> float | None:
+    """Measurement time from the canonical active immutable profile."""
     try:
         from cortex.libs.config.settings import get_config
+        from cortex.services.capture_service.calibration_store import (
+            CalibrationProfileStore,
+        )
 
-        return Path(get_config().storage.path) / "baselines" / "default.json"
+        config = get_config()
+        profile = CalibrationProfileStore(config.storage.path).load_active()
+        if profile is None:
+            return None
+        return profile.created_at_unix_ms / 1000.0
     except Exception:
-        return Path("storage") / "baselines" / "default.json"
+        logger.debug("active calibration metadata unavailable", exc_info=True)
+        return None
 
 
 def _baseline_age_days(now: float | None = None) -> float | None:
-    """Age of the default baseline file in days, or None if missing."""
-    target = _baseline_default_path()
-    try:
-        if not target.exists():
-            return None
-        current = now if now is not None else time.time()
-        return max(0.0, (current - target.stat().st_mtime) / 86400.0)
-    except OSError:
+    """Age of the active measured profile, or ``None`` when unavailable."""
+    measured_at = _active_calibration_measured_at()
+    if measured_at is None:
         return None
+    current = now if now is not None else time.time()
+    return max(0.0, (current - measured_at) / 86400.0)
 
 
 _MAX_HR_HISTORY = 120
@@ -1477,7 +1477,7 @@ class _ConsumerTab(QWidget):
             pill.setVisible(False)
             return
         if age > 30.0:
-            pill.setText("Stale baseline · Recalibrate?")
+            pill.setText("Measured profile is old · Recalibrate?")
             pill.setStyleSheet(
                 f"color: {BRAND_ACCENT}; background: {_GROUPED_BG};"
                 f" border-radius: {RADIUS_PILL}px; padding: 3px 10px;"

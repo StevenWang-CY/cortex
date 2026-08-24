@@ -83,7 +83,7 @@ def test_store_health_roundtrip() -> None:
 
 
 def test_biometrics_summary_all_optional() -> None:
-    """Every field is ``float | None`` — an empty bundle must parse."""
+    """Unavailable measurements remain explicit in an empty bundle."""
     s = BiometricsSummary()
     blob = s.model_dump(mode="json")
     restored = BiometricsSummary.model_validate(blob)
@@ -91,6 +91,8 @@ def test_biometrics_summary_all_optional() -> None:
     assert s.heart_rate is None
     assert s.hrv_rmssd is None
     assert s.respiration_rate is None
+    assert s.head_neck_flexion_score is None
+    assert s.head_neck_proxy_available is False
 
 
 def test_biometrics_summary_roundtrip_full() -> None:
@@ -100,8 +102,10 @@ def test_biometrics_summary_roundtrip_full() -> None:
         hr_delta=-3.2,
         blink_rate=18.0,
         perclos=0.12,
-        forward_lean=0.32,
-        forward_lean_angle=14.4,
+        head_neck_flexion_score=0.32,
+        head_neck_flexion_angle=14.4,
+        head_neck_flexion_dwell_seconds=8.0,
+        head_neck_proxy_available=True,
         respiration_rate=14.5,
         thrashing_score=0.15,
         stress_integral=2.5,

@@ -253,6 +253,7 @@ class WebSocketServer:
         # Callbacks for received messages
         self._user_action_callback: Any = None
         self._settings_callback: Any = None
+        self._calibration_reload_callback: Any = None
         self._shutdown_callback: Any = None
         self._activity_sync_callback: Any = None
         self._tab_relevance_feedback_callback: Any = None
@@ -361,6 +362,11 @@ class WebSocketServer:
     def set_settings_callback(self, callback: Any) -> None:
         """Set callback for SETTINGS_SYNC messages from clients."""
         self._settings_callback = callback
+
+    def set_calibration_reload_callback(self, callback: Any) -> None:
+        """Set the measured-profile live reload callback."""
+
+        self._calibration_reload_callback = callback
 
     def set_shutdown_callback(self, callback: Any) -> None:
         """Set callback for SHUTDOWN messages from clients."""
@@ -857,6 +863,8 @@ class WebSocketServer:
             self._handle_context_response(msg)
         elif msg.type == MessageType.SETTINGS_SYNC.value:
             await self._handle_settings_sync(client, msg)
+        elif msg.type == MessageType.CALIBRATION_RELOAD.value:
+            await self._handle_calibration_reload(client, msg)
         elif msg.type == MessageType.ACTIVITY_SYNC.value:
             await self._handle_activity_sync(client, msg)
         elif msg.type == MessageType.TAB_RELEVANCE_FEEDBACK.value:
@@ -1170,6 +1178,95 @@ class WebSocketServer:
                 self._settings_callback(msg.payload)
         except Exception as exc:
             logger.error("Settings callback error from %s: %s", client.client_id, exc)
+
+    async def _handle_calibration_reload(
+        self,
+        client: WebSocketClient,
+        msg: WSMessage,
+    ) -> None:
+        """Apply a committed profile; only the desktop authority may request it."""
+
+        async def _reject(code: str, message: str, profile_id: object = None) -> None:
+            await self._send_to(
+                client,
+                MessageType.CALIBRATION_UPDATE_FAILED.value,
+                {
+                    "code": code,
+                    "message": message,
+                    "profile_id": (
+                        str(profile_id) if isinstance(profile_id, str) else None
+                    ),
+                    "previous_calibration_unchanged": True,
+                },
+                correlation_id=msg.correlation_id,
+                causation_id=str(msg.event_id),
+            )
+
+        if client.client_type != "desktop":
+            logger.warning(
+                "Rejected calibration reload from client type %s",
+                client.client_type,
+            )
+            await _reject(
+                "calibration_authority_required",
+                "Only the desktop application may apply calibration.",
+            )
+            return
+        callback = self._calibration_reload_callback
+        profile_id = msg.payload.get("profile_id")
+        profile_sha256 = msg.payload.get("profile_sha256")
+        if callback is None:
+            await _reject(
+                "calibration_service_unavailable",
+                "Calibration could not be applied; the previous profile remains active.",
+                profile_id,
+            )
+            return
+        if not isinstance(profile_id, str) or not profile_id:
+            await _reject(
+                "invalid_calibration_profile_id",
+                "The calibration profile identifier is missing or invalid.",
+            )
+            return
+        if not (
+            isinstance(profile_sha256, str)
+            and len(profile_sha256) == 64
+            and all(char in "0123456789abcdef" for char in profile_sha256)
+        ):
+            await _reject(
+                "invalid_calibration_checksum",
+                "The calibration integrity value is missing or invalid.",
+                profile_id,
+            )
+            return
+        try:
+            result = callback(
+                profile_id,
+                expected_sha256=profile_sha256,
+            )
+            if asyncio.iscoroutine(result):
+                result = await result
+            payload = (
+                result.model_dump(mode="json")
+                if hasattr(result, "model_dump")
+                else dict(result)
+            )
+            await self.send_message(
+                MessageType.CALIBRATION_UPDATED.value,
+                payload,
+                correlation_id=msg.correlation_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "Calibration reload failed for %s: %s",
+                profile_id,
+                exc,
+            )
+            await _reject(
+                "calibration_apply_failed",
+                "Calibration could not be validated or applied; the previous profile remains active.",
+                profile_id,
+            )
 
     async def _handle_activity_sync(self, client: WebSocketClient, msg: WSMessage) -> None:
         """Forward activity sync to the daemon for aggregation."""

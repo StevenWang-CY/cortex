@@ -158,6 +158,14 @@ class FeatureFusion:
         blink_rate_delta = None
         perclos_60s = None
         ear_variance = None
+        blink_valid_exposure_seconds = 0.0
+        head_angular_velocity_deg_per_s = None
+        head_is_jittery = None
+        head_is_frozen = None
+        head_neck_flexion_angle = None
+        head_neck_flexion_score = None
+        head_neck_flexion_dwell_seconds = 0.0
+        head_neck_proxy_available = False
         shoulder_drop_ratio = None
         forward_lean_angle = None
         if self._kinematics is not None:
@@ -165,14 +173,23 @@ class FeatureFusion:
             blink_rate_delta = self._kinematics.blink_rate_delta
             perclos_60s = self._kinematics.perclos_60s
             ear_variance = self._kinematics.ear_variance
-            shoulder_drop_ratio = self._kinematics.shoulder_drop_ratio
-            if self._kinematics.forward_lean_score is not None:
-                # Convert 0-1 score to 0-45 degree range for FeatureVector.
-                # P1 Pipeline A: when forward_lean_score is None we leave
-                # forward_lean_angle as None instead of coercing to 0.0, so
-                # downstream lean-AND-shoulder posture-HYPO scoring can
-                # explicitly skip rather than score a false slump.
-                forward_lean_angle = self._kinematics.forward_lean_score * 45.0
+            blink_valid_exposure_seconds = (
+                self._kinematics.blink_valid_exposure_seconds
+            )
+            head_angular_velocity_deg_per_s = (
+                self._kinematics.head_angular_velocity_deg_per_s
+            )
+            head_is_jittery = self._kinematics.head_is_jittery
+            head_is_frozen = self._kinematics.head_is_frozen
+            head_neck_flexion_angle = self._kinematics.head_neck_flexion_angle
+            head_neck_flexion_score = self._kinematics.head_neck_flexion_score
+            head_neck_flexion_dwell_seconds = (
+                self._kinematics.head_neck_flexion_dwell_seconds
+            )
+            head_neck_proxy_available = self._kinematics.head_neck_proxy_available
+            # Decode-only aliases for consumers migrated in WP-5. No
+            # shoulder value is fabricated.
+            forward_lean_angle = head_neck_flexion_angle
 
         # Telemetry features (dimensions 8-12)
         mouse_velocity_mean = 0.0
@@ -209,6 +226,14 @@ class FeatureFusion:
             blink_rate_delta=blink_rate_delta,
             perclos_60s=perclos_60s,
             ear_variance=ear_variance,
+            blink_valid_exposure_seconds=blink_valid_exposure_seconds,
+            head_angular_velocity_deg_per_s=head_angular_velocity_deg_per_s,
+            head_is_jittery=head_is_jittery,
+            head_is_frozen=head_is_frozen,
+            head_neck_flexion_angle=head_neck_flexion_angle,
+            head_neck_flexion_score=head_neck_flexion_score,
+            head_neck_flexion_dwell_seconds=head_neck_flexion_dwell_seconds,
+            head_neck_proxy_available=head_neck_proxy_available,
             shoulder_drop_ratio=shoulder_drop_ratio,
             forward_lean_angle=forward_lean_angle,
             mouse_velocity_mean=mouse_velocity_mean,

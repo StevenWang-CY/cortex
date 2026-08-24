@@ -182,13 +182,10 @@ class UserBaselines(BaseModel):
         17.0, ge=5.0, le=30.0, description="Baseline blink rate (blinks/min)"
     )
     mouse_velocity_baseline: float = Field(
-        500.0, ge=100.0, le=2000.0, description="Baseline mouse velocity (px/s)"
+        500.0, ge=0.0, description="Baseline mouse velocity (px/s)"
     )
     mouse_variance_baseline: float = Field(
-        10000.0, ge=1000.0, le=100000.0, description="Baseline mouse variance"
-    )
-    shoulder_neutral_y: float = Field(
-        0.5, ge=0.0, le=1.0, description="Neutral shoulder Y position (normalized)"
+        10000.0, ge=0.0, description="Baseline mouse variance"
     )
     resp_baseline: float = Field(
         15.0, ge=4.0, le=30.0, description="Baseline respiration rate (breaths/min)"

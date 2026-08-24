@@ -979,6 +979,28 @@ class TestWebSocketBridge:
         bridge._handle_message(json.dumps({"type": "UNKNOWN", "payload": {}}))
         assert len(received) == 0
 
+    def test_handle_calibration_failure(self):
+        bridge = WebSocketBridge()
+        received = []
+        bridge.calibration_update_failed.connect(lambda p: received.append(p))
+        bridge._handle_message(json.dumps({
+            "type": "CALIBRATION_UPDATE_FAILED",
+            "payload": {
+                "code": "calibration_apply_failed",
+                "profile_id": "profile-1",
+                "previous_calibration_unchanged": True,
+            },
+        }))
+        assert received == [{
+            "code": "calibration_apply_failed",
+            "profile_id": "profile-1",
+            "previous_calibration_unchanged": True,
+        }]
+
+    def test_calibration_reload_reports_disconnected_delivery(self):
+        bridge = WebSocketBridge()
+        assert bridge.send_calibration_reload("profile-1", "a" * 64) is False
+
 
 # ===========================================================================
 # CortexApp Tests
@@ -996,6 +1018,33 @@ class TestCortexApp:
         assert not app._paused
         app._paused = True
         assert app._paused
+
+    def test_lost_calibration_ack_reconciles_authoritative_pointer(self):
+        app = CortexApp()
+
+        class Runner:
+            applied: list[str] = []
+            failed: list[str] = []
+
+            def is_committed_profile_active(self, profile_id):
+                return profile_id == "profile-1"
+
+            def mark_applied(self, profile_id):
+                self.applied.append(profile_id)
+
+            def mark_failed(self, reason):
+                self.failed.append(reason)
+
+        runner = Runner()
+        app._calibration_runner = runner
+        app._pending_calibration_profile_id = "profile-1"
+        app._on_calibration_update_failed(
+            {"profile_id": "profile-1", "message": "acknowledgement lost"}
+        )
+
+        assert runner.applied == ["profile-1"]
+        assert runner.failed == []
+        assert app._calibration_runner is None
 
 
 # ===========================================================================

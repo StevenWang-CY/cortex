@@ -623,18 +623,34 @@ class RPPGSignalConfig(BaseModel):
 class BlinkSignalConfig(BaseModel):
     """Blink detection configuration."""
 
-    ear_threshold: float = 0.21
-    ear_recovery: float = 0.25
-    min_frames: int = 3
-    perclos_threshold: float = 0.2
-    personalize_ear_percentile: float = 0.15
+    ear_threshold: float = Field(0.21, gt=0.0, lt=1.0)
+    ear_recovery: float = Field(0.25, gt=0.0, lt=1.0)
+    min_closed_ms: float = Field(80.0, gt=0.0)
+    max_closed_ms: float = Field(1000.0, gt=0.0)
+    min_valid_exposure_seconds: float = Field(15.0, gt=0.0)
+    history_window_seconds: float = Field(60.0, gt=0.0)
+    max_valid_gap_ms: float = Field(250.0, gt=0.0)
+    perclos_threshold: float = Field(0.2, ge=0.0, le=1.0)
+    personalize_ear_percentile: float = Field(0.15, ge=0.05, le=0.45)
+
+    @model_validator(mode="after")
+    def _blink_thresholds_are_coherent(self) -> BlinkSignalConfig:
+        if self.ear_recovery <= self.ear_threshold:
+            raise ValueError("ear_recovery must exceed ear_threshold")
+        if self.max_closed_ms <= self.min_closed_ms:
+            raise ValueError("max_closed_ms must exceed min_closed_ms")
+        if self.min_valid_exposure_seconds > self.history_window_seconds:
+            raise ValueError("blink warm-up cannot exceed its history window")
+        return self
 
 
 class PostureSignalConfig(BaseModel):
-    """Posture detection configuration."""
+    """Camera-relative head/neck pose proxy configuration."""
 
-    shoulder_drop_threshold: float = 0.15
-    forward_lean_threshold: float = 20.0
+    head_neck_flexion_threshold_deg: float = Field(20.0, gt=0.0, le=60.0)
+    head_neck_sustain_seconds: float = Field(30.0, gt=0.0)
+    face_scale_change_tolerance: float = Field(0.25, gt=0.0, le=1.0)
+    max_valid_gap_ms: float = Field(250.0, gt=0.0)
 
 
 class SignalConfig(BaseModel):
@@ -681,7 +697,6 @@ class LandmarksConfig(BaseModel):
     right_cheek: list[int] = Field(default=[280, 330, 345, 346, 347, 348, 349, 350])
     left_eye: list[int] = Field(default=[33, 160, 158, 133, 153, 144])
     right_eye: list[int] = Field(default=[362, 385, 387, 263, 373, 380])
-    shoulders: list[int] = Field(default=[11, 12])
 
 
 class StorageConfig(BaseModel):

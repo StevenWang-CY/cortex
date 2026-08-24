@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from cortex.apps.desktop_shell import mac_native
 from cortex.apps.desktop_shell.break_overlay import BreakOverlayWindow
@@ -101,6 +101,7 @@ class DaemonBridge(QObject):
     # stay in sync with the running capture loop. Payload is a plain
     # dict so Qt's queued-connection marshalling is cheap.
     calibration_progress = Signal(dict)
+    calibration_review = Signal(dict)
 
     # -- callbacks invoked from daemon thread ---------------------------------
     #
@@ -473,6 +474,7 @@ class CortexAppController:
         # apply_calibration_progress slot. Queued connection by default —
         # Qt marshals the dict payload onto the Qt main thread.
         self._bridge.calibration_progress.connect(self._on_calibration_progress)
+        self._bridge.calibration_review.connect(self._on_calibration_review)
         # P0 §3.4: Settings → Sensing → Recalibrate baselines. Re-uses
         # the same _run_calibration path as onboarding so both surfaces
         # drive one CalibrationRunner.
@@ -1865,6 +1867,7 @@ class CortexAppController:
         # the module-level dependency graph until calibration starts).
         from cortex.services.capture_service.calibration_runner import (
             CalibrationRunner,
+            calibration_review_payload,
         )
 
         # Guard against re-entry: a second click on Begin while a run
@@ -1886,6 +1889,16 @@ class CortexAppController:
                     "face_ok": bool(getattr(progress, "face_ok", False)),
                     "pct_complete": float(getattr(progress, "pct_complete", 0.0)),
                     "status": str(getattr(progress, "status", "running")),
+                    "phase": str(getattr(progress, "phase", "camera_quality_check")),
+                    "phase_instruction": str(
+                        getattr(progress, "phase_instruction", "")
+                    ),
+                    "valid_duration_seconds": float(
+                        getattr(progress, "valid_duration_seconds", 0.0)
+                    ),
+                    "missing_fraction": float(
+                        getattr(progress, "missing_fraction", 1.0)
+                    ),
                 }
                 self._bridge.calibration_progress.emit(payload)
             except Exception:
@@ -1896,6 +1909,7 @@ class CortexAppController:
 
         async def _drive() -> None:
             paused_capture = False
+            ready_for_review = False
             try:
                 if (
                     self._daemon is not None
@@ -1911,11 +1925,19 @@ class CortexAppController:
                             exc_info=True,
                         )
                 await runner.start(on_progress=_progress_cb)
-                await runner.finish()
+                if runner.last_progress is not None and (
+                    runner.last_progress.status == "review_required"
+                ):
+                    profile = runner.preview_profile()
+                    self._bridge.calibration_review.emit(
+                        calibration_review_payload(profile)
+                    )
+                    ready_for_review = True
             except Exception:
                 logger.exception("calibration run failed")
             finally:
-                self._calibration_runner = None
+                if not ready_for_review:
+                    self._calibration_runner = None
                 if paused_capture and self._daemon is not None:
                     try:
                         await self._daemon._capture_pipeline.start()
@@ -1946,6 +1968,125 @@ class CortexAppController:
             name="cortex-calibration",
             daemon=True,
         ).start()
+
+    def _on_calibration_review(self, payload: dict) -> None:
+        """Present measured evidence before the active-pointer commit."""
+
+        metrics = payload.get("metrics", [])
+        lines: list[str] = []
+        if isinstance(metrics, list):
+            for item in metrics:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name", "metric")).replace("_", " ").title()
+                maturity = str(item.get("maturity", "unavailable"))
+                value = item.get("value")
+                unit = str(item.get("unit", ""))
+                rendered = "Unavailable" if value is None else f"{float(value):.2f} {unit}"
+                valid_seconds = float(item.get("valid_duration_seconds", 0.0))
+                missing_pct = float(item.get("missing_fraction", 1.0)) * 100.0
+                quality = float(item.get("quality_median", 0.0))
+                lines.append(
+                    f"{name}: {rendered} · {maturity}\n"
+                    f"  {valid_seconds:.0f}s valid · median quality {quality:.2f} "
+                    f"· {missing_pct:.0f}% missing/rejected"
+                )
+        box = QMessageBox(self._onboarding or self._dashboard)
+        box.setWindowTitle("Review calibration")
+        box.setIcon(QMessageBox.Icon.Information)
+        provenance = str(payload.get("provenance", "unknown"))
+        camera_name = str(payload.get("camera_name") or "Current camera")
+        box.setText("Apply this measured calibration profile?")
+        box.setInformativeText(
+            f"Source: {provenance} · Camera: {camera_name}. "
+            "Cortex will apply observed work and head/neck baselines now. "
+            "Webcam heart and breathing estimates remain experimental and "
+            "will not affect scoring."
+        )
+        box.setDetailedText("\n".join(lines) or "No metrics were available.")
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard
+        )
+        save_button = box.button(QMessageBox.StandardButton.Save)
+        if save_button is not None:
+            save_button.setText("Save measured profile")
+        if box.exec() == QMessageBox.StandardButton.Save:
+            self._commit_calibration()
+        else:
+            self._discard_calibration()
+
+    def _commit_calibration(self) -> None:
+        runner = self._calibration_runner
+        if runner is None:
+            return
+
+        async def _commit() -> None:
+            try:
+                from cortex.services.capture_service.calibration_store import (
+                    calibration_profile_sha256,
+                )
+
+                profile = await runner.finish(approved_by_user=True)
+                if self._daemon is None:
+                    raise RuntimeError("daemon is unavailable")
+                event = self._daemon.activate_calibration_profile(
+                    str(profile.profile_id),
+                    expected_sha256=calibration_profile_sha256(profile),
+                )
+                runner.mark_applied(str(event.profile_id))
+            except Exception as exc:
+                logger.exception("calibration commit or live reload failed")
+                try:
+                    runner.mark_failed(str(exc))
+                except Exception:
+                    logger.debug("calibration failure progress failed", exc_info=True)
+                self._bridge.error_occurred.emit(
+                    "Calibration not applied",
+                    (
+                        "Cortex could not validate and apply the measured profile. "
+                        "The previous calibration remains active."
+                    ),
+                    "calibration_apply_failed",
+                )
+            finally:
+                self._calibration_runner = None
+
+        if self._daemon_loop is not None and self._daemon_loop.is_running():
+            asyncio.run_coroutine_threadsafe(_commit(), self._daemon_loop)
+            return
+
+        def _worker() -> None:
+            asyncio.run(_commit())
+
+        threading.Thread(
+            target=_worker,
+            name="cortex-calibration-commit",
+            daemon=True,
+        ).start()
+
+    def _discard_calibration(self) -> None:
+        runner = self._calibration_runner
+        if runner is not None:
+            runner.abort()
+        self._calibration_runner = None
+        self._on_calibration_progress(
+            {
+                "elapsed_seconds": 0.0,
+                "total_seconds": 0.0,
+                "current_hr": None,
+                "current_hrv": None,
+                "current_sqi": None,
+                "lighting_ok": False,
+                "motion_ok": False,
+                "face_ok": False,
+                "pct_complete": 0.0,
+                "status": "aborted",
+                "phase": "review",
+                "phase_instruction": "Profile discarded; the previous calibration is unchanged.",
+                "valid_duration_seconds": 0.0,
+                "missing_fraction": 1.0,
+            }
+        )
 
     def _on_calibration_progress(self, payload: dict) -> None:
         """Marshal calibration progress (queued from the daemon thread)

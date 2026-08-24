@@ -1,180 +1,271 @@
-"""P0 §3.4 — unit tests for CalibrationRunner.
-
-The runner wraps the existing simulate + live calibration loops so the
-desktop shell wizard, the Settings recalibrate button, and the
-developer CLI all drive the same code path. These tests cover only the
-simulate path so they run on CI without OpenCV / a webcam.
-
-Cases:
-
-1. ``test_simulate_runner_writes_baselines`` — a short simulated run
-   ends with ``storage/baselines/default.json`` present and parseable
-   as a :class:`UserBaselines`.
-2. ``test_abort_releases_camera`` — calling ``abort()`` mid-run causes
-   ``start()`` to return promptly without raising; ``finish()`` raises
-   because we never overwrite ``default.json`` with a partial run.
-3. ``test_progress_callback_fired`` — the callback fires at least N
-   times during a 3-second simulate.
-4. ``test_finish_before_start_raises`` — calling ``finish()`` before
-   ``start()`` is a defensive error.
-"""
+"""Calibration protocol, provenance, and commit-boundary tests."""
 
 from __future__ import annotations
 
 import asyncio
-import json
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
-from cortex.libs.schemas.state import UserBaselines
+from cortex.application.clock import FakeClock
+from cortex.libs.config.settings import CortexConfig, get_config
+from cortex.libs.schemas.calibration import (
+    CalibrationMetricMaturity,
+    CalibrationMetricName,
+    CalibrationProvenance,
+)
+from cortex.libs.schemas.observations import CameraIdentity
+from cortex.libs.schemas.physiology import SignalAlgorithmIdentity
+from cortex.services.capture_service import calibration_runner as runner_module
 from cortex.services.capture_service.calibration_runner import (
+    CalibrationCapture,
+    CalibrationCaptureUnavailable,
     CalibrationProgress,
     CalibrationRunner,
+    compute_baselines,
 )
-
-
-def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+from cortex.services.capture_service.calibration_store import CalibrationProfileStore
 
 
 @pytest.fixture()
-def baselines_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Redirect ``storage.path`` to a tmp dir so the runner's atomic
-    write doesn't pollute the repo's checked-in baseline file."""
-    from cortex.libs.config import settings as config_module
-
-    config = config_module.get_config()
-    monkeypatch.setattr(config.storage, "path", str(tmp_path))
-    return tmp_path / "baselines"
+def config(tmp_path: Path) -> CortexConfig:
+    value = get_config().model_copy(deep=True)
+    value.storage.path = str(tmp_path)
+    return value
 
 
-def test_simulate_runner_writes_baselines(baselines_dir: Path) -> None:
-    runner = CalibrationRunner(duration_seconds=2, simulate=True)
+def _algorithm(name: str) -> SignalAlgorithmIdentity:
+    return SignalAlgorithmIdentity(
+        name=name,
+        version="2.0.0",
+        implementation_sha256="a" * 64,
+        configuration_sha256="b" * 64,
+        selection_mode="fixed",
+    )
+
+
+def _measured_capture() -> CalibrationCapture:
+    samples = runner_module._empty_samples()  # noqa: SLF001 - fixture boundary
+    samples["heart_rate_rest"].extend([69.0, 70.0, 71.0])
+    samples["respiration_rate_rest"].extend([14.0, 15.0, 16.0])
+    samples["blink_rate_work"].extend([14.0, 15.0, 16.0])
+    samples["open_eye_ratio_work"].extend([0.30, 0.31, 0.32])
+    samples["mouse_velocity_work"].extend([400.0, 500.0, 600.0])
+    samples["mouse_variance_work"].extend([8_000.0, 10_000.0, 12_000.0])
+    samples["neutral_head_pitch"].extend([1.0, 2.0, 3.0])
+    samples["neutral_face_scale"].extend([178.0, 180.0, 182.0])
+    samples["quality"].extend([0.7, 0.8, 0.9])
+    return CalibrationCapture(
+        samples=samples,
+        camera=CameraIdentity(
+            identity_key="builtin:facetime-hd",
+            device_id=0,
+            device_name="FaceTime HD Camera",
+            source="builtin",
+            width=1280,
+            height=720,
+        ),
+        phase_valid_duration_seconds={
+            "camera_quality_check": 12.0,
+            "physiological_rest": 54.0,
+            "representative_work": 54.0,
+        },
+        phase_scheduled_count={
+            "camera_quality_check": 360,
+            "physiological_rest": 1_620,
+            "representative_work": 1_620,
+        },
+        phase_valid_count={
+            "camera_quality_check": 350,
+            "physiological_rest": 1_550,
+            "representative_work": 1_500,
+        },
+        phase_quality={
+            "camera_quality_check": [0.7, 0.8, 0.9],
+            "physiological_rest": [0.7, 0.8, 0.9],
+            "representative_work": [0.7, 0.8, 0.9],
+        },
+        algorithms={
+            "physiology": _algorithm("pulse-v2"),
+            "blink": _algorithm("blink-v2"),
+            "head_pose": _algorithm("head-pose-v2"),
+            "telemetry": _algorithm("telemetry-v2"),
+        },
+    )
+
+
+def test_simulation_can_only_create_isolated_demo_profile(config: CortexConfig) -> None:
+    runner = CalibrationRunner(duration_seconds=1, simulate=True, config=config)
     asyncio.run(runner.start())
-    baselines = asyncio.run(runner.finish())
+    preview = runner.preview_profile()
+    assert preview.provenance == CalibrationProvenance.DEMO.value
+    assert preview.approved_at_unix_ms is None
 
-    assert isinstance(baselines, UserBaselines)
-    default_path = baselines_dir / "default.json"
-    assert default_path.exists(), "default.json must be written on success"
-
-    # Round-trip through the schema.
-    payload = json.loads(default_path.read_text())
-    reloaded = UserBaselines.model_validate(payload)
-    assert reloaded.hr_baseline > 0
-    assert reloaded.hrv_baseline > 0
-    # Timestamped sibling is also present.
-    siblings = list(baselines_dir.glob("baseline_*.json"))
-    assert siblings, "timestamped baseline file must be present"
+    with pytest.raises(RuntimeError, match="demo-only"):
+        asyncio.run(runner.finish(approved_by_user=True))
+    demo = asyncio.run(runner.save_demo())
+    store = CalibrationProfileStore(config.storage.path)
+    assert store.profile_path(demo.profile_id, demo=True).exists()
+    assert store.load_active() is None
+    assert not (Path(config.storage.path) / "baselines" / "default.json").exists()
 
 
-def test_abort_releases_camera(baselines_dir: Path) -> None:
-    """Aborting mid-run returns cleanly; finish() refuses to write a
-    partial baseline so we never overwrite the prior known-good file."""
-    runner = CalibrationRunner(duration_seconds=10, simulate=True)
+def test_capture_emits_review_before_commit_and_completion_after_commit(
+    config: CortexConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _collect(*_args, **_kwargs) -> CalibrationCapture:
+        return _measured_capture()
+
+    monkeypatch.setattr(runner_module, "_collect_live_calibration", _collect)
+    progress: list[CalibrationProgress] = []
+    runner = CalibrationRunner(
+        duration_seconds=120,
+        config=config,
+        clock=FakeClock(wall_unix_ms=1_700_000_000_000),
+    )
+    asyncio.run(runner.start(on_progress=progress.append))
+    assert progress[-1].status == "review_required"
+    assert all(item.status != "completed" for item in progress)
+
+    profile = asyncio.run(runner.finish(approved_by_user=True))
+    assert progress[-1].status == "applying"
+    assert profile.provenance == CalibrationProvenance.MEASURED.value
+    assert profile.approved_at_unix_ms is not None
+    store = CalibrationProfileStore(config.storage.path)
+    assert store.load_active() is None
+    assert store.load_profile(profile.profile_id) == profile
+    assert runner.is_committed_profile_active(str(profile.profile_id)) is False
+    runner.activate_for_next_start(str(profile.profile_id))
+    assert store.load_active() == profile
+    assert runner.is_committed_profile_active(str(profile.profile_id)) is True
+    assert runner.is_committed_profile_active(str(uuid4())) is False
+    runner.mark_applied(str(profile.profile_id))
+    assert progress[-1].status == "completed"
+
+
+def test_failed_live_apply_leaves_staged_profile_inactive(
+    config: CortexConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _collect(*_args, **_kwargs) -> CalibrationCapture:
+        return _measured_capture()
+
+    monkeypatch.setattr(runner_module, "_collect_live_calibration", _collect)
+    progress: list[CalibrationProgress] = []
+    runner = CalibrationRunner(duration_seconds=120, config=config)
+    asyncio.run(runner.start(on_progress=progress.append))
+    profile = asyncio.run(runner.finish(approved_by_user=True))
+    runner.mark_failed("candidate was incompatible")
+
+    store = CalibrationProfileStore(config.storage.path)
+    assert store.load_profile(profile.profile_id) == profile
+    assert store.load_active() is None
+    assert progress[-1].status == "failed"
+    assert "not confirmed" in progress[-1].phase_instruction
+
+
+def test_explicit_approval_is_required(
+    config: CortexConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _collect(*_args, **_kwargs) -> CalibrationCapture:
+        return _measured_capture()
+
+    monkeypatch.setattr(runner_module, "_collect_live_calibration", _collect)
+    runner = CalibrationRunner(duration_seconds=120, config=config)
+    asyncio.run(runner.start())
+    with pytest.raises(ValueError, match="explicit user approval"):
+        asyncio.run(runner.finish(approved_by_user=False))
+    assert CalibrationProfileStore(config.storage.path).load_active() is None
+
+
+def test_preview_separates_rest_work_and_experimental_maturity(
+    config: CortexConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _collect(*_args, **_kwargs) -> CalibrationCapture:
+        return _measured_capture()
+
+    monkeypatch.setattr(runner_module, "_collect_live_calibration", _collect)
+    runner = CalibrationRunner(duration_seconds=120, config=config)
+    asyncio.run(runner.start())
+    profile = runner.preview_profile()
+    heart = profile.metric(CalibrationMetricName.HEART_RATE_BPM)
+    blink = profile.metric(CalibrationMetricName.BLINK_RATE_PER_MIN)
+    mouse = profile.metric(CalibrationMetricName.MOUSE_VELOCITY_PX_PER_S)
+    assert heart is not None and heart.maturity == CalibrationMetricMaturity.EXPERIMENTAL.value
+    assert blink is not None and blink.reference_task == "representative_work"
+    assert mouse is not None and mouse.reference_task == "representative_work"
+    assert heart.effective_sample_count <= heart.sample_count
+
+
+def test_abort_never_writes_profile(config: CortexConfig) -> None:
+    runner = CalibrationRunner(duration_seconds=10, simulate=True, config=config)
 
     async def _drive() -> None:
-        async def _abort_soon() -> None:
-            await asyncio.sleep(0.2)
+        async def _abort() -> None:
+            await asyncio.sleep(0.1)
             runner.abort()
-        await asyncio.gather(runner.start(), _abort_soon())
+
+        await asyncio.gather(runner.start(), _abort())
 
     asyncio.run(_drive())
-
-    # finish() must refuse to overwrite default.json with a partial run.
-    with pytest.raises(RuntimeError):
-        asyncio.run(runner.finish())
-
-    # default.json must NOT exist — we never crossed the success gate.
-    assert not (baselines_dir / "default.json").exists()
+    assert runner.last_progress is not None
+    assert runner.last_progress.status == "aborted"
+    with pytest.raises(RuntimeError, match="aborted"):
+        runner.preview_profile()
+    assert CalibrationProfileStore(config.storage.path).load_active() is None
 
 
-def test_progress_callback_fired(baselines_dir: Path) -> None:
-    """Over a 3-second simulate the callback should fire at least
-    several times (the loop runs at ~2 Hz, so >= 4 ticks)."""
-    received: list[CalibrationProgress] = []
+def test_live_unavailability_does_not_fall_back_to_synthetic(
+    config: CortexConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _unavailable(*_args, **_kwargs) -> CalibrationCapture:
+        raise CalibrationCaptureUnavailable("camera unavailable")
 
-    def _cb(progress: CalibrationProgress) -> None:
-        received.append(progress)
-
-    runner = CalibrationRunner(duration_seconds=3, simulate=True)
-    asyncio.run(runner.start(on_progress=_cb))
-
-    assert len(received) >= 4, (
-        f"expected >= 4 progress callbacks, got {len(received)}"
-    )
-    # The final emission should be the completion sentinel.
-    statuses = {p.status for p in received}
-    assert "completed" in statuses
-    # pct_complete should monotonically increase across emissions.
-    pcts = [p.pct_complete for p in received if p.status == "running"]
-    assert pcts == sorted(pcts)
-
-
-def test_finish_before_start_raises(baselines_dir: Path) -> None:
-    runner = CalibrationRunner(duration_seconds=2, simulate=True)
-    with pytest.raises(RuntimeError):
-        asyncio.run(runner.finish())
-
-
-def test_start_twice_raises(baselines_dir: Path) -> None:
-    """Defensive: calling start() twice is a programming error."""
-    runner = CalibrationRunner(duration_seconds=1, simulate=True)
-    asyncio.run(runner.start())
-    with pytest.raises(RuntimeError):
+    monkeypatch.setattr(runner_module, "_collect_live_calibration", _unavailable)
+    runner = CalibrationRunner(duration_seconds=1, config=config)
+    with pytest.raises(CalibrationCaptureUnavailable):
         asyncio.run(runner.start())
-
-
-def test_negative_duration_raises() -> None:
-    with pytest.raises(ValueError):
-        CalibrationRunner(duration_seconds=0, simulate=True)
-
-
-# ---------------------------------------------------------------------------
-# P1 — calibration must NOT silently calibrate against synthetic frames when
-# the live camera is unavailable/contended. ``used_simulation`` lets the
-# desktop wizard surface a visible warning instead of accepting a useless
-# baseline (CLAUDE.md rules #5/#15).
-# ---------------------------------------------------------------------------
-
-
-def test_simulate_runner_marks_used_simulation() -> None:
-    from cortex.services.capture_service.calibration_runner import CalibrationRunner
-
-    runner = CalibrationRunner(duration_seconds=1, simulate=True)
-    assert runner.used_simulation is True
-
-
-def test_live_calibration_invokes_on_fallback_when_camera_unavailable(
-    monkeypatch: pytest.MonkeyPatch, baselines_dir: Path
-) -> None:
-    import cortex.services.capture_service.webcam as webcam_mod
-    from cortex.services.capture_service.calibration_runner import run_live_calibration
-
-    # Camera cannot be opened -> live path must degrade to simulation AND
-    # signal the fallback so the caller can warn the user.
-    monkeypatch.setattr(webcam_mod, "open_video_capture", lambda cfg: (None, None))
-    fired = {"fallback": False}
-
-    asyncio.run(
-        run_live_calibration(
-            1,
-            is_aborted=lambda: True,
-            on_fallback=lambda: fired.__setitem__("fallback", True),
-        )
-    )
-    assert fired["fallback"] is True
-
-
-def test_runner_marks_used_simulation_on_camera_fallback(
-    monkeypatch: pytest.MonkeyPatch, baselines_dir: Path
-) -> None:
-    import cortex.services.capture_service.webcam as webcam_mod
-    from cortex.services.capture_service.calibration_runner import CalibrationRunner
-
-    monkeypatch.setattr(webcam_mod, "open_video_capture", lambda cfg: (None, None))
-    runner = CalibrationRunner(duration_seconds=1, simulate=False)
     assert runner.used_simulation is False
-    runner.abort()  # exit the simulate loop immediately
+    assert CalibrationProfileStore(config.storage.path).load_active() is None
+
+
+def test_progress_reports_all_protocol_phases(config: CortexConfig) -> None:
+    received: list[CalibrationProgress] = []
+    runner = CalibrationRunner(duration_seconds=2, simulate=True, config=config)
+    asyncio.run(runner.start(on_progress=received.append))
+    phases = {item.phase for item in received}
+    assert {
+        "camera_quality_check",
+        "physiological_rest",
+        "representative_work",
+        "review",
+    } <= phases
+    assert all(item.current_hrv is None for item in received)
+    assert received[-1].status == "review_required"
+
+
+def test_legacy_baseline_view_does_not_invent_missing_samples() -> None:
+    empty = compute_baselines({})
+    assert empty.is_calibrated is False
+    samples = runner_module._empty_samples()  # noqa: SLF001 - compatibility fixture
+    samples["blink_rate_work"].extend([12.0, 14.0])
+    measured = compute_baselines(samples, clock=FakeClock(wall_unix_ms=1_000))
+    assert measured.blink_rate_baseline == pytest.approx(13.0)
+    assert measured.hr_baseline == 72.0
+    assert measured.is_calibrated is True
+
+
+def test_defensive_lifecycle_errors(config: CortexConfig) -> None:
+    runner = CalibrationRunner(duration_seconds=1, simulate=True, config=config)
+    with pytest.raises(RuntimeError, match="no completed capture"):
+        runner.preview_profile()
     asyncio.run(runner.start())
-    assert runner.used_simulation is True
+    with pytest.raises(RuntimeError, match="already called"):
+        asyncio.run(runner.start())
+    with pytest.raises(ValueError):
+        CalibrationRunner(duration_seconds=0, config=config)

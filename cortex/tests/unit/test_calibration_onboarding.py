@@ -178,8 +178,10 @@ def test_apply_progress_updates_numerics(wizard) -> None:
         face_ok=True,
         pct_complete=8.3,
         status="running",
+        valid_duration_seconds=8.0,
     )
     text = wizard._cal_numerics.text()
     assert "68" in text
-    assert "49" in text
+    assert "49" not in text  # unvalidated HRV is never presented
     assert "0.92" in text
+    assert "Valid: 8s" in text

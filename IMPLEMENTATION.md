@@ -1522,6 +1522,33 @@ subject-split-enforced and skip when licensed datasets are not locally supplied.
 
 ### WP-4 — Kinematics and calibration unification (`L`)
 
+**Implementation status (2026-08-24): complete.** Blink rate, duration,
+PERCLOS, EAR variance, head angular velocity/jitter/freeze, and neutral-pose
+dwell now use monotonic elapsed time and valid exposure rather than nominal
+frame counts. The former shoulder/posture surface is an explicitly
+camera-relative head/neck flexion proxy; no shoulder landmark or diagnostic
+posture value is fabricated. Calibration now produces immutable, checksummed,
+versioned profiles whose metric evidence records task context, maturity,
+distribution, effective sample size, valid duration, missingness, quality,
+camera identity/geometry, and exact code/configuration identity. Measured
+profiles alone can be approved. Simulations remain demo artifacts and can
+never become active.
+
+The live and WebSocket paths now converge on one atomic activation command:
+the daemon validates and constructs the entire replacement graph before
+committing the active pointer, then swaps the graph synchronously and emits a
+correlated `CalibrationUpdated` event. Persistence, checksum, schema,
+algorithm, and camera failures preserve the prior graph; disconnect and
+timeout paths reconcile a lost acknowledgement against the checksum-bound
+authoritative pointer before reporting an outcome. Camera identity or
+resolution changes invalidate camera-bound neutral pose and reapply it only
+when the exact measured camera geometry returns. Completion evidence: 87
+focused kinematics/calibration tests; 2,089 non-PySide tests with five
+dataset/platform skips;
+all 38 PySide-bearing test files passed in isolated processes; strict mypy
+across 461 files; Ruff and schema-drift gates; 178 browser tests plus Chrome
+build; and 12 VS Code tests, TypeScript compile, and VSIX packaging.
+
 **Files:**
 
 - blink, head-pose, posture services under `cortex/services/kinematics_engine/`
@@ -1904,7 +1931,7 @@ Move one cohesive flow at a time behind the kernel after characterization tests.
 - [x] P1-02 motion ordering and time-correct MediaPipe/kinematics
 - [x] P1-03 unique beat/IBI stream
 - [x] P1-04 respiration redesign or feature removal
-- [ ] P1-05 calibrated profile provenance and live reload
+- [x] P1-05 calibrated profile provenance and live reload
 - [ ] P1-06 evidence-normalized inference with unknown state
 - [ ] P1-07 manifest/authorization/receipt intervention protocol
 - [ ] P1-08 event store and restart recovery

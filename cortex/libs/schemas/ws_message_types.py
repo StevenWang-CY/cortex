@@ -100,6 +100,10 @@ class MessageType(str, Enum):  # noqa: UP042 — pydantic-to-typescript requires
     SETTINGS_SYNC = "SETTINGS_SYNC"
     """Bidirectional — client sends new settings, daemon broadcasts current."""
 
+    CALIBRATION_RELOAD = "CALIBRATION_RELOAD"
+    """Desktop requests live application of the already committed immutable
+    measured profile named by ``payload.profile_id``."""
+
     ACTIVITY_SYNC = "ACTIVITY_SYNC"
     """Extension forwards per-tab activity records for aggregation."""
 
@@ -240,6 +244,14 @@ class MessageType(str, Enum):  # noqa: UP042 — pydantic-to-typescript requires
 
     STATE_UPDATE = "STATE_UPDATE"
     """Periodic state estimate broadcast (every ~500 ms)."""
+
+    CALIBRATION_UPDATED = "CALIBRATION_UPDATED"
+    """Daemon confirms one atomic profile reload and dependent-state reset."""
+
+    CALIBRATION_UPDATE_FAILED = "CALIBRATION_UPDATE_FAILED"
+    """Daemon rejects a staged calibration candidate without changing the
+    active pointer or live dependency graph.  The reply is unicast to the
+    requesting desktop and preserves its correlation id."""
 
     INTERVENTION_TRIGGER = "INTERVENTION_TRIGGER"
     """Plan + UI hints for a new intervention."""

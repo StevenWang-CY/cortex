@@ -165,7 +165,10 @@ interface Biometrics {
     heart_rate: number | null;
     hrv_rmssd: number | null;
     blink_rate: number | null;
-    forward_lean: number | null;
+    head_neck_flexion_score: number | null;
+    head_neck_flexion_angle: number | null;
+    head_neck_flexion_dwell_seconds: number | null;
+    head_neck_proxy_available: boolean;
 }
 
 interface CortexState {
