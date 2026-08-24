@@ -34,6 +34,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
+from cortex.application.clock import SYSTEM_CLOCK, Clock, utc_datetime
 from cortex.libs.logging.structured import EventType
 from cortex.libs.utils.atomic_write import atomic_write_json
 
@@ -54,7 +55,7 @@ def _today_iso(now: datetime | None = None) -> str:
     function's docstring, the module docstring, and the COST_RESPONSE
     schema's "resets at local midnight" contract). A tz-aware ``now`` is
     first converted to the local zone via ``astimezone()`` so a caller
-    that passes ``datetime.now(UTC)`` still buckets into the local day;
+    that passes a timezone-aware UTC instant still buckets into the local day;
     a naive ``now`` is assumed to already be local wall-clock.
     """
     return _local_date(now).isoformat()
@@ -68,7 +69,7 @@ def _local_date(now: datetime | None = None) -> date:
     local-midnight boundary. A tz-aware instant is converted to local
     wall-clock; a naive instant is assumed local already.
     """
-    moment = now if now is not None else datetime.now()
+    moment = now if now is not None else utc_datetime(SYSTEM_CLOCK)
     if moment.tzinfo is not None:
         moment = moment.astimezone()
     return moment.date()
@@ -119,6 +120,7 @@ class CostTracker:
         *,
         warn_usd: float = 5.0,
         kill_usd: float = 20.0,
+        clock: Clock | None = None,
     ) -> None:
         # P2-BE-COST-BUDGET-ZERO: a non-positive threshold means "unlimited"
         # (the documented ``daily_cost_budget_usd == 0`` => 'unlimited'
@@ -135,6 +137,7 @@ class CostTracker:
         if kill_usd > 0 and warn_usd > 0 and kill_usd < warn_usd:
             raise ValueError("kill_usd must be >= warn_usd when both are set")
         self._ledger_path = ledger_path
+        self._clock = clock or SYSTEM_CLOCK
         self._warn_usd = float(warn_usd)
         self._kill_usd = float(kill_usd)
         self._lock = threading.Lock()
@@ -245,7 +248,7 @@ class CostTracker:
         for k, v in data.items():
             if isinstance(k, str) and isinstance(v, dict):
                 out[k] = v
-        return _prune_old(out, today=date.today())
+        return _prune_old(out, today=_local_date(utc_datetime(self._clock)))
 
     def _flush(self) -> None:
         try:
@@ -293,7 +296,7 @@ class CostTracker:
         if usd < 0:
             raise ValueError(f"usd must be non-negative; got {usd!r}")
         cid_key = cid or "-"
-        moment = now or datetime.now()
+        moment = now if now is not None else utc_datetime(self._clock)
         today = _today_iso(moment)
         with self._lock:
             day = self._day(today)
@@ -355,7 +358,7 @@ class CostTracker:
 
     def today_total_usd(self, *, now: datetime | None = None) -> float:
         """Return the running spend for the current local day."""
-        today = _today_iso(now)
+        today = _today_iso(now if now is not None else utc_datetime(self._clock))
         with self._lock:
             entry = self._days.get(today)
             return float(entry["total_usd"]) if entry else 0.0
@@ -371,7 +374,7 @@ class CostTracker:
         Used by support tooling: given a correlation id, how much did
         that single user-action chain cost?
         """
-        today = _today_iso(now)
+        today = _today_iso(now if now is not None else utc_datetime(self._clock))
         with self._lock:
             entry = self._days.get(today)
             if not entry:
@@ -391,7 +394,7 @@ class CostTracker:
         ``WARN`` and ``KILL`` events are emitted at most once per day so
         a high-frequency caller does not spam the log aggregator.
         """
-        moment = now or datetime.now()
+        moment = now if now is not None else utc_datetime(self._clock)
         today = _today_iso(moment)
         total = self.today_total_usd(now=moment)
         # P2-BE-COST-BUDGET-ZERO: a disabled (<= 0) threshold is "unlimited"

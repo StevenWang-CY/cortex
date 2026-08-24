@@ -18,12 +18,12 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 from cortex.libs.config.settings import TelemetryConfig
 
 logger = logging.getLogger(__name__)
@@ -141,7 +141,13 @@ class InputHooks:
         hooks.stop()
     """
 
-    def __init__(self, config: TelemetryConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: TelemetryConfig | None = None,
+        *,
+        clock: Clock | None = None,
+    ) -> None:
+        self._clock = clock or SYSTEM_CLOCK
         self._config = config or TelemetryConfig()
         self._buffers = InputEventBuffers()
         # pynput ``Listener`` instances (typed ``Any`` because pynput
@@ -214,7 +220,7 @@ class InputHooks:
 
     def record_mouse_move(self, x: int, y: int, timestamp: float | None = None) -> None:
         """Manually record a mouse move event (for testing or external sources)."""
-        t = timestamp if timestamp is not None else time.monotonic()
+        t = timestamp if timestamp is not None else monotonic_seconds(self._clock)
         event = MouseMoveEvent(timestamp=t, x=x, y=y)
         with self._buffers.lock:
             self._buffers.mouse_moves.append(event)
@@ -224,7 +230,7 @@ class InputHooks:
         pressed: bool = True, timestamp: float | None = None,
     ) -> None:
         """Manually record a mouse click event."""
-        t = timestamp if timestamp is not None else time.monotonic()
+        t = timestamp if timestamp is not None else monotonic_seconds(self._clock)
         event = MouseClickEvent(timestamp=t, x=x, y=y, button=button, pressed=pressed)
         with self._buffers.lock:
             self._buffers.mouse_clicks.append(event)
@@ -234,7 +240,7 @@ class InputHooks:
         timestamp: float | None = None,
     ) -> None:
         """Manually record a mouse scroll event."""
-        t = timestamp if timestamp is not None else time.monotonic()
+        t = timestamp if timestamp is not None else monotonic_seconds(self._clock)
         direction = ScrollDirection.UP if dy > 0 else ScrollDirection.DOWN
         event = MouseScrollEvent(
             timestamp=t, x=x, y=y, dx=dx, dy=dy, direction=direction,
@@ -247,7 +253,7 @@ class InputHooks:
         pressed: bool = True, timestamp: float | None = None,
     ) -> None:
         """Manually record a key event."""
-        t = timestamp if timestamp is not None else time.monotonic()
+        t = timestamp if timestamp is not None else monotonic_seconds(self._clock)
         event = KeyEvent(timestamp=t, key_type=key_type, pressed=pressed)
         with self._buffers.lock:
             self._buffers.key_events.append(event)
@@ -266,7 +272,11 @@ class InputHooks:
             Dict with lists of events for each type.
         """
         window = window_seconds or self._config.window_seconds
-        now = current_time or time.monotonic()
+        now = (
+            monotonic_seconds(self._clock)
+            if current_time is None
+            else current_time
+        )
         cutoff = now - window
 
         with self._buffers.lock:
@@ -284,7 +294,7 @@ class InputHooks:
 
     def _on_mouse_move(self, x: int, y: int) -> None:
         """pynput mouse move callback (rate-limited)."""
-        now = time.monotonic()
+        now = monotonic_seconds(self._clock)
         # Rate limit to sample_hz
         if now - self._last_move_time < self._move_interval:
             return
@@ -295,7 +305,7 @@ class InputHooks:
 
     def _on_mouse_click(self, x: int, y: int, button: object, pressed: bool) -> None:
         """pynput mouse click callback."""
-        now = time.monotonic()
+        now = monotonic_seconds(self._clock)
         # Map pynput button to our enum
         btn = MouseButton.UNKNOWN
         btn_name = getattr(button, "name", "")
@@ -314,7 +324,7 @@ class InputHooks:
 
     def _on_mouse_scroll(self, x: int, y: int, dx: int, dy: int) -> None:
         """pynput mouse scroll callback."""
-        now = time.monotonic()
+        now = monotonic_seconds(self._clock)
         direction = ScrollDirection.UP if dy > 0 else ScrollDirection.DOWN
         event = MouseScrollEvent(
             timestamp=now, x=x, y=y, dx=dx, dy=dy, direction=direction,
@@ -324,7 +334,7 @@ class InputHooks:
 
     def _on_key_press(self, key: object) -> None:
         """pynput key press callback."""
-        now = time.monotonic()
+        now = monotonic_seconds(self._clock)
         key_type = self._classify_key(key)
         event = KeyEvent(timestamp=now, key_type=key_type, pressed=True)
         with self._buffers.lock:
@@ -332,7 +342,7 @@ class InputHooks:
 
     def _on_key_release(self, key: object) -> None:
         """pynput key release callback."""
-        now = time.monotonic()
+        now = monotonic_seconds(self._clock)
         key_type = self._classify_key(key)
         event = KeyEvent(timestamp=now, key_type=key_type, pressed=False)
         with self._buffers.lock:

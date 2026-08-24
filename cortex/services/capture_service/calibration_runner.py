@@ -37,13 +37,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from cortex.application.clock import (
+    SYSTEM_CLOCK,
+    Clock,
+    monotonic_seconds,
+    utc_datetime,
+)
 from cortex.libs.config.settings import get_config
 from cortex.libs.schemas.state import UserBaselines
 from cortex.libs.utils.atomic_write import atomic_write_json
@@ -158,6 +162,7 @@ async def run_simulate_calibration(
     *,
     is_aborted: Callable[[], bool] | None = None,
     on_progress: ProgressCallback | None = None,
+    clock: Clock | None = None,
 ) -> dict[str, list[float]]:
     """Async simulation loop — same data shape as the live path.
 
@@ -170,10 +175,11 @@ async def run_simulate_calibration(
     import random
 
     random.seed(42)
+    active_clock = clock or SYSTEM_CLOCK
     samples = _empty_samples()
     total_ticks = max(1, int(duration_seconds * PROGRESS_HZ))
     tick_interval = 1.0 / PROGRESS_HZ
-    start = time.monotonic()
+    start = monotonic_seconds(active_clock)
     _emit_progress(
         on_progress,
         elapsed=0.0,
@@ -198,7 +204,7 @@ async def run_simulate_calibration(
         samples["mouse_variance"].append(max(1000.0, min(100000.0, 10000.0 + random.gauss(0, 2000.0))))
         samples["shoulder_y"].append(max(0.0, min(1.0, 0.5 + random.gauss(0, 0.02))))
 
-        elapsed = time.monotonic() - start
+        elapsed = monotonic_seconds(active_clock) - start
         _emit_progress(
             on_progress,
             elapsed=elapsed,
@@ -221,6 +227,7 @@ async def run_live_calibration(
     is_aborted: Callable[[], bool] | None = None,
     on_progress: ProgressCallback | None = None,
     on_fallback: Callable[[], None] | None = None,
+    clock: Clock | None = None,
 ) -> dict[str, list[float]]:
     """Async live capture loop. Falls back to simulate mode if the
     webcam / OpenCV / pipeline modules are unavailable.
@@ -235,11 +242,16 @@ async def run_live_calibration(
     loop stays responsive — the wizard's progress callback delivery and
     the abort flag check both run on the same loop.
     """
+    active_clock = clock or SYSTEM_CLOCK
+
     async def _fallback() -> dict[str, list[float]]:
         if on_fallback is not None:
             on_fallback()
         return await run_simulate_calibration(
-            duration_seconds, is_aborted=is_aborted, on_progress=on_progress
+            duration_seconds,
+            is_aborted=is_aborted,
+            on_progress=on_progress,
+            clock=active_clock,
         )
 
     try:
@@ -292,8 +304,12 @@ async def run_live_calibration(
         landmarks_config=config.landmarks,
     )
     pulse_estimator = PulseEstimator(fs=float(config.capture.fps))
-    input_hooks = InputHooks(config.telemetry)
-    aggregator = FeatureAggregator(input_hooks, config=config.telemetry)
+    input_hooks = InputHooks(config.telemetry, clock=active_clock)
+    aggregator = FeatureAggregator(
+        input_hooks,
+        config=config.telemetry,
+        clock=active_clock,
+    )
     rgb_window: list[Any] = []
     max_window = max(1, config.signal.rppg.window_seconds * config.capture.fps)
     last_physio_time = 0.0
@@ -324,7 +340,7 @@ async def run_live_calibration(
         status="initializing",
     )
 
-    start = time.monotonic()
+    start = monotonic_seconds(active_clock)
     last_progress_time = 0.0
     progress_interval = 1.0 / PROGRESS_HZ
     lighting_ok = False
@@ -341,7 +357,7 @@ async def run_live_calibration(
                 await asyncio.sleep(0)
                 continue
 
-            elapsed = time.monotonic() - start
+            elapsed = monotonic_seconds(active_clock) - start
             if elapsed >= duration_seconds:
                 break
 
@@ -417,7 +433,7 @@ async def run_live_calibration(
 
             telemetry = aggregator.build_features(
                 window_seconds=min(config.telemetry.window_seconds, max(1.0, elapsed)),
-                current_time=time.monotonic(),
+                current_time=monotonic_seconds(active_clock),
             )
             if telemetry.mouse_velocity_mean > 0.0:
                 samples["mouse_velocity"].append(telemetry.mouse_velocity_mean)
@@ -472,7 +488,11 @@ async def run_live_calibration(
     return samples
 
 
-def compute_baselines(samples: dict[str, list[float]]) -> UserBaselines:
+def compute_baselines(
+    samples: dict[str, list[float]],
+    *,
+    clock: Clock | None = None,
+) -> UserBaselines:
     """Compute baseline statistics. Same implementation as the legacy
     CLI; re-exported here so the CLI can import it from one place."""
     import statistics
@@ -511,7 +531,7 @@ def compute_baselines(samples: dict[str, list[float]]) -> UserBaselines:
         mouse_velocity_baseline=_safe_mean(mouse_vel, 500.0),
         mouse_variance_baseline=_safe_mean(mouse_var, 10000.0),
         shoulder_neutral_y=_safe_mean(shoulder_values, 0.5),
-        calibrated_at=datetime.now(UTC),
+        calibrated_at=utc_datetime(clock or SYSTEM_CLOCK),
         metric_distributions={
             "hr": _distribution(hr_values, 72.0, 5.0),
             "hrv_rmssd": _distribution(hrv_values, 50.0, 10.0),
@@ -563,10 +583,12 @@ class CalibrationRunner:
         config: Any | None = None,
         *,
         output_path: Path | str | None = None,
+        clock: Clock | None = None,
     ) -> None:
         if duration_seconds <= 0:
             raise ValueError("duration_seconds must be positive")
         self.duration_seconds = int(duration_seconds)
+        self._clock = clock or SYSTEM_CLOCK
         self.simulate = bool(simulate)
         # True if calibration ran against synthetic frames — either because
         # ``simulate=True`` was requested OR the live path degraded to the
@@ -627,6 +649,7 @@ class CalibrationRunner:
                     self.duration_seconds,
                     is_aborted=lambda: self._aborted,
                     on_progress=wrapped_cb,
+                    clock=self._clock,
                 )
             else:
                 def _mark_simulated() -> None:
@@ -638,6 +661,7 @@ class CalibrationRunner:
                     is_aborted=lambda: self._aborted,
                     on_progress=wrapped_cb,
                     on_fallback=_mark_simulated,
+                    clock=self._clock,
                 )
         except Exception:
             logger.exception("calibration capture loop crashed")
@@ -692,7 +716,7 @@ class CalibrationRunner:
                 "refusing to overwrite default.json"
             )
 
-        baselines = compute_baselines(self._samples)
+        baselines = compute_baselines(self._samples, clock=self._clock)
         await asyncio.to_thread(self._write_baselines, baselines)
         self._finished = True
         return baselines
@@ -707,7 +731,7 @@ class CalibrationRunner:
             timestamped = self._output_override
             timestamped.parent.mkdir(parents=True, exist_ok=True)
         else:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = utc_datetime(self._clock).strftime("%Y%m%d_%H%M%S")
             timestamped = base_dir / f"baseline_{timestamp}.json"
 
         atomic_write_json(timestamped, data)

@@ -17,12 +17,12 @@ Parameters (from StateConfig):
 from __future__ import annotations
 
 import logging
-import time
 from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
 
+from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 from cortex.libs.config.settings import StateConfig
 from cortex.libs.logging.correlation import get_correlation_id
 from cortex.libs.logging.structured import log_state_transition
@@ -34,6 +34,7 @@ from cortex.libs.schemas.state import (
     StateTransition,
     UserState,
 )
+from cortex.libs.schemas.temporal import EventTime
 
 logger = logging.getLogger(__name__)
 
@@ -79,8 +80,14 @@ class ScoreSmoother:
         estimate = smoother.update(raw_scores, signal_quality, timestamp)
     """
 
-    def __init__(self, config: StateConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: StateConfig | None = None,
+        *,
+        clock: Clock | None = None,
+    ) -> None:
         self._config = config or StateConfig()
+        self._clock = clock or SYSTEM_CLOCK
         self._alpha = self._config.ema_alpha
         self._probability_temperature = 1.0
 
@@ -120,6 +127,7 @@ class ScoreSmoother:
         signal_quality: SignalQuality,
         timestamp: float | None = None,
         *,
+        event_time: EventTime | None = None,
         ml_p_hyper: float | None = None,
         ml_alpha: float = 0.0,
     ) -> StateEstimate:
@@ -141,7 +149,10 @@ class ScoreSmoother:
         Returns:
             StateEstimate with smoothed state, confidence, and reasons.
         """
-        now = timestamp if timestamp is not None else time.monotonic()
+        if event_time is not None:
+            now = event_time.observed_at_mono_ns / 1_000_000_000.0
+        else:
+            now = timestamp if timestamp is not None else monotonic_seconds(self._clock)
 
         # Initialize state_entered_at on first update
         if self._state_entered_at is None:
@@ -179,6 +190,13 @@ class ScoreSmoother:
             # State changed — record transition
             transition = StateTransition(
                 timestamp=now,
+                observed_at_unix_ms=(
+                    event_time.observed_at_unix_ms if event_time is not None else None
+                ),
+                observed_at_mono_ns=(
+                    event_time.observed_at_mono_ns if event_time is not None else None
+                ),
+                boot_id=event_time.boot_id if event_time is not None else None,
                 from_state=self._current_state.value,
                 to_state=confirmed_state.value,
                 from_confidence=self._get_state_score(self._current_state),
@@ -240,6 +258,13 @@ class ScoreSmoother:
             reasons=self._generate_reasons(),
             signal_quality=signal_quality,
             timestamp=now,
+            observed_at_unix_ms=(
+                event_time.observed_at_unix_ms if event_time is not None else None
+            ),
+            observed_at_mono_ns=(
+                event_time.observed_at_mono_ns if event_time is not None else None
+            ),
+            boot_id=event_time.boot_id if event_time is not None else None,
             dwell_seconds=self._dwell_seconds,
         )
 

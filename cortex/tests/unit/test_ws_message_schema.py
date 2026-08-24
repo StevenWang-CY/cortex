@@ -230,8 +230,8 @@ def test_legacy_dataclass_to_pydantic_helper() -> None:
     assert new.payload == {"quiet_mode": True}
 
 
-def test_wire_format_matches_legacy_field_set() -> None:
-    """Wire JSON carries exactly the same keys as the legacy dataclass."""
+def test_wire_format_dual_writes_legacy_fields_and_v2_metadata() -> None:
+    """V2 adds metadata while preserving every v1 decoder field."""
     pyd = WSMessage(
         type=MessageType.STATE_UPDATE,
         payload={"state": "FLOW"},
@@ -245,7 +245,17 @@ def test_wire_format_matches_legacy_field_set() -> None:
     )
     pyd_keys = set(json.loads(pyd.to_json()).keys())
     legacy_keys = set(json.loads(legacy.to_json()).keys())
-    assert pyd_keys == legacy_keys
+    assert legacy_keys <= pyd_keys
+    assert {
+        "schema_version",
+        "protocol_version",
+        "event_id",
+        "sent_at_unix_ms",
+        "sent_at_mono_ns",
+        "boot_id",
+        "causation_id",
+    } <= pyd_keys
+    assert pyd.sent_at_unix_ms == int(float(pyd.timestamp) * 1000)
 
 
 def test_replay_representative_session_frames() -> None:

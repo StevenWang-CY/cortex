@@ -56,7 +56,15 @@ import type {
 // optional. We promote the always-emitted fields back to required here
 // so consumers below can rely on them existing. Genuinely-optional
 // fields (``correlation_id`` etc.) stay optional.
-type WSMessage = Omit<WSMessageSchema, "payload"> & {
+type WSMetadataKeys =
+    | "schema_version"
+    | "protocol_version"
+    | "event_id"
+    | "sent_at_unix_ms"
+    | "sent_at_mono_ns"
+    | "boot_id";
+type WSMessage = Omit<WSMessageSchema, "payload" | WSMetadataKeys> &
+    Partial<Pick<WSMessageSchema, WSMetadataKeys>> & {
     payload: Record<string, unknown>;
 };
 
@@ -152,6 +160,46 @@ let reconnectDelay = INITIAL_RECONNECT_DELAY;
 const MAX_RECONNECT_DELAY = 30000;
 let intentionalDisconnect = false;
 let sequence = 0;
+const WIRE_SCHEMA_VERSION = "2.0";
+const PROTOCOL_VERSION = "2.0";
+const SUPPORTED_PROTOCOL_VERSIONS = ["2.0", "1.0"] as const;
+let negotiatedProtocolVersion: (typeof SUPPORTED_PROTOCOL_VERSIONS)[number] =
+    PROTOCOL_VERSION;
+
+function newWireId(): string {
+    try {
+        if (typeof globalThis.crypto?.randomUUID === "function") {
+            return globalThis.crypto.randomUUID();
+        }
+    } catch {
+        // Older extension test runtimes may not expose Web Crypto.
+    }
+    return `xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`.replace(/[xy]/g, (ch) => {
+        const r = (Math.random() * 16) | 0;
+        const v = ch === "x" ? r : (r & 0x3) | 0x8;
+        return v.toString(16);
+    });
+}
+
+const CLIENT_BOOT_ID = newWireId();
+
+function withWireMetadata(msg: WSMessage): WSMessage {
+    const sentAtUnixMs = Date.now();
+    const monoMs = typeof globalThis.performance?.now === "function"
+        ? globalThis.performance.now()
+        : 0;
+    return {
+        ...msg,
+        schema_version: WIRE_SCHEMA_VERSION,
+        protocol_version: negotiatedProtocolVersion,
+        event_id: newWireId(),
+        sent_at_unix_ms: sentAtUnixMs,
+        sent_at_mono_ns: Math.max(0, Math.round(monoMs * 1_000_000)),
+        boot_id: CLIENT_BOOT_ID,
+        // One-release dual-write for v1 daemons.
+        timestamp: sentAtUnixMs / 1000,
+    } as WSMessage;
+}
 // DAEMON_WS_URL, DAEMON_HTTP_URL, LAUNCHER_HTTP_URL — imported from "./config"
 
 let currentState: CortexState | null = null;
@@ -748,6 +796,7 @@ function connect(): void {
             // long-running disconnect cycle that finally succeeds doesn't
             // keep waiting 30s on the next transient drop.
             reconnectDelay = INITIAL_RECONNECT_DELAY;
+            negotiatedProtocolVersion = PROTOCOL_VERSION;
             // F17 (audit): clear the per-type sequence tracker. The
             // daemon restarts its WSMessage.sequence counter from 0
             // each boot; keeping the pre-restart values would reject
@@ -773,12 +822,16 @@ function connect(): void {
                     if (!ws || ws.readyState !== WebSocket.OPEN) {
                         return;
                     }
-                    ws.send(JSON.stringify({
+                    ws.send(JSON.stringify(withWireMetadata({
                         type: "AUTH",
-                        payload: { auth_token: authToken },
+                        payload: {
+                            auth_token: authToken,
+                            protocol_version: PROTOCOL_VERSION,
+                            supported_protocol_versions: [...SUPPORTED_PROTOCOL_VERSIONS],
+                        },
                         timestamp: Date.now() / 1000,
                         sequence: ++sequence,
-                    }));
+                    } as WSMessage)));
                     // Identify the host browser (AFTER auth so the
                     // daemon-side ``IDENTIFY`` handler runs in the
                     // authenticated branch of dispatch). The same JS
@@ -865,7 +918,7 @@ function disconnect(): void {
 function send(msg: WSMessage): void {
     if (!ws || !connected) return;
     try {
-        ws.send(JSON.stringify(msg));
+        ws.send(JSON.stringify(withWireMetadata(msg)));
     } catch {
         // Connection may have dropped
     }
@@ -1105,9 +1158,14 @@ export function _getInitialReconnectDelay(): number {
  * reject every post-restart frame as "stale".
  */
 const lastSeqByType: Record<string, number> = {};
+const seenEventIds = new Set<string>();
+const seenEventIdOrder: string[] = [];
+const MAX_SEEN_EVENT_IDS = 512;
 
 export function _resetLastSeqByType(): void {
     for (const key of Object.keys(lastSeqByType)) delete lastSeqByType[key];
+    seenEventIds.clear();
+    seenEventIdOrder.length = 0;
 }
 
 export function _getLastSeq(msgType: string): number {
@@ -1122,6 +1180,15 @@ export function _getLastSeq(msgType: string): number {
  * the counter only moves forward.
  */
 function acceptSequencedFrame(msg: WSMessage): boolean {
+    if (typeof msg.event_id === "string" && msg.event_id.length > 0) {
+        if (seenEventIds.has(msg.event_id)) return false;
+        seenEventIds.add(msg.event_id);
+        seenEventIdOrder.push(msg.event_id);
+        if (seenEventIdOrder.length > MAX_SEEN_EVENT_IDS) {
+            const evicted = seenEventIdOrder.shift();
+            if (evicted) seenEventIds.delete(evicted);
+        }
+    }
     const seq = typeof msg.sequence === "number" ? msg.sequence : 0;
     if (seq <= 0 || !msg.type) return true; // unsequenced — bypass
     const last = lastSeqByType[msg.type] ?? 0;
@@ -1196,13 +1263,30 @@ async function handleMessage(raw: string): Promise<void> {
     }
 
     switch (msg.type) {
-        case "AUTH_OK":
+        case "AUTH_OK": {
             // Debt-2 (audit): the daemon ACKed our AUTH frame. Nothing
             // to do — the daemon will start broadcasting STATE_UPDATE
             // and other types on its own cadence. We accept this frame
             // as a known type so the legacy `default` branch (which
             // would otherwise treat it as "unknown") cannot accidentally
             // re-classify it as a parse error.
+            const selected = msg.payload.selected_protocol_version;
+            if (selected === "1.0" || selected === "2.0") {
+                negotiatedProtocolVersion = selected;
+            }
+            break;
+        }
+
+        case "PROTOCOL_ERROR":
+            console.error(
+                `[cortex.bg] protocol negotiation failed: ${JSON.stringify(msg.payload)}`,
+            );
+            intentionalDisconnect = true;
+            try {
+                ws?.close(1002, "unsupported Cortex protocol");
+            } catch {
+                // Socket may already be closing after the server error frame.
+            }
             break;
 
         case "STATE_UPDATE":

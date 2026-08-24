@@ -9,11 +9,29 @@ injection rule).
 
 from __future__ import annotations
 
+import hashlib
 import sys
 import types
+from pathlib import Path
 from typing import Any
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_trigger_policy_storage(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Never let a test read or mutate the signed-in user's policy state."""
+
+    test_key = hashlib.sha256(request.node.nodeid.encode("utf-8")).hexdigest()[:16]
+    config_dir = Path(tmp_path_factory.getbasetemp()) / "cortex-config" / test_key
+    monkeypatch.setattr(
+        "cortex.services.state_engine.trigger_policy.get_config_dir",
+        lambda: config_dir,
+    )
 
 
 def _make_qt_stubs() -> dict[str, types.ModuleType]:

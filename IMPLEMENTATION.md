@@ -1384,6 +1384,19 @@ Each package is independently reviewable. “Exit” means the package is not co
 
 ### WP-1 — Clock and schema foundation (`L`)
 
+**Implementation status (2026-08-24): complete.** The runtime, REST, and
+WebSocket composition paths now share an injected dual clock; v2 event
+metadata carries wall time, monotonic time, boot identity, event identity,
+ordering, and causality while v1 decoding preserves its original provenance.
+Cooldown persistence is reboot-safe and bounded under wall-clock rollback.
+Both browser and VS Code declarations are generated from every Pydantic schema
+and checked as identical consumers, with negotiated protocol compatibility and
+duplicate/reordered-event defenses. Deterministic tests cover clock jumps,
+reboot, long uptime, DST/date rollover, time zero, legacy/new protocol minors,
+major rejection, and wall-independent elapsed decisions. Completion evidence:
+2,350 non-Qt Python tests plus 57 isolated Qt tests, strict mypy across 441
+files, Ruff, schema drift, 178 browser tests/build, and 12 VS Code tests/package.
+
 **Files:**
 
 - new `cortex/application/clock.py`

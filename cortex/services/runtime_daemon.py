@@ -14,10 +14,8 @@ import json
 import logging
 import queue
 import threading
-import time
 from collections import deque
 from collections.abc import Callable
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -25,6 +23,15 @@ from urllib.parse import urlparse
 import numpy as np
 import uvicorn
 
+from cortex.application.clock import (
+    SYSTEM_CLOCK,
+    BoundedDeadline,
+    Clock,
+    clock_or_system,
+    monotonic_seconds,
+    unix_seconds,
+    utc_datetime,
+)
 from cortex.libs.adapters.leetcode_adapter import LeetCodeAdapter
 from cortex.libs.config.settings import CortexConfig, get_config
 from cortex.libs.logging.correlation import get_correlation_id
@@ -45,6 +52,7 @@ from cortex.libs.schemas.session_history import (
     TrendsResponse,
 )
 from cortex.libs.schemas.state import UserBaselines
+from cortex.libs.schemas.temporal import EventTime
 from cortex.libs.schemas.ws_message_types import MessageType
 
 # v2.0 imports
@@ -125,6 +133,12 @@ from cortex.services.telemetry_engine.window_tracker import WindowTracker
 from cortex.services.throttle.copilot_throttle import CopilotThrottle
 
 logger = logging.getLogger(__name__)
+
+
+def _daemon_clock(owner: object) -> Clock:
+    """Resolve the daemon clock at legacy unbound-method boundaries."""
+
+    return clock_or_system(getattr(owner, "_clock", None))
 
 # C6 (audit): structured event sink. ``configure_logging`` (invoked once at
 # daemon startup, see ``start()``) wires the structlog processor chain; this
@@ -351,12 +365,13 @@ class SessionRecorder:
     shutdown.
     """
 
-    def __init__(self, storage_root: str) -> None:
+    def __init__(self, storage_root: str, *, clock: Clock | None = None) -> None:
+        self._clock = clock or SYSTEM_CLOCK
         root = Path(storage_root)
         root.mkdir(parents=True, exist_ok=True)
         session_dir = root / "sessions"
         session_dir.mkdir(parents=True, exist_ok=True)
-        self._path = session_dir / f"session_{int(time.time())}.jsonl"
+        self._path = session_dir / f"session_{self._clock.unix_ms() // 1000}.jsonl"
         # Bounded queue so a runaway producer can't exhaust memory; if
         # the writer thread falls behind by more than 4096 records we
         # drop the oldest and log so the data loss is observable.
@@ -379,7 +394,7 @@ class SessionRecorder:
         self._writer_thread.start()
 
     def append(self, event_type: str, payload: dict[str, Any]) -> None:
-        record = (event_type, payload, time.time())
+        record = (event_type, payload, unix_seconds(self._clock))
         try:
             self._queue.put_nowait(record)
             # B19 (Phase 4.1): clear the overflow streak counter on every
@@ -492,8 +507,14 @@ class SessionRecorder:
 class CortexDaemon:
     """In-process supervisor for the full Cortex runtime."""
 
-    def __init__(self, config: CortexConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: CortexConfig | None = None,
+        *,
+        clock: Clock | None = None,
+    ) -> None:
         self.config = config or get_config()
+        self._clock = clock or SYSTEM_CLOCK
         self._shutdown = asyncio.Event()
         self._tasks: list[asyncio.Task[Any]] = []
         # F03: every dynamically-spawned background task (intervention
@@ -519,9 +540,9 @@ class CortexDaemon:
         self._state_callback_seq: int = 0
         self._intervention_callback_seq: int = 0
 
-        self._recorder = SessionRecorder(self.config.storage.path)
-        self._input_hooks = InputHooks(self.config.telemetry)
-        self._window_tracker = WindowTracker()
+        self._recorder = SessionRecorder(self.config.storage.path, clock=self._clock)
+        self._input_hooks = InputHooks(self.config.telemetry, clock=self._clock)
+        self._window_tracker = WindowTracker(clock=self._clock)
         self._terminal_adapter = TerminalAdapter()
         self._editor_adapter = EditorAdapter(request_context_fn=self._request_context)
         self._browser_adapter = BrowserAdapter(request_context_fn=self._request_context)
@@ -569,9 +590,9 @@ class CortexDaemon:
             frame_height=self.config.capture.height,
         )
         self._posture = PostureAnalyzer(self.config.signal.posture)
-        self._feature_fusion = FeatureFusion()
+        self._feature_fusion = FeatureFusion(clock=self._clock)
         self._scorer = RuleScorer(config=self.config.state, baselines=self._load_baselines())
-        self._smoother = ScoreSmoother(self.config.state)
+        self._smoother = ScoreSmoother(self.config.state, clock=self._clock)
 
         # C.2: optional per-user ML classifier. If a previously-trained
         # model file exists in storage/baselines/classifier.json AND
@@ -602,8 +623,9 @@ class CortexDaemon:
         self._trigger_policy = TriggerPolicy(
             self.config.intervention,
             state_config=self.config.state,
+            clock=self._clock,
         )
-        self._llm_client = create_llm_client(self.config.llm)
+        self._llm_client = create_llm_client(self.config.llm, clock=self._clock)
         self._executor = InterventionExecutor(
             execution_mode=self.intervention_execution_mode,
         )
@@ -611,6 +633,7 @@ class CortexDaemon:
         self._restore_manager = RestoreManager(
             self._executor,
             timeout_seconds=float(self.config.intervention.timeout_minutes * 60),
+            clock=self._clock,
         )
         for adapter_name in ("browser", "editor", "overlay", "terminal"):
             self._executor.register_adapter(adapter_name, _PassiveWorkspaceAdapter())
@@ -624,7 +647,7 @@ class CortexDaemon:
         self._executor.set_editor_focus_hook(self._resume_last_active_file)
         self._executor.set_prompt_broadcast_hook(self._broadcast_prompt)
 
-        self._ws_server = WebSocketServer(self.config.api)
+        self._ws_server = WebSocketServer(self.config.api, clock=self._clock)
         self._ws_server.set_user_action_callback(self._handle_user_action)
         self._ws_server.set_settings_callback(self.apply_settings)
         self._ws_server.set_shutdown_callback(self._request_shutdown)
@@ -701,7 +724,7 @@ class CortexDaemon:
         self._last_physio_update = 0.0
         # B22 (Phase 4.1): monotonic timestamp of the most recent
         # kinematics feature delivery. State loop marks the kinematics
-        # channel stale when ``time.monotonic() - _last_kinematics_ts > 2.0``.
+        # channel stale when monotonic age exceeds 2 seconds.
         self._last_kinematics_ts: float = 0.0
         self._active_intervention_id: str | None = None
         # P0 §3.6: cache the most recently broadcast InterventionPlan
@@ -763,6 +786,7 @@ class CortexDaemon:
                 if self._browser_adapter.last_context is not None
                 else 0
             ),
+            clock=self._clock,
         )
         self._capture_available = False
         self._capture_processing_enabled = True
@@ -877,7 +901,10 @@ class CortexDaemon:
         self._broadcast_interval_seconds: float = 0.5
 
         # Longitudinal tracker (baseline drift)
-        self._longitudinal = LongitudinalTracker(store=self._store)
+        self._longitudinal = LongitudinalTracker(
+            store=self._store,
+            clock=self._clock,
+        )
 
         # Zombie reading detector
         self._zombie_detector = ZombieReadingDetector()
@@ -902,7 +929,7 @@ class CortexDaemon:
         self._load_consent_overrides()
 
         # Helpfulness tracker
-        self._helpfulness = HelpfulnessTracker(store=self._store)
+        self._helpfulness = HelpfulnessTracker(store=self._store, clock=self._clock)
 
         # P0 §3.9: per-signal causal attributor — fed by ``_state_loop``
         # at the same cadence the state estimate runs and queried when
@@ -1097,6 +1124,7 @@ class CortexDaemon:
         # ``pause`` lasts until the user resumes).
         self._quiet_mode_kind: str = "off"
         self._quiet_mode_ends_at: float | None = None
+        self._quiet_mode_deadline: BoundedDeadline | None = None
         self._quiet_mode_source: str = "daemon"
         # Phase-3 P0: serialise concurrent ``set_quiet_mode`` calls
         # (dashboard menu, tray, overlay footer, WS dispatch, F26
@@ -1253,12 +1281,16 @@ class CortexDaemon:
                 StateScores as _StateScores,
             )
 
+            event_time = EventTime.from_clock(self._clock)
             estimate = _StateEstimate(
                 state="FLOW",
                 confidence=0.0,
                 scores=_StateScores(flow=0.0, hypo=0.0, hyper=0.0, recovery=0.0),
                 signal_quality=_SQ(physio=0.0, kinematics=0.0, telemetry=0.0),
-                timestamp=time.monotonic(),
+                timestamp=event_time.observed_at_mono_ns / 1_000_000_000.0,
+                observed_at_unix_ms=event_time.observed_at_unix_ms,
+                observed_at_mono_ns=event_time.observed_at_mono_ns,
+                boot_id=event_time.boot_id,
                 dwell_seconds=0.0,
                 reasons=["capture_unavailable"],
             )
@@ -1739,7 +1771,7 @@ class CortexDaemon:
                     from cortex.libs.schemas.realtime import SessionRecap
                     recap_payload = SessionRecap(
                         report=report,
-                        generated_at=datetime.now(UTC).isoformat(),
+                        generated_at=utc_datetime(self._clock).isoformat(),
                         persisted=persisted_ok,
                     ).model_dump(mode="json")
                     self._latest_session_recap = recap_payload
@@ -1899,7 +1931,11 @@ class CortexDaemon:
         registry.healthy = True
 
     def _start_api_server(self) -> None:
-        app = create_app(config=self.config.api, cortex_config=self.config)
+        app = create_app(
+            config=self.config.api,
+            cortex_config=self.config,
+            clock=self._clock,
+        )
         # Phase-4b TASK L: bind a concrete InterventionPort instance on
         # the app's state so routes that depend on the protocol
         # (cortex.libs.ports.intervention_port.InterventionPort) can
@@ -1926,6 +1962,7 @@ class CortexDaemon:
         from cortex.services.intervention_engine.snapshot import (
             capture_snapshot as _cap,
         )
+        daemon_clock = self._clock
 
         class _DefaultInterventionPort:
             def capture_snapshot(
@@ -1939,6 +1976,7 @@ class CortexDaemon:
                     context,
                     intervention_id=intervention_id,
                     timestamp=timestamp,
+                    clock=daemon_clock,
                 )
 
             def prepare_plan(
@@ -2169,12 +2207,15 @@ class CortexDaemon:
             self._latest_physio = self._pulse_estimator.get_features(output.frame_meta.timestamp)
             registry.register("latest_physio", self._latest_physio)
             # P1-PIPE-CLOCK: feature_fusion staleness math (_compute_signal_quality)
-            # subtracts this stamp from time.monotonic() at fuse() time, so it MUST
-            # be a monotonic instant. frame_meta.timestamp is a time.time() EPOCH
+            # subtracts this stamp from the injected monotonic clock at fuse time,
+            # so it MUST be a monotonic instant. frame_meta.timestamp is an epoch
             # (~1.7e9); using it made staleness hugely negative and the staleness
             # penalties dead. _last_physio_update below is a SEPARATE epoch var used
             # for the epoch-vs-epoch rPPG-stride gate at :2035 — leave it on epoch.
-            self._feature_fusion.update_physio(self._latest_physio, timestamp=time.monotonic())
+            self._feature_fusion.update_physio(
+                self._latest_physio,
+                timestamp=monotonic_seconds(self._clock),
+            )
             self._last_physio_update = output.frame_meta.timestamp
 
         blink = self._blink_detector.update(output.landmarks_px, output.frame_meta.timestamp)
@@ -2201,11 +2242,10 @@ class CortexDaemon:
         # this to decide whether the signal is fresh enough to drive a
         # state estimate (see ``kinematics_age`` check below).
         # P1-PIPE-CLOCK: the state loop compares this against
-        # time.monotonic() (timestamp - _last_kinematics_ts at :2288), so
-        # it MUST be a monotonic instant — frame_meta.timestamp is a
-        # time.time() epoch, which made kinematics_age hugely negative and
+        # the injected monotonic clock, so it MUST be a monotonic instant —
+        # frame_meta.timestamp is an epoch, which made kinematics_age hugely negative and
         # the >2.0s stale guard unreachable.
-        self._last_kinematics_ts = time.monotonic()
+        self._last_kinematics_ts = monotonic_seconds(self._clock)
         # C5 (audit): cache this frame's blink-suppression score so the NEXT
         # frame's rPPG window build can forward it into the apnea path with
         # a 1-frame lag. ``blink_suppression_score`` is Optional on
@@ -2216,7 +2256,10 @@ class CortexDaemon:
         # P1-PIPE-CLOCK: monotonic stamp for fusion staleness math (see
         # update_physio above). frame_meta.timestamp is an epoch and would
         # make _compute_signal_quality's staleness penalty dead code.
-        self._feature_fusion.update_kinematics(self._latest_kinematics, timestamp=time.monotonic())
+        self._feature_fusion.update_kinematics(
+            self._latest_kinematics,
+            timestamp=monotonic_seconds(self._clock),
+        )
 
     async def _telemetry_loop(self) -> None:
         try:
@@ -2401,9 +2444,9 @@ class CortexDaemon:
         try:
             while True:
                 try:
-                    now = time.localtime()
+                    now = utc_datetime(self._clock).astimezone()
                     target_hour = self.config.eval.causal_report.nightly_hour_local
-                    if now.tm_hour == target_hour and now.tm_min < 5:
+                    if now.hour == target_hour and now.minute < 5:
                         generate_daily_causal_report(self.config.storage.path)
                         await asyncio.sleep(300.0)
                         continue
@@ -2417,9 +2460,10 @@ class CortexDaemon:
     async def _state_loop(self) -> None:
         try:
             while True:
-                timestamp = time.monotonic()
+                event_time = EventTime.from_clock(self._clock)
+                timestamp = event_time.observed_at_mono_ns / 1_000_000_000.0
                 try:
-                    vector, quality = self._feature_fusion.fuse(timestamp=timestamp)
+                    vector, quality = self._feature_fusion.fuse(event_time=event_time)
 
                     # v2.0: Inject thrashing score from aggregator. The
                     # FeatureAggregator guarantees ``thrashing_score`` as
@@ -2465,7 +2509,7 @@ class CortexDaemon:
                     estimate = self._smoother.update(
                         scores,
                         quality,
-                        timestamp=timestamp,
+                        event_time=event_time,
                         ml_p_hyper=ml_p_hyper,
                         ml_alpha=ml_alpha,
                     )
@@ -2551,7 +2595,7 @@ class CortexDaemon:
                             self._session_report.start()
                             self._session_report_started = True
                         self._session_report.record_state(
-                            estimate.state, time.time(),
+                            estimate.state, unix_seconds(self._clock),
                         )
                         if vector.hr:
                             self._session_report.record_hr(float(vector.hr))
@@ -2671,7 +2715,7 @@ class CortexDaemon:
                             kb_burst = float(getattr(telemetry_for_trigger, "keyboard_burst_score", 0.0))
                             if kb_burst >= 0.8:
                                 typing_burst_seconds = self.config.intervention.receptivity_typing_burst_seconds
-                        hour_now = time.localtime().tm_hour
+                        hour_now = utc_datetime(self._clock).astimezone().hour
                         within_work_hours = (
                             self.config.intervention.receptivity_work_hours_start
                             <= hour_now
@@ -2688,7 +2732,7 @@ class CortexDaemon:
                         # controller can suppress audio when the user
                         # is on a call.
                         if mic_state:
-                            self._last_mic_active_at = time.monotonic()
+                            self._last_mic_active_at = monotonic_seconds(self._clock)
                         decision = self._trigger_policy.evaluate(
                             estimate,
                             context_complexity=context.complexity_score,
@@ -3040,7 +3084,11 @@ class CortexDaemon:
                 return
 
             snapshot = (
-                capture_snapshot(context, intervention_id=plan.intervention_id)
+                capture_snapshot(
+                    context,
+                    intervention_id=plan.intervention_id,
+                    clock=self._clock,
+                )
                 if commands
                 else None
             )
@@ -3667,7 +3715,8 @@ class CortexDaemon:
             if (
                 mute_window > 0
                 and self._last_mic_active_at > 0
-                and time.monotonic() - self._last_mic_active_at < mute_window
+                and monotonic_seconds(self._clock) - self._last_mic_active_at
+                < mute_window
             ):
                 logger.info(
                     "Biology break: muting audio_cue — microphone "
@@ -3770,21 +3819,35 @@ class CortexDaemon:
         """
         kind = self._quiet_mode_kind
         ends_at = self._quiet_mode_ends_at
+        active_clock = getattr(self, "_clock", SYSTEM_CLOCK)
+        deadline = getattr(self, "_quiet_mode_deadline", None)
+        deadline_expired = (
+            deadline.expired(active_clock)
+            if isinstance(deadline, BoundedDeadline)
+            else ends_at is not None and unix_seconds(active_clock) >= ends_at
+        )
         if kind == "off" or (
-            ends_at is not None and time.time() >= ends_at
+            ends_at is not None and deadline_expired
         ):
             # Stale window — re-normalise so the broadcast is honest.
             kind = "off"
             ends_at = None
             self._quiet_mode_kind = "off"
             self._quiet_mode_ends_at = None
+            self._quiet_mode_deadline = None
         duration_minutes: int | None = None
         if ends_at is not None:
-            duration_minutes = max(0, int(round((ends_at - time.time()) / 60.0)))
+            remaining_seconds = (
+                deadline.remaining_ms(active_clock) / 1_000.0
+                if isinstance(deadline, BoundedDeadline)
+                else max(0.0, ends_at - unix_seconds(active_clock))
+            )
+            duration_minutes = max(0, int(round(remaining_seconds / 60.0)))
         return {
             "kind": kind,
             "duration_minutes": duration_minutes,
             "ends_at": ends_at,
+            "ends_at_unix_ms": int(ends_at * 1_000) if ends_at is not None else None,
             "source": self._quiet_mode_source,
         }
 
@@ -3848,8 +3911,16 @@ class CortexDaemon:
             )))
         else:
             minutes = 0  # pause / off carry no countdown
-        ends_at: float | None = (
-            time.time() + minutes * 60.0 if minutes > 0 else None
+        active_clock = getattr(self, "_clock", SYSTEM_CLOCK)
+        deadline = (
+            BoundedDeadline.after(active_clock, minutes * 60_000)
+            if minutes > 0
+            else None
+        )
+        ends_at = (
+            deadline.expires_at_unix_ms / 1_000.0
+            if deadline is not None
+            else None
         )
 
         # Serialise under the lock so two surfaces flipping kinds
@@ -3924,6 +3995,7 @@ class CortexDaemon:
             # Record state under the same lock to keep readers consistent.
             self._quiet_mode_kind = kind
             self._quiet_mode_ends_at = ends_at
+            self._quiet_mode_deadline = deadline
             self._quiet_mode_source = str(source or "daemon")
 
             # C6 (audit): emit QUIET_MODE_ENTERED / QUIET_MODE_EXITED on the
@@ -4004,6 +4076,7 @@ class CortexDaemon:
                 return
             self._quiet_mode_kind = "off"
             self._quiet_mode_ends_at = None
+            self._quiet_mode_deadline = None
             self._quiet_mode_source = "daemon_decay"
             self._trigger_policy.clear_quiet_mode()
         try:
@@ -4502,7 +4575,7 @@ class CortexDaemon:
             # across timezones. The step schema stores datetimes; the
             # reader at Phase-4a tolerates both naive and tz-aware
             # values for backwards compat with older session JSONs.
-            now = datetime.now(UTC)
+            now = utc_datetime(_daemon_clock(self))
             prior_status = step.status
             step.status = new_status  # type: ignore[assignment]
             # Stamp lifecycle timestamps. ``started_at`` is set the first
@@ -4771,7 +4844,7 @@ class CortexDaemon:
                         # quiet-mode timer. The latch records the last
                         # activation timestamp; subsequent crossings
                         # are no-ops until the window clears.
-                        now = time.monotonic()
+                        now = monotonic_seconds(self._clock)
                         already_latched = (
                             now - self._quiet_mode_throttle_latched_at < 30.0
                         )
@@ -5420,6 +5493,8 @@ class CortexDaemon:
     @staticmethod
     def _leetcode_submission_epoch_seconds(context: LeetCodeContext) -> float | None:
         """Normalize content-script submission timestamps to epoch seconds."""
+        if context.last_submission_at_unix_ms is not None:
+            return float(context.last_submission_at_unix_ms) / 1_000.0
         value = context.last_submission_ts
         if value is None:
             return None
@@ -5430,14 +5505,13 @@ class CortexDaemon:
             return None
         return ts
 
-    @classmethod
-    def _leetcode_submission_monotonic(cls, context: LeetCodeContext) -> float | None:
+    def _leetcode_submission_monotonic(self, context: LeetCodeContext) -> float | None:
         """Convert a LeetCode submission epoch timestamp to monotonic time."""
-        epoch_seconds = cls._leetcode_submission_epoch_seconds(context)
+        epoch_seconds = self._leetcode_submission_epoch_seconds(context)
         if epoch_seconds is None:
             return None
-        age = max(0.0, time.time() - epoch_seconds)
-        return time.monotonic() - age
+        age = max(0.0, unix_seconds(self._clock) - epoch_seconds)
+        return monotonic_seconds(self._clock) - age
 
     # --- v2.0 helper methods ---
 
@@ -5447,8 +5521,7 @@ class CortexDaemon:
         # Phase-4b TASK N: UTC for the hour-of-day feature so the bandit
         # learns a single global chronotype rather than one per timezone
         # the user travels through.
-        import datetime as dt
-        hour = dt.datetime.now(dt.UTC).hour
+        hour = utc_datetime(self._clock).hour
         return [
             state_map.get(estimate.state, 0.5),
             context.complexity_score if hasattr(context, 'complexity_score') else 0.0,
@@ -5516,7 +5589,10 @@ class CortexDaemon:
     async def _generate_handover(self, context: Any) -> None:
         """Generate a handover snapshot for tomorrow's morning briefing."""
         try:
-            snapshot = HandoverSnapshot(str(self.config.storage.path))
+            snapshot = HandoverSnapshot(
+                str(self.config.storage.path),
+                clock=self._clock,
+            )
 
             # Gather recent activity data for the handover
             activity_timeline: list[dict[str, Any]] | None = None
@@ -5685,7 +5761,8 @@ class CortexDaemon:
         # (the CostResponse schema promises the two surfaces are identical).
         prompt_tokens, completion_tokens = probe_token_totals(tracker)
         model = probe_active_model(self._llm_client)
-        return CostResponse(
+        return CostResponse.from_clock(
+            _daemon_clock(self),
             cost_today=cost_today,
             budget_today=budget_today,
             provider=provider,
@@ -5763,7 +5840,8 @@ class CortexDaemon:
         # Probe path: prefer a tiny diagnostic ``ping`` if the client
         # exposes one; otherwise fall back to a token-count call. Both
         # paths run inside a 5 s wall-clock cap.
-        start = time.monotonic()
+        clock = _daemon_clock(self)
+        start = monotonic_seconds(clock)
         try:
             probe = getattr(client, "ping", None)
             if probe is None or not asyncio.iscoroutinefunction(probe):
@@ -5785,7 +5863,7 @@ class CortexDaemon:
                 # attribute we treat construction-time success as a
                 # probe (the network call is gated by an env-bound 5 s
                 # timeout but production tests already inject stubs).
-                latency_ms = (time.monotonic() - start) * 1000.0
+                latency_ms = (monotonic_seconds(clock) - start) * 1000.0
                 return TestProviderResult(
                     provider=canonical,
                     ok=True,
@@ -5793,7 +5871,7 @@ class CortexDaemon:
                     error=None,
                 )
             await asyncio.wait_for(probe(), timeout=5.0)
-            latency_ms = (time.monotonic() - start) * 1000.0
+            latency_ms = (monotonic_seconds(clock) - start) * 1000.0
             return TestProviderResult(
                 provider=canonical,
                 ok=True,
@@ -5868,6 +5946,7 @@ class CortexDaemon:
         if ws is None:
             return False
         recap_payload: dict[str, Any]
+        clock = _daemon_clock(self)
         try:
             if self._session_report_started and self._session_report is not None:
                 # C4 (audit): wrap the real report in the declared
@@ -5876,7 +5955,7 @@ class CortexDaemon:
                 report = self._session_report.finish()
                 recap_payload = SessionRecap(
                     report=report,
-                    generated_at=datetime.now(UTC).isoformat(),
+                    generated_at=utc_datetime(clock).isoformat(),
                     persisted=False,
                 ).model_dump(mode="json")
             else:
@@ -5885,8 +5964,8 @@ class CortexDaemon:
                 # ``session_id`` presence and tolerates this shape.
                 recap_payload = {
                     "session_id": "force_recap",
-                    "start_time": datetime.now(UTC).isoformat(),
-                    "end_time": datetime.now(UTC).isoformat(),
+                    "start_time": utc_datetime(clock).isoformat(),
+                    "end_time": utc_datetime(clock).isoformat(),
                     "duration_seconds": 0.0,
                     "persisted": False,
                 }
@@ -5951,6 +6030,7 @@ class CortexDaemon:
                 self._trigger_policy = TriggerPolicy(
                     self.config.intervention,
                     state_config=self.config.state,
+                    clock=self._clock,
                 )
             registry.register("trigger_policy", self._trigger_policy)
         if "cooldown_seconds" in settings:
@@ -5964,6 +6044,7 @@ class CortexDaemon:
                 self._trigger_policy = TriggerPolicy(
                     self.config.intervention,
                     state_config=self.config.state,
+                    clock=self._clock,
                 )
             registry.register("trigger_policy", self._trigger_policy)
         if "webcam_enabled" in settings:

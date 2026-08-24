@@ -19,11 +19,11 @@ Levels:
 
 from __future__ import annotations
 
-import time
 import warnings
 from collections import deque
 from dataclasses import dataclass, field
 
+from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 from cortex.libs.schemas.state import StateEstimate
 
 
@@ -72,6 +72,7 @@ class InterventionTrigger:
         quiet_mode_seconds: float = 1800.0,  # 30 min
         dismissal_bump: float = 0.05,
         dismissal_decay_seconds: float = 3600.0,  # 1 hour
+        clock: Clock | None = None,
     ) -> None:
         warnings.warn(
             "InterventionTrigger is deprecated; use "
@@ -79,6 +80,7 @@ class InterventionTrigger:
             DeprecationWarning,
             stacklevel=2,
         )
+        self._clock = clock or SYSTEM_CLOCK
         self._overlay_threshold = overlay_threshold
         self._simplified_threshold = simplified_threshold
         self._guided_threshold = guided_threshold
@@ -116,7 +118,11 @@ class InterventionTrigger:
         Returns:
             TriggerDecision with should_trigger, level, and reasons.
         """
-        now = current_time if current_time is not None else time.monotonic()
+        now = (
+            current_time
+            if current_time is not None
+            else monotonic_seconds(self._clock)
+        )
         reasons: list[str] = []
 
         # Check quiet mode
@@ -192,7 +198,11 @@ class InterventionTrigger:
 
     def record_dismissal(self, *, timestamp: float | None = None) -> None:
         """Record that the user dismissed an intervention."""
-        now = timestamp if timestamp is not None else time.monotonic()
+        now = (
+            timestamp
+            if timestamp is not None
+            else monotonic_seconds(self._clock)
+        )
         self._dismissals.append(
             DismissalEntry(timestamp=now, threshold_bump=self._dismissal_bump)
         )
@@ -212,7 +222,7 @@ class InterventionTrigger:
     @property
     def in_quiet_mode(self) -> bool:
         """Check if quiet mode is currently active (using real time)."""
-        return time.monotonic() < self._quiet_mode_until
+        return monotonic_seconds(self._clock) < self._quiet_mode_until
 
     def is_quiet_mode_at(self, t: float) -> bool:
         """Check if quiet mode is active at a given timestamp."""

@@ -8,10 +8,15 @@ Manages intervention lifecycle: auto-timeout (5 min), recovery detection
 from __future__ import annotations
 
 import logging
-import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from cortex.application.clock import (
+    SYSTEM_CLOCK,
+    Clock,
+    monotonic_seconds,
+    utc_datetime,
+)
 from cortex.libs.schemas.intervention import (
     InterventionOutcome,
     MicroStep,
@@ -71,6 +76,8 @@ class ActiveIntervention:
     timeout_seconds: float = 300.0  # 5 min
     recovery_threshold: float = 0.70
     recovery_dwell_seconds: float = 15.0
+    started_at_unix_ms: int = 0
+    clock: Clock = field(default=SYSTEM_CLOCK, repr=False, compare=False)
 
     # Recovery tracking
     flow_start_time: float | None = None
@@ -78,7 +85,9 @@ class ActiveIntervention:
     @property
     def is_timed_out(self) -> bool:
         """Check if intervention has exceeded timeout (using real time)."""
-        return (time.monotonic() - self.started_at) > self.timeout_seconds
+        return (
+            monotonic_seconds(self.clock) - self.started_at
+        ) > self.timeout_seconds
 
     def timed_out_at(self, t: float) -> bool:
         """Check if intervention has exceeded timeout at a given time."""
@@ -108,7 +117,7 @@ class ActiveIntervention:
     @property
     def duration_seconds(self) -> float:
         """Duration since intervention started."""
-        return time.monotonic() - self.started_at
+        return monotonic_seconds(self.clock) - self.started_at
 
     def duration_at(self, t: float) -> float:
         """Duration at a given timestamp."""
@@ -128,7 +137,9 @@ class RestoreManager:
         timeout_seconds: float = 300.0,
         recovery_threshold: float = 0.70,
         recovery_dwell_seconds: float = 15.0,
+        clock: Clock | None = None,
     ) -> None:
+        self._clock = clock or SYSTEM_CLOCK
         self._executor = executor
         self._timeout = timeout_seconds
         self._recovery_threshold = recovery_threshold
@@ -144,7 +155,11 @@ class RestoreManager:
         started_at: float | None = None,
     ) -> ActiveIntervention:
         """Register a new active intervention."""
-        now = started_at if started_at is not None else time.monotonic()
+        now = (
+            started_at
+            if started_at is not None
+            else monotonic_seconds(self._clock)
+        )
         active = ActiveIntervention(
             intervention_id=intervention_id,
             snapshot=snapshot,
@@ -152,6 +167,8 @@ class RestoreManager:
             timeout_seconds=self._timeout,
             recovery_threshold=self._recovery_threshold,
             recovery_dwell_seconds=self._recovery_dwell,
+            started_at_unix_ms=self._clock.unix_ms(),
+            clock=self._clock,
         )
         self._active[intervention_id] = active
         return active
@@ -169,7 +186,11 @@ class RestoreManager:
 
         Returns list of outcomes for any interventions that ended.
         """
-        now = current_time if current_time is not None else time.monotonic()
+        now = (
+            current_time
+            if current_time is not None
+            else monotonic_seconds(self._clock)
+        )
         ended: list[InterventionOutcome] = []
 
         for iid in list(self._active.keys()):
@@ -208,7 +229,11 @@ class RestoreManager:
         if active is None:
             return None
 
-        now = current_time if current_time is not None else time.monotonic()
+        now = (
+            current_time
+            if current_time is not None
+            else monotonic_seconds(self._clock)
+        )
         return await self._end_intervention(active, "dismissed", now)
 
     async def engage(
@@ -222,7 +247,11 @@ class RestoreManager:
         if active is None:
             return None
 
-        now = current_time if current_time is not None else time.monotonic()
+        now = (
+            current_time
+            if current_time is not None
+            else monotonic_seconds(self._clock)
+        )
         return await self._end_intervention(active, "engaged", now)
 
     async def snooze(
@@ -236,7 +265,11 @@ class RestoreManager:
         if active is None:
             return None
 
-        now = current_time if current_time is not None else time.monotonic()
+        now = (
+            current_time
+            if current_time is not None
+            else monotonic_seconds(self._clock)
+        )
         return await self._end_intervention(active, "snoozed", now)
 
     async def cancel(
@@ -250,7 +283,11 @@ class RestoreManager:
         if active is None:
             return None
 
-        now = current_time if current_time is not None else time.monotonic()
+        now = (
+            current_time
+            if current_time is not None
+            else monotonic_seconds(self._clock)
+        )
         return await self._end_intervention(active, "system_cancelled", now)
 
     async def _end_intervention(
@@ -308,8 +345,12 @@ class RestoreManager:
 
         outcome = InterventionOutcome(
             intervention_id=iid,
-            started_at=datetime.now(UTC),  # approximate
-            ended_at=datetime.now(UTC),
+            started_at=(
+                datetime.fromtimestamp(active.started_at_unix_ms / 1_000, tz=UTC)
+                if active.started_at_unix_ms > 0
+                else utc_datetime(self._clock)
+            ),
+            ended_at=utc_datetime(self._clock),
             duration_seconds=duration,
             user_action=user_action,
             recovery_detected=is_recovery,

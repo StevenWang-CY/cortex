@@ -9,8 +9,9 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 from typing import Literal
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 
 class UserState(StrEnum):
@@ -97,12 +98,16 @@ class StateEstimate(BaseModel):
     )
     timestamp: float = Field(
         ...,
+        deprecated=True,
         description=(
-            "UNIX epoch seconds (wall-clock, UTC); comparable across "
-            "producer and consumer. Previously documented as 'Monotonic' "
-            "but the producer uses time.time(), not time.monotonic()."
+            "Deprecated v1 state-pipeline monotonic seconds. Prefer the "
+            "explicit observed_at_* fields."
         ),
     )
+    schema_version: Literal["2.0"] = "2.0"
+    observed_at_unix_ms: int | None = Field(None, ge=0)
+    observed_at_mono_ns: int | None = Field(None, ge=0)
+    boot_id: UUID | None = None
     dwell_seconds: float = Field(
         0.0, ge=0.0, description="Seconds in current state"
     )
@@ -121,6 +126,17 @@ class StateEstimate(BaseModel):
     classifier_alpha: float | None = Field(
         None, ge=0.0, le=1.0, description="Ensemble weight on ML branch when used"
     )
+
+    @model_validator(mode="after")
+    def _validate_v2_time_tuple(self) -> StateEstimate:
+        supplied = (
+            self.observed_at_unix_ms is not None,
+            self.observed_at_mono_ns is not None,
+            self.boot_id is not None,
+        )
+        if any(supplied) and not all(supplied):
+            raise ValueError("state estimate v2 time fields must be supplied together")
+        return self
 
     @property
     def is_overwhelmed(self) -> bool:
@@ -210,11 +226,15 @@ class StateTransition(BaseModel):
 
     timestamp: float = Field(
         ...,
+        deprecated=True,
         description=(
-            "UNIX epoch seconds (wall-clock, UTC) when the transition "
-            "occurred; comparable across producer and consumer."
+            "Deprecated v1 monotonic seconds in the producing boot."
         ),
     )
+    schema_version: Literal["2.0"] = "2.0"
+    observed_at_unix_ms: int | None = Field(None, ge=0)
+    observed_at_mono_ns: int | None = Field(None, ge=0)
+    boot_id: UUID | None = None
     from_state: Literal["FLOW", "HYPO", "HYPER", "RECOVERY"] = Field(
         ..., description="Previous state"
     )
@@ -233,6 +253,17 @@ class StateTransition(BaseModel):
     trigger_reasons: list[str] = Field(
         default_factory=list, description="Reasons for transition"
     )
+
+    @model_validator(mode="after")
+    def _validate_v2_time_tuple(self) -> StateTransition:
+        supplied = (
+            self.observed_at_unix_ms is not None,
+            self.observed_at_mono_ns is not None,
+            self.boot_id is not None,
+        )
+        if any(supplied) and not all(supplied):
+            raise ValueError("state transition v2 time fields must be supplied together")
+        return self
 
     @property
     def is_escalation(self) -> bool:

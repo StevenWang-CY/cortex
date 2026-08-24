@@ -31,12 +31,13 @@ import asyncio
 import logging
 import os
 import random
-import time
 from collections import deque
 from typing import Any, Literal, cast
 
 from anthropic import APIError, APIStatusError, APITimeoutError, RateLimitError
 from pydantic import ValidationError
+
+from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 
 # audit Phase-I: ``keyring`` is imported lazily inside
 # :func:`_keychain_get_bedrock_token`. The module is heavyweight
@@ -304,8 +305,10 @@ class AnthropicPlanner:
         *,
         sdk: Any | None = None,
         cost_tracker: CostTracker | None = None,
+        clock: Clock | None = None,
     ) -> None:
         self._config = config or LLMConfig()
+        self._clock = clock or SYSTEM_CLOCK
 
         # F11: previously the keychain-sourced Bedrock token was written
         # to ``os.environ`` permanently, which then propagated to every
@@ -362,7 +365,10 @@ class AnthropicPlanner:
             ),
         }
 
-        self._cache = cache or LLMCache(default_ttl=self._config.cache_ttl_seconds)
+        self._cache = cache or LLMCache(
+            default_ttl=self._config.cache_ttl_seconds,
+            clock=self._clock,
+        )
         self._semaphore = asyncio.Semaphore(self._config.max_concurrent_requests)
         self._circuit = _CircuitBreaker(
             threshold=self._config.circuit_failure_threshold,
@@ -383,6 +389,7 @@ class AnthropicPlanner:
                     ledger_path=ledger_path,
                     warn_usd=self._config.cost_warn_usd,
                     kill_usd=self._config.daily_cost_budget_usd,
+                    clock=self._clock,
                 )
             except (OSError, ValueError) as exc:
                 # Cost tracking is best-effort: a broken ledger path
@@ -473,7 +480,7 @@ class AnthropicPlanner:
         extra_context: str = "",
     ) -> InterventionPlan:
         """Generate a typed intervention plan, with cache + retry + fallback."""
-        now_mono = time.monotonic()
+        now_mono = monotonic_seconds(self._clock)
 
         # Cache hit short-circuits everything.
         cached = self._cache.get(context, state, constraints, now=now_mono)
@@ -569,7 +576,7 @@ class AnthropicPlanner:
                 killed.metadata["budget_killed"] = True
                 killed.metadata["budget_killed_on_retry"] = attempt + 1
                 return killed
-            t0 = time.perf_counter()
+            t0 = monotonic_seconds(self._clock)
             response: Any = None
             try:
                 async with self._semaphore:
@@ -621,7 +628,7 @@ class AnthropicPlanner:
                         )
                         raise
             except (RateLimitError, APITimeoutError, APIStatusError) as exc:
-                latency_ms = (time.perf_counter() - t0) * 1000.0
+                latency_ms = (monotonic_seconds(self._clock) - t0) * 1000.0
                 # Audit-2 fix: surface 401 / 403 (revoked or invalid
                 # BYOK token) as a distinct, non-retryable failure so the
                 # user gets an immediate signal that their token is bad.
@@ -640,7 +647,7 @@ class AnthropicPlanner:
                         status,
                         type(exc).__name__,
                     )
-                    self._circuit.record_failure(time.monotonic())
+                    self._circuit.record_failure(monotonic_seconds(self._clock))
                     auth_fallback = build_fallback_plan(context)
                     auth_fallback.metadata["fallback_reason"] = "auth_error"
                     auth_fallback.metadata["source"] = "fallback"
@@ -656,7 +663,7 @@ class AnthropicPlanner:
                     type(exc).__name__,
                 )
                 if attempt == attempts - 1:
-                    self._circuit.record_failure(time.monotonic())
+                    self._circuit.record_failure(monotonic_seconds(self._clock))
                     break
                 # Bounded exponential backoff with jitter. Wrap in
                 # try/finally so a cancellation during the sleep still
@@ -674,7 +681,7 @@ class AnthropicPlanner:
                     raise
                 continue
             except APIError as exc:
-                latency_ms = (time.perf_counter() - t0) * 1000.0
+                latency_ms = (monotonic_seconds(self._clock) - t0) * 1000.0
                 logger.error(
                     "llm.request status=fatal model=%s template=%s "
                     "latency_ms=%.0f err=%s",
@@ -683,7 +690,7 @@ class AnthropicPlanner:
                     latency_ms,
                     type(exc).__name__,
                 )
-                self._circuit.record_failure(time.monotonic())
+                self._circuit.record_failure(monotonic_seconds(self._clock))
                 break
 
             # Successful HTTP — now validate the tool_use payload.
@@ -696,7 +703,7 @@ class AnthropicPlanner:
                         line_errors=[],
                     )
             except (ValueError, ValidationError) as exc:
-                latency_ms = (time.perf_counter() - t0) * 1000.0
+                latency_ms = (monotonic_seconds(self._clock) - t0) * 1000.0
                 logger.warning(
                     "llm.request status=invalid model=%s template=%s "
                     "latency_ms=%.0f err=%s",
@@ -706,7 +713,7 @@ class AnthropicPlanner:
                     type(exc).__name__,
                 )
                 if attempt == attempts - 1:
-                    self._circuit.record_failure(time.monotonic())
+                    self._circuit.record_failure(monotonic_seconds(self._clock))
                     # B11 (Phase 4.1): stash the discriminator so the
                     # post-loop fallback path can stamp the right
                     # failure_mode (parse_error vs. timeout). Without
@@ -718,7 +725,7 @@ class AnthropicPlanner:
 
             self._circuit.record_success()
             self._last_validation_error = False
-            latency_ms = (time.perf_counter() - t0) * 1000.0
+            latency_ms = (monotonic_seconds(self._clock) - t0) * 1000.0
             usage = getattr(response, "usage", None)
             # F19: include the active correlation id so downstream cost
             # accounting (F20) can group spend by originating request.
@@ -760,7 +767,13 @@ class AnthropicPlanner:
                 enriched.metadata["context_truncated_sections"] = list(
                     _truncation_report.sections_trimmed
                 )
-            self._cache.put(context, enriched, state, constraints)
+            self._cache.put(
+                context,
+                enriched,
+                state,
+                constraints,
+                now=monotonic_seconds(self._clock),
+            )
             return enriched
 
         # All retries exhausted → deterministic fallback.

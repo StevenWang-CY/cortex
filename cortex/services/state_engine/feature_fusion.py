@@ -11,8 +11,8 @@ tracks per-channel signal quality for downstream state classification.
 from __future__ import annotations
 
 import logging
-import time
 
+from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 from cortex.libs.schemas.features import (
     FeatureVector,
     KinematicFeatures,
@@ -20,6 +20,7 @@ from cortex.libs.schemas.features import (
     TelemetryFeatures,
 )
 from cortex.libs.schemas.state import SignalQuality
+from cortex.libs.schemas.temporal import EventTime
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,8 @@ class FeatureFusion:
         vector, quality = fusion.fuse()
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Clock | None = None) -> None:
+        self._clock = clock or SYSTEM_CLOCK
         # Phase 4 fix #5/#7 invariant: the per-channel timestamp must always
         # be valid *by the time* the matching feature pointer becomes
         # non-None. ``update_*`` enforces this by assigning timestamp BEFORE
@@ -75,7 +77,9 @@ class FeatureFusion:
         today so this is belt-and-braces, but the ordering invariant must
         match the code regardless.
         """
-        self._physio_timestamp = timestamp if timestamp is not None else time.monotonic()
+        self._physio_timestamp = (
+            timestamp if timestamp is not None else monotonic_seconds(self._clock)
+        )
         self._physio = features
 
     def update_kinematics(
@@ -85,7 +89,9 @@ class FeatureFusion:
 
         Phase 4 fix #5: see ``update_physio`` for ordering rationale.
         """
-        self._kinematics_timestamp = timestamp if timestamp is not None else time.monotonic()
+        self._kinematics_timestamp = (
+            timestamp if timestamp is not None else monotonic_seconds(self._clock)
+        )
         self._kinematics = features
 
     def update_telemetry(
@@ -95,11 +101,18 @@ class FeatureFusion:
 
         Phase 4 fix #5: see ``update_physio`` for ordering rationale.
         """
-        self._telemetry_timestamp = timestamp if timestamp is not None else time.monotonic()
+        self._telemetry_timestamp = (
+            timestamp if timestamp is not None else monotonic_seconds(self._clock)
+        )
         self._telemetry = features
         self._telemetry_seen_count += 1
 
-    def fuse(self, timestamp: float | None = None) -> tuple[FeatureVector, SignalQuality]:
+    def fuse(
+        self,
+        timestamp: float | None = None,
+        *,
+        event_time: EventTime | None = None,
+    ) -> tuple[FeatureVector, SignalQuality]:
         """
         Produce a unified FeatureVector from all available channels.
 
@@ -112,7 +125,10 @@ class FeatureFusion:
         Returns:
             (FeatureVector, SignalQuality) tuple.
         """
-        now = timestamp or time.monotonic()
+        if event_time is not None:
+            now = event_time.observed_at_mono_ns / 1_000_000_000.0
+        else:
+            now = timestamp if timestamp is not None else monotonic_seconds(self._clock)
 
         # Physio features (dimensions 1-3 + respiration)
         hr = None
@@ -177,6 +193,13 @@ class FeatureFusion:
 
         vector = FeatureVector(
             timestamp=now,
+            observed_at_unix_ms=(
+                event_time.observed_at_unix_ms if event_time is not None else None
+            ),
+            observed_at_mono_ns=(
+                event_time.observed_at_mono_ns if event_time is not None else None
+            ),
+            boot_id=event_time.boot_id if event_time is not None else None,
             hr=hr,
             hrv_rmssd=hrv_rmssd,
             hrv_sdnn=hrv_sdnn,

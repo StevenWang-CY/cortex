@@ -6,8 +6,10 @@ WIRE_CONTRACTS
 Timestamp unit
 --------------
 Version-2 contracts use explicit ``*_unix_ms`` / ``*_mono_ns`` names plus a
-``boot_id``. Legacy ``float timestamp`` fields remain epoch seconds for one
-compatibility interval and must not be introduced into new schemas.
+``boot_id``. Deprecated v1 ``float timestamp`` fields retain their historical
+meaning—epoch seconds on transport/capture records and monotonic seconds on
+the state pipeline—and every such field documents that provenance. New
+schemas must not introduce an unqualified numeric time field.
 
 Enum policy
 -----------
@@ -28,6 +30,33 @@ as equivalent** — never assume an absent key means ``False`` or ``0``.
 
 # Pydantic schemas for Cortex
 
+from cortex.libs.schemas.api import (
+    AckResponse,
+    ConsentLevelResponse,
+    ConsentResetRequest,
+    ConsentResetResponse,
+    ContextBuildRequest,
+    ContextBuildResponse,
+    DashboardRaiseRequest,
+    DashboardRaiseResponse,
+    FeedbackRequest,
+    FeedbackResponse,
+    HealthResponse,
+    HelpfulnessSummaryResponse,
+    InterventionApplyRequest,
+    InterventionApplyResponse,
+    InterventionRestoreRequest,
+    InterventionRestoreResponse,
+    LaunchProjectResponse,
+    LLMPlanRequest,
+    LLMPlanResponse,
+    ProjectListResponse,
+    ShutdownResponse,
+    StateInferRequest,
+    StateInferResponse,
+    StatusResponse,
+    StressIntegralResponse,
+)
 from cortex.libs.schemas.consent import (
     ActionConsentState,
     ConsentDecision,
@@ -86,6 +115,11 @@ from cortex.libs.schemas.native_messaging import (
     StopMessage,
     StopResponse,
 )
+from cortex.libs.schemas.protocol import (
+    AuthOkPayload,
+    AuthRequestPayload,
+    ProtocolErrorPayload,
+)
 from cortex.libs.schemas.session_history import (
     SESSION_ID_PATTERN,
     SessionDetailResponse,
@@ -108,7 +142,12 @@ from cortex.libs.schemas.state import (
     UserBaselines,
     UserState,
 )
-from cortex.libs.schemas.temporal import EventTime
+from cortex.libs.schemas.temporal import (
+    DualClockModel,
+    EventMetadata,
+    EventTime,
+    PersistedDeadline,
+)
 from cortex.libs.schemas.transition_graph import (
     FocusEdge,
     FocusNode,
@@ -118,6 +157,32 @@ from cortex.libs.schemas.ws_message import WSMessage
 from cortex.libs.schemas.ws_message_types import MessageType
 
 __all__ = [
+    # HTTP API
+    "AckResponse",
+    "ShutdownResponse",
+    "DashboardRaiseRequest",
+    "DashboardRaiseResponse",
+    "HealthResponse",
+    "StatusResponse",
+    "StateInferRequest",
+    "StateInferResponse",
+    "ContextBuildRequest",
+    "ContextBuildResponse",
+    "LLMPlanRequest",
+    "LLMPlanResponse",
+    "InterventionApplyRequest",
+    "InterventionApplyResponse",
+    "InterventionRestoreRequest",
+    "InterventionRestoreResponse",
+    "StressIntegralResponse",
+    "HelpfulnessSummaryResponse",
+    "ConsentLevelResponse",
+    "ConsentResetRequest",
+    "ConsentResetResponse",
+    "ProjectListResponse",
+    "LaunchProjectResponse",
+    "FeedbackRequest",
+    "FeedbackResponse",
     # Features
     "FrameMeta",
     "PhysioFeatures",
@@ -132,6 +197,9 @@ __all__ = [
     "UserBaselines",
     "StateTransition",
     "EventTime",
+    "EventMetadata",
+    "PersistedDeadline",
+    "DualClockModel",
     # Context
     "Diagnostic",
     "EditorContext",
@@ -194,6 +262,10 @@ __all__ = [
     "GetAuthTokenResponse",
     "RaiseDashboardResponse",
     "NativeErrorResponse",
+    # Protocol negotiation
+    "AuthRequestPayload",
+    "AuthOkPayload",
+    "ProtocolErrorPayload",
     # WS Envelope (Debt-1 codegen source of truth)
     "WSMessage",
     "MessageType",

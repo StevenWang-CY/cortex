@@ -20,15 +20,16 @@ parser, matching the rest of the schemas in this package.
 
 from __future__ import annotations
 
-import time
-from datetime import UTC, datetime
 from typing import Literal
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from cortex.application.clock import SYSTEM_CLOCK, utc_datetime
 from cortex.libs.schemas.intervention import CausalSignal, InterventionPlan
 from cortex.libs.schemas.session_report import SessionReport
 from cortex.libs.schemas.state import SignalQuality, StateScores
+from cortex.libs.schemas.temporal import DualClockModel
 
 # ─── Shared Literal vocabularies ──────────────────────────────────────
 
@@ -159,11 +160,16 @@ class QuietModeState(BaseModel):
     )
     ends_at: float | None = Field(
         None,
+        deprecated=True,
         description=(
-            "UNIX epoch seconds (wall-clock) when the mode lapses. None "
-            "when kind=='off'. Clients compute a countdown from "
-            "(ends_at - Date.now() / 1000)."
+            "Deprecated v1 UTC Unix-seconds expiry mirror. Prefer "
+            "ends_at_unix_ms."
         ),
+    )
+    ends_at_unix_ms: int | None = Field(
+        None,
+        ge=0,
+        description="UTC Unix epoch milliseconds when the mode lapses.",
     )
     source: QuietModeSource = Field(
         "daemon",
@@ -343,7 +349,7 @@ class SessionRecap(BaseModel):
         ..., description="The full on-disk session report"
     )
     generated_at: str = Field(
-        default_factory=lambda: datetime.now(UTC).isoformat(),
+        default_factory=lambda: utc_datetime(SYSTEM_CLOCK).isoformat(),
         description=(
             "ISO-8601 instant the recap envelope was constructed "
             "(wall-clock). C4 (audit): typed as ``str`` so the daemon's "
@@ -366,7 +372,7 @@ class SessionRecap(BaseModel):
 # ─── CostResponse (COST_RESPONSE payload, §3.15) ──────────────────────
 
 
-class CostResponse(BaseModel):
+class CostResponse(DualClockModel):
     """P0 §3.15: COST_RESPONSE wire payload (unified HTTP + WS envelope).
 
     Emitted as a reply to :attr:`MessageType.COST_REQUEST` (WebSocket path)
@@ -410,13 +416,6 @@ class CostResponse(BaseModel):
     budget_exhausted: bool = Field(
         False,
         description="True when today's spend exceeded the budget cap.",
-    )
-    timestamp: float = Field(
-        default_factory=lambda: time.time(),
-        description=(
-            "UNIX epoch seconds (wall-clock UTC) when this cost snapshot "
-            "was taken. Comparable across producer and consumer."
-        ),
     )
     prompt_tokens: int | None = Field(
         None, ge=0,
@@ -711,13 +710,26 @@ class StateUpdatePayload(BaseModel):
     )
     timestamp: float | str | None = Field(
         None,
+        deprecated=True,
         description=(
-            "Wall-clock timestamp the estimate was produced. May be an "
-            "ISO string (datetime path) or float (monotonic-style "
-            "producer); consumers must accept both shapes for "
-            "backwards-compatibility."
+            "Deprecated v1 producer timestamp with legacy mixed provenance. "
+            "Use observed_at_unix_ms/observed_at_mono_ns/boot_id."
         ),
     )
+    observed_at_unix_ms: int | None = Field(None, ge=0)
+    observed_at_mono_ns: int | None = Field(None, ge=0)
+    boot_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def _validate_v2_time_tuple(self) -> StateUpdatePayload:
+        supplied = (
+            self.observed_at_unix_ms is not None,
+            self.observed_at_mono_ns is not None,
+            self.boot_id is not None,
+        )
+        if any(supplied) and not all(supplied):
+            raise ValueError("state update v2 time fields must be supplied together")
+        return self
     connected_clients: list[str] = Field(
         default_factory=list,
         description=(

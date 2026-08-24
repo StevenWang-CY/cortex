@@ -8,8 +8,11 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Literal
+from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+from cortex.application.clock import SYSTEM_CLOCK, utc_datetime
 
 
 class InterventionSnapshot(BaseModel):
@@ -21,7 +24,28 @@ class InterventionSnapshot(BaseModel):
     error_count: int = Field(0, ge=0)
     thrashing_score: float = Field(0.0, ge=0.0, le=1.0)
     stress_integral: float = Field(0.0, ge=0.0)
-    timestamp: float = Field(0.0)
+    timestamp: float = Field(
+        0.0,
+        deprecated=True,
+        description="Deprecated v1 process-local monotonic seconds.",
+    )
+    schema_version: Literal["2.0"] = "2.0"
+    observed_at_unix_ms: int | None = Field(None, ge=0)
+    observed_at_mono_ns: int | None = Field(None, ge=0)
+    boot_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def _validate_v2_time_tuple(self) -> InterventionSnapshot:
+        supplied = (
+            self.observed_at_unix_ms is not None,
+            self.observed_at_mono_ns is not None,
+            self.boot_id is not None,
+        )
+        if any(supplied) and not all(supplied):
+            raise ValueError(
+                "intervention snapshot v2 time fields must be supplied together"
+            )
+        return self
 
 
 class HelpfulnessRecord(BaseModel):
@@ -34,7 +58,9 @@ class HelpfulnessRecord(BaseModel):
     post_state: InterventionSnapshot | None = Field(None, description="State after intervention")
 
     # Timing
-    started_at: datetime = Field(default_factory=datetime.now)
+    started_at: datetime = Field(
+        default_factory=lambda: utc_datetime(SYSTEM_CLOCK)
+    )
     ended_at: datetime | None = Field(None)
     time_to_flow_seconds: float | None = Field(
         None, ge=0.0, description="Seconds until user returned to FLOW"

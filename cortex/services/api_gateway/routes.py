@@ -26,20 +26,45 @@ Status & Health:
 from __future__ import annotations
 
 import logging
-import time
 from typing import Any, Literal
 
 from fastapi import APIRouter, Path, Request
 from fastapi.responses import Response
-from pydantic import BaseModel, Field
 
+from cortex.application.clock import Clock, clock_or_system, utc_datetime
 from cortex.libs.config.ports import HTTP_API_PORT, WEBSOCKET_PORT
 from cortex.libs.logging.correlation import get_correlation_id
 from cortex.libs.logging.structured import EventType
 from cortex.libs.ports.intervention_port import InterventionPort
+from cortex.libs.schemas.api import (
+    AckResponse,
+    ConsentLevelResponse,
+    ConsentResetRequest,
+    ConsentResetResponse,
+    ContextBuildRequest,
+    ContextBuildResponse,
+    DashboardRaiseRequest,
+    DashboardRaiseResponse,
+    FeedbackRequest,
+    FeedbackResponse,
+    HealthResponse,
+    HelpfulnessSummaryResponse,
+    InterventionApplyRequest,
+    InterventionApplyResponse,
+    InterventionRestoreRequest,
+    InterventionRestoreResponse,
+    LaunchProjectResponse,
+    LLMPlanRequest,
+    LLMPlanResponse,
+    ProjectListResponse,
+    ShutdownResponse,
+    StateInferRequest,
+    StateInferResponse,
+    StatusResponse,
+    StressIntegralResponse,
+)
 from cortex.libs.schemas.context import TaskContext
 from cortex.libs.schemas.features import (
-    FeatureVector,
     FrameMeta,
     KinematicFeatures,
     PhysioFeatures,
@@ -47,7 +72,6 @@ from cortex.libs.schemas.features import (
 )
 from cortex.libs.schemas.intervention import (
     InterventionApplyResult,
-    InterventionOutcome,
     InterventionPlan,
     WorkspaceSnapshot,
 )
@@ -57,7 +81,8 @@ from cortex.libs.schemas.session_history import (
     SessionListResponse,
     TrendsResponse,
 )
-from cortex.libs.schemas.state import SignalQuality, StateEstimate, StateScores
+from cortex.libs.schemas.state import StateEstimate, StateScores
+from cortex.libs.schemas.temporal import EventTime
 from cortex.libs.schemas.ws_message_types import MessageType
 from cortex.services.intervention_engine import (
     capture_snapshot as _engine_capture_snapshot,
@@ -119,6 +144,14 @@ def prepare_plan(
 
 logger = logging.getLogger(__name__)
 
+
+def _get_clock(request: Request) -> Clock:
+    """Resolve the app-owned clock, falling back only at the HTTP boundary."""
+
+    state = getattr(getattr(request, "app", None), "state", None)
+    candidate = getattr(state, "clock", None) if state is not None else None
+    return clock_or_system(candidate)
+
 # Two routers — a public liveness-only router and an authenticated
 # router that owns every mutating endpoint. ``app.py`` mounts each with
 # the appropriate dependency. The split is structural: defining a new
@@ -133,23 +166,6 @@ health_router = APIRouter()
 # =============================================================================
 # Response models
 # =============================================================================
-
-
-class AckResponse(BaseModel):
-    """Simple acknowledgement response."""
-
-    status: str = "ok"
-    # Phase-4a fix: use wall-clock seconds so clients can compare this to
-    # ``Date.now() / 1000`` without a monotonic-vs-epoch unit mismatch.
-    timestamp: float = Field(default_factory=time.time)
-
-
-class ShutdownResponse(BaseModel):
-    """Response for the /shutdown endpoint."""
-
-    status: str = "shutting_down"
-    # Phase-4a fix: see ``AckResponse.timestamp``.
-    timestamp: float = Field(default_factory=time.time)
 
 
 @router.post("/shutdown", response_model=ShutdownResponse)
@@ -171,23 +187,8 @@ async def shutdown(request: Request) -> ShutdownResponse:
     # Schedule shutdown after response is sent
     loop = asyncio.get_running_loop()
     loop.call_later(0.5, os.kill, os.getpid(), _signal.SIGTERM)
-    return ShutdownResponse(status="shutting_down")
-
-
-class DashboardRaiseRequest(BaseModel):
-    """Phase-4b TASK K: optional ``target`` hint for the dashboard."""
-
-    target: str | None = None
-
-
-class DashboardRaiseResponse(BaseModel):
-    """Phase-4b TASK K: result of a /dashboard/raise call."""
-
-    raised: bool = True
-    target: str | None = None
-    timestamp: float = Field(
-        default_factory=time.time,
-        description="Wall-clock seconds since epoch (UTC).",
+    return ShutdownResponse.from_clock(
+        _get_clock(request), status="shutting_down",
     )
 
 
@@ -219,194 +220,12 @@ async def raise_dashboard(
                 "RAISE_DASHBOARD broadcast failed (ws_port=%d)",
                 WEBSOCKET_PORT,
             )
-            return DashboardRaiseResponse(raised=False, target=target)
-    return DashboardRaiseResponse(raised=True, target=target)
-
-
-class HealthResponse(BaseModel):
-    """Health check response."""
-
-    status: str
-    services: dict[str, str]
-    uptime_seconds: float
-    # G2 (audit-prod): expose the daemon version so the browser
-    # extension's CONNECTIVITY_DIAGNOSTIC can detect a version mismatch
-    # between the installed extension and the running daemon.
-    version: str | None = None
-    # B2 (Phase 4.1): operator-facing counter of duplicate
-    # INTERVENTION_APPLIED ack frames seen since the daemon started.
-    # A nonzero value points at extension misbehaviour (re-acking the
-    # same phase) but is non-fatal — the dedup logic still suppresses
-    # the second mutation overwrite.
-    duplicate_intervention_acks: int = 0
-    # B3 (Phase 4.1): operator-facing counter of frames the capture
-    # pipeline evicted from its output queue when the queue was full.
-    # A sustained nonzero value means a downstream consumer is slower
-    # than the capture rate; rPPG / kinematics quality may degrade.
-    frames_dropped_total: int = 0
-    # B4 (Phase 4.1): True when the daemon fell back to the in-memory
-    # store at boot because Redis was unreachable. Persistence is
-    # non-durable while this is True.
-    store_degraded: bool = False
-    # B5 (Phase 4.1): count of feedback bundle log-tail reads that
-    # raised OSError. A spike here usually means the daemon's log path
-    # was rotated out from under us.
-    feedback_log_read_failures: int = 0
-
-
-class StatusResponse(BaseModel):
-    """Current system status.
-
-    Phase 4.4 T3: ``status`` is an explicit discriminator that clients can
-    use without inspecting the nullability of ``state``/``features``. The
-    legacy optional fields are preserved so callers that already inspect
-    them continue to compile; new clients should branch on ``status``.
-    """
-
-    status: Literal["initializing", "ready", "degraded"] = Field(
-        "initializing",
-        description=(
-            "Coarse readiness discriminator. ``initializing`` = no "
-            "estimate yet; ``ready`` = state engine producing live "
-            "estimates; ``degraded`` = serving a synthetic/last-known "
-            "estimate because real inference failed."
-        ),
+            return DashboardRaiseResponse.from_clock(
+                _get_clock(request), raised=False, target=target,
+            )
+    return DashboardRaiseResponse.from_clock(
+        _get_clock(request), raised=True, target=target,
     )
-    state: str | None = None
-    confidence: float | None = None
-    signal_quality: SignalQuality | None = None
-    features: FeatureVector | None = None
-    timestamp: float = Field(
-        default_factory=time.time,
-        description="Wall-clock seconds since epoch (UTC).",
-    )
-
-
-class StateInferRequest(BaseModel):
-    """Request to infer state from a feature vector."""
-
-    feature_vector: FeatureVector
-    signal_quality: SignalQuality
-
-
-class StateInferResponse(BaseModel):
-    """State inference result.
-
-    F18 (audit): the ``source`` and ``degraded`` envelope fields let the
-    UI distinguish a real classifier confidence from a synthetic
-    fallback. Pre-fix, a 0.5 confidence from the fallback path looked
-    identical to a 0.5 confidence from the rule scorer — observability
-    and correctness in one bug. Defaults are chosen so existing callers
-    that don't read the fields still get the same wire shape they had
-    before plus two extra boolean-ish fields they can safely ignore.
-    """
-
-    estimate: StateEstimate
-    timestamp: float = Field(
-        default_factory=time.time,
-        description="Wall-clock seconds since epoch (UTC).",
-    )
-    source: Literal["classifier", "fallback"] = Field(
-        "classifier",
-        description=(
-            "``classifier`` when the rule scorer + smoother produced the "
-            "estimate; ``fallback`` when those engines were missing or "
-            "raised and the route returned a synthetic estimate."
-        ),
-    )
-    degraded: bool = Field(
-        False,
-        description=(
-            "True when the daemon could not run real inference and is "
-            "serving a synthetic estimate. UIs surface a banner so the "
-            "user understands the state stream is not authoritative."
-        ),
-    )
-
-
-class ContextBuildRequest(BaseModel):
-    """Request to build task context."""
-
-    include_editor: bool = True
-    include_terminal: bool = True
-    include_browser: bool = True
-
-
-class ContextBuildResponse(BaseModel):
-    """Context build result."""
-
-    context: TaskContext | None = None
-    available: bool = False
-    timestamp: float = Field(
-        default_factory=time.time,
-        description="Wall-clock seconds since epoch (UTC).",
-    )
-
-
-class LLMPlanRequest(BaseModel):
-    """Request intervention plan from LLM."""
-
-    state_estimate: StateEstimate
-    task_context: TaskContext
-
-
-class LLMPlanResponse(BaseModel):
-    """LLM plan result."""
-
-    plan: InterventionPlan | None = None
-    fallback_used: bool = False
-    timestamp: float = Field(
-        default_factory=time.time,
-        description="Wall-clock seconds since epoch (UTC).",
-    )
-
-
-class InterventionApplyRequest(BaseModel):
-    """Request to apply an intervention."""
-
-    plan: InterventionPlan
-
-
-class InterventionApplyResponse(BaseModel):
-    """Intervention apply result.
-
-    F05: ``applied`` mirrors the optimistic adapter's pre-F05 contract
-    (mutations dispatched successfully). ``confirmation`` is the real
-    ack-driven outcome surfaced when ``await_confirmation`` is honoured;
-    callers that pass ``await_confirmation=False`` receive a 202-style
-    response with ``correlation_id`` populated so they can poll later.
-    """
-
-    applied: bool = False
-    snapshot: WorkspaceSnapshot | None = None
-    correlation_id: str | None = None
-    confirmation: InterventionApplyResult | None = None
-    timestamp: float = Field(
-        default_factory=time.time,
-        description="Wall-clock seconds since epoch (UTC).",
-    )
-
-
-class InterventionRestoreRequest(BaseModel):
-    """Request to restore workspace from snapshot."""
-
-    intervention_id: str
-    user_action: str = "dismissed"
-
-
-class InterventionRestoreResponse(BaseModel):
-    """Intervention restore result."""
-
-    restored: bool = False
-    outcome: InterventionOutcome | None = None
-    timestamp: float = Field(
-        default_factory=time.time,
-        description="Wall-clock seconds since epoch (UTC).",
-    )
-
-
-# Track app start time for uptime computation
-_start_time: float = time.monotonic()
 
 
 # Audit-prod fix (P2-E): memoize the daemon version lookup so /health
@@ -555,10 +374,19 @@ async def health_check(request: Request) -> HealthResponse:
                 getattr(pipeline, "frames_dropped_total", 0) or 0
             )
 
-    return HealthResponse(
+    clock = _get_clock(request)
+    app_state = getattr(getattr(request, "app", None), "state", None)
+    started_mono_ns = getattr(app_state, "started_at_mono_ns", None)
+    started_boot_id = getattr(app_state, "started_boot_id", None)
+    if isinstance(started_mono_ns, int) and started_boot_id == clock.boot_id:
+        uptime_seconds = max(0.0, (clock.monotonic_ns() - started_mono_ns) / 1e9)
+    else:
+        uptime_seconds = 0.0
+    return HealthResponse.from_clock(
+        clock,
         status=overall,
         services=services,
-        uptime_seconds=time.monotonic() - _start_time,
+        uptime_seconds=uptime_seconds,
         version=_resolve_daemon_version(),
         duplicate_intervention_acks=duplicate_acks,
         frames_dropped_total=frames_dropped_total,
@@ -610,26 +438,26 @@ async def get_current_status(request: Request) -> StatusResponse:
     if state_engine is not None and hasattr(state_engine, "latest_estimate"):
         est = state_engine.latest_estimate
         if est is not None:
-            return StatusResponse(
+            return StatusResponse.from_clock(
+                _get_clock(request),
                 status="ready",
                 state=est.state,
                 confidence=est.confidence,
                 signal_quality=est.signal_quality,
-                timestamp=est.timestamp,
             )
 
     # Try to get from stored latest
     latest_state = reg.get("latest_state_estimate")
     if latest_state is not None:
-        return StatusResponse(
+        return StatusResponse.from_clock(
+            _get_clock(request),
             status="ready",
             state=latest_state.state,
             confidence=latest_state.confidence,
             signal_quality=latest_state.signal_quality,
-            timestamp=latest_state.timestamp,
         )
 
-    return StatusResponse(status="initializing")
+    return StatusResponse.from_clock(_get_clock(request), status="initializing")
 
 
 # =============================================================================
@@ -652,7 +480,7 @@ async def submit_frame_meta(
     if capture_handler is not None and callable(capture_handler):
         await capture_handler(frame_meta)
 
-    return AckResponse()
+    return AckResponse.from_clock(_get_clock(request))
 
 
 @router.post("/features/physio", response_model=AckResponse)
@@ -669,7 +497,7 @@ async def submit_physio_features(
     if fusion is not None and hasattr(fusion, "update_physio"):
         fusion.update_physio(features)
 
-    return AckResponse()
+    return AckResponse.from_clock(_get_clock(request))
 
 
 @router.post("/features/kinematics", response_model=AckResponse)
@@ -685,7 +513,7 @@ async def submit_kinematic_features(
     if fusion is not None and hasattr(fusion, "update_kinematics"):
         fusion.update_kinematics(features)
 
-    return AckResponse()
+    return AckResponse.from_clock(_get_clock(request))
 
 
 @router.post("/features/telemetry", response_model=AckResponse)
@@ -701,7 +529,7 @@ async def submit_telemetry_features(
     if fusion is not None and hasattr(fusion, "update_telemetry"):
         fusion.update_telemetry(features)
 
-    return AckResponse()
+    return AckResponse.from_clock(_get_clock(request))
 
 
 # =============================================================================
@@ -732,7 +560,23 @@ async def infer_state(
     if scorer is not None and smoother is not None:
         try:
             scores = scorer.compute_scores(body.feature_vector)
-            estimate = smoother.update(scores, body.signal_quality)
+            feature = body.feature_vector
+            event_time = (
+                EventTime(
+                    observed_at_unix_ms=feature.observed_at_unix_ms,
+                    observed_at_mono_ns=feature.observed_at_mono_ns,
+                    boot_id=feature.boot_id,
+                )
+                if feature.observed_at_unix_ms is not None
+                and feature.observed_at_mono_ns is not None
+                and feature.boot_id is not None
+                else EventTime.from_clock(_get_clock(request))
+            )
+            estimate = smoother.update(
+                scores,
+                body.signal_quality,
+                event_time=event_time,
+            )
         except Exception:
             # F18: scorer/smoother raised — fall through to the synthetic
             # estimate but flag the response as degraded so the UI can
@@ -741,7 +585,9 @@ async def infer_state(
             logger.exception("rule scorer / smoother raised; serving fallback estimate")
         else:
             reg.register("latest_state_estimate", estimate)
-            return StateInferResponse(estimate=estimate)
+            return StateInferResponse.from_clock(
+                _get_clock(request), estimate=estimate,
+            )
 
     # Fallback: produce a basic estimate without engines. Emit the
     # degradation telemetry so a log aggregator sees the failure even if
@@ -759,10 +605,14 @@ async def infer_state(
         reasons=["No state engine registered, using default"],
         signal_quality=body.signal_quality,
         timestamp=body.feature_vector.timestamp,
+        observed_at_unix_ms=body.feature_vector.observed_at_unix_ms,
+        observed_at_mono_ns=body.feature_vector.observed_at_mono_ns,
+        boot_id=body.feature_vector.boot_id,
         dwell_seconds=0.0,
     )
     reg.register("latest_state_estimate", estimate)
-    return StateInferResponse(
+    return StateInferResponse.from_clock(
+        _get_clock(request),
         estimate=estimate,
         source="fallback",
         degraded=True,
@@ -788,9 +638,13 @@ async def build_context(
             include_terminal=body.include_terminal,
             include_browser=body.include_browser,
         )
-        return ContextBuildResponse(context=ctx, available=True)
+        return ContextBuildResponse.from_clock(
+            _get_clock(request), context=ctx, available=True,
+        )
 
-    return ContextBuildResponse(available=False)
+    return ContextBuildResponse.from_clock(
+        _get_clock(request), available=False,
+    )
 
 
 # =============================================================================
@@ -871,7 +725,11 @@ async def request_llm_plan(
                         "fallback_used": fallback_used,
                     },
                 )
-                return LLMPlanResponse(plan=plan, fallback_used=fallback_used)
+                return LLMPlanResponse.from_clock(
+                    _get_clock(request),
+                    plan=plan,
+                    fallback_used=fallback_used,
+                )
             if hasattr(llm_engine, "generate_plan"):
                 logger.info(
                     "LLM planner branch selected",
@@ -880,8 +738,10 @@ async def request_llm_plan(
                 plan = await llm_engine.generate_plan(
                     body.state_estimate, body.task_context,
                 )
-                return LLMPlanResponse(
-                    plan=plan, fallback_used=_plan_served_fallback(plan),
+                return LLMPlanResponse.from_clock(
+                    _get_clock(request),
+                    plan=plan,
+                    fallback_used=_plan_served_fallback(plan),
                 )
 
         # v0.2.1: only "llm_client" is registered — the legacy remote_qwen /
@@ -898,8 +758,10 @@ async def request_llm_plan(
                 body.task_context,
                 body.state_estimate,
             )
-            return LLMPlanResponse(
-                plan=plan, fallback_used=_plan_served_fallback(plan),
+            return LLMPlanResponse.from_clock(
+                _get_clock(request),
+                plan=plan,
+                fallback_used=_plan_served_fallback(plan),
             )
     except Exception:
         # Finding #6: a raising planner client must not surface an
@@ -912,13 +774,17 @@ async def request_llm_plan(
             extra={"cid": get_correlation_id() or "-"},
             exc_info=True,
         )
-        return LLMPlanResponse(plan=None, fallback_used=True)
+        return LLMPlanResponse.from_clock(
+            _get_clock(request), plan=None, fallback_used=True,
+        )
 
     logger.info(
         "LLM planner branch selected",
         extra={"planner_method": "fallback"},
     )
-    return LLMPlanResponse(fallback_used=True)
+    return LLMPlanResponse.from_clock(
+        _get_clock(request), fallback_used=True,
+    )
 
 
 # =============================================================================
@@ -984,7 +850,8 @@ async def apply_intervention(
                 body.plan.intervention_id,
                 validation.errors,
             )
-            return InterventionApplyResponse(
+            return InterventionApplyResponse.from_clock(
+                _get_clock(request),
                 applied=False,
                 correlation_id=correlation_id,
             )
@@ -992,7 +859,8 @@ async def apply_intervention(
         ws_server = reg.get("ws_server")
         if ws_server is not None and hasattr(ws_server, "send_intervention"):
             await ws_server.send_intervention(proposal)
-        return InterventionApplyResponse(
+        return InterventionApplyResponse.from_clock(
+            _get_clock(request),
             applied=False,
             correlation_id=correlation_id,
         )
@@ -1000,7 +868,8 @@ async def apply_intervention(
     intervention_engine = reg.get("intervention_engine")
     if intervention_engine is not None and hasattr(intervention_engine, "apply"):
         snapshot = await intervention_engine.apply(body.plan)
-        return InterventionApplyResponse(
+        return InterventionApplyResponse.from_clock(
+            _get_clock(request),
             applied=True,
             snapshot=snapshot,
             correlation_id=correlation_id,
@@ -1014,8 +883,10 @@ async def apply_intervention(
                 body.plan.intervention_id,
                 validation.errors,
             )
-            return InterventionApplyResponse(
-                applied=False, correlation_id=correlation_id,
+            return InterventionApplyResponse.from_clock(
+                _get_clock(request),
+                applied=False,
+                correlation_id=correlation_id,
             )
 
         snapshot = await _build_snapshot_for_plan(reg, body.plan, request=request)
@@ -1040,7 +911,8 @@ async def apply_intervention(
             await_confirmation=await_confirmation,
             timeout_seconds=confirmation_timeout_seconds,
         )
-        return InterventionApplyResponse(
+        return InterventionApplyResponse.from_clock(
+            _get_clock(request),
             applied=applied,
             snapshot=snapshot,
             correlation_id=correlation_id,
@@ -1058,14 +930,17 @@ async def apply_intervention(
             await_confirmation=await_confirmation,
             timeout_seconds=confirmation_timeout_seconds,
         )
-        return InterventionApplyResponse(
+        return InterventionApplyResponse.from_clock(
+            _get_clock(request),
             applied=True,
             correlation_id=correlation_id,
             confirmation=confirmation,
         )
 
-    return InterventionApplyResponse(
-        applied=False, correlation_id=correlation_id,
+    return InterventionApplyResponse.from_clock(
+        _get_clock(request),
+        applied=False,
+        correlation_id=correlation_id,
     )
 
 
@@ -1125,7 +1000,9 @@ async def restore_intervention(
         outcome = await intervention_engine.restore(
             body.intervention_id, body.user_action,
         )
-        return InterventionRestoreResponse(restored=True, outcome=outcome)
+        return InterventionRestoreResponse.from_clock(
+            _get_clock(request), restored=True, outcome=outcome,
+        )
 
     restore_manager = _get_first_service(reg, "restore_manager", "intervention_restore_manager")
     if restore_manager is not None:
@@ -1143,12 +1020,15 @@ async def restore_intervention(
                     body.intervention_id,
                     user_action=body.user_action,
                 )
-            return InterventionRestoreResponse(
+            return InterventionRestoreResponse.from_clock(
+                _get_clock(request),
                 restored=outcome.workspace_restored,
                 outcome=outcome,
             )
 
-    return InterventionRestoreResponse(restored=False)
+    return InterventionRestoreResponse.from_clock(
+        _get_clock(request), restored=False,
+    )
 
 
 # =============================================================================
@@ -1156,53 +1036,11 @@ async def restore_intervention(
 # =============================================================================
 
 
-class StressIntegralResponse(BaseModel):
-    """Compatibility envelope for a metric disabled pending validation."""
-
-    status: Literal["unavailable"] = "unavailable"
-    unavailable_reason: Literal["validation_required"] = "validation_required"
-    current_value: float = 0.0
-    threshold: float = 0.0
-    should_break: bool = False
-    sensitivity_multiplier: float = 1.0
-    timestamp: float = Field(
-        default_factory=time.time,
-        description="Wall-clock seconds since epoch (UTC).",
-    )
-
-
 @router.get("/api/stress-integral", response_model=StressIntegralResponse)
 async def get_stress_integral(request: Request) -> StressIntegralResponse:
     """Report unavailability; never turn a diagnostic read into a trigger."""
 
-    del request
-    return StressIntegralResponse()
-
-
-class HelpfulnessSummaryResponse(BaseModel):
-    """Summary of helpfulness metrics.
-
-    P2 fix (finding #5): the response model now declares EVERY key the
-    source :class:`~cortex.services.eval.helpfulness.HelpfulnessSummary`
-    TypedDict produces, so ``HelpfulnessSummaryResponse(**summary)`` no
-    longer silently drops ``total_tracked`` / ``positive_rate``. These
-    two are backward-compat aliases the WS dashboard and unit tests
-    already consume; surfacing them on the HTTP envelope keeps the two
-    transports in sync instead of letting the HTTP shape drift to a
-    silent subset of the canonical contract.
-    """
-    total_interventions: int = 0
-    # Backward-compat alias for ``total_interventions`` (WS dashboard).
-    total_tracked: int = 0
-    mean_reward: float = 0.0
-    engagement_rate: float = 0.0
-    # Fraction of recent rewards that were strictly positive.
-    positive_rate: float = 0.0
-    recent_rewards: list[float] = Field(default_factory=list)
-    timestamp: float = Field(
-        default_factory=time.time,
-        description="Wall-clock seconds since epoch (UTC).",
-    )
+    return StressIntegralResponse.from_clock(_get_clock(request))
 
 
 @router.get("/api/helpfulness/summary", response_model=HelpfulnessSummaryResponse)
@@ -1212,43 +1050,13 @@ async def get_helpfulness_summary(request: Request) -> HelpfulnessSummaryRespons
     tracker = reg.get("helpfulness_tracker")
     if tracker is not None and hasattr(tracker, "get_summary"):
         summary = await tracker.get_summary()
-        return HelpfulnessSummaryResponse(**summary)
-    return HelpfulnessSummaryResponse()
+        return HelpfulnessSummaryResponse.from_clock(_get_clock(request), **summary)
+    return HelpfulnessSummaryResponse.from_clock(_get_clock(request))
 
 
 # =============================================================================
 # Consent Endpoints
 # =============================================================================
-
-
-class ConsentLevelResponse(BaseModel):
-    """Current consent state."""
-    levels: dict[str, dict[str, Any]] = Field(default_factory=dict)
-    timestamp: float = Field(
-        default_factory=time.time,
-        description="Wall-clock seconds since epoch (UTC).",
-    )
-
-
-class ConsentResetRequest(BaseModel):
-    """Phase 4.4 T4: explicit (currently empty) body for ``POST
-    /consent/reset``.
-
-    Defined so the OpenAPI spec advertises a request schema (rather
-    than implicit ``Body(None)``) and TS codegen emits a typed shape.
-    Future fields (e.g. ``reason``, ``actor``) can be added without
-    breaking existing callers because every field is optional.
-    """
-
-
-class ConsentResetResponse(BaseModel):
-    """Result of consent reset."""
-    reset: bool = False
-    levels: dict[str, dict[str, Any]] = Field(default_factory=dict)
-    timestamp: float = Field(
-        default_factory=time.time,
-        description="Wall-clock seconds since epoch (UTC).",
-    )
 
 
 @router.get("/consent/level", response_model=ConsentLevelResponse)
@@ -1258,8 +1066,10 @@ async def get_consent_level(request: Request) -> ConsentLevelResponse:
     ladder = reg.get("consent_ladder")
     if ladder is not None and hasattr(ladder, "get_all_states"):
         states = await ladder.get_all_states()
-        return ConsentLevelResponse(levels=states)
-    return ConsentLevelResponse()
+        return ConsentLevelResponse.from_clock(
+            _get_clock(request), levels=states,
+        )
+    return ConsentLevelResponse.from_clock(_get_clock(request))
 
 
 @router.post("/consent/reset", response_model=ConsentResetResponse)
@@ -1288,8 +1098,10 @@ async def reset_consent(
     if ladder is not None and hasattr(ladder, "reset"):
         await ladder.reset()
         states = await ladder.get_all_states()
-        return ConsentResetResponse(reset=True, levels=states)
-    return ConsentResetResponse()
+        return ConsentResetResponse.from_clock(
+            _get_clock(request), reset=True, levels=states,
+        )
+    return ConsentResetResponse.from_clock(_get_clock(request))
 
 
 # =============================================================================
@@ -1407,7 +1219,8 @@ async def get_cost(request: Request) -> CostResponse:
     model = _resolve_active_model(reg) or None
 
     if tracker is None:
-        return CostResponse(
+        return CostResponse.from_clock(
+            _get_clock(request),
             cost_today=0.0,
             budget_today=0.0,
             provider=provider,  # None when no daemon/config wired
@@ -1454,7 +1267,8 @@ async def get_cost(request: Request) -> CostResponse:
 
     prompt_tokens, completion_tokens = probe_token_totals(tracker)
 
-    return CostResponse(
+    return CostResponse.from_clock(
+        _get_clock(request),
         cost_today=cost_today,
         budget_today=budget_today,
         budget_exhausted=budget_exhausted,
@@ -1465,11 +1279,6 @@ async def get_cost(request: Request) -> CostResponse:
     )
 
 
-class ProjectListResponse(BaseModel):
-    """List of configured projects."""
-    projects: list[dict[str, Any]] = Field(default_factory=list)
-
-
 @router.get("/api/projects", response_model=ProjectListResponse)
 async def list_projects(request: Request) -> ProjectListResponse:
     """List all configured project launch profiles."""
@@ -1477,15 +1286,14 @@ async def list_projects(request: Request) -> ProjectListResponse:
     launcher = reg.get("project_launcher")
     if launcher is not None and hasattr(launcher, "list_projects"):
         projects = launcher.list_projects()
-        return ProjectListResponse(projects=[p.model_dump() if hasattr(p, 'model_dump') else p for p in projects])
-    return ProjectListResponse()
-
-
-class LaunchProjectResponse(BaseModel):
-    """Result of launching a project."""
-    launched: bool = False
-    project_name: str = ""
-    errors: list[str] = Field(default_factory=list)
+        return ProjectListResponse.from_clock(
+            _get_clock(request),
+            projects=[
+                p.model_dump() if hasattr(p, "model_dump") else p
+                for p in projects
+            ],
+        )
+    return ProjectListResponse.from_clock(_get_clock(request))
 
 
 @router.post("/api/launch/{project_name}", response_model=LaunchProjectResponse)
@@ -1516,29 +1324,35 @@ async def launch_project(
     reg = _get_registry(request)
     launcher = reg.get("project_launcher")
     if launcher is None or not hasattr(launcher, "launch"):
-        return LaunchProjectResponse(
+        return LaunchProjectResponse.from_clock(
+            _get_clock(request),
             launched=False,
             project_name=project_name,
             errors=["No project launcher available"],
         )
     try:
         await _asyncio.wait_for(launcher.launch(project_name), timeout=20.0)
-        return LaunchProjectResponse(launched=True, project_name=project_name)
+        return LaunchProjectResponse.from_clock(
+            _get_clock(request), launched=True, project_name=project_name,
+        )
     except TimeoutError:
         logger.warning("Project launch timed out: %s", project_name)
-        return LaunchProjectResponse(
+        return LaunchProjectResponse.from_clock(
+            _get_clock(request),
             launched=False,
             project_name=project_name,
             errors=["launch_timeout"],
         )
     except FileNotFoundError:
-        return LaunchProjectResponse(
+        return LaunchProjectResponse.from_clock(
+            _get_clock(request),
             launched=False,
             project_name=project_name,
             errors=["project_not_found"],
         )
     except PermissionError:
-        return LaunchProjectResponse(
+        return LaunchProjectResponse.from_clock(
+            _get_clock(request),
             launched=False,
             project_name=project_name,
             errors=["permission_denied"],
@@ -1548,7 +1362,8 @@ async def launch_project(
         # Map every unexpected error to a generic category — the raw
         # exception text frequently contains absolute paths from
         # osascript / subprocess that we should not leak to callers.
-        return LaunchProjectResponse(
+        return LaunchProjectResponse.from_clock(
+            _get_clock(request),
             launched=False,
             project_name=project_name,
             errors=["launch_failed"],
@@ -1675,33 +1490,6 @@ async def get_trends_route(
 # =============================================================================
 
 
-class FeedbackRequest(BaseModel):
-    """P0 §3.24: bug-report payload from the desktop shell.
-
-    The shell composes this when the user opens the "Send feedback" sheet.
-    Length bounds match the dashboard's UX (10–500 chars on description).
-    """
-
-    description: str = Field(..., min_length=10, max_length=500)
-    include_logs: bool = Field(default=False)
-    app_version: str = Field(default="", max_length=64)
-    # C2: the extension popup sends BOTH ``user_agent`` (navigator.userAgent)
-    # and ``app_version`` (manifest version). The daemon persists
-    # ``user_agent`` in the stored feedback record so support can tell
-    # which browser / OS a report came from without round-tripping the
-    # user. Bounded so a hostile / oversized UA string can't bloat the
-    # on-disk record.
-    user_agent: str = Field(default="", max_length=512)
-
-
-class FeedbackResponse(BaseModel):
-    """P0 §3.24: feedback acknowledgement."""
-
-    ok: bool = True
-    report_id: str = ""
-    timestamp: float = Field(default_factory=time.time)
-
-
 # Patterns redacted from bundled log tail. Two scrub passes are applied:
 # (1) the auth-token header value, (2) absolute home-directory paths.
 # Pre-compiled here so the route handler does not pay the cost on every
@@ -1744,14 +1532,13 @@ async def submit_feedback(
     record, after two PII-scrub passes.
     """
     import uuid as _uuid
-    from datetime import datetime as _dt
     from pathlib import Path as _Path
 
     from cortex.libs.utils.atomic_write import atomic_write_json
     from cortex.libs.utils.platform import get_config_dir
 
     report_id = _uuid.uuid4().hex
-    ts = _dt.now()
+    ts = utc_datetime(_get_clock(request))
     record: dict[str, Any] = {
         "report_id": report_id,
         "submitted_at": ts.isoformat(timespec="seconds"),
@@ -1795,6 +1582,10 @@ async def submit_feedback(
         atomic_write_json(path, record)
     except OSError:
         logger.exception("POST /api/feedback failed to persist")
-        return FeedbackResponse(ok=False, report_id=report_id)
+        return FeedbackResponse.from_clock(
+            _get_clock(request), ok=False, report_id=report_id,
+        )
 
-    return FeedbackResponse(ok=True, report_id=report_id)
+    return FeedbackResponse.from_clock(
+        _get_clock(request), ok=True, report_id=report_id,
+    )

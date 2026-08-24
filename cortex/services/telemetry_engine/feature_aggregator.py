@@ -22,11 +22,11 @@ Derived features:
 from __future__ import annotations
 
 import logging
-import time
 from collections.abc import Callable
 
 import numpy as np
 
+from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 from cortex.libs.config.settings import TelemetryConfig
 from cortex.libs.schemas.features import TelemetryFeatures
 from cortex.services.telemetry_engine.focus_graph import FocusGraphBuilder
@@ -80,12 +80,15 @@ class FeatureAggregator:
         window_tracker: WindowTracker | None = None,
         config: TelemetryConfig | None = None,
         tab_count_provider: Callable[[], int | None] | None = None,
+        *,
+        clock: Clock | None = None,
     ) -> None:
+        self._clock = clock or SYSTEM_CLOCK
         self._hooks = input_hooks
         self._window_tracker = window_tracker
         self._config = config or TelemetryConfig()
         self._tab_count_provider = tab_count_provider
-        self._focus_graph = FocusGraphBuilder()
+        self._focus_graph = FocusGraphBuilder(clock=self._clock)
 
     def build_features(
         self,
@@ -103,7 +106,11 @@ class FeatureAggregator:
             TelemetryFeatures Pydantic model with all computed features.
         """
         window = window_seconds or self._config.window_seconds
-        now = current_time or time.monotonic()
+        now = (
+            monotonic_seconds(self._clock)
+            if current_time is None
+            else current_time
+        )
 
         # Gather events
         events = self._hooks.get_events_in_window(window, now)

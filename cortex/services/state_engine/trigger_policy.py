@@ -23,14 +23,22 @@ from __future__ import annotations
 import json
 import logging
 import threading
-import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
+from cortex.application.clock import (
+    SYSTEM_CLOCK,
+    BoundedDeadline,
+    Clock,
+    monotonic_seconds,
+    unix_seconds,
+    utc_datetime,
+)
 from cortex.libs.config.settings import InterventionConfig, StateConfig
 from cortex.libs.schemas.state import StateEstimate
 from cortex.libs.utils.atomic_write import atomic_write_json
@@ -63,7 +71,7 @@ _DISMISSAL_FLUSH_EVERY_N_UPDATES: int = 10
 _DISMISSAL_FLUSH_EVERY_SECONDS: float = 30.0
 
 # F26: persisted quiet-mode-history record version.
-QUIET_MODE_HISTORY_VERSION: int = 1
+QUIET_MODE_HISTORY_VERSION: int = 2
 
 
 def _default_dismissal_model_path() -> Path:
@@ -147,7 +155,9 @@ class TriggerPolicy:
         recovery_window_seconds: float | None = None,
         dismissal_model_path: Path | None = None,
         quiet_mode_history_path: Path | None = None,
+        clock: Clock | None = None,
     ) -> None:
+        self._clock = clock or SYSTEM_CLOCK
         self._config = config or InterventionConfig()
         # Single source of truth for HYPER dwell is StateConfig (v0.2.0 C.5).
         # Tests may inject ``hyper_dwell_seconds`` directly for short cycles.
@@ -214,6 +224,7 @@ class TriggerPolicy:
 
         # Quiet mode
         self._quiet_mode_until: float = 0.0
+        self._quiet_mode_deadline: BoundedDeadline | None = None
         self._quiet_mode_count: int = 0
         self._quiet_mode_count_reset_at: float = 0.0
 
@@ -237,7 +248,7 @@ class TriggerPolicy:
         )
         self._dismissal_persist_lock: threading.Lock = threading.Lock()
         self._dismissal_updates_since_flush: int = 0
-        self._dismissal_last_flush_at: float = time.monotonic()
+        self._dismissal_last_flush_at = monotonic_seconds(self._clock)
         self._load_dismissal_model()
 
         # F26: quiet-mode escalation persistence.
@@ -306,13 +317,16 @@ class TriggerPolicy:
 
         ``None`` means "no schedule armed" (legacy behaviour, every
         intervention permitted). Returns one of ``"on" | "quiet" | "off"``.
-        The wall-clock time is used (not ``time.monotonic``) so the
+        Local wall-clock time is used (not the monotonic clock) so the
         schedule honours actual day-of-week.
         """
         if not self._weekly_schedule:
             return None
-        import datetime as _dt
-        ts = _dt.datetime.now() if when is None else _dt.datetime.fromtimestamp(when)
+        ts = (
+            utc_datetime(self._clock).astimezone()
+            if when is None
+            else datetime.fromtimestamp(when)
+        )
         day = self._SCHEDULE_DAYS[ts.weekday()]
         slots = self._weekly_schedule.get(day)
         if not slots:
@@ -350,7 +364,9 @@ class TriggerPolicy:
     @property
     def is_quiet_mode(self) -> bool:
         """Check if quiet mode is currently active."""
-        return time.monotonic() < self._quiet_mode_until
+        if self._quiet_mode_deadline is not None:
+            return not self._quiet_mode_deadline.expired(self._clock)
+        return monotonic_seconds(self._clock) < self._quiet_mode_until
 
     @property
     def intervention_count(self) -> int:
@@ -395,7 +411,11 @@ class TriggerPolicy:
         Returns:
             TriggerDecision with trigger verdict and explanation.
         """
-        now = time.monotonic() if current_time is None else current_time
+        now = (
+            monotonic_seconds(self._clock)
+            if current_time is None
+            else current_time
+        )
 
         # F25 (audit): track HYPER-enter transitions BEFORE any gate so
         # the oscillation tracker stays accurate even when other gates
@@ -421,7 +441,11 @@ class TriggerPolicy:
         cooldown_remaining = max(
             0.0, self._last_intervention_time + self._config.cooldown_seconds - now
         )
-        quiet_active = now < self._quiet_mode_until
+        quiet_active = (
+            self.is_quiet_mode
+            if current_time is None
+            else now < self._quiet_mode_until
+        )
 
         # F25: drop intervention timestamps that fell out of the
         # trailing-hour window so the count below reflects only the
@@ -499,11 +523,11 @@ class TriggerPolicy:
         #
         # P1: the schedule slot lookup MUST use wall-clock day-of-week /
         # hour, NOT ``current_time``. ``current_time`` is the monotonic
-        # cooldown clock (line ~398, ``time.monotonic()``); feeding it
+        # cooldown clock (a monotonic instant); feeding it
         # into ``datetime.fromtimestamp`` yields a garbage weekday/hour
         # (monotonic epoch is process-boot-relative, not UNIX wall time)
         # and mis-gates the weekly schedule. Pass no ``when`` so the
-        # lookup resolves against ``datetime.now()`` (local wall clock),
+        # lookup resolves against the injected local wall clock,
         # decoupled from the cooldown clock.
         slot_value = self.lookup_schedule_slot()
         if slot_value == "off":
@@ -947,7 +971,11 @@ class TriggerPolicy:
 
     def record_intervention(self, timestamp: float | None = None) -> None:
         """Record that an intervention was triggered."""
-        now = time.monotonic() if timestamp is None else timestamp
+        now = (
+            monotonic_seconds(self._clock)
+            if timestamp is None
+            else timestamp
+        )
         self._last_intervention_time = now
         self._intervention_count += 1
         # F25 (audit): append to the sliding-hour window so the next
@@ -1011,7 +1039,11 @@ class TriggerPolicy:
 
         Tracks dismissals for quiet mode and adaptive thresholds.
         """
-        now = time.monotonic() if timestamp is None else timestamp
+        now = (
+            monotonic_seconds(self._clock)
+            if timestamp is None
+            else timestamp
+        )
         self._dismissals.append(DismissalEvent(timestamp=now))
         # P1: do NOT increment ``_dismissals_total`` here. The daemon's
         # dismiss path calls BOTH ``record_dismissal()`` (quiet-mode
@@ -1051,6 +1083,10 @@ class TriggerPolicy:
             ]
             minutes = durations[min(self._quiet_mode_count - 1, len(durations) - 1)]
             self._quiet_mode_until = now + minutes * 60.0
+            self._quiet_mode_deadline = BoundedDeadline.after(
+                self._clock,
+                int(minutes * 60_000),
+            )
             # Track the last-escalation timestamp for diagnostics; we no
             # longer use it as a reset trigger.
             self._quiet_mode_count_reset_at = now
@@ -1115,7 +1151,7 @@ class TriggerPolicy:
             w = w - 0.05 * grad
             self._dismissal_model_weights = (float(w[0]), float(w[1]), float(w[2]))
             self._dismissal_updates_since_flush += 1
-            now = time.monotonic()
+            now = monotonic_seconds(self._clock)
             should_flush = (
                 self._dismissal_updates_since_flush
                 >= _DISMISSAL_FLUSH_EVERY_N_UPDATES
@@ -1139,7 +1175,7 @@ class TriggerPolicy:
         """
         with self._dismissal_persist_lock:
             self._dismissal_updates_since_flush = 0
-            self._dismissal_last_flush_at = time.monotonic()
+            self._dismissal_last_flush_at = monotonic_seconds(self._clock)
             snapshot = self._dismissal_model_weights
             outcomes_snapshot = self._dismissal_outcomes
         self._persist_dismissal_model(snapshot, outcomes_snapshot)
@@ -1154,7 +1190,7 @@ class TriggerPolicy:
             "model_version": DISMISSAL_MODEL_VERSION,
             "weights": [float(w) for w in weights],
             "outcomes": int(outcomes),
-            "saved_at": time.time(),
+            "saved_at": unix_seconds(self._clock),
         }
         try:
             atomic_write_json(self._dismissal_model_path, record)
@@ -1231,13 +1267,23 @@ class TriggerPolicy:
         current_time: float | None = None,
     ) -> None:
         """Force quiet mode on for an explicit duration."""
-        now = time.monotonic() if current_time is None else current_time
+        now = (
+            monotonic_seconds(self._clock)
+            if current_time is None
+            else current_time
+        )
         minutes = duration_minutes or self._config.quiet_mode_minutes
-        self._quiet_mode_until = now + max(1, minutes) * 60.0
+        duration_seconds = max(1, minutes) * 60.0
+        self._quiet_mode_until = now + duration_seconds
+        self._quiet_mode_deadline = BoundedDeadline.after(
+            self._clock,
+            int(duration_seconds * 1_000),
+        )
 
     def clear_quiet_mode(self) -> None:
         """Disable quiet mode immediately."""
         self._quiet_mode_until = 0.0
+        self._quiet_mode_deadline = None
 
     def reset_quiet_mode(self) -> None:
         """User-driven quiet-mode reset (F26).
@@ -1249,6 +1295,7 @@ class TriggerPolicy:
         explicit call zeroes the escalation memory.
         """
         self._quiet_mode_until = 0.0
+        self._quiet_mode_deadline = None
         self._quiet_mode_count = 0
         self._quiet_mode_count_reset_at = 0.0
         try:
@@ -1268,7 +1315,12 @@ class TriggerPolicy:
         record_dismissal writer.
         """
         with self._quiet_mode_history_lock:
-            now = time.monotonic()
+            now = monotonic_seconds(self._clock)
+            deadline_record = (
+                self._quiet_mode_deadline.to_record()
+                if self._quiet_mode_deadline is not None
+                else None
+            )
             # ``quiet_mode_until`` is in the future, so the remainder is
             # ``until - now`` (positive while the window is still open).
             # ``quiet_mode_count_reset_at`` is the monotonic timestamp of
@@ -1289,13 +1341,14 @@ class TriggerPolicy:
                     0.0,
                     self._quiet_mode_until - now,
                 ),
+                "quiet_mode_deadline": deadline_record,
                 "last_escalation_age_seconds": max(
                     0.0,
                     now - self._quiet_mode_count_reset_at,
                 )
                 if self._quiet_mode_count_reset_at > 0.0
                 else 0.0,
-                "saved_at": time.time(),
+                "saved_at": unix_seconds(self._clock),
             }
         try:
             atomic_write_json(self._quiet_mode_history_path, record)
@@ -1338,7 +1391,8 @@ class TriggerPolicy:
                 path,
             )
             return
-        if data.get("version") != QUIET_MODE_HISTORY_VERSION:
+        version = data.get("version")
+        if version not in {1, QUIET_MODE_HISTORY_VERSION}:
             logger.info(
                 "Quiet mode history version mismatch (have=%r, want=%r); cold-starting.",
                 data.get("version"),
@@ -1348,10 +1402,45 @@ class TriggerPolicy:
         count = data.get("quiet_mode_count", 0)
         if isinstance(count, int) and count >= 0:
             self._quiet_mode_count = count
-        # Restore the active quiet window if a remainder is still set.
-        remaining = data.get("quiet_mode_until_monotonic_delta", 0.0)
-        if isinstance(remaining, (int, float)) and remaining > 0.0:
-            self._quiet_mode_until = time.monotonic() + float(remaining)
+        # v2 persists both wall expiry and a duration cap. In the same
+        # boot, monotonic elapsed time wins; after restart, wall expiry is
+        # bounded by the original duration so clock rollback cannot create
+        # an unbounded quiet window.
+        remaining_seconds = 0.0
+        deadline_value = data.get("quiet_mode_deadline")
+        if isinstance(deadline_value, dict):
+            try:
+                deadline = BoundedDeadline.from_record(deadline_value)
+                remaining_seconds = deadline.remaining_ms(self._clock) / 1_000.0
+                if remaining_seconds > 0.0:
+                    self._quiet_mode_deadline = deadline
+            except (KeyError, TypeError, ValueError):
+                logger.warning(
+                    "Invalid quiet-mode deadline in %s; ignoring active window.",
+                    path,
+                )
+        elif version == 1:
+            # Legacy records only carried a remaining duration. Subtract
+            # observable wall-clock downtime, but never allow a rollback to
+            # extend the original persisted remainder.
+            remaining = data.get("quiet_mode_until_monotonic_delta", 0.0)
+            saved_at = data.get("saved_at", unix_seconds(self._clock))
+            if isinstance(remaining, (int, float)) and remaining > 0.0:
+                elapsed_wall = (
+                    max(0.0, unix_seconds(self._clock) - float(saved_at))
+                    if isinstance(saved_at, (int, float))
+                    else 0.0
+                )
+                remaining_seconds = max(0.0, float(remaining) - elapsed_wall)
+                if remaining_seconds > 0.0:
+                    self._quiet_mode_deadline = BoundedDeadline.after(
+                        self._clock,
+                        int(remaining_seconds * 1_000),
+                    )
+        if remaining_seconds > 0.0:
+            self._quiet_mode_until = (
+                monotonic_seconds(self._clock) + remaining_seconds
+            )
         # audit-w2: ``last_escalation_age_seconds`` replaces the legacy
         # ``last_escalation_at_monotonic_delta`` field whose sign was
         # inverted at write time. Read both names so an upgrade-in-place
@@ -1363,7 +1452,9 @@ class TriggerPolicy:
         if last_age is None:
             last_age = data.get("last_escalation_at_monotonic_delta", 0.0)
         if isinstance(last_age, (int, float)) and last_age >= 0.0:
-            self._quiet_mode_count_reset_at = time.monotonic() - float(last_age)
+            self._quiet_mode_count_reset_at = (
+                monotonic_seconds(self._clock) - float(last_age)
+            )
         logger.info(
             "Rehydrated quiet-mode history from %s (level=%d)",
             path,
@@ -1421,6 +1512,7 @@ class TriggerPolicy:
         self._dismissals.clear()
         self._threshold_bumps.clear()
         self._quiet_mode_until = 0.0
+        self._quiet_mode_deadline = None
         self._quiet_mode_count = 0
         self._quiet_mode_count_reset_at = 0.0
         self._intervention_count = 0

@@ -235,6 +235,9 @@ class MessageType(str, Enum):  # noqa: UP042 — pydantic-to-typescript requires
     missing ``AUTH_OK`` (close-immediately) means the token was wrong
     and the client must refresh its cache."""
 
+    PROTOCOL_ERROR = "PROTOCOL_ERROR"
+    """Typed negotiation failure followed by WebSocket close code 1002."""
+
     STATE_UPDATE = "STATE_UPDATE"
     """Periodic state estimate broadcast (every ~500 ms)."""
 
@@ -329,9 +332,12 @@ class MessageType(str, Enum):  # noqa: UP042 — pydantic-to-typescript requires
     Payload mirrors :class:`cortex.libs.schemas.realtime.QuietModeState`:
     ``{kind: "snooze_15" | "quiet_session" | "pause" | "off",
     duration_minutes: int | None, ends_at: float | None,
+    ends_at_unix_ms: int | None,
     source: "dashboard" | "overlay" | "tray" | "shortcut" | "popup" |
     "vscode" | "os_notification" | "settings_sync" | "daemon" |
-    "daemon_decay"}`` where ``ends_at`` is a unix timestamp (seconds)."""
+    "daemon_decay"}``. ``ends_at`` is the deprecated Unix-seconds mirror;
+    new clients consume ``ends_at_unix_ms``.
+    """
 
     START_FOCUS_AUTO = "START_FOCUS_AUTO"
     """P0 §3.10: daemon-armed focus session start directive.

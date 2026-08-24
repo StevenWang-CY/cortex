@@ -934,7 +934,9 @@ function CortexPopup(): React.ReactElement {
                     const kind = cached.kind as string;
                     setQuietModeKind(kind);
                     setQuietMode(kind !== "off");
-                    if (typeof cached.ends_at === "number") {
+                    if (typeof cached.ends_at_unix_ms === "number") {
+                        setQuietModeEndsAt(cached.ends_at_unix_ms / 1000);
+                    } else if (typeof cached.ends_at === "number") {
                         setQuietModeEndsAt(cached.ends_at as number);
                     }
                     if (typeof cached.duration_minutes === "number") {
@@ -1314,7 +1316,11 @@ function CortexPopup(): React.ReactElement {
                 setQuietModeKind(kind);
                 setQuietMode(kind !== "off");
                 setQuietModeEndsAt(
-                    typeof state.ends_at === "number" ? (state.ends_at as number) : null,
+                    typeof state.ends_at_unix_ms === "number"
+                        ? state.ends_at_unix_ms / 1000
+                        : typeof state.ends_at === "number"
+                            ? (state.ends_at as number)
+                            : null,
                 );
                 setQuietModeDurationMin(
                     typeof state.duration_minutes === "number"

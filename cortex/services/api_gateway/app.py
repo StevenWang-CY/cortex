@@ -29,6 +29,7 @@ from fastapi.responses import Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
 from cortex import __version__
+from cortex.application.clock import SYSTEM_CLOCK, Clock
 from cortex.libs.config.settings import APIConfig, CortexConfig
 from cortex.libs.logging.correlation import correlation_scope
 from cortex.services.api_gateway.auth import require_capability_token
@@ -108,6 +109,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app(
     config: APIConfig | None = None,
     cortex_config: CortexConfig | None = None,
+    *,
+    clock: Clock | None = None,
 ) -> FastAPI:
     """
     Create and configure the FastAPI application.
@@ -115,11 +118,13 @@ def create_app(
     Args:
         config: API configuration. Defaults to APIConfig().
         cortex_config: Full Cortex configuration for service initialization.
+        clock: Explicit wall/monotonic clock shared with the application.
 
     Returns:
         Configured FastAPI application.
     """
     cfg = config or APIConfig()
+    app_clock = clock or SYSTEM_CLOCK
 
     app = FastAPI(
         title="Cortex API Gateway",
@@ -178,6 +183,9 @@ def create_app(
     app.state.config = cfg
     app.state.cortex_config = cortex_config
     app.state.registry = registry
+    app.state.clock = app_clock
+    app.state.started_at_mono_ns = app_clock.monotonic_ns()
+    app.state.started_boot_id = app_clock.boot_id
 
     # Register routes — health is mounted without auth so the supervisor
     # liveness probe can reach the daemon before the UI has presented

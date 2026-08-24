@@ -169,7 +169,9 @@ export function activate(context: vscode.ExtensionContext): void {
         statusBarItem.text = kind === "off"
             ? "$(pulse) Cortex"
             : `$(circle-slash) ${label}`;
-        const endsAt = payload.ends_at as number | undefined;
+        const endsAt = typeof payload.ends_at_unix_ms === "number"
+            ? payload.ends_at_unix_ms / 1000
+            : payload.ends_at as number | undefined;
         if (kind !== "off" && typeof endsAt === "number") {
             const remainingMin = Math.max(
                 0,

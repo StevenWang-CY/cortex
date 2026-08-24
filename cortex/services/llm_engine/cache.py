@@ -8,10 +8,10 @@ calls when the workspace context hasn't meaningfully changed.
 from __future__ import annotations
 
 import hashlib
-import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
+from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 from cortex.libs.schemas.context import TaskContext
 from cortex.libs.schemas.intervention import InterventionPlan, SimplificationConstraints
 from cortex.libs.schemas.state import StateEstimate
@@ -25,10 +25,8 @@ class CacheEntry:
     created_at: float
     ttl: float
 
-    def is_expired(self, now: float | None = None) -> bool:
+    def is_expired(self, now: float) -> bool:
         """Check if this entry has expired."""
-        if now is None:
-            now = time.monotonic()
         return (now - self.created_at) > self.ttl
 
 
@@ -41,7 +39,14 @@ class LLMCache:
         default_ttl: Default time-to-live in seconds (300 = 5 min).
     """
 
-    def __init__(self, max_size: int = 64, default_ttl: float = 300.0) -> None:
+    def __init__(
+        self,
+        max_size: int = 64,
+        default_ttl: float = 300.0,
+        *,
+        clock: Clock | None = None,
+    ) -> None:
+        self._clock = clock or SYSTEM_CLOCK
         self._max_size = max_size
         self._default_ttl = default_ttl
         self._cache: OrderedDict[str, CacheEntry] = OrderedDict()
@@ -68,7 +73,8 @@ class LLMCache:
             self._misses += 1
             return None
 
-        if entry.is_expired(now):
+        effective_now = monotonic_seconds(self._clock) if now is None else now
+        if entry.is_expired(effective_now):
             # Expired — remove and miss
             del self._cache[key]
             self._misses += 1
@@ -96,7 +102,7 @@ class LLMCache:
         """
         key = self._context_key(context, state, constraints)
         if now is None:
-            now = time.monotonic()
+            now = monotonic_seconds(self._clock)
         if ttl is None:
             ttl = self._default_ttl
 
@@ -154,7 +160,7 @@ class LLMCache:
     def prune_expired(self, now: float | None = None) -> int:
         """Remove all expired entries. Returns number removed."""
         if now is None:
-            now = time.monotonic()
+            now = monotonic_seconds(self._clock)
         expired_keys = [
             k for k, v in self._cache.items() if v.is_expired(now)
         ]

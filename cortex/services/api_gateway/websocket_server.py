@@ -17,18 +17,30 @@ import asyncio
 import inspect
 import json
 import logging
-import time
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from pydantic import ValidationError
 
+from cortex.application.clock import (
+    SYSTEM_CLOCK,
+    Clock,
+    monotonic_seconds,
+    unix_seconds,
+)
 from cortex.libs.auth import verify_token
 from cortex.libs.config.settings import APIConfig
 from cortex.libs.logging.correlation import correlation_scope, get_correlation_id
 from cortex.libs.logging.structured import EventType
 from cortex.libs.schemas.intervention import InterventionPlan
+from cortex.libs.schemas.protocol import (
+    AuthOkPayload,
+    AuthRequestPayload,
+    ProtocolErrorPayload,
+    negotiate_protocol,
+)
 from cortex.libs.schemas.realtime import (
     BiometricsSummary,
     CaptureStatus,
@@ -48,29 +60,21 @@ from cortex.libs.schemas.ws_message_types import MessageType
 logger = logging.getLogger(__name__)
 
 
-def _auth_ok_frame() -> str:
+def _auth_ok_frame(clock: Clock, selected_protocol_version: str) -> str:
     """Serialise a minimal ``AUTH_OK`` reply frame (audit Debt-2).
 
-    The Pydantic ``WSMessage`` would also work but is slightly heavier
-    than needed for a confirmation that carries no payload data. We hand
-    the JSON to ``websocket.send`` directly. ``type`` is the canonical
-    ``MessageType.AUTH_OK.value`` so the client side narrows it via the
-    same generated TypeScript union.
+    The reply includes the selected protocol and full v2 event metadata.
     """
-    # ``time.time()`` (wall-clock seconds) per the WSMessage schema
-    # docstring at cortex/libs/schemas/ws_message.py:74-78 — JS clients
-    # compare this against ``Date.now() / 1000`` and ``time.monotonic``
-    # is process-local, not comparable. Phase-4a regression closure: the
-    # Pydantic model was fixed but the hand-built AUTH_OK frame wasn't.
-    return json.dumps({
-        "type": MessageType.AUTH_OK.value,
-        "payload": {},
-        "timestamp": time.time(),
-        "sequence": 0,
-        "correlation_id": None,
-        "target_client_types": None,
-        "source_client_type": "daemon",
-    })
+    payload = AuthOkPayload.model_validate(
+        {"selected_protocol_version": selected_protocol_version}
+    )
+    return _PydanticWSMessage.from_clock(
+        clock=clock,
+        type=MessageType.AUTH_OK,
+        payload=payload.model_dump(mode="json"),
+        protocol_version=selected_protocol_version,
+        source_client_type="daemon",
+    ).to_json()
 
 
 def _serialize_timestamp(ts: Any) -> Any:
@@ -119,12 +123,18 @@ class WebSocketClient:
 
     client_id: str
     websocket: Any  # websockets.WebSocketServerProtocol
-    connected_at: float = field(default_factory=time.monotonic)
+    connected_at: float = 0.0
     client_type: str = "unknown"  # "vscode", "chrome", "desktop", "unknown"
     last_message_at: float = 0.0
     authenticated: bool = False
+    protocol_version: str = "1.0"
     coalesce_queue: Any | None = None  # asyncio.Queue[str] | None
     coalesce_task: Any | None = None  # asyncio.Task | None
+    seen_event_ids: deque[str] = field(
+        default_factory=lambda: deque(maxlen=512),
+        repr=False,
+    )
+    seen_event_id_set: set[str] = field(default_factory=set, repr=False)
 
 
 # ─── WSMessage: Pydantic source of truth (Debt-1 closure, Commit 2) ───
@@ -161,11 +171,11 @@ class WSMessageLegacy:
     payload: dict[str, Any]
     # Wall-clock seconds matching the Pydantic ``WSMessage`` contract
     # (cortex/libs/schemas/ws_message.py:70-78). The legacy dataclass
-    # previously seeded with ``time.monotonic`` which is process-local
+    # previously seeded with a process-local monotonic reading
     # and not comparable to a JS client clock — fixed here so the
     # round-trip ``WSMessageLegacy → WSMessage → JSON`` produces a
     # uniform wire format regardless of construction path.
-    timestamp: float = field(default_factory=time.time)
+    timestamp: float = field(default_factory=lambda: unix_seconds(SYSTEM_CLOCK))
     sequence: int = 0
     correlation_id: str | None = None
     target_client_types: list[str] | None = None
@@ -189,7 +199,7 @@ class WSMessageLegacy:
             type=parsed.get("type", "UNKNOWN"),
             payload=parsed.get("payload", {}),
             # Same wall-clock contract as the field default above.
-            timestamp=parsed.get("timestamp", time.time()),
+            timestamp=parsed.get("timestamp", unix_seconds(SYSTEM_CLOCK)),
             sequence=parsed.get("sequence", 0),
             correlation_id=parsed.get("correlation_id"),
             target_client_types=parsed.get("target_client_types"),
@@ -227,8 +237,14 @@ class WebSocketServer:
         await server.stop()
     """
 
-    def __init__(self, config: APIConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: APIConfig | None = None,
+        *,
+        clock: Clock | None = None,
+    ) -> None:
         self._config = config or APIConfig()
+        self._clock = clock or SYSTEM_CLOCK
         self._clients: dict[str, WebSocketClient] = {}
         self._server: Any = None  # websockets server
         self._running = False
@@ -655,6 +671,7 @@ class WebSocketServer:
         client = WebSocketClient(
             client_id=client_id,
             websocket=websocket,
+            connected_at=monotonic_seconds(self._clock),
         )
         self._clients[client_id] = client
         logger.info(f"Client connected: {client_id}")
@@ -722,7 +739,26 @@ class WebSocketServer:
             logger.warning(f"Invalid message from {client.client_id}: {e}")
             return
 
-        client.last_message_at = time.monotonic()
+        client.last_message_at = monotonic_seconds(self._clock)
+
+        # v2 event IDs make mutating command delivery idempotent even when a
+        # reconnecting client replays an already-sent frame. Keep a bounded
+        # per-connection set; legacy 1.0 frames retain their historical
+        # at-least-once behavior because they did not carry stable identity.
+        if client.authenticated and client.protocol_version != "1.0":
+            event_id = str(msg.event_id)
+            if event_id in client.seen_event_id_set:
+                logger.debug(
+                    "Dropping duplicate event_id=%s from %s",
+                    event_id,
+                    client.client_id,
+                )
+                return
+            if len(client.seen_event_ids) == client.seen_event_ids.maxlen:
+                evicted = client.seen_event_ids.popleft()
+                client.seen_event_id_set.discard(evicted)
+            client.seen_event_ids.append(event_id)
+            client.seen_event_id_set.add(event_id)
 
         # F19: every incoming message enters a correlation scope. If the
         # client supplied a correlation id we honour it; otherwise we mint
@@ -931,7 +967,9 @@ class WebSocketServer:
         if client.authenticated:
             # Idempotent replay — just re-ACK so the peer's promise resolves.
             try:
-                await client.websocket.send(_auth_ok_frame())
+                await client.websocket.send(
+                    _auth_ok_frame(self._clock, client.protocol_version)
+                )
             except Exception:
                 logger.debug(
                     "AUTH_OK replay send failed for %s",
@@ -962,9 +1000,48 @@ class WebSocketServer:
                 )
             return
 
-        client.authenticated = True
         try:
-            await client.websocket.send(_auth_ok_frame())
+            auth_payload = AuthRequestPayload.model_validate(msg.payload or {})
+        except ValidationError:
+            error = ProtocolErrorPayload(
+                code="malformed_protocol",
+                offered_protocol_versions=[],
+            )
+            await client.websocket.send(
+                WSMessage.from_clock(
+                    clock=self._clock,
+                    type=MessageType.PROTOCOL_ERROR,
+                    payload=error.model_dump(mode="json"),
+                    source_client_type="daemon",
+                ).to_json()
+            )
+            await client.websocket.close(code=1002, reason="malformed protocol offer")
+            return
+
+        offers = auth_payload.offers()
+        selected_protocol = negotiate_protocol(offers)
+        if selected_protocol is None:
+            error = ProtocolErrorPayload(
+                code="unsupported_protocol",
+                offered_protocol_versions=offers,
+            )
+            await client.websocket.send(
+                WSMessage.from_clock(
+                    clock=self._clock,
+                    type=MessageType.PROTOCOL_ERROR,
+                    payload=error.model_dump(mode="json"),
+                    source_client_type="daemon",
+                ).to_json()
+            )
+            await client.websocket.close(code=1002, reason="unsupported protocol")
+            return
+
+        client.authenticated = True
+        client.protocol_version = selected_protocol
+        try:
+            await client.websocket.send(
+                _auth_ok_frame(self._clock, selected_protocol)
+            )
         except Exception:
             logger.debug(
                 "AUTH_OK send failed for %s",
@@ -1747,6 +1824,8 @@ class WebSocketServer:
                 "code": "daemon_not_ready",
                 "correlation_id": getattr(msg, "correlation_id", None),
             },
+            correlation_id=msg.correlation_id,
+            causation_id=str(msg.event_id),
         )
 
     async def _handle_cost_request(
@@ -1767,6 +1846,8 @@ class WebSocketServer:
                 client,
                 MessageType.COST_RESPONSE.value,
                 payload.model_dump(mode="json"),
+                correlation_id=msg.correlation_id,
+                causation_id=str(msg.event_id),
             )
         except Exception:
             logger.exception("COST_REQUEST handling failed")
@@ -1789,6 +1870,8 @@ class WebSocketServer:
                 client,
                 MessageType.TEST_PROVIDER_RESULT.value,
                 result.model_dump(mode="json"),
+                correlation_id=msg.correlation_id,
+                causation_id=str(msg.event_id),
             )
         except Exception:
             logger.exception("TEST_PROVIDER handling failed")
@@ -1841,6 +1924,9 @@ class WebSocketServer:
         client: WebSocketClient,
         message_type: str,
         payload: dict[str, Any],
+        *,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
     ) -> None:
         """Send a single typed frame to a single client.
 
@@ -1848,10 +1934,13 @@ class WebSocketServer:
         reply must be unicast (broadcast would leak per-client UI state).
         """
         self._sequence += 1
-        message = WSMessage(
+        message = WSMessage.from_clock(
+            clock=self._clock,
             type=message_type,
             payload=payload,
             sequence=self._sequence,
+            correlation_id=correlation_id,
+            causation_id=causation_id,
             source_client_type="daemon",
         )
         try:
@@ -1919,7 +2008,8 @@ class WebSocketServer:
         """Broadcast an explicit restore event to all clients."""
         self._sequence += 1
         return await self._broadcast(
-            WSMessage(
+            WSMessage.from_clock(
+                clock=self._clock,
                 type=MessageType.INTERVENTION_RESTORE,
                 payload={
                     "intervention_id": intervention_id,
@@ -1933,7 +2023,8 @@ class WebSocketServer:
         """Broadcast settings to all clients."""
         self._sequence += 1
         return await self._broadcast(
-            WSMessage(
+            WSMessage.from_clock(
+                clock=self._clock,
                 type=MessageType.SETTINGS_SYNC,
                 payload=settings,
                 sequence=self._sequence,
@@ -1951,7 +2042,8 @@ class WebSocketServer:
         """Broadcast an arbitrary typed message to connected clients."""
         self._sequence += 1
         return await self._broadcast(
-            WSMessage(
+            WSMessage.from_clock(
+                clock=self._clock,
                 type=message_type,
                 payload=payload,
                 sequence=self._sequence,
@@ -1984,7 +2076,8 @@ class WebSocketServer:
         self._pending_cids_by_client.setdefault(target.client_id, set()).add(
             correlation_id,
         )
-        message = WSMessage(
+        message = WSMessage.from_clock(
+            clock=self._clock,
             type=MessageType.CONTEXT_REQUEST,
             payload={},
             sequence=self._sequence,
@@ -2241,7 +2334,7 @@ class WebSocketServer:
         # cancel only the unfinished tasks; already-completed tasks keep
         # their results (a plain ``asyncio.gather`` would cancel every
         # inner coroutine when the wrapper is cancelled).
-        broadcast_start = time.monotonic()
+        broadcast_start = monotonic_seconds(self._clock)
         send_tasks = [
             asyncio.create_task(_send_one(client)) for _, client in targets
         ]
@@ -2266,7 +2359,7 @@ class WebSocketServer:
                 except BaseException as exc:  # noqa: BLE001
                     results.append(exc)
 
-        elapsed_s = time.monotonic() - broadcast_start
+        elapsed_s = monotonic_seconds(self._clock) - broadcast_start
         sent = 0
         # F22: track (client_id, reason) so the post-loop close path can
         # emit the right reason string per disconnect.
@@ -2408,14 +2501,30 @@ class WebSocketServer:
             from cortex.services.api_gateway.app import registry as _registry
             frame_meta = _registry.get("latest_frame_meta")
             if frame_meta is not None:
-                fm_ts = float(getattr(frame_meta, "timestamp", 0.0))
-                # ``fm_ts`` is wall-clock seconds per the FrameMeta
-                # schema docstring; the producer (capture pipeline) is
-                # being aligned to ``time.time()`` in tandem with this
-                # consumer change. Comparing against ``time.time()``
-                # here is the correct freshness window once both sides
-                # agree on the clock.
-                frames_flowing = time.time() - fm_ts < 2.0
+                fm_mono_ns = getattr(frame_meta, "observed_at_mono_ns", None)
+                fm_boot_id = getattr(frame_meta, "boot_id", None)
+                if isinstance(fm_mono_ns, int) and fm_boot_id == self._clock.boot_id:
+                    age_seconds = max(
+                        0.0,
+                        (self._clock.monotonic_ns() - fm_mono_ns) / 1e9,
+                    )
+                else:
+                    fm_unix_ms = getattr(frame_meta, "observed_at_unix_ms", None)
+                    if isinstance(fm_unix_ms, int):
+                        age_seconds = max(
+                            0.0,
+                            (self._clock.unix_ms() - fm_unix_ms) / 1000.0,
+                        )
+                    else:
+                        # One-release v1 compatibility: FrameMeta.timestamp is
+                        # documented UTC Unix seconds. Never reinterpret it as
+                        # monotonic time.
+                        fm_ts = float(getattr(frame_meta, "timestamp", 0.0))
+                        age_seconds = max(
+                            0.0,
+                            self._clock.unix_ms() / 1000.0 - fm_ts,
+                        )
+                frames_flowing = age_seconds < 2.0
                 face_detected = bool(
                     getattr(frame_meta, "face_detected", False)
                 )
@@ -2477,6 +2586,9 @@ class WebSocketServer:
             source=envelope_source,
             degraded=degraded,
             timestamp=_serialize_timestamp(estimate.timestamp),
+            observed_at_unix_ms=estimate.observed_at_unix_ms,
+            observed_at_mono_ns=estimate.observed_at_mono_ns,
+            boot_id=estimate.boot_id,
             # G1 (audit-prod): stamp the deduped list of
             # currently-IDENTIFY-ed client types so consumers (desktop
             # dashboard) can light up the Chrome / Edge / Editor
@@ -2489,7 +2601,8 @@ class WebSocketServer:
             sequence=self._sequence,
         )
 
-        return WSMessage(
+        return WSMessage.from_clock(
+            clock=self._clock,
             type=MessageType.STATE_UPDATE,
             payload=payload_model.model_dump(mode="json"),
             sequence=self._sequence,
@@ -2568,7 +2681,8 @@ class WebSocketServer:
         if payload_dict.get("connected_clients") is None:
             payload_dict.pop("connected_clients", None)
 
-        return WSMessage(
+        return WSMessage.from_clock(
+            clock=self._clock,
             type=MessageType.INTERVENTION_TRIGGER,
             payload=payload_dict,
             sequence=self._sequence,

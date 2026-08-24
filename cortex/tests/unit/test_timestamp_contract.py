@@ -1,94 +1,74 @@
-"""P1-12: Timestamp contract tests — all float timestamps must be wall-clock.
-
-Verifies:
-- StateEstimate.timestamp is epoch-seconds (much larger than monotonic).
-- FeatureVector.timestamp is epoch-seconds.
-- FrameMeta.timestamp is epoch-seconds.
-- StateTransition.timestamp is epoch-seconds.
-- Values are within 60 seconds of time.time() when set via time.time().
-"""
+"""Versioned timestamp contracts preserve provenance during v1 -> v2."""
 
 from __future__ import annotations
 
-import time
+import pytest
 
+from cortex.application.clock import FakeClock
 from cortex.libs.schemas.features import FeatureVector, FrameMeta
-from cortex.libs.schemas.state import (
-    SignalQuality,
-    StateEstimate,
-    StateScores,
-    StateTransition,
-    UserState,
-)
+from cortex.libs.schemas.state import StateScores
+from cortex.libs.schemas.temporal import EventTime
+from cortex.services.state_engine.feature_fusion import FeatureFusion
+from cortex.services.state_engine.smoother import ScoreSmoother
 
 
-def _make_state_estimate(ts: float) -> StateEstimate:
-    return StateEstimate(
-        state=UserState.FLOW,
-        confidence=0.8,
-        scores=StateScores(flow=0.8, hypo=0.1, hyper=0.0, recovery=0.1),
-        signal_quality=SignalQuality(physio=0.7, kinematics=0.6, telemetry=0.8),
-        timestamp=ts,
+def test_capture_legacy_timestamp_remains_epoch_seconds() -> None:
+    """FrameMeta's legacy field mirrors its historical wall-clock producer."""
+
+    clock = FakeClock(wall_unix_ms=1_700_000_000_123, mono_ns=250_000_000)
+    event = EventTime.from_clock(clock)
+    frame = FrameMeta(
+        timestamp=event.observed_at_unix_ms / 1_000,
+        observed_at_unix_ms=event.observed_at_unix_ms,
+        observed_at_mono_ns=event.observed_at_mono_ns,
+        boot_id=event.boot_id,
+        face_detected=True,
+        face_confidence=0.9,
+        brightness_score=0.8,
+        blur_score=0.9,
+        motion_score=0.1,
     )
 
+    assert frame.timestamp == 1_700_000_000.123
+    assert frame.observed_at_mono_ns == 250_000_000
 
-class TestTimestampIsWallClock:
-    def test_state_estimate_timestamp_is_epoch(self) -> None:
-        """timestamp set from time.time() must be epoch-seconds (>> monotonic)."""
-        now = time.time()
-        est = _make_state_estimate(now)
-        # Any supported date is safely after 2001. Do not compare to process
-        # uptime: a long-lived host makes magnitude heuristics invalid.
-        assert abs(est.timestamp) > 1_000_000_000, (
-            "timestamp looks like monotonic, not epoch"
+
+def test_state_pipeline_legacy_timestamp_remains_monotonic() -> None:
+    """The deprecated state timestamp is not silently redefined as wall time."""
+
+    clock = FakeClock(wall_unix_ms=1_700_000_000_123, mono_ns=250_000_000)
+    event = EventTime.from_clock(clock)
+    vector, quality = FeatureFusion(clock=clock).fuse(event_time=event)
+    estimate = ScoreSmoother(clock=clock).update(
+        StateScores(flow=1.0),
+        quality,
+        event_time=event,
+    )
+
+    assert vector.timestamp == 0.25
+    assert estimate.timestamp == 0.25
+    assert vector.observed_at_unix_ms == 1_700_000_000_123
+    assert estimate.observed_at_unix_ms == 1_700_000_000_123
+
+
+@pytest.mark.parametrize("model", [FrameMeta, FeatureVector])
+def test_partial_v2_clock_tuple_is_rejected(
+    model: type[FrameMeta] | type[FeatureVector],
+) -> None:
+    """A monotonic value without its boot domain must never cross a boundary."""
+
+    kwargs: dict[str, object] = {
+        "timestamp": 0.0,
+        "observed_at_unix_ms": 1,
+    }
+    if model is FrameMeta:
+        kwargs.update(
+            face_detected=False,
+            face_confidence=0.0,
+            brightness_score=0.0,
+            blur_score=0.0,
+            motion_score=0.0,
         )
 
-    def test_state_estimate_timestamp_within_60s_of_now(self) -> None:
-        before = time.time()
-        est = _make_state_estimate(time.time())
-        after = time.time()
-        assert before - 1 <= est.timestamp <= after + 1
-
-    def test_feature_vector_timestamp_is_epoch(self) -> None:
-        now = time.time()
-        fv = FeatureVector(timestamp=now)
-        assert abs(fv.timestamp) > 1_000_000_000
-
-    def test_frame_meta_timestamp_is_epoch(self) -> None:
-        now = time.time()
-        fm = FrameMeta(
-            timestamp=now,
-            face_detected=True,
-            face_confidence=0.9,
-            brightness_score=0.8,
-            blur_score=0.9,
-            motion_score=0.1,
-        )
-        assert abs(fm.timestamp) > 1_000_000_000
-
-    def test_state_transition_timestamp_is_epoch(self) -> None:
-        now = time.time()
-        tr = StateTransition(
-            timestamp=now,
-            from_state="FLOW",
-            to_state="HYPER",
-            from_confidence=0.7,
-            to_confidence=0.85,
-            dwell_seconds=30.0,
-        )
-        assert abs(tr.timestamp) > 1_000_000_000
-
-    def test_epoch_sanity_check_gt_monotonic(self) -> None:
-        """Epoch seconds (circa 1.7e9) must be much larger than monotonic.
-
-        Epoch time is ~1.7 billion seconds since 1970.  Even a machine
-        that has been running for a full year (~31 million seconds) yields
-        epoch >> monotonic.  We assert epoch > 1e9 as a baseline check
-        (the year 2001 is more than enough headroom)."""
-        now = time.time()
-        # epoch seconds must be > 1 billion (any date after ~year 2001)
-        assert now > 1e9, f"time.time() returned {now}, expected > 1e9 (epoch)"
-        # and epoch seconds are definitely larger than monotonic
-        assert now > time.monotonic(), (
-            "time.time() must be greater than time.monotonic() for any sane system"
-        )
+    with pytest.raises(ValueError, match="must be supplied together"):
+        model(**kwargs)

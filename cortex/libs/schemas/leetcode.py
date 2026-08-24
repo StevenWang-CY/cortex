@@ -66,7 +66,17 @@ class LeetCodeContext(BaseModel):
         None, description="Most recent submission result"
     )
     last_submission_ts: float | None = Field(
-        None, description="Timestamp of last submission"
+        None,
+        deprecated=True,
+        description=(
+            "Deprecated v1 UTC Unix timestamp; historical clients sent "
+            "milliseconds while some Python callers sent seconds."
+        ),
+    )
+    last_submission_at_unix_ms: int | None = Field(
+        None,
+        ge=0,
+        description="Last submission time in UTC Unix epoch milliseconds.",
     )
     accepted: bool = Field(False, description="Whether problem has been accepted")
 
@@ -141,7 +151,16 @@ class PatternLadderRung(BaseModel):
     label: str = Field(..., description="Rung label (e.g. 'Category', 'Key Insight')")
     content: str = Field(..., description="Hint content for this rung")
     revealed: bool = Field(False, description="Whether user has revealed this rung")
-    revealed_at: float | None = Field(None, description="Timestamp when revealed")
+    revealed_at: float | None = Field(
+        None,
+        deprecated=True,
+        description="Deprecated v1 process-local monotonic seconds.",
+    )
+    revealed_at_unix_ms: int | None = Field(
+        None,
+        ge=0,
+        description="Reveal time in UTC Unix epoch milliseconds.",
+    )
 
 
 class LeetCodeSessionMetrics(BaseModel):

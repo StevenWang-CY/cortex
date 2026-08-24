@@ -19,9 +19,11 @@ from dataclasses import field as dc_field
 from datetime import datetime
 from typing import Any, Literal
 from urllib.parse import urlparse
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from cortex.application.clock import SYSTEM_CLOCK, utc_datetime
 
 # ---------------------------------------------------------------------------
 # Planner-side dataclasses (intentionally NOT pydantic models).
@@ -560,7 +562,18 @@ class WorkspaceSnapshot(BaseModel):
     """
 
     intervention_id: str = Field(..., description="Associated intervention ID")
-    timestamp: float = Field(..., description="When snapshot was taken")
+    timestamp: float = Field(
+        ...,
+        deprecated=True,
+        description=(
+            "Deprecated v1 process-local monotonic seconds. Compare only "
+            "inside the producing boot; prefer observed_at_mono_ns."
+        ),
+    )
+    schema_version: Literal["2.0"] = "2.0"
+    observed_at_unix_ms: int | None = Field(None, ge=0)
+    observed_at_mono_ns: int | None = Field(None, ge=0)
+    boot_id: UUID | None = None
 
     # Editor state
     fold_states: list[FoldState] = Field(
@@ -587,6 +600,17 @@ class WorkspaceSnapshot(BaseModel):
     terminal_scroll_position: int | None = Field(
         None, description="Terminal scroll position"
     )
+
+    @model_validator(mode="after")
+    def _validate_v2_time_tuple(self) -> WorkspaceSnapshot:
+        supplied = (
+            self.observed_at_unix_ms is not None,
+            self.observed_at_mono_ns is not None,
+            self.boot_id is not None,
+        )
+        if any(supplied) and not all(supplied):
+            raise ValueError("workspace snapshot v2 time fields must be supplied together")
+        return self
 
     @property
     def has_editor_state(self) -> bool:
@@ -679,10 +703,13 @@ class DismissalRecord(BaseModel):
         stored timestamp so the subtraction is always valid.
         """
         if self.timestamp.tzinfo is not None:
-            now = datetime.now(self.timestamp.tzinfo)
+            now = utc_datetime(SYSTEM_CLOCK).astimezone(self.timestamp.tzinfo)
         else:
-            now = datetime.now()
-        return (now - self.timestamp).total_seconds()
+            now = utc_datetime(SYSTEM_CLOCK).astimezone().replace(tzinfo=None)
+        # Construction and access can straddle adjacent clock reads; a caller
+        # may also provide a timestamp a few microseconds in the future due to
+        # serialization precision. Age is a duration and cannot be negative.
+        return max(0.0, (now - self.timestamp).total_seconds())
 
 
 class InterventionApplied(BaseModel):

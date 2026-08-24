@@ -21,6 +21,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
+from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 from cortex.libs.utils.platform import Platform, get_platform
 
 logger = logging.getLogger(__name__)
@@ -54,7 +55,10 @@ class WindowTracker:
         self,
         poll_interval: float = 1.0,
         history_size: int = 1000,
+        *,
+        clock: Clock | None = None,
     ) -> None:
+        self._clock = clock or SYSTEM_CLOCK
         self._poll_interval = poll_interval
         self._events: deque[WindowFocusEvent] = deque(maxlen=history_size)
         self._lock = threading.Lock()
@@ -142,7 +146,11 @@ class WindowTracker:
 
         Only records if the focus actually changed from the previous state.
         """
-        t = timestamp if timestamp is not None else time.monotonic()
+        t = (
+            timestamp
+            if timestamp is not None
+            else monotonic_seconds(self._clock)
+        )
 
         if app_name == self._last_app_name and window_title == self._last_window_title:
             return  # No change
@@ -175,7 +183,11 @@ class WindowTracker:
         Returns:
             List of window focus events in chronological order.
         """
-        now = current_time or time.monotonic()
+        now = (
+            monotonic_seconds(self._clock)
+            if current_time is None
+            else current_time
+        )
         cutoff = now - window_seconds
 
         with self._lock:

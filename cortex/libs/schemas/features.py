@@ -7,6 +7,9 @@ webcam, face tracking, and telemetry sources.
 
 from __future__ import annotations
 
+from typing import Literal
+from uuid import UUID
+
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -15,11 +18,27 @@ class FrameMeta(BaseModel):
 
     timestamp: float = Field(
         ...,
+        deprecated=True,
         description=(
             "UNIX epoch seconds (wall-clock, UTC); comparable across "
             "producer and consumer. Previously documented as 'Monotonic' "
             "but the producer uses time.time(), not time.monotonic()."
         ),
+    )
+    schema_version: Literal["2.0"] = "2.0"
+    observed_at_unix_ms: int | None = Field(
+        None,
+        ge=0,
+        description="Capture time in UTC Unix epoch milliseconds.",
+    )
+    observed_at_mono_ns: int | None = Field(
+        None,
+        ge=0,
+        description="Capture time in the producer's monotonic clock domain.",
+    )
+    boot_id: UUID | None = Field(
+        None,
+        description="Producer boot ID; required when observed_at_mono_ns is present.",
     )
     face_detected: bool = Field(..., description="Whether a face was detected")
     face_confidence: float = Field(
@@ -44,6 +63,20 @@ class FrameMeta(BaseModel):
             "appending the actual pixels."
         ),
     )
+
+    @model_validator(mode="after")
+    def _validate_v2_time_tuple(self) -> FrameMeta:
+        supplied = (
+            self.observed_at_unix_ms is not None,
+            self.observed_at_mono_ns is not None,
+            self.boot_id is not None,
+        )
+        if any(supplied) and not all(supplied):
+            raise ValueError(
+                "observed_at_unix_ms, observed_at_mono_ns, and boot_id "
+                "must be supplied together"
+            )
+        return self
 
 
 class PhysioFeatures(BaseModel):
@@ -219,11 +252,26 @@ class FeatureVector(BaseModel):
 
     timestamp: float = Field(
         ...,
+        deprecated=True,
         description=(
-            "UNIX epoch seconds (wall-clock, UTC); comparable across "
-            "producer and consumer. Previously documented as 'Monotonic' "
-            "but the producer uses time.time(), not time.monotonic()."
+            "Deprecated v1 state-pipeline monotonic seconds. Compare only "
+            "inside the producing process; prefer observed_at_mono_ns."
         ),
+    )
+    schema_version: Literal["2.0"] = "2.0"
+    observed_at_unix_ms: int | None = Field(
+        None,
+        ge=0,
+        description="UTC Unix epoch milliseconds for persistence/display.",
+    )
+    observed_at_mono_ns: int | None = Field(
+        None,
+        ge=0,
+        description="Monotonic nanoseconds for elapsed-time decisions.",
+    )
+    boot_id: UUID | None = Field(
+        None,
+        description="Clock domain for observed_at_mono_ns.",
     )
 
     # Physiological features (1-3)
@@ -309,6 +357,20 @@ class FeatureVector(BaseModel):
             "5+ samples (warm-up gate)."
         ),
     )
+
+    @model_validator(mode="after")
+    def _validate_v2_time_tuple(self) -> FeatureVector:
+        supplied = (
+            self.observed_at_unix_ms is not None,
+            self.observed_at_mono_ns is not None,
+            self.boot_id is not None,
+        )
+        if any(supplied) and not all(supplied):
+            raise ValueError(
+                "observed_at_unix_ms, observed_at_mono_ns, and boot_id "
+                "must be supplied together"
+            )
+        return self
 
     def to_array(self) -> list[float | None]:
         """Convert feature vector to a list for ML inference."""

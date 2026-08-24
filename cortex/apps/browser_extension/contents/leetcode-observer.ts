@@ -748,6 +748,7 @@ export class LeetCodeObserver {
       wrong_answer_count: this.wrongAnswerCount,
       last_submission_result: this.lastSubmissionResult,
       last_submission_ts: this.lastSubmissionTs,
+      last_submission_at_unix_ms: this.lastSubmissionTs,
       accepted: this.accepted,
       stage: this.currentStage,
       code_snapshot: this.lastCodeSnapshot,

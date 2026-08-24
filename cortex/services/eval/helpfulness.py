@@ -11,9 +11,10 @@ The reward signal feeds the contextual bandit learning loop.
 from __future__ import annotations
 
 import logging
-import time
 from collections import deque
 from typing import Any, TypedDict
+
+from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -124,8 +125,9 @@ class HelpfulnessTracker:
         record = await tracker.end_tracking(intervention_id, state, context, outcome)
     """
 
-    def __init__(self, store: Any = None) -> None:
+    def __init__(self, store: Any = None, *, clock: Clock | None = None) -> None:
         self._store = store
+        self._clock = clock or SYSTEM_CLOCK
         self._active: dict[str, _TrackedIntervention] = {}
         self._recent_rewards: list[float] = []
         self._recent_engaged: list[bool] = []
@@ -166,7 +168,7 @@ class HelpfulnessTracker:
             pre_error_count=error_count,
             pre_thrashing=thrashing_score,
             pre_stress=stress_integral,
-            started_at=time.monotonic(),
+            started_at=monotonic_seconds(self._clock),
             decision_id=decision_id,
             propensity=propensity,
             policy_arm=policy_arm,
@@ -184,7 +186,11 @@ class HelpfulnessTracker:
             return
 
         tracked.user_action = action
-        ts = timestamp or time.monotonic()
+        ts = (
+            monotonic_seconds(self._clock)
+            if timestamp is None
+            else timestamp
+        )
 
         if action == "engaged":
             tracked.was_engaged = True
@@ -225,20 +231,20 @@ class HelpfulnessTracker:
             # end_tracking) — a user who downvotes the dismissal toast
             # of a stale intervention shouldn't be silently lost.
             if rating == "thumbs_down":
-                self._recent_downvotes.append(time.monotonic())
+                self._recent_downvotes.append(monotonic_seconds(self._clock))
             return
         tracked.user_rating = rating
         if text_feedback is not None:
             cleaned = text_feedback.strip()[:_MAX_TEXT_FEEDBACK_CHARS]
             tracked.text_feedback = cleaned or None
         if rating == "thumbs_down":
-            self._recent_downvotes.append(time.monotonic())
+            self._recent_downvotes.append(monotonic_seconds(self._clock))
 
     def downvote_count_within(self, window_seconds: float) -> int:
         """Count thumbs_down events within the last ``window_seconds``."""
         if window_seconds <= 0:
             return 0
-        cutoff = time.monotonic() - float(window_seconds)
+        cutoff = monotonic_seconds(self._clock) - float(window_seconds)
         # Drop entries that fall outside the window so the deque doesn't
         # accumulate stale timestamps forever.
         while self._recent_downvotes and self._recent_downvotes[0] < cutoff:
@@ -272,7 +278,7 @@ class HelpfulnessTracker:
         tracked.post_complexity = complexity
         tracked.post_tab_count = tab_count
         tracked.post_error_count = error_count
-        tracked.ended_at = time.monotonic()
+        tracked.ended_at = monotonic_seconds(self._clock)
 
         # Compute time to FLOW
         if state == "FLOW":

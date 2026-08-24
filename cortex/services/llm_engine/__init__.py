@@ -8,6 +8,7 @@ SDK and selects ``AsyncAnthropicBedrock`` / ``AsyncAnthropic`` /
 ``AsyncAnthropicVertex`` via the ``ANTHROPIC_PROVIDER`` env var.
 """
 
+from cortex.application.clock import Clock
 from cortex.libs.config.settings import LLMConfig
 from cortex.services.llm_engine.anthropic_planner import AnthropicPlanner
 from cortex.services.llm_engine.cache import LLMCache
@@ -53,6 +54,8 @@ __all__ = [
 
 def create_llm_client(
     config: LLMConfig | None = None,
+    *,
+    clock: Clock | None = None,
 ) -> LLMClient:
     """Construct the production LLM client.
 
@@ -71,8 +74,8 @@ def create_llm_client(
 
         if cfg.provider == "bedrock" and not os.getenv("AWS_BEARER_TOKEN_BEDROCK"):
             try:
-                return AnthropicPlanner(cfg)
+                return AnthropicPlanner(cfg, clock=clock)
             except RuntimeError:
                 return RuleBasedLLMClient()
 
-    return AnthropicPlanner(cfg)
+    return AnthropicPlanner(cfg, clock=clock)

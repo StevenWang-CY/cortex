@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import time
 from dataclasses import dataclass
 from typing import Any
+
+from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +84,10 @@ class FocusGraphBuilder:
         self,
         window_seconds: float = _DEFAULT_WINDOW_SECONDS,
         max_events: int = 500,
+        *,
+        clock: Clock | None = None,
     ) -> None:
+        self._clock = clock or SYSTEM_CLOCK
         self._window_seconds = window_seconds
         self._events: list[_FocusEvent] = []
         self._max_events = max_events
@@ -110,10 +114,10 @@ class FocusGraphBuilder:
         Args:
             app_name: Name of the application that gained focus.
             window_title: Window/tab title.
-            timestamp: Event timestamp. None = use time.monotonic().
+            timestamp: Event monotonic timestamp. None = use the injected clock.
         """
         if timestamp is None:
-            timestamp = time.monotonic()
+            timestamp = monotonic_seconds(self._clock)
 
         node_id = self._make_node_id(app_name, window_title)
 
@@ -155,13 +159,13 @@ class FocusGraphBuilder:
 
         Args:
             window_seconds: Override analysis window. None = use default.
-            current_time: Override current time. None = use time.monotonic().
+            current_time: Override monotonic time. None = use the injected clock.
 
         Returns:
             Thrashing score in [0, 1].
         """
         if current_time is None:
-            current_time = time.monotonic()
+            current_time = monotonic_seconds(self._clock)
         window = window_seconds or self._window_seconds
 
         # Get events in window
@@ -230,7 +234,7 @@ class FocusGraphBuilder:
         Args:
             goal_keywords: Keywords from the session goal.
             window_seconds: Analysis window. None = use default.
-            current_time: Override time. None = use time.monotonic().
+            current_time: Override monotonic time. None = use the injected clock.
 
         Returns:
             Alignment score in [0, 1]. 1.0 = perfectly on-task.
@@ -239,7 +243,7 @@ class FocusGraphBuilder:
             return 1.0  # No goal set → assume aligned
 
         if current_time is None:
-            current_time = time.monotonic()
+            current_time = monotonic_seconds(self._clock)
         window = window_seconds or self._window_seconds
 
         cutoff = current_time - window
@@ -281,7 +285,7 @@ class FocusGraphBuilder:
         Returns list of dicts with node_id, app_name, title, visit_count, total_dwell_s.
         """
         if current_time is None:
-            current_time = time.monotonic()
+            current_time = monotonic_seconds(self._clock)
         window = window_seconds or self._window_seconds
         cutoff = current_time - window
         recent = [e for e in self._events if e.timestamp >= cutoff]
@@ -321,7 +325,7 @@ class FocusGraphBuilder:
     ) -> list[dict[str, Any]]:
         """Get recent transitions for LLM context."""
         if current_time is None:
-            current_time = time.monotonic()
+            current_time = monotonic_seconds(self._clock)
         window = window_seconds or self._window_seconds
         cutoff = current_time - window
         recent = [e for e in self._events if e.timestamp >= cutoff]

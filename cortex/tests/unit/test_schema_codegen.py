@@ -101,6 +101,11 @@ def test_output_path_targets_extension_generated_dir() -> None:
     assert str(gen.OUTPUT_PATH).endswith(str(expected_tail))
 
 
+def test_vscode_output_path_targets_its_generated_dir() -> None:
+    expected_tail = Path("apps/vscode_extension/src/generated/cortex_schemas.d.ts")
+    assert str(gen.VSCODE_OUTPUT_PATH).endswith(str(expected_tail))
+
+
 def test_cli_accepts_check_flag(capsys: pytest.CaptureFixture[str]) -> None:
     """``--help`` lists the ``--check`` flag (regression guard for CI gate)."""
     with pytest.raises(SystemExit):
@@ -148,6 +153,27 @@ def test_run_check_passes_when_in_sync(
     monkeypatch.setattr(gen, "_generate_into", fake_generate)
 
     assert gen.run_check() == 0
+
+
+def test_run_check_detects_vscode_consumer_drift(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Both TypeScript clients are first-class checked contract targets."""
+
+    canonical = tmp_path / "browser.d.ts"
+    vscode = tmp_path / "vscode.d.ts"
+    canonical.write_text("// fresh generated body\n", encoding="utf-8")
+    vscode.write_text("// stale consumer body\n", encoding="utf-8")
+
+    def fake_generate(target: Path) -> None:
+        target.write_text("// fresh generated body\n", encoding="utf-8")
+
+    monkeypatch.setattr(gen, "OUTPUT_PATH", canonical)
+    monkeypatch.setattr(gen, "_CANONICAL_OUTPUT_PATH", canonical)
+    monkeypatch.setattr(gen, "VSCODE_OUTPUT_PATH", vscode)
+    monkeypatch.setattr(gen, "_generate_into", fake_generate)
+
+    assert gen.run_check() == 1
 
 
 def test_run_check_reports_missing_output(

@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from cortex.application.clock import FakeClock
 from cortex.services.api_gateway.app import create_app, registry
 from cortex.services.api_gateway.routes import (
     AckResponse,
@@ -141,6 +142,32 @@ class TestWallClockTimestamps:
         resp = StateInferResponse(estimate=estimate)
         after = time.time()
         assert before - 5.0 <= resp.timestamp <= after + 5.0
+
+    def test_route_envelope_uses_the_app_owned_clock(
+        self, tmp_path: Any, monkeypatch: Any,
+    ) -> None:
+        """REST construction must not bypass an injected deterministic clock."""
+
+        from cortex.libs.auth.local_token import load_or_create_token
+
+        token_file = tmp_path / "auth.token"
+        monkeypatch.setattr(
+            "cortex.libs.auth.local_token.auth_token_path",
+            lambda: token_file,
+        )
+        token = load_or_create_token(token_file)
+        clock = FakeClock(wall_unix_ms=1_700_000_000_123, mono_ns=987_654_321)
+        with TestClient(create_app(clock=clock)) as injected_client:
+            response = injected_client.get(
+                "/api/cost",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        body = response.json()
+        assert body["observed_at_unix_ms"] == clock.unix_ms()
+        assert body["observed_at_mono_ns"] == clock.monotonic_ns()
+        assert body["boot_id"] == str(clock.boot_id)
+        assert body["timestamp"] == clock.unix_ms() / 1_000
 
 
 # ─── T2: /api/cost endpoint ───────────────────────────────────────────
