@@ -46,6 +46,14 @@ from cortex.libs.schemas.intervention import (
     InterventionPlan,
 )
 from cortex.libs.schemas.leetcode import LeetCodeContext
+from cortex.libs.schemas.observations import (
+    CameraFrameObservation,
+    CameraIdentity,
+    MissingReason,
+    ObservationEnvelope,
+    ObservationSource,
+    ObservationValidity,
+)
 from cortex.libs.schemas.session_history import (
     SessionDetailResponse,
     SessionListResponse,
@@ -61,6 +69,12 @@ from cortex.libs.utils import receptivity
 from cortex.services.activity_tracker.aggregator import ActivityAggregator
 from cortex.services.api_gateway.app import create_app, registry
 from cortex.services.api_gateway.websocket_server import WebSocketServer
+from cortex.services.capture_service.observation_buffer import (
+    NumericObservation,
+    ObservationBuffer,
+    PreparedObservationWindow,
+    prepare_observation_window,
+)
 from cortex.services.capture_service.pipeline import CapturePipeline, PipelineOutput
 from cortex.services.consent.ladder import ConsentLadder
 from cortex.services.consent.policy import (
@@ -162,17 +176,15 @@ def _emit_event(event: EventType, **fields: Any) -> None:
 
 
 def _interpolate_nan_window(window: np.ndarray) -> np.ndarray:
-    """Linear-interpolate over NaN-sentinel rows in an rPPG RGB window.
+    """Legacy bounded-input helper for a prevalidated rPPG RGB window.
 
-    ``window`` is shape ``(N, C)`` (N frames, C colour channels). Low-quality
-    frames are appended to ``_rgb_history`` as all-NaN rows so the window
-    stays time-uniform (audit P1); this fills those gaps per-channel via
-    ``np.interp`` so the downstream non-NaN-aware bandpass filter + Welch PSD
-    never see a NaN. A channel that is entirely NaN (no good frame in the
-    window) falls back to zeros, which ``extract_bvp`` already tolerates.
+    ``window`` is shape ``(N, C)``. The production path first applies the
+    explicit time/coverage/gap gate in ``prepare_observation_window`` and no
+    longer calls this helper. It remains for compatibility callers that have
+    already bounded their gaps. An entirely missing channel remains NaN:
+    fabricating a zero trace would make an unavailable window look ready.
 
-    Returns a finite array of the same shape. A window with no NaNs is
-    returned (a copy is acceptable) unchanged.
+    A window with no NaNs is returned (a copy is acceptable) unchanged.
     """
     if window.size == 0:
         return window
@@ -188,7 +200,6 @@ def _interpolate_nan_window(window: np.ndarray) -> np.ndarray:
         col = view[:, c]
         good = ~np.isnan(col)
         if not good.any():
-            col[:] = 0.0
             continue
         if good.all():
             continue
@@ -553,7 +564,10 @@ class CortexDaemon:
             active_app_provider=self._current_app_name,
         )
 
-        self._capture_pipeline = CapturePipeline(self.config.capture)
+        self._capture_pipeline = CapturePipeline(
+            self.config.capture,
+            clock=self._clock,
+        )
         self._roi_extractor = RoiExtractor(self.config.landmarks)
         _rppg_cfg = self.config.signal.rppg
         # B2: the temporal stabilizer removes the ~1 Hz "Reading your
@@ -675,17 +689,29 @@ class CortexDaemon:
         self._last_leetcode_hrv_rmssd: float | None = None
         self._leetcode_action_signatures: dict[str, float] = {}
 
-        _rgb_maxlen = max(
-            1, self.config.signal.rppg.window_seconds * self.config.capture.fps
+        _rgb_window_seconds = float(self.config.signal.rppg.window_seconds)
+        self._rgb_observations: ObservationBuffer[NumericObservation] = (
+            ObservationBuffer(
+                max_age_seconds=(
+                    _rgb_window_seconds
+                    + self.config.signal.rppg.max_interpolation_gap_ms / 1000.0
+                    + 1.0
+                ),
+                max_items=max(
+                    self.config.capture.observation_buffer_max_items,
+                    int(
+                        _rgb_window_seconds
+                        * self.config.signal.rppg.fps_clamp_max
+                    ) + 2,
+                ),
+            )
         )
-        self._rgb_history: deque[np.ndarray] = deque(maxlen=_rgb_maxlen)
-        # B1 (sampling-rate correctness): real frame timestamps kept in
-        # lock-step with ``_rgb_history`` so the rPPG window's *effective*
-        # fps is derived from wall-clock spacing, not the configured 30. A
-        # MacBook/Continuity camera commonly delivers ~24-28 fps; feeding a
-        # wrong fs into the Welch PSD scales BPM by the same factor and
-        # drifts the spectral peak across the SQI gate.
-        self._rgb_ts_history: deque[float] = deque(maxlen=_rgb_maxlen)
+        self._legacy_capture_sequence = 0
+        self._legacy_capture_source_instance_id = self._clock.boot_id
+        self._legacy_capture_mono_origin_ns = self._clock.monotonic_ns()
+        self._active_camera_identity_key: str | None = None
+        self._active_camera_source_instance_id: str | None = None
+        self._camera_calibration_valid = True
         # P0-2: count of low-quality frames rejected from the rPPG window.
         self._frames_low_quality_rejected: int = 0
         # C5 (audit): cache the previous frame's blink-suppression score so
@@ -722,6 +748,7 @@ class CortexDaemon:
             confidence=0.0,
         )
         self._last_physio_update = 0.0
+        self._last_physio_update_mono_ns = 0
         # B22 (Phase 4.1): monotonic timestamp of the most recent
         # kinematics feature delivery. State loop marks the kinematics
         # channel stale when monotonic age exceeds 2 seconds.
@@ -2087,140 +2114,430 @@ class CortexDaemon:
             # B6 (Phase 4.1): graceful task shutdown; intentional.
             logger.debug("capture loop cancelled")
 
-    def _effective_rppg_fps(self) -> float:
-        """Effective sampling rate of the current rPPG window (B1).
+    @property
+    def _rgb_history(self) -> deque[np.ndarray]:
+        """Derived legacy view; the canonical store is one observation deque."""
 
-        Computed from the real frame timestamps held in ``_rgb_ts_history``
-        as ``(n - 1) / (t_last - t_first)`` — the true mean frame rate over
-        the window, which is what the Welch PSD needs to map a spectral peak
-        to BPM. Clamped to ``[fps_clamp_min, fps_clamp_max]``; outside that
-        band (or with too few / degenerate timestamps, or when disabled) we
-        fall back to the configured capture fps. Refs: MDPI Sensors
-        25(2):588 (2025); rPPG-in-the-wild, Behavior Research Methods 2024.
-        """
+        maxlen = max(
+            1, self.config.signal.rppg.window_seconds * self.config.capture.fps
+        )
+        rows = (
+            item.value
+            if item.is_valid and item.value is not None
+            else np.full(3, np.nan, dtype=np.float64)
+            for item in self._rgb_observations.snapshot()
+        )
+        return deque(rows, maxlen=maxlen)
+
+    @property
+    def _rgb_ts_history(self) -> deque[float]:
+        """Derived legacy timestamp view; no parallel timestamp state exists."""
+
+        maxlen = max(
+            1, self.config.signal.rppg.window_seconds * self.config.capture.fps
+        )
+        return deque(
+            (
+                item.observed_at_mono_ns / 1_000_000_000.0
+                for item in self._rgb_observations.snapshot()
+            ),
+            maxlen=maxlen,
+        )
+
+    def _effective_rppg_fps(self) -> float:
+        """Return measured cadence from the canonical observation stream."""
+
         cfg = self.config.signal.rppg
         fallback = float(self.config.capture.fps)
         if not cfg.use_measured_fps:
             return fallback
-        ts = self._rgb_ts_history
-        if len(ts) < 2:
+        times = np.asarray(
+            [item.observed_at_mono_ns for item in self._rgb_observations.snapshot()],
+            dtype=np.int64,
+        )
+        if len(times) < 2:
             return fallback
-        span = float(ts[-1]) - float(ts[0])
-        if span <= 1e-3:
+        diffs = np.diff(times)
+        if bool((diffs <= 0).any()):
             return fallback
-        cand = (len(ts) - 1) / span
-        if cfg.fps_clamp_min <= cand <= cfg.fps_clamp_max:
-            return float(cand)
+        candidate = 1_000_000_000.0 / float(np.median(diffs))
+        if cfg.fps_clamp_min <= candidate <= cfg.fps_clamp_max:
+            return candidate
         return fallback
+
+    def _legacy_capture_observation(
+        self, output: PipelineOutput
+    ) -> ObservationEnvelope[CameraFrameObservation]:
+        """Adapt pre-v2 internal test/plugin outputs without mixing clocks."""
+
+        frame_meta = output.frame_meta
+        sequence = self._legacy_capture_sequence
+        self._legacy_capture_sequence += 1
+        interval_ns = max(
+            1, int(1_000_000_000 / max(1, self.config.capture.fps))
+        )
+        mono_ns = self._legacy_capture_mono_origin_ns + sequence * interval_ns
+        unix_ms = max(0, int(float(frame_meta.timestamp) * 1000))
+        identity = self._camera_identity_from_output(output)
+        face_detected = bool(getattr(frame_meta, "face_detected", False))
+        low_quality = bool(getattr(frame_meta, "low_quality", False))
+        frame = getattr(output, "frame", None)
+        landmarks_px = getattr(output, "landmarks_px", None)
+        valid = face_detected and not low_quality and frame is not None and landmarks_px is not None
+        validity = ObservationValidity.VALID if valid else (
+            ObservationValidity.REJECTED if low_quality else ObservationValidity.MISSING
+        )
+        reason = None if valid else (
+            MissingReason.ARTIFACT if low_quality else MissingReason.NO_FACE
+        )
+        components = {
+            "brightness": float(getattr(frame_meta, "brightness_score", 0.0)),
+            "blur": float(getattr(frame_meta, "blur_score", 0.0)),
+            "motion": float(getattr(frame_meta, "motion_score", 0.0)),
+            "face_confidence": float(getattr(frame_meta, "face_confidence", 0.0)),
+        }
+        quality = min(max(0.0, min(1.0, value)) for value in components.values())
+        if valid:
+            assert frame is not None
+            frame_shape = np.asarray(frame).shape
+            value = CameraFrameObservation(
+                width=int(frame_shape[1]),
+                height=int(frame_shape[0]),
+                face_detected=True,
+                face_stable=True,
+                face_confidence=components["face_confidence"],
+                camera_identity=identity,
+            )
+        else:
+            value = None
+        return ObservationEnvelope[CameraFrameObservation](
+            source=ObservationSource.CAMERA,
+            source_instance_id=self._legacy_capture_source_instance_id,
+            sequence=sequence,
+            observed_at_unix_ms=unix_ms,
+            observed_at_mono_ns=mono_ns,
+            boot_id=self._clock.boot_id,
+            value=value,
+            validity=validity,
+            missing_reason=reason,
+            quality=quality,
+            quality_components=components,
+            algorithm_version="capture-integrity/legacy-adapter",
+        )
+
+    def _observation_from_output(
+        self, output: PipelineOutput
+    ) -> ObservationEnvelope[CameraFrameObservation]:
+        observation = getattr(output, "observation", None)
+        if isinstance(observation, ObservationEnvelope):
+            return observation
+        return self._legacy_capture_observation(output)
+
+    def _camera_identity_from_output(self, output: PipelineOutput) -> CameraIdentity:
+        identity = getattr(output, "camera_identity", None)
+        if isinstance(identity, CameraIdentity):
+            return identity
+        observation = getattr(output, "observation", None)
+        value = getattr(observation, "value", None)
+        value_identity = getattr(value, "camera_identity", None)
+        if isinstance(value_identity, CameraIdentity):
+            return value_identity
+        return CameraIdentity(
+            identity_key="legacy-camera",
+            device_id=max(0, int(self.config.capture.device_id or 0)),
+            device_name=None,
+            source="legacy",
+            backend=None,
+            width=self.config.capture.width,
+            height=self.config.capture.height,
+        )
+
+    def _reset_camera_dependent_state(self, *, invalidate_calibration: bool) -> None:
+        self._rgb_observations.clear()
+        self._pulse_estimator.reset()
+        self._blink_detector.reset()
+        self._head_pose.reset()
+        if invalidate_calibration:
+            self._posture.reset_calibration()
+            self._camera_calibration_valid = False
+        else:
+            self._posture.reset()
+        self._feature_fusion.invalidate_camera_channels()
+        self._latest_physio = PhysioFeatures(
+            pulse_bpm=None,
+            pulse_quality=0.0,
+            pulse_variability_proxy=None,
+            hr_delta_5s=None,
+            valid=False,
+        )
+        self._latest_kinematics = KinematicFeatures(
+            blink_rate=None,
+            blink_rate_delta=None,
+            blink_suppression_score=None,
+            perclos_60s=None,
+            mean_blink_duration_ms=None,
+            ear_variance=None,
+            head_pitch=None,
+            head_yaw=None,
+            head_roll=None,
+            slump_score=None,
+            forward_lean_score=None,
+            shoulder_drop_ratio=None,
+            confidence=0.0,
+        )
+        self._last_physio_update = 0.0
+        self._last_physio_update_mono_ns = 0
+        self._last_kinematics_ts = 0.0
+        registry.register("latest_physio", self._latest_physio)
+        registry.register("latest_kinematics", self._latest_kinematics)
+        registry.register("camera_calibration_valid", self._camera_calibration_valid)
+
+    def _handle_camera_identity(
+        self,
+        identity: CameraIdentity,
+        observation: ObservationEnvelope[CameraFrameObservation],
+    ) -> None:
+        old_key = self._active_camera_identity_key
+        source_id = str(observation.source_instance_id)
+        physical_changed = old_key is not None and old_key != identity.identity_key
+        source_changed = (
+            self._active_camera_source_instance_id is not None
+            and self._active_camera_source_instance_id != source_id
+        )
+        if physical_changed:
+            self._reset_camera_dependent_state(invalidate_calibration=True)
+            _emit_event(
+                EventType.CAMERA_IDENTITY_CHANGED,
+                previous_identity_key=old_key,
+                camera_identity_key=identity.identity_key,
+                observed_at_unix_ms=observation.observed_at_unix_ms,
+            )
+        elif source_changed:
+            # Same camera reopened: preserve its calibration, but never bridge
+            # signal windows or temporal detector state across acquisitions.
+            self._reset_camera_dependent_state(invalidate_calibration=False)
+        self._active_camera_identity_key = identity.identity_key
+        self._active_camera_source_instance_id = source_id
+        registry.register("camera_identity", identity.model_dump(mode="json"))
+        registry.register("camera_calibration_valid", self._camera_calibration_valid)
+
+    def _handle_face_transition(
+        self,
+        output: PipelineOutput,
+        observation: ObservationEnvelope[CameraFrameObservation],
+    ) -> None:
+        tracking = getattr(output, "tracking", None)
+        face_now = bool(
+            getattr(
+                tracking,
+                "face_stable",
+                getattr(output.frame_meta, "face_detected", False),
+            )
+        )
+        if face_now == self._face_present_prev:
+            return
+        if face_now:
+            _emit_event(
+                EventType.FACE_REACQUIRED,
+                observed_at_unix_ms=observation.observed_at_unix_ms,
+                face_confidence=float(output.frame_meta.face_confidence),
+            )
+        else:
+            _emit_event(
+                EventType.FACE_LOST,
+                observed_at_unix_ms=observation.observed_at_unix_ms,
+            )
+            self._reset_camera_dependent_state(invalidate_calibration=False)
+        self._face_present_prev = face_now
+
+    def _prepare_rppg_window(self) -> PreparedObservationWindow:
+        cfg = self.config.signal.rppg
+        return prepare_observation_window(
+            self._rgb_observations.snapshot(),
+            window_seconds=float(cfg.window_seconds),
+            nominal_fps=float(self.config.capture.fps),
+            min_valid_fraction=cfg.min_valid_coverage,
+            max_interpolation_gap_ms=cfg.max_interpolation_gap_ms,
+            max_motion_fraction=cfg.max_motion_rejected_fraction,
+            fps_clamp_min=cfg.fps_clamp_min,
+            fps_clamp_max=cfg.fps_clamp_max,
+        )
+
+    def _publish_unavailable_physio(
+        self,
+        prepared: PreparedObservationWindow,
+        *,
+        mono_seconds: float,
+    ) -> None:
+        self._latest_physio = PhysioFeatures(
+            pulse_bpm=None,
+            pulse_quality=prepared.quality,
+            pulse_variability_proxy=None,
+            physio_sqi=prepared.quality,
+            physio_sqi_components={
+                "valid_fraction": prepared.valid_fraction,
+                "temporal_coverage": prepared.temporal_coverage,
+                "artifact_fraction": prepared.artifact_fraction,
+            },
+            hr_delta_5s=None,
+            valid=False,
+        )
+        registry.register("latest_physio", self._latest_physio)
+        registry.register(
+            "physio_window_readiness",
+            {
+                "ready": False,
+                "quality": prepared.quality,
+                "valid_fraction": prepared.valid_fraction,
+                "temporal_coverage": prepared.temporal_coverage,
+                "artifact_fraction": prepared.artifact_fraction,
+                "reasons": [reason.value for reason in prepared.unavailable_reasons],
+            },
+        )
+        self._feature_fusion.update_physio(
+            self._latest_physio,
+            timestamp=mono_seconds,
+        )
 
     async def _process_capture_output(self, output: PipelineOutput) -> None:
         registry.register("latest_frame_meta", output.frame_meta)
-        if output.landmarks_px is None:
+        observation = self._observation_from_output(output)
+        identity = self._camera_identity_from_output(output)
+        self._handle_camera_identity(identity, observation)
+        self._handle_face_transition(output, observation)
+        registry.register(
+            "latest_camera_observation",
+            observation.model_dump(mode="json"),
+        )
+
+        validity = str(observation.validity)
+        missing_reason = observation.missing_reason
+        rgb_value: np.ndarray | None = None
+        head_jitter_deg = 0.0
+        frame = getattr(output, "frame", None)
+        landmarks_px = getattr(output, "landmarks_px", None)
+        roi_frame: Any | None = None
+        if (
+            validity == ObservationValidity.VALID.value
+            and frame is not None
+            and landmarks_px is not None
+        ):
+            roi_frame = self._roi_extractor.extract(
+                frame,
+                landmarks_px,
+                observation.observed_at_unix_ms / 1000.0,
+            )
+            combined_rgb = roi_frame.combined_rgb()
+            if combined_rgb is not None and bool(np.isfinite(combined_rgb).all()):
+                rgb_value = np.asarray(combined_rgb, dtype=np.float64)
+                head_jitter_deg = float(roi_frame.head_jitter_px) * (
+                    45.0 / max(1.0, float(self.config.capture.width))
+                )
+            else:
+                validity = ObservationValidity.REJECTED.value
+                missing_reason = MissingReason.OCCLUDED
+        elif validity == ObservationValidity.VALID.value:
+            validity = ObservationValidity.REJECTED.value
+            missing_reason = MissingReason.ARTIFACT
+
+        if validity != ObservationValidity.VALID.value:
+            if validity == ObservationValidity.REJECTED.value:
+                self._frames_low_quality_rejected += 1
+            rgb_value = None
+
+        numeric = NumericObservation(
+            observed_at_unix_ms=observation.observed_at_unix_ms,
+            observed_at_mono_ns=observation.observed_at_mono_ns,
+            boot_id=observation.boot_id,
+            sequence=observation.sequence,
+            value=rgb_value,
+            validity=validity,
+            missing_reason=missing_reason,
+            quality=observation.quality if rgb_value is not None else 0.0,
+            head_jitter_deg=head_jitter_deg,
+        )
+        try:
+            self._rgb_observations.append(numeric)
+        except ValueError:
+            logger.warning(
+                "Capture observation time moved backwards; resetting window",
+                exc_info=True,
+            )
+            self._rgb_observations.clear()
+            self._rgb_observations.append(
+                NumericObservation(
+                    observed_at_unix_ms=numeric.observed_at_unix_ms,
+                    observed_at_mono_ns=numeric.observed_at_mono_ns,
+                    boot_id=numeric.boot_id,
+                    sequence=numeric.sequence,
+                    value=None,
+                    validity=ObservationValidity.REJECTED.value,
+                    missing_reason=MissingReason.ARTIFACT,
+                    quality=0.0,
+                )
+            )
+
+        mono_seconds = observation.observed_at_mono_ns / 1_000_000_000.0
+        stride_ns = int(self.config.signal.rppg.stride_seconds * 1_000_000_000)
+        if (
+            self._last_physio_update_mono_ns == 0
+            or observation.observed_at_mono_ns - self._last_physio_update_mono_ns
+            >= stride_ns
+        ):
+            prepared = self._prepare_rppg_window()
+            if prepared.ready and prepared.values is not None:
+                bvp = extract_bvp(
+                    prepared.values,
+                    algorithm=self.config.signal.rppg.backend,
+                    fs=prepared.sample_rate_hz,
+                    model_path=self.config.signal.rppg.model_path,
+                )
+                unix_seconds_at_observation = observation.observed_at_unix_ms / 1000.0
+                self._pulse_estimator.process_window(
+                    bvp,
+                    timestamp=unix_seconds_at_observation,
+                    fs=prepared.sample_rate_hz,
+                    head_jitter_deg=prepared.mean_head_jitter_deg,
+                    face_presence_ratio=prepared.valid_fraction,
+                    blink_suppression=self._last_blink_suppression_score,
+                )
+                self._latest_physio = self._pulse_estimator.get_features(
+                    unix_seconds_at_observation
+                )
+                registry.register("latest_physio", self._latest_physio)
+                registry.register(
+                    "physio_window_readiness",
+                    {
+                        "ready": True,
+                        "quality": prepared.quality,
+                        "valid_fraction": prepared.valid_fraction,
+                        "temporal_coverage": prepared.temporal_coverage,
+                        "artifact_fraction": prepared.artifact_fraction,
+                        "sample_rate_hz": prepared.sample_rate_hz,
+                    },
+                )
+                self._feature_fusion.update_physio(
+                    self._latest_physio,
+                    timestamp=mono_seconds,
+                )
+            else:
+                self._publish_unavailable_physio(
+                    prepared,
+                    mono_seconds=mono_seconds,
+                )
+            self._last_physio_update = observation.observed_at_unix_ms / 1000.0
+            self._last_physio_update_mono_ns = observation.observed_at_mono_ns
+
+        if (
+            validity != ObservationValidity.VALID.value
+            or landmarks_px is None
+            or bool(getattr(getattr(output, "tracking", None), "is_replayed", False))
+        ):
             return
 
-        # C6 (audit): emit FACE_LOST / FACE_REACQUIRED structured events on
-        # the capture-health transition. SENSING's face_tracker counts
-        # lost-frames internally but does NOT emit the observability event;
-        # the daemon owns that here. Edge-triggered off
-        # ``frame_meta.face_detected`` so we log once per transition, not
-        # once per frame.
-        face_now = bool(output.frame_meta.face_detected)
-        if face_now != self._face_present_prev:
-            if face_now:
-                _emit_event(
-                    EventType.FACE_REACQUIRED,
-                    timestamp=float(output.frame_meta.timestamp),
-                    face_confidence=float(output.frame_meta.face_confidence),
-                )
-            else:
-                _emit_event(
-                    EventType.FACE_LOST,
-                    timestamp=float(output.frame_meta.timestamp),
-                )
-            self._face_present_prev = face_now
-
-        roi_frame = self._roi_extractor.extract(output.frame, output.landmarks_px, output.frame_meta.timestamp)
-        combined_rgb = roi_frame.combined_rgb()
-        if combined_rgb is not None:
-            # P0-2 / audit P1: low-quality frames (motion blur / occlusion)
-            # must NOT contribute their RGB sample to the rPPG window — but
-            # they must STILL advance the window by one slot. ``_rgb_history``
-            # is a fixed-maxlen deque; dropping low-quality frames entirely
-            # made the window span a NON-uniform amount of wall-clock time
-            # (e.g. 300 frames over 14 s instead of 10 s when 30 % of frames
-            # were dropped), which biases the Welch-PSD HR estimate. Append a
-            # NaN-sentinel sample instead so the time axis stays uniform; the
-            # NaN gaps are interpolated away just before ``extract_bvp`` (see
-            # below) so the non-NaN-aware filter never sees a NaN.
-            if output.frame_meta.low_quality:
-                self._frames_low_quality_rejected += 1
-                self._rgb_history.append(
-                    np.full(np.shape(combined_rgb), np.nan, dtype=np.float64)
-                )
-            else:
-                self._rgb_history.append(np.asarray(combined_rgb, dtype=np.float64))
-            # B1: stamp every appended slot (NaN sentinel or real) so the
-            # timestamp deque stays index-aligned with ``_rgb_history`` and
-            # the window's effective fps reflects true frame spacing.
-            self._rgb_ts_history.append(float(output.frame_meta.timestamp))
-
-        stride_seconds = self.config.signal.rppg.stride_seconds
-        window_maxlen = self._rgb_history.maxlen or 0
-        if len(self._rgb_history) >= window_maxlen and window_maxlen > 0 and (
-            output.frame_meta.timestamp - self._last_physio_update
-        ) >= stride_seconds:
-            rgb_window = np.array(self._rgb_history, dtype=np.float64)
-            # audit P1: interpolate over the NaN-sentinel slots left by
-            # low-quality frames so the window stays time-uniform yet the
-            # downstream (non-NaN-aware) bandpass filter + Welch PSD see a
-            # finite signal. Per-channel linear interpolation; if a whole
-            # channel is NaN (no good frame in the window) it falls back to
-            # zeros, which ``extract_bvp`` already tolerates.
-            rgb_window = _interpolate_nan_window(rgb_window)
-            # B1: derive the window's effective fps from the real frame
-            # timestamps (n-1 intervals over the wall-clock span). Self-
-            # correcting and smooth over the ~10 s window; clamped to a
-            # plausible camera band, else we fall back to the configured
-            # rate. This is the single number that makes the Welch BPM
-            # correct (HR = dominant_freq × 60).
-            fs_eff = self._effective_rppg_fps()
-            bvp = extract_bvp(
-                rgb_window,
-                algorithm=self.config.signal.rppg.backend,
-                fs=fs_eff,
-                model_path=self.config.signal.rppg.model_path,
-            )
-            head_jitter_deg = float(roi_frame.head_jitter_px) * (45.0 / max(1.0, float(self.config.capture.width)))
-            self._pulse_estimator.process_window(
-                bvp,
-                timestamp=output.frame_meta.timestamp,
-                fs=fs_eff,
-                head_jitter_deg=head_jitter_deg,
-                face_presence_ratio=1.0 if output.frame_meta.face_detected else 0.0,
-                # C5 (audit): forward the prior frame's blink-suppression
-                # score so ``PulseEstimator`` → ``RespirationEstimator``
-                # can run the apnea sustain timer off real fixation data
-                # (1-frame lag is acceptable; kinematics for THIS frame are
-                # computed below, after the window is built).
-                blink_suppression=self._last_blink_suppression_score,
-            )
-            self._latest_physio = self._pulse_estimator.get_features(output.frame_meta.timestamp)
-            registry.register("latest_physio", self._latest_physio)
-            # P1-PIPE-CLOCK: feature_fusion staleness math (_compute_signal_quality)
-            # subtracts this stamp from the injected monotonic clock at fuse time,
-            # so it MUST be a monotonic instant. frame_meta.timestamp is an epoch
-            # (~1.7e9); using it made staleness hugely negative and the staleness
-            # penalties dead. _last_physio_update below is a SEPARATE epoch var used
-            # for the epoch-vs-epoch rPPG-stride gate at :2035 — leave it on epoch.
-            self._feature_fusion.update_physio(
-                self._latest_physio,
-                timestamp=monotonic_seconds(self._clock),
-            )
-            self._last_physio_update = output.frame_meta.timestamp
-
-        blink = self._blink_detector.update(output.landmarks_px, output.frame_meta.timestamp)
-        pose = self._head_pose.update(output.landmarks_px, output.frame_meta.timestamp)
-        posture = self._posture.update_with_face(output.landmarks_px, output.frame_meta.timestamp)
+        blink = self._blink_detector.update(landmarks_px, mono_seconds)
+        pose = self._head_pose.update(landmarks_px, mono_seconds)
+        posture = self._posture.update_with_face(landmarks_px, mono_seconds)
         self._latest_kinematics = KinematicFeatures(
             blink_rate=blink.blink_rate,
             blink_rate_delta=blink.blink_rate_delta,
@@ -2237,28 +2554,13 @@ class CortexDaemon:
             confidence=output.frame_meta.face_confidence,
         )
         registry.register("latest_kinematics", self._latest_kinematics)
-        # B22 (Phase 4.1): stamp the monotonic timestamp the
-        # kinematics features were derived from. The state loop reads
-        # this to decide whether the signal is fresh enough to drive a
-        # state estimate (see ``kinematics_age`` check below).
-        # P1-PIPE-CLOCK: the state loop compares this against
-        # the injected monotonic clock, so it MUST be a monotonic instant —
-        # frame_meta.timestamp is an epoch, which made kinematics_age hugely negative and
-        # the >2.0s stale guard unreachable.
-        self._last_kinematics_ts = monotonic_seconds(self._clock)
-        # C5 (audit): cache this frame's blink-suppression score so the NEXT
-        # frame's rPPG window build can forward it into the apnea path with
-        # a 1-frame lag. ``blink_suppression_score`` is Optional on
-        # KinematicFeatures (None until the blink detector warms up).
+        self._last_kinematics_ts = mono_seconds
         self._last_blink_suppression_score = float(
             blink.blink_suppression_score or 0.0
         )
-        # P1-PIPE-CLOCK: monotonic stamp for fusion staleness math (see
-        # update_physio above). frame_meta.timestamp is an epoch and would
-        # make _compute_signal_quality's staleness penalty dead code.
         self._feature_fusion.update_kinematics(
             self._latest_kinematics,
-            timestamp=monotonic_seconds(self._clock),
+            timestamp=mono_seconds,
         )
 
     async def _telemetry_loop(self) -> None:

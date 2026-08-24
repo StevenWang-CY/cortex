@@ -31,7 +31,11 @@ capture:
   height: 480
   min_brightness: 50
   max_jitter_px: 5.0
+  max_motion_face_widths_per_second: 0.75
   face_lost_tolerance_frames: 5
+  face_lost_tolerance_seconds: null
+  observation_buffer_seconds: 30.0
+  observation_buffer_max_items: 3600
 
 state:
   # Hysteresis thresholds
@@ -136,6 +140,9 @@ signal:
     min_resp_snr_db: 1.5
     max_face_loss_ratio: 0.20
     max_head_jitter_deg: 7.5
+    min_valid_coverage: 0.80
+    max_interpolation_gap_ms: 250.0
+    max_motion_rejected_fraction: 0.10
     hrv_min_window_seconds: 60
     hrv_min_valid_ibi: 30
     # Sampling-rate correctness (B1): derive fps from real frame

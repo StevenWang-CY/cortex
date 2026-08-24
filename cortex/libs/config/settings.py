@@ -297,8 +297,18 @@ class CaptureConfig(BaseModel):
     width: int = 640
     height: int = 480
     min_brightness: int = 50
+    # Deprecated compatibility threshold. New motion gating uses a
+    # resolution- and frame-rate-independent face-widths/second measure.
     max_jitter_px: float = 5.0
+    max_motion_face_widths_per_second: float = Field(0.75, gt=0.0)
+    # The frame-count setting remains loadable for one migration release.
+    # When the explicit duration is absent, FaceTracker derives seconds as
+    # ``face_lost_tolerance_frames / fps`` and still makes the decision on
+    # elapsed monotonic time.
     face_lost_tolerance_frames: int = 5
+    face_lost_tolerance_seconds: float | None = Field(None, ge=0.0)
+    observation_buffer_seconds: float = Field(30.0, gt=0.0)
+    observation_buffer_max_items: int = Field(3600, ge=2)
     # audit Phase-I: how often to run MediaPipe FaceLandmarker relative
     # to the capture cadence. ``1`` = every frame, ``2`` = every other
     # frame (15 Hz at 30 Hz capture). C5 (audit): default reverted to
@@ -544,6 +554,9 @@ class RPPGSignalConfig(BaseModel):
     min_resp_snr_db: float = 1.5
     max_face_loss_ratio: float = 0.20
     max_head_jitter_deg: float = 7.5
+    min_valid_coverage: float = Field(0.80, ge=0.0, le=1.0)
+    max_interpolation_gap_ms: float = Field(250.0, gt=0.0)
+    max_motion_rejected_fraction: float = Field(0.10, ge=0.0, le=1.0)
     hrv_min_window_seconds: int = 60
     hrv_min_valid_ibi: int = 30
 

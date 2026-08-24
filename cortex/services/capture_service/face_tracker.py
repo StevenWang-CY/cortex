@@ -96,6 +96,13 @@ class FaceTrackingResult:
     # were a fresh measurement, or those rates are scaled by the subsample
     # factor. A fresh mediapipe detection always has ``is_replayed=False``.
     is_replayed: bool = False
+    observed_at_mono_ns: int | None = None
+    detector_timestamp_ms: int | None = None
+    detector_timestamp_adjusted: bool = False
+    nose_displacement_px: float = 0.0
+    nose_velocity_px_per_second: float | None = None
+    motion_face_widths_per_second: float | None = None
+    sample_interval_ms: float | None = None
 
 
 class FaceTracker:
@@ -122,14 +129,18 @@ class FaceTracker:
         self._model_path = Path(model_path) if model_path else _DEFAULT_MODEL_PATH
         self._landmarker: Any = None  # mediapipe FaceLandmarker (lazy import)
         self._frame_timestamp_ms = 0
+        self._synthetic_capture_mono_ns = 0
 
         # Hysteresis state
         self._face_lost_frames = 0
         self._face_detected_prev = False
         self._face_stable = False
+        self._last_face_seen_mono_ns: int | None = None
 
         # Previous landmarks for motion tracking
         self._prev_landmarks_px: np.ndarray | None = None
+        self._prev_landmarks_mono_ns: int | None = None
+        self._prev_face_width_px: float | None = None
 
         # audit Phase-I: cached result for sub-sampled frames. When
         # ``face_mesh_subsample_n > 1`` we run MediaPipe only every
@@ -167,6 +178,7 @@ class FaceTracker:
         )
         self._landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(options)
         self._frame_timestamp_ms = 0
+        self._synthetic_capture_mono_ns = 0
         logger.info("FaceTracker initialized with MediaPipe FaceLandmarker Tasks API")
 
     def release(self) -> None:
@@ -175,14 +187,35 @@ class FaceTracker:
             self._landmarker.close()
             self._landmarker = None
         self._prev_landmarks_px = None
+        self._prev_landmarks_mono_ns = None
+        self._prev_face_width_px = None
+        self._last_face_seen_mono_ns = None
+        self._face_lost_frames = 0
+        self._face_detected_prev = False
+        self._face_stable = False
         # audit Phase-I: discard the sub-sample cache so a restart never
         # replays stale landmarks from a previous session.
         self._last_result = None
         self._subsample_counter = 0
         logger.info("FaceTracker released")
 
+    @property
+    def face_stable(self) -> bool:
+        """Current time-hysteresis state for scheduled missing reads/skips."""
+
+        return self._face_stable
+
+    def process_missing(self, *, capture_mono_ns: int) -> FaceTrackingResult:
+        """Advance face-loss time when the camera produced no frame."""
+
+        return self._process_no_face(capture_mono_ns=capture_mono_ns)
+
     def process_frame(
-        self, frame: np.ndarray, rgb_frame: np.ndarray | None = None,
+        self,
+        frame: np.ndarray,
+        rgb_frame: np.ndarray | None = None,
+        *,
+        capture_mono_ns: int | None = None,
     ) -> FaceTrackingResult:
         """
         Process a single BGR frame and extract face landmarks.
@@ -202,6 +235,8 @@ class FaceTracker:
         if self._landmarker is None:
             raise RuntimeError("FaceTracker not initialized. Call initialize() first.")
 
+        capture_ns = self._resolve_capture_mono_ns(capture_mono_ns)
+
         # audit Phase-I: sub-sample mediapipe at ``face_mesh_subsample_n``.
         # When the counter is not 0 we replay the cached result so
         # downstream consumers still receive a structurally-valid
@@ -216,7 +251,15 @@ class FaceTracker:
                 # Mark the replayed result so time-integrating consumers
                 # (blink duration, angular velocity) can skip it instead of
                 # double-counting stale landmarks as a fresh measurement.
-                return replace(self._last_result, is_replayed=True)
+                return replace(
+                    self._last_result,
+                    is_replayed=True,
+                    observed_at_mono_ns=capture_ns,
+                    nose_displacement_px=0.0,
+                    nose_velocity_px_per_second=None,
+                    motion_face_widths_per_second=None,
+                    sample_interval_ms=None,
+                )
         else:
             self._subsample_counter = 0
 
@@ -231,15 +274,32 @@ class FaceTracker:
         mp = _ensure_mediapipe()
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
-        # Advance timestamp (must be monotonically increasing for VIDEO mode)
-        self._frame_timestamp_ms += 33  # ~30fps
-        result = self._landmarker.detect_for_video(mp_image, self._frame_timestamp_ms)
+        # MediaPipe VIDEO mode requires a strictly increasing millisecond
+        # timestamp. Use the real monotonic capture time; repeated/sub-ms
+        # scheduler instants are clamped only for MediaPipe and surfaced in
+        # the result so downstream can reject the ambiguous observation.
+        raw_timestamp_ms = capture_ns // 1_000_000
+        detector_timestamp_ms = max(raw_timestamp_ms, self._frame_timestamp_ms + 1)
+        timestamp_adjusted = detector_timestamp_ms != raw_timestamp_ms
+        self._frame_timestamp_ms = detector_timestamp_ms
+        result = self._landmarker.detect_for_video(mp_image, detector_timestamp_ms)
 
         if result.face_landmarks and len(result.face_landmarks) > 0:
             face_landmarks = result.face_landmarks[0]
-            tracking = self._process_detected_face(face_landmarks, h, w)
+            tracking = self._process_detected_face(
+                face_landmarks,
+                h,
+                w,
+                capture_mono_ns=capture_ns,
+                detector_timestamp_ms=detector_timestamp_ms,
+                detector_timestamp_adjusted=timestamp_adjusted,
+            )
         else:
-            tracking = self._process_no_face()
+            tracking = self._process_no_face(
+                capture_mono_ns=capture_ns,
+                detector_timestamp_ms=detector_timestamp_ms,
+                detector_timestamp_adjusted=timestamp_adjusted,
+            )
 
         self._last_result = tracking
         return tracking
@@ -249,8 +309,13 @@ class FaceTracker:
         face_landmarks: list[Any],
         height: int,
         width: int,
+        *,
+        capture_mono_ns: int | None = None,
+        detector_timestamp_ms: int | None = None,
+        detector_timestamp_adjusted: bool = False,
     ) -> FaceTrackingResult:
         """Process a frame where a face was detected."""
+        capture_ns = self._resolve_capture_mono_ns(capture_mono_ns)
         # Extract normalized landmarks (N x 3)
         landmarks = np.array(
             [[lm.x, lm.y, lm.z] for lm in face_landmarks],
@@ -276,13 +341,43 @@ class FaceTracker:
         # Compute confidence from detection stability
         confidence = self._compute_confidence(landmarks)
 
+        # Derivatives MUST be computed against the previous committed sample
+        # before current landmarks replace it. Normalize by face width and
+        # elapsed monotonic time so the threshold is stable across resolution
+        # and frame rate.
+        displacement_px = self.compute_nose_tip_displacement(landmarks_px)
+        sample_interval_ms: float | None = None
+        velocity_px_s: float | None = None
+        motion_face_widths_s: float | None = None
+        if (
+            self._prev_landmarks_px is not None
+            and self._prev_landmarks_mono_ns is not None
+            and capture_ns > self._prev_landmarks_mono_ns
+        ):
+            dt_s = (capture_ns - self._prev_landmarks_mono_ns) / 1_000_000_000.0
+            sample_interval_ms = dt_s * 1000.0
+            velocity_px_s = displacement_px / dt_s
+            current_width = max(1.0, float(bbox.width))
+            reference_width = (
+                (current_width + self._prev_face_width_px) / 2.0
+                if self._prev_face_width_px is not None
+                else current_width
+            )
+            motion_face_widths_s = velocity_px_s / max(1.0, reference_width)
+        elif self._prev_landmarks_px is None:
+            velocity_px_s = 0.0
+            motion_face_widths_s = 0.0
+
         # Update hysteresis: face is found, reset lost counter
         self._face_lost_frames = 0
         self._face_detected_prev = True
         self._face_stable = True
+        self._last_face_seen_mono_ns = capture_ns
 
-        # Store for motion computation
-        self._prev_landmarks_px = landmarks_px
+        # Commit only after derivative computation.
+        self._prev_landmarks_px = landmarks_px.copy()
+        self._prev_landmarks_mono_ns = capture_ns
+        self._prev_face_width_px = max(1.0, float(bbox.width))
 
         return FaceTrackingResult(
             face_detected=True,
@@ -291,15 +386,42 @@ class FaceTracker:
             landmarks_px=landmarks_px,
             bounding_box=bbox,
             face_stable=True,
+            observed_at_mono_ns=capture_ns,
+            detector_timestamp_ms=detector_timestamp_ms,
+            detector_timestamp_adjusted=detector_timestamp_adjusted,
+            nose_displacement_px=displacement_px,
+            nose_velocity_px_per_second=velocity_px_s,
+            motion_face_widths_per_second=motion_face_widths_s,
+            sample_interval_ms=sample_interval_ms,
         )
 
-    def _process_no_face(self) -> FaceTrackingResult:
+    def _process_no_face(
+        self,
+        *,
+        capture_mono_ns: int | None = None,
+        detector_timestamp_ms: int | None = None,
+        detector_timestamp_adjusted: bool = False,
+    ) -> FaceTrackingResult:
         """Process a frame where no face was detected."""
+        capture_ns = self._resolve_capture_mono_ns(capture_mono_ns)
         if self._face_detected_prev:
             self._face_lost_frames += 1
 
-            # Hysteresis: keep reporting face as "stable" during tolerance window
-            if self._face_lost_frames <= self._config.face_lost_tolerance_frames:
+            if self._last_face_seen_mono_ns is None:
+                interval_ns = max(
+                    1, int(1_000_000_000 / max(1, self._config.fps))
+                )
+                self._last_face_seen_mono_ns = capture_ns - interval_ns
+
+            tolerance_seconds = self._face_lost_tolerance_seconds()
+            elapsed_seconds = (
+                (capture_ns - self._last_face_seen_mono_ns) / 1_000_000_000.0
+                if self._last_face_seen_mono_ns is not None
+                else float("inf")
+            )
+            # Hysteresis is elapsed-time based. Frame count remains diagnostic
+            # only and cannot lengthen tolerance under low/variable FPS.
+            if elapsed_seconds <= tolerance_seconds:
                 return FaceTrackingResult(
                     face_detected=False,
                     confidence=0.0,
@@ -307,12 +429,17 @@ class FaceTracker:
                     landmarks_px=None,
                     bounding_box=None,
                     face_stable=True,  # Still within tolerance
+                    observed_at_mono_ns=capture_ns,
+                    detector_timestamp_ms=detector_timestamp_ms,
+                    detector_timestamp_adjusted=detector_timestamp_adjusted,
                 )
 
             # Tolerance exceeded — face truly lost
             self._face_detected_prev = False
             self._face_stable = False
             self._prev_landmarks_px = None
+            self._prev_landmarks_mono_ns = None
+            self._prev_face_width_px = None
 
         return FaceTrackingResult(
             face_detected=False,
@@ -321,7 +448,30 @@ class FaceTracker:
             landmarks_px=None,
             bounding_box=None,
             face_stable=False,
+            observed_at_mono_ns=capture_ns,
+            detector_timestamp_ms=detector_timestamp_ms,
+            detector_timestamp_adjusted=detector_timestamp_adjusted,
         )
+
+    def _resolve_capture_mono_ns(self, supplied: int | None) -> int:
+        """Resolve explicit capture time or a deterministic legacy cadence."""
+
+        if supplied is not None:
+            if supplied < 0:
+                raise ValueError("capture_mono_ns must be non-negative")
+            self._synthetic_capture_mono_ns = max(
+                self._synthetic_capture_mono_ns, supplied
+            )
+            return supplied
+        interval_ns = max(1, int(1_000_000_000 / max(1, self._config.fps)))
+        self._synthetic_capture_mono_ns += interval_ns
+        return self._synthetic_capture_mono_ns
+
+    def _face_lost_tolerance_seconds(self) -> float:
+        explicit = self._config.face_lost_tolerance_seconds
+        if explicit is not None:
+            return explicit
+        return self._config.face_lost_tolerance_frames / max(1.0, float(self._config.fps))
 
     def _compute_confidence(self, landmarks: np.ndarray) -> float:
         """

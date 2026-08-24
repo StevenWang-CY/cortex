@@ -1,8 +1,9 @@
 """
 Capture Service — Threaded Webcam Capture
 
-Provides a threaded OpenCV VideoCapture that acquires frames at stable FPS,
-timestamps each frame with monotonic clock, and publishes to an async queue.
+Provides a threaded OpenCV VideoCapture that acquires scheduled observations
+at stable FPS, stamps each attempt with dual clocks, and publishes successes
+and failures to an async queue.
 
 Design:
 - Separate capture thread to avoid blocking the async event loop
@@ -15,16 +16,21 @@ Design:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import threading
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from uuid import UUID, uuid4
 
 import cv2
 import numpy as np
 
+from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 from cortex.libs.config.settings import CaptureConfig
+from cortex.libs.schemas.observations import CameraIdentity, MissingReason
+from cortex.libs.schemas.temporal import EventTime
 from cortex.libs.utils.platform import is_macos
 
 logger = logging.getLogger(__name__)
@@ -54,11 +60,35 @@ _CONTINUITY_CAMERA_KEYWORDS = (
 
 @dataclass(frozen=True)
 class CapturedFrame:
-    """A single captured webcam frame with metadata."""
+    """One scheduler-owned camera observation.
 
-    frame: np.ndarray  # BGR uint8, shape (H, W, 3)
+    ``frame`` is absent when the scheduled read failed.  Legacy constructors
+    may omit the explicit event tuple for one internal migration release;
+    production capture always supplies the complete tuple.
+    """
+
+    frame: np.ndarray | None  # BGR uint8, shape (H, W, 3), or missing
     timestamp: float  # UNIX epoch seconds (time.time()), to match FrameMeta.timestamp schema
     sequence: int  # monotonically increasing frame counter
+    observed_at_unix_ms: int | None = None
+    observed_at_mono_ns: int | None = None
+    boot_id: UUID | None = None
+    source_instance_id: UUID | None = None
+    camera_identity: CameraIdentity | None = None
+    missing_reason: MissingReason | None = None
+
+    def __post_init__(self) -> None:
+        supplied = (
+            self.observed_at_unix_ms is not None,
+            self.observed_at_mono_ns is not None,
+            self.boot_id is not None,
+        )
+        if any(supplied) and not all(supplied):
+            raise ValueError("captured frame event-time fields must be supplied together")
+        if self.frame is None and self.missing_reason is None:
+            raise ValueError("a missing frame requires a missing_reason")
+        if self.frame is not None and self.missing_reason is not None:
+            raise ValueError("a captured frame cannot carry a missing_reason")
 
 
 @dataclass(frozen=True)
@@ -69,6 +99,27 @@ class CameraSelection:
     backend: int | None
     source: str
     device_name: str | None = None
+
+    def identity(self, *, width: int, height: int) -> CameraIdentity:
+        """Return an index-reorder-safe camera identity.
+
+        AVFoundation indices are intentionally excluded from the identity
+        hash.  The live post-open device name and source remain stable when
+        an iPhone waking up shifts every numeric index.
+        """
+
+        normalized_name = " ".join((self.device_name or "unknown").casefold().split())
+        material = f"{self.source}\0{normalized_name}\0{width}x{height}"
+        identity_key = hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+        return CameraIdentity(
+            identity_key=identity_key,
+            device_id=self.device_id,
+            device_name=self.device_name,
+            source=self.source,
+            backend=self.backend,
+            width=width,
+            height=height,
+        )
 
 
 def describe_requested_camera(config: CaptureConfig) -> str:
@@ -535,7 +586,19 @@ def open_video_capture(
                     actual_name or candidate.source,
                     f"{frame.shape[1]}x{frame.shape[0]}",
                 )
-                return capture, candidate
+                live_source = candidate.source
+                if actual_name and any(
+                    kw in actual_name.casefold()
+                    for kw in _BUILTIN_MAC_CAMERA_KEYWORDS
+                ):
+                    live_source = "builtin_mac_camera"
+                elif actual_name and is_macos():
+                    live_source = "other_camera"
+                return capture, replace(
+                    candidate,
+                    source=live_source,
+                    device_name=actual_name,
+                )
             logger.debug(
                 "Camera device %d (%s) opened but no frames, skipping",
                 candidate.device_id,
@@ -564,8 +627,11 @@ class WebcamCapture:
         self,
         config: CaptureConfig | None = None,
         queue_maxsize: int = 30,
+        *,
+        clock: Clock | None = None,
     ) -> None:
         self._config = config or CaptureConfig()
+        self._clock = clock or SYSTEM_CLOCK
         self._queue_maxsize = queue_maxsize
 
         # State
@@ -592,6 +658,9 @@ class WebcamCapture:
         self._fps_frame_count = 0
         self._measured_fps = 0.0
         self._camera_selection: CameraSelection | None = None
+        self._camera_identity: CameraIdentity | None = None
+        self._source_instance_id: UUID | None = None
+        self._has_successful_frame = False
 
         # Phase 4 fix #3: consecutive-failure tracking. Incremented on each
         # ``cap.read()`` False/raise, reset on a successful frame. When the
@@ -641,6 +710,18 @@ class WebcamCapture:
         """
         return self._capture_stale
 
+    @property
+    def camera_identity(self) -> CameraIdentity | None:
+        """Live, post-open camera identity (never a cached pre-open index map)."""
+
+        return self._camera_identity
+
+    @property
+    def source_instance_id(self) -> UUID | None:
+        """Unique identity for this acquisition/open session."""
+
+        return self._source_instance_id
+
     async def start(self) -> None:
         """
         Start the webcam capture thread.
@@ -670,6 +751,11 @@ class WebcamCapture:
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._config.width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._config.height)
         self._cap.set(cv2.CAP_PROP_FPS, self._config.fps)
+        self._camera_identity = self._camera_selection.identity(
+            width=self._config.width,
+            height=self._config.height,
+        )
+        self._source_instance_id = uuid4()
 
         # Reset counters
         self._sequence = 0
@@ -677,7 +763,8 @@ class WebcamCapture:
         self._input_queue_drops = 0
         self._consecutive_failed_reads = 0
         self._capture_stale = False
-        self._last_fps_time = time.monotonic()
+        self._has_successful_frame = False
+        self._last_fps_time = monotonic_seconds(self._clock)
         self._fps_frame_count = 0
 
         # Start capture thread
@@ -771,11 +858,11 @@ class WebcamCapture:
     def _capture_loop(self) -> None:
         """Main capture loop running in a dedicated thread."""
         target_interval = 1.0 / self._config.fps
-        next_capture_time = time.monotonic()
+        next_capture_time = monotonic_seconds(self._clock)
 
         try:
             while self._running.is_set():
-                now = time.monotonic()
+                now = monotonic_seconds(self._clock)
 
                 # FPS timing: wait until next frame is due
                 sleep_time = next_capture_time - now
@@ -785,6 +872,9 @@ class WebcamCapture:
                 # Read frame
                 if self._cap is None or not self._cap.isOpened():
                     logger.error("Webcam lost")
+                    self._enqueue_frame(
+                        self._missing_capture(MissingReason.SOURCE_DISCONNECTED)
+                    )
                     break
 
                 # Phase 4 fix #1: ``CapturedFrame.timestamp`` MUST be UNIX
@@ -803,8 +893,11 @@ class WebcamCapture:
                     )
                     ret, frame = False, None
                     read_failed = True
-                wall_ts = time.time()
-                mono_ts = time.monotonic()
+                event_time = EventTime.from_clock(self._clock)
+                wall_ts = event_time.observed_at_unix_ms / 1000.0
+                mono_ts = event_time.observed_at_mono_ns / 1_000_000_000.0
+                sequence = self._sequence
+                self._sequence += 1
 
                 if not ret or frame is None:
                     # Phase 4 fix #3: track consecutive read failures so the
@@ -824,6 +917,24 @@ class WebcamCapture:
                         )
                     if not read_failed:
                         logger.warning("Failed to read frame from webcam")
+                    reason = (
+                        MissingReason.CAMERA_WARMUP
+                        if not self._has_successful_frame
+                        else MissingReason.SOURCE_DISCONNECTED
+                    )
+                    self._enqueue_frame(
+                        CapturedFrame(
+                            frame=None,
+                            timestamp=wall_ts,
+                            sequence=sequence,
+                            observed_at_unix_ms=event_time.observed_at_unix_ms,
+                            observed_at_mono_ns=event_time.observed_at_mono_ns,
+                            boot_id=event_time.boot_id,
+                            source_instance_id=self._source_instance_id,
+                            camera_identity=self._camera_identity,
+                            missing_reason=reason,
+                        )
+                    )
                     next_capture_time = mono_ts + target_interval
                     continue
 
@@ -841,10 +952,15 @@ class WebcamCapture:
                 captured = CapturedFrame(
                     frame=frame,
                     timestamp=wall_ts,
-                    sequence=self._sequence,
+                    sequence=sequence,
+                    observed_at_unix_ms=event_time.observed_at_unix_ms,
+                    observed_at_mono_ns=event_time.observed_at_mono_ns,
+                    boot_id=event_time.boot_id,
+                    source_instance_id=self._source_instance_id,
+                    camera_identity=self._camera_identity,
                 )
-                self._sequence += 1
                 self._frames_captured += 1
+                self._has_successful_frame = True
 
                 # Publish to async queue (non-blocking)
                 self._enqueue_frame(captured)
@@ -868,6 +984,24 @@ class WebcamCapture:
         finally:
             self._running.clear()
             self._stopped.set()
+
+    def _missing_capture(self, reason: MissingReason) -> CapturedFrame:
+        """Create and sequence one missing observation at the scheduler boundary."""
+
+        event_time = EventTime.from_clock(self._clock)
+        sequence = self._sequence
+        self._sequence += 1
+        return CapturedFrame(
+            frame=None,
+            timestamp=event_time.observed_at_unix_ms / 1000.0,
+            sequence=sequence,
+            observed_at_unix_ms=event_time.observed_at_unix_ms,
+            observed_at_mono_ns=event_time.observed_at_mono_ns,
+            boot_id=event_time.boot_id,
+            source_instance_id=self._source_instance_id,
+            camera_identity=self._camera_identity,
+            missing_reason=reason,
+        )
 
     def _enqueue_frame(self, frame: CapturedFrame) -> None:
         """Thread-safe enqueue of a frame to the async queue."""

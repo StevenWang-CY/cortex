@@ -115,6 +115,15 @@ from cortex.libs.schemas.native_messaging import (
     StopMessage,
     StopResponse,
 )
+from cortex.libs.schemas.observations import (
+    CameraFrameObservation,
+    CameraIdentity,
+    CameraObservationEnvelope,
+    MissingReason,
+    ObservationEnvelope,
+    ObservationSource,
+    ObservationValidity,
+)
 from cortex.libs.schemas.protocol import (
     AuthOkPayload,
     AuthRequestPayload,
@@ -189,6 +198,14 @@ __all__ = [
     "KinematicFeatures",
     "TelemetryFeatures",
     "FeatureVector",
+    # Scheduled sensor observations
+    "ObservationSource",
+    "ObservationValidity",
+    "MissingReason",
+    "CameraIdentity",
+    "CameraFrameObservation",
+    "CameraObservationEnvelope",
+    "ObservationEnvelope",
     # State
     "UserState",
     "SignalQuality",

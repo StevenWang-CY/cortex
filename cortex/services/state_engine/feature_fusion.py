@@ -282,3 +282,11 @@ class FeatureFusion:
         self._kinematics_timestamp = 0.0
         self._telemetry_timestamp = 0.0
         self._telemetry_seen_count = 0
+
+    def invalidate_camera_channels(self) -> None:
+        """Clear camera-dependent channels while retaining input telemetry."""
+
+        self._physio = None
+        self._kinematics = None
+        self._physio_timestamp = 0.0
+        self._kinematics_timestamp = 0.0

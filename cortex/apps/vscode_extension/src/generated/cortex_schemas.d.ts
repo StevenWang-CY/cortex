@@ -3,13 +3,37 @@
 //
 // Source of truth: cortex/libs/schemas/*.py (Pydantic v2 models).
 // Schema package: cortex-wire/2.0
-// Source SHA-256: 062762ddf3e1e4b8eb66948a9f866c4c8cdcc13e3cf2a93d6867f8b9ec317d1b
+// Source SHA-256: a248432b41510738780e7f70e435682bf23870023a8d9a161a5c96897bfc54e8
 // Drift-gate: a pre-commit hook and the GitHub Actions CI run
 //   `python -m cortex.scripts.generate_ts_schemas --check`
 // and fail if this file is out of sync with the Python models.
 //
 // Debt-1 closure (audit/findings.md) — closes F42, F43, F44, F45.
 
+export type ObservationSource = "camera" | "mouse" | "keyboard" | "browser" | "editor" | "window";
+/**
+ * Whether a scheduled observation contains a usable measurement.
+ */
+export type ObservationValidity = "valid" | "missing" | "rejected" | "stale";
+/**
+ * Closed reason catalog for absent or unusable observations.
+ */
+export type MissingReason =
+  | "NO_FACE"
+  | "LOW_LIGHT"
+  | "SATURATED"
+  | "MOTION"
+  | "OCCLUDED"
+  | "CAMERA_WARMUP"
+  | "FRAME_DROPPED"
+  | "PERMISSION"
+  | "SOURCE_DISCONNECTED"
+  | "INSUFFICIENT_WINDOW"
+  | "ARTIFACT"
+  | "UNKNOWN";
+/**
+ * Classified user state
+ */
 export type UserState = "FLOW" | "HYPO" | "HYPER" | "RECOVERY";
 /**
  * Wire-level message type; see ``MessageType``.
@@ -317,6 +341,62 @@ export interface TabInfo {
    * Seconds since this tab was last the active tab (None if unknown).
    */
   last_activated_ago_seconds?: number | null;
+}
+/**
+ * Serializable metadata for one camera-derived observation.
+ *
+ * Raw pixels and landmarks remain process-local and are deliberately not
+ * part of the wire/schema object.
+ */
+export interface CameraFrameObservation {
+  width: number;
+  height: number;
+  face_detected: boolean;
+  face_stable: boolean;
+  face_confidence: number;
+  detector_replayed?: boolean;
+  detector_timestamp_adjusted?: boolean;
+  motion_face_widths_per_second?: number | null;
+  camera_identity: CameraIdentity;
+}
+/**
+ * Non-secret identity of the physical/logical camera in use.
+ *
+ * ``identity_key`` is derived from the live post-open device name and
+ * source classification, not the AVFoundation index.  Device indices can
+ * reorder whenever Continuity Camera appears or disappears.
+ */
+export interface CameraIdentity {
+  identity_key: string;
+  /**
+   * Current backend index; not stable identity
+   */
+  device_id: number;
+  device_name?: string | null;
+  source: string;
+  backend?: number | null;
+  width: number;
+  height: number;
+}
+/**
+ * Concrete camera specialization emitted by cross-client codegen.
+ */
+export interface CameraObservationEnvelope {
+  schema_version?: string;
+  source: ObservationSource;
+  source_instance_id: string;
+  sequence: number;
+  observed_at_unix_ms: number;
+  observed_at_mono_ns: number;
+  boot_id: string;
+  value: CameraFrameObservation | null;
+  validity: ObservationValidity;
+  missing_reason?: MissingReason | null;
+  quality: number;
+  quality_components?: {
+    [k: string]: number;
+  };
+  algorithm_version: string;
 }
 /**
  * Longitudinal model tracking how baselines drift over weeks.
@@ -3044,6 +3124,23 @@ export interface ParseResult {
   message?: (LaunchMessage | StopMessage | StatusMessage | GetAuthTokenMessage | RaiseDashboardMessage) | null;
   error?: string | null;
   detail?: string | null;
+}
+export interface ObservationEnvelopeCameraFrameObservation {
+  schema_version?: string;
+  source: ObservationSource;
+  source_instance_id: string;
+  sequence: number;
+  observed_at_unix_ms: number;
+  observed_at_mono_ns: number;
+  boot_id: string;
+  value: CameraFrameObservation | null;
+  validity: ObservationValidity;
+  missing_reason?: MissingReason | null;
+  quality: number;
+  quality_components?: {
+    [k: string]: number;
+  };
+  algorithm_version: string;
 }
 /**
  * Per-tick biometrics summary attached to STATE_UPDATE payloads.

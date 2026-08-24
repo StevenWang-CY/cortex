@@ -1,11 +1,10 @@
-"""P0-2 / audit P1: low-quality frames must be NaN-filled (not dropped)
-in the rPPG RGB window so the window stays time-uniform.
+"""WP-2: missing/low-quality camera observations retain window exposure.
 
 The behaviour lives inside ``CortexDaemon._process_capture_output``: a
 low-quality frame is NOT contributed as a real RGB sample, but a NaN
-sentinel row IS appended so the fixed-maxlen deque still advances by one
-slot. ``_frames_low_quality_rejected`` is incremented. The NaN gaps are
-interpolated away just before ``extract_bvp``.
+observation IS appended so the bounded time-series still advances by one
+slot. ``_frames_low_quality_rejected`` is incremented. Interpolation is
+permitted only after the coverage/gap gate accepts the window.
 """
 
 from __future__ import annotations
@@ -145,12 +144,10 @@ def test_interpolate_nan_window_fills_gaps_finite() -> None:
     np.testing.assert_allclose(out[2], [3.0, 4.0, 5.0])
 
 
-def test_interpolate_nan_window_all_nan_channel_falls_back_to_zero() -> None:
-    """A channel with no finite sample anywhere falls back to zeros (which
-    extract_bvp tolerates) rather than propagating NaN."""
+def test_interpolate_nan_window_all_nan_channel_stays_unavailable() -> None:
+    """An all-missing channel must never be fabricated into a zero signal."""
     from cortex.services.runtime_daemon import _interpolate_nan_window
 
     window = np.full((4, 3), np.nan, dtype=np.float64)
     out = _interpolate_nan_window(window)
-    assert not np.isnan(out).any()
-    np.testing.assert_allclose(out, np.zeros((4, 3)))
+    assert np.isnan(out).all()

@@ -49,7 +49,9 @@ from cortex.application.clock import (
     utc_datetime,
 )
 from cortex.libs.config.settings import get_config
+from cortex.libs.schemas.observations import MissingReason, ObservationValidity
 from cortex.libs.schemas.state import UserBaselines
+from cortex.libs.schemas.temporal import EventTime
 from cortex.libs.utils.atomic_write import atomic_write_json
 
 logger = logging.getLogger(__name__)
@@ -284,6 +286,12 @@ async def run_live_calibration(
         import numpy as np
 
         from cortex.services.capture_service.face_tracker import FaceTracker
+        from cortex.services.capture_service.observation_buffer import (
+            NumericObservation,
+            ObservationBuffer,
+            prepare_observation_window,
+        )
+        from cortex.services.capture_service.quality import FrameQualityScorer
         from cortex.services.kinematics_engine.blink_detector import BlinkDetector
         from cortex.services.physio_engine.pulse_estimator import PulseEstimator
         from cortex.services.physio_engine.roi_extractor import RoiExtractor
@@ -298,6 +306,7 @@ async def run_live_calibration(
         return await _fallback()
 
     tracker = FaceTracker(config.capture)
+    quality_scorer = FrameQualityScorer(config.capture)
     extractor = RoiExtractor(config.landmarks)
     blink_detector = BlinkDetector(
         blink_config=config.signal.blink,
@@ -310,9 +319,17 @@ async def run_live_calibration(
         config=config.telemetry,
         clock=active_clock,
     )
-    rgb_window: list[Any] = []
-    max_window = max(1, config.signal.rppg.window_seconds * config.capture.fps)
-    last_physio_time = 0.0
+    rgb_observations: ObservationBuffer[NumericObservation] = ObservationBuffer(
+        max_age_seconds=(
+            float(config.signal.rppg.window_seconds)
+            + config.signal.rppg.max_interpolation_gap_ms / 1000.0
+            + 1.0
+        ),
+        max_items=config.capture.observation_buffer_max_items,
+    )
+    sequence = 0
+    last_physio_mono_ns = 0
+    saw_successful_read = False
 
     try:
         tracker.initialize()
@@ -352,21 +369,37 @@ async def run_live_calibration(
             if is_aborted is not None and is_aborted():
                 break
 
-            ret, frame = cap.read()
-            if not ret:
-                await asyncio.sleep(0)
-                continue
-
-            elapsed = monotonic_seconds(active_clock) - start
+            try:
+                ret, frame = cap.read()
+            except Exception:
+                logger.warning("Calibration camera read raised", exc_info=True)
+                ret, frame = False, None
+            event_time = EventTime.from_clock(active_clock)
+            current_sequence = sequence
+            sequence += 1
+            elapsed = event_time.observed_at_mono_ns / 1_000_000_000.0 - start
             if elapsed >= duration_seconds:
                 break
 
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            brightness = float(np.mean(gray))
-            lighting_ok = brightness >= config.capture.min_brightness
-
-            if not lighting_ok:
-                # Still emit progress so the UI can show the warning pill
+            if not ret or frame is None:
+                rgb_observations.append(
+                    NumericObservation(
+                        observed_at_unix_ms=event_time.observed_at_unix_ms,
+                        observed_at_mono_ns=event_time.observed_at_mono_ns,
+                        boot_id=event_time.boot_id,
+                        sequence=current_sequence,
+                        value=None,
+                        validity=ObservationValidity.MISSING.value,
+                        missing_reason=(
+                            MissingReason.CAMERA_WARMUP
+                            if not saw_successful_read
+                            else MissingReason.SOURCE_DISCONNECTED
+                        ),
+                        quality=0.0,
+                    )
+                )
+                face_ok = False
+                lighting_ok = False
                 if elapsed - last_progress_time >= progress_interval:
                     _emit_progress(
                         on_progress,
@@ -381,12 +414,83 @@ async def run_live_calibration(
                     last_progress_time = elapsed
                 await asyncio.sleep(0)
                 continue
+            saw_successful_read = True
 
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             frame_u8 = np.asarray(frame, dtype=np.uint8)
-            tracking = tracker.process_frame(frame_u8)
+            tracking = tracker.process_frame(
+                frame_u8,
+                capture_mono_ns=event_time.observed_at_mono_ns,
+            )
+            quality = quality_scorer.score(
+                frame_u8,
+                tracking.nose_displacement_px,
+                gray_frame=gray,
+                motion_face_widths_per_second=(
+                    tracking.motion_face_widths_per_second
+                ),
+            )
+            lighting_ok = quality.brightness_score >= 0.2
+            motion_ok = quality.motion_score >= 0.3
             landmarks_px = tracking.landmarks_px
             face_ok = bool(tracking.face_detected and landmarks_px is not None)
-            if not face_ok or landmarks_px is None:
+            observation_validity = ObservationValidity.VALID.value
+            missing_reason: MissingReason | None = None
+            if tracking.detector_timestamp_adjusted:
+                observation_validity = ObservationValidity.REJECTED.value
+                missing_reason = MissingReason.ARTIFACT
+            elif not face_ok or landmarks_px is None:
+                observation_validity = ObservationValidity.MISSING.value
+                missing_reason = MissingReason.NO_FACE
+            elif not quality.passed:
+                observation_validity = ObservationValidity.REJECTED.value
+                missing_reason = quality_scorer.rejection_reason(quality)
+
+            rgb_value = None
+            roi_frame = None
+            if observation_validity == ObservationValidity.VALID.value:
+                assert landmarks_px is not None
+                roi_frame = extractor.extract(
+                    frame_u8,
+                    landmarks_px,
+                    event_time.observed_at_mono_ns / 1_000_000_000.0,
+                )
+                combined_rgb = roi_frame.combined_rgb()
+                if combined_rgb is not None and bool(np.isfinite(combined_rgb).all()):
+                    rgb_value = np.asarray(combined_rgb, dtype=np.float64)
+                else:
+                    observation_validity = ObservationValidity.REJECTED.value
+                    missing_reason = MissingReason.OCCLUDED
+
+            rgb_observations.append(
+                NumericObservation(
+                    observed_at_unix_ms=event_time.observed_at_unix_ms,
+                    observed_at_mono_ns=event_time.observed_at_mono_ns,
+                    boot_id=event_time.boot_id,
+                    sequence=current_sequence,
+                    value=rgb_value,
+                    validity=observation_validity,
+                    missing_reason=missing_reason,
+                    quality=(
+                        min(
+                            quality.brightness_score,
+                            quality.blur_score,
+                            quality.motion_score,
+                            tracking.confidence,
+                        )
+                        if rgb_value is not None
+                        else 0.0
+                    ),
+                    head_jitter_deg=(
+                        float(roi_frame.head_jitter_px)
+                        * (45.0 / max(1.0, float(config.capture.width)))
+                        if roi_frame is not None and rgb_value is not None
+                        else 0.0
+                    ),
+                )
+            )
+
+            if observation_validity != ObservationValidity.VALID.value:
                 if elapsed - last_progress_time >= progress_interval:
                     _emit_progress(
                         on_progress,
@@ -402,14 +506,13 @@ async def run_live_calibration(
                 await asyncio.sleep(0)
                 continue
 
-            roi_frame = extractor.extract(frame_u8, landmarks_px, elapsed)
-            combined_rgb = roi_frame.combined_rgb()
-            if combined_rgb is not None:
-                rgb_window.append(combined_rgb)
-                if len(rgb_window) > max_window:
-                    rgb_window.pop(0)
-
-            blink_state = blink_detector.update(landmarks_px, elapsed)
+            assert landmarks_px is not None
+            observation_mono_seconds = (
+                event_time.observed_at_mono_ns / 1_000_000_000.0
+            )
+            blink_state = blink_detector.update(
+                landmarks_px, observation_mono_seconds
+            )
             if blink_state.blink_rate is not None:
                 samples["blink_rate"].append(blink_state.blink_rate)
 
@@ -418,18 +521,45 @@ async def run_live_calibration(
             ) / float(frame_u8.shape[0])
             samples["shoulder_y"].append(ear_mid_y)
 
+            stride_ns = int(config.signal.rppg.stride_seconds * 1_000_000_000)
             if (
-                len(rgb_window) >= max_window
-                and elapsed - last_physio_time >= config.signal.rppg.stride_seconds
+                last_physio_mono_ns == 0
+                or event_time.observed_at_mono_ns - last_physio_mono_ns >= stride_ns
             ):
-                bvp = extract_bvp(np.array(rgb_window, dtype=np.float64), fs=float(config.capture.fps))
-                pulse_estimator.process_window(bvp, timestamp=elapsed)
-                physio = pulse_estimator.get_features(elapsed)
-                if physio.valid and physio.pulse_bpm is not None:
-                    samples["hr"].append(physio.pulse_bpm)
-                if physio.pulse_variability_proxy is not None:
-                    samples["hrv"].append(physio.pulse_variability_proxy)
-                last_physio_time = elapsed
+                prepared = prepare_observation_window(
+                    rgb_observations.snapshot(),
+                    window_seconds=float(config.signal.rppg.window_seconds),
+                    nominal_fps=float(config.capture.fps),
+                    min_valid_fraction=config.signal.rppg.min_valid_coverage,
+                    max_interpolation_gap_ms=(
+                        config.signal.rppg.max_interpolation_gap_ms
+                    ),
+                    max_motion_fraction=(
+                        config.signal.rppg.max_motion_rejected_fraction
+                    ),
+                    fps_clamp_min=config.signal.rppg.fps_clamp_min,
+                    fps_clamp_max=config.signal.rppg.fps_clamp_max,
+                )
+                last_physio_mono_ns = event_time.observed_at_mono_ns
+                if prepared.ready and prepared.values is not None:
+                    bvp = extract_bvp(
+                        prepared.values,
+                        fs=prepared.sample_rate_hz,
+                        algorithm=config.signal.rppg.backend,
+                        model_path=config.signal.rppg.model_path,
+                    )
+                    pulse_estimator.process_window(
+                        bvp,
+                        timestamp=observation_mono_seconds,
+                        fs=prepared.sample_rate_hz,
+                        head_jitter_deg=prepared.mean_head_jitter_deg,
+                        face_presence_ratio=prepared.valid_fraction,
+                    )
+                    physio = pulse_estimator.get_features(observation_mono_seconds)
+                    if physio.valid and physio.pulse_bpm is not None:
+                        samples["hr"].append(physio.pulse_bpm)
+                    if physio.pulse_variability_proxy is not None:
+                        samples["hrv"].append(physio.pulse_variability_proxy)
 
             telemetry = aggregator.build_features(
                 window_seconds=min(config.telemetry.window_seconds, max(1.0, elapsed)),

@@ -24,6 +24,7 @@ import cv2
 import numpy as np
 
 from cortex.libs.config.settings import CaptureConfig
+from cortex.libs.schemas.observations import MissingReason
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,8 @@ class FrameQuality:
     blur_score: float  # 0.0 (very blurry) to 1.0 (sharp)
     motion_score: float  # 0.0 (excessive jitter) to 1.0 (stable)
     passed: bool  # Whether frame passes the composite quality gate
+    mean_intensity: float = 0.0
+    motion_face_widths_per_second: float | None = None
 
 
 class FrameQualityScorer:
@@ -66,6 +69,8 @@ class FrameQualityScorer:
         frame: np.ndarray,
         nose_displacement: float = 0.0,
         gray_frame: np.ndarray | None = None,
+        *,
+        motion_face_widths_per_second: float | None = None,
     ) -> FrameQuality:
         """
         Score a frame's quality.
@@ -91,7 +96,11 @@ class FrameQualityScorer:
             gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         brightness = self._score_brightness(gray_frame)
         blur = self._score_blur(gray_frame)
-        motion = self._score_motion(nose_displacement)
+        motion = (
+            self._score_motion_rate(motion_face_widths_per_second)
+            if motion_face_widths_per_second is not None
+            else self._score_motion(nose_displacement)
+        )
 
         passed = (
             brightness >= self._brightness_threshold
@@ -104,7 +113,24 @@ class FrameQualityScorer:
             blur_score=blur,
             motion_score=motion,
             passed=passed,
+            mean_intensity=float(np.mean(gray_frame)),
+            motion_face_widths_per_second=motion_face_widths_per_second,
         )
+
+    def rejection_reason(self, quality: FrameQuality) -> MissingReason:
+        """Return the dominant closed-catalog reason for a rejected frame."""
+
+        if quality.motion_score < self._motion_threshold:
+            return MissingReason.MOTION
+        if quality.brightness_score < self._brightness_threshold:
+            return (
+                MissingReason.LOW_LIGHT
+                if quality.mean_intensity < _BRIGHTNESS_LOW
+                else MissingReason.SATURATED
+            )
+        if quality.blur_score < self._blur_threshold:
+            return MissingReason.ARTIFACT
+        return MissingReason.UNKNOWN
 
     def _score_brightness(self, gray: np.ndarray) -> float:
         """
@@ -191,3 +217,19 @@ class FrameQualityScorer:
             range_start = max_jitter * 0.5
             range_end = max_jitter * 2.0
             return 1.0 - (nose_displacement - range_start) / (range_end - range_start)
+
+    def _score_motion_rate(self, motion_face_widths_per_second: float) -> float:
+        """Score resolution/FPS-independent facial translation speed."""
+
+        if motion_face_widths_per_second <= 0.0:
+            return 1.0
+        threshold = self._config.max_motion_face_widths_per_second
+        if motion_face_widths_per_second <= threshold * 0.5:
+            return 1.0
+        if motion_face_widths_per_second >= threshold * 2.0:
+            return 0.0
+        return float(
+            1.0
+            - (motion_face_widths_per_second - threshold * 0.5)
+            / (threshold * 1.5)
+        )

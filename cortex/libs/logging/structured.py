@@ -45,6 +45,7 @@ class EventType(StrEnum):
     CAPTURE_STOPPED = "capture_stopped"
     FACE_LOST = "face_lost"
     FACE_REACQUIRED = "face_reacquired"
+    CAMERA_IDENTITY_CHANGED = "camera_identity_changed"
 
     # System events
     SERVICE_STARTED = "service_started"

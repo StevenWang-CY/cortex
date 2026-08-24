@@ -1422,6 +1422,24 @@ files, Ruff, schema drift, 178 browser tests/build, and 12 VS Code tests/package
 
 ### WP-2 — Observation and capture integrity (`L`)
 
+**Implementation status (2026-08-24): complete.** The camera scheduler now
+emits a dual-clock, sequenced observation for every attempt, including warm-up
+and disconnected reads, queue evictions, adaptive skips, no-face results,
+detector timestamp artifacts, and quality rejections. Motion is computed
+before landmark commit in face-widths per second; MediaPipe receives the
+actual monotonic capture instant; face-loss hysteresis is elapsed-time based.
+Runtime and calibration use one bounded observation buffer with explicit
+coverage, repeated-time, motion-fraction, and 250 ms maximum-gap gates before
+bounded interpolation. All-missing windows stay unavailable and never reach
+the pulse estimator. Live post-open camera identity is index-reorder safe;
+physical changes reset camera-dependent state and invalidate calibration while
+the TCC, Continuity Camera, post-open re-verification, and four-read warm-up
+rules remain intact. Completion evidence: 98 focused capture/runtime/
+calibration tests; 2,182 non-PySide tests passed with five dataset/platform
+skips; every PySide-bearing module passed in an isolated process; strict mypy
+across 444 files, Ruff, both generated-client schema drift gates, 178 browser
+tests plus Chrome build, and 12 VS Code tests plus VSIX packaging.
+
 **Files:**
 
 - `cortex/services/capture_service/webcam.py`
