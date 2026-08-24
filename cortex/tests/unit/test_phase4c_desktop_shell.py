@@ -217,11 +217,12 @@ def test_concepts_glossary_has_core_terms() -> None:
     from cortex.apps.desktop_shell import dashboard
 
     glossary = dashboard._CONCEPTS_GLOSSARY
-    for required in ("state", "hr", "hrv", "perclos", "sqi"):
+    for required in ("state", "hr", "perclos", "sqi"):
         assert required in glossary, f"glossary missing {required!r}"
         # Every entry is a non-empty string so the tooltip is not blank.
         assert isinstance(glossary[required], str)
         assert len(glossary[required]) > 10
+    assert "hrv" not in glossary
 
 
 # ---------------------------------------------------------------------------

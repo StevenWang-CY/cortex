@@ -17,7 +17,7 @@ import asyncio
 import copy
 import logging
 import time
-from typing import Any
+from typing import Any, Literal
 
 from cortex.services.consent.policy import ConsentPolicy
 
@@ -47,17 +47,21 @@ _DECAY_HALF_LIFE_SECONDS = 10 * 24 * 3600
 class ConsentDecision:
     """Result of a consent check."""
 
-    __slots__ = ("allowed", "effective_level", "requested_level", "reason")
+    __slots__ = (
+        "allowed", "effective_level", "outcome", "requested_level", "reason",
+    )
 
     def __init__(
         self,
         allowed: bool,
         effective_level: int,
         requested_level: int,
+        outcome: Literal["permit", "downgrade", "deny"],
         reason: str = "",
     ) -> None:
         self.allowed = allowed
         self.effective_level = effective_level
+        self.outcome = outcome
         self.requested_level = requested_level
         self.reason = reason
 
@@ -220,29 +224,49 @@ class ConsentLadder:
             min_level = self._policy.get_minimum_level(action_type)
             global_max = self._policy.global_max_level
 
-        # Effective level is capped by global max and current earned level
+        if requested_level not in _LEVEL_NAMES:
+            raise ValueError(
+                f"requested_level must be in 0..4, got {requested_level!r}"
+            )
+
+        # Effective level is capped by global max and current earned level.
+        # An action may only execute when the *exact requested manifest* is
+        # both at least the action's minimum and no more authoritative than
+        # the earned/global ceiling. A lower effective level is information
+        # for materializing a new plan; it is never permission to execute the
+        # original request.
         max_allowed = min(current_level, global_max)
 
-        if requested_level <= max_allowed:
+        if min_level <= requested_level <= max_allowed:
             return ConsentDecision(
                 allowed=True,
                 effective_level=requested_level,
                 requested_level=requested_level,
+                outcome="permit",
                 reason=f"Action '{action_type}' allowed at level {_LEVEL_NAMES.get(requested_level, '?')}",
             )
 
-        # Downgrade to what's allowed
+        # A downgrade is explicitly non-executable. The caller may present a
+        # newly materialized lower-authority plan and request consent again.
         effective = min(max_allowed, requested_level)
+        outcome: Literal["downgrade", "deny"] = (
+            "downgrade"
+            if requested_level > max_allowed and effective >= min_level
+            else "deny"
+        )
+        disposition = "downgraded" if outcome == "downgrade" else "denied"
         return ConsentDecision(
-            allowed=effective >= min_level,
+            allowed=False,
             effective_level=effective,
             requested_level=requested_level,
+            outcome=outcome,
             reason=(
-                f"Action '{action_type}' downgraded from "
-                f"{_LEVEL_NAMES.get(requested_level, '?')} to "
-                f"{_LEVEL_NAMES.get(effective, '?')} "
+                f"Action '{action_type}' {disposition} at "
+                f"{_LEVEL_NAMES.get(requested_level, '?')}; effective ceiling "
+                f"is {_LEVEL_NAMES.get(effective, '?')} "
                 f"(earned: {_LEVEL_NAMES.get(current_level, '?')}, "
-                f"cap: {_LEVEL_NAMES.get(global_max, '?')})"
+                f"cap: {_LEVEL_NAMES.get(global_max, '?')}, "
+                f"minimum: {_LEVEL_NAMES.get(min_level, '?')})"
             ),
         )
 

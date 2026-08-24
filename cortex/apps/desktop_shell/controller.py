@@ -230,19 +230,9 @@ class DaemonBridge(QObject):
             logger.debug("on_stop_focus_auto emit failed", exc_info=True)
 
     def on_break_recommendation(self, payload: dict) -> None:
-        """P0 §3.7: relay BREAK_RECOMMENDATION onto the Qt main thread.
+        """Decode-only compatibility sink for an unsupported metric claim."""
 
-        Mirrors the other on_* handlers — dict is shallow-copied so the
-        bridge can re-broadcast without callers mutating shared state.
-        """
-        try:
-            self.break_recommendation_received.emit(
-                dict(payload) if payload else {}
-            )
-        except Exception:
-            logger.debug(
-                "break_recommendation_received emit failed", exc_info=True,
-            )
+        del payload
 
     def on_intervention_failed(self, payload: dict) -> None:
         """P1-FC-INTERVENTION-FAILED: a total mutation failure was
@@ -439,14 +429,8 @@ class CortexAppController:
         self._bridge.quiet_mode_state_received.connect(
             self._on_quiet_mode_state_to_tray,
         )
-        # P0 §3.7 desktop dispatch: route BREAK_RECOMMENDATION into the
-        # dashboard's break pill (and tray notification helper). The
-        # dashboard handler is the source of truth — if it isn't wired
-        # (legacy lightweight test stub) we fall through silently.
-        if hasattr(self._dashboard, "apply_break_recommendation"):
-            self._bridge.break_recommendation_received.connect(
-                self._dashboard.apply_break_recommendation,
-            )
+        # BREAK_RECOMMENDATION remains a decode-only compatibility message;
+        # unsupported HRV/stress claims are never connected to product UI.
 
         self._overlay.dismissed.connect(self._on_overlay_dismissed)
         # G4 (audit-prod): overlay action buttons emit ``action_invoked``;
@@ -838,8 +822,6 @@ class CortexAppController:
                 MessageType.QUIET_MODE_STATE.value: bridge.on_quiet_mode_state,
                 MessageType.START_FOCUS_AUTO.value: bridge.on_start_focus_auto,
                 MessageType.STOP_FOCUS_AUTO.value: bridge.on_stop_focus_auto,
-                # P0 §3.7 desktop dispatch.
-                MessageType.BREAK_RECOMMENDATION.value: bridge.on_break_recommendation,
                 # P1-FC-INTERVENTION-FAILED: total mutation failure → toast.
                 MessageType.INTERVENTION_FAILED.value: bridge.on_intervention_failed,
                 # P1-FC-INTERVENTION-PROMPT: cross-surface prompt sync. The
@@ -1199,6 +1181,13 @@ class CortexAppController:
         """
         if self._daemon is None or self._daemon_loop is None:
             return
+        if not self._daemon.workspace_mutation_allowed:
+            logger.info(
+                "Desktop action ignored in suggest-only mode "
+                "(intervention_id=%s)",
+                intervention_id,
+            )
+            return
         action_type = str(action.get("action_type") or "")
         action_id = str(action.get("action_id") or "")
         # Native vs browser routing is authoritative on the overlay's
@@ -1237,19 +1226,12 @@ class CortexAppController:
                     reason=str(meta.get("reason", "user_requested_timer"))[:120],
                 )
             elif action_type == "take_biology_break":
-                # P0 §3.7: the breathing session is a full-screen Qt
-                # overlay driven by the daemon (it owns the HRV context).
-                # Route to ``start_biology_break`` — NEVER the browser.
-                meta = action.get("metadata")
-                meta = meta if isinstance(meta, dict) else {}
-                duration = int(meta.get("duration_seconds", 240) or 240)
-                pattern = meta.get("breathing_pattern")
-                native_coro = self._daemon.start_biology_break(
-                    intervention_id=str(intervention_id or ""),
-                    duration_seconds=duration,
-                    breathing_pattern=pattern if isinstance(pattern, str) else None,
-                    audio_cue=bool(meta.get("audio_cue", True)),
-                    reason=str(meta.get("reason", "user_requested_break"))[:120],
+                # Decode-only compatibility action. Camera-derived HRV/stress
+                # cannot justify a product break in any execution mode.
+                logger.info(
+                    "Ignoring unsupported take_biology_break action "
+                    "(intervention_id=%s)",
+                    intervention_id,
                 )
             elif action_type == "resume_last_active_file":
                 # Editor/native adapter — focus the last active file in
@@ -1684,46 +1666,9 @@ class CortexAppController:
 
     @Slot(dict)
     def _on_break_pill_clicked(self, payload: dict) -> None:
-        """P0 §3.7: user clicked the "Take a break" pill on the dashboard.
+        """Legacy pill callbacks cannot start an unvalidated biology break."""
 
-        Schedules ``daemon.start_biology_break`` directly so the desktop
-        full-screen overlay drives the same breathing controller as a
-        daemon-initiated promotion. Pulls duration / pattern / audio cue
-        out of the cached BREAK_RECOMMENDATION payload that the dashboard
-        echoes back; falls back to the controller's existing defaults
-        when fields are missing.
-        """
-        if self._daemon is None or self._daemon_loop is None:
-            return
-        if not isinstance(payload, dict):
-            payload = {}
-        # The payload mirrors MessageType.BREAK_RECOMMENDATION fields.
-        # ``duration_seconds`` defaults to 240 (4 min) per the spec.
-        try:
-            duration_seconds = int(payload.get("duration_seconds") or 240)
-        except (TypeError, ValueError):
-            duration_seconds = 240
-        pattern_raw = payload.get("breathing_pattern")
-        pattern: str | None = (
-            str(pattern_raw) if isinstance(pattern_raw, str) and pattern_raw else None
-        )
-        audio_cue = bool(payload.get("audio_cue", True))
-        reason = str(payload.get("reason") or "user_break_pill_click")[:120]
-        try:
-            asyncio.run_coroutine_threadsafe(
-                self._daemon.start_biology_break(
-                    intervention_id=None,
-                    duration_seconds=duration_seconds,
-                    breathing_pattern=pattern,
-                    audio_cue=audio_cue,
-                    reason=reason,
-                ),
-                self._daemon_loop,
-            )
-        except Exception:
-            logger.debug(
-                "start_biology_break scheduling failed", exc_info=True,
-            )
+        del payload
 
     @Slot(str)
     def _on_undo_action_requested(self, intervention_id: str) -> None:

@@ -2,10 +2,10 @@
   <img src="cortex/assets/banner.svg?v=2" alt="Cortex Banner" width="450" />
 </p>
 
-<h1 align="center">Cortex — The Biological Browser Engine</h1>
+<h1 align="center">Cortex — A Local Workspace Support Engine</h1>
 
 <p align="center">
-  Real-time biofeedback for macOS. Reads cognitive overwhelm from your face and webcam at 30 FPS, then lets Claude restructure your workspace.
+  A macOS research prototype that combines local camera and activity signals with workspace context to offer conservative, user-controlled suggestions.
 </p>
 
 <p align="center">
@@ -39,11 +39,11 @@
   <tr>
     <td width="33%" align="center">
       <img src="assets/demo/dashboard.png" alt="Cortex desktop dashboard showing live biometrics" width="100%" />
-      <sub><b>Desktop dashboard</b><br/>HR, HRV, blink rate, and session stats in real time</sub>
+      <sub><b>Desktop dashboard</b><br/>Quality-gated pulse, blink rate, and session stats</sub>
     </td>
     <td width="33%" align="center">
       <img src="assets/demo/overlay.png" alt="Intervention overlay live on a Chrome tab" width="100%" />
-      <sub><b>Intervention overlay</b><br/>Causal explanation, per-tab recommendations, single-CTA execute, undo</sub>
+      <sub><b>Intervention overlay</b><br/>Evidence summary, per-tab suggestions, and explicit user review</sub>
     </td>
     <td width="33%" align="center">
       <img src="assets/demo/pulse-room.png" alt="Pulse Room new-tab page pulsing at the user's heart rate" width="100%" />
@@ -68,44 +68,39 @@
   rotatable from the UI). Each mutating request is assigned an
   `X-Cortex-Request-ID` that surfaces in dashboard error toasts so
   users can quote the cid back when filing issues.
-- **AMIP — Adaptive Microrandomized Intervention Policy.** Contextual
-  Thompson sampling over fixed intervention arms with temperature
-  softmax, deterministic safety floor, propensity logging, and a
-  write-ahead policy log for off-policy evaluation; nightly causal
-  reports written locally. Implemented from scratch in
-  [`cortex/services/eval/amip.py`](cortex/services/eval/amip.py).
-- **Four rPPG algorithms** — POS / CHROM / GREEN / TS-CAN (ONNX) with
-  peer-reviewed citations; composite SQI vetoes physiology before
-  publication; 60-second-window HRV (RMSSD, SDNN, pNN50, SD1/SD2,
-  LF/HF via Lomb-Scargle, sample entropy).
+- **Research policy instrumentation.** The repository contains contextual
+  policy and propensity-logging experiments. Their current reports are
+  diagnostics, not causal evidence, and production defaults do not grant
+  them workspace authority.
+- **Conservative physiology boundary.** Quality-gated webcam pulse can be
+  displayed as an experimental wellness signal. Camera-derived HRV,
+  respiration, LF/HF, apnea, and the former stress-integral trigger are
+  unavailable until metric-specific reference-sensor validation passes.
 - **Multi-layer kill chain.** Stopping the daemon executes
   WebSocket `SHUTDOWN` → HTTP `/shutdown` → Chrome native-messaging
   `stop` → SIGTERM-by-port-and-name → SIGKILL survivors, with
   bounded waits between each layer. Documented in
   [`CLAUDE.md`](CLAUDE.md) rule #13.
-- **Hard CI gates.** `ruff` + 124 pytest files (1,334 test functions)
-  + 17 vitest specs + schema-codegen drift + eval-regression baseline
-  (synthetic-trace replay with 3 % relative tolerance) on every PR.
-  `mypy` runs as an informational check.
+- **Hard CI gates.** Python lint/type/tests, schema and version drift,
+  browser type/tests/build, VS Code compile/tests/package, regression
+  replay, and dependency-policy artifacts run on changes before release.
 - **Cross-language stack** with intent: Python (FastAPI + PySide6) ·
   TypeScript (Plasmo MV3 + VS Code) · C (`.cortex_launcher.c` for
   macOS TCC identity) · ONNX Runtime (TS-CAN inference).
-- **56 / 56 audit findings closed** across 2 sessions, plus 2
-  Architectural Debts (schema codegen, capability-token auth) — see
-  [`audit/state.md`](audit/state.md). The ledger is the design-process
-  artifact, not vapourware.
+- **Tracked redesign.** [`IMPLEMENTATION.md`](IMPLEMENTATION.md) records
+  the current algorithm/architecture audit, evidence limits, invariants,
+  work packages, risk register, and objective exit gates.
 
 ---
 
 ## Key features
 
-- **Bio-extraction at 30 FPS** — HR / HRV / respiratory rate via rPPG; blink rate, head pose, posture via MediaPipe; mouse/keyboard via pynput. Gracefully degrades to telemetry-only in poor lighting.
-- **Cognitive state classification** — fuses signals every 500 ms into FLOW · HYPER (overwhelmed) · HYPO (disengaged) · RECOVERY using rule-based scoring with EMA smoothing, Schmitt hysteresis, and per-user calibration.
-- **LLM-powered interventions** — workspace context (never biometrics) is sent to Claude via the Anthropic SDK (Bedrock default, Vertex or direct API supported); structured JSON output, schema-validated, schema-degraded on parse failure. Closes distraction tabs, groups related tabs, surfaces error fixes, decomposes tasks into micro-steps.
+- **Local sensing** — quality-gated pulse plus blink, head-pose, and input/window telemetry. Missing or poor-quality camera data degrades explicitly.
+- **Heuristic support estimates** — current labels are rule scores with smoothing and hysteresis, not calibrated probabilities or diagnoses.
+- **LLM-generated proposals** — selected workspace context can be sent to Claude; structured output is schema-validated and presented as suggestions by default.
 - **LeetCode mode** — DOM observer, stage inference (READ / PLAN / IMPLEMENT / DEBUG / REFLECT), amygdala-hijack lockout, pattern-ladder hints, submission-discipline guard.
-- **Biology-driven breaks** — cumulative HRV-suppression integral replaces arbitrary Pomodoro timers.
-- **Progressive consent** — 5-level trust ladder per action type (OBSERVE → SUGGEST → PREVIEW → REVERSIBLE_ACT → AUTONOMOUS_ACT). Cortex earns autonomy through repeated approvals; rejections de-escalate.
-- **Learning loop** — AMIP selects the intervention arm; per-tab relevance tracker learns from Keep-button feedback (EMA, 90-day TTL).
+- **Suggestion-only authority** — fresh and migrated installs cannot mutate tabs, editors, windows, or files from a proposal. Higher modes remain explicit and guarded while transactional authorization is completed.
+- **Exact consent outcomes** — permit, downgrade, and deny are distinct; a downgraded request cannot execute its original plan.
 - **Ambient somatic feedback** — sub-threshold color vignettes, weather particles, flow shield that fades distractions during sustained focus.
 - **Chrome + Edge extension** — Plasmo / React MV3 with popup, intervention overlay, Pulse Room new tab, focus sessions, activity tracker, resume cards.
 
@@ -117,22 +112,22 @@
 Webcam (30 FPS)
      │
      ▼
-L1: Bio-Extraction ─── rPPG (POS/CHROM/GREEN + optional TS-CAN/ONNX) · Respiration · Blink/PERCLOS · Pose · Telemetry
+L1: Observation ─────── quality-gated rPPG pulse · Blink/PERCLOS · Pose · Telemetry
      │
      ▼  SQI Gate (NSQI + SNR + motion + face-loss) → FeatureVector (500 ms)
-L2: State Engine ────── Personalized scoring · optional ML ensemble · calibrated confidence
+L2: Support Engine ──── Heuristic scoring · smoothing · evidence/quality gates
      │
-     ▼  StateEstimate + stress_integral
-L3: Trigger Policy ──── Receptivity gate · dwell/hysteresis · adaptive threshold · AMIP
+     ▼  Support proposal
+L3: Trigger Policy ──── Receptivity gate · dwell/hysteresis · deterministic safeguards
      │
      ▼  TaskContext
 L4: LLM Engine ──────── Anthropic SDK (Bedrock / Vertex / direct) · schema-constrained output · grounded explanations · self-critique · rule-based fallback
      │
      ▼  InterventionPlan
-L5: Intervention ────── Recency-weighted consent · single-CTA execute · undo stack · reward logging
+L5: Intervention ────── Proposal-only default · exact consent · restore planning
      │
      ▼
-Store (Redis / in-memory + policy WAL + nightly causal reports)
+Store (Redis / in-memory + legacy policy diagnostics)
 ```
 
 All layers communicate via FastAPI (`:9472`) and WebSocket (`:9473`),
@@ -165,33 +160,27 @@ Deep dives: [How It Works](https://github.com/StevenWang-CY/cortex/wiki/How-It-W
 
 <!-- EDIT THIS PARAGRAPH — rewrite in your own voice before publishing -->
 
-Existing focus tools are either dumb timers (Pomodoro doesn't know you
-just hit a deep flow state at minute 24) or anxiety-machines that
-nag you for "task switching" without ever asking your body whether it
-was actually a problem. I wanted a system that read me first and
-nagged me second — one that could see I was thrashing between tabs
-*because my heart rate was climbing* and intervene with something
-specific (close these four tabs, the error is on line 67, you've been
-holding your breath for two minutes), not generic ("Time for a
-break!"). Building it also meant getting my hands dirty in a stack I
-hadn't touched together before: real-time signal processing, on-device
-ML, browser-extension architecture, async + Qt + native macOS,
-adversarial code audits. The version-control history is the project,
-not the binary.
+Existing focus tools often ignore context. Cortex explores whether local
+signals and workspace structure can support better-timed, more specific
+suggestions without pretending that webcam measurements diagnose a mental
+state. Building it combines real-time signal processing, browser-extension
+architecture, async + Qt + native macOS, privacy boundaries, and adversarial
+code audits. The version-control history is the project, not the binary.
 
 ---
 
 ## Status
 
-- **What works.** State classification is conservative and well-tuned in testing (no false alarms during caffeinated studying, debugging sessions, deep reading). Biology-driven break timer, LeetCode multi-selector DOM observer, intervention matrix, context-aware LLM fallback, progressive-consent ladder all behave as designed.
-- **Known limits.** Webcam rPPG is sensitive to lighting / motion / camera quality; HRV at 30 FPS is trend-level, not clinical-grade beat-level. UBFC / PURE replay tests are dataset-gated. Intervention copy can be generic early on before the learning loop calibrates.
+- **What works.** Local capture/telemetry, quality-gated pulse, schema-validated planning, proposal presentation, capability-token auth, and deterministic cleanup paths have automated coverage.
+- **Known limits.** This is an alpha research prototype. Webcam pulse is sensitive to lighting, motion, skin/camera conditions, and is not medical grade. Support labels are heuristic. HRV, respiration/apnea, LF/HF, and physiology-triggered breaks are disabled pending external validation.
+- **Safety default.** `execution_mode=suggest_only`; proposals do not close/hide tabs, fold editors, or otherwise restructure the workspace.
 - **Not yet.** Linux / Windows support (the whole stack is tied to AVFoundation, TCC, and macOS-specific frameworks). No multi-user / cloud sync — by design (everything stays local).
 
 ---
 
 ## Install
 
-1. Download **Cortex.dmg** from the [latest release](https://github.com/StevenWang-CY/cortex/releases/latest).
+1. Download the versioned **Cortex-&lt;version&gt;.dmg** from the [latest release](https://github.com/StevenWang-CY/cortex/releases/latest).
 2. Drag **Cortex.app** to `/Applications`.
 3. Strip quarantine: `xattr -cr /Applications/Cortex.app`.
 4. Open Cortex — follow the 4-step setup wizard (Camera, Accessibility, API key, Extensions).
@@ -276,14 +265,14 @@ Then load `cortex/apps/browser_extension/build/chrome-mv3-prod/` (or `edge-mv3-p
 ```bash
 make ci               # everything CI runs (lint + typecheck + tests + codegen drift)
 make test             # pytest suite
-make test-eval        # AMIP / IPS / safety-floor / calibration
+make test-eval        # policy diagnostics / safety-floor / calibration
 make codegen-check    # schema drift gate
 ```
 
 ### Build a DMG
 
 ```bash
-make dmg              # produces dist/Cortex.dmg
+make dmg              # produces dist/Cortex-<version>.dmg
 ```
 
 For production distribution, set `CORTEX_SIGN_IDENTITY` to your
@@ -297,7 +286,7 @@ notarytool keychain profile before running `make dmg`.
 - **No video is ever saved.** Frames are processed in memory and immediately discarded.
 - **No biometrics reach the LLM.** The model sees only workspace context: file paths, error messages, tab titles.
 - **Local-only network surface.** FastAPI, WebSocket, and the launcher agent bind to `127.0.0.1` and require a capability token.
-- **Consent-gated autonomy.** No action executes without earned trust. Users control the maximum autonomy level. Destructive actions are reversible.
+- **User authority.** The shipped default is suggestion-only. Experimental mutation modes remain disabled until the transactional authorization and durable-receipt gates in [`IMPLEMENTATION.md`](IMPLEMENTATION.md) pass.
 
 See [Privacy](https://github.com/StevenWang-CY/cortex/wiki/Privacy) and [SECURITY.md](SECURITY.md) for the full boundary commitments.
 

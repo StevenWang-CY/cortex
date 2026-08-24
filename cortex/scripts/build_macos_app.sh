@@ -23,6 +23,11 @@ if [ -f "${ROOT_DIR}/.venv/bin/activate" ]; then
     source "${ROOT_DIR}/.venv/bin/activate"
 fi
 
+# pyproject.toml is the sole version source. Refuse to package stale generated
+# Python/extension surfaces before spending minutes on native builds.
+python -m cortex.scripts.sync_versions --check
+CORTEX_VERSION=$(python -m cortex.scripts.sync_versions --print)
+
 # Non-interactive bash launched from GUI tools often lacks Homebrew/NVM paths.
 # Add the common macOS Node locations before building bundled extensions.
 export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
@@ -65,29 +70,25 @@ else
     (
         cd "${EXT_DIR}"
         if command -v pnpm &>/dev/null; then
-            pnpm install
+            pnpm install --frozen-lockfile
             pnpm exec plasmo build
             pnpm exec plasmo build --target=edge-mv3
         elif command -v corepack &>/dev/null; then
-            corepack pnpm install
+            corepack pnpm install --frozen-lockfile
             corepack pnpm exec plasmo build
             corepack pnpm exec plasmo build --target=edge-mv3
-        elif command -v npm &>/dev/null; then
-            npm install
-            npx plasmo build
-            npx plasmo build --target=edge-mv3
         else
-            echo "ERROR: pnpm/corepack/npm not installed; cannot build browser extension" >&2
+            echo "ERROR: pnpm/corepack not installed; cannot consume pnpm-lock.yaml" >&2
             exit 1
         fi
     )
 fi
 
 # ── Step 2: Build VS Code extension ────────────────────────────────────────
-# P2-12: Read version from package.json so the VSIX path is always
-# consistent with the manifest; never hardcode the version string here.
-VSIX_VERSION=$(jq -r .version "${CORTEX_DIR}/apps/vscode_extension/package.json")
-VSIX="${CORTEX_DIR}/apps/vscode_extension/cortex-somatic-${VSIX_VERSION}.vsix"
+# The version-consistency gate above proves the VS Code manifest agrees with
+# the canonical project version, so both the expected VSIX and bundled spec
+# resolve the same immutable artifact name.
+VSIX="${CORTEX_DIR}/apps/vscode_extension/cortex-somatic-${CORTEX_VERSION}.vsix"
 VSCODE_EXT_DIR="${CORTEX_DIR}/apps/vscode_extension"
 if [ "${CORTEX_SKIP_VSCODE_EXT_BUILD:-0}" = "1" ]; then
     echo "→ Skipping VS Code extension build (CORTEX_SKIP_VSCODE_EXT_BUILD=1)"
@@ -96,9 +97,9 @@ else
     (
         cd "${VSCODE_EXT_DIR}"
         if command -v npm &>/dev/null; then
-            npm install
+            npm ci
             npm run compile
-            npx --yes @vscode/vsce package --out "${VSIX}"
+            npm exec -- vsce package --out "${VSIX}"
         else
             echo "ERROR: npm not installed; cannot build VS Code extension" >&2
             exit 1
@@ -109,7 +110,7 @@ fi
 # ── Step 3: Verify VSIX ────────────────────────────────────────────────────
 if [ ! -f "${VSIX}" ]; then
     echo "ERROR: VSIX not found at ${VSIX}" >&2
-    echo "Build it with: cd cortex/apps/vscode_extension && npx @vscode/vsce package --out cortex-somatic-${VSIX_VERSION}.vsix" >&2
+    echo "Build it with: cd cortex/apps/vscode_extension && npm ci && npm exec -- vsce package --out cortex-somatic-${CORTEX_VERSION}.vsix" >&2
     exit 1
 fi
 echo "→ VSIX found"
@@ -302,7 +303,7 @@ fi
 spctl -a -v --type execute "${APP_PATH}" 2>&1 || true
 
 # ── Step 8: Create DMG ────────────────────────────────────────────────────
-DMG_PATH="${DIST_DIR}/Cortex.dmg"
+DMG_PATH="${DIST_DIR}/Cortex-${CORTEX_VERSION}.dmg"
 echo "→ Creating DMG..."
 DMG_STAGE_DIR="$(mktemp -d /tmp/cortex_dmg_stage.XXXXXX)"
 cp -R "${APP_PATH}" "${DMG_STAGE_DIR}/Cortex.app"

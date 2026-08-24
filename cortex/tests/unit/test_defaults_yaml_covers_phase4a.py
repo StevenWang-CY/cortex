@@ -9,6 +9,7 @@ import yaml
 _DEFAULTS = Path(__file__).resolve().parent.parent.parent / "libs" / "config" / "defaults.yaml"
 
 _REQUIRED_FLAGS = [
+    "execution_mode",
     "enable_biology_break",
     "enable_auto_distraction_block",
     "enable_os_notifications",
@@ -46,9 +47,10 @@ def test_os_notifications_flag_present() -> None:
 
 
 def test_flag_defaults_match_spec() -> None:
-    """Confirm the defaults match the spec: bio=true, block=false, notif=true."""
+    """Confirm fresh installs default to presentation-only authority."""
     data = _load()
     iv = data["intervention"]
-    assert iv["enable_biology_break"] is True
+    assert iv["enable_biology_break"] is False
+    assert iv["execution_mode"] == "suggest_only"
     assert iv["enable_auto_distraction_block"] is False
     assert iv["enable_os_notifications"] is True

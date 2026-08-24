@@ -64,11 +64,13 @@ class _FakeWSServer:
 
 
 class _FakeConfigIntervention:
+    execution_mode: str = "suggest_only"
     quiet_mode_minutes: int = 30
 
 
 class _FakeConfig:
-    intervention = _FakeConfigIntervention()
+    def __init__(self) -> None:
+        self.intervention = _FakeConfigIntervention()
 
 
 class _MinimalDaemon:
@@ -112,6 +114,7 @@ class _MinimalDaemon:
     # the implementation in the test.
     from cortex.services.runtime_daemon import CortexDaemon
 
+    intervention_execution_mode = CortexDaemon.intervention_execution_mode
     get_quiet_mode_state = CortexDaemon.get_quiet_mode_state
     _broadcast_quiet_mode_state = CortexDaemon._broadcast_quiet_mode_state
     set_quiet_mode = CortexDaemon.set_quiet_mode

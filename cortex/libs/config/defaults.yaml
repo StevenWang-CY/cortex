@@ -61,6 +61,11 @@ state:
     workspace_complexity: 0.15
 
 intervention:
+  # Safety boundary: proposals are presentation-only until an exact
+  # authorization transaction is available. Existing configs missing this
+  # key inherit the same least-authority default from InterventionConfig.
+  execution_mode: suggest_only
+
   # Confidence thresholds for intervention levels
   overlay_threshold: 0.70
   simplified_threshold: 0.85
@@ -91,9 +96,9 @@ intervention:
   dismissal_model_enabled: true
   dismissal_model_threshold: 0.6
 
-  # P0 §3.7 — Biology-driven break. When true, StressIntegralTracker
-  # transitions emit BREAK_RECOMMENDATION and promote take_biology_break.
-  enable_biology_break: true
+  # Compatibility-only. Runtime coercion keeps this false until the
+  # underlying physiology is reference-validated.
+  enable_biology_break: false
 
   # P0 §3.10 — Auto-armed distraction blocking on sustained HYPER.
   # Defaults OFF (principle of least surprise; users opt in from Settings).

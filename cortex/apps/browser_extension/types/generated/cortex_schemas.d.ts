@@ -406,6 +406,10 @@ export interface ComparisonStats {
  */
 export interface ConsentDecision {
   /**
+   * Exact decision outcome. Only permit authorizes execution; downgrade is a non-executable proposal for a lower-level plan.
+   */
+  outcome: "permit" | "downgrade" | "deny";
+  /**
    * Whether the action is allowed
    */
   allowed: boolean;
@@ -459,6 +463,10 @@ export interface ConsentRecord {
    * When decision was made
    */
   timestamp?: string;
+}
+export interface DaemonStatusResponse {
+  command: "status";
+  status: "running" | "stopped";
 }
 /**
  * Code diagnostic (error, warning, info) from editor.
@@ -543,6 +551,24 @@ export interface EditorContext {
   visible_code?: string;
 }
 /**
+ * Dual-clock metadata for one observation or domain event.
+ */
+export interface EventTime {
+  schema_version?: "2.0";
+  /**
+   * UTC Unix epoch milliseconds for display and persistence
+   */
+  observed_at_unix_ms: number;
+  /**
+   * Process-local monotonic nanoseconds for elapsed-time ordering
+   */
+  observed_at_mono_ns: number;
+  /**
+   * Monotonic clock domain; values compare only within one boot_id
+   */
+  boot_id: string;
+}
+/**
  * Unified 14-dimensional feature vector produced every 500ms.
  *
  * Combines physiological, kinematic, and telemetry features into a single
@@ -558,11 +584,11 @@ export interface FeatureVector {
    */
   hr?: number | null;
   /**
-   * HRV proxy - RMSSD in ms
+   * Compatibility field; unavailable in product
    */
   hrv_rmssd?: number | null;
   /**
-   * SDNN in ms
+   * Compatibility field; unavailable in product
    */
   hrv_sdnn?: number | null;
   /**
@@ -626,7 +652,7 @@ export interface FeatureVector {
    */
   scroll_back_rate_per_min?: number | null;
   /**
-   * Respiration rate (breaths/min)
+   * Compatibility field; unavailable in product
    */
   respiration_rate?: number | null;
   /**
@@ -764,6 +790,21 @@ export interface FrameMeta {
    * Frame failed the per-frame quality gate. Consumers should skip the RGB sample or insert a NaN sentinel rather than appending the actual pixels.
    */
   low_quality?: boolean;
+}
+export interface GetAuthTokenMessage {
+  command: "get_auth_token";
+}
+/**
+ * Successful capability-token response.
+ *
+ * Errors use :class:`NativeErrorResponse`, keeping this success shape
+ * strict enough that a client cannot accidentally accept a legacy
+ * ``token`` key or an empty/non-hex secret.
+ */
+export interface GetAuthTokenResponse {
+  command: "get_auth_token";
+  status: "ok";
+  auth_token: string;
 }
 /**
  * Complete evaluation record for a single intervention.
@@ -1288,6 +1329,30 @@ export interface KinematicFeatures {
   confidence: number;
 }
 /**
+ * ``{"command":"launch", "project_root": "/Users/.../Project X"}``.
+ *
+ * ``project_root`` is optional. When present the value must be an
+ * existing directory that lives under the project-root allowlist; the
+ * validator runs at parse time so an invalid path is reported before
+ * dispatch.
+ */
+export interface LaunchMessage {
+  command: "launch";
+  project_root?: string | null;
+}
+export interface LaunchResponse {
+  command: "launch";
+  status: "launched" | "already_running" | "timeout" | "error";
+  error?: string | null;
+}
+export interface NativeErrorResponse {
+  command: "error";
+  status?: "error";
+  request_command?: string | null;
+  error: string;
+  detail?: string | null;
+}
+/**
  * Physiological features extracted from rPPG analysis.
  */
 export interface PhysioFeatures {
@@ -1300,31 +1365,31 @@ export interface PhysioFeatures {
    */
   pulse_quality: number;
   /**
-   * RMSSD of inter-beat intervals in ms
+   * Compatibility field; unavailable in product pending validation
    */
   pulse_variability_proxy?: number | null;
   /**
-   * SDNN of inter-beat intervals in ms
+   * Compatibility field; unavailable in product
    */
   hrv_sdnn?: number | null;
   /**
-   * Fraction of adjacent IBI deltas > 50ms
+   * Compatibility field; unavailable in product
    */
   hrv_pnn50?: number | null;
   /**
-   * Poincare SD1 in ms
+   * Compatibility field; unavailable in product
    */
   hrv_sd1?: number | null;
   /**
-   * Poincare SD2 in ms
+   * Compatibility field; unavailable in product
    */
   hrv_sd2?: number | null;
   /**
-   * LF/HF ratio from Lomb-Scargle PSD
+   * Compatibility field; unavailable in product
    */
   hrv_lf_hf_ratio?: number | null;
   /**
-   * Sample entropy of IBI sequence
+   * Compatibility field; unavailable in product
    */
   hrv_sample_entropy?: number | null;
   /**
@@ -1342,13 +1407,37 @@ export interface PhysioFeatures {
    */
   hr_delta_5s?: number | null;
   /**
-   * Respiration rate in breaths per minute
+   * Compatibility field; unavailable in product pending validation
    */
   respiration_rate_bpm?: number | null;
   /**
    * Whether physiological features are valid
    */
   valid: boolean;
+}
+/**
+ * ``{"command":"raise_dashboard", "target":"desktop"}``.
+ *
+ * Audit-prod Phase-4 closure: native_host.py was peeking the raw JSON
+ * for this command and dispatching outside the Pydantic-validated
+ * union. Promoting the command to a typed message gives the same
+ * validation guarantees the rest of the native-host vocabulary has,
+ * and lets the codegen pipeline emit a generated TypeScript type for
+ * the extension's side of the channel.
+ *
+ * ``target`` is a short string identifying the surface to raise (the
+ * desktop shell window, an editor host, etc.). The 64-char cap is
+ * generous for short identifiers and prevents a hostile / malformed
+ * extension from blowing up the host with a megabyte target.
+ */
+export interface RaiseDashboardMessage {
+  command: "raise_dashboard";
+  target: string;
+}
+export interface RaiseDashboardResponse {
+  command: "raise_dashboard";
+  status: "ok";
+  http_status: number;
 }
 /**
  * Reply envelope for ``REQUEST_SESSION_DETAIL`` / ``REQUEST_SESSION_RECAP``.
@@ -1611,7 +1700,7 @@ export interface StateEstimate {
    */
   dwell_seconds?: number;
   /**
-   * Cumulative stress load integral (ms*s)
+   * Compatibility field; unavailable pending reference validation
    */
   stress_integral?: number | null;
   /**
@@ -1726,6 +1815,17 @@ export interface StateTransition1 {
    * Reasons for transition
    */
   trigger_reasons?: string[];
+}
+export interface StatusMessage {
+  command: "status";
+}
+export interface StopMessage {
+  command: "stop";
+}
+export interface StopResponse {
+  command: "stop";
+  status: "stopped" | "error";
+  error?: string | null;
 }
 /**
  * Browser tab visibility state.
@@ -2465,21 +2565,6 @@ export interface PatternLadderRung {
    */
   revealed_at?: number | null;
 }
-export interface GetAuthTokenMessage {
-  command: "get_auth_token";
-}
-/**
- * ``{"command":"launch", "project_root": "/Users/.../Project X"}``.
- *
- * ``project_root`` is optional. When present the value must be an
- * existing directory that lives under the project-root allowlist; the
- * validator runs at parse time so an invalid path is reported before
- * dispatch.
- */
-export interface LaunchMessage {
-  command: "launch";
-  project_root?: string | null;
-}
 /**
  * Outcome of :func:`parse_native_message`.
  *
@@ -2491,31 +2576,6 @@ export interface ParseResult {
   message?: (LaunchMessage | StopMessage | StatusMessage | GetAuthTokenMessage | RaiseDashboardMessage) | null;
   error?: string | null;
   detail?: string | null;
-}
-export interface StopMessage {
-  command: "stop";
-}
-export interface StatusMessage {
-  command: "status";
-}
-/**
- * ``{"command":"raise_dashboard", "target":"desktop"}``.
- *
- * Audit-prod Phase-4 closure: native_host.py was peeking the raw JSON
- * for this command and dispatching outside the Pydantic-validated
- * union. Promoting the command to a typed message gives the same
- * validation guarantees the rest of the native-host vocabulary has,
- * and lets the codegen pipeline emit a generated TypeScript type for
- * the extension's side of the channel.
- *
- * ``target`` is a short string identifying the surface to raise (the
- * desktop shell window, an editor host, etc.). The 64-char cap is
- * generous for short identifiers and prevents a hostile / malformed
- * extension from blowing up the host with a megabyte target.
- */
-export interface RaiseDashboardMessage {
-  command: "raise_dashboard";
-  target: string;
 }
 /**
  * Per-tick biometrics summary attached to STATE_UPDATE payloads.
@@ -2536,7 +2596,7 @@ export interface BiometricsSummary {
    */
   heart_rate?: number | null;
   /**
-   * HRV RMSSD in milliseconds
+   * Compatibility field; unavailable in product
    */
   hrv_rmssd?: number | null;
   /**
@@ -2560,7 +2620,7 @@ export interface BiometricsSummary {
    */
   forward_lean_angle?: number | null;
   /**
-   * Respiration rate in breaths/minute
+   * Compatibility field; unavailable in product
    */
   respiration_rate?: number | null;
   /**
@@ -2568,7 +2628,7 @@ export interface BiometricsSummary {
    */
   thrashing_score?: number | null;
   /**
-   * Cumulative stress-integral load tracked by ``StressIntegralTracker``. Used by the break-readiness UI.
+   * Compatibility field; unavailable pending validation
    */
   stress_integral?: number | null;
 }
@@ -2790,6 +2850,10 @@ export interface InterventionTriggerPayload {
   metadata?: {
     [k: string]: unknown;
   };
+  /**
+   * Daemon-owned workspace authority mode. Missing or legacy values decode to suggest_only so protocol downgrade cannot increase authority.
+   */
+  execution_mode?: "suggest_only" | "authorized" | "research_autonomous";
   /**
    * P0 §3.12: True when the daemon observed that the desktop shell isn't focused (user on a different Space / fullscreen app). Receivers surface OS-level notification cues. None means 'focus state unknown' (default — only stamped when explicitly observed unfocused).
    */
@@ -3028,7 +3092,7 @@ export interface StateUpdatePayload {
    */
   reasons?: string[];
   /**
-   * Cumulative stress-integral load (ms*s)
+   * Compatibility field; unavailable pending validation
    */
   stress_integral?: number | null;
   /**

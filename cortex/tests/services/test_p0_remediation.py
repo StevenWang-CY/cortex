@@ -67,6 +67,7 @@ class _FakeWSServer:
 
 
 class _FakeConfigIntervention:
+    execution_mode: str = "authorized"
     quiet_mode_minutes: int = 30
     enable_auto_distraction_block: bool = True
     auto_distraction_block_confidence: float = 0.85
@@ -78,7 +79,8 @@ class _FakeConfigIntervention:
 
 
 class _FakeConfig:
-    intervention = _FakeConfigIntervention()
+    def __init__(self) -> None:
+        self.intervention = _FakeConfigIntervention()
 
 
 class _MinimalDaemon:
@@ -134,6 +136,10 @@ class _MinimalDaemon:
         task = asyncio.create_task(coro, name=name)
         task.cancel()
         return task
+
+    @property
+    def workspace_mutation_allowed(self) -> bool:
+        return self.config.intervention.execution_mode != "suggest_only"
 
 
 def _hyper(confidence: float = 0.9) -> SimpleNamespace:

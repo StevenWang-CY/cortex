@@ -27,6 +27,7 @@ __all__ = [
     "validate_plan",
     "sanitize_plan_actions",
     "map_hide_targets",
+    "materialize_suggestion_only",
     "promote_biology_break",
     "prepare_plan",
 ]
@@ -51,6 +52,43 @@ _HIDE_TARGET_MAP: dict[str, AdapterCommand] = {
         action="fold_except_current",
     ),
 }
+
+
+def materialize_suggestion_only(plan: InterventionPlan) -> InterventionPlan:
+    """Return a presentation-only copy of a validated intervention plan.
+
+    The original plan is retained only as descriptive context. Every field
+    that can cause an automatic workspace effect is removed, and suggested
+    actions are marked non-executable for clients that render the legacy
+    action shape. This conversion happens after validation so it cannot hide
+    an invalid LLM response from observability.
+    """
+    proposal = plan.model_copy(deep=True)
+    original_level = proposal.level
+    original_consent = proposal.consent_level
+
+    proposal.hide_targets = []
+    proposal.ui_plan = proposal.ui_plan.model_copy(
+        update={
+            "show_overlay": True,
+            "fold_unrelated_code": False,
+            "intervention_type": "overlay_only",
+        },
+        deep=True,
+    )
+    proposal.level = "overlay_only"
+    proposal.consent_level = "suggest"
+    proposal.metadata = dict(proposal.metadata or {})
+    proposal.metadata.update({
+        "execution_mode": "suggest_only",
+        "original_intervention_level": original_level,
+        "original_consent_level": original_consent,
+        "workspace_mutation_allowed": False,
+    })
+    for action in proposal.suggested_actions:
+        action.metadata = dict(action.metadata or {})
+        action.metadata["execution_available"] = False
+    return proposal
 
 
 # ---------------------------------------------------------------------------

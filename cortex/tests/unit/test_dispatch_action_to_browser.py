@@ -17,6 +17,7 @@ client trying to forge it is rejected.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -50,10 +51,26 @@ class _RecordingWS:
 @pytest.fixture
 def daemon() -> CortexDaemon:
     d = CortexDaemon.__new__(CortexDaemon)
+    d.config = SimpleNamespace(
+        intervention=SimpleNamespace(execution_mode="authorized"),
+    )
     d._ws_server = _RecordingWS(recipients=1)
     d._active_intervention_id = "iv_active"
     d._recorder = type("_R", (), {"append": lambda *_a, **_k: None})()
     return d
+
+
+def test_missing_config_fails_closed() -> None:
+    d = CortexDaemon.__new__(CortexDaemon)
+    d._ws_server = _RecordingWS(recipients=1)
+    d._active_intervention_id = "iv_active"
+
+    sent = asyncio.run(
+        d.dispatch_action_to_browser("iv_active", _valid_action())
+    )
+
+    assert sent == 0
+    assert d._ws_server.calls == []
 
 
 def _valid_action() -> dict[str, Any]:

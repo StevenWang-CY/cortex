@@ -270,6 +270,7 @@ def test_trends_schedule_failure_emits_internal(
 
 class _BreakRecordingDaemon:
     def __init__(self) -> None:
+        self.workspace_mutation_allowed = True
         self.break_calls: list[dict[str, Any]] = []
         self.user_actions: list[dict[str, Any]] = []
 

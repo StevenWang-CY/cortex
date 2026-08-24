@@ -217,17 +217,19 @@ The script automatically:
 1. macOS will ask: *"Chrome/Edge wants to control Terminal. Allow?"* — click **Allow** (one-time)
 2. A Terminal window opens when the daemon starts — this is normal (Terminal provides camera access)
 
-### 8. Calibration (recommended)
+### 8. Calibration (experimental)
 
-Sit relaxed for 2 minutes while Cortex learns your personal baselines:
+The legacy runner can collect advisory baselines for research:
 
 ```bash
 cortex-calibrate --duration 120
 ```
 
-Measures resting heart rate, HRV, baseline blink rate, and neutral posture. Results are saved to `storage/baselines/`. Calibration improves state detection accuracy but is not required to start.
+It does not validate HRV/respiration, turn heuristic scores into calibrated
+probabilities, or enable physiology-triggered actions. Profiles are saved
+under `storage/baselines/`; read [Calibration](calibration.md) before use.
 
-For testing without a webcam:
+For UI/developer demonstrations only (never a measured user profile):
 ```bash
 cortex-calibrate --simulate
 ```
@@ -236,7 +238,7 @@ cortex-calibrate --simulate
 
 ```bash
 cd cortex/apps/vscode_extension
-npm install
+npm ci
 npm run compile
 code --install-extension cortex-somatic-0.1.0.vsix
 ```

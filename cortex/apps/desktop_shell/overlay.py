@@ -364,6 +364,7 @@ class OverlayWindow(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._intervention_id = ""
+        self._execution_mode = "suggest_only"
         # P0 §3.6: per-intervention checkbox cache. Keyed by
         # ``intervention_id``; value is the list of ``QCheckBox``
         # widgets currently in the steps_container. When a re-render
@@ -425,6 +426,11 @@ class OverlayWindow(QWidget):
             mac_native.apply_vibrancy(self, material="hudWindow")
         except Exception:
             pass
+
+    @property
+    def workspace_actions_enabled(self) -> bool:
+        """Whether the current proposal permits action-button dispatch."""
+        return self._execution_mode in ("authorized", "research_autonomous")
 
     def _build_ui(self) -> None:
         self._main_layout = QVBoxLayout(self)
@@ -894,6 +900,12 @@ class OverlayWindow(QWidget):
 
     def show_intervention(self, payload: dict) -> None:
         self._intervention_id = payload.get("intervention_id", "")
+        raw_execution_mode = payload.get("execution_mode", "suggest_only")
+        self._execution_mode = (
+            str(raw_execution_mode)
+            if raw_execution_mode in ("authorized", "research_autonomous")
+            else "suggest_only"
+        )
         # Fresh intervention — clear dismissed flag so this one can dismiss.
         self._dismissed = False
 
@@ -993,6 +1005,7 @@ class OverlayWindow(QWidget):
             self._render_actions(
                 payload.get("suggested_actions") or [],
                 connected_clients=payload.get("connected_clients") or [],
+                execution_mode=self._execution_mode,
             )
         except Exception:
             logger.debug("Action rendering failed", exc_info=True)
@@ -1523,6 +1536,7 @@ class OverlayWindow(QWidget):
         self,
         actions: list[dict],
         connected_clients: list[str] | None = None,
+        execution_mode: str = "suggest_only",
     ) -> None:
         """Re-render the suggested_action button list.
 
@@ -1552,6 +1566,9 @@ class OverlayWindow(QWidget):
         # action_type" lives implicitly here.
         has_browser_executor = bool(connected & {"chrome", "edge"})
         any_browser_bound = False
+        suggestion_only = execution_mode not in (
+            "authorized", "research_autonomous",
+        )
 
         for action in actions:
             if not isinstance(action, dict):
@@ -1587,7 +1604,12 @@ class OverlayWindow(QWidget):
             )
             _set_accessible_name(btn, label)
 
-            if is_browser and not has_browser_executor:
+            if suggestion_only:
+                btn.setEnabled(False)
+                btn.setToolTip(
+                    "Suggestion only — switch to an authorized mode to apply actions."
+                )
+            elif is_browser and not has_browser_executor:
                 btn.setEnabled(False)
                 any_browser_bound = True
             elif not is_browser and not is_native:
@@ -1613,7 +1635,12 @@ class OverlayWindow(QWidget):
             self._actions_container.addWidget(btn)
             self._action_buttons.append(btn)
 
-        if any_browser_bound and not has_browser_executor:
+        if suggestion_only:
+            self._actions_caption.setText(
+                "Suggestions only — Cortex will not change your workspace."
+            )
+            self._actions_caption.show()
+        elif any_browser_bound and not has_browser_executor:
             self._actions_caption.setText(
                 "Open Cortex in Chrome or Edge to enable these actions."
             )
@@ -1627,7 +1654,10 @@ class OverlayWindow(QWidget):
         the action dict. The host (controller / main) decides how to
         dispatch.
         """
-        if not self._intervention_id:
+        if (
+            not self._intervention_id
+            or self._execution_mode == "suggest_only"
+        ):
             return
         try:
             self.action_invoked.emit(self._intervention_id, dict(action))

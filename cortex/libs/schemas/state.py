@@ -107,7 +107,9 @@ class StateEstimate(BaseModel):
         0.0, ge=0.0, description="Seconds in current state"
     )
     stress_integral: float | None = Field(
-        None, ge=0.0, description="Cumulative stress load integral (ms*s)"
+        None,
+        ge=0.0,
+        description="Compatibility field; unavailable pending reference validation",
     )
     calibrated_probabilities: StateScores | None = Field(
         None,

@@ -11,7 +11,6 @@ import {
     classifyTabType as classifyBrowserTabType,
     classifyTabTypeWithGoal,
     groupSpecificTabs,
-    hideNonActiveTabs as hideTabsForIntervention,
     restoreAllTabs,
     restoreHiddenTabs as restoreTabsForIntervention,
     saveTabSession,
@@ -174,6 +173,24 @@ interface ActiveInterventionRecord {
 
 let activeIntervention: ActiveInterventionRecord | null = null;
 let quietMode = false;
+
+type ExecutionMode = "suggest_only" | "authorized" | "research_autonomous";
+let currentExecutionMode: ExecutionMode = "suggest_only";
+
+function parseExecutionMode(value: unknown): ExecutionMode {
+    return value === "authorized" || value === "research_autonomous"
+        ? value
+        : "suggest_only";
+}
+
+function workspaceMutationAllowed(): boolean {
+    return currentExecutionMode !== "suggest_only";
+}
+
+/** Test-only witness for the fail-closed client authority state. */
+export function _getExecutionMode(): ExecutionMode {
+    return currentExecutionMode;
+}
 
 // Dismissal cooldown: maps intervention_id → timestamp when dismissed
 // Prevents the same intervention from re-triggering within the cooldown window
@@ -1254,6 +1271,11 @@ async function handleMessage(raw: string): Promise<void> {
             const triggerPayload = msg.payload as
                 & InterventionTriggerPayload
                 & Record<string, unknown>;
+            // Missing and unknown modes fail closed. A legacy trigger can
+            // therefore never inherit authority from an earlier frame.
+            currentExecutionMode = parseExecutionMode(
+                triggerPayload.execution_mode,
+            );
             const iid = plan.intervention_id;
             const now = Date.now();
 
@@ -1352,6 +1374,12 @@ async function handleMessage(raw: string): Promise<void> {
             // and duration. The session is marked auto-armed so the
             // symmetric STOP_FOCUS_AUTO can tear down only when WE
             // armed (never tear down a manually-started session).
+            if (!workspaceMutationAllowed()) {
+                console.warn(
+                    "[cortex.bg] START_FOCUS_AUTO rejected in suggest-only mode",
+                );
+                break;
+            }
             const preset = (msg.payload.preset as string | undefined) || "developer";
             const customDomains = (msg.payload.custom_domains as string[] | undefined) || [];
             const durationMinutes = typeof msg.payload.duration_minutes === "number"
@@ -1417,6 +1445,9 @@ async function handleMessage(raw: string): Promise<void> {
 
         case "SETTINGS_SYNC":
             quietMode = Boolean(msg.payload.quiet_mode);
+            currentExecutionMode = parseExecutionMode(
+                msg.payload.execution_mode,
+            );
             // Sync cooldown values from daemon config, keeping defaults as fallbacks
             if (typeof msg.payload.intervention_dismiss_cooldown_ms === "number") {
                 interventionDismissCooldown = msg.payload.intervention_dismiss_cooldown_ms as number;
@@ -1434,6 +1465,12 @@ async function handleMessage(raw: string): Promise<void> {
             // initiated. The extension runs the action via the existing
             // ``executeAction`` helper and reports back the standard
             // ACTION_EXECUTE log so the daemon can record success.
+            if (!workspaceMutationAllowed()) {
+                console.warn(
+                    "[cortex.bg] ACTION_DISPATCH rejected in suggest-only mode",
+                );
+                break;
+            }
             const dispatchPayload = msg.payload;
             const interventionId = String(dispatchPayload.intervention_id || "");
             // P1-13: use isSuggestedAction runtime guard instead of a bare cast
@@ -1475,14 +1512,8 @@ async function handleMessage(raw: string): Promise<void> {
         }
 
         case "BREATHING_OVERLAY": {
-            // Route to active tab's content script
-            const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-            if (activeTab?.id) {
-                chrome.tabs.sendMessage(activeTab.id, {
-                    type: "SHOW_BREATHING_OVERLAY",
-                    payload: msg.payload,
-                });
-            }
+            // Disabled compatibility message: the producing algorithm has
+            // not passed reference validation, so do not present its claim.
             break;
         }
         case "ACTIVE_RECALL": {
@@ -1499,12 +1530,7 @@ async function handleMessage(raw: string): Promise<void> {
         }
 
         case "PRE_BREAK_WARNING": {
-            const headline = String(msg.payload.headline || "Biological load rising");
-            const summary = String(
-                msg.payload.situation_summary || "Consider a short reset before stress load crosses the break threshold.",
-            );
-            injectToast(headline, summary);
-            broadcastToPopup({ type: "PRE_BREAK_WARNING", payload: msg.payload });
+            // Disabled compatibility message; see BREATHING_OVERLAY above.
             break;
         }
 
@@ -1556,14 +1582,7 @@ async function handleMessage(raw: string): Promise<void> {
         }
 
         case "BREAK_RECOMMENDATION": {
-            // P0 §3.7: relay the soft "take a break" pulse to the popup.
-            // The popup renders a terracotta pill above the intervention
-            // card with a single CTA; the daemon already deduplicates
-            // per ``should_break`` False→True transition.
-            broadcastToPopup({
-                type: "BREAK_RECOMMENDATION",
-                payload: msg.payload,
-            });
+            // Fail closed even if an older or compromised daemon emits it.
             break;
         }
 
@@ -2280,24 +2299,12 @@ function injectLeetCodeCoachOverlay(kind: string, payload: Record<string, unknow
 async function handleIntervention(
     payload: Record<string, unknown>,
 ): Promise<void> {
-    // B.2: track what we actually applied so the ack at the bottom is
-    // truthful instead of theatrical. Each successful effect appends
-    // a descriptor; failures push to ``errors``.
-    const appliedActions: string[] = [];
-    const errors: string[] = [];
-    // P1-9: track whether we have hidden tabs so the recovery path can
-    // unconditionally restore them if an unhandled exception escapes
-    // after the hide step. This prevents the user from being stranded
-    // with a half-applied workspace.
-    let tabsWereHidden = false;
-
-    // Snapshot tabs so action executor can resolve tab_index → chrome tab ID
-    await snapshotTabsForIntervention();
-
     const uiPlan = payload.ui_plan as Record<string, boolean> | undefined;
 
-    // Directly inject overlay into the active tab via executeScript.
-    // This bypasses content script messaging entirely — most reliable approach.
+    // INTERVENTION_TRIGGER is a proposal event, never an apply command.
+    // Presentation is allowed; tab grouping/hiding and action execution require
+    // a separate exact authorization transaction. Legacy triggers therefore
+    // remain safe even when they contain hide_targets.
     if (uiPlan?.show_overlay || uiPlan?.dim_background) {
         try {
             const [tab] = await chrome.tabs.query({
@@ -2310,98 +2317,16 @@ async function handleIntervention(
                     func: injectOverlay,
                     args: [payload],
                 });
-                appliedActions.push("inject_overlay");
             }
         } catch (e) {
             if (DEBUG) console.error("Cortex: failed to inject overlay", e);
-            errors.push(`inject_overlay: ${(e as Error)?.message ?? String(e)}`);
         }
     }
 
-    // Hide tabs if simplified workspace — but protect goal-relevant and recently-active tabs
-    if (payload.hide_targets) {
-        const targets = payload.hide_targets as string[];
-        const interventionId = payload.intervention_id;
-        if (
-            targets.includes("browser_tabs_except_active") &&
-            typeof interventionId === "string"
-        ) {
-            // Build set of protected tab IDs: recently-active tabs + goal-relevant tabs
-            const protectedIds = new Set<number>();
-            const now = Date.now();
-            for (const [tabId, lastActive] of tabLastActivated) {
-                if (now - lastActive < RECENTLY_ACTIVE_PROTECTION_MS) {
-                    protectedIds.add(tabId);
-                }
-            }
-            // Also protect tabs that match goal keywords
-            if (focusSession?.goal) {
-                const goalKw = extractGoalKeywords(focusSession.goal);
-                if (goalKw.length > 0) {
-                    try {
-                        const allTabs = await chrome.tabs.query({});
-                        for (const tab of allTabs) {
-                            if (!tab.id) continue;
-                            const titleLower = (tab.title ?? "").toLowerCase();
-                            if (goalKw.some(kw => titleLower.includes(kw))) {
-                                protectedIds.add(tab.id);
-                            }
-                        }
-                    } catch (err) {
-                        // F12 (Phase-4 audit): query may transiently fail
-                        // mid-extension-reload; we degrade to "no extra
-                        // protection" which is safer than crashing.
-                        console.warn(
-                            "[cortex.bg] goal-keyword tab protection failed:",
-                            err,
-                        );
-                    }
-                }
-            }
-            try {
-                await hideTabsForIntervention(interventionId, protectedIds);
-                tabsWereHidden = true;
-                appliedActions.push("hide_tabs_except_active");
-            } catch (e) {
-                errors.push(`hide_tabs: ${(e as Error)?.message ?? String(e)}`);
-            }
-        }
-    }
-
-    try {
-        broadcastToPopup({
-            type: "INTERVENTION_TRIGGER",
-            payload,
-        });
-
-        // B.2: ack the apply so the daemon can replace the optimistic
-        // _OptimisticInterventionAdapter mutation tracking with real
-        // browser-side outcomes. Without this, InterventionOutcome.workspace_restored
-        // is theatrical for tab/overlay mutations (which are the majority).
-        const interventionId = payload.intervention_id;
-        if (typeof interventionId === "string") {
-            sendInterventionApplied(
-                interventionId,
-                "apply",
-                errors.length === 0,
-                appliedActions,
-                errors,
-            );
-        }
-    } catch (applyErr) {
-        // P1-9: if an unexpected error escapes after we already hid tabs,
-        // restore all tabs immediately so the user is not stranded with a
-        // half-applied workspace. Log the original error so it's visible.
-        if (DEBUG) {
-            console.error("[cortex.bg] P1-9: intervention apply threw after hideTabsForIntervention — restoring all tabs", applyErr);
-        }
-        if (tabsWereHidden) {
-            await restoreAllTabs().catch((restoreErr: unknown) => {
-                if (DEBUG) console.debug("[cortex.bg] P1-9: restoreAllTabs recovery also failed: %o", restoreErr);
-            });
-        }
-        throw applyErr;
-    }
+    broadcastToPopup({
+        type: "INTERVENTION_TRIGGER",
+        payload,
+    });
 }
 
 async function handleContextRequest(msg: WSMessage): Promise<void> {
@@ -4582,6 +4507,18 @@ chrome.runtime.onMessage.addListener(
                 break;
 
             case "EXECUTE_ACTION":
+                if (!workspaceMutationAllowed()) {
+                    sendResponse({
+                        action_id: String(
+                            (message.action as Partial<SuggestedAction> | undefined)
+                                ?.action_id ?? "",
+                        ),
+                        success: false,
+                        message: "Action unavailable in suggest-only mode",
+                        reversible: false,
+                    });
+                    break;
+                }
                 executeAction(message.action as SuggestedAction)
                     .then((result) => {
                         sendResponse(result);
@@ -4601,6 +4538,14 @@ chrome.runtime.onMessage.addListener(
                 return true; // async
 
             case "EXECUTE_ALL_RECOMMENDED":
+                if (!workspaceMutationAllowed()) {
+                    sendResponse({
+                        success: false,
+                        message: "Actions unavailable in suggest-only mode",
+                        results: [],
+                    });
+                    break;
+                }
                 executeAllRecommended(message.actions as SuggestedAction[])
                     .then((results) => {
                         sendResponse(results);

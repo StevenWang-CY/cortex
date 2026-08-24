@@ -56,25 +56,27 @@ class PhysioFeatures(BaseModel):
         ..., ge=0.0, le=1.0, description="Signal quality (SNR-based, 0-1)"
     )
     pulse_variability_proxy: float | None = Field(
-        None, ge=0.0, description="RMSSD of inter-beat intervals in ms"
+        None,
+        ge=0.0,
+        description="Compatibility field; unavailable in product pending validation",
     )
     hrv_sdnn: float | None = Field(
-        None, ge=0.0, description="SDNN of inter-beat intervals in ms"
+        None, ge=0.0, description="Compatibility field; unavailable in product"
     )
     hrv_pnn50: float | None = Field(
-        None, ge=0.0, le=1.0, description="Fraction of adjacent IBI deltas > 50ms"
+        None, ge=0.0, le=1.0, description="Compatibility field; unavailable in product"
     )
     hrv_sd1: float | None = Field(
-        None, ge=0.0, description="Poincare SD1 in ms"
+        None, ge=0.0, description="Compatibility field; unavailable in product"
     )
     hrv_sd2: float | None = Field(
-        None, ge=0.0, description="Poincare SD2 in ms"
+        None, ge=0.0, description="Compatibility field; unavailable in product"
     )
     hrv_lf_hf_ratio: float | None = Field(
-        None, ge=0.0, description="LF/HF ratio from Lomb-Scargle PSD"
+        None, ge=0.0, description="Compatibility field; unavailable in product"
     )
     hrv_sample_entropy: float | None = Field(
-        None, ge=0.0, description="Sample entropy of IBI sequence"
+        None, ge=0.0, description="Compatibility field; unavailable in product"
     )
     physio_sqi: float | None = Field(
         None, ge=0.0, le=1.0, description="Composite physiological signal-quality index"
@@ -87,7 +89,10 @@ class PhysioFeatures(BaseModel):
         None, description="Heart rate change over last 5 seconds (BPM/5s)"
     )
     respiration_rate_bpm: float | None = Field(
-        None, ge=0.0, le=60.0, description="Respiration rate in breaths per minute"
+        None,
+        ge=0.0,
+        le=60.0,
+        description="Compatibility field; unavailable in product pending validation",
     )
     valid: bool = Field(..., description="Whether physiological features are valid")
 
@@ -226,10 +231,10 @@ class FeatureVector(BaseModel):
         None, ge=30.0, le=220.0, description="Instantaneous heart rate (BPM)"
     )
     hrv_rmssd: float | None = Field(
-        None, ge=0.0, description="HRV proxy - RMSSD in ms"
+        None, ge=0.0, description="Compatibility field; unavailable in product"
     )
     hrv_sdnn: float | None = Field(
-        None, ge=0.0, description="SDNN in ms"
+        None, ge=0.0, description="Compatibility field; unavailable in product"
     )
     hr_delta: float | None = Field(
         None, description="Heart rate gradient over 5s"
@@ -279,7 +284,10 @@ class FeatureVector(BaseModel):
         None, ge=0.0, description="Upward reread scroll bursts per minute"
     )
     respiration_rate: float | None = Field(
-        None, ge=0.0, le=60.0, description="Respiration rate (breaths/min)"
+        None,
+        ge=0.0,
+        le=60.0,
+        description="Compatibility field; unavailable in product",
     )
     thrashing_score: float = Field(
         0.0, ge=0.0, le=1.0, description="Focus thrashing score from transition graph"

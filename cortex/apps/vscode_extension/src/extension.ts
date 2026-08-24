@@ -17,6 +17,23 @@ let contextProvider: ContextProvider | undefined;
 let foldController: FoldController | undefined;
 let panelProvider: CortexPanelProvider | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
+type ExecutionMode = "suggest_only" | "authorized" | "research_autonomous";
+let currentExecutionMode: ExecutionMode = "suggest_only";
+
+function handleLegacyBreakRecommendation(_payload: unknown): void {
+    // Decode-only compatibility sink. The underlying HRV/stress algorithm
+    // has not passed reference validation, so product UI must stay silent.
+}
+
+function parseExecutionMode(value: unknown): ExecutionMode {
+    return value === "authorized" || value === "research_autonomous"
+        ? value
+        : "suggest_only";
+}
+
+function workspaceMutationAllowed(): boolean {
+    return currentExecutionMode !== "suggest_only";
+}
 // Phase-3 P1-N4 / Audit-1.2 F10: cached pulse timeout cleared on
 // deactivate so the closure doesn't outlive the disposed status bar.
 let osNotifPulseTimeout: ReturnType<typeof setTimeout> | undefined;
@@ -129,6 +146,7 @@ export function activate(context: vscode.ExtensionContext): void {
     });
 
     wsClient.onSettingsSync((payload) => {
+        currentExecutionMode = parseExecutionMode(payload.execution_mode);
         const quietMode = Boolean(payload.quiet_mode);
         if (statusBarItem && quietMode) {
             statusBarItem.tooltip = "Cortex — Quiet mode enabled";
@@ -234,57 +252,10 @@ export function activate(context: vscode.ExtensionContext): void {
         }
     });
 
-    // --- P0 §3.7: BREAK_RECOMMENDATION → status bar pulse + notification ---
+    // Compatibility-only: reject unsupported HRV/stress-derived claims.
     wsClient.onMessage((msg) => {
         if (msg.type === 'BREAK_RECOMMENDATION') {
-            const payload = msg.payload as Record<string, unknown> | undefined;
-            const reason = (payload?.reason as string | undefined) ?? 'stress_integral_crossed_threshold';
-            const urgency = (payload?.urgency as string | undefined) ?? 'medium';
-            const durationS = Number(payload?.duration_seconds ?? 240);
-            const breathingPattern = (() => {
-                const raw = payload?.breathing_pattern;
-                return raw === '4-7-8' || raw === 'coherent' || raw === 'box'
-                    ? (raw as 'box' | '4-7-8' | 'coherent')
-                    : 'box';
-            })();
-            const mins = Math.max(1, Math.round(durationS / 60));
-            try {
-                if (statusBarItem) {
-                    statusBarItem.text = `$(pulse) Cortex — take ${mins} min`;
-                    statusBarItem.tooltip = `Biology break suggested (${urgency} urgency)`;
-                    setTimeout(() => {
-                        if (statusBarItem) {
-                            statusBarItem.text = '$(pulse) Cortex';
-                            statusBarItem.tooltip = 'Cortex active';
-                        }
-                    }, 60 * 1000);
-                }
-            } catch {/* statusBar may be torn down during reload */ }
-            vscode.window.showInformationMessage(
-                `Your HRV has been suppressed — take a ${mins}-minute break?`,
-                `Take ${mins} min`,
-                'Snooze',
-            ).then((choice) => {
-                if (choice !== `Take ${mins} min`) return;
-                // P0 §3.7 audit fix: instead of fabricating a synthetic
-                // intervention_id and posting USER_ACTION (which the
-                // daemon's helpfulness tracker cannot correlate back to
-                // any real intervention), dispatch a proper
-                // ``take_biology_break`` ACTION_EXECUTE with the real
-                // recommendation's metadata. The daemon routes it
-                // through the BiologyBreakController.
-                const interventionId = (payload?.intervention_id as string | undefined)
-                    || `break_${Date.now()}`;
-                wsClient?.sendBiologyBreakRequest(interventionId, {
-                    duration_seconds: durationS,
-                    breathing_pattern: breathingPattern,
-                    audio_cue: true,
-                    reason,
-                });
-            });
-            if (panelProvider) {
-                panelProvider.applyBreakRecommendation(payload || {});
-            }
+            handleLegacyBreakRecommendation(msg.payload);
         }
     });
 
@@ -324,6 +295,19 @@ export function activate(context: vscode.ExtensionContext): void {
         const target = String(payload.target || '').trim();
         const actionId = (payload.action_id as string | undefined) || '';
         const interventionId = (payload.intervention_id as string | undefined) || '';
+
+        if (!workspaceMutationAllowed()) {
+            try {
+                wsClient?.sendInterventionApplied(
+                    interventionId,
+                    'execute_action',
+                    false,
+                    [],
+                    [`${actionType}: action unavailable in suggest-only mode`],
+                );
+            } catch { /* ws may not be ready */ }
+            return;
+        }
 
         // Parse "file_path:line"; the line is optional and falls back to 1.
         const lastColon = target.lastIndexOf(':');
@@ -385,6 +369,10 @@ export function activate(context: vscode.ExtensionContext): void {
     // changes; the prior implementation depended on onMessage being
     // bound before the first daemon-pushed throttle frame.
     wsClient.onCopilotThrottle((payload) => {
+        if (!workspaceMutationAllowed()) {
+            _logDebug("COPILOT_THROTTLE rejected in suggest-only mode");
+            return;
+        }
         const action = payload?.action;
         // P2 (audit Phase 4d, Task D): gate the dev-time tracer lines
         // behind ``cortex.debug``. Defaults to off so a production
@@ -556,51 +544,13 @@ function updateStatusBar(payload: Record<string, unknown>): void {
  * Handle an INTERVENTION_TRIGGER from the daemon.
  */
 function handleIntervention(payload: Record<string, unknown>): void {
-    const uiPlan = payload.ui_plan as Record<string, unknown> | undefined;
-
-    // D.6: respect the LLM-supplied max_visible_lines constraint instead
-    // of hard-coding ±20. The daemon's SimplificationConstraints flow
-    // into UIPlan.max_visible_lines (default 40 = ±20 either side of
-    // cursor) — see libs/schemas/intervention.py.
-    const rawMaxVisible =
-        (uiPlan?.max_visible_lines as number | undefined) ??
-        ((payload.constraints as Record<string, unknown> | undefined)
-            ?.max_visible_lines as number | undefined);
-    const halfWindow = Math.max(
-        5,
-        Math.floor(((typeof rawMaxVisible === "number" ? rawMaxVisible : 40)) / 2),
-    );
-
-    // Apply fold if requested
-    if (uiPlan?.fold_unrelated_code && foldController) {
-        const editor = vscode.window.activeTextEditor;
-        if (editor) {
-            const cursorLine = editor.selection.active.line;
-            foldController.foldExcept(
-                Math.max(0, cursorLine - halfWindow),
-                cursorLine + halfWindow,
-            );
-        }
-    }
+    // A trigger is a proposal, never an apply command. Missing/unknown
+    // execution modes fail closed and no editor-folding API is reachable
+    // from this handler, including for legacy payloads that request it.
+    currentExecutionMode = parseExecutionMode(payload.execution_mode);
 
     // Show panel with intervention content
     panelProvider?.showIntervention(payload);
-
-    // D.4 / B.2: ack the apply so the daemon can replace optimistic
-    // mutation tracking with real client outcome. We don't have detailed
-    // success/failure per action here; report overall success and the
-    // current state of the fold controller.
-    try {
-        wsClient?.sendInterventionApplied(
-            payload.intervention_id as string,
-            "apply",
-            true,
-            uiPlan?.fold_unrelated_code ? ["foldExcept"] : [],
-            [],
-        );
-    } catch {
-        // wsClient may not be ready in tests — never crash the handler
-    }
 
     // Show notification for overlay_only
     const level = payload.level as string | undefined;
@@ -621,4 +571,23 @@ function handleIntervention(payload: Record<string, unknown>): void {
             }
         });
     }
+}
+
+/** Test seam proving that proposal handling cannot reach the fold adapter. */
+export function _setFoldControllerForTest(
+    controller: Pick<FoldController, "foldExcept"> | undefined,
+): void {
+    foldController = controller as FoldController | undefined;
+}
+
+/** Test seam for the non-mutating INTERVENTION_TRIGGER handler. */
+export function _handleInterventionForTest(
+    payload: Record<string, unknown>,
+): void {
+    handleIntervention(payload);
+}
+
+/** Test seam for the compatibility sink for unvalidated physiology claims. */
+export function _handleLegacyBreakRecommendationForTest(payload: unknown): void {
+    handleLegacyBreakRecommendation(payload);
 }

@@ -183,6 +183,80 @@ jobs:
       - name: Verify design tokens are in sync
         run: python -m cortex.scripts.sync_design_tokens --check
 
+  version-consistency:
+    name: version-consistency (pyproject source gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Verify Python, API, extension, lock, and build versions
+        run: python -m cortex.scripts.sync_versions --check
+
+  dependency-audit:
+    name: dependency-audit (reviewed-path policy + artifacts)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: "pnpm"
+          cache-dependency-path: cortex/apps/browser_extension/pnpm-lock.yaml
+      - name: Install frozen dependency graphs
+        run: |
+          python -m pip install --upgrade pip setuptools
+          pip install --upgrade -e "./cortex[dev]"
+          pnpm --dir cortex/apps/browser_extension install --frozen-lockfile
+          npm --prefix cortex/apps/vscode_extension ci
+      - name: Generate machine-readable audit reports
+        run: |
+          mkdir -p audit-results
+          pip-audit --format json --output audit-results/python.json || true
+          pnpm --dir cortex/apps/browser_extension audit --json > audit-results/browser.json || true
+          npm --prefix cortex/apps/vscode_extension audit --json > audit-results/vscode.json || true
+      - name: Enforce vulnerability and exception policy
+        run: |
+          status=0
+          python cortex/scripts/verify_dependency_audit.py \
+            --ecosystem pip \
+            --report audit-results/python.json \
+            --summary-out audit-results/python-summary.json || status=1
+          python cortex/scripts/verify_dependency_audit.py \
+            --ecosystem pnpm \
+            --report audit-results/browser.json \
+            --exceptions cortex/security/node-audit-exceptions.json \
+            --summary-out audit-results/browser-summary.json || status=1
+          python cortex/scripts/verify_dependency_audit.py \
+            --ecosystem npm \
+            --report audit-results/vscode.json \
+            --summary-out audit-results/vscode-summary.json || status=1
+          exit "${status}"
+      - name: Upload raw and policy audit artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dependency-audit-reports
+          path: audit-results/*.json
+          if-no-files-found: error
+          retention-days: 30
+
   python:
     name: python (pytest + ruff + mypy)
     # Cortex is macOS-only — many of the PySide6 / pyobjc / AVFoundation
@@ -294,6 +368,14 @@ jobs:
           node-version: "22"
           cache: "pnpm"
           cache-dependency-path: cortex/apps/browser_extension/pnpm-lock.yaml
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install native-contract runtime
+        # Vitest launches the real Python native host and validates its
+        # binary response with the generated TypeScript decoder. The host's
+        # schema layer requires Pydantic but not the full desktop stack.
+        run: python -m pip install "pydantic>=2.6,<3"
       - name: Install
         run: pnpm install --frozen-lockfile
       - name: Typecheck
@@ -307,7 +389,7 @@ jobs:
     # ``vsce package`` at release time with no PR-level signal. This job
     # compiles the extension exactly as ``vscode:prepublish`` does so
     # vsix-breaking type errors surface on every PR.
-    name: extension-vscode (tsc compile)
+    name: extension-vscode (compile + jest)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -316,10 +398,14 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
           cache-dependency-path: cortex/apps/vscode_extension/package-lock.json
       - name: Install
         run: npm ci
       - name: Compile (tsc -p ./)
         run: npm run compile
+      - name: Test (Jest)
+        run: npm test
+      - name: Package locked VSIX
+        run: npm exec -- vsce package --out "${{ runner.temp }}/cortex-somatic.vsix"

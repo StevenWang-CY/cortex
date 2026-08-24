@@ -564,7 +564,7 @@ class TestRespirationGatedOnValidity:
     def test_good_sqi_passes_respiration_through(self) -> None:
         from cortex.services.physio_engine.respiration import RespirationEstimate
 
-        estimator = PulseEstimator(fs=30.0)
+        estimator = PulseEstimator(fs=30.0, publish_experimental_metrics=True)
         est = PulseEstimate(
             hr_bpm=72.0,
             hr_confidence=0.9,
@@ -607,7 +607,7 @@ class TestApneaThreadingFromPulseEstimator:
         return (cardiac * resp_envelope).astype(np.float64)
 
     def _make_estimator(self) -> PulseEstimator:
-        est = PulseEstimator(fs=30.0)
+        est = PulseEstimator(fs=30.0, publish_experimental_metrics=True)
         # Raise the apnea threshold into the filter's detectable band so a
         # real ~15 bpm rate counts as "low"; short sustain for a fast test.
         est._resp_estimator._apnea_resp_threshold = 18.0
@@ -668,7 +668,7 @@ class TestMotionRespirationFusion:
 
     def test_motion_proxy_feeds_fusion(self) -> None:
         fs = 30.0
-        estimator = PulseEstimator(fs=fs)
+        estimator = PulseEstimator(fs=fs, publish_experimental_metrics=True)
 
         # Feed a full window of head vertical positions oscillating at the
         # respiratory rate (0.25 Hz = 15 breaths/min).
@@ -694,6 +694,38 @@ class TestMotionRespirationFusion:
         estimator = PulseEstimator(fs=30.0)
         # Without any head-vertical samples the proxy is None (BVP-only path).
         assert estimator._motion_resp_signal() is None
+
+
+def test_product_estimator_never_publishes_unvalidated_metrics() -> None:
+    """The default daemon contract exposes HR only, never HRV/respiration."""
+
+    estimator = PulseEstimator(fs=30.0)
+    estimator._latest_estimate = PulseEstimate(
+        hr_bpm=72.0,
+        hr_confidence=0.9,
+        rmssd_ms=40.0,
+        sdnn_ms=50.0,
+        pnn50=0.2,
+        sd1_ms=20.0,
+        sd2_ms=30.0,
+        lf_hf_ratio=1.2,
+        sample_entropy=1.1,
+        ibi_count=40,
+        signal_quality=0.9,
+        physio_sqi=0.8,
+        sqi_components={"nsqi": 0.9, "snr_db": 8.0},
+    )
+    features = estimator.get_features(timestamp=60.0)
+    assert features.valid is True
+    assert features.pulse_bpm == 72.0
+    assert features.pulse_variability_proxy is None
+    assert features.hrv_sdnn is None
+    assert features.hrv_pnn50 is None
+    assert features.hrv_sd1 is None
+    assert features.hrv_sd2 is None
+    assert features.hrv_lf_hf_ratio is None
+    assert features.hrv_sample_entropy is None
+    assert features.respiration_rate_bpm is None
 
 
 class TestParabolicInterpolation:

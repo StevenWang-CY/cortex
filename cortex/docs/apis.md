@@ -6,7 +6,10 @@ Cortex exposes a REST API on `http://127.0.0.1:9472` and a WebSocket server on `
 
 Base URL: `http://127.0.0.1:9472`
 
-All request and response bodies are JSON. Timestamps use monotonic seconds (`time.monotonic()`).
+All request and response bodies are JSON. Legacy v1 payloads contain a bare
+`timestamp` whose clock varies by endpoint and must not be compared across
+processes. New v2 payloads use explicit `observed_at_unix_ms`,
+`observed_at_mono_ns`, and `boot_id`; see the compatibility notes below.
 
 ### Authentication
 
@@ -38,7 +41,9 @@ Health check for all registered services. Capability token is optional.
 
 #### `GET /status/current`
 
-Current cognitive state, confidence, and signal quality.
+Current legacy support label, heuristic score, and signal quality. The
+`confidence` name is retained for wire compatibility; it is not a calibrated
+probability.
 
 **Response:**
 ```json
@@ -149,7 +154,9 @@ All feature endpoints return `{ "status": "ok", "timestamp": <float> }`.
 
 #### `POST /state/infer`
 
-Compute cognitive state from a fused feature vector.
+Compute the legacy heuristic support label from a fused feature vector.
+Compatibility inputs such as `hrv_norm` are accepted but product runtime
+does not populate unsupported HRV/respiration evidence.
 
 **Request body:**
 ```json
@@ -190,7 +197,7 @@ Compute cognitive state from a fused feature vector.
       "hyper": 0.08,
       "recovery": 0.0
     },
-    "reasons": ["Good HRV", "Normal blink rate", "Steady input"],
+    "reasons": ["Stable visible-eye activity", "Steady input"],
     "signal_quality": { "physio": 0.9, "kinematics": 0.85, "telemetry": 0.95, "overall": 0.9 },
     "timestamp": 1000.5,
     "dwell_seconds": 45.2
@@ -299,7 +306,11 @@ Request an intervention plan from the LLM engine.
 
 #### `POST /intervention/apply`
 
-Apply an intervention plan to the workspace.
+Submit an intervention plan to the authority boundary. In the shipping
+`suggest_only` mode the route validates and sanitizes the plan, broadcasts a
+presentation-only proposal, performs no adapter call or snapshot, and returns
+`applied: false`. Legacy `authorized` behavior remains experimental until
+manifest-bound authorization and durable action receipts are complete.
 
 **Request body:**
 ```json
@@ -308,21 +319,13 @@ Apply an intervention plan to the workspace.
 }
 ```
 
-**Response:**
+**Safe-default response:**
 ```json
 {
-  "applied": true,
-  "snapshot": {
-    "intervention_id": "int_a1b2c3d4e5f6",
-    "timestamp": 1002.2,
-    "fold_states": [],
-    "editor_visible_range": [45, 95],
-    "tab_visibility": [],
-    "active_tab_id": null,
-    "overlay_present": false,
-    "terminal_scroll_position": null
-  },
-  "timestamp": 1002.3
+  "applied": false,
+  "snapshot": null,
+  "confirmation": null,
+  "correlation_id": "..."
 }
 ```
 
@@ -365,18 +368,19 @@ Valid `user_action` values: `dismissed`, `engaged`, `snoozed`, `timed_out`, `nat
 
 #### `GET /api/stress-integral`
 
-Current cumulative standardized HRV-deficit integral (the "biological
-pomodoro"). When ``current_value / threshold ≥ 1`` the daemon recommends
-a break.
+Compatibility endpoint for the removed physiology-triggered break feature.
+It is side-effect free and always reports unavailable.
 
 **Response:**
 ```json
 {
-  "current_value": 12.5,
-  "threshold": 30.0,
+  "status": "unavailable",
+  "unavailable_reason": "validation_required",
+  "current_value": 0.0,
+  "threshold": 0.0,
   "should_break": false,
   "sensitivity_multiplier": 1.0,
-  "timestamp": 1000.5
+  "timestamp": 1787592000.5
 }
 ```
 
@@ -505,7 +509,14 @@ The full list below is the canonical message-type catalog (Python source of trut
 
 **Inbound (client → daemon):** `AUTH`, `IDENTIFY`, `USER_ACTION`, `ACTION_EXECUTE`, `USER_RATING`, `CONTEXT_RESPONSE`, `SETTINGS_SYNC`, `ACTIVITY_SYNC`, `TAB_RELEVANCE_FEEDBACK`, `LEETCODE_CONTEXT_UPDATE`, `INTERVENTION_APPLIED`, `SHUTDOWN`.
 
-**Outbound (daemon → client):** `AUTH_OK`, `STATE_UPDATE`, `INTERVENTION_TRIGGER`, `INTERVENTION_RESTORE`, `CONTEXT_REQUEST`, `ACTIVE_RECALL`, `BREATHING_OVERLAY`, `PRE_BREAK_WARNING`, `MORNING_BRIEFING`, `COPILOT_THROTTLE`, `AMBIENT_STATE_UPDATE`.
+**Outbound (daemon → client):** the generated catalog includes
+`AUTH_OK`, `STATE_UPDATE`, `INTERVENTION_TRIGGER`,
+`INTERVENTION_RESTORE`, `CONTEXT_REQUEST`, `ACTIVE_RECALL`,
+`BREATHING_OVERLAY`, `PRE_BREAK_WARNING`, `BREAK_RECOMMENDATION`,
+`MORNING_BRIEFING`, `COPILOT_THROTTLE`, and
+`AMBIENT_STATE_UPDATE`. The three break/respiration messages are
+decode-only compatibility entries and product clients intentionally ignore
+them.
 
 **LeetCode cues (daemon → chrome, `target_client_types=["chrome"]`):** `LEETCODE_SHOW_SCRATCHPAD`, `LEETCODE_SHOW_PATTERN_LADDER`, `LEETCODE_SHOW_LOCKOUT`, `LEETCODE_SHOW_CONSOLIDATION`, `LEETCODE_SHOW_SUBMISSION_GATE`, `LEETCODE_SHOW_SOLUTION_FRICTION`, `LEETCODE_SHOW_SESSION_BRIEFING`, `LEETCODE_LOCK_EDITOR`, `LEETCODE_INTERCEPT_SUBMIT`, `LEETCODE_GATE_SOLUTIONS`, `LEETCODE_AI_RESTATEMENT_CHECK`, `LEETCODE_AI_COMPREHENSION_CHECK`, `LEETCODE_AI_HYPOTHESIS_CHECK`, `LEETCODE_AI_STUCK_ANALYSIS`, `LEETCODE_AI_SESSION_BRIEFING`.
 
@@ -534,7 +545,7 @@ Broadcast every 500ms to all connected clients.
       "overall": 0.9
     },
     "dwell_seconds": 45.2,
-    "reasons": ["Good HRV", "Normal blink rate"]
+    "reasons": ["Stable visible-eye activity", "Steady input"]
   },
   "timestamp": 12345.6,
   "sequence": 42
@@ -543,7 +554,8 @@ Broadcast every 500ms to all connected clients.
 
 #### `INTERVENTION_TRIGGER` (server → client)
 
-Sent when the intervention engine triggers an intervention.
+Legacy name for a presentation-only proposal in `suggest_only` mode.
+Receiving this message is never authorization to mutate a workspace.
 
 ```json
 {
@@ -559,12 +571,12 @@ Sent when the intervention engine triggers an intervention.
       "Check the expected type",
       "Update the value"
     ],
-    "hide_targets": ["sidebar", "terminal"],
+    "hide_targets": [],
     "ui_plan": {
-      "dim_background": true,
+      "dim_background": false,
       "show_overlay": true,
-      "fold_unrelated_code": true,
-      "intervention_type": "simplified_workspace"
+      "fold_unrelated_code": false,
+      "intervention_type": "overlay_only"
     },
     "tone": "direct"
   },
@@ -618,7 +630,8 @@ Sent by clients to update settings, or by the server to broadcast settings chang
   "payload": {
     "consent_levels": { "close_tabs": 3, "fold_code": 4 },
     "quiet_mode": false,
-    "max_autonomy": "REVERSIBLE_ACT"
+    "max_autonomy": "SUGGEST",
+    "execution_mode": "suggest_only"
   },
   "timestamp": 12350.0,
   "sequence": 2

@@ -875,6 +875,16 @@ class CortexApp:
         """
         if self._bridge is None:
             return
+        if (
+            self._overlay is None
+            or not self._overlay.workspace_actions_enabled
+        ):
+            logger.info(
+                "Desktop WS action ignored in suggest-only mode "
+                "(intervention_id=%s)",
+                intervention_id,
+            )
+            return
         action_type = str(action.get("action_type") or "")
         executed_natively = False
         if action_type == "copy_to_clipboard":

@@ -340,6 +340,15 @@ class StateConfig(BaseModel):
 class InterventionConfig(BaseModel):
     """Intervention engine configuration."""
 
+    # Workspace authority is explicit and defaults to presentation only.
+    # Existing settings files that predate this field therefore migrate to
+    # the least-authoritative mode instead of silently preserving autonomous
+    # behaviour. ``authorized`` is reserved for exact, materialized user
+    # authorizations; ``research_autonomous`` requires separate study consent.
+    execution_mode: Literal[
+        "suggest_only", "authorized", "research_autonomous",
+    ] = "suggest_only"
+
     overlay_threshold: float = 0.70
     simplified_threshold: float = 0.85
     guided_threshold: float = 0.95
@@ -410,14 +419,17 @@ class InterventionConfig(BaseModel):
     # avoids any early all-in on a not-yet-trained reward signal.
     enable_hypo_recovery_interventions: bool = False
 
-    # P0 §3.7: biology-driven break feature flag. When True, a
-    # ``StressIntegralTracker.should_break`` False→True transition
-    # emits ``BREAK_RECOMMENDATION`` and the planner promotes
-    # ``take_biology_break`` to the primary action. Disabled in
-    # contexts where the biology-break overlay would interfere
-    # (e.g. CI smoke tests). Maps to env var
-    # ``CORTEX_INTERVENTION__ENABLE_BIOLOGY_BREAK``.
-    enable_biology_break: bool = True
+    # Decode-only compatibility field. The HRV-derived stress algorithm has
+    # not met reference-sensor validation gates, so even a legacy ``true``
+    # value is coerced to False and cannot restore the retired trigger path.
+    enable_biology_break: bool = False
+
+    @field_validator("enable_biology_break", mode="before")
+    @classmethod
+    def _disable_unvalidated_biology_break(cls, _value: object) -> bool:
+        """Contain the unsupported HRV/stress action until validation exists."""
+
+        return False
 
     # P0 §3.7 risk mitigation (spec line 643): the spec calls for
     # audio to default off when ``mic_active`` was detected in the
@@ -786,7 +798,6 @@ def load_yaml_defaults() -> dict[str, Any]:
 # key would never know. We surface a one-line WARN at config load to
 # bound mis-configuration surprise.
 _REQUIRED_FEATURE_TOGGLES: tuple[str, ...] = (
-    "CORTEX_INTERVENTION__ENABLE_BIOLOGY_BREAK",
     "CORTEX_INTERVENTION__ENABLE_AUTO_DISTRACTION_BLOCK",
     "CORTEX_INTERVENTION__ENABLE_OS_NOTIFICATIONS",
 )

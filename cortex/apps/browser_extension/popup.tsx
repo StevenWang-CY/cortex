@@ -15,7 +15,6 @@ import { getLastRuntimeError } from "./lib/chrome-runtime";
 import { DAEMON_HTTP_URL } from "./config";
 import { getAuthToken } from "./lib/auth";
 import type {
-    BreakRecommendation as BreakRecommendationSchema,
     CausalSignal as CausalSignalSchema,
     WhyDetail as WhyDetailSchema,
 } from "./types/generated/cortex_schemas";
@@ -214,6 +213,14 @@ interface DailyStats {
     sessions: number;
     distractionsBlocked: number;
     longestStreakMin: number;
+}
+
+type ExecutionMode = "suggest_only" | "authorized" | "research_autonomous";
+
+function parseExecutionMode(value: unknown): ExecutionMode {
+    return value === "authorized" || value === "research_autonomous"
+        ? value
+        : "suggest_only";
 }
 
 interface MorningBriefing {
@@ -702,6 +709,9 @@ function CortexPopup(): React.ReactElement {
     const [tabRecs, setTabRecs] = useState<TabRecommendations | null>(null);
     const [errAnalysis, setErrAnalysis] = useState<Record<string, string> | null>(null);
     const [interventionId, setInterventionId] = useState<string>("");
+    const [executionMode, setExecutionMode] = useState<ExecutionMode>(
+        "suggest_only",
+    );
     const [applied, setApplied] = useState(false);
     // P1-FC-INTERVENTION-FAILED: when the daemon reports that an
     // intervention's mutations ALL failed (workspace NOT changed), the
@@ -791,17 +801,6 @@ function CortexPopup(): React.ReactElement {
     // a blank panel when the daemon returns ``error="not_found"`` or
     // similar. Reset on each new INTERVENTION_TRIGGER.
     const [whyError, setWhyError] = useState<string | null>(null);
-    // P0 §3.7: BREAK_RECOMMENDATION pulse from the daemon. When set we
-    // render a soft pill above the intervention card with a one-click
-    // "Take a 4-minute break" CTA.
-    const [breakRec, setBreakRec] = useState<{
-        reason: string;
-        urgency: "low" | "medium" | "high";
-        stress_load: number;
-        threshold: number;
-        duration_seconds: number;
-        breathing_pattern: "box" | "4-7-8" | "coherent";
-    } | null>(null);
     // P0 §3.3: end-of-session recap card. ``recap`` is the cached
     // SessionReport; ``recapTimestamp`` is when the background script
     // wrote it. ``historyStatus`` carries the response from
@@ -1038,6 +1037,7 @@ function CortexPopup(): React.ReactElement {
             setFocus(resp.focusSession);
             if (resp.intervention) {
                 const p = resp.intervention;
+                setExecutionMode(parseExecutionMode(p.execution_mode));
                 const rawActions = (p.suggested_actions as Record<string, unknown>[]) || [];
                 const recs = (p.tab_recommendations as TabRecommendations | undefined) ?? null;
                 setActiveActions(synthesizeActions(rawActions, recs));
@@ -1139,6 +1139,7 @@ function CortexPopup(): React.ReactElement {
                 break;
             case "INTERVENTION_TRIGGER": {
                 const p = msg.payload as Record<string, unknown>;
+                setExecutionMode(parseExecutionMode(p.execution_mode));
                 const rawActions = (p.suggested_actions as Record<string, unknown>[]) || [];
                 const recs = (p.tab_recommendations as TabRecommendations | undefined) ?? null;
                 setActiveActions(synthesizeActions(rawActions, recs));
@@ -1219,13 +1220,6 @@ function CortexPopup(): React.ReactElement {
                 setWhyOpen(false);
                 setWhyError(null);
                 setApplied(false);
-                // P0 §3.7 audit fix: when the underlying intervention
-                // ends (dismiss / engage / restore), the standalone
-                // BREAK_RECOMMENDATION pill must clear too. Without
-                // this, a stale pill from the prior intervention
-                // remained on screen and clicking its CTA dispatched
-                // EXECUTE_ACTION with a dangling intervention_id.
-                setBreakRec(null);
                 setInterventionError(null);
                 setInterventionPrompt(null);
                 break;
@@ -1262,26 +1256,8 @@ function CortexPopup(): React.ReactElement {
                 break;
             }
             case "BREAK_RECOMMENDATION": {
-                // P0 §3.7: BREAK_RECOMMENDATION pulse relayed from
-                // background.ts. Typed against the generated
-                // ``BreakRecommendationSchema`` so a future schema-rename
-                // produces a TS error instead of a silent fallthrough.
-                const p = msg.payload as Partial<BreakRecommendationSchema> & Record<string, unknown>;
-                setBreakRec({
-                    reason: String(p.reason ?? "stress_integral_crossed_threshold"),
-                    urgency:
-                        p.urgency === "high" || p.urgency === "low"
-                            ? (p.urgency as "low" | "high")
-                            : "medium",
-                    stress_load: Number(p.stress_load ?? 0),
-                    threshold: Number(p.threshold ?? 0),
-                    duration_seconds: Number(p.duration_seconds ?? 240),
-                    breathing_pattern:
-                        p.breathing_pattern === "4-7-8" ||
-                        p.breathing_pattern === "coherent"
-                            ? (p.breathing_pattern as "4-7-8" | "coherent")
-                            : "box",
-                });
+                // Compatibility-only message. Never render an unsupported
+                // HRV/stress claim, even if an older daemon emits one.
                 break;
             }
             case "WHY_DETAIL": {
@@ -1323,6 +1299,7 @@ function CortexPopup(): React.ReactElement {
             }
             case "SETTINGS_SYNC": {
                 const settings = msg.payload as Record<string, unknown>;
+                setExecutionMode(parseExecutionMode(settings.execution_mode));
                 if (typeof settings.quiet_mode === "boolean") {
                     setQuietMode(settings.quiet_mode);
                 }
@@ -1646,7 +1623,6 @@ function CortexPopup(): React.ReactElement {
             ? "Connecting…"
             : "Idle";
     const hr = state?.biometrics?.heart_rate;
-    const hrv = state?.biometrics?.hrv_rmssd;
     const blink = state?.biometrics?.blink_rate;
     // Capture-pipeline status mirrored from the daemon (set in
     // ``WebSocketServer._make_state_update``). Drives the
@@ -2103,80 +2079,6 @@ function CortexPopup(): React.ReactElement {
                 </div>
             )}
 
-            {/* P0 §3.7: BREAK_RECOMMENDATION pill. Surfaces above the
-                intervention card whenever the daemon's stress integral
-                crosses threshold. Single CTA dispatches the bound
-                ``take_biology_break`` action through the EXECUTE_ACTION
-                channel. */}
-            {breakRec && (
-                <div
-                    data-testid="break-recommendation-pill"
-                    style={{
-                        background: "rgba(217, 119, 87, 0.10)",
-                        border: `1px solid ${CX.accent}55`,
-                        borderRadius: CX.radiusMd,
-                        padding: "10px 12px",
-                        marginBottom: 10,
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 10,
-                        fontFamily: CX.font,
-                    }}
-                >
-                    <div style={{ flex: 1, fontSize: 12, color: CX.text }}>
-                        Your HRV has been suppressed — take a {Math.round(breakRec.duration_seconds / 60)}-minute break?
-                    </div>
-                    <button
-                        style={{
-                            padding: "6px 12px",
-                            border: "none",
-                            borderRadius: CX.radiusSm,
-                            background: CX.accent,
-                            color: "white",
-                            fontSize: 11,
-                            fontWeight: 600,
-                            cursor: "pointer",
-                            fontFamily: CX.font,
-                        }}
-                        data-testid="break-recommendation-cta"
-                        onClick={() => {
-                            safeSendMessage({
-                                type: "EXECUTE_ACTION",
-                                action: {
-                                    action_id: `bk_${Date.now()}`,
-                                    action_type: "take_biology_break",
-                                    label: "Take a break",
-                                    target: "",
-                                    metadata: {
-                                        duration_seconds: breakRec.duration_seconds,
-                                        breathing_pattern: breakRec.breathing_pattern,
-                                        audio_cue: true,
-                                        reason: breakRec.reason,
-                                    },
-                                },
-                                intervention_id: interventionId || `break_${Date.now()}`,
-                            });
-                            setBreakRec(null);
-                        }}
-                    >
-                        Take {Math.round(breakRec.duration_seconds / 60)} min
-                    </button>
-                    <button
-                        aria-label="Dismiss break recommendation"
-                        style={{
-                            border: "none",
-                            background: "transparent",
-                            color: CX.textSecondary,
-                            cursor: "pointer",
-                            fontSize: 14,
-                        }}
-                        onClick={() => setBreakRec(null)}
-                    >
-                        {"×"}
-                    </button>
-                </div>
-            )}
-
             {/* Intervention preview */}
             {hasIntervention && (
                 <div style={S.interventionCard}>
@@ -2442,8 +2344,18 @@ function CortexPopup(): React.ReactElement {
                                         ? { ...S.primaryBtn, ...S.doneBtnStyle }
                                         : S.primaryBtn
                                 }
-                                disabled={applied || interventionError !== null}
+                                aria-disabled={
+                                    applied
+                                    || interventionError !== null
+                                    || executionMode === "suggest_only"
+                                }
+                                disabled={
+                                    applied
+                                    || interventionError !== null
+                                    || executionMode === "suggest_only"
+                                }
                                 onClick={() => {
+                                    if (executionMode === "suggest_only") return;
                                     sendWithCid(
                                         {
                                             type: "EXECUTE_ALL_RECOMMENDED",
@@ -2470,6 +2382,8 @@ function CortexPopup(): React.ReactElement {
                             >
                                 {interventionError
                                     ? "Couldn't apply"
+                                    : executionMode === "suggest_only"
+                                    ? "Suggestions only"
                                     : applied
                                     ? "Done"
                                     : closeTabs.length > 0
@@ -2626,10 +2540,6 @@ function CortexPopup(): React.ReactElement {
                     <div style={S.bioCol}>
                         <span style={{ ...S.bioLabel, color: `${CX.bioHr}80` }}>BPM</span>
                         <span style={S.bioVal} aria-label={`${Math.round(hr)} beats per minute`}>{Math.round(hr)}</span>
-                    </div>
-                    <div style={S.bioCol}>
-                        <span style={{ ...S.bioLabel, color: `${CX.bioHrv}80` }}>HRV</span>
-                        <span style={S.bioVal} aria-label={hrv ? `${Math.round(hrv)} milliseconds heart rate variability` : "no HRV data"}>{hrv ? `${Math.round(hrv)}ms` : "\u2014"}</span>
                     </div>
                     <div style={S.bioCol}>
                         <span style={{ ...S.bioLabel, color: `${CX.bioBlink}80` }}>BLK</span>

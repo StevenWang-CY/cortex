@@ -179,11 +179,14 @@ class TestCheckDecision:
         """Request at or below earned level should be allowed."""
         decision = _run(ladder.check("show_overlay", requested_level=SUGGEST))
         assert decision.allowed
+        assert decision.outcome == "permit"
         assert decision.effective_level == SUGGEST
 
     def test_blocked_when_level_insufficient(self, ladder):
         """Request above earned level should be downgraded."""
         decision = _run(ladder.check("close_tab", requested_level=AUTONOMOUS_ACT))
+        assert not decision.allowed
+        assert decision.outcome == "downgrade"
         # effective_level should be capped
         assert decision.effective_level < AUTONOMOUS_ACT
 
@@ -197,7 +200,56 @@ class TestCheckDecision:
             _run(ladder.record_approval("show_overlay"))
 
         decision = _run(ladder.check("show_overlay", requested_level=PREVIEW))
+        assert not decision.allowed
+        assert decision.outcome == "downgrade"
         assert decision.effective_level <= SUGGEST
+
+    def test_exhaustive_exact_consent_matrix(self):
+        """Only an exact request inside [minimum, earned/global cap] permits.
+
+        This covers every combination of requested, earned, global maximum,
+        and action minimum across the five-level ladder (5^4 = 625 cases).
+        """
+        action = "matrix_action"
+        for requested in range(5):
+            for earned in range(5):
+                for global_max in range(5):
+                    for minimum in range(5):
+                        policy = ConsentPolicy(
+                            overrides={action: minimum},
+                            global_max_level=global_max,
+                        )
+                        ladder = ConsentLadder(policy=policy, store=None)
+                        ladder._loaded = True
+                        ladder._action_states[action] = {"level": earned}
+
+                        decision = _run(
+                            ladder.check(action, requested_level=requested)
+                        )
+                        ceiling = min(earned, global_max)
+                        expected_outcome = (
+                            "permit"
+                            if minimum <= requested <= ceiling
+                            else "downgrade"
+                            if requested > ceiling and ceiling >= minimum
+                            else "deny"
+                        )
+                        assert decision.outcome == expected_outcome, (
+                            requested, earned, global_max, minimum,
+                        )
+                        assert decision.allowed is (
+                            expected_outcome == "permit"
+                        )
+                        assert decision.effective_level == (
+                            requested
+                            if expected_outcome == "permit"
+                            else min(ceiling, requested)
+                        )
+
+    @pytest.mark.parametrize("requested", [-1, 5, 99])
+    def test_invalid_requested_level_is_rejected(self, ladder, requested):
+        with pytest.raises(ValueError, match="requested_level"):
+            _run(ladder.check("show_overlay", requested_level=requested))
 
 
 # ---------------------------------------------------------------------------

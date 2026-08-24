@@ -146,22 +146,6 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
     }
 
     /**
-     * P0 §3.7: route a BREAK_RECOMMENDATION pulse into the webview so
-     * the panel can render a soft pill above the intervention card.
-     */
-    public applyBreakRecommendation(payload: Record<string, unknown>): void {
-        if (!this._view) return;
-        try {
-            this._view.webview.postMessage({
-                type: 'breakRecommendation',
-                payload,
-            });
-        } catch {
-            // webview may be tearing down
-        }
-    }
-
-    /**
      * Clear the current intervention display.
      */
     clearIntervention(): void {
@@ -414,13 +398,6 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                     <div class="causal" style="font-size:11px;color:#71717a;margin-top:6px;cursor:pointer;" onclick="this.querySelector('.causal-body').style.display = this.querySelector('.causal-body').style.display === 'none' ? 'block' : 'none'">
                         <span style="font-weight:500;">Why this?</span> ›
                         <div class="causal-body" style="display:none;margin-top:4px;line-height:1.5;">${causalExplanation}</div>
-                    </div>
-                    <!-- P0 §3.7: BREAK_RECOMMENDATION pill — hidden by
-                         default; populated when the daemon emits the
-                         pulse. The CTA fires the desktop-side break. -->
-                    <div id="break-recommendation" class="break-rec" style="display:none;">
-                        <span class="break-rec-text"></span>
-                        <button class="break-rec-cta" type="button">Take 4 min</button>
                     </div>
                     <!-- P0 §3.9: structured rationale drilldown. The
                          "Why?" link expands the panel; when no
@@ -681,32 +658,6 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             50%       { opacity: 1.0; transform: scale(1.15); }
         }
 
-        /* P0 §3.7: BREAK_RECOMMENDATION pill */
-        .break-rec {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            margin: 8px 0 12px;
-            padding: 8px 10px;
-            border-radius: 6px;
-            background: rgba(217, 119, 87, 0.10);
-            border: 1px solid rgba(217, 119, 87, 0.45);
-            font-size: var(--fs-caption);
-        }
-
-        .break-rec-text { flex: 1; color: var(--cx-text); }
-
-        .break-rec-cta {
-            background: var(--cx-accent);
-            color: white;
-            border: none;
-            border-radius: 5px;
-            padding: 4px 10px;
-            cursor: pointer;
-            font-size: var(--fs-caption);
-            font-weight: 600;
-        }
-
         /* P0 §3.8: rating row */
         .rating-row {
             display: flex;
@@ -953,7 +904,6 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             });
         }
 
-        // P0 §3.7: BREAK_RECOMMENDATION pill listener.
         window.addEventListener('message', (event) => {
             const m = event.data || {};
             if (m.type === 'whyDetail') {
@@ -963,28 +913,6 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                 whyOpen = true;
                 if (whyToggle) whyToggle.textContent = 'Hide why';
                 return;
-            }
-            if (m.type === 'breakRecommendation') {
-                const p = m.payload || {};
-                const durationS = Number(p.duration_seconds || 240);
-                const mins = Math.max(1, Math.round(durationS / 60));
-                const pill = document.getElementById('break-recommendation');
-                if (pill) {
-                    pill.style.display = 'flex';
-                    const txt = pill.querySelector('.break-rec-text');
-                    if (txt) txt.textContent = 'Your HRV has been suppressed — take a ' + mins + '-minute break?';
-                    const cta = pill.querySelector('.break-rec-cta');
-                    if (cta) {
-                        cta.textContent = 'Take ' + mins + ' min';
-                        cta.onclick = () => {
-                            vscode.postMessage({
-                                command: 'userRating',
-                                rating: 'thumbs_up',
-                            });
-                            pill.style.display = 'none';
-                        };
-                    }
-                }
             }
         });
 

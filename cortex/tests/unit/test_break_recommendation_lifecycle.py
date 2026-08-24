@@ -1,110 +1,51 @@
-"""P0 §3.7 audit follow-ups: BREAK_RECOMMENDATION lifecycle invariants.
-
-Covers the post-implementation audit gaps:
-
-* feature flag ``enable_biology_break`` gates BREAK_RECOMMENDATION
-  emission + planner promotion without touching the legacy
-  breathing_overlay path,
-* ``_break_recommendation_sent`` re-arms when the stress integral
-  recovers back below the warning threshold,
-* ``biology_break_audio_mute_after_mic_seconds`` mutes audio when the
-  microphone was active recently,
-* frustration-spiral throttle is idempotent within the 30 s window.
-"""
+"""Containment tests for unvalidated HRV-derived break behavior."""
 
 from __future__ import annotations
 
-import time
+from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
+from fastapi.testclient import TestClient
 
+from cortex.libs.auth.local_token import load_or_create_token
 from cortex.libs.config.settings import InterventionConfig
+from cortex.services.api_gateway.app import create_app, registry
 
 
-def test_intervention_config_exposes_biology_break_flags() -> None:
-    cfg = InterventionConfig()
-    assert hasattr(cfg, "enable_biology_break")
-    assert cfg.enable_biology_break is True
-    assert hasattr(cfg, "biology_break_audio_mute_after_mic_seconds")
-    assert cfg.biology_break_audio_mute_after_mic_seconds == pytest.approx(300.0)
+def test_biology_break_cannot_be_enabled_by_legacy_config() -> None:
+    assert InterventionConfig().enable_biology_break is False
+    assert InterventionConfig(enable_biology_break=True).enable_biology_break is False
 
 
-@pytest.mark.asyncio
-async def test_break_recommendation_rearms_when_stress_recovers() -> None:
-    """Once the stress integral falls back below 80% of the threshold,
-    the latched ``_break_recommendation_sent`` flag clears so a future
-    crossing can re-emit.
-    """
-    # Avoid the heavy CortexDaemon constructor — exercise just the
-    # specific re-arm branch by simulating the path.
-    from collections import namedtuple
+def test_stress_endpoint_is_unavailable_and_side_effect_free(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    tracker = MagicMock()
+    tracker.should_break.side_effect = AssertionError("must not inspect trigger state")
+    old_tracker = registry.get("stress_integral_tracker")
+    registry.register("stress_integral_tracker", tracker)
+    token_path = tmp_path / "auth.token"
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        "cortex.libs.auth.local_token.auth_token_path",
+        lambda: token_path,
+    )
+    token = load_or_create_token(token_path)
 
-    daemon = MagicMock()
-    daemon._break_recommendation_sent = True
-    StressTracker = namedtuple("StressTracker", ["load_ratio"])
-    daemon._stress_tracker = StressTracker(load_ratio=0.55)
+    try:
+        with TestClient(create_app()) as client:
+            response = client.get(
+                "/api/stress-integral",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+    finally:
+        if old_tracker is None:
+            registry._services.pop("stress_integral_tracker", None)
+        else:
+            registry.register("stress_integral_tracker", old_tracker)
 
-    # The re-arm path is the inline ``if`` block at the top of the
-    # state loop; replicate it deterministically.
-    if (
-        daemon._break_recommendation_sent
-        and daemon._stress_tracker.load_ratio < 0.8
-    ):
-        daemon._break_recommendation_sent = False
-    assert daemon._break_recommendation_sent is False
-
-    # Still above the floor: latch survives.
-    daemon._break_recommendation_sent = True
-    daemon._stress_tracker = StressTracker(load_ratio=0.95)
-    if (
-        daemon._break_recommendation_sent
-        and daemon._stress_tracker.load_ratio < 0.8
-    ):
-        daemon._break_recommendation_sent = False
-    assert daemon._break_recommendation_sent is True
-
-
-def test_audio_mute_logic_when_mic_active_recently() -> None:
-    """When the microphone was active within the configured window,
-    ``start_biology_break`` should flip audio_cue to False.
-
-    Validates the inline math without instantiating the daemon.
-    """
-    mute_window = 300.0
-    now = time.monotonic()
-    last_mic = now - 60.0  # active 60s ago — within window
-    audio_cue = True
-    if (
-        mute_window > 0
-        and last_mic > 0
-        and now - last_mic < mute_window
-    ):
-        audio_cue = False
-    assert audio_cue is False
-
-    # Outside the window: keep audio on.
-    last_mic = now - 600.0  # 10 minutes ago
-    audio_cue = True
-    if (
-        mute_window > 0
-        and last_mic > 0
-        and now - last_mic < mute_window
-    ):
-        audio_cue = False
-    assert audio_cue is True
-
-
-def test_quiet_mode_throttle_idempotent() -> None:
-    """A 30 s latch prevents the frustration spiral handler from
-    re-activating Quiet Mode within the same window."""
-    latch_at = time.monotonic()
-    # Inside the latch window — should be a no-op.
-    now = latch_at + 5.0
-    already_latched = now - latch_at < 30.0
-    assert already_latched is True
-
-    # Past the window — handler should re-arm.
-    now = latch_at + 31.0
-    already_latched = now - latch_at < 30.0
-    assert already_latched is False
+    assert response.status_code == 200
+    assert response.json()["status"] == "unavailable"
+    assert response.json()["unavailable_reason"] == "validation_required"
+    assert response.json()["should_break"] is False
+    tracker.should_break.assert_not_called()

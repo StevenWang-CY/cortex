@@ -2,6 +2,13 @@
 
 Workspace adapters connect Cortex to external applications (VS Code, Chrome, terminals) to gather context for LLM-powered interventions. This guide explains how to add a new adapter.
 
+> **Authority status:** adapters may expose mutation capabilities for
+> experimental development, but the shipping mode is `suggest_only`.
+> A proposal or legacy trigger is never permission to call `execute`.
+> New mutating adapters cannot be product-enabled until the manifest,
+> exact-authorization, durable-receipt, idempotency, and restore fault matrix
+> in WP-6/WP-7 of the implementation plan pass.
+
 ## Formal Adapter Protocol
 
 Cortex defines a formal `CortexAdapter` protocol in `cortex/libs/adapters/base.py` with properties `name` and `capabilities`, and async methods `execute`, `get_context`, and `health_check`. Action results flow back as `AdapterResult` (`success`, `data`, `reversible`, `reverse_action`, `error`). The `AdapterRegistry` in `cortex/libs/adapters/registry.py` handles discovery, capability querying, action routing, health checks, and plugin discovery via Python entry points. Legacy adapters that pre-date the protocol are auto-wrapped for backward compatibility.
@@ -39,7 +46,13 @@ Key principles:
 1. **Graceful fallback** — always return `None` if the application isn't available
 2. **Timeout** — all operations should have a configurable timeout (default 2s)
 3. **No blocking** — all methods are async
-4. **Snapshot/restore** — support capturing state before intervention and restoring after
+4. **Fail closed** — reject unknown actions, modes, schema majors, targets,
+   and missing authorization
+5. **Receipt-driven restore** — a future mutation must return exact before
+   state, postcondition fingerprint, inverse command, and idempotency key;
+   an in-memory snapshot is not sufficient
+6. **Proposal purity** — context/proposal handlers have no path to
+   `execute`
 
 ## Existing Adapters
 
@@ -161,7 +174,10 @@ Update the context assembly to include your adapter. The `TaskContext.mode` fiel
 
 ### Step 4: Add Intervention Actions
 
-If your adapter supports workspace modifications, map LLM `hide_targets` to adapter actions in `intervention_engine/executor.py`.
+Do not map a model field directly to an effect. Define a typed action command,
+add it to an immutable action manifest, bind an exact unexpired authorization
+to that manifest hash, and return a durable action receipt. Until WP-6/WP-7
+are complete, keep new workspace modifications unavailable.
 
 ### Step 5: Write Tests
 
@@ -216,7 +232,7 @@ Adapters communicate with their corresponding extensions via the WebSocket serve
 }
 ```
 
-### Action (daemon → extension)
+### Legacy action (daemon → extension; experimental/disabled by default)
 ```json
 {
   "type": "APPLY_ACTION",
@@ -228,7 +244,11 @@ Adapters communicate with their corresponding extensions via the WebSocket serve
 }
 ```
 
-Extensions connect to the WebSocket and send an `IDENTIFY` message to declare their type. The daemon routes adapter messages to the correct extension based on client type.
+Extensions first send `AUTH` with the capability token and wait for
+`AUTH_OK`; only then may they send `IDENTIFY`. Production clients reject
+legacy apply/action traffic while in `suggest_only`. The target protocol
+uses separate PROPOSED → AUTHORIZED → APPLY message types with replay-safe
+identities.
 
 ## Privacy Requirements
 

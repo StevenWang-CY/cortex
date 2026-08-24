@@ -37,8 +37,9 @@ class TestTimestampIsWallClock:
         """timestamp set from time.time() must be epoch-seconds (>> monotonic)."""
         now = time.time()
         est = _make_state_estimate(now)
-        # Epoch seconds are ~1.7 billion; monotonic seconds are tiny.
-        assert abs(est.timestamp) > time.monotonic() * 1000, (
+        # Any supported date is safely after 2001. Do not compare to process
+        # uptime: a long-lived host makes magnitude heuristics invalid.
+        assert abs(est.timestamp) > 1_000_000_000, (
             "timestamp looks like monotonic, not epoch"
         )
 
@@ -51,7 +52,7 @@ class TestTimestampIsWallClock:
     def test_feature_vector_timestamp_is_epoch(self) -> None:
         now = time.time()
         fv = FeatureVector(timestamp=now)
-        assert abs(fv.timestamp) > time.monotonic() * 1000
+        assert abs(fv.timestamp) > 1_000_000_000
 
     def test_frame_meta_timestamp_is_epoch(self) -> None:
         now = time.time()
@@ -63,7 +64,7 @@ class TestTimestampIsWallClock:
             blur_score=0.9,
             motion_score=0.1,
         )
-        assert abs(fm.timestamp) > time.monotonic() * 1000
+        assert abs(fm.timestamp) > 1_000_000_000
 
     def test_state_transition_timestamp_is_epoch(self) -> None:
         now = time.time()
@@ -75,7 +76,7 @@ class TestTimestampIsWallClock:
             to_confidence=0.85,
             dwell_seconds=30.0,
         )
-        assert abs(tr.timestamp) > time.monotonic() * 1000
+        assert abs(tr.timestamp) > 1_000_000_000
 
     def test_epoch_sanity_check_gt_monotonic(self) -> None:
         """Epoch seconds (circa 1.7e9) must be much larger than monotonic.

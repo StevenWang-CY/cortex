@@ -96,7 +96,7 @@ def test_state_transition_increments_counter() -> None:
 @pytest.mark.asyncio
 async def test_intervention_applied_increments_counter_on_success() -> None:
     """A successful adapter dispatch bumps the applied counter once."""
-    executor = InterventionExecutor()
+    executor = InterventionExecutor(execution_mode="authorized")
     executor._allow_unwired_consent = True  # noqa: SLF001  # test escape hatch
     executor.register_adapter("editor", _MockAdapter())
 
@@ -121,7 +121,7 @@ async def test_intervention_applied_increments_counter_on_success() -> None:
 @pytest.mark.asyncio
 async def test_intervention_applied_not_incremented_on_failure() -> None:
     """A failed adapter dispatch must NOT bump the applied counter."""
-    executor = InterventionExecutor()
+    executor = InterventionExecutor(execution_mode="authorized")
     executor._allow_unwired_consent = True  # noqa: SLF001
     executor.register_adapter("editor", _MockAdapter(fail=True))
 

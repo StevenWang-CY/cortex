@@ -78,12 +78,45 @@ def read_message_bytes() -> bytes | None:
     return sys.stdin.buffer.read(length)
 
 
-def send_message(msg: dict) -> None:
+def send_message(msg: dict[str, object]) -> None:
     """Send a native messaging response to stdout."""
     encoded = json.dumps(msg).encode("utf-8")
     sys.stdout.buffer.write(struct.pack("<I", len(encoded)))
     sys.stdout.buffer.write(encoded)
     sys.stdout.buffer.flush()
+
+
+def _native_error(
+    error: object,
+    *,
+    request_command: str | None = None,
+    detail: object | None = None,
+) -> dict[str, object]:
+    """Build a bounded canonical native-host error response."""
+
+    response: dict[str, object] = {
+        "command": "error",
+        "status": "error",
+        "error": str(error)[:4096] or "unknown_error",
+    }
+    if request_command:
+        response["request_command"] = request_command[:64]
+    if detail is not None:
+        response["detail"] = str(detail)[:8192]
+    return response
+
+
+def _send_validated_response(response: dict[str, object]) -> None:
+    """Validate against the Pydantic response union, then frame it.
+
+    Keeping validation immediately adjacent to stdout ensures no dispatch
+    branch can silently drift from the generated TypeScript contract.
+    """
+
+    from cortex.libs.schemas.native_messaging import validate_native_response
+
+    validated = validate_native_response(response)
+    send_message(validated.model_dump(mode="json", exclude_none=True))
 
 
 def is_daemon_running(port: int = WEBSOCKET_PORT) -> bool:
@@ -124,7 +157,9 @@ def launch_daemon() -> dict:
         try:
             result = subprocess.run(
                 ["open", CORTEX_APP_PATH],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
             if result.returncode != 0:
                 stderr = (result.stderr or "").strip()
@@ -142,10 +177,13 @@ def launch_daemon() -> dict:
         for i in range(40):
             time.sleep(0.5)
             if is_daemon_running():
-                log(f"Daemon ready after {(i+1)*0.5}s")
+                log(f"Daemon ready after {(i + 1) * 0.5}s")
                 return {"status": "launched"}
         log("Daemon did not become ready in 20s")
-        return {"status": "timeout", "error": f"Daemon started but port {WEBSOCKET_PORT} not yet ready"}
+        return {
+            "status": "timeout",
+            "error": f"Daemon started but port {WEBSOCKET_PORT} not yet ready",
+        }
 
     # --- Dev path: python -m cortex.scripts.run_dev via Terminal.app -------
     # Find the project root (this script is at cortex/scripts/native_host.py)
@@ -169,10 +207,13 @@ def launch_daemon() -> dict:
         )
         result = subprocess.run(
             [
-                "osascript", "-e",
+                "osascript",
+                "-e",
                 f'tell application "Terminal" to do script "{cmd}"',
             ],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if result.returncode != 0:
             stderr = (result.stderr or "").strip()
@@ -188,7 +229,7 @@ def launch_daemon() -> dict:
     for i in range(24):
         time.sleep(0.5)
         if is_daemon_running():
-            log(f"Daemon ready after {(i+1)*0.5}s")
+            log(f"Daemon ready after {(i + 1) * 0.5}s")
             return {"status": "launched"}
 
     log("Daemon did not become ready in 12s")
@@ -208,7 +249,9 @@ def _find_all_daemon_pids() -> set[int]:
         try:
             result = subprocess.run(
                 ["lsof", "-ti", f"tcp:{port}"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
             for line in result.stdout.strip().split("\n"):
                 line = line.strip()
@@ -222,7 +265,9 @@ def _find_all_daemon_pids() -> set[int]:
     try:
         result = subprocess.run(
             ["pgrep", "-f", "cortex.scripts.run_dev"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         for line in result.stdout.strip().split("\n"):
             line = line.strip()
@@ -234,7 +279,9 @@ def _find_all_daemon_pids() -> set[int]:
     try:
         result = subprocess.run(
             ["pgrep", "-f", f"{CORTEX_APP_PATH}/Contents/MacOS/Cortex"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         for line in result.stdout.strip().split("\n"):
             line = line.strip()
@@ -253,8 +300,11 @@ def stop_daemon() -> dict:
     # Step 1: Try HTTP shutdown (cleanest — triggers graceful stop chain)
     try:
         import urllib.request
+
         req = urllib.request.Request(
-            f"http://127.0.0.1:{HTTP_API_PORT}/shutdown", method="POST", data=b"",
+            f"http://127.0.0.1:{HTTP_API_PORT}/shutdown",
+            method="POST",
+            data=b"",
         )
         urllib.request.urlopen(req, timeout=2)
     except Exception:
@@ -289,7 +339,7 @@ def stop_daemon() -> dict:
     return {"status": "stopped"}
 
 
-def _get_auth_token_response() -> dict:
+def _get_auth_token_response() -> dict[str, object]:
     """Return the daemon's capability token to the extension.
 
     Loads or creates the token via :func:`cortex.libs.auth.load_or_create_token`.
@@ -300,9 +350,16 @@ def _get_auth_token_response() -> dict:
     try:
         from cortex.libs.auth import load_or_create_token
 
-        return {"status": "ok", "token": load_or_create_token()}
+        return {
+            "command": "get_auth_token",
+            "status": "ok",
+            "auth_token": load_or_create_token(),
+        }
     except Exception as exc:  # pragma: no cover - import-path dependent
-        return {"status": "error", "error": f"auth_token_unavailable: {exc}"}
+        return _native_error(
+            f"auth_token_unavailable: {exc}",
+            request_command="get_auth_token",
+        )
 
 
 def _read_auth_token() -> str:
@@ -375,38 +432,10 @@ def main() -> None:
             log("stdin closed before payload arrived")
             return
 
-        # P1 (audit Phase 4d, Task E): ``raise_dashboard`` lives
-        # outside the Pydantic discriminated-union in
-        # :mod:`cortex.libs.schemas.native_messaging` (owned by another
-        # phase). To avoid blocking on that schema bump, peek at the
-        # raw command and short-circuit when it matches. The payload is
-        # tiny (a single ``target`` string) so we validate inline
-        # rather than via a Pydantic model.
-        try:
-            _peek: dict = json.loads(raw.decode("utf-8"))
-        except Exception:
-            _peek = {}
-        if isinstance(_peek, dict) and _peek.get("command") == "raise_dashboard":
-            target_raw = _peek.get("target", "dashboard")
-            target = target_raw if isinstance(target_raw, str) else "dashboard"
-            # Guard against absurd payloads (Pydantic would do this for us
-            # in the standard path).
-            if len(target) > 64:
-                target = target[:64]
-            log(f"received: command=raise_dashboard target={target}")
-            result = _raise_dashboard(target)
-            log(f"sending: {result}")
-            send_message(result)
-            return
-
         parsed = parse_native_message(raw)
         if parsed.error is not None:
             log(f"rejected: error={parsed.error} detail={parsed.detail}")
-            send_message({
-                "status": "error",
-                "error": parsed.error,
-                "detail": parsed.detail,
-            })
+            _send_validated_response(_native_error(parsed.error, detail=parsed.detail))
             return
 
         msg = parsed.message
@@ -414,11 +443,14 @@ def main() -> None:
         log(f"received: command={msg.command}")
 
         if msg.command == "launch":
-            result = launch_daemon()
+            result = {"command": "launch", **launch_daemon()}
         elif msg.command == "stop":
-            result = stop_daemon()
+            result = {"command": "stop", **stop_daemon()}
         elif msg.command == "status":
-            result = {"status": "running" if is_daemon_running() else "stopped"}
+            result = {
+                "command": "status",
+                "status": "running" if is_daemon_running() else "stopped",
+            }
         elif msg.command == "get_auth_token":
             # F07b/F08: extension cannot read mode-0600 files directly;
             # the native host runs as the user and CAN. The browser↔host
@@ -427,22 +459,36 @@ def main() -> None:
             # does not widen the attack surface — it just reaches the
             # capability gates we added on WS SHUTDOWN and launcher /stop.
             result = _get_auth_token_response()
+        elif msg.command == "raise_dashboard":
+            dashboard_result = _raise_dashboard(msg.target)
+            if dashboard_result.get("ok") is True:
+                result = {
+                    "command": "raise_dashboard",
+                    "status": "ok",
+                    "http_status": int(dashboard_result["status"]),
+                }
+            else:
+                result = _native_error(
+                    dashboard_result.get("error", "raise_dashboard_failed"),
+                    request_command="raise_dashboard",
+                )
         else:
             # Unreachable: the schema's discriminated union exhausts the
             # legitimate command set. Surfaced for defence in depth.
-            result = {
-                "status": "error",
-                "error": "unknown_command",
-                "detail": str(msg.command),
-            }
+            result = _native_error(
+                "unknown_command",
+                request_command=str(msg.command),
+            )
 
-        log(f"sending: {result}")
-        send_message(result)
+        # Never log the full response: the get_auth_token payload contains
+        # the capability secret. Command/status are sufficient diagnostics.
+        log(f"sending: command={result.get('command')} status={result.get('status')}")
+        _send_validated_response(result)
     except Exception as e:
         log(f"CRASH: {traceback.format_exc()}")
         # Always try to send a response even on crash
         try:
-            send_message({"status": "error", "error": str(e)})
+            _send_validated_response(_native_error(e))
         except Exception:
             pass
 

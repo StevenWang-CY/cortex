@@ -1,4 +1,4 @@
-"""Native-messaging request schemas (audit F14 + F37).
+"""Native-messaging request and response schemas.
 
 The Chrome native-host channel (:mod:`cortex.scripts.native_host`) used
 to validate inbound messages only by length cap (8 MB). Everything past
@@ -29,9 +29,17 @@ host's ``main()`` loop forwards the envelope back over native-messaging
 stdout so the extension can surface a meaningful error rather than
 hanging on a silent reject.
 
-Tighter size cap (64 KB) lives next to the schema so the two
-guardrails ship together; every legitimate native-host request is
-well under 1 KB.
+Responses use the same generated contract. Every response carries the
+request command as its discriminator; parse/dispatch failures use the
+``"error"`` discriminator and may carry the rejected command name as
+``request_command``. This prevents the Python host and TypeScript
+client from independently inventing response field names (the auth
+response historically used ``token`` in Python and ``auth_token`` in
+TypeScript, so both isolated test suites passed while the real channel
+failed).
+
+Tighter size cap (64 KB) lives next to the schemas so the guardrails
+ship together; every legitimate native-host message is well under 1 KB.
 """
 
 from __future__ import annotations
@@ -41,7 +49,14 @@ import os
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+)
 
 # Maximum byte length of a native-messaging payload. Tightened from the
 # legacy 8 MB ceiling — every legitimate request is < 1 KB; the cap is
@@ -177,13 +192,83 @@ class RaiseDashboardMessage(_Base):
 
 
 NativeMessage = Annotated[
-    LaunchMessage
-    | StopMessage
-    | StatusMessage
-    | GetAuthTokenMessage
-    | RaiseDashboardMessage,
+    LaunchMessage | StopMessage | StatusMessage | GetAuthTokenMessage | RaiseDashboardMessage,
     Field(discriminator="command"),
 ]
+
+
+# ---------------------------------------------------------------------------
+# Response schemas
+# ---------------------------------------------------------------------------
+
+
+class LaunchResponse(_Base):
+    command: Literal["launch"]
+    status: Literal["launched", "already_running", "timeout", "error"]
+    error: str | None = Field(default=None, max_length=4096)
+
+
+class StopResponse(_Base):
+    command: Literal["stop"]
+    status: Literal["stopped", "error"]
+    error: str | None = Field(default=None, max_length=4096)
+
+
+class DaemonStatusResponse(_Base):
+    command: Literal["status"]
+    status: Literal["running", "stopped"]
+
+
+class GetAuthTokenResponse(_Base):
+    """Successful capability-token response.
+
+    Errors use :class:`NativeErrorResponse`, keeping this success shape
+    strict enough that a client cannot accidentally accept a legacy
+    ``token`` key or an empty/non-hex secret.
+    """
+
+    command: Literal["get_auth_token"]
+    status: Literal["ok"]
+    auth_token: str = Field(min_length=32, max_length=1024, pattern=r"^[0-9a-f]+$")
+
+
+class RaiseDashboardResponse(_Base):
+    command: Literal["raise_dashboard"]
+    status: Literal["ok"]
+    http_status: int = Field(ge=100, le=599)
+
+
+class NativeErrorResponse(_Base):
+    command: Literal["error"]
+    status: Literal["error"] = "error"
+    request_command: str | None = Field(default=None, max_length=64)
+    error: str = Field(min_length=1, max_length=4096)
+    detail: str | None = Field(default=None, max_length=8192)
+
+
+NativeHostResponse = Annotated[
+    LaunchResponse
+    | StopResponse
+    | DaemonStatusResponse
+    | GetAuthTokenResponse
+    | RaiseDashboardResponse
+    | NativeErrorResponse,
+    Field(discriminator="command"),
+]
+
+_NATIVE_MESSAGE_ADAPTER: TypeAdapter[NativeMessage] = TypeAdapter(NativeMessage)
+_NATIVE_RESPONSE_ADAPTER: TypeAdapter[NativeHostResponse] = TypeAdapter(NativeHostResponse)
+
+
+def validate_native_response(data: Any) -> NativeHostResponse:
+    """Validate a native-host response against the canonical union.
+
+    The host uses this immediately before framing a response. Tests and
+    non-browser clients may also use it as the runtime counterpart to
+    the generated TypeScript decoder.
+    """
+
+    return _NATIVE_RESPONSE_ADAPTER.validate_python(data)
 
 
 # ---------------------------------------------------------------------------
@@ -245,10 +330,7 @@ def parse_native_message(raw: bytes) -> ParseResult:
         # Pydantic v2 discriminated-union validation. Unknown command
         # names produce a ValidationError with ``discriminator`` in the
         # error path.
-        from pydantic import TypeAdapter
-
-        adapter: TypeAdapter[NativeMessage] = TypeAdapter(NativeMessage)
-        parsed = adapter.validate_python(data)
+        parsed = _NATIVE_MESSAGE_ADAPTER.validate_python(data)
     except ValidationError as exc:
         return ParseResult(error="invalid_message", detail=str(exc))
 
@@ -256,13 +338,21 @@ def parse_native_message(raw: bytes) -> ParseResult:
 
 
 __all__ = [
+    "DaemonStatusResponse",
     "GetAuthTokenMessage",
+    "GetAuthTokenResponse",
     "LaunchMessage",
+    "LaunchResponse",
     "MAX_MESSAGE_BYTES",
+    "NativeErrorResponse",
+    "NativeHostResponse",
     "NativeMessage",
     "ParseResult",
     "RaiseDashboardMessage",
+    "RaiseDashboardResponse",
     "StatusMessage",
+    "StopResponse",
     "StopMessage",
     "parse_native_message",
+    "validate_native_response",
 ]

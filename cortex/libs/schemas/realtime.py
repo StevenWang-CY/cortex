@@ -583,7 +583,7 @@ class BiometricsSummary(BaseModel):
         None, description="rPPG heart-rate estimate in BPM"
     )
     hrv_rmssd: float | None = Field(
-        None, description="HRV RMSSD in milliseconds"
+        None, description="Compatibility field; unavailable in product"
     )
     hr_delta: float | None = Field(
         None,
@@ -618,7 +618,7 @@ class BiometricsSummary(BaseModel):
         ),
     )
     respiration_rate: float | None = Field(
-        None, description="Respiration rate in breaths/minute"
+        None, description="Compatibility field; unavailable in product"
     )
     thrashing_score: float | None = Field(
         None,
@@ -630,10 +630,7 @@ class BiometricsSummary(BaseModel):
     stress_integral: float | None = Field(
         None,
         ge=0.0,
-        description=(
-            "Cumulative stress-integral load tracked by "
-            "``StressIntegralTracker``. Used by the break-readiness UI."
-        ),
+        description="Compatibility field; unavailable pending validation",
     )
 
 
@@ -680,7 +677,7 @@ class StateUpdatePayload(BaseModel):
     stress_integral: float | None = Field(
         None,
         ge=0.0,
-        description="Cumulative stress-integral load (ms*s)",
+        description="Compatibility field; unavailable pending validation",
     )
     calibrated_probabilities: StateScores | None = Field(
         None,
@@ -791,6 +788,16 @@ class InterventionTriggerPayload(InterventionPlan):
     """
 
     model_config = ConfigDict(extra="ignore")
+
+    execution_mode: Literal[
+        "suggest_only", "authorized", "research_autonomous",
+    ] = Field(
+        "suggest_only",
+        description=(
+            "Daemon-owned workspace authority mode. Missing or legacy values "
+            "decode to suggest_only so protocol downgrade cannot increase authority."
+        ),
+    )
 
     desktop_not_focused: bool | None = Field(
         None,

@@ -41,6 +41,18 @@ function authenticate(): void {
         target_client_types: null,
         source_client_type: "daemon",
     });
+    // Auto-focus is an applying path and is deliberately unavailable in
+    // the production default. This suite opts into authorized mode so it
+    // can test the feature's own lifecycle independently of containment.
+    socket.__deliver({
+        type: "SETTINGS_SYNC",
+        payload: { execution_mode: "authorized" },
+        sequence: 2,
+        timestamp: Date.now() / 1000,
+        correlation_id: null,
+        target_client_types: null,
+        source_client_type: "daemon",
+    });
 }
 
 function deliverFrame(payload: Record<string, unknown>): void {

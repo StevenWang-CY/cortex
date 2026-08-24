@@ -16,13 +16,20 @@ from __future__ import annotations
 
 import json
 
+import pytest
+from pydantic import ValidationError
+
 from cortex.libs.schemas.native_messaging import (
     MAX_MESSAGE_BYTES,
+    DaemonStatusResponse,
     GetAuthTokenMessage,
+    GetAuthTokenResponse,
     LaunchMessage,
+    NativeErrorResponse,
     StatusMessage,
     StopMessage,
     parse_native_message,
+    validate_native_response,
 )
 
 
@@ -39,24 +46,16 @@ class TestValidCommands:
         assert isinstance(result.message, LaunchMessage)
         assert result.message.project_root is None
 
-    def test_valid_launch_with_allowlisted_project_root(
-        self, tmp_path, monkeypatch
-    ) -> None:
+    def test_valid_launch_with_allowlisted_project_root(self, tmp_path, monkeypatch) -> None:
         # Add tmp_path's parent to the env-configurable allowlist so the
         # validator accepts it.
-        monkeypatch.setenv(
-            "CORTEX_NATIVE_HOST_PROJECT_ROOTS", str(tmp_path.parent)
-        )
-        result = parse_native_message(
-            _encode({"command": "launch", "project_root": str(tmp_path)})
-        )
+        monkeypatch.setenv("CORTEX_NATIVE_HOST_PROJECT_ROOTS", str(tmp_path.parent))
+        result = parse_native_message(_encode({"command": "launch", "project_root": str(tmp_path)}))
         assert result.error is None, result.detail
         assert isinstance(result.message, LaunchMessage)
         assert result.message.project_root == str(tmp_path.resolve())
 
-    def test_comma_separated_allowlist_extends_roots(
-        self, tmp_path, monkeypatch
-    ) -> None:
+    def test_comma_separated_allowlist_extends_roots(self, tmp_path, monkeypatch) -> None:
         """Finding-10: ``CORTEX_NATIVE_HOST_PROJECT_ROOTS`` is COMMA-separated
         (matching the documented ``.env.example`` example). A two-entry,
         comma-separated value must register BOTH roots. With the legacy
@@ -73,9 +72,7 @@ class TestValidCommands:
         )
         # The SECOND entry must be honoured — proves the comma split, not
         # a single-path interpretation of the whole string.
-        result = parse_native_message(
-            _encode({"command": "launch", "project_root": str(root_b)})
-        )
+        result = parse_native_message(_encode({"command": "launch", "project_root": str(root_b)}))
         assert result.error is None, result.detail
         assert isinstance(result.message, LaunchMessage)
         assert result.message.project_root == str(root_b.resolve())
@@ -108,16 +105,12 @@ class TestRejections:
         assert result.detail is not None
         assert f"max={MAX_MESSAGE_BYTES}" in result.detail
 
-    def test_project_root_outside_allowlist_rejected(
-        self, tmp_path, monkeypatch
-    ) -> None:
+    def test_project_root_outside_allowlist_rejected(self, tmp_path, monkeypatch) -> None:
         # Clear the env override so only the default allowlist applies.
         monkeypatch.delenv("CORTEX_NATIVE_HOST_PROJECT_ROOTS", raising=False)
         # ``tmp_path`` (typically under /private/var/folders/) lives
         # outside ~/Desktop, ~/Documents, ~/Projects, and Cortex.app.
-        result = parse_native_message(
-            _encode({"command": "launch", "project_root": str(tmp_path)})
-        )
+        result = parse_native_message(_encode({"command": "launch", "project_root": str(tmp_path)}))
         assert result.message is None
         assert result.error == "invalid_message"
         assert result.detail is not None
@@ -125,9 +118,7 @@ class TestRejections:
         assert "project_root_outside_allowlist" in result.detail
 
     def test_unknown_command_rejected(self) -> None:
-        result = parse_native_message(
-            _encode({"command": "exfil", "victim": "user"})
-        )
+        result = parse_native_message(_encode({"command": "exfil", "victim": "user"}))
         assert result.message is None
         assert result.error == "invalid_message"
 
@@ -152,18 +143,14 @@ class TestRejections:
     def test_extra_fields_rejected(self) -> None:
         # ``extra="forbid"`` keeps tampered extensions from smuggling
         # in attributes the dispatcher might later trust.
-        result = parse_native_message(
-            _encode({"command": "stop", "smuggle": "payload"})
-        )
+        result = parse_native_message(_encode({"command": "stop", "smuggle": "payload"}))
         assert result.message is None
         assert result.error == "invalid_message"
 
     def test_project_root_pointing_at_file_rejected(self, tmp_path) -> None:
         target = tmp_path / "not_a_dir.txt"
         target.write_text("x")
-        result = parse_native_message(
-            _encode({"command": "launch", "project_root": str(target)})
-        )
+        result = parse_native_message(_encode({"command": "launch", "project_root": str(target)}))
         assert result.message is None
         assert result.error == "invalid_message"
         assert result.detail is not None
@@ -202,3 +189,43 @@ class TestSize:
             {"command": "get_auth_token"},
         ):
             assert len(_encode(payload)) < 64
+
+
+class TestResponseContract:
+    """The Python producer contract matches the generated TS consumer."""
+
+    def test_auth_response_uses_canonical_auth_token_field(self) -> None:
+        response = validate_native_response(
+            {
+                "command": "get_auth_token",
+                "status": "ok",
+                "auth_token": "ab" * 32,
+            }
+        )
+        assert isinstance(response, GetAuthTokenResponse)
+        assert response.auth_token == "ab" * 32
+
+    def test_legacy_token_field_is_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            validate_native_response(
+                {
+                    "command": "get_auth_token",
+                    "status": "ok",
+                    "token": "ab" * 32,
+                }
+            )
+
+    def test_status_response_is_discriminated(self) -> None:
+        response = validate_native_response({"command": "status", "status": "stopped"})
+        assert isinstance(response, DaemonStatusResponse)
+
+    def test_bounded_error_response(self) -> None:
+        response = validate_native_response(
+            {
+                "command": "error",
+                "status": "error",
+                "request_command": "get_auth_token",
+                "error": "auth_token_unavailable",
+            }
+        )
+        assert isinstance(response, NativeErrorResponse)

@@ -227,7 +227,6 @@ from cortex.apps.desktop_shell import mac_native
 from cortex.apps.desktop_shell.tokens import (
     BIO_BLINK,
     BIO_HR,
-    BIO_HRV,
     BRAND_ACCENT,
     BRAND_ACCENT_DARK,
     BRAND_DISPLAY_FONT,
@@ -267,35 +266,46 @@ logger = logging.getLogger(__name__)
 # calls reach in by key.
 _CONCEPTS_GLOSSARY: dict[str, str] = {
     "state": (
-        "Cognitive state: Cortex infers FLOW (deep focus), HYPER (overwhelmed), "
-        "HYPO (idle), or RECOVERY (winding back to focus) from biometrics + "
-        "activity. The pill turns warmer when sustained HYPER is detected."
+        "Support estimate: Cortex combines available local activity and sensor "
+        "signals into a heuristic workspace-support label. It is not a medical "
+        "or psychological assessment."
     ),
-    "flow": "FLOW: sustained deep focus — your nervous system is regulated and engaged.",
-    "hyper": "HYPER: elevated arousal — heart rate up, attention scattered. Cortex offers a calming intervention.",
-    "hypo": "HYPO: low arousal — long pauses, low engagement. Cortex offers a re-engagement nudge.",
-    "recovery": "RECOVERY: post-HYPER cool-down — Cortex eases interventions while your nervous system settles.",
-    "hr": "BPM (Heart rate): beats per minute, inferred from your face using rPPG. Not medical-grade.",
-    "hrv": (
-        "HRV (Heart Rate Variability): variation between heartbeats. Higher HRV "
-        "correlates with a calmer, more adaptive nervous system."
+    "flow": (
+        "FLOW: a legacy heuristic label for sustained activity patterns. "
+        "It does not measure a nervous-system state."
+    ),
+    "hyper": (
+        "HYPER: a legacy heuristic label for activity patterns that may "
+        "benefit from a suggestion. It is not a diagnosis of arousal."
+    ),
+    "hypo": (
+        "HYPO: a legacy heuristic label for quieter activity patterns. "
+        "It does not establish disengagement or low arousal."
+    ),
+    "recovery": (
+        "RECOVERY: a legacy transition label after another heuristic state; "
+        "it is not a physiological recovery measurement."
+    ),
+    "hr": (
+        "BPM: an experimental camera-derived pulse estimate. Accuracy varies "
+        "with lighting, motion, camera, and individual conditions; it is not "
+        "medical-grade."
     ),
     "perclos": (
-        "PERCLOS: percentage of eyelid closure, averaged over a minute. "
-        "A proxy for drowsiness / cognitive fatigue."
+        "PERCLOS: estimated eyelid-closure exposure over a recent window. "
+        "Cortex has not validated it as a drowsiness or fatigue measure."
     ),
-    "blink": "Blink rate: blinks per minute. Elevated rates can flag screen fatigue.",
+    "blink": (
+        "Blink rate: an estimated local count per minute. It is contextual "
+        "telemetry, not a fatigue diagnosis."
+    ),
     "sqi": (
-        "SQI (Signal Quality Index): how confident Cortex is in its biometric "
-        "readout. Drops when lighting, motion, or face position degrade the signal."
-    ),
-    "stress_integral": (
-        "Stress integral: a running area-under-curve of elevated arousal. When it "
-        "crosses a threshold, Cortex suggests a paced break."
+        "SQI (Signal Quality Index): an algorithmic camera-signal quality "
+        "score. It is not measurement confidence or an accuracy guarantee."
     ),
     "calibration": (
-        "Calibration: a 2-minute capture that locks in your resting baselines so "
-        "Cortex can detect *your* shift, not the population average."
+        "Calibration: a legacy research capture of advisory baseline values. "
+        "It does not validate a metric or create calibrated probabilities."
     ),
 }
 
@@ -1147,7 +1157,7 @@ class _ConsumerTab(QWidget):
         bio_inner.addWidget(bio_heading)
 
         # Phase J-3: empty-state placeholder. Pre-first-frame the BPM /
-        # HRV / BLK numerics carry placeholder "--" glyphs but that
+        # pulse / blink numerics carry placeholder "--" glyphs but that
         # reads as "stuck at zero" rather than "we haven't started yet".
         # The placeholder paragraph below sets the expectation: nothing
         # is broken; the daemon simply hasn't captured a frame. Hidden
@@ -1184,7 +1194,6 @@ class _ConsumerTab(QWidget):
         # the inline tooltips share a single source of truth.
         bio_specs = [
             (self._bpm_label, "BPM", BIO_HR, "hr"),
-            (self._hrv_label, "HRV", BIO_HRV, "hrv"),
             (self._blk_label, "BLK", BIO_BLINK, "blink"),
         ]
         for val_widget, title, color, glossary_key in bio_specs:
@@ -1770,30 +1779,10 @@ class _ConsumerTab(QWidget):
             logger.debug("focus protection pill update failed", exc_info=True)
 
     def apply_break_recommendation(self, payload: dict) -> None:
-        """P0 §3.7 desktop dispatch: surface the "Take a break?" pill.
+        """Reject the legacy unvalidated HRV/stress recommendation."""
 
-        Idempotent: if the pill is already visible, the payload is
-        refreshed (so a higher-urgency recommendation can over-write a
-        prior low one) but no flicker is introduced.
-        """
-        if not isinstance(payload, dict):
-            return
-        self._break_recommendation_payload = dict(payload)
-        urgency = str(payload.get("urgency") or "low").lower()
-        label_by_urgency = {
-            "low": "Take a break?",
-            "medium": "Time for a break",
-            "high": "Break recommended now",
-        }
-        try:
-            self._break_pill.setText(label_by_urgency.get(urgency, "Take a break?"))
-            self._break_pill.setToolTip(
-                str(payload.get("reason") or "")
-                or "Stress integral threshold reached. Click for a paced break."
-            )
-            self._break_pill.setVisible(True)
-        except Exception:
-            logger.debug("break pill update failed", exc_info=True)
+        del payload
+        self._clear_break_pill()
 
     def _on_break_pill_clicked(self) -> None:
         """Bubble the cached BREAK_RECOMMENDATION payload up to the host."""

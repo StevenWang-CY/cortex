@@ -12,7 +12,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from cortex.libs.adapters.registry import AdapterRegistry
 from cortex.libs.observability.metrics import INTERVENTIONS_APPLIED_TOTAL
@@ -113,6 +113,13 @@ _REVERSE_ACTIONS: dict[str, str] = {
     # omitted — they have no sensible single-step reverse mutation.
 }
 
+_PRESENTATION_ACTIONS = frozenset({
+    "show_overlay",
+    "dim_background",
+    "prompt_micro_commit",
+    "suggest_movement_break",
+})
+
 
 # ---------------------------------------------------------------------------
 # Executor
@@ -126,10 +133,18 @@ class InterventionExecutor:
     Tracks all mutations for restoration. Ensures no destructive operations.
     """
 
-    def __init__(self, adapter_registry: AdapterRegistry | None = None) -> None:
+    def __init__(
+        self,
+        adapter_registry: AdapterRegistry | None = None,
+        *,
+        execution_mode: Literal[
+            "suggest_only", "authorized", "research_autonomous"
+        ] = "suggest_only",
+    ) -> None:
         self._adapters: dict[str, WorkspaceAdapter] = {}
         self._registry: AdapterRegistry | None = adapter_registry
         self._active_mutations: dict[str, list[Mutation]] = {}
+        self._execution_mode = execution_mode
         # B17 (Phase 4.1): cumulative count of permanently-missing
         # adapter dispatches. Increments only after the one-shot retry
         # below also fails, so a transient adapter registration race
@@ -170,6 +185,25 @@ class InterventionExecutor:
         been gated at LLM time.
         """
         self._consent_check = fn
+
+    def set_execution_mode(
+        self,
+        mode: Literal["suggest_only", "authorized", "research_autonomous"],
+    ) -> None:
+        """Update the outer workspace-authority kill switch."""
+        self._execution_mode = mode
+
+    @property
+    def execution_mode(
+        self,
+    ) -> Literal["suggest_only", "authorized", "research_autonomous"]:
+        """Expose the fail-closed authority mode to transport adapters.
+
+        The executor remains the final enforcement point, but transport
+        adapters also need to avoid snapshots, restore registrations, and
+        optimistic success responses for a proposal-only request.
+        """
+        return self._execution_mode
 
     def set_editor_focus_hook(
         self,
@@ -315,6 +349,18 @@ class InterventionExecutor:
                 timestamp=now,
                 reverse_action=_REVERSE_ACTIONS.get(cmd.action),
             )
+
+            # Defence in depth: callers cannot bypass the runtime's plan
+            # containment by invoking the executor directly. Suggest-only
+            # permits presentation effects, never workspace changes.
+            if (
+                self._execution_mode == "suggest_only"
+                and cmd.action not in _PRESENTATION_ACTIONS
+            ):
+                mutation.success = False
+                mutation.reason = "execution_mode_suggest_only"
+                mutations.append(mutation)
+                continue
 
             # Phase-4b TASK M: per-action consent gate. Runs BEFORE
             # adapter dispatch so a denied command never touches the

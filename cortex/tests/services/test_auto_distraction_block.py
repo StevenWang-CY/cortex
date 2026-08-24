@@ -39,6 +39,7 @@ class _FakeWSServer:
 
 
 class _FakeIntervention:
+    execution_mode: str = "authorized"
     enable_auto_distraction_block: bool = False
     auto_distraction_block_confidence: float = 0.85
     auto_distraction_block_dwell_seconds: float = 30.0
@@ -49,7 +50,8 @@ class _FakeIntervention:
 
 
 class _FakeConfig:
-    intervention = _FakeIntervention()
+    def __init__(self) -> None:
+        self.intervention = _FakeIntervention()
 
 
 class _MinimalDaemon:
@@ -90,6 +92,14 @@ class _MinimalDaemon:
             CortexDaemon._reset_auto_focus_timers.__get__(self, CortexDaemon)
         )
 
+    @property
+    def workspace_mutation_allowed(self) -> bool:
+        return self.config.intervention.execution_mode != "suggest_only"
+
+    @property
+    def intervention_execution_mode(self) -> str:
+        return self.config.intervention.execution_mode
+
 
 def _hyper(confidence: float = 0.9) -> SimpleNamespace:
     return SimpleNamespace(state="HYPER", confidence=confidence)
@@ -107,6 +117,20 @@ async def test_disabled_flag_never_arms() -> None:
     await d._evaluate_auto_distraction_block(_hyper(), timestamp=200.0)
     assert d._ws_server.sent == []
     assert d._auto_focus_armed is False
+
+
+@pytest.mark.asyncio
+async def test_suggest_only_mode_never_arms() -> None:
+    d = _MinimalDaemon()
+    d.config.intervention.execution_mode = "suggest_only"
+    d.config.intervention.enable_auto_distraction_block = True
+    d._consent_policy.set_level("distraction_block", AUTONOMOUS_ACT)
+
+    for ts in (0.0, 40.0, 80.0):
+        await d._evaluate_auto_distraction_block(_hyper(), timestamp=ts)
+
+    assert d._auto_focus_armed is False
+    assert d._ws_server.sent == []
 
 
 @pytest.mark.asyncio

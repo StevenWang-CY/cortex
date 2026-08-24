@@ -1888,6 +1888,9 @@ class WebSocketServer:
         plan: InterventionPlan,
         *,
         desktop_focused: bool | None = None,
+        execution_mode: Literal[
+            "suggest_only", "authorized", "research_autonomous"
+        ] = "suggest_only",
     ) -> int:
         """
         Send INTERVENTION_TRIGGER to all connected clients.
@@ -1905,7 +1908,11 @@ class WebSocketServer:
         Returns:
             Number of clients successfully sent to.
         """
-        msg = self._make_intervention_trigger(plan, desktop_focused=desktop_focused)
+        msg = self._make_intervention_trigger(
+            plan,
+            desktop_focused=desktop_focused,
+            execution_mode=execution_mode,
+        )
         return await self._broadcast(msg)
 
     async def send_restore(self, intervention_id: str, *, user_action: str) -> int:
@@ -2494,6 +2501,9 @@ class WebSocketServer:
         plan: InterventionPlan,
         *,
         desktop_focused: bool | None = None,
+        execution_mode: Literal[
+            "suggest_only", "authorized", "research_autonomous"
+        ] = "suggest_only",
     ) -> WSMessage:
         """Create an INTERVENTION_TRIGGER message.
 
@@ -2536,6 +2546,7 @@ class WebSocketServer:
         plan_dict = plan.model_dump(mode="json")
         plan_dict["desktop_not_focused"] = desktop_not_focused
         plan_dict["connected_clients"] = connected
+        plan_dict["execution_mode"] = execution_mode
         payload_model = InterventionTriggerPayload.model_validate(plan_dict)
 
         # F16-srv: stamp a deterministic cid per intervention emission so a

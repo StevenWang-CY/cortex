@@ -59,7 +59,11 @@ class _RecordingDaemon:
     """
 
     def __init__(self) -> None:
+        self.workspace_mutation_allowed = True
         self.call_order: list[tuple[str, dict[str, Any]]] = []
+
+    async def start_biology_break(self, **_kwargs: Any) -> dict[str, bool]:
+        return {"ok": True}
 
     async def dispatch_action_to_browser(
         self, intervention_id: str, action: dict

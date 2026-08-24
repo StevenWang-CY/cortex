@@ -12,7 +12,8 @@ EXT_DIR       := cortex/apps/browser_extension
 .DEFAULT_GOAL := help
 
 .PHONY: help setup dev test test-unit test-eval lint format typecheck \
-        codegen codegen-check ci ext ext-dev ext-edge dmg clean wiki precommit
+        codegen codegen-check version-sync version-check audit ci ext ext-dev \
+        ext-edge dmg clean wiki precommit
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -68,7 +69,22 @@ codegen: ## Regenerate cortex_schemas.d.ts from Pydantic models
 codegen-check: ## Drift gate — fails if cortex_schemas.d.ts is stale
 	$(PY) -m cortex.scripts.generate_ts_schemas --check
 
-ci: lint typecheck test codegen-check ## Run everything CI runs
+version-sync: ## Synchronize generated versions from cortex/pyproject.toml
+	$(PY) -m cortex.scripts.sync_versions --apply
+
+version-check: ## Fail if any runtime/manifest version diverges
+	$(PY) -m cortex.scripts.sync_versions --check
+
+audit: ## Emit and enforce Python/browser/VS Code dependency audit reports
+	mkdir -p audit-results
+	$(VENV)/bin/pip-audit --format json --output audit-results/python.json
+	$(PY) cortex/scripts/verify_dependency_audit.py --ecosystem pip --report audit-results/python.json --summary-out audit-results/python-summary.json
+	cd $(EXT_DIR) && (pnpm audit --json > ../../../audit-results/browser.json || true)
+	$(PY) cortex/scripts/verify_dependency_audit.py --ecosystem pnpm --report audit-results/browser.json --exceptions cortex/security/node-audit-exceptions.json --summary-out audit-results/browser-summary.json
+	cd cortex/apps/vscode_extension && (npm audit --json > ../../../audit-results/vscode.json || true)
+	$(PY) cortex/scripts/verify_dependency_audit.py --ecosystem npm --report audit-results/vscode.json --summary-out audit-results/vscode-summary.json
+
+ci: lint typecheck test codegen-check version-check ## Run local Python/contract CI gates
 
 # ─── Browser extension ────────────────────────────────────────────────
 

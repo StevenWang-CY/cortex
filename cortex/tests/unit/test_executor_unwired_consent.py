@@ -36,9 +36,28 @@ def _make_command(action: str = "close_tab") -> AdapterCommand:
 
 class TestExecutorUnwiredConsent:
     @pytest.mark.asyncio
+    async def test_default_execution_mode_blocks_workspace_mutation(self) -> None:
+        executor = InterventionExecutor()
+        executor._allow_unwired_consent = True
+
+        class _OkAdapter:
+            async def execute(self, action: str, params: dict) -> bool:
+                return True
+
+        executor.register_adapter("browser", _OkAdapter())
+        mutations = await executor.apply(
+            _make_plan("simplified_workspace"),
+            [_make_command("close_tab")],
+        )
+
+        assert len(mutations) == 1
+        assert mutations[0].success is False
+        assert mutations[0].reason == "execution_mode_suggest_only"
+
+    @pytest.mark.asyncio
     async def test_mutation_plan_blocked_without_consent_check(self) -> None:
         """simplified_workspace without consent_check → all mutations refused."""
-        executor = InterventionExecutor()
+        executor = InterventionExecutor(execution_mode="authorized")
         plan = _make_plan("simplified_workspace")
         commands = [_make_command("close_tab"), _make_command("focus_tab")]
 
@@ -54,7 +73,7 @@ class TestExecutorUnwiredConsent:
     @pytest.mark.asyncio
     async def test_guided_mode_plan_blocked_without_consent_check(self) -> None:
         """guided_mode without consent_check → refused."""
-        executor = InterventionExecutor()
+        executor = InterventionExecutor(execution_mode="authorized")
         plan = _make_plan("guided_mode")
         commands = [_make_command("focus_tab")]
 
@@ -65,7 +84,7 @@ class TestExecutorUnwiredConsent:
     @pytest.mark.asyncio
     async def test_overlay_only_plan_passes_without_consent_check(self) -> None:
         """overlay_only plans are safe to execute without a consent gate."""
-        executor = InterventionExecutor()
+        executor = InterventionExecutor(execution_mode="authorized")
         # Register a no-op adapter so the command can succeed
         class _OkAdapter:
             async def execute(self, action: str, params: dict) -> bool:
@@ -83,7 +102,7 @@ class TestExecutorUnwiredConsent:
     @pytest.mark.asyncio
     async def test_escape_hatch_allows_mutation_without_consent_check(self) -> None:
         """When _allow_unwired_consent=True the default-deny is bypassed."""
-        executor = InterventionExecutor()
+        executor = InterventionExecutor(execution_mode="authorized")
         executor._allow_unwired_consent = True  # test escape hatch
 
         class _OkAdapter:

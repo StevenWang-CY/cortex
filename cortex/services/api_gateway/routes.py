@@ -63,6 +63,9 @@ from cortex.services.intervention_engine import (
     capture_snapshot as _engine_capture_snapshot,
 )
 from cortex.services.intervention_engine import (
+    materialize_suggestion_only,
+)
+from cortex.services.intervention_engine import (
     prepare_plan as _engine_prepare_plan,
 )
 
@@ -930,7 +933,7 @@ async def apply_intervention(
     await_confirmation: bool = True,
     confirmation_timeout_seconds: float = 30.0,
 ) -> InterventionApplyResponse:
-    """Apply intervention to workspace.
+    """Apply or, in the safe default, present an intervention proposal.
 
     F05: when ``await_confirmation`` is True (the default), the call
     blocks until the extension's WS ``INTERVENTION_APPLIED`` ack lands
@@ -948,6 +951,52 @@ async def apply_intervention(
         else None
     )
 
+    # The HTTP route is an authority boundary of its own. Do not rely only on
+    # executor-level per-command rejection: suggestion-only must also avoid
+    # snapshots, restore registrations, confirmation waits, and an optimistic
+    # applied response. Configuration is authoritative in production; daemon
+    # and executor fallbacks cover lightweight composition/test rigs.
+    configured = getattr(request.app.state, "cortex_config", None)
+    raw_mode: object | None = None
+    if configured is not None:
+        raw_mode = getattr(
+            getattr(configured, "intervention", None),
+            "execution_mode",
+            None,
+        )
+    daemon = reg.get("daemon")
+    if raw_mode is None and daemon is not None:
+        raw_mode = getattr(daemon, "intervention_execution_mode", None)
+    executor = _get_first_service(reg, "intervention_executor", "executor")
+    if raw_mode is None and executor is not None:
+        raw_mode = getattr(executor, "execution_mode", None)
+    execution_mode = (
+        str(raw_mode)
+        if raw_mode in {"suggest_only", "authorized", "research_autonomous"}
+        else "suggest_only"
+    )
+
+    if execution_mode == "suggest_only":
+        validation, _ = prepare_plan(body.plan, request=request)
+        if not validation.is_valid:
+            logger.warning(
+                "Rejected intervention proposal %s: %s",
+                body.plan.intervention_id,
+                validation.errors,
+            )
+            return InterventionApplyResponse(
+                applied=False,
+                correlation_id=correlation_id,
+            )
+        proposal = materialize_suggestion_only(body.plan)
+        ws_server = reg.get("ws_server")
+        if ws_server is not None and hasattr(ws_server, "send_intervention"):
+            await ws_server.send_intervention(proposal)
+        return InterventionApplyResponse(
+            applied=False,
+            correlation_id=correlation_id,
+        )
+
     intervention_engine = reg.get("intervention_engine")
     if intervention_engine is not None and hasattr(intervention_engine, "apply"):
         snapshot = await intervention_engine.apply(body.plan)
@@ -957,7 +1006,6 @@ async def apply_intervention(
             correlation_id=correlation_id,
         )
 
-    executor = _get_first_service(reg, "intervention_executor", "executor")
     if executor is not None and hasattr(executor, "apply"):
         validation, commands = prepare_plan(body.plan, request=request)
         if not validation.is_valid:
@@ -1109,9 +1157,12 @@ async def restore_intervention(
 
 
 class StressIntegralResponse(BaseModel):
-    """Stress integral current value."""
+    """Compatibility envelope for a metric disabled pending validation."""
+
+    status: Literal["unavailable"] = "unavailable"
+    unavailable_reason: Literal["validation_required"] = "validation_required"
     current_value: float = 0.0
-    threshold: float = 500.0
+    threshold: float = 0.0
     should_break: bool = False
     sensitivity_multiplier: float = 1.0
     timestamp: float = Field(
@@ -1122,17 +1173,9 @@ class StressIntegralResponse(BaseModel):
 
 @router.get("/api/stress-integral", response_model=StressIntegralResponse)
 async def get_stress_integral(request: Request) -> StressIntegralResponse:
-    """Get current stress integral value and break recommendation."""
-    reg = _get_registry(request)
-    tracker = reg.get("stress_integral_tracker")
-    if tracker is not None:
-        data = tracker.to_dict()
-        return StressIntegralResponse(
-            current_value=data.get("current_value", 0.0),
-            threshold=data.get("threshold", 500.0),
-            should_break=tracker.should_break(),
-            sensitivity_multiplier=data.get("sensitivity_multiplier", 1.0),
-        )
+    """Report unavailability; never turn a diagnostic read into a trigger."""
+
+    del request
     return StressIntegralResponse()
 
 

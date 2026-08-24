@@ -9,6 +9,7 @@ from cortex.services.intervention_engine.planner import (
     AdapterCommand,
     ValidationResult,
     map_hide_targets,
+    materialize_suggestion_only,
     prepare_plan,
     validate_plan,
 )
@@ -34,6 +35,7 @@ __all__ = [
     "WorkspaceAdapter",
     "capture_snapshot",
     "map_hide_targets",
+    "materialize_suggestion_only",
     "prepare_plan",
     "validate_plan",
 ]

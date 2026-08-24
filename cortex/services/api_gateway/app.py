@@ -28,6 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
+from cortex import __version__
 from cortex.libs.config.settings import APIConfig, CortexConfig
 from cortex.libs.logging.correlation import correlation_scope
 from cortex.services.api_gateway.auth import require_capability_token
@@ -123,7 +124,7 @@ def create_app(
     app = FastAPI(
         title="Cortex API Gateway",
         description="Somatic Workspace Engine — Internal Service API",
-        version="0.1.0",
+        version=__version__,
         lifespan=lifespan,
     )
 

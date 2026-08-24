@@ -1018,6 +1018,7 @@ class _RecordingDaemon:
 
     def __init__(self) -> None:
         self.active_intervention_id = "int_1"
+        self.workspace_mutation_allowed = True
         self.calls: list[tuple[str, tuple, dict]] = []
 
     async def start_biology_break(self, **kwargs):
@@ -1085,18 +1086,14 @@ def _run_action_invoked(action_type: str, *, extra: dict | None = None):
 
 class TestControllerNativeActionRouting:
 
-    def test_take_biology_break_routes_to_daemon_not_browser(self):
+    def test_take_biology_break_is_compatibility_only(self):
         daemon = _run_action_invoked(
             "take_biology_break",
             extra={"metadata": {"duration_seconds": 60, "audio_cue": False}},
         )
         names = daemon.names()
-        assert "start_biology_break" in names
+        assert "start_biology_break" not in names
         assert "dispatch_action_to_browser" not in names
-        # The break-break kwargs were threaded through.
-        bb = next(c for c in daemon.calls if c[0] == "start_biology_break")
-        assert bb[2]["duration_seconds"] == 60
-        assert bb[2]["audio_cue"] is False
 
     def test_resume_last_active_file_routes_to_editor_adapter(self):
         daemon = _run_action_invoked("resume_last_active_file")

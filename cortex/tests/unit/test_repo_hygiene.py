@@ -1,8 +1,8 @@
-"""P1-15: Repo hygiene — lock file tracking.
+"""Dependency lockfile hygiene.
 
-Asserts that neither browser_extension nor vscode_extension
-package-lock.json files are tracked by git, and that both are
-listed in .gitignore.
+The pnpm browser workspace rejects accidental npm lockfiles. The VS Code
+extension intentionally tracks npm's lockfile so clean-checkout packaging is
+reproducible.
 """
 
 from __future__ import annotations
@@ -35,23 +35,22 @@ class TestPackageLockNotTracked:
             f"found: {tracked}"
         )
 
-    def test_vscode_extension_lock_not_tracked(self) -> None:
-        tracked = _git_ls_files("cortex/apps/vscode_extension/package-lock.json")
-        assert tracked == [], (
-            "cortex/apps/vscode_extension/package-lock.json must NOT be tracked by git; "
-            f"found: {tracked}"
-        )
-
-
-class TestPackageLockInGitignore:
     def test_browser_extension_lock_in_gitignore(self) -> None:
         contents = _gitignore_contents()
         assert "cortex/apps/browser_extension/package-lock.json" in contents, (
             "cortex/apps/browser_extension/package-lock.json must appear in .gitignore"
         )
 
-    def test_vscode_extension_lock_in_gitignore(self) -> None:
-        contents = _gitignore_contents()
-        assert "cortex/apps/vscode_extension/package-lock.json" in contents, (
-            "cortex/apps/vscode_extension/package-lock.json must appear in .gitignore"
+
+class TestVSCodePackageLock:
+    def test_vscode_extension_lock_exists_and_is_not_ignored(self) -> None:
+        relative = "cortex/apps/vscode_extension/package-lock.json"
+        assert (_ROOT / relative).is_file()
+        result = subprocess.run(
+            ["git", "check-ignore", "-q", relative],
+            cwd=_ROOT,
+            check=False,
+        )
+        assert result.returncode != 0, (
+            "VS Code package-lock.json must remain trackable"
         )

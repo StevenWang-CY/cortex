@@ -37,6 +37,15 @@ function authenticate(): void {
         target_client_types: null,
         source_client_type: "daemon",
     });
+    socket.__deliver({
+        type: "SETTINGS_SYNC",
+        payload: { execution_mode: "authorized" },
+        sequence: 2,
+        timestamp: Date.now() / 1000,
+        correlation_id: null,
+        target_client_types: null,
+        source_client_type: "daemon",
+    });
 }
 
 function deliverFrame(payload: Record<string, unknown>): void {

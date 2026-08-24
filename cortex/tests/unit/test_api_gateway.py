@@ -474,6 +474,59 @@ class TestInterventionEndpoints:
         data = resp.json()
         assert data["applied"] is False
 
+    def test_apply_safe_default_only_broadcasts_sanitized_proposal(
+        self,
+        client: TestClient,
+    ):
+        adapter_calls: list[tuple[str, dict]] = []
+        proposals: list[InterventionPlan] = []
+
+        class BrowserAdapter:
+            async def execute(self, action: str, params: dict) -> bool:
+                adapter_calls.append((action, params))
+                return True
+
+        class WSServer:
+            async def send_intervention(self, plan: InterventionPlan) -> None:
+                proposals.append(plan)
+
+        executor = InterventionExecutor()
+        executor.register_adapter("browser", BrowserAdapter())
+        registry.register("intervention_executor", executor)
+        registry.register("ws_server", WSServer())
+
+        payload = {
+            "plan": {
+                "intervention_id": "int_safe_default",
+                "level": "simplified_workspace",
+                "situation_summary": "Several unrelated tabs are open",
+                "headline": "Review a smaller workspace",
+                "primary_focus": "Current task",
+                "micro_steps": ["Review the proposal"],
+                "hide_targets": ["browser_tabs_except_active"],
+                "ui_plan": {
+                    "dim_background": True,
+                    "show_overlay": True,
+                    "fold_unrelated_code": True,
+                    "intervention_type": "simplified_workspace",
+                },
+                "tone": "supportive",
+                "consent_level": "reversible_act",
+            },
+        }
+
+        response = client.post("/intervention/apply", json=payload)
+
+        assert response.status_code == 200
+        assert response.json()["applied"] is False
+        assert adapter_calls == []
+        assert len(proposals) == 1
+        proposal = proposals[0]
+        assert proposal.level == "overlay_only"
+        assert proposal.hide_targets == []
+        assert proposal.ui_plan.fold_unrelated_code is False
+        assert proposal.metadata["workspace_mutation_allowed"] is False
+
     def test_restore_no_engine(self, client: TestClient):
         payload = {
             "intervention_id": "int_abc123",
@@ -489,7 +542,7 @@ class TestInterventionEndpoints:
             async def execute(self, action: str, params: dict) -> bool:
                 return action in {"show_overlay", "hide_overlay"}
 
-        executor = InterventionExecutor()
+        executor = InterventionExecutor(execution_mode="authorized")
         executor.register_adapter("overlay", OverlayAdapter())
         restore_manager = RestoreManager(executor)
         registry.register("intervention_executor", executor)
@@ -524,7 +577,7 @@ class TestInterventionEndpoints:
             async def execute(self, action: str, params: dict) -> bool:
                 return action in {"show_overlay", "hide_overlay"}
 
-        executor = InterventionExecutor()
+        executor = InterventionExecutor(execution_mode="authorized")
         executor.register_adapter("overlay", OverlayAdapter())
         restore_manager = RestoreManager(executor)
         registry.register("intervention_executor", executor)

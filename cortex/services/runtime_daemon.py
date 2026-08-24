@@ -83,8 +83,8 @@ from cortex.services.intervention_engine.break_overlay import (
 from cortex.services.intervention_engine.executor import InterventionExecutor
 from cortex.services.intervention_engine.leetcode_interventions import InterventionMatrix
 from cortex.services.intervention_engine.planner import (
+    materialize_suggestion_only,
     prepare_plan,
-    promote_biology_break,
 )
 from cortex.services.intervention_engine.restore import RestoreManager
 from cortex.services.intervention_engine.snapshot import capture_snapshot
@@ -222,6 +222,10 @@ _AUTO_FOCUS_DEBOUNCE_S: float = 30.0
 # nightly tick. Daily baselines older than this are pruned from
 # ``storage/chronotype/daily/*.json``.
 _CHRONOTYPE_WINDOW_DAYS: int = 90
+
+_EXECUTION_MODES = frozenset({
+    "suggest_only", "authorized", "research_autonomous",
+})
 
 
 def enforce_session_storage_budget(
@@ -600,7 +604,9 @@ class CortexDaemon:
             state_config=self.config.state,
         )
         self._llm_client = create_llm_client(self.config.llm)
-        self._executor = InterventionExecutor()
+        self._executor = InterventionExecutor(
+            execution_mode=self.intervention_execution_mode,
+        )
         self._project_launcher = ProjectLauncher(storage_path=self.config.storage.path)
         self._restore_manager = RestoreManager(
             self._executor,
@@ -1127,6 +1133,32 @@ class CortexDaemon:
         # disabled to avoid spamming when the user IS looking at the
         # dashboard.
         self._desktop_focused_probe: Callable[[], bool] | None = None
+
+    @property
+    def intervention_execution_mode(
+        self,
+    ) -> Literal["suggest_only", "authorized", "research_autonomous"]:
+        """Return the configured workspace-authority mode, fail closed.
+
+        Configuration is Pydantic-validated in normal operation, but this
+        boundary also protects tests, legacy deserializers, and partially
+        constructed configs from increasing authority with an unknown value.
+        """
+        config = getattr(self, "config", None)
+        intervention = getattr(config, "intervention", None)
+        raw = str(getattr(intervention, "execution_mode", "suggest_only"))
+        if raw not in _EXECUTION_MODES:
+            logger.error(
+                "Unknown intervention execution_mode=%r; using suggest_only",
+                raw,
+            )
+            return "suggest_only"
+        return raw  # type: ignore[return-value]
+
+    @property
+    def workspace_mutation_allowed(self) -> bool:
+        """Whether this runtime may enter a workspace-apply path at all."""
+        return self.intervention_execution_mode != "suggest_only"
 
     def set_state_callback(self, fn: Callable[[dict[str, Any]], None]) -> None:
         """Register a callback invoked on every state update.
@@ -2395,6 +2427,15 @@ class CortexDaemon:
                     # accumulated yet) so we can read it unconditionally.
                     vector.thrashing_score = self._aggregator.thrashing_score
 
+                    # Product containment: the current webcam pipeline has
+                    # not met the validation duration/reference gates for
+                    # HRV or respiration. Null them before *any* scorer,
+                    # detector, report, or policy can consume an injected or
+                    # stale value. Heart rate remains quality-gated and live.
+                    vector.hrv_rmssd = None
+                    vector.hrv_sdnn = None
+                    vector.respiration_rate = None
+
                     scores = self._scorer.compute_scores(vector)
                     # C.2: blend ML classifier into smoother HYPER score
                     # once we have enough labeled episodes for a useful ramp.
@@ -2465,55 +2506,11 @@ class CortexDaemon:
                                     exc_info=True,
                                 )
 
-                    # v2.0: Update stress integral
-                    if vector.hrv_rmssd is not None:
-                        self._stress_tracker.update(vector.hrv_rmssd, timestamp)
-                        estimate.stress_integral = self._stress_tracker.current_load
-                        # P0 §3.7 audit fix: re-arm BREAK_RECOMMENDATION
-                        # when the stress integral drops back below the
-                        # warning threshold (80% of the break threshold).
-                        # Without this the latch stayed True after a
-                        # dismissed recommendation, so the user only got
-                        # one pulse per session even after their HRV
-                        # recovered and re-degraded.
-                        if (
-                            self._break_recommendation_sent
-                            and self._stress_tracker.load_ratio < 0.8
-                        ):
-                            logger.info(
-                                "Stress integral recovered to %.0f%% — "
-                                "re-arming BREAK_RECOMMENDATION",
-                                self._stress_tracker.load_ratio * 100,
-                            )
-                            self._break_recommendation_sent = False
-                        # B21: remember the timestamp of the most recent
-                        # HRV reading so the time-elapsed re-arm gate
-                        # below can tell "HRV silent for a while" apart
-                        # from "HRV never delivered".
-                        self._last_hrv_seen_at = timestamp
-                    else:
-                        # B21 (Phase 4.1): when HRV has been None for an
-                        # extended period AND the recommendation is
-                        # still latched, allow a time-elapsed re-arm so
-                        # the user can be re-prompted on the NEXT
-                        # genuine stress integral build-up. Pre-fix the
-                        # latch required an HRV reading to clear; if the
-                        # user's camera ROI degraded post-break the
-                        # recommendation would never re-fire.
-                        last_seen = getattr(self, "_last_hrv_seen_at", 0.0)
-                        hrv_silent_for = timestamp - last_seen
-                        if (
-                            self._break_recommendation_sent
-                            and last_seen > 0.0
-                            and hrv_silent_for > 30.0
-                        ):
-                            logger.info(
-                                "HRV silent for %.0fs after a break "
-                                "recommendation — re-arming so the next "
-                                "build-up can re-trigger",
-                                hrv_silent_for,
-                            )
-                            self._break_recommendation_sent = False
+                    # Containment: webcam HRV/respiration and the derived
+                    # stress integral are unavailable until metric-specific
+                    # reference validation lands. Never carry an old tracker
+                    # value into a public state estimate.
+                    estimate.stress_integral = None
 
                     # P0 §3.9: feed the causal attributor at the same
                     # cadence so the per-signal sparkline buffers fill
@@ -2541,8 +2538,8 @@ class CortexDaemon:
                     if vector.hr is not None:
                         self._longitudinal.accumulate(
                             hr=vector.hr,
-                            hrv=vector.hrv_rmssd,
-                            resp=vector.respiration_rate,
+                            hrv=None,
+                            resp=None,
                             state=estimate.state,
                         )
 
@@ -2558,12 +2555,6 @@ class CortexDaemon:
                         )
                         if vector.hr:
                             self._session_report.record_hr(float(vector.hr))
-                        if vector.hrv_rmssd:
-                            self._session_report.record_hrv(float(vector.hrv_rmssd))
-                        if estimate.stress_integral is not None:
-                            self._session_report.record_stress(
-                                float(estimate.stress_integral)
-                            )
                     except Exception:
                         logger.debug("session_report record failed", exc_info=True)
                     # Audit-2 fix: publish ``forward_lean`` as a 0-1 score
@@ -2582,14 +2573,11 @@ class CortexDaemon:
                         _lean_score = max(0.0, min(1.0, float(_lean_angle) / 45.0))
                     biometrics = {
                         "heart_rate": vector.hr,
-                        "hrv_rmssd": vector.hrv_rmssd,
                         "hr_delta": vector.hr_delta,
                         "blink_rate": vector.blink_rate,
                         "forward_lean": _lean_score,
                         "forward_lean_angle": _lean_angle,
-                        "respiration_rate": vector.respiration_rate,
                         "thrashing_score": vector.thrashing_score,
-                        "stress_integral": self._stress_tracker.current_load,
                     }
                     # B.3: cache for the dedicated broadcast loop instead of
                     # broadcasting inline. Inline broadcasts let LLM/trigger
@@ -2762,72 +2750,10 @@ class CortexDaemon:
                                     ws_type="INTERVENTION_TRIGGER",
                                 )
 
-                        # v2.0: Check stress integral — break at 100% (priority), warn at 80%
-                        # P0 §3.7 audit fix: feature flag gates the
-                        # *biology-break* augmentations (BREAK_RECOMMENDATION
-                        # pulse + planner promotion) without disturbing the
-                        # legacy breathing_overlay special intervention,
-                        # which always fires on threshold crossing.
-                        biology_break_enabled = bool(
-                            getattr(
-                                self.config.intervention,
-                                "enable_biology_break",
-                                True,
-                            )
-                        )
-                        if self._stress_tracker.should_break():
-                            logger.info("Stress integral threshold — biological break")
-                            # P0 §3.7: emit BREAK_RECOMMENDATION once
-                            # per False→True transition. The pulse
-                            # surfaces a soft pill on every UI even
-                            # when no overlay is active.
-                            if biology_break_enabled and not self._break_recommendation_sent:
-                                try:
-                                    pre_hrv_snapshot = (
-                                        float(vector.hrv_rmssd)
-                                        if vector.hrv_rmssd is not None
-                                        else None
-                                    )
-                                    suggested_pattern = self._suggest_break_pattern(pre_hrv_snapshot)
-                                    urgency = self._classify_break_urgency()
-                                    await self._ws_server.send_message(
-                                        MessageType.BREAK_RECOMMENDATION.value,
-                                        {
-                                            "reason": "stress_integral_crossed_threshold",
-                                            "urgency": urgency,
-                                            "stress_load": float(
-                                                self._stress_tracker.current_load
-                                            ),
-                                            "threshold": float(
-                                                self._stress_tracker.threshold
-                                            ),
-                                            "duration_seconds": 240,
-                                            "breathing_pattern": suggested_pattern,
-                                        },
-                                    )
-                                    self._break_recommendation_sent = True
-                                except Exception:
-                                    logger.debug(
-                                        "BREAK_RECOMMENDATION send failed",
-                                        exc_info=True,
-                                    )
-                            await self._trigger_special_intervention(
-                                context, estimate, template_name="breathing_overlay",
-                                ws_type="BREATHING_OVERLAY",
-                            )
-                            # NB: do NOT reset the integral here — the
-                            # break controller decides whether to reset
-                            # (natural completion) or apply a partial
-                            # recovery credit (early termination). The
-                            # legacy reset() was too eager — it cleared
-                            # the integral even if the user dismissed
-                            # the BREATHING_OVERLAY toast outright.
-                        elif self._stress_tracker.should_warn():
-                            logger.info("Stress integral at 80%% — pre-break warning")
-                            await self._trigger_special_intervention(
-                                context, estimate, template_name="pre_break_warning",
-                                ws_type="PRE_BREAK_WARNING",
-                            )
+                        # HRV-derived stress warnings and break triggers are
+                        # intentionally unavailable. Reintroduction requires
+                        # the validated SignalEstimate contract and the
+                        # intervention transaction from WP-3/WP-6.
 
                         # v2.0: Check shutdown detection
                         if self._shutdown_detector.should_handover(
@@ -3009,46 +2935,6 @@ class CortexDaemon:
                             self._active_intervention_id = None
                             return
 
-            # P0 §3.7: if the stress integral has crossed threshold
-            # (latched by ``_break_recommendation_sent`` so we don't
-            # re-flip the should_break() one-shot), promote
-            # ``take_biology_break`` to the primary action. The biology
-            # break is always the right intervention when the user's
-            # HRV has been suppressed long enough to flag — downstream
-            # LLM plans get rewritten in place rather than competing
-            # for the single-CTA slot. Gated on the feature flag so
-            # operators can disable the entire promotion path without
-            # disabling the legacy breathing_overlay.
-            biology_break_enabled = bool(
-                getattr(self.config.intervention, "enable_biology_break", True)
-            )
-            if biology_break_enabled and self._break_recommendation_sent:
-                try:
-                    pattern_hint = self._suggest_break_pattern(
-                        self._sample_hrv_for_break(),
-                    )
-                    # ``_suggest_break_pattern`` returns a plain ``str``;
-                    # narrow it to the planner's Literal so mypy accepts the
-                    # call (an unrecognised hint maps to None = planner default).
-                    breathing_pattern: Literal["box", "4-7-8", "coherent"] | None
-                    if pattern_hint == "box":
-                        breathing_pattern = "box"
-                    elif pattern_hint == "4-7-8":
-                        breathing_pattern = "4-7-8"
-                    elif pattern_hint == "coherent":
-                        breathing_pattern = "coherent"
-                    else:
-                        breathing_pattern = None
-                    plan = promote_biology_break(
-                        plan,
-                        duration_seconds=240,
-                        breathing_pattern=breathing_pattern,
-                        audio_cue=True,
-                        reason="stress_integral_crossed_threshold",
-                    )
-                except Exception:
-                    logger.debug("promote_biology_break failed", exc_info=True)
-
             # P0 §3.9: attach structured causal signals to every plan
             # so each surface's "Why?" drilldown renders without an
             # extra round-trip. The cache is keyed by intervention_id
@@ -3082,6 +2968,19 @@ class CortexDaemon:
                 return
             if validation.warnings:
                 plan.plan_warnings.extend(validation.warnings)
+
+            execution_mode = self.intervention_execution_mode
+            if execution_mode == "suggest_only":
+                # Validation observes the original LLM plan; containment is
+                # then materialized as a new presentation-only plan. The
+                # original requested level is retained in metadata, while no
+                # adapter command survives to the executor.
+                plan = materialize_suggestion_only(plan)
+                commands = []
+            else:
+                plan.metadata = dict(plan.metadata or {})
+                plan.metadata["execution_mode"] = execution_mode
+                plan.metadata["workspace_mutation_allowed"] = True
 
             # v2.0: Check consent ladder
             consent_level_map = {
@@ -3122,14 +3021,34 @@ class CortexDaemon:
                 return
             requested_level = consent_level_map[plan.consent_level]
             consent = await self._consent_ladder.check(
-                action_type=plan.level, requested_level=requested_level,
+                action_type=(
+                    "show_overlay"
+                    if execution_mode == "suggest_only"
+                    else plan.level
+                ),
+                requested_level=requested_level,
             )
             if not consent.allowed:
-                logger.info("Consent ladder blocked intervention %s (level=%s)", plan.intervention_id, plan.consent_level)
+                logger.info(
+                    "Consent ladder blocked intervention %s "
+                    "(level=%s outcome=%s effective=%s)",
+                    plan.intervention_id,
+                    plan.consent_level,
+                    consent.outcome,
+                    consent.effective_level,
+                )
                 return
 
-            snapshot = capture_snapshot(context, intervention_id=plan.intervention_id)
-            mutations = await self._executor.apply(plan, commands)
+            snapshot = (
+                capture_snapshot(context, intervention_id=plan.intervention_id)
+                if commands
+                else None
+            )
+            mutations = (
+                await self._executor.apply(plan, commands)
+                if commands and self.workspace_mutation_allowed
+                else []
+            )
             # Phase-4b TASK C: compute the actual applied count so the
             # downstream broadcast knows whether the workspace mutated.
             # ``commands`` may legitimately be empty (suggested-action-
@@ -3172,7 +3091,10 @@ class CortexDaemon:
                     )
                 self._active_intervention_id = None
                 return
-            self._restore_manager.start_intervention(plan.intervention_id, snapshot)
+            if snapshot is not None and applied > 0:
+                self._restore_manager.start_intervention(
+                    plan.intervention_id, snapshot,
+                )
             self._trigger_policy.record_intervention()
             # P1-PIPE-REPORT: a plan was approved by the trigger policy AND
             # delivered to the user (mutations applied, restore session
@@ -3221,7 +3143,10 @@ class CortexDaemon:
                     )
                 self._active_plan = plan
                 self._micro_step_recovery_fired = False
-            registry.register(f"workspace_snapshot:{plan.intervention_id}", snapshot)
+            if snapshot is not None and applied > 0:
+                registry.register(
+                    f"workspace_snapshot:{plan.intervention_id}", snapshot,
+                )
             self._recorder.append("intervention_plan", plan.model_dump(mode="json"))
 
             # v2.0: Start helpfulness tracking
@@ -3318,7 +3243,9 @@ class CortexDaemon:
             else:
                 desktop_focused = None
             await self._ws_server.send_intervention(
-                plan, desktop_focused=desktop_focused,
+                plan,
+                desktop_focused=desktop_focused,
+                execution_mode=execution_mode,
             )
             # P0 §3.15: plan-finalised event — push COST_RESPONSE so the
             # UI cost meter updates without polling lag. Best-effort; a
@@ -3343,6 +3270,7 @@ class CortexDaemon:
                 self._intervention_callback_seq += 1
                 _payload = copy.deepcopy(plan.model_dump(mode="json"))
                 _payload["_seq"] = self._intervention_callback_seq
+                _payload["execution_mode"] = execution_mode
                 # Audit-prod fix (G4 P0): the overlay's action-buttons gate
                 # browser-bound actions on ``payload.connected_clients``;
                 # without this field every browser button renders disabled
@@ -3512,6 +3440,12 @@ class CortexDaemon:
         is rejected at the daemon boundary instead of confusing the
         extension's switch-default.
         """
+        if not self.workspace_mutation_allowed:
+            logger.info(
+                "ACTION_DISPATCH denied: execution_mode=%s",
+                self.intervention_execution_mode,
+            )
+            return 0
         if not intervention_id or not isinstance(action, dict):
             return 0
         # Reject stale interventions. ``__pending__`` is the sentinel
@@ -4039,6 +3973,7 @@ class CortexDaemon:
                     "quiet_mode": kind != "off",
                     "quiet_mode_kind": kind,
                     "quiet_duration_minutes": minutes if minutes > 0 else 0,
+                    "execution_mode": self.intervention_execution_mode,
                 },
             )
         except Exception:
@@ -4079,6 +4014,7 @@ class CortexDaemon:
                     "quiet_mode": False,
                     "quiet_mode_kind": "off",
                     "quiet_duration_minutes": 0,
+                    "execution_mode": self.intervention_execution_mode,
                 },
             )
         except Exception:
@@ -4404,6 +4340,12 @@ class CortexDaemon:
         defer flipping ``_auto_focus_armed`` until the wire confirms
         (Phase-3 P1-2 / Audit-1.1 P1-2).
         """
+        if not self.workspace_mutation_allowed:
+            logger.info(
+                "START_FOCUS_AUTO suppressed: execution_mode=%s",
+                self.intervention_execution_mode,
+            )
+            return False
         cfg = self.config.intervention
         preset = str(getattr(
             cfg, "auto_distraction_block_preset", "developer",
@@ -4691,6 +4633,14 @@ class CortexDaemon:
                 payload.get("result") is None
                 and payload.get("request_dispatch") is True
             )
+            if is_dispatch_request and not self.workspace_mutation_allowed:
+                logger.info(
+                    "Action request denied in suggest-only mode "
+                    "(action_id=%s action_type=%s)",
+                    payload.get("action_id"),
+                    payload.get("action_type"),
+                )
+                return
             if not is_dispatch_request:
                 self._recorder.append("action_executed", {
                     "intervention_id": payload.get("intervention_id"),
@@ -4711,11 +4661,8 @@ class CortexDaemon:
             # An empty source string (legacy in-process callback path
             # that bypasses the WS server) is also honoured because no
             # peer client could have produced it.
-            # P0 §3.7: ``take_biology_break`` is always desktop-local
-            # (full-screen Qt overlay). Run it directly here regardless
-            # of source — any authenticated surface may request a
-            # break and the daemon is the only place with the HRV
-            # context to drive the breathing controller correctly.
+            # Compatibility action names remain decodable, but unsupported
+            # physiology never confers break-action authority.
             action_dict_raw = payload.get("action") if isinstance(payload.get("action"), dict) else None
             current_action_type = str(
                 payload.get("action_type")
@@ -4723,33 +4670,10 @@ class CortexDaemon:
                 or ""
             )
             if current_action_type == "take_biology_break":
-                metadata = {}
-                if isinstance(action_dict_raw, dict):
-                    md = action_dict_raw.get("metadata")
-                    if isinstance(md, dict):
-                        metadata = md
-                if not metadata and isinstance(payload.get("metadata"), dict):
-                    metadata = payload["metadata"]
-                duration = int(metadata.get("duration_seconds", 240) or 240)
-                pattern_arg = metadata.get("breathing_pattern")
-                audio_cue = bool(metadata.get("audio_cue", True))
-                reason = str(
-                    metadata.get("reason", "user_requested_break")
-                )[:120]
-                iid = str(payload.get("intervention_id") or "")
-                # Run in background — the controller blocks for
-                # ``duration_seconds`` and we don't want to stall the
-                # WS message dispatch loop. The recorder gets the
-                # outcome via ``start_biology_break``.
-                self._spawn_background_task(
-                    self.start_biology_break(
-                        intervention_id=iid,
-                        duration_seconds=duration,
-                        breathing_pattern=pattern_arg if isinstance(pattern_arg, str) else None,
-                        audio_cue=audio_cue,
-                        reason=reason,
-                    ),
-                    name="cortex-biology-break",
+                logger.info(
+                    "Ignoring compatibility take_biology_break action "
+                    "(intervention_id=%s)",
+                    payload.get("intervention_id"),
                 )
                 return
             if is_dispatch_request and source_client in ("", "desktop"):
@@ -5457,6 +5381,13 @@ class CortexDaemon:
                         "LeetCode action %s blocked by consent ladder: %s",
                         action_name,
                         consent.reason,
+                    )
+                    continue
+
+                if not self.workspace_mutation_allowed:
+                    logger.debug(
+                        "LeetCode action %s suppressed in suggest-only mode",
+                        action_name,
                     )
                     continue
 
@@ -6170,6 +6101,10 @@ class CortexDaemon:
             "url_dismiss_cooldown_ms",
             int(self.config.intervention.url_dismiss_cooldown_ms),
         )
+        # Execution authority is not client-writable. Echo the daemon's
+        # validated configuration even if a compromised client attempted to
+        # smuggle a more-authoritative value in SETTINGS_SYNC.
+        applied["execution_mode"] = self.intervention_execution_mode
         await self._ws_server.broadcast_settings(applied)
 
     # ------------------------------------------------------------------

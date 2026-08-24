@@ -59,7 +59,7 @@ CORTEX_LLM__FALLBACK_MODE=rule_based   # default — deterministic plan if all e
 
 `cortex/libs/llm/anthropic_client.resolve_anthropic_model_id` maps each logical id to the provider-specific identifier (Bedrock inference profile, Vertex revision, or direct API name).
 
-### 2. Calibrate
+### 2. Optional research calibration
 
 ```bash
 cortex-calibrate --duration 120
@@ -117,11 +117,10 @@ For research recovery:
 - keep Chrome open with docs, PDFs, and paper tabs
 - let the browser extension classify the active research context
 
-When overwhelm is detected, Cortex can:
-- fold unrelated code
-- hide non-active research tabs
-- show a focused overlay with 1-3 next steps
-- restore the workspace when you dismiss, snooze, or recover
+When the legacy heuristic support gate is reached, Cortex can show a focused
+proposal with 1–3 next steps. The shipping `suggest_only` mode does not fold
+code, hide tabs, or otherwise restructure the workspace. Do not interpret the
+gate as a diagnosis of overwhelm.
 
 ### 6. Package a macOS app
 

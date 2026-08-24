@@ -241,6 +241,7 @@ class PulseEstimator:
         hrv_min_window_seconds: float = 60.0,
         hrv_min_valid_ibi: int = 30,
         stabilizer: PulseStabilizer | None = None,
+        publish_experimental_metrics: bool = False,
     ) -> None:
         self._fs = fs
         self._low_hz = low_hz
@@ -250,6 +251,11 @@ class PulseEstimator:
         self._min_cardiac_snr_db = min_cardiac_snr_db
         self._hrv_min_window_seconds = hrv_min_window_seconds
         self._hrv_min_valid_ibi = hrv_min_valid_ibi
+        # HRV and camera-derived respiration have not passed the reference-
+        # sensor validation gates required for product publication. Keep the
+        # algorithms available to explicit research harnesses, but make the
+        # ordinary runtime output contract fail closed to ``None``.
+        self._publish_experimental_metrics = publish_experimental_metrics
         # B2: temporal stabilizer (hysteresis hold + BPM smoothing). When
         # None the estimator behaves exactly as before (stateless per-window
         # gate) — preserved so existing callers / tests are unaffected.
@@ -398,27 +404,28 @@ class PulseEstimator:
             filtered, fs=self._fs, low_hz=self._low_hz, high_hz=self._high_hz,
         )
 
-        # Step 3: Peak detection for IBI
-        peaks = detect_bvp_peaks(filtered, fs=self._fs)
-
-        # Step 4: IBI and expanded HRV metrics (with parabolic peak interpolation)
-        ibi = compute_ibi_series(peaks, fs=self._fs, signal=filtered)
-        self._update_ibi_history(ibi, timestamp)
-        rolling_ibi = self._get_rolling_ibi(timestamp)
-        hrv = (
-            compute_hrv_metrics(rolling_ibi)
-            if rolling_ibi.size >= self._hrv_min_valid_ibi
-            else {
-                "rmssd": None,
-                "sdnn": None,
-                "pnn50": None,
-                "sd1": None,
-                "sd2": None,
-                "lf_hf_ratio": None,
-                "sample_entropy": None,
-            }
-        )
-        ibi_count = len(ibi)
+        # Step 3/4: IBI and experimental HRV metrics are computed only in
+        # an explicitly constructed research estimator. The shipped daemon
+        # never enables this path, so unsupported measures are unavailable
+        # rather than silently approximated from a ten-second webcam window.
+        hrv: dict[str, float | None] = {
+            "rmssd": None,
+            "sdnn": None,
+            "pnn50": None,
+            "sd1": None,
+            "sd2": None,
+            "lf_hf_ratio": None,
+            "sample_entropy": None,
+        }
+        ibi_count = 0
+        if self._publish_experimental_metrics:
+            peaks = detect_bvp_peaks(filtered, fs=self._fs)
+            ibi = compute_ibi_series(peaks, fs=self._fs, signal=filtered)
+            self._update_ibi_history(ibi, timestamp)
+            rolling_ibi = self._get_rolling_ibi(timestamp)
+            if rolling_ibi.size >= self._hrv_min_valid_ibi:
+                hrv = compute_hrv_metrics(rolling_ibi)
+            ibi_count = len(ibi)
 
         # Step 5: Signal quality and composite SQI.
         quality = compute_signal_quality(
@@ -468,17 +475,18 @@ class PulseEstimator:
         # estimator derives one from the head vertical-position history fed
         # via push_head_vertical_sample(). When neither is available the
         # respiration estimator runs BVP-only.
-        motion_proxy = (
-            motion_resp_signal
-            if motion_resp_signal is not None
-            else self._motion_resp_signal()
-        )
-        self._resp_estimator.process_bvp_window(
-            bvp_window,
-            blink_suppression=blink_suppression,
-            motion_proxy_signal=motion_proxy,
-            timestamp=timestamp,
-        )
+        if self._publish_experimental_metrics:
+            motion_proxy = (
+                motion_resp_signal
+                if motion_resp_signal is not None
+                else self._motion_resp_signal()
+            )
+            self._resp_estimator.process_bvp_window(
+                bvp_window,
+                blink_suppression=blink_suppression,
+                motion_proxy_signal=motion_proxy,
+                timestamp=timestamp,
+            )
 
         return estimate
 
@@ -573,9 +581,10 @@ class PulseEstimator:
         hr_delta = self.compute_hr_delta(timestamp)
 
         resp_rate = None
-        resp_est = self._resp_estimator.latest_estimate
-        if resp_est is not None:
-            resp_rate = resp_est.resp_rate_bpm
+        if self._publish_experimental_metrics:
+            resp_est = self._resp_estimator.latest_estimate
+            if resp_est is not None:
+                resp_rate = resp_est.resp_rate_bpm
 
         nsqi = est.sqi_components.get("nsqi", 0.0)
         snr_db = est.sqi_components.get("snr_db", -99.0)
@@ -606,7 +615,10 @@ class PulseEstimator:
             eff_bpm = est.hr_bpm if sqi_gate_ok else None
 
         fresh = sqi_gate_ok
-        hrv_ready = len(self._get_rolling_ibi(timestamp)) >= self._hrv_min_valid_ibi
+        hrv_ready = (
+            self._publish_experimental_metrics
+            and len(self._get_rolling_ibi(timestamp)) >= self._hrv_min_valid_ibi
+        )
         fresh_hrv = fresh and hrv_ready
 
         return PhysioFeatures(

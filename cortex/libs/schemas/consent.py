@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import IntEnum
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -61,6 +62,13 @@ class ConsentLadderState(BaseModel):
 
 class ConsentDecision(BaseModel):
     """Result of a consent check."""
+    outcome: Literal["permit", "downgrade", "deny"] = Field(
+        ...,
+        description=(
+            "Exact decision outcome. Only permit authorizes execution; "
+            "downgrade is a non-executable proposal for a lower-level plan."
+        ),
+    )
     allowed: bool = Field(..., description="Whether the action is allowed")
     effective_level: int = Field(..., ge=0, le=4, description="Level the action will execute at")
     requested_level: int = Field(..., ge=0, le=4, description="Level that was requested")

@@ -5,10 +5,9 @@ WIRE_CONTRACTS
 
 Timestamp unit
 --------------
-All ``float`` timestamps in this package are **UNIX epoch seconds
-(wall-clock UTC)**.  Use ``time.time()`` on the producer side; compare to
-``Date.now() / 1000`` on the TypeScript consumer side.  ``datetime``
-fields serialize to ISO-8601 strings via Pydantic's JSON encoder.
+Version-2 contracts use explicit ``*_unix_ms`` / ``*_mono_ns`` names plus a
+``boot_id``. Legacy ``float timestamp`` fields remain epoch seconds for one
+compatibility interval and must not be introduced into new schemas.
 
 Enum policy
 -----------
@@ -72,6 +71,21 @@ from cortex.libs.schemas.longitudinal import (
     HourlyOverloadRate,
     TaskOverloadPattern,
 )
+from cortex.libs.schemas.native_messaging import (
+    DaemonStatusResponse,
+    GetAuthTokenMessage,
+    GetAuthTokenResponse,
+    LaunchMessage,
+    LaunchResponse,
+    NativeErrorResponse,
+    NativeHostResponse,
+    NativeMessage,
+    RaiseDashboardMessage,
+    RaiseDashboardResponse,
+    StatusMessage,
+    StopMessage,
+    StopResponse,
+)
 from cortex.libs.schemas.session_history import (
     SESSION_ID_PATTERN,
     SessionDetailResponse,
@@ -94,6 +108,7 @@ from cortex.libs.schemas.state import (
     UserBaselines,
     UserState,
 )
+from cortex.libs.schemas.temporal import EventTime
 from cortex.libs.schemas.transition_graph import (
     FocusEdge,
     FocusNode,
@@ -116,6 +131,7 @@ __all__ = [
     "StateEstimate",
     "UserBaselines",
     "StateTransition",
+    "EventTime",
     # Context
     "Diagnostic",
     "EditorContext",
@@ -164,6 +180,20 @@ __all__ = [
     "InterventionSnapshot",
     "HelpfulnessRecord",
     "BanditWeights",
+    # Native messaging (generated request/response contracts)
+    "NativeMessage",
+    "LaunchMessage",
+    "StopMessage",
+    "StatusMessage",
+    "GetAuthTokenMessage",
+    "RaiseDashboardMessage",
+    "NativeHostResponse",
+    "LaunchResponse",
+    "StopResponse",
+    "DaemonStatusResponse",
+    "GetAuthTokenResponse",
+    "RaiseDashboardResponse",
+    "NativeErrorResponse",
     # WS Envelope (Debt-1 codegen source of truth)
     "WSMessage",
     "MessageType",

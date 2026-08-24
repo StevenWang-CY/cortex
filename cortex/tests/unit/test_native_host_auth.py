@@ -23,14 +23,14 @@ def test_get_auth_token_returns_existing_token(
 ) -> None:
     token_file = tmp_path / "auth.token"
     expected = load_or_create_token(token_file)
-    monkeypatch.setattr(
-        "cortex.libs.auth.local_token.auth_token_path", lambda: token_file
-    )
+    monkeypatch.setattr("cortex.libs.auth.local_token.auth_token_path", lambda: token_file)
 
     response = native_host._get_auth_token_response()
 
+    assert response["command"] == "get_auth_token"
     assert response["status"] == "ok"
-    assert response["token"] == expected
+    assert response["auth_token"] == expected
+    assert "token" not in response
 
 
 def test_get_auth_token_provisions_when_missing(
@@ -38,12 +38,11 @@ def test_get_auth_token_provisions_when_missing(
 ) -> None:
     token_file = tmp_path / "auth.token"
     assert not token_file.exists()
-    monkeypatch.setattr(
-        "cortex.libs.auth.local_token.auth_token_path", lambda: token_file
-    )
+    monkeypatch.setattr("cortex.libs.auth.local_token.auth_token_path", lambda: token_file)
 
     response = native_host._get_auth_token_response()
 
+    assert response["command"] == "get_auth_token"
     assert response["status"] == "ok"
-    assert len(response["token"]) >= 32
+    assert len(str(response["auth_token"])) >= 32
     assert token_file.exists()
