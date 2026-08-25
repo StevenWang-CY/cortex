@@ -2042,9 +2042,10 @@ README/wiki pages, finding ledger, ADRs, model cards, and release templates
    committing prohibited data.
 5. Added a source/frozen release smoke and a mounted-DMG verifier that checks
    version/architecture identity, bundle plist, single-architecture Mach-O,
-   nested signing, embedded credentials/personal identifiers, frozen resources,
-   notarization/stapling, and Gatekeeper when requested. Secret scanning is
-   streaming and catches patterns spanning read boundaries.
+   nested signing, complete high-confidence credentials, actual non-generic
+   build-home identifiers, frozen resources, notarization/stapling, and
+   Gatekeeper when requested. Secret scanning is streaming, fails closed on
+   unreadable bundle members, and catches patterns spanning read boundaries.
 6. Hardened the release workflow around a protected environment, temporary
    Keychain, Developer ID hardened-runtime signing, accepted Apple notary log,
    stapling, per-architecture names/checksums/evidence, application and Python

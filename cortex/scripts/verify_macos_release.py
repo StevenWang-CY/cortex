@@ -8,6 +8,7 @@ import json
 import os
 import platform
 import plistlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -17,15 +18,57 @@ from typing import Any
 
 from cortex import __version__
 
-_SECRET_PATTERNS = (
-    b"sk-ant-",
-    b"AWS_SECRET_ACCESS_KEY=",
-    b"AWS_BEARER_TOKEN_BEDROCK=",
-    b"ANTHROPIC_API_KEY=",
-    b"/Users/",
-    b"/home/",
-    b"C:\\Users\\",
+_CREDENTIAL_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
+    (
+        "anthropic-api-key",
+        re.compile(rb"(?<![A-Za-z0-9_-])sk-ant-[A-Za-z0-9_-]{16,512}(?![A-Za-z0-9_-])"),
+    ),
+    (
+        "openai-api-key",
+        re.compile(
+            rb"(?<![A-Za-z0-9_-])sk-(?!ant-)(?:proj-|svcacct-)?"
+            rb"[A-Za-z0-9_-]{20,512}"
+            rb"(?![A-Za-z0-9_-])"
+        ),
+    ),
+    (
+        "aws-access-key-id",
+        re.compile(rb"(?<![A-Z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Z0-9])"),
+    ),
+    (
+        "credential-assignment",
+        re.compile(
+            rb"\b(?:AWS_SECRET_ACCESS_KEY|AWS_BEARER_TOKEN_BEDROCK|ANTHROPIC_API_KEY)"
+            rb"\s*=\s*['\"]?[A-Za-z0-9_./+=-]{16,512}",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "private-key",
+        re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    ),
+    (
+        "github-token",
+        re.compile(
+            rb"(?<![A-Za-z0-9])(?:"
+            rb"gh[pour]_[A-Za-z0-9]{36,255}|"
+            rb"ghs_[A-Za-z0-9_.-]{20,2048}|"
+            rb"github_pat_[A-Za-z0-9_]{22,255}"
+            rb")(?![A-Za-z0-9_.-])"
+        ),
+    ),
+    (
+        "slack-token",
+        re.compile(
+            rb"(?<![A-Za-z0-9])(?:xox(?:a|b|p|r|s)|xapp|xwfp)-"
+            rb"[A-Za-z0-9-]{10,512}(?![A-Za-z0-9-])"
+        ),
+    ),
 )
+# Must exceed the longest accepted credential form so a match cannot evade the
+# scanner by straddling two 1 MiB reads.
+_SCAN_OVERLAP_BYTES = 4096
+_NON_PERSONAL_BUILD_USERS = frozenset({"root", "runner", "runneradmin"})
 
 
 class ReleaseVerificationError(RuntimeError):
@@ -69,27 +112,76 @@ def _run(
     return result
 
 
-def _scan_forbidden(root: Path) -> list[str]:
+def _default_personal_roots() -> tuple[str, ...]:
+    """Return local home roots worth treating as personal build metadata.
+
+    GitHub-hosted runner homes are intentionally generic and routinely appear
+    in debug strings embedded by third-party wheels. A developer's own home is
+    not generic and must never leak into a distributable bundle.
+    """
+
+    roots: list[str] = []
+    for variable in ("HOME", "USERPROFILE"):
+        value = os.environ.get(variable, "").strip().rstrip("/\\")
+        if not value:
+            continue
+        username = re.split(r"[/\\]", value)[-1].casefold()
+        if username in _NON_PERSONAL_BUILD_USERS:
+            continue
+        if value not in roots:
+            roots.append(value)
+    return tuple(roots)
+
+
+def _scan_forbidden(
+    root: Path,
+    *,
+    personal_roots: tuple[str, ...] | None = None,
+) -> list[str]:
+    """Scan for complete credentials and non-generic local home paths.
+
+    Prefix-only matching is deliberately rejected: Cortex ships redaction
+    rules containing strings such as ``sk-ant-``, while native dependencies
+    contain generic ``/Users/runner`` debug paths. Credential expressions are
+    length-bounded and path checks target only the actual non-generic build
+    homes (or explicit roots supplied by a test/caller).
+    """
+
     findings: list[str] = []
-    overlap = max(len(pattern) for pattern in _SECRET_PATTERNS) - 1
+    roots = _default_personal_roots() if personal_roots is None else personal_roots
+    encoded_roots = tuple(
+        (candidate + separator).encode("utf-8")
+        for root_value in roots
+        if (candidate := root_value.strip().rstrip("/\\"))
+        for separator in ("/", "\\")
+    )
     for path in root.rglob("*"):
         if not path.is_file() or path.is_symlink():
             continue
+        relative = path.relative_to(root)
         try:
             with path.open("rb") as handle:
                 tail = b""
-                matched: set[bytes] = set()
+                matched_credentials: set[str] = set()
+                matched_local_path = False
                 for block in iter(lambda: handle.read(1024 * 1024), b""):
-                    searchable = (tail + block).lower()
-                    matched.update(
-                        pattern for pattern in _SECRET_PATTERNS if pattern.lower() in searchable
+                    searchable = tail + block
+                    matched_credentials.update(
+                        name
+                        for name, pattern in _CREDENTIAL_PATTERNS
+                        if pattern.search(searchable) is not None
                     )
-                    tail = searchable[-overlap:] if overlap else b""
-        except OSError:
+                    if any(root_bytes in searchable for root_bytes in encoded_roots):
+                        matched_local_path = True
+                    tail = searchable[-_SCAN_OVERLAP_BYTES:]
+        except OSError as exc:
+            findings.append(f"{relative} could not be scanned ({type(exc).__name__})")
             continue
         findings.extend(
-            f"{path.relative_to(root)} contains {pattern!r}" for pattern in sorted(matched)
+            f"{relative} matches credential rule {name}" for name in sorted(matched_credentials)
         )
+        if matched_local_path:
+            findings.append(f"{relative} contains a non-generic local home path")
     return findings
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from pathlib import Path
+from typing import Any
 
 import pytest
 from jsonschema import Draft202012Validator, FormatChecker
@@ -28,7 +29,7 @@ from cortex.scripts.validate_release_records import (
     ReleaseRecordError,
     validate_release_records,
 )
-from cortex.scripts.verify_macos_release import _scan_forbidden
+from cortex.scripts.verify_macos_release import _default_personal_roots, _scan_forbidden
 
 _ROOT = Path(__file__).resolve().parents[3]
 
@@ -74,14 +75,12 @@ def test_release_workflow_wires_both_notary_modes_through_selector() -> None:
 def test_release_workflow_stages_versioned_changelog_notes() -> None:
     workflow = (_ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
     assert 'HEADING="## [${RELEASE_TAG}]"' in workflow
-    assert 'body_path: ${{ env.CORTEX_RELEASE_NOTES }}' in workflow
+    assert "body_path: ${{ env.CORTEX_RELEASE_NOTES }}" in workflow
     assert "generate_release_notes: false" in workflow
 
 
 def test_macos_builder_preserves_caller_selected_node_before_gui_fallbacks() -> None:
-    build_script = (_ROOT / "cortex/scripts/build_macos_app.sh").read_text(
-        encoding="utf-8"
-    )
+    build_script = (_ROOT / "cortex/scripts/build_macos_app.sh").read_text(encoding="utf-8")
     assert 'export PATH="${PATH}:/opt/homebrew/bin:/usr/local/bin"' in build_script
     assert 'export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"' not in build_script
 
@@ -262,16 +261,137 @@ def test_release_evidence_rejects_ambiguous_checksum_basenames(
 
 def test_release_bundle_scan_finds_embedded_credentials(tmp_path: Path) -> None:
     (tmp_path / "safe.txt").write_text("nothing sensitive", encoding="utf-8")
-    (tmp_path / "unsafe.bin").write_bytes(b"prefix sk-ant-not-a-real-key suffix")
-    findings = _scan_forbidden(tmp_path)
-    assert findings == ["unsafe.bin contains b'sk-ant-'"]
+    credential = b"".join((b"sk-", b"ant-", b"abcdefghijklmnop123456"))
+    (tmp_path / "unsafe.bin").write_bytes(b"prefix " + credential + b" suffix")
+    findings = _scan_forbidden(tmp_path, personal_roots=())
+    assert findings == ["unsafe.bin matches credential rule anthropic-api-key"]
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_rule"),
+    [
+        (
+            b"AWS_SECRET_ACCESS_KEY=" + b"abcdefghijklmnopqrstuvwxyz1234567890ABCD",
+            "credential-assignment",
+        ),
+        (b"-----BEGIN " + b"PRIVATE KEY-----", "private-key"),
+        (b"AKIA" + b"ABCDEFGHIJKLMNOP", "aws-access-key-id"),
+        (b"ASIA" + b"ABCDEFGHIJKLMNOP", "aws-access-key-id"),
+        (b"sk-" + b"proj-" + b"abcdefghijklmnopqrstuvwxyz123456", "openai-api-key"),
+        (b"ghp_" + b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJ", "github-token"),
+        (b"github_" + b"pat_" + b"abcdefghijklmnopqrstuv", "github-token"),
+        (b"ghs_123456_" + b"header.payload.signature-material", "github-token"),
+        (b"xoxb-" + b"1234567890-abcdefghijkl", "slack-token"),
+        (b"xapp-" + b"1234567890-abcdefghijkl", "slack-token"),
+        (b"xwfp-" + b"1234567890-abcdefghijkl", "slack-token"),
+    ],
+    ids=(
+        "aws-secret-assignment",
+        "private-key",
+        "aws-long-term-access-id",
+        "aws-temporary-access-id",
+        "openai-project-key",
+        "github-classic-pat",
+        "github-fine-grained-pat",
+        "github-stateless-installation-token",
+        "slack-bot-token",
+        "slack-app-token",
+        "slack-workflow-token",
+    ),
+)
+def test_release_bundle_scan_rejects_high_confidence_secret_forms(
+    tmp_path: Path,
+    payload: bytes,
+    expected_rule: str,
+) -> None:
+    (tmp_path / "unsafe.bin").write_bytes(payload)
+
+    assert _scan_forbidden(tmp_path, personal_roots=()) == [
+        f"unsafe.bin matches credential rule {expected_rule}"
+    ]
 
 
 def test_release_bundle_scan_detects_pattern_across_read_boundary(tmp_path: Path) -> None:
     prefix = b"x" * (1024 * 1024 - 3)
-    (tmp_path / "boundary.bin").write_bytes(prefix + b"sk-ant-placeholder")
+    credential = b"".join((b"sk-", b"ant-", b"abcdefghijklmnop123456"))
+    (tmp_path / "boundary.bin").write_bytes(prefix + b" " + credential)
 
-    assert _scan_forbidden(tmp_path) == ["boundary.bin contains b'sk-ant-'"]
+    assert _scan_forbidden(tmp_path, personal_roots=()) == [
+        "boundary.bin matches credential rule anthropic-api-key"
+    ]
+
+
+def test_release_bundle_scan_detects_long_token_across_read_boundary(tmp_path: Path) -> None:
+    prefix = b"x" * (1024 * 1024 - 1001) + b" "
+    credential = b"".join((b"ghs_123456_", b"a" * 1500))
+    (tmp_path / "boundary.bin").write_bytes(prefix + credential + b" ")
+
+    assert _scan_forbidden(tmp_path, personal_roots=()) == [
+        "boundary.bin matches credential rule github-token"
+    ]
+
+
+def test_release_bundle_scan_ignores_detector_literals_and_generic_runner_paths(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "detector.js").write_bytes(rb"/\bsk-ant-[A-Za-z0-9_-]{16,}\b/gu")
+    (tmp_path / "dependency.bin").write_bytes(
+        b"debug metadata /Users/runner/work/dependency/source.c"
+    )
+
+    assert _scan_forbidden(tmp_path, personal_roots=()) == []
+
+
+def test_release_bundle_scan_rejects_explicit_personal_build_root(tmp_path: Path) -> None:
+    (tmp_path / "compiled.bin").write_bytes(b"debug metadata /Users/alice/private-project/source.c")
+
+    assert _scan_forbidden(tmp_path, personal_roots=("/Users/alice",)) == [
+        "compiled.bin contains a non-generic local home path"
+    ]
+
+
+def test_release_bundle_scan_does_not_confuse_home_prefixes(tmp_path: Path) -> None:
+    (tmp_path / "compiled.bin").write_bytes(b"debug metadata /Users/alice2/project/source.c")
+
+    assert _scan_forbidden(tmp_path, personal_roots=("/Users/alice",)) == []
+
+
+def test_default_personal_roots_captures_local_home(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", "/Users/alice")
+    monkeypatch.delenv("USERPROFILE", raising=False)
+
+    assert _default_personal_roots() == ("/Users/alice",)
+
+
+def test_default_personal_roots_excludes_generic_build_accounts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", "/Users/runner")
+    monkeypatch.setenv("USERPROFILE", "C:\\Users\\runneradmin")
+
+    assert _default_personal_roots() == ()
+
+
+def test_release_bundle_scan_fails_closed_on_unreadable_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unreadable = tmp_path / "unreadable.bin"
+    unreadable.write_bytes(b"content")
+    original_open = Path.open
+
+    def deny_unreadable_open(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path == unreadable:
+            raise PermissionError("simulated unreadable bundle member")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", deny_unreadable_open)
+
+    assert _scan_forbidden(tmp_path, personal_roots=()) == [
+        "unreadable.bin could not be scanned (PermissionError)"
+    ]
 
 
 def test_manual_release_template_is_valid_and_cannot_be_released() -> None:

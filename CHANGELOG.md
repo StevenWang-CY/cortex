@@ -4,6 +4,33 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.3.2] — 2026-08-25
+
+This patch makes post-notarization bundle scanning distinguish complete
+credentials and non-generic local build paths from redaction rules and
+third-party debug metadata. It contains no runtime algorithm, authority,
+privacy, or interaction-policy change from v0.3.0.
+
+### Fixed
+
+* Replaced prefix-only secret matching with bounded, high-confidence rules for
+  Anthropic/OpenAI keys, permanent and temporary AWS credentials, private
+  keys, current GitHub token families, and current Slack token families. The
+  scanner continues to detect matches split across streaming read boundaries
+  and now fails closed if a bundle member cannot be read.
+* Scoped personal-path detection to the actual non-generic home roots involved
+  in a build. Generic GitHub runner paths and dependency metadata no longer
+  fail a release merely because they contain `/Users/` or `/home/`.
+* Added regression cases for complete credentials, boundary-split keys,
+  explicit personal build roots, the browser's own `sk-ant-` redaction regex,
+  and generic runner debug paths.
+
+### Release process
+
+* The immutable v0.3.1 tag is retained as the artifact-free candidate that
+  reached successful signing, Apple notarization, and stapling before the
+  over-broad scanner rejected upstream metadata. v0.3.2 supersedes it.
+
 ## [v0.3.1] — 2026-08-25
 
 This patch preserves the exact Node toolchain selected by the release runner.
