@@ -175,9 +175,12 @@ export function classifyTabTypeWithGoal(
     // AI assistants are tools that could be used for ANY topic — if the user's
     // goal keywords appear in the title, the assistant is actively helping with
     // the goal and should get full goal_relevant protection.
+    // These values must be the canonical outputs of classifyTabType above.
+    // The former list used pre-collapse names (video_platform,
+    // communication, distraction), so relevant video and entertainment tabs
+    // never received goal protection.
     const ambiguousTypes = new Set([
-        "video_platform", "social", "communication", "distraction", "other",
-        "ai_assistant",
+        "video", "social", "entertainment", "other", "ai_assistant",
     ]);
     if (!ambiguousTypes.has(baseType)) return baseType;
 

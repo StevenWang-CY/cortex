@@ -544,10 +544,12 @@ class ContextPrivacyDialog(QDialog):
         self.confirmation_requested.emit(preview_id, phrase)
 
     def apply_confirmation(self, payload: dict[str, Any]) -> None:
-        plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else {}
+        raw_plan = payload.get("plan")
+        plan: dict[str, Any] = raw_plan if isinstance(raw_plan, dict) else {}
         headline = str(plan.get("headline") or "Validated planner response")
         focus = str(plan.get("primary_focus") or "")
-        steps = plan.get("micro_steps") if isinstance(plan.get("micro_steps"), list) else []
+        raw_steps = plan.get("micro_steps")
+        steps: list[Any] = raw_steps if isinstance(raw_steps, list) else []
         step_text = "\n".join(f"• {str(step)}" for step in steps[:5])
         body = "\n".join(part for part in (headline, focus, step_text) if part)
         self._result_plan.setText(body)

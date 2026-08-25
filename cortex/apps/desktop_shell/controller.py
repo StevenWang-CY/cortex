@@ -32,6 +32,7 @@ from cortex.apps.desktop_shell.context_privacy_controller import (
     ContextPrivacyController,
 )
 from cortex.apps.desktop_shell.dashboard import DashboardWindow
+from cortex.apps.desktop_shell.message_router import DesktopMessageRouter
 from cortex.apps.desktop_shell.onboarding import OnboardingWindow, onboarding_marker_path
 from cortex.apps.desktop_shell.overlay import OverlayWindow
 from cortex.apps.desktop_shell.settings import SettingsDialog
@@ -343,6 +344,9 @@ class CortexAppController:
         self._daemon: Any = None  # CortexDaemon (lazy import to avoid heavy deps at module level)
         self._daemon_loop: asyncio.AbstractEventLoop | None = None
         self._daemon_thread: threading.Thread | None = None
+        self._state_subscription: Any = None
+        self._intervention_subscription: Any = None
+        self._outbound_subscription: Any = None
         # P0 §3.4: in-flight calibration runner. None when idle. Guards
         # against double-click re-entry and lets ``_stop_daemon_and_quit``
         # cooperatively abort the runner on shutdown.
@@ -775,8 +779,10 @@ class CortexAppController:
         from cortex.services.runtime_daemon import CortexDaemon
 
         self._daemon = CortexDaemon(config=self._config)
-        self._daemon.set_state_callback(self._bridge.on_state)
-        self._daemon.set_intervention_callback(self._bridge.on_intervention)
+        self._state_subscription = self._daemon.subscribe_state(self._bridge.on_state)
+        self._intervention_subscription = self._daemon.subscribe_intervention(
+            self._bridge.on_intervention
+        )
         # P0 §3.7: hand the desktop shell's full-screen break overlay to
         # the daemon. The handler is async because the controller has
         # to marshal back onto the Qt thread; the daemon owns the
@@ -824,36 +830,17 @@ class CortexAppController:
         self._bridge.connection_changed.emit(True)
 
     def _install_ws_broadcast_observer(self) -> None:
-        """P0 §3.1 / §3.2 / §3.3: wrap ``_ws_server.send_message`` so the
-        in-process controller observes outbound SESSION_LIST /
-        SESSION_DETAIL / TRENDS_PAYLOAD / SESSION_RECAP frames in
-        addition to relaying them to attached WS clients.
-
-        Why a wrapper, not a callback API? The daemon's WS server has no
-        broadcast-observer hook today (the existing
-        ``set_state_callback`` / ``set_intervention_callback`` mechanism
-        is daemon-internal and predates these frames). A monkey-patched
-        wrapper is the smallest non-invasive way to keep the backend
-        contract intact while still surfacing the frames to the
-        in-process dashboard. The wrapper preserves the original return
-        value (a client count) and is idempotent — re-installs are
-        no-ops via the ``_cortex_broadcast_wrapped`` sentinel attr.
-        """
+        """Subscribe the in-process desktop to transport-neutral events."""
         if self._daemon is None:
             return
         ws_server = getattr(self._daemon, "_ws_server", None)
         if ws_server is None:
             logger.debug("Daemon has no _ws_server; broadcast observer skipped")
             return
-        send_message = getattr(ws_server, "send_message", None)
-        if send_message is None or getattr(send_message, "_cortex_broadcast_wrapped", False):
+        subscribe = getattr(ws_server, "subscribe_outbound", None)
+        if not callable(subscribe) or self._outbound_subscription is not None:
             return
         bridge = self._bridge
-
-        # Map of message-type strings → bridge methods. We import the
-        # enum locally so a missing schemas package on a stripped CI
-        # harness doesn't crash boot — the wrapper degrades to passing
-        # through without fan-out in that case.
         try:
             from cortex.libs.schemas.ws_message_types import MessageType
 
@@ -862,62 +849,40 @@ class CortexAppController:
                 MessageType.SESSION_DETAIL.value: bridge.on_session_detail,
                 MessageType.TRENDS_PAYLOAD.value: bridge.on_trends,
                 MessageType.SESSION_RECAP.value: bridge.on_session_recap,
-                # P0 §3.11 / §3.10: route quiet-mode + auto-focus
-                # broadcasts to the bridge so the dashboard reflects
-                # them in DMG mode (the WS-client path picks them up
-                # via the WebSocketBridge separately).
                 MessageType.QUIET_MODE_STATE.value: bridge.on_quiet_mode_state,
                 MessageType.START_FOCUS_AUTO.value: bridge.on_start_focus_auto,
                 MessageType.STOP_FOCUS_AUTO.value: bridge.on_stop_focus_auto,
-                # P1-FC-INTERVENTION-FAILED: total mutation failure → toast.
                 MessageType.INTERVENTION_FAILED.value: bridge.on_intervention_failed,
                 MessageType.INTERVENTION_TRANSACTION_STATE.value: (
                     bridge.on_intervention_transaction_state
                 ),
-                # P1-FC-INTERVENTION-PROMPT: cross-surface prompt sync. The
-                # desktop overlay renders the prompt inline already; this
-                # entry only completes the dispatch map (informational).
                 MessageType.INTERVENTION_PROMPT.value: bridge.on_intervention_prompt,
             }
+            router = DesktopMessageRouter(type_to_handler)
         except Exception:
             logger.debug("MessageType import failed; broadcast observer disabled", exc_info=True)
             return
 
-        async def _wrapped_send_message(message_type: str, payload: dict, **kwargs: Any) -> int:
-            # Phase 4.B fix (#26): respect ``target_client_types``.
-            # The daemon's WS dispatch arms now use
-            # ``send_to_client(client_id, ...)`` for targeted replies, so
-            # this observer should normally only see broadcasts. But a
-            # caller that goes through ``send_message`` with a non-empty
-            # ``target_client_types`` list that excludes "desktop" is
-            # explicitly opting out of the in-process bridge; we must
-            # honour that to avoid leaking targeted SESSION_RECAP
-            # replies into the desktop dashboard.
-            targets = kwargs.get("target_client_types")
-            if isinstance(targets, (list, tuple, set)) and targets:
-                if "desktop" not in targets:
-                    logger.debug(
-                        "broadcast observer: skipping %s — targets=%r excludes 'desktop'",
-                        message_type, targets,
-                    )
-                    return await send_message(message_type, payload, **kwargs)
-            handler = type_to_handler.get(message_type)
-            if handler is not None:
-                try:
-                    handler(dict(payload) if payload else {})
-                except Exception:
-                    logger.debug(
-                        "Broadcast observer handler raised for %s",
-                        message_type, exc_info=True,
-                    )
-            return await send_message(message_type, payload, **kwargs)
-
-        _wrapped_send_message._cortex_broadcast_wrapped = True  # type: ignore[attr-defined]
+        def _observe(event: Any) -> None:
+            targets = tuple(getattr(event, "target_client_types", ()) or ())
+            message_type = str(getattr(event, "message_type", ""))
+            try:
+                router.dispatch(
+                    message_type,
+                    getattr(event, "payload", {}),
+                    target_client_types=targets,
+                )
+            except Exception:
+                logger.debug(
+                    "Broadcast observer handler raised for %s",
+                    message_type,
+                    exc_info=True,
+                )
         try:
-            ws_server.send_message = _wrapped_send_message
+            self._outbound_subscription = subscribe(_observe)
         except Exception:
             logger.debug(
-                "Failed to install ws_server.send_message wrapper",
+                "Failed to subscribe to outbound application events",
                 exc_info=True,
             )
 

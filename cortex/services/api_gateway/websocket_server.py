@@ -30,6 +30,17 @@ from cortex.application.clock import (
     monotonic_seconds,
     unix_seconds,
 )
+from cortex.application.events import (
+    ApplicationEventHub,
+    OutboundTransportEvent,
+    Subscription,
+)
+from cortex.application.gateway import WebSocketCommandHandlers
+from cortex.application.runtime_status import (
+    RuntimeStatusReader,
+    RuntimeStatusSnapshot,
+)
+from cortex.application.services import ServiceProvider
 from cortex.libs.auth import verify_token
 from cortex.libs.config.settings import APIConfig
 from cortex.libs.logging.correlation import correlation_scope, get_correlation_id
@@ -298,9 +309,15 @@ class WebSocketServer:
         config: APIConfig | None = None,
         *,
         clock: Clock | None = None,
+        services: ServiceProvider | None = None,
+        events: ApplicationEventHub | None = None,
+        runtime_status: RuntimeStatusReader | None = None,
     ) -> None:
         self._config = config or APIConfig()
         self._clock = clock or SYSTEM_CLOCK
+        self._services = services
+        self._events = events or ApplicationEventHub()
+        self._runtime_status = runtime_status
         self._clients: dict[str, WebSocketClient] = {}
         self._server: Any = None  # websockets server
         self._running = False
@@ -403,6 +420,37 @@ class WebSocketServer:
         # the forward write finishes before a concurrently requested inverse
         # can reach the same owner.
         self._intervention_wire_dispatch_lock = asyncio.Lock()
+
+    def bind_command_handlers(self, handlers: WebSocketCommandHandlers) -> None:
+        """Bind one immutable application command surface.
+
+        This is the production composition API. The individual ``set_*``
+        methods below remain temporary compatibility facades for isolated
+        tests and external integrations.
+        """
+
+        for attribute, handler in handlers.as_callback_attributes().items():
+            if not hasattr(self, attribute):
+                raise AttributeError(f"unknown WebSocket handler slot: {attribute}")
+            setattr(self, attribute, handler)
+        self._published_client_connectivity.clear()
+
+    def subscribe_outbound(
+        self,
+        listener: Callable[[OutboundTransportEvent], None],
+    ) -> Subscription:
+        """Observe transport-neutral outbound events without monkey-patching."""
+
+        return self._events.outbound_transport.subscribe(listener)
+
+    def _service_provider(self) -> ServiceProvider:
+        """Return injected services, falling back only for compatibility."""
+
+        if self._services is not None:
+            return self._services
+        from cortex.services.api_gateway.app import registry
+
+        return registry
 
     @property
     def client_count(self) -> int:
@@ -2479,7 +2527,7 @@ class WebSocketServer:
             )
 
     def _resolve_daemon(self) -> Any:
-        """Resolve the daemon via the service registry.
+        """Resolve the daemon through the typed runtime-status port.
 
         Returns ``None`` when the daemon hasn't registered itself yet
         (e.g. early in startup or in unit tests that construct the WS
@@ -2487,10 +2535,32 @@ class WebSocketServer:
         daemon never closes the socket on the peer.
         """
         try:
-            from cortex.services.api_gateway.app import registry as _registry
-            return _registry.get("daemon")
+            if self._runtime_status is not None:
+                return self._runtime_status.snapshot().daemon
+            # One-release compatibility for isolated fixtures that still
+            # compose only a ServiceProvider.
+            return self._service_provider().get("daemon")
         except Exception:
             return None
+
+    def _runtime_health_snapshot(self) -> RuntimeStatusSnapshot:
+        """Read transport health without string-key discovery in production."""
+
+        if self._runtime_status is not None:
+            return self._runtime_status.snapshot()
+        services = self._service_provider()
+        raw_backend = services.get("store_backend")
+        raw_healthy = services.get("store_healthy")
+        return RuntimeStatusSnapshot(
+            daemon=services.get("daemon"),
+            latest_frame_meta=services.get("latest_frame_meta"),
+            capture_stale=bool(services.get("capture_stale") or False),
+            store_degraded=bool(services.get("store_degraded") or False),
+            store_backend=(str(raw_backend) if raw_backend is not None else None),
+            store_healthy=(
+                bool(raw_healthy) if raw_healthy is not None else None
+            ),
+        )
 
     async def _send_daemon_not_ready(
         self,
@@ -3267,14 +3337,23 @@ class WebSocketServer:
           metric but is NOT disconnected on the first miss (only if its
           per-send timeout actually fires).
         """
-        if not self._clients:
-            return 0
-
         # F19: stamp the outgoing message with the caller's correlation id
         # so receivers can echo it back on USER_ACTION / INTERVENTION_APPLIED
         # replies and the full intent-to-effect chain stays traceable.
         if msg.correlation_id is None:
             msg.correlation_id = get_correlation_id()
+
+        self._events.outbound_transport.publish(
+            OutboundTransportEvent(
+                message_type=str(msg.type),
+                payload=dict(msg.payload or {}),
+                correlation_id=msg.correlation_id,
+                target_client_types=tuple(msg.target_client_types or ()),
+            )
+        )
+
+        if not self._clients:
+            return 0
 
         payload = msg.to_json()
         target_types = set(msg.target_client_types or [])
@@ -3472,8 +3551,8 @@ class WebSocketServer:
         store_backend: str | None = None
         store_healthy: bool | None = None
         try:
-            from cortex.services.api_gateway.app import registry as _registry
-            frame_meta = _registry.get("latest_frame_meta")
+            runtime_status = self._runtime_health_snapshot()
+            frame_meta = runtime_status.latest_frame_meta
             if frame_meta is not None:
                 fm_mono_ns = getattr(frame_meta, "observed_at_mono_ns", None)
                 fm_boot_id = getattr(frame_meta, "boot_id", None)
@@ -3511,7 +3590,7 @@ class WebSocketServer:
             # Daemon plants this when the capture pipeline fails to
             # start so the very first broadcast carries the offline
             # marker.
-            if bool(_registry.get("capture_stale") or False):
+            if runtime_status.capture_stale:
                 stale = True
             # If there ARE recent frames, capture is healthy regardless of
             # what the stale flag says — clear it so a transient init
@@ -3519,16 +3598,12 @@ class WebSocketServer:
             # UI stuck in "offline".
             if frames_flowing:
                 stale = False
-            store_degraded = bool(_registry.get("store_degraded") or False)
-            raw_backend = _registry.get("store_backend")
-            store_backend = str(raw_backend) if raw_backend is not None else None
-            raw_healthy = _registry.get("store_healthy")
-            store_healthy = (
-                bool(raw_healthy) if raw_healthy is not None else None
-            )
+            store_degraded = runtime_status.store_degraded
+            store_backend = runtime_status.store_backend
+            store_healthy = runtime_status.store_healthy
         except Exception:
-            # Registry lookup is best-effort; never block a broadcast.
-            logger.debug("registry lookup for capture/store status failed", exc_info=True)
+            # Health projection is best-effort; never block a broadcast.
+            logger.debug("runtime status lookup failed", exc_info=True)
 
         capture_status = CaptureStatus(
             frames_flowing=frames_flowing,

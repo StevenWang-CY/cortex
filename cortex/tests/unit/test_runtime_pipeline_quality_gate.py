@@ -90,7 +90,7 @@ async def _run_outputs(daemon: object, outputs: list[object]) -> None:
         mock_posture.update.return_value = fake_posture
         mock_fusion.update_kinematics.return_value = None
         mock_fusion.update_physio.return_value = None
-        with patch("cortex.services.runtime_daemon.registry") as mock_reg:
+        with patch.object(daemon, "_services") as mock_reg:
             mock_reg.register.return_value = None
             for out in outputs:
                 await daemon._process_capture_output(out)  # type: ignore[attr-defined]

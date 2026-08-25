@@ -32,6 +32,7 @@ from cortex.apps.desktop_shell.context_privacy_controller import (
     ContextPrivacyController,
 )
 from cortex.apps.desktop_shell.dashboard import DashboardWindow
+from cortex.apps.desktop_shell.message_router import DesktopMessageRouter
 from cortex.apps.desktop_shell.onboarding import OnboardingWindow, onboarding_marker_path
 from cortex.apps.desktop_shell.overlay import OverlayWindow
 from cortex.apps.desktop_shell.settings import SettingsDialog
@@ -100,7 +101,6 @@ class WebSocketBridge(QObject):
         # is not strictly greater than the last applied value for its
         # type. Reset to {} on every fresh connect so a daemon restart
         # always wins.
-        self._last_seq_by_type: dict[str, int] = {}
         self._boot_id = uuid4()
         self._reconnect_delay_max = 30.0
         # Debt-2 (audit): cache the capability token at startup so we can
@@ -113,6 +113,45 @@ class WebSocketBridge(QObject):
         except Exception:
             logger.exception("Could not load capability token; AUTH will fail")
             self._auth_token = None
+        self._message_router = DesktopMessageRouter(
+            {
+                "STATE_UPDATE": lambda payload: self.state_updated.emit(payload),
+                "INTERVENTION_TRIGGER": lambda payload: (
+                    self.intervention_triggered.emit(payload)
+                ),
+                "INTERVENTION_RESTORE": lambda payload: (
+                    self.intervention_restored.emit(payload)
+                ),
+                "INTERVENTION_TRANSACTION_STATE": (
+                    lambda payload: self.intervention_transaction_state.emit(payload)
+                ),
+                "INTERVENTION_FAILED": lambda payload: (
+                    self.intervention_failed.emit(payload)
+                ),
+                "INTERVENTION_PROMPT": lambda payload: (
+                    self.intervention_prompt.emit(payload)
+                ),
+                "SETTINGS_SYNC": lambda payload: self.settings_synced.emit(payload),
+                "CALIBRATION_UPDATED": lambda payload: (
+                    self.calibration_updated.emit(payload)
+                ),
+                "CALIBRATION_UPDATE_FAILED": lambda payload: (
+                    self.calibration_update_failed.emit(payload)
+                ),
+                "SESSION_LIST": lambda payload: (
+                    self.session_list_received.emit(payload)
+                ),
+                "SESSION_DETAIL": lambda payload: (
+                    self.session_detail_received.emit(payload)
+                ),
+                "TRENDS_PAYLOAD": lambda payload: self.trends_received.emit(payload),
+                "SESSION_RECAP": lambda payload: (
+                    self.session_recap_received.emit(payload)
+                ),
+            }
+        )
+        # One-release compatibility facade. New code calls router.reset().
+        self._last_seq_by_type = self._message_router.sequence_state
 
     def start(self) -> None:
         """Start the WebSocket listener in a background thread."""
@@ -443,7 +482,7 @@ class WebSocketBridge(QObject):
                     # here the receiver would reject every post-restart
                     # frame as "stale" until the new daemon's counter
                     # caught up with the pre-restart value.
-                    self._last_seq_by_type.clear()
+                    self._message_router.reset()
 
                     # Debt-2 (audit): AUTH is the contractual first
                     # frame. The daemon refuses every other type until
@@ -511,75 +550,9 @@ class WebSocketBridge(QObject):
                     )
 
     def _handle_message(self, raw: str) -> None:
-        """Parse and dispatch a WebSocket message."""
-        try:
-            msg = json.loads(raw)
-        except json.JSONDecodeError:
-            return
+        """Decode through the same router used by in-process events."""
 
-        msg_type = msg.get("type", "")
-        payload = msg.get("payload", {})
-
-        # F17 (audit): per-type drop-stale on the WSMessage envelope
-        # ``sequence`` field. The daemon increments this once per
-        # outbound message; receivers maintain a per-type last-applied
-        # value and ignore any frame whose sequence isn't strictly
-        # greater. ``sequence=0`` from older daemons or test fixtures
-        # bypasses the check (the default goes through on the first
-        # frame only, which is the safe behaviour at connect time).
-        seq = msg.get("sequence", 0)
-        if isinstance(seq, int) and seq > 0 and msg_type:
-            last = self._last_seq_by_type.get(msg_type, 0)
-            if seq <= last:
-                logger.debug(
-                    "F17: dropping stale %s frame seq=%d last=%d",
-                    msg_type, seq, last,
-                )
-                return
-            self._last_seq_by_type[msg_type] = seq
-
-        if msg_type == "STATE_UPDATE":
-            self.state_updated.emit(payload)
-        elif msg_type == "INTERVENTION_TRIGGER":
-            self.intervention_triggered.emit(payload)
-        elif msg_type == "INTERVENTION_RESTORE":
-            self.intervention_restored.emit(payload)
-        elif msg_type == "INTERVENTION_TRANSACTION_STATE":
-            self.intervention_transaction_state.emit(
-                payload if isinstance(payload, dict) else {}
-            )
-        # P1-FC-INTERVENTION-FAILED / -PROMPT: surface the daemon's
-        # total-failure broadcast (toast) and the cross-surface prompt
-        # (informational) in WS mode as well.
-        elif msg_type == "INTERVENTION_FAILED":
-            self.intervention_failed.emit(payload if isinstance(payload, dict) else {})
-        elif msg_type == "INTERVENTION_PROMPT":
-            self.intervention_prompt.emit(payload if isinstance(payload, dict) else {})
-        elif msg_type == "SETTINGS_SYNC":
-            self.settings_synced.emit(payload)
-        elif msg_type == "CALIBRATION_UPDATED":
-            self.calibration_updated.emit(
-                payload if isinstance(payload, dict) else {}
-            )
-        elif msg_type == "CALIBRATION_UPDATE_FAILED":
-            self.calibration_update_failed.emit(
-                payload if isinstance(payload, dict) else {}
-            )
-        # P0 §3.1 / §3.2 / §3.3: history / trends / recap inbound dispatch.
-        elif msg_type == "SESSION_LIST":
-            self.session_list_received.emit(payload if isinstance(payload, dict) else {})
-        elif msg_type == "SESSION_DETAIL":
-            self.session_detail_received.emit(payload if isinstance(payload, dict) else {})
-        elif msg_type == "TRENDS_PAYLOAD":
-            self.trends_received.emit(payload if isinstance(payload, dict) else {})
-        elif msg_type == "SESSION_RECAP":
-            # Phase 4.B fix (#30): empty payloads ARE meaningful — the
-            # daemon broadcasts ``{}`` for short sessions to tell the
-            # dashboard to finalise its stop flow without opening the
-            # recap sheet. Forward an empty dict in that case; the
-            # dashboard's ``apply_session_recap`` handles the empty
-            # payload as the synthetic short-session signal.
-            self.session_recap_received.emit(payload if isinstance(payload, dict) else {})
+        self._message_router.dispatch_json(raw)
 
 
 # ---------------------------------------------------------------------------

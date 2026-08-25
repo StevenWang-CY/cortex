@@ -34,6 +34,22 @@ from cortex.application.clock import (
     unix_seconds,
     utc_datetime,
 )
+from cortex.application.coordinators import (
+    ExperimentCoordinator,
+    ExperimentOperations,
+    InferenceCoordinator,
+    InferenceOperations,
+    InterventionCoordinator,
+    LoopSpec,
+    OperationsCoordinator,
+    RuntimeCoordinatorSet,
+    SensingCoordinator,
+    SensingOperations,
+)
+from cortex.application.events import Subscription
+from cortex.application.gateway import WebSocketCommandHandlers
+from cortex.application.kernel import ApplicationKernel
+from cortex.application.task_supervisor import TaskFailure, TaskGroupName
 from cortex.libs.adapters.leetcode_adapter import LeetCodeAdapter
 from cortex.libs.config.settings import CortexConfig, get_config
 from cortex.libs.logging.structured import (
@@ -109,7 +125,7 @@ from cortex.libs.store import (
 )
 from cortex.libs.utils import receptivity
 from cortex.services.activity_tracker.aggregator import ActivityAggregator
-from cortex.services.api_gateway.app import create_app, registry
+from cortex.services.api_gateway.app import create_app
 from cortex.services.api_gateway.websocket_server import WebSocketServer
 from cortex.services.capture_service.calibration_store import (
     CalibrationProfileStore,
@@ -716,6 +732,7 @@ class CortexDaemon:
         config: CortexConfig | None = None,
         *,
         clock: Clock | None = None,
+        kernel: ApplicationKernel | None = None,
     ) -> None:
         self.config = config or get_config()
         self._clock = clock or SYSTEM_CLOCK
@@ -762,6 +779,16 @@ class CortexDaemon:
         self._baseline_snapshot = UserBaselines()
         self._inference_publication_paused = False
         self._shutdown = asyncio.Event()
+        self._kernel = kernel or ApplicationKernel.create(
+            on_task_failure=self._on_supervised_task_failure,
+        )
+        self._services = self._kernel.services
+        self._events = self._kernel.events
+        self._task_supervisor = self._kernel.tasks
+        self._runtime_status = self._kernel.runtime_status
+        self._runtime_data = self._kernel.runtime_data
+        self._runtime_status.bind_daemon(self)
+        self._stop_started = False
         self._tasks: list[asyncio.Task[Any]] = []
         # F03: every dynamically-spawned background task (intervention
         # dispatch, in-flight LLM call, etc.) is tracked here so stop()
@@ -777,6 +804,8 @@ class CortexDaemon:
         # must handle thread-safety, e.g. via Qt signal emission).
         self._state_callback: Callable[[dict[str, Any]], None] | None = None
         self._intervention_callback: Callable[[dict[str, Any]], None] | None = None
+        self._legacy_state_subscription: Subscription | None = None
+        self._legacy_intervention_subscription: Subscription | None = None
         # F17 (audit): per-callback monotonic sequence numbers. The
         # in-process bridge (``DaemonBridge``) reads ``_seq`` from the
         # payload and drops frames whose ``_seq`` is not strictly
@@ -872,22 +901,20 @@ class CortexDaemon:
         self._executor.set_editor_focus_hook(self._resume_last_active_file)
         self._executor.set_prompt_broadcast_hook(self._broadcast_prompt)
 
-        self._ws_server = WebSocketServer(self.config.api, clock=self._clock)
-        self._ws_server.set_user_action_callback(self._handle_user_action)
-        self._ws_server.set_settings_callback(self.apply_settings)
-        self._ws_server.set_calibration_reload_callback(self.activate_calibration_profile)
-        self._ws_server.set_shutdown_callback(self._request_shutdown)
-        self._ws_server.set_leetcode_context_callback(self._handle_leetcode_context_update)
-        self._ws_server.set_intervention_applied_callback(self._handle_intervention_applied)
+        self._ws_server = WebSocketServer(
+            self.config.api,
+            clock=self._clock,
+            services=self._services,
+            events=self._events,
+            runtime_status=self._runtime_status,
+        )
         # P0 §3.6: route MICRO_STEP_TOGGLED frames into ``toggle_micro_step``
         # so peer surfaces (popup, VS Code panel, WS-mode overlay) can
         # toggle steps without the in-process Qt overlay path.
-        self._ws_server.set_micro_step_toggled_callback(self.toggle_micro_step)
         # G1 (audit-prod): caller registers via set_client_identified_callback
         # to bridge connection events to the desktop shell. Default is a
         # noop list so the daemon can still run headless.
         self._client_identified_listeners: list[Callable[[str, bool], None]] = []
-        self._ws_server.set_client_identified_callback(self._on_client_identified)
 
         self._leetcode_adapter = LeetCodeAdapter()
         self._leetcode_adapter.set_ws_sender(self._send_leetcode_ws_message)
@@ -1083,6 +1110,11 @@ class CortexDaemon:
         # False there. We OR with the existing value so the explicit
         # except-branch above (construction failure) is never un-set.
         self._store_degraded = self._store_degraded or bool(getattr(self._store, "degraded", False))
+        self._runtime_status.publish_storage(
+            degraded=self._store_degraded,
+            backend="sqlite",
+            healthy=not self._store_degraded,
+        )
 
         self._focus_break_policy = FocusBreakPolicy(
             enabled=self.config.intervention.enable_focus_break_reminders,
@@ -1147,17 +1179,6 @@ class CortexDaemon:
         )
         self._executor.set_authorization_verifier(self._transaction_coordinator.validate_consumed)
         self._restore_manager.set_restore_callback(self._restore_transaction_and_wait)
-        self._ws_server.set_intervention_authorize_callback(self._authorize_intervention)
-        self._ws_server.set_intervention_receipt_callback(self._record_intervention_receipts)
-        self._ws_server.set_intervention_dispatch_failure_callback(
-            self._record_intervention_dispatch_failure
-        )
-        self._ws_server.set_intervention_partial_dispatch_callback(
-            self._compensate_partial_intervention_dispatch
-        )
-        self._ws_server.set_intervention_dispatch_binding_callback(
-            self._transaction_coordinator.bind_dispatch_targets
-        )
         self._pending_restore_results: dict[str, asyncio.Future[bool]] = {}
         self._pending_startup_restores: dict[str, InterventionRestoreCommand] = {}
 
@@ -1256,8 +1277,6 @@ class CortexDaemon:
 
         # Activity tracker aggregator
         self._activity_aggregator = ActivityAggregator(store=self._store)
-        self._ws_server.set_activity_sync_callback(self._handle_activity_sync)
-        self._ws_server.set_tab_relevance_feedback_callback(self._handle_tab_relevance_feedback)
 
         # Track previous state for copilot throttle transitions
         self._prev_state: str = "FLOW"
@@ -1295,19 +1314,10 @@ class CortexDaemon:
         self._recap_dismissed_event: asyncio.Event = asyncio.Event()
 
         # P0 §3.1: serve REQUEST_SESSION_LIST / REQUEST_SESSION_DETAIL
-        self._ws_server.set_session_list_callback(self.list_sessions)
-        self._ws_server.set_session_detail_callback(self.get_session)
         # P0 §3.2: serve REQUEST_TRENDS
-        self._ws_server.set_trends_callback(self.get_trends)
         # P0 §3.3: serve REQUEST_SESSION_RECAP from the cached payload
-        self._ws_server.set_session_recap_cache_callback(
-            self.latest_session_recap,
-        )
         # P0 §3.3 (Wave-2 P1): consume SESSION_RECAP_ACKNOWLEDGED
         # frames; flips ``_recap_dismissed_event`` to release ``stop()``.
-        self._ws_server.set_session_recap_acknowledged_callback(
-            self.acknowledge_session_recap,
-        )
 
         # Compatibility break-overlay controller. The policy feeding it is
         # the opt-in elapsed-focus reminder above; no HRV tracker is bound.
@@ -1322,14 +1332,12 @@ class CortexDaemon:
 
         # P0 §3.9: serve WHY_DETAIL_REQUEST from the per-intervention
         # causal-signal cache. Returns a list[dict] or None.
-        self._ws_server.set_why_detail_callback(self.get_causal_signals)
 
         # P0 §3.11: serve QUIET_MODE_TOGGLE / SNOOZE_REQUEST. Routed
         # through :meth:`set_quiet_mode` which centralises the
         # quiet/pause primitives and broadcasts QUIET_MODE_STATE so
         # every surface (dashboard, overlay, tray, browser popup, VS
         # Code) reflects the same truth.
-        self._ws_server.set_quiet_mode_toggle_callback(self.set_quiet_mode)
 
         # P0 §3.10: auto-armed focus session bookkeeping. ``_auto_focus_armed``
         # is True only when the daemon (not the user) opened the focus
@@ -1401,6 +1409,175 @@ class CortexDaemon:
         # dashboard.
         self._desktop_focused_probe: Callable[[], bool] | None = None
 
+        self._coordinators = self._compose_runtime_coordinators()
+        self._bind_gateway_handlers()
+
+    def _on_supervised_task_failure(self, failure: TaskFailure) -> None:
+        """Fail the application closed when a critical owner exits."""
+
+        if failure.critical:
+            logger.error(
+                "Critical application task failed; requesting shutdown: %s/%s",
+                failure.group,
+                failure.name,
+            )
+            self._shutdown.set()
+
+    def _bind_gateway_handlers(self) -> None:
+        """Compose the transport command boundary exactly once."""
+
+        self._intervention_coordinator.bind(self._ws_server)
+
+    def _gateway_command_handlers(self) -> WebSocketCommandHandlers:
+        """Return the immutable command port implemented by this runtime."""
+
+        return WebSocketCommandHandlers(
+            user_action=self._handle_user_action,
+            settings=self.apply_settings,
+            calibration_reload=self.activate_calibration_profile,
+            shutdown=self._request_shutdown,
+            activity_sync=self._handle_activity_sync,
+            tab_relevance_feedback=self._handle_tab_relevance_feedback,
+            leetcode_context=self._handle_leetcode_context_update,
+            intervention_applied=self._handle_intervention_applied,
+            intervention_authorize=self._authorize_intervention,
+            intervention_receipt=self._record_intervention_receipts,
+            intervention_dispatch_failure=self._record_intervention_dispatch_failure,
+            intervention_partial_dispatch=self._compensate_partial_intervention_dispatch,
+            intervention_dispatch_binding=(
+                self._transaction_coordinator.bind_dispatch_targets
+            ),
+            client_identified=self._on_client_identified,
+            session_list=self.list_sessions,
+            session_detail=self.get_session,
+            trends=self.get_trends,
+            micro_step_toggled=self.toggle_micro_step,
+            why_detail=self.get_causal_signals,
+            session_recap_cache=self.latest_session_recap,
+            session_recap_acknowledged=self.acknowledge_session_recap,
+            quiet_mode_toggle=self.set_quiet_mode,
+        )
+
+    def _compose_runtime_coordinators(self) -> RuntimeCoordinatorSet:
+        """Declare every long-lived application loop and its owner."""
+
+        self._intervention_coordinator = InterventionCoordinator(
+            self._task_supervisor,
+            handlers=self._gateway_command_handlers(),
+        )
+        return RuntimeCoordinatorSet(
+            SensingCoordinator(
+                self._task_supervisor,
+                operations=SensingOperations(
+                    capture_enabled=lambda: (
+                        self._capture_available
+                        and self._capture_processing_enabled
+                    ),
+                    next_capture=self._next_capture_output,
+                    process_capture=self._process_capture_output,
+                    telemetry_enabled=lambda: self._telemetry_enabled,
+                    sample_telemetry=self._sample_telemetry,
+                    refresh_context=self._refresh_context,
+                ),
+            ),
+            InferenceCoordinator(
+                self._task_supervisor,
+                operations=InferenceOperations(
+                    state_loop=self._state_loop,
+                    current_publication=lambda: self._latest_broadcast_snapshot,
+                    publish_state=self._ws_server.broadcast_state,
+                    broadcast_interval_seconds=self._broadcast_interval_seconds,
+                ),
+            ),
+            # Intervention commands are event-driven through the immutable
+            # WebSocket handler bundle; this coordinator deliberately owns no
+            # polling loop.
+            self._intervention_coordinator,
+            ExperimentCoordinator(
+                self._task_supervisor,
+                operations=ExperimentOperations(
+                    finalize_outcomes=self._finalize_policy_outcomes,
+                    outcome_interval_seconds=(
+                        self.config.eval.outcome.collector_interval_seconds
+                    ),
+                    generate_diagnostics_if_due=(
+                        self._generate_policy_diagnostics_if_due
+                        if self.config.eval.policy_diagnostics.enabled
+                        else None
+                    ),
+                ),
+            ),
+            OperationsCoordinator(
+                self._task_supervisor,
+                (
+                    LoopSpec(
+                        "cortex-longitudinal-loop",
+                        self._longitudinal_loop,
+                        critical=False,
+                    ),
+                    LoopSpec(
+                        "cortex-retention-loop",
+                        self._retention_sweep_loop,
+                        critical=False,
+                    ),
+                    LoopSpec(
+                        "cortex-session-checkpoint-loop",
+                        self._session_checkpoint_loop,
+                        critical=False,
+                    ),
+                    LoopSpec(
+                        "cortex-chronotype-backfill",
+                        lambda: asyncio.to_thread(
+                            self._session_aggregator.backfill_if_needed
+                        ),
+                        critical=False,
+                    ),
+                ),
+            ),
+        )
+
+    @property
+    def task_tree(self) -> dict[str, Any]:
+        """Return an operator-safe snapshot of application task ownership."""
+
+        return self._task_supervisor.snapshot()
+
+    @property
+    def services(self) -> Any:
+        """Expose the instance composition container for diagnostic adapters."""
+
+        return self._services
+
+    def _current_state_estimate(self) -> Any | None:
+        value = self._runtime_data.snapshot().state_estimate
+        return value if value is not None else self._services.get("latest_state_estimate")
+
+    def _current_telemetry(self) -> Any | None:
+        value = self._runtime_data.snapshot().telemetry
+        return value if value is not None else self._services.get("latest_telemetry")
+
+    def _current_feature_vector(self) -> Any | None:
+        value = self._runtime_data.snapshot().feature_vector
+        return value if value is not None else self._services.get("latest_feature_vector")
+
+    def _workspace_snapshot(self, intervention_id: str) -> Any | None:
+        present, value = self._runtime_data.workspace_snapshot(intervention_id)
+        if present:
+            return value
+        return self._services.get(f"workspace_snapshot:{intervention_id}")
+
+    def subscribe_state(
+        self,
+        listener: Callable[[dict[str, Any]], None],
+    ) -> Subscription:
+        return self._events.state.subscribe(listener)
+
+    def subscribe_intervention(
+        self,
+        listener: Callable[[dict[str, Any]], None],
+    ) -> Subscription:
+        return self._events.intervention.subscribe(listener)
+
     @property
     def intervention_execution_mode(
         self,
@@ -1435,7 +1612,10 @@ class CortexDaemon:
         the recipient is responsible for thread-safe dispatching (e.g.
         emit a Qt signal).
         """
+        if self._legacy_state_subscription is not None:
+            self._legacy_state_subscription.cancel()
         self._state_callback = fn
+        self._legacy_state_subscription = self.subscribe_state(fn)
 
     def set_intervention_callback(self, fn: Callable[[dict[str, Any]], None]) -> None:
         """Register a callback invoked when an intervention is sent.
@@ -1443,7 +1623,10 @@ class CortexDaemon:
         The callback receives a deep-copied dict of the intervention plan
         payload.  Same threading caveat as :meth:`set_state_callback`.
         """
+        if self._legacy_intervention_subscription is not None:
+            self._legacy_intervention_subscription.cancel()
         self._intervention_callback = fn
+        self._legacy_intervention_subscription = self.subscribe_intervention(fn)
 
     # ------------------------------------------------------------------
     # F05: background task helper + apply-confirmation primitives
@@ -1468,10 +1651,27 @@ class CortexDaemon:
         instead of disappearing into asyncio's "Task exception was
         never retrieved" garbage-collection warning at process exit.
         """
-        task = asyncio.create_task(coro, name=name)
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
-        task.add_done_callback(_supervise_background_task)
+        supervisor = getattr(self, "_task_supervisor", None)
+        if supervisor is None:
+            # Compatibility for narrow mixin-style adapters that bind this
+            # method without constructing the full kernel. The task is still
+            # supervised; production always supplies the kernel-owned one.
+            from cortex.application.task_supervisor import TaskSupervisor
+
+            supervisor = TaskSupervisor()
+            self._task_supervisor = supervisor
+        background_tasks = getattr(self, "_background_tasks", None)
+        if background_tasks is None:
+            background_tasks = set()
+            self._background_tasks = background_tasks
+        task = supervisor.spawn(
+            coro,
+            name=name or "cortex-background-task",
+            group=TaskGroupName.BACKGROUND,
+            critical=False,
+        )
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
         return task
 
     @staticmethod
@@ -1542,7 +1742,8 @@ class CortexDaemon:
             # surface ``capture.frames_flowing`` and ``face_detected``;
             # adding the ``stale`` field there keeps the wire path
             # unchanged.
-            registry.register("capture_stale", True)
+            self._services.register("capture_stale", True)
+            self._runtime_status.mark_capture_stale()
             await self._ws_server.broadcast_state(estimate, None)
         except Exception:
             logger.warning(
@@ -1751,53 +1952,19 @@ class CortexDaemon:
         # rather than adding a new MessageType.
         if self._store_degraded:
             try:
-                registry.register("store_degraded", True)
+                self._services.register("store_degraded", True)
+                self._runtime_status.publish_storage(
+                    degraded=True,
+                    backend="sqlite",
+                    healthy=False,
+                )
             except Exception:
                 logger.debug("registry.register(store_degraded) failed", exc_info=True)
 
-        self._tasks = [
-            asyncio.create_task(self._capture_loop(), name="cortex-capture-loop"),
-            asyncio.create_task(self._telemetry_loop(), name="cortex-telemetry-loop"),
-            asyncio.create_task(self._state_loop(), name="cortex-state-loop"),
-            asyncio.create_task(self._broadcast_loop(), name="cortex-broadcast-loop"),
-            asyncio.create_task(self._context_loop(), name="cortex-context-loop"),
-            asyncio.create_task(self._longitudinal_loop(), name="cortex-longitudinal-loop"),
-            asyncio.create_task(self._policy_outcome_loop(), name="cortex-policy-outcome-loop"),
-        ]
-        if self.config.eval.policy_diagnostics.enabled:
-            self._tasks.append(
-                asyncio.create_task(
-                    self._policy_diagnostics_loop(),
-                    name="cortex-policy-diagnostics-loop",
-                )
-            )
-        # G.2: daily retention sweep so storage doesn't grow forever.
-        self._tasks.append(
-            asyncio.create_task(self._retention_sweep_loop(), name="cortex-retention-loop")
-        )
-        # Task C: periodic checkpoint so the in-progress session is visible
-        # in the History tab (which reads the on-disk store) while running.
-        self._tasks.append(
-            asyncio.create_task(
-                self._session_checkpoint_loop(), name="cortex-session-checkpoint-loop"
-            )
-        )
-
-        # P0 §3.2: kick off chronotype backfill on a worker thread so
-        # cold-start doesn't block the daemon loop. The aggregator is
-        # idempotent — repeated calls are no-ops if the model is fresh.
-        # B7 (Phase 4.1): the previously-orphaned task is now tracked on
-        # ``self._tasks`` AND wrapped with the supervision callback so
-        # any unexpected exception lands in the daemon log instead of
-        # being silently swallowed by asyncio's garbage collector.
-        _chronotype_backfill_task = asyncio.create_task(
-            asyncio.to_thread(self._session_aggregator.backfill_if_needed),
-            name="cortex-chronotype-backfill",
-        )
-        _chronotype_backfill_task.add_done_callback(
-            _supervise_background_task,
-        )
-        self._tasks.append(_chronotype_backfill_task)
+        # The composition root, rather than this method, declares ownership
+        # of every long-running loop. Critical child failures request a
+        # fail-closed daemon shutdown through ``TaskSupervisor``.
+        self._tasks = list(await self._coordinators.start())
         # P0 §3.2: start the nightly aggregation scheduler. The state
         # dir is the chronotype storage path so ``scheduler_state.json``
         # lives alongside ``model.json`` / ``daily/`` — persisting the
@@ -1877,6 +2044,9 @@ class CortexDaemon:
 
     async def stop(self) -> None:
         """Gracefully stop all runtime services."""
+        if self._stop_started:
+            return
+        self._stop_started = True
         self._shutdown.set()
         # Revoke the production path before cancelling proposal producers.
         # Already-consumed effects are handled by the exact restore barrier
@@ -1913,20 +2083,15 @@ class CortexDaemon:
                     exc_info=True,
                 )
         if self._uvicorn_server is not None:
+            self._task_supervisor.expect_completion(self._api_task)
             self._uvicorn_server.should_exit = True
-        for task in self._tasks:
-            task.cancel()
-        if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
+        await self._coordinators.stop(timeout=5.0)
         self._tasks.clear()
         # F03 + F05: cancel + drain dynamically-spawned background tasks
         # so they cannot outlive the daemon and corrupt persisted state.
         # Apply-confirmation timeout watchers (F05) are part of this set.
-        if self._background_tasks:
-            for task in list(self._background_tasks):
-                task.cancel()
-            await asyncio.gather(*list(self._background_tasks), return_exceptions=True)
-            self._background_tasks.clear()
+        await self._task_supervisor.cancel(TaskGroupName.BACKGROUND, timeout=5.0)
+        self._background_tasks.clear()
         # WP6: while authenticated clients and receipt handlers are still
         # alive, request every exact inverse and wait a bounded interval for
         # verified completion. Offline/unresponsive owners remain durable and
@@ -2186,7 +2351,11 @@ class CortexDaemon:
         finally:
             await self._database.close()
         self._uvicorn_server = None
-        registry.reset()
+        self._task_supervisor.forget_finished()
+        self._services.reset()
+        self._events.clear()
+        self._runtime_status.reset()
+        self._runtime_data.reset()
         logger.info("Cortex daemon stopped")
 
     async def run(self) -> None:
@@ -2196,7 +2365,7 @@ class CortexDaemon:
             await self.stop()
 
     def _register_services(self) -> None:
-        registry.reset()
+        self._services.reset()
         for name, service in {
             "feature_fusion": self._feature_fusion,
             "rule_scorer": self._scorer,
@@ -2232,16 +2401,22 @@ class CortexDaemon:
             "policy_lifecycle": self._policy_lifecycle,
             "copilot_throttle": self._copilot_throttle,
         }.items():
-            registry.register(name, service)
-        registry.register("store_backend", "sqlite")
-        registry.register("store_healthy", not self._store_degraded)
-        registry.healthy = True
+            self._services.register(name, service)
+        self._services.register("store_backend", "sqlite")
+        self._services.register("store_healthy", not self._store_degraded)
+        self._runtime_status.publish_storage(
+            degraded=self._store_degraded,
+            backend="sqlite",
+            healthy=not self._store_degraded,
+        )
+        self._services.healthy = True
 
     def _start_api_server(self) -> None:
         app = create_app(
             config=self.config.api,
             cortex_config=self.config,
             clock=self._clock,
+            services=self._services,
         )
         # Phase-4b TASK L: bind a concrete InterventionPort instance on
         # the app's state so routes that depend on the protocol
@@ -2335,7 +2510,12 @@ class CortexDaemon:
                 logger.exception("API server crashed unexpectedly; triggering daemon shutdown")
                 self._shutdown.set()
 
-        self._api_task = asyncio.create_task(_supervised_serve(), name="cortex-api")
+        self._api_task = self._task_supervisor.spawn(
+            _supervised_serve(),
+            name="cortex-api",
+            group=TaskGroupName.TRANSPORT,
+            critical=True,
+        )
 
     def _current_app_name(self) -> str:
         events = self._window_tracker.get_events_in_window(window_seconds=60.0)
@@ -2572,9 +2752,9 @@ class CortexDaemon:
                 "causal_attribution",
             ),
         )
-        registry.register("active_calibration_profile", profile.model_dump(mode="json"))
-        registry.register("calibration_updated", event.model_dump(mode="json"))
-        registry.register(
+        self._services.register("active_calibration_profile", profile.model_dump(mode="json"))
+        self._services.register("calibration_updated", event.model_dump(mode="json"))
+        self._services.register(
             "camera_calibration_valid",
             prepared.camera_calibration_valid,
         )
@@ -2587,34 +2767,10 @@ class CortexDaemon:
     async def _request_context(self, client_type: str) -> dict[str, Any]:
         return await self._ws_server.request_context(client_type)
 
-    async def _capture_loop(self) -> None:
-        try:
-            while True:
-                if not self._capture_available or not self._capture_processing_enabled:
-                    await asyncio.sleep(0.5)
-                    continue
-                try:
-                    output = await self._capture_pipeline.get_output(timeout=0.5)
-                except Exception:
-                    # Audit-2 fix: a NaN landmark or an rPPG numerical
-                    # blow-up used to propagate out of the loop and kill
-                    # the task silently. The user then saw zero physio
-                    # updates for the rest of the session with no log
-                    # trace. Log + continue keeps the pipeline alive.
-                    logger.exception("Capture pipeline get_output failed; continuing")
-                    await asyncio.sleep(0.5)
-                    continue
-                if output is not None:
-                    try:
-                        await self._process_capture_output(output)
-                    except Exception:
-                        # Mediapipe occasionally returns malformed
-                        # landmarks; treat as a transient bad frame and
-                        # keep the loop running.
-                        logger.exception("Capture frame processing failed; skipping frame")
-        except asyncio.CancelledError:
-            # B6 (Phase 4.1): graceful task shutdown; intentional.
-            logger.debug("capture loop cancelled")
+    async def _next_capture_output(self) -> PipelineOutput | None:
+        """Typed sensing port implemented by the capture pipeline."""
+
+        return await self._capture_pipeline.get_output(timeout=0.5)
 
     @property
     def _rgb_history(self) -> deque[np.ndarray]:
@@ -2786,9 +2942,9 @@ class CortexDaemon:
         self._last_physio_update = 0.0
         self._last_physio_update_mono_ns = 0
         self._last_kinematics_ts = 0.0
-        registry.register("latest_physio", self._latest_physio)
-        registry.register("latest_kinematics", self._latest_kinematics)
-        registry.register("camera_calibration_valid", self._camera_calibration_valid)
+        self._services.register("latest_physio", self._latest_physio)
+        self._services.register("latest_kinematics", self._latest_kinematics)
+        self._services.register("camera_calibration_valid", self._camera_calibration_valid)
 
     def _handle_camera_identity(
         self,
@@ -2843,8 +2999,8 @@ class CortexDaemon:
         self._active_camera_identity_key = identity.identity_key
         self._active_camera_geometry = new_geometry
         self._active_camera_source_instance_id = source_id
-        registry.register("camera_identity", identity.model_dump(mode="json"))
-        registry.register("camera_calibration_valid", self._camera_calibration_valid)
+        self._services.register("camera_identity", identity.model_dump(mode="json"))
+        self._services.register("camera_calibration_valid", self._camera_calibration_valid)
 
     def _apply_camera_bound_posture_calibration(
         self,
@@ -2945,8 +3101,8 @@ class CortexDaemon:
             hr_delta_5s=None,
             valid=False,
         )
-        registry.register("latest_physio", self._latest_physio)
-        registry.register(
+        self._services.register("latest_physio", self._latest_physio)
+        self._services.register(
             "physio_window_readiness",
             {
                 "ready": False,
@@ -2963,12 +3119,13 @@ class CortexDaemon:
         )
 
     async def _process_capture_output(self, output: PipelineOutput) -> None:
-        registry.register("latest_frame_meta", output.frame_meta)
+        self._services.register("latest_frame_meta", output.frame_meta)
+        self._runtime_status.publish_frame(output.frame_meta)
         observation = self._observation_from_output(output)
         identity = self._camera_identity_from_output(output)
         self._handle_camera_identity(identity, observation)
         self._handle_face_transition(output, observation)
-        registry.register(
+        self._services.register(
             "latest_camera_observation",
             observation.model_dump(mode="json"),
         )
@@ -3077,7 +3234,7 @@ class CortexDaemon:
                 legacy_physio_shadow = self._pulse_estimator.get_features(
                     unix_seconds_at_observation
                 )
-                registry.register(
+                self._services.register(
                     "legacy_physio_shadow",
                     legacy_physio_shadow.model_dump(mode="json"),
                 )
@@ -3133,7 +3290,7 @@ class CortexDaemon:
                         head_vertical_face_units=(respiration_window.head_vertical_face_units),
                     )
                     self._latest_respiration_evidence = respiration_result.fused
-                    registry.register(
+                    self._services.register(
                         "latest_respiration_evidence",
                         {
                             "fused": respiration_result.fused.model_dump(mode="json"),
@@ -3153,8 +3310,8 @@ class CortexDaemon:
                         "respiration_evidence": self._latest_respiration_evidence,
                     }
                 )
-                registry.register("latest_physio", self._latest_physio)
-                registry.register(
+                self._services.register("latest_physio", self._latest_physio)
+                self._services.register(
                     "latest_pulse_evidence",
                     {
                         "summary": pulse_result.summary.model_dump(mode="json"),
@@ -3170,7 +3327,7 @@ class CortexDaemon:
                         },
                     },
                 )
-                registry.register(
+                self._services.register(
                     "physio_window_readiness",
                     {
                         "ready": True,
@@ -3234,94 +3391,38 @@ class CortexDaemon:
             shoulder_drop_ratio=None,
             confidence=output.frame_meta.face_confidence,
         )
-        registry.register("latest_kinematics", self._latest_kinematics)
+        self._services.register("latest_kinematics", self._latest_kinematics)
         self._last_kinematics_ts = mono_seconds
         self._feature_fusion.update_kinematics(
             self._latest_kinematics,
             timestamp=mono_seconds,
         )
 
-    async def _telemetry_loop(self) -> None:
-        try:
-            while True:
-                if not self._telemetry_enabled:
-                    await asyncio.sleep(0.5)
-                    continue
-                features = self._aggregator.build_features()
-                registry.register("latest_telemetry", features)
-                self._feature_fusion.update_telemetry(features)
-                await asyncio.sleep(0.5)
-        except asyncio.CancelledError:
-            # B6 (Phase 4.1): graceful telemetry shutdown.
-            logger.debug("telemetry loop cancelled")
+    async def _sample_telemetry(self) -> None:
+        """Publish one telemetry sample; cadence belongs to its coordinator."""
 
-    async def _broadcast_loop(self) -> None:
-        """Broadcast STATE_UPDATE at a steady 500ms cadence (B.3).
+        features = self._aggregator.build_features()
+        self._services.register("latest_telemetry", features)
+        self._runtime_data.publish_telemetry(features)
+        self._feature_fusion.update_telemetry(features)
 
-        The state pipeline (``_state_loop``) can take 1-3s per iteration when
-        an intervention path runs — feature fusion + classification + LLM
-        trigger evaluation, plus the per-iteration ``await asyncio.sleep(0.5)``.
-        That dragged the visible STATE_UPDATE cadence out of spec; UI bars
-        froze for seconds whenever the daemon was actively working.
+    async def _refresh_context(self) -> None:
+        """Build and publish one context snapshot."""
 
-        This dedicated task wakes every 500ms regardless, reads the latest
-        cached estimate + biometrics that ``_state_loop`` produced, and
-        broadcasts. Clients see a stable cadence; the pipeline is free to
-        run as fast (or slow) as it needs.
-        """
-        try:
-            interval = self._broadcast_interval_seconds
-            while True:
-                await asyncio.sleep(interval)
-                # Audit-2 fix: read the (estimate, biometrics) pair from
-                # the atomic snapshot so the broadcast never ships an
-                # estimate(T+1) paired with biometrics(T). The state
-                # loop writes ``_latest_broadcast_snapshot`` as a single
-                # tuple assignment; the GIL guarantees that pointer swap
-                # is atomic, eliminating the pair-write tearing window.
-                snapshot = self._latest_broadcast_snapshot
-                if snapshot is None:
-                    continue
-                estimate, biometrics = snapshot
-                try:
-                    await self._ws_server.broadcast_state(estimate, biometrics)
-                except Exception:
-                    logger.debug("broadcast_state failed", exc_info=True)
-        except asyncio.CancelledError:
-            # B6 (Phase 4.1): graceful broadcast loop shutdown.
-            logger.debug("broadcast loop cancelled")
-
-    async def _context_loop(self) -> None:
-        """Build context every 5s — separate from fast state loop to avoid blocking."""
-        try:
-            while True:
-                try:
-                    context = await self._context_engine.build_context()
-                    # Audit-2 fix: apply user-supplied goal override so the
-                    # planner sees the intent the user typed into the
-                    # dashboard. We mutate the freshly-built context (no
-                    # external reference yet, no race).
-                    if self._user_goal_override:
-                        try:
-                            context.current_goal_hint = self._user_goal_override
-                        except Exception:
-                            logger.debug(
-                                "Failed to apply user goal override",
-                                exc_info=True,
-                            )
-                    self._latest_context = context
-                    registry.register("latest_task_context", context)
-                    self._terminal_adapter.set_running_command(
-                        context.terminal_context.running_command
-                        if context.terminal_context
-                        else None
-                    )
-                except Exception:
-                    logger.exception("Context loop error")
-                await asyncio.sleep(5.0)
-        except asyncio.CancelledError:
-            # B6 (Phase 4.1): graceful context loop shutdown.
-            logger.debug("context loop cancelled")
+        context = await self._context_engine.build_context()
+        if self._user_goal_override:
+            try:
+                context.current_goal_hint = self._user_goal_override
+            except Exception:
+                logger.debug("Failed to apply user goal override", exc_info=True)
+        self._latest_context = context
+        self._services.register("latest_task_context", context)
+        self._runtime_data.publish_task_context(context)
+        self._terminal_adapter.set_running_command(
+            context.terminal_context.running_command
+            if context.terminal_context
+            else None
+        )
 
     async def _retention_sweep_loop(self) -> None:
         """Run the daily retention sweep (G.2).
@@ -3419,31 +3520,24 @@ class CortexDaemon:
         except asyncio.CancelledError:
             logger.debug("session checkpoint loop cancelled")
 
-    async def _policy_diagnostics_loop(self) -> None:
-        """Generate a nightly descriptive policy-lifecycle report."""
-        try:
-            while True:
-                try:
-                    now = utc_datetime(self._clock).astimezone()
-                    target_hour = self.config.eval.policy_diagnostics.nightly_hour_local
-                    if now.hour == target_hour and now.minute < 5:
-                        await generate_daily_policy_diagnostics(
-                            self._policy_repository,
-                            self.config.storage.path,
-                            day=self._clock.today_utc().isoformat(),
-                        )
-                        await asyncio.sleep(300.0)
-                        continue
-                except Exception:
-                    logger.debug("Failed generating policy diagnostics", exc_info=True)
-                await asyncio.sleep(60.0)
-        except asyncio.CancelledError:
-            logger.debug("policy diagnostics loop cancelled")
+    async def _generate_policy_diagnostics_if_due(self) -> bool:
+        """Generate one due diagnostic; polling cadence belongs to WP10."""
+
+        now = utc_datetime(self._clock).astimezone()
+        target_hour = self.config.eval.policy_diagnostics.nightly_hour_local
+        if now.hour != target_hour or now.minute >= 5:
+            return False
+        await generate_daily_policy_diagnostics(
+            self._policy_repository,
+            self.config.storage.path,
+            day=self._clock.today_utc().isoformat(),
+        )
+        return True
 
     def _policy_outcome_snapshot(self) -> dict[str, Any] | None:
         """Capture the same bounded behavioral fields for every policy arm."""
 
-        estimate = registry.get("latest_state_estimate")
+        estimate = self._current_state_estimate()
         context = self._latest_context
         if estimate is None or context is None:
             return None
@@ -3463,26 +3557,14 @@ class CortexDaemon:
             "boot_id": str(self._clock.boot_id),
         }
 
-    async def _policy_outcome_loop(self) -> None:
-        """Finalize every due window, including no-action, after restart."""
+    async def _finalize_policy_outcomes(self) -> None:
+        """Finalize one due outcome batch, including the no-action arm."""
 
-        interval = self.config.eval.outcome.collector_interval_seconds
-        try:
-            while True:
-                try:
-                    finalized = await self._policy_lifecycle.finalize_due(
-                        self._policy_outcome_snapshot,
-                    )
-                    if finalized:
-                        logger.info(
-                            "Finalized %d policy outcome window(s)",
-                            len(finalized),
-                        )
-                except Exception:
-                    logger.exception("Policy outcome finalization failed")
-                await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            logger.debug("policy outcome loop cancelled")
+        finalized = await self._policy_lifecycle.finalize_due(
+            self._policy_outcome_snapshot,
+        )
+        if finalized:
+            logger.info("Finalized %d policy outcome window(s)", len(finalized))
 
     async def _state_loop(self) -> None:
         try:
@@ -3596,7 +3678,7 @@ class CortexDaemon:
                         active=input_is_active,
                         timestamp=timestamp,
                     )
-                    registry.register("latest_focus_break_decision", break_decision)
+                    self._services.register("latest_focus_break_decision", break_decision)
                     if break_decision.should_recommend and self._interventions_enabled:
                         from cortex.libs.schemas.realtime import BreakRecommendation
 
@@ -3624,7 +3706,8 @@ class CortexDaemon:
                     # cold.
                     try:
                         self._causal_attributor.record_feature_vector(vector)
-                        registry.register("latest_feature_vector", vector)
+                        self._services.register("latest_feature_vector", vector)
+                        self._runtime_data.publish_feature_vector(vector)
                     except Exception:
                         # B20 (Phase 4.1): a silent attributor failure
                         # means the per-intervention causal sparkline
@@ -3648,7 +3731,8 @@ class CortexDaemon:
                             state=estimate.state,
                         )
 
-                    registry.register("latest_state_estimate", estimate)
+                    self._services.register("latest_state_estimate", estimate)
+                    self._runtime_data.publish_state_estimate(estimate)
                     self._recorder.append("state_estimate", estimate.model_dump(mode="json"))
                     # G.1: feed the session-debrief generator.
                     try:
@@ -3701,7 +3785,7 @@ class CortexDaemon:
                     self._latest_biometrics = biometrics
                     self._latest_broadcast_snapshot = (estimate, biometrics)
 
-                    if self._state_callback is not None:
+                    if self._events.state.subscriber_count:
                         # F17: stamp a monotonic sequence into the payload so
                         # the in-process bridge can drop reordered frames.
                         # ``_seq`` underscore-prefix marks this as a wire
@@ -3763,7 +3847,7 @@ class CortexDaemon:
                                 else []
                             ),
                         }
-                        self._state_callback(copy.deepcopy(_payload))
+                        self._events.state.publish(_payload)
 
                     # v2.0: Copilot throttle on state transitions
                     if estimate.state != self._prev_state:
@@ -3796,7 +3880,7 @@ class CortexDaemon:
 
                     context = self._latest_context
                     if context is not None:
-                        telemetry_for_trigger = registry.get("latest_telemetry")
+                        telemetry_for_trigger = self._current_telemetry()
                         typing_burst_seconds = 0.0
                         if telemetry_for_trigger is not None:
                             kb_burst = float(
@@ -3833,12 +3917,12 @@ class CortexDaemon:
                             within_work_hours=within_work_hours,
                             current_time=timestamp,
                         )
-                        registry.register("latest_trigger_decision", decision)
+                        self._services.register("latest_trigger_decision", decision)
                         await self._handle_restore_updates(estimate, timestamp)
 
                         # v2.0: Check zombie reading
                         active_app = self._current_app_name()
-                        telemetry = registry.get("latest_telemetry")
+                        telemetry = self._current_telemetry()
                         kinematics = self._latest_kinematics
                         self._zombie_detector.update_baseline(
                             self._scorer.baselines.blink_rate_baseline
@@ -4115,7 +4199,8 @@ class CortexDaemon:
                     )
                 )
         if clear_snapshot:
-            registry.register(f"workspace_snapshot:{intervention_id}", None)
+            self._services.register(f"workspace_snapshot:{intervention_id}", None)
+            self._runtime_data.put_workspace_snapshot(intervention_id, None)
 
     async def _trigger_intervention(
         self,
@@ -4159,7 +4244,7 @@ class CortexDaemon:
             plan.trigger_url = self._active_trigger_url(context)
 
             # Staleness check: suppress if student genuinely recovered
-            current_state = registry.get("latest_state_estimate")
+            current_state = self._current_state_estimate()
             if current_state:
                 # Suppress only if student is in FLOW for >3s (genuine recovery)
                 if current_state.state == "FLOW" and current_state.dwell_seconds >= 3.0:
@@ -4197,7 +4282,7 @@ class CortexDaemon:
             # so WHY_DETAIL_REQUEST can resolve even if the surface
             # joined late.
             try:
-                latest_features = registry.get("latest_feature_vector")
+                latest_features = self._current_feature_vector()
                 if latest_features is not None:
                     plan.causal_signals = self._causal_attributor.attribute_top_signals(
                         latest_features,
@@ -4272,7 +4357,7 @@ class CortexDaemon:
             if (
                 isinstance(authenticated_count, int)
                 and authenticated_count == 0
-                and self._intervention_callback is None
+                and self._events.intervention.subscriber_count == 0
             ):
                 await self._close_unpresented_transaction(
                     plan.intervention_id,
@@ -4308,8 +4393,12 @@ class CortexDaemon:
                 self._active_plan = plan
                 self._micro_step_recovery_fired = False
             if snapshot is not None:
-                registry.register(
+                self._services.register(
                     f"workspace_snapshot:{plan.intervention_id}",
+                    snapshot,
+                )
+                self._runtime_data.put_workspace_snapshot(
+                    plan.intervention_id,
                     snapshot,
                 )
             self._recorder.append("intervention_plan", plan.model_dump(mode="json"))
@@ -4402,7 +4491,7 @@ class CortexDaemon:
                 execution_mode=execution_mode,
             )
             callback_delivered = False
-            if self._intervention_callback is not None:
+            if self._events.intervention.subscriber_count:
                 # F17: stamp a monotonic sequence so the in-process bridge
                 # can drop reordered intervention triggers. The plan dict
                 # is augmented with ``_seq`` after deep-copying so we
@@ -4432,11 +4521,7 @@ class CortexDaemon:
                 # path is taking over (dual-fire de-dup).
                 if desktop_focused is False:
                     _payload["desktop_not_focused"] = True
-                try:
-                    self._intervention_callback(_payload)
-                    callback_delivered = True
-                except Exception:
-                    logger.exception("In-process intervention presentation failed")
+                callback_delivered = self._events.intervention.publish(_payload) > 0
 
             if sent == 0 and not callback_delivered:
                 # A surface can disconnect between the preflight count and
@@ -5017,7 +5102,7 @@ class CortexDaemon:
                     has_workspace_effect
                     and self._restore_manager.get_active(batch.intervention_id) is None
                 ):
-                    snapshot = registry.get(f"workspace_snapshot:{batch.intervention_id}")
+                    snapshot = self._workspace_snapshot(batch.intervention_id)
                     if snapshot is not None:
                         self._restore_manager.start_intervention(
                             batch.intervention_id,
@@ -5507,7 +5592,7 @@ class CortexDaemon:
         # Fall back to live attribution against the most recent feature
         # vector + baselines if available.
         try:
-            latest_features = registry.get("latest_feature_vector")
+            latest_features = self._current_feature_vector()
             if latest_features is None:
                 return None
             signals = self._causal_attributor.attribute_top_signals(
@@ -6644,7 +6729,7 @@ class CortexDaemon:
         # the prespecified proximal window.
         self._helpfulness.record_user_action(intervention_id, action)
         context = self._latest_context
-        state_estimate = registry.get("latest_state_estimate")
+        state_estimate = self._current_state_estimate()
         if state_estimate:
             reward_record = await self._helpfulness.end_tracking(
                 intervention_id=intervention_id,
@@ -6837,7 +6922,7 @@ class CortexDaemon:
             self._rebound_detector.reset()
 
         self._leetcode_adapter.update_context(context.model_dump(mode="json"))
-        registry.register("latest_leetcode_context", context)
+        self._services.register("latest_leetcode_context", context)
 
     async def _handle_intervention_applied(self, payload: dict[str, Any]) -> None:
         """Reconcile optimistic mutation tracking with the client's ack.
@@ -6974,7 +7059,7 @@ class CortexDaemon:
                 return
 
             baselines = self._scorer.baselines
-            telemetry = registry.get("latest_telemetry")
+            telemetry = self._current_telemetry()
             # Biology-derived mode inputs are contained until their separate
             # reference/label validation gates pass. Domain behavior (typing,
             # submissions, rereads) remains available.
@@ -7045,7 +7130,7 @@ class CortexDaemon:
                 destructive=destructive,
                 parasympathetic_rebound=rebound,
             )
-            registry.register("latest_leetcode_mode_estimate", mode_estimate)
+            self._services.register("latest_leetcode_mode_estimate", mode_estimate)
 
             for action in self._leetcode_interventions.select(mode_estimate, context):
                 action_name = str(action.get("action") or "")
@@ -7667,7 +7752,7 @@ class CortexDaemon:
                     state_config=self.config.state,
                     clock=self._clock,
                 )
-            registry.register("trigger_policy", self._trigger_policy)
+            self._services.register("trigger_policy", self._trigger_policy)
         if "cooldown_seconds" in settings:
             self.config.intervention.cooldown_seconds = int(settings["cooldown_seconds"])
             if hasattr(self._trigger_policy, "update_thresholds"):
@@ -7681,7 +7766,7 @@ class CortexDaemon:
                     state_config=self.config.state,
                     clock=self._clock,
                 )
-            registry.register("trigger_policy", self._trigger_policy)
+            self._services.register("trigger_policy", self._trigger_policy)
         if "webcam_enabled" in settings:
             desired_capture = bool(settings["webcam_enabled"])
             self._capture_processing_enabled = desired_capture
@@ -7842,7 +7927,7 @@ class CortexDaemon:
             if callable(clear_previews):
                 clear_previews()
             self._llm_client = create_llm_client(self.config.llm, clock=self._clock)
-            registry.register("llm_client", self._llm_client)
+            self._services.register("llm_client", self._llm_client)
         # Re-broadcast settings with the values the daemon actually applied,
         # plus any keys clients need to mirror (W-16 cooldown sync).
         # NOTE: dismiss-cooldowns are SEPARATE from the trigger-spacing

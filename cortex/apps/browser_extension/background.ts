@@ -8,8 +8,6 @@
  */
 
 import {
-    classifyTabType as classifyBrowserTabType,
-    classifyTabTypeWithGoal,
     groupSpecificTabs,
     hideNonActiveTabs,
     getSnapshot as getTabManagerSnapshot,
@@ -22,16 +20,24 @@ import {
 import { getAuthToken } from "./lib/auth";
 import { detectBrowser } from "./lib/browser";
 import {
-    minimizeContextUrl,
     PAGE_EXCERPT_MAX_CHARS,
     sanitizeContextText,
-    TAB_TITLE_MAX_CHARS,
 } from "./lib/context-privacy";
 import {
     sanitizeActivityRecord,
-    type ActivityPosition,
     type ActivityRecord,
 } from "./lib/activity-privacy";
+import {
+    canonicalizeActivityUrl as canonicalizeUrl,
+    configureActivityStore,
+    enrichWithRelatedTabs,
+    loadActivities,
+    prepareActivityRecordForStorage,
+    saveActivities,
+    scrubStoredActivityContent,
+    upsertActivity,
+} from "./lib/activity-store";
+export { prepareActivityRecordForStorage } from "./lib/activity-store";
 import {
     isCortexState,
     isSuggestedAction,
@@ -47,6 +53,40 @@ import {
     verifyRestoreCommand,
 } from "./lib/intervention-transaction";
 import { mayExtractPageContent } from "./lib/site-access";
+import {
+    createFocusSession,
+    emptyDailyStats,
+    focusSessionSnapshot,
+    isDistractionForSession,
+    resolveFocusPreset,
+    updateFocusSessionState,
+    type DailyStats,
+    type FocusSession,
+} from "./lib/focus-session";
+import {
+    BrowserContextCollector,
+    type TabData,
+} from "./lib/context-collector";
+import {
+    BrowserSessionStore,
+    type PersistedSessionState,
+} from "./lib/persisted-session";
+import {
+    ClientIdentityStore,
+    FrameReplayGuard,
+    ParseErrorWindow,
+    ReconnectBackoff,
+    SerialCommandQueue,
+    WireEnvelopeEncoder,
+    newWireId,
+} from "./lib/daemon-connection";
+import {
+    CapabilityExecutor,
+    UnsupportedCapabilityError,
+    type CapabilityHandlers,
+} from "./lib/capability-executor";
+import { InterventionPresentationState } from "./lib/intervention-presentation";
+import { TabActivationTelemetry } from "./lib/browser-telemetry";
 import {
     DAEMON_WS_URL,
     DAEMON_HTTP_URL,
@@ -187,100 +227,41 @@ export function _getDebugFlag(): boolean {
 let ws: WebSocket | null = null;
 let connected = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-// F32: keep the initial delay symbolic so the reset on `open` is
-// obviously paired with the doubling in `scheduleReconnect`.
-const INITIAL_RECONNECT_DELAY = 3000;
-let reconnectDelay = INITIAL_RECONNECT_DELAY;
-const MAX_RECONNECT_DELAY = 30000;
+const reconnectBackoff = new ReconnectBackoff(3_000, 30_000);
 let intentionalDisconnect = false;
 let sequence = 0;
 // Browser WebSocket callbacks do not await an async `onmessage` handler. The
 // envelope is still parsed and sequence-checked synchronously, while exact
 // APPLY/RESTORE capability work is serialized on this dedicated chain.
-let transactionCommandChain: Promise<void> = Promise.resolve();
+const transactionCommands = new SerialCommandQueue((error: unknown) => {
+    console.warn(
+        "[cortex.bg] transaction command failed closed:",
+        String(error),
+    );
+});
 
 function enqueueTransactionCommand(
     operation: () => Promise<void>,
 ): Promise<void> {
-    const scheduled = transactionCommandChain.then(operation);
-    transactionCommandChain = scheduled.catch((error: unknown) => {
-        console.warn(
-            "[cortex.bg] transaction command failed closed:",
-            String(error),
-        );
-    });
-    return transactionCommandChain;
+    return transactionCommands.enqueue(operation);
 }
-const WIRE_SCHEMA_VERSION = "2.0";
 const PROTOCOL_VERSION = "2.0";
 const SUPPORTED_PROTOCOL_VERSIONS = ["2.0", "1.0"] as const;
 let negotiatedProtocolVersion: (typeof SUPPORTED_PROTOCOL_VERSIONS)[number] =
     PROTOCOL_VERSION;
-
-function newWireId(): string {
-    try {
-        if (typeof globalThis.crypto?.randomUUID === "function") {
-            return globalThis.crypto.randomUUID();
-        }
-    } catch {
-        // Older extension test runtimes may not expose Web Crypto.
-    }
-    return `xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`.replace(/[xy]/g, (ch) => {
-        const r = (Math.random() * 16) | 0;
-        const v = ch === "x" ? r : (r & 0x3) | 0x8;
-        return v.toString(16);
-    });
-}
-
-const CLIENT_BOOT_ID = newWireId();
-const CLIENT_INSTANCE_STORAGE_KEY = "cortex_client_instance_id_v1";
-let clientInstanceIdPromise: Promise<string> | null = null;
-
-function validClientInstanceId(value: unknown): value is string {
-    return typeof value === "string"
-        && value.length >= 8
-        && value.length <= 128
-        && /^[A-Za-z0-9._:-]+$/.test(value);
-}
+const clientIdentityStore = new ClientIdentityStore();
+const wireEncoder = new WireEnvelopeEncoder({
+    schemaVersion: "2.0",
+    protocolVersion: () => negotiatedProtocolVersion,
+});
+const CLIENT_BOOT_ID = wireEncoder.bootId;
 
 async function getClientInstanceId(): Promise<string> {
-    if (clientInstanceIdPromise) return clientInstanceIdPromise;
-    clientInstanceIdPromise = (async () => {
-        const stored = await chrome.storage.local.get(
-            CLIENT_INSTANCE_STORAGE_KEY,
-        );
-        const existing = stored[CLIENT_INSTANCE_STORAGE_KEY];
-        if (validClientInstanceId(existing)) return existing;
-        const created = `browser_${newWireId()}`;
-        await chrome.storage.local.set({
-            [CLIENT_INSTANCE_STORAGE_KEY]: created,
-        });
-        return created;
-    })();
-    try {
-        return await clientInstanceIdPromise;
-    } catch (error) {
-        clientInstanceIdPromise = null;
-        throw error;
-    }
+    return clientIdentityStore.get();
 }
 
 function withWireMetadata(msg: WSMessage): WSMessage {
-    const sentAtUnixMs = Date.now();
-    const monoMs = typeof globalThis.performance?.now === "function"
-        ? globalThis.performance.now()
-        : 0;
-    return {
-        ...msg,
-        schema_version: WIRE_SCHEMA_VERSION,
-        protocol_version: negotiatedProtocolVersion,
-        event_id: newWireId(),
-        sent_at_unix_ms: sentAtUnixMs,
-        sent_at_mono_ns: Math.max(0, Math.round(monoMs * 1_000_000)),
-        boot_id: CLIENT_BOOT_ID,
-        // One-release dual-write for v1 daemons.
-        timestamp: sentAtUnixMs / 1000,
-    } as WSMessage;
+    return wireEncoder.encode(msg as WSMessage & Record<string, unknown>) as WSMessage;
 }
 // DAEMON_WS_URL, DAEMON_HTTP_URL, LAUNCHER_HTTP_URL — imported from "./config"
 
@@ -295,13 +276,8 @@ let currentState: CortexState | null = null;
  * same cid so the daemon can ignore stale ACKs from a now-superseded
  * plan. `mountedAt` is the local mount timestamp (ms since epoch).
  */
-interface ActiveInterventionRecord {
-    plan: Record<string, unknown>;
-    correlation_id: string;
-    mountedAt: number;
-}
-
-let activeIntervention: ActiveInterventionRecord | null = null;
+const interventionPresentation = new InterventionPresentationState();
+const browserContextCollector = new BrowserContextCollector();
 let quietMode = false;
 
 type ExecutionMode = "suggest_only" | "authorized" | "research_autonomous";
@@ -587,39 +563,7 @@ export function _getExecutionMode(): ExecutionMode {
     return currentExecutionMode;
 }
 
-// Dismissal cooldown: maps intervention_id → timestamp when dismissed
-// Prevents the same intervention from re-triggering within the cooldown window
-const dismissedInterventions = new Map<string, number>();
-const DEFAULT_INTERVENTION_DISMISS_COOLDOWN = 30 * 60 * 1000; // 30 min cooldown after dismiss
-let interventionDismissCooldown = DEFAULT_INTERVENTION_DISMISS_COOLDOWN;
-// Also track by URL pattern to prevent same-site re-triggers
-const dismissedUrlPatterns = new Map<string, number>();
-const DEFAULT_URL_DISMISS_COOLDOWN = 10 * 60 * 1000; // 10 min cooldown for same URL
-let urlDismissCooldown = DEFAULT_URL_DISMISS_COOLDOWN;
-
 // --- Focus Session State ---
-
-interface FocusSession {
-    startTime: number;
-    totalFocusMs: number;      // biometrically-verified focus milliseconds
-    distractionsBlocked: number;
-    lastFocusCheck: number;
-    lastStateWasFocus: boolean;
-    longestStreakMs: number;
-    currentStreakStart: number;
-    goal: string;
-}
-
-interface DailyStats {
-    date: string; // YYYY-MM-DD
-    totalFocusMin: number;
-    totalSessionMin: number;
-    sessions: number;
-    distractionsBlocked: number;
-    longestStreakMin: number;
-    avgHrDuringFocus: number;
-    hrSamples: number;
-}
 
 let focusSession: FocusSession | null = null;
 
@@ -633,25 +577,6 @@ let autoFocusAlarmName: string | null = null;
 // stable preset → patterns map. The browser extension is the source
 // of truth for the per-preset list; the daemon ships only the preset
 // name + any user custom_domains.
-const FOCUS_PRESET_DOMAINS: Record<string, RegExp[]> = {
-    developer: [
-        /reddit\.com/i, /twitter\.com/i, /x\.com/i, /facebook\.com/i,
-        /instagram\.com/i, /tiktok\.com/i, /youtube\.com/i, /netflix\.com/i,
-        /9gag\.com/i, /buzzfeed\.com/i, /tumblr\.com/i, /twitch\.tv/i,
-    ],
-    student: [
-        /instagram\.com/i, /tiktok\.com/i, /youtube\.com/i, /reddit\.com/i,
-        /twitter\.com/i, /x\.com/i, /netflix\.com/i, /twitch\.tv/i,
-        /facebook\.com/i, /snapchat\.com/i,
-    ],
-    writer: [
-        /twitter\.com/i, /x\.com/i, /reddit\.com/i, /facebook\.com/i,
-        /instagram\.com/i, /tiktok\.com/i, /youtube\.com/i, /netflix\.com/i,
-        /hacker-news\.firebaseio\.com/i, /news\.ycombinator\.com/i,
-    ],
-    custom: [],
-};
-
 let activeFocusPresetPatterns: RegExp[] = [];
 let activeFocusCustomDomains: string[] = [];
 // Phase-3 P1-DF-10.4: persisted preset name so the SW can rebuild
@@ -659,100 +584,50 @@ let activeFocusCustomDomains: string[] = [];
 // survive chrome.storage round-trips, but the string preset name does).
 let _activeFocusPresetName: string = "developer";
 
-// Two-tier distraction detection
-const ALWAYS_DISTRACTION = [
-    /instagram\.com/i, /tiktok\.com/i, /netflix\.com/i,
-    /twitch\.tv/i, /9gag\.com/i, /buzzfeed\.com/i, /tumblr\.com/i,
-];
-const CONDITIONAL_DISTRACTION = [
-    /reddit\.com/i, /twitter\.com/i, /x\.com/i, /facebook\.com/i,
-];
-const AI_ASSISTANT_URL_PATTERN = /gemini\.google\.com|chatgpt\.com|chat\.openai\.com|claude\.ai|copilot\.microsoft\.com|perplexity\.ai/i;
-const VIDEO_PLATFORM_URL_PATTERN = /youtube\.com|youtu\.be/i;
-
 // --- Recently-visited tab protection ---
 // Track when each tab was last activated so we can protect recently-used tabs from closing
-const tabLastActivated = new Map<number, number>();
+const tabActivationTelemetry = new TabActivationTelemetry();
 const RECENTLY_ACTIVE_PROTECTION_MS = 5 * 60 * 1000; // 5 minutes
 
 chrome.tabs.onActivated.addListener((activeInfo) => {
-    tabLastActivated.set(activeInfo.tabId, Date.now());
+    tabActivationTelemetry.recordActivation(activeInfo.tabId);
     schedulePersist();
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-    tabLastActivated.delete(tabId);
+    tabActivationTelemetry.recordRemoval(tabId);
     schedulePersist();
 });
 
 // --- State Persistence (survives MV3 service worker restarts) ---
 
-let persistTimer: ReturnType<typeof setTimeout> | null = null;
-// Phase-3 P1-DF-10.4: auto-focus state must survive MV3 SW eviction
-// or ``isDistractionUrl`` falls back to an empty blocklist while the
-// daemon still believes the session is armed.
-const PERSIST_KEYS = [
-    "focusSession", "undoStack", "dismissedInterventions",
-    "dismissedUrlPatterns", "quietMode", "tabLastActivated",
-    "autoFocusArmed", "autoFocusEndsAt", "autoFocusPreset",
-    "autoFocusCustomDomains",
-] as const;
-
-// Phase 4d Task A: auto-focus state mirrored to ``chrome.storage.local``
-// under a single key. ``chrome.storage.session`` clears whenever the
-// browser fully restarts (or when SW eviction races a profile restart),
-// but the daemon's ``STOP_FOCUS_AUTO`` is symmetric — if the extension
-// forgot it ever armed, the stop becomes a no-op and the daemon's
-// _auto_focus_armed bit gets stuck on. Local storage is the durable
-// floor that survives the worst restart scenarios.
-const AUTO_FOCUS_STATE_KEY = "cortex_auto_focus_state";
-let _autoFocusStatePersistTimer: ReturnType<typeof setTimeout> | null = null;
+const browserSessionStore = new BrowserSessionStore();
 
 async function persistAutoFocusState(): Promise<void> {
-    // Debounce so a rapid arm → tick → stop sequence collapses to one
-    // chrome.storage.local.set; matches the schedulePersist pattern.
-    if (_autoFocusStatePersistTimer) clearTimeout(_autoFocusStatePersistTimer);
-    _autoFocusStatePersistTimer = setTimeout(async () => {
-        try {
-            await chrome.storage.local.set({
-                [AUTO_FOCUS_STATE_KEY]: {
-                    autoFocusArmed,
-                    _activeFocusPresetName,
-                    activeFocusPresetPatterns: activeFocusPresetPatterns
-                        .map((p) => p.source),
-                },
-            });
-        } catch {
-            // storage.local may transiently fail (quota / extension reload).
-        }
-    }, 200);
+    browserSessionStore.scheduleAutoFocus({
+        autoFocusArmed,
+        presetName: _activeFocusPresetName,
+        presetPatternSources: activeFocusPresetPatterns.map(
+            (pattern) => pattern.source,
+        ),
+    });
 }
 
 async function restoreAutoFocusStateLocal(): Promise<void> {
     try {
-        const data = await chrome.storage.local.get(AUTO_FOCUS_STATE_KEY);
-        const blob = data[AUTO_FOCUS_STATE_KEY] as
-            | {
-                  autoFocusArmed?: boolean;
-                  _activeFocusPresetName?: string;
-                  activeFocusPresetPatterns?: string[];
-              }
-            | undefined;
+        const blob = await browserSessionStore.loadAutoFocus();
         if (!blob) return;
         // session storage takes precedence — it's the freshest source
         // when both are available. Only adopt local-state fields the
         // session restore left unset.
-        if (typeof blob._activeFocusPresetName === "string"
-            && !_activeFocusPresetName) {
-            _activeFocusPresetName = blob._activeFocusPresetName;
-        }
         if (blob.autoFocusArmed === true && !autoFocusArmed) {
+            _activeFocusPresetName = blob.presetName;
             autoFocusArmed = true;
             // Rebuild patterns from the preset name (regex literals
             // don't survive JSON; the preset string does).
-            activeFocusPresetPatterns =
-                FOCUS_PRESET_DOMAINS[_activeFocusPresetName]
-                || FOCUS_PRESET_DOMAINS.developer;
+            activeFocusPresetPatterns = resolveFocusPreset(
+                _activeFocusPresetName,
+            );
         }
         // Sanity check (spec): inconsistent state where we claim
         // ``autoFocusArmed=true`` but there is no ``focusSession`` means
@@ -790,22 +665,23 @@ async function restoreAutoFocusStateLocal(): Promise<void> {
 }
 
 function schedulePersist(): void {
-    if (persistTimer) clearTimeout(persistTimer);
-    persistTimer = setTimeout(async () => {
-        await chrome.storage.session.set({
-            focusSession,
-            undoStack,
-            dismissedInterventions: [...dismissedInterventions.entries()],
-            dismissedUrlPatterns: [...dismissedUrlPatterns.entries()],
-            quietMode,
-            tabLastActivated: [...tabLastActivated.entries()],
-            // Phase-3 P1-DF-10.4: auto-focus session bookkeeping.
-            autoFocusArmed,
-            autoFocusEndsAt,
-            autoFocusPreset: _activeFocusPresetName,
-            autoFocusCustomDomains: activeFocusCustomDomains,
-        });
-    }, 500);
+    browserSessionStore.scheduleSession(persistedSessionSnapshot());
+}
+
+function persistedSessionSnapshot(): PersistedSessionState<FocusSession, UndoEntry> {
+    const cooldowns = interventionPresentation.cooldownSnapshot();
+    return {
+        focusSession,
+        undoStack,
+        dismissedInterventions: cooldowns.interventions,
+        dismissedUrlPatterns: cooldowns.urls,
+        quietMode,
+        tabLastActivated: tabActivationTelemetry.entries(),
+        autoFocusArmed,
+        autoFocusEndsAt,
+        autoFocusPreset: _activeFocusPresetName,
+        autoFocusCustomDomains: activeFocusCustomDomains,
+    };
 }
 
 /**
@@ -814,39 +690,19 @@ function schedulePersist(): void {
  * `--strict`, so we cast the result to this explicit shape to recover the
  * per-key element types (Map entries round-trip as `[K, V][]` arrays).
  */
-interface PersistedSessionState {
-    focusSession?: FocusSession;
-    undoStack?: UndoEntry[];
-    dismissedInterventions?: [string, number][];
-    dismissedUrlPatterns?: [string, number][];
-    quietMode?: boolean;
-    tabLastActivated?: [number, number][];
-    autoFocusArmed?: boolean;
-    autoFocusEndsAt?: number | null;
-    autoFocusPreset?: string;
-    autoFocusCustomDomains?: string[];
-}
-
 async function restoreState(): Promise<void> {
-    const data = (await chrome.storage.session.get(
-        PERSIST_KEYS as unknown as (keyof PersistedSessionState)[],
-    )) as PersistedSessionState;
+    const data = await browserSessionStore.loadSession<FocusSession, UndoEntry>();
     if (data.focusSession) focusSession = data.focusSession;
     if (data.undoStack) {
         undoStack.splice(0, undoStack.length, ...data.undoStack);
     }
-    if (data.dismissedInterventions) {
-        dismissedInterventions.clear();
-        for (const [k, v] of data.dismissedInterventions) dismissedInterventions.set(k, v);
-    }
-    if (data.dismissedUrlPatterns) {
-        dismissedUrlPatterns.clear();
-        for (const [k, v] of data.dismissedUrlPatterns) dismissedUrlPatterns.set(k, v);
-    }
+    interventionPresentation.hydrateCooldowns({
+        interventions: data.dismissedInterventions,
+        urls: data.dismissedUrlPatterns,
+    });
     if (data.quietMode !== undefined) quietMode = data.quietMode;
     if (data.tabLastActivated) {
-        tabLastActivated.clear();
-        for (const [k, v] of data.tabLastActivated) tabLastActivated.set(k, v);
+        tabActivationTelemetry.hydrate(data.tabLastActivated);
     }
     // Phase-3 P1-DF-10.4: rehydrate auto-focus state so isDistractionUrl
     // keeps blocking even across MV3 SW eviction.
@@ -858,8 +714,9 @@ async function restoreState(): Promise<void> {
     }
     if (typeof data.autoFocusPreset === "string") {
         _activeFocusPresetName = data.autoFocusPreset;
-        activeFocusPresetPatterns = FOCUS_PRESET_DOMAINS[_activeFocusPresetName]
-            || FOCUS_PRESET_DOMAINS.developer;
+        activeFocusPresetPatterns = resolveFocusPreset(
+            _activeFocusPresetName,
+        );
     }
     if (Array.isArray(data.autoFocusCustomDomains)) {
         activeFocusCustomDomains = data.autoFocusCustomDomains
@@ -894,224 +751,17 @@ const BLINK_ALERT_THRESHOLD = 180_000;  // 3 min low blink rate
 
 // --- Activity Tracking State ---
 
-let lastActivitySyncTime = 0;
-const ACTIVITY_SYNC_INTERVAL = 60_000; // Sync to daemon every 60s
-const ACTIVITY_STORAGE_KEY = "cortex_activities";
-const MAX_ACTIVITIES = 200;
-
-async function loadActivities(): Promise<Record<string, ActivityRecord>> {
-    const data = await chrome.storage.local.get(ACTIVITY_STORAGE_KEY);
-    return (data[ACTIVITY_STORAGE_KEY] as Record<string, ActivityRecord>) || {};
-}
-
-async function saveActivities(activities: Record<string, ActivityRecord>): Promise<void> {
-    await chrome.storage.local.set({ [ACTIVITY_STORAGE_KEY]: activities });
-}
-
-async function scrubStoredActivityContent(): Promise<void> {
-    const activities = await loadActivities();
-    const scrubbed: Record<string, ActivityRecord> = {};
-    for (const record of Object.values(activities)) {
-        const safe = sanitizeActivityRecord(record, false);
-        if (safe) scrubbed[safe.content_id] = safe;
-    }
-    await saveActivities(scrubbed);
-}
-
-async function upsertActivity(record: ActivityRecord): Promise<void> {
-    const activities = await loadActivities();
-    const existing = activities[record.content_id];
-
-    if (existing) {
-        // Determine if this is a continuation of the same session or a new visit.
-        // Same session: first_visited matches (content script uses sessionStartTime).
-        // New visit: first_visited differs (content script reset via resetForNewPage).
-        const isSameSession = existing.first_visited === record.first_visited
-            || (record.first_visited > existing.last_visited - 10_000); // within 10s = same session
-
-        if (isSameSession) {
-            // Replace session contribution: subtract old session time, add new
-            existing.duration_spent_s = (existing.duration_spent_s - existing.session_duration_s) + record.duration_spent_s;
-            existing.session_duration_s = record.duration_spent_s;
-        } else {
-            // New visit: add the new session's dwell time
-            existing.duration_spent_s += record.duration_spent_s;
-            existing.session_duration_s = record.duration_spent_s;
-            existing.visit_count++;
-            // Re-visiting means user may want resume card next time
-            existing.dismissed = false;
-        }
-
-        existing.position = record.position;
-        existing.last_visited = record.last_visited;
-        existing.context_snapshot = record.context_snapshot;
-        if (record.cognitive_state) existing.cognitive_state = record.cognitive_state;
-        // Only increase completion, never decrease
-        existing.completion_pct = Math.max(existing.completion_pct, record.completion_pct);
-        existing.max_completion_pct = Math.max(existing.max_completion_pct, record.completion_pct);
-        // Merge related tabs
-        const tabSet = new Set([...existing.related_tabs, ...record.related_tabs]);
-        existing.related_tabs = Array.from(tabSet).slice(0, 5);
-        // Update title if non-empty
-        if (record.title) existing.title = record.title;
-        // Keep the original first_visited
-        activities[record.content_id] = existing;
-    } else {
-        activities[record.content_id] = record;
-    }
-
-    // Enforce cap with LRU eviction
-    const entries = Object.entries(activities);
-    if (entries.length > MAX_ACTIVITIES) {
-        const now = Date.now();
-        const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000;
-        // Sort by last_visited ascending (oldest first)
-        entries.sort((a, b) => a[1].last_visited - b[1].last_visited);
-        while (entries.length > MAX_ACTIVITIES) {
-            const oldest = entries[0];
-            // Prefer evicting entries older than 7 days
-            if (now - oldest[1].last_visited > SEVEN_DAYS || entries.length > MAX_ACTIVITIES + 10) {
-                delete activities[oldest[0]];
-                entries.shift();
-            } else {
-                break;
-            }
-        }
-        // If still over cap, evict oldest regardless
-        while (Object.keys(activities).length > MAX_ACTIVITIES) {
-            const allEntries = Object.entries(activities).sort((a, b) => a[1].last_visited - b[1].last_visited);
-            delete activities[allEntries[0][0]];
-        }
-    }
-
-    await saveActivities(activities);
-
-    // Sync to daemon if connected and enough time has passed
-    const now = Date.now();
-    if (connected && now - lastActivitySyncTime > ACTIVITY_SYNC_INTERVAL) {
-        lastActivitySyncTime = now;
-        syncActivitiesToDaemon(activities);
-    }
-}
-
-export async function prepareActivityRecordForStorage(
-    raw: unknown,
-    senderTab: Pick<chrome.tabs.Tab, "url" | "incognito"> | undefined,
-): Promise<ActivityRecord | null> {
-    if (!senderTab || senderTab.incognito) return null;
-    const allowPageContent = await mayExtractPageContent(senderTab);
-    return sanitizeActivityRecord(raw, allowPageContent);
-}
-
-function syncActivitiesToDaemon(activities: Record<string, ActivityRecord>): void {
-    const top10 = Object.values(activities)
-        .sort((a, b) => b.last_visited - a.last_visited)
-        .slice(0, 10)
-        .map(a => ({
-            content_id: a.content_id,
-            platform: a.platform,
-            content_type: a.content_type,
-            title: a.title,
-            url: a.url,
-            position_description: formatPositionDescription(a),
-            duration_spent_s: a.duration_spent_s,
-            last_visited: a.last_visited,
-            completion_pct: a.completion_pct,
-            topic_tags: a.topic_tags,
-            context_snapshot: a.context_snapshot,
-        }));
-
-    send({
-        type: "ACTIVITY_SYNC",
-        payload: { activities: top10 },
-        timestamp: Date.now() / 1000,
-        sequence: ++sequence,
-    });
-}
-
-function formatPositionDescription(a: ActivityRecord): string {
-    const pos = a.position;
-    switch (pos.type) {
-        case "video": {
-            const ts = pos.timestamp_s as number;
-            const dur = pos.duration_s as number;
-            return `${formatTime(ts)} / ${formatTime(dur)}`;
-        }
-        case "scroll":
-            return `${Math.round(pos.scroll_pct as number)}% read`;
-        case "code_problem":
-            return `Stage: ${pos.stage} · ${pos.wrong_answer_count} WA`;
-        case "notebook":
-            return `Cell ${(pos.cell_index as number) + 1}`;
-        case "pdf":
-            return `Page ${pos.page}/${pos.total_pages}`;
-        case "slides":
-            return `Slide ${(pos.slide_index as number) + 1}/${pos.total_slides}`;
-        case "general":
-            return `${Math.round(pos.scroll_pct as number)}% scrolled`;
-        default:
-            return "";
-    }
-}
-
-function formatTime(seconds: number): string {
-    const s = Math.floor(seconds);
-    const h = Math.floor(s / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    const sec = s % 60;
-    if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
-    return `${m}:${String(sec).padStart(2, "0")}`;
-}
-
-function canonicalizeUrl(rawUrl: string): string {
-    let u: URL;
-    try { u = new URL(rawUrl); } catch { return rawUrl; }
-
-    const STRIP = ["utm_source","utm_medium","utm_campaign","utm_term","utm_content",
-                    "fbclid","gclid","ref","source","si","feature","pp"];
-    for (const p of STRIP) u.searchParams.delete(p);
-    u.hostname = u.hostname.replace(/^www\./, "");
-
-    if (u.hostname.includes("youtube.com") || u.hostname.includes("youtu.be")) {
-        const v = u.searchParams.get("v");
-        if (v) return `https://youtube.com/watch?v=${v}`;
-        if (u.hostname === "youtu.be") return `https://youtube.com/watch?v=${u.pathname.slice(1)}`;
-    }
-    if (u.hostname.includes("bilibili.com")) {
-        const match = u.pathname.match(/\/video\/(BV\w+)/);
-        const p = u.searchParams.get("p") || "1";
-        if (match) return `https://bilibili.com/video/${match[1]}?p=${p}`;
-    }
-    if (u.hostname.includes("leetcode")) {
-        const match = u.pathname.match(/\/problems\/([^/]+)/);
-        if (match) return `https://${u.hostname}/problems/${match[1]}`;
-    }
-
-    const KEEP_HASH = [/docs\.google\.com\/presentation/, /\.pdf$/i];
-    if (!KEEP_HASH.some(p => p.test(rawUrl))) u.hash = "";
-
-    return u.toString();
-}
-
-async function enrichWithRelatedTabs(record: ActivityRecord): Promise<void> {
-    try {
-        const allTabs = (await chrome.tabs.query({})).filter(
-            (tab) => !tab.incognito,
-        );
-        const activities = await loadActivities();
-        const relatedIds: string[] = [];
-        for (const tab of allTabs) {
-            if (!tab.url || tab.url === record.url) continue;
-            const canonical = canonicalizeUrl(tab.url);
-            if (activities[canonical]) {
-                relatedIds.push(canonical);
-            }
-        }
-        record.related_tabs = relatedIds.slice(0, 5);
-    } catch {
-        // tabs query may fail
-    }
-}
+configureActivityStore({
+    isConnected: () => connected,
+    sync: (activities) => {
+        send({
+            type: "ACTIVITY_SYNC",
+            payload: { activities },
+            timestamp: Date.now() / 1000,
+            sequence: ++sequence,
+        });
+    },
+});
 
 // --- WebSocket Connection ---
 
@@ -1129,7 +779,7 @@ function connect(): void {
             // F32: reset the reconnect backoff on every successful open so a
             // long-running disconnect cycle that finally succeeds doesn't
             // keep waiting 30s on the next transient drop.
-            reconnectDelay = INITIAL_RECONNECT_DELAY;
+            reconnectBackoff.reset();
             negotiatedProtocolVersion = PROTOCOL_VERSION;
             // F17 (audit): clear the per-type sequence tracker. The
             // daemon restarts its WSMessage.sequence counter from 0
@@ -1388,11 +1038,11 @@ async function probeConnectivity(trigger: string): Promise<void> {
 
 function scheduleReconnect(): void {
     if (reconnectTimer || intentionalDisconnect) return;
+    const delay = reconnectBackoff.takeAndAdvance();
     reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
         connect();
-    }, reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
+    }, delay);
 }
 
 // swift-concurrency-pro rule (transferred to JS): tear down all in-flight
@@ -1405,10 +1055,8 @@ if (typeof chrome !== "undefined" && chrome.runtime?.onSuspend) {
             clearTimeout(reconnectTimer);
             reconnectTimer = null;
         }
-        if (persistTimer) {
-            clearTimeout(persistTimer);
-            persistTimer = null;
-        }
+        browserSessionStore.cancelPendingWrites();
+        void browserSessionStore.saveSessionNow(persistedSessionSnapshot());
         try {
             disconnect();
         } catch {
@@ -1456,24 +1104,27 @@ async function scrapeVisibleText(tabId?: number): Promise<string> {
  */
 const WS_PARSE_ERROR_WINDOW_MS = 10_000;
 const WS_PARSE_ERROR_RECONNECT_THRESHOLD = 3;
-let wsParseErrorTimestamps: number[] = [];
+const parseErrors = new ParseErrorWindow(
+    WS_PARSE_ERROR_WINDOW_MS,
+    WS_PARSE_ERROR_RECONNECT_THRESHOLD,
+);
 
 export function _resetWsParseErrorCounter(): void {
-    wsParseErrorTimestamps = [];
+    parseErrors.reset();
 }
 
 export function _getWsParseErrorCount(): number {
-    return wsParseErrorTimestamps.length;
+    return parseErrors.count;
 }
 
 /** Test-only: expose the F32 reconnect delay so tests can verify it
  * resets on every successful WS open. */
 export function _getReconnectDelay(): number {
-    return reconnectDelay;
+    return reconnectBackoff.current;
 }
 
 export function _getInitialReconnectDelay(): number {
-    return INITIAL_RECONNECT_DELAY;
+    return reconnectBackoff.initialDelay;
 }
 
 /**
@@ -1495,19 +1146,14 @@ export function _getInitialReconnectDelay(): number {
  * starts at 0 each restart, so retaining the pre-restart values would
  * reject every post-restart frame as "stale".
  */
-const lastSeqByType: Record<string, number> = {};
-const seenEventIds = new Set<string>();
-const seenEventIdOrder: string[] = [];
-const MAX_SEEN_EVENT_IDS = 512;
+const frameReplayGuard = new FrameReplayGuard(512);
 
 export function _resetLastSeqByType(): void {
-    for (const key of Object.keys(lastSeqByType)) delete lastSeqByType[key];
-    seenEventIds.clear();
-    seenEventIdOrder.length = 0;
+    frameReplayGuard.reset();
 }
 
 export function _getLastSeq(msgType: string): number {
-    return lastSeqByType[msgType] ?? 0;
+    return frameReplayGuard.lastSequence(msgType);
 }
 
 /**
@@ -1518,21 +1164,7 @@ export function _getLastSeq(msgType: string): number {
  * the counter only moves forward.
  */
 function acceptSequencedFrame(msg: WSMessage): boolean {
-    if (typeof msg.event_id === "string" && msg.event_id.length > 0) {
-        if (seenEventIds.has(msg.event_id)) return false;
-        seenEventIds.add(msg.event_id);
-        seenEventIdOrder.push(msg.event_id);
-        if (seenEventIdOrder.length > MAX_SEEN_EVENT_IDS) {
-            const evicted = seenEventIdOrder.shift();
-            if (evicted) seenEventIds.delete(evicted);
-        }
-    }
-    const seq = typeof msg.sequence === "number" ? msg.sequence : 0;
-    if (seq <= 0 || !msg.type) return true; // unsequenced — bypass
-    const last = lastSeqByType[msg.type] ?? 0;
-    if (seq <= last) return false; // stale
-    lastSeqByType[msg.type] = seq;
-    return true;
+    return frameReplayGuard.accept(msg);
 }
 
 /** Test-only: expose the sequence-drop predicate so vitest can exercise
@@ -1547,20 +1179,13 @@ function recordWsParseError(err: unknown, msg: Partial<WSMessage> | null): void 
             ? (msg as { correlation_id?: string }).correlation_id
             : "-";
     console.warn(`cortex.ws.parse_error cid=${cid} err=${String(err)}`);
-    const now = Date.now();
-    wsParseErrorTimestamps.push(now);
-    wsParseErrorTimestamps = wsParseErrorTimestamps.filter(
-        (t) => now - t <= WS_PARSE_ERROR_WINDOW_MS,
-    );
-    if (
-        wsParseErrorTimestamps.length >= WS_PARSE_ERROR_RECONNECT_THRESHOLD &&
-        ws !== null
-    ) {
+    const storm = parseErrors.record();
+    if (storm && ws !== null) {
         console.warn(
-            `cortex.ws.parse_error_storm count=${wsParseErrorTimestamps.length} ` +
+            `cortex.ws.parse_error_storm count=${parseErrors.count} ` +
                 `window_ms=${WS_PARSE_ERROR_WINDOW_MS} — forcing reconnect`,
         );
-        wsParseErrorTimestamps = [];
+        parseErrors.reset();
         try {
             // Bypass `disconnect()` because that sets intentionalDisconnect
             // and suppresses the reconnect we want.
@@ -1581,8 +1206,8 @@ async function handleMessage(raw: string): Promise<void> {
     }
     // Reset the rolling counter on a clean parse so transient flakes do
     // not stay armed forever.
-    if (wsParseErrorTimestamps.length > 0) {
-        wsParseErrorTimestamps = [];
+    if (parseErrors.count > 0) {
+        parseErrors.reset();
     }
 
     // F17 (audit): drop reordered or duplicated frames before they reach
@@ -1594,7 +1219,7 @@ async function handleMessage(raw: string): Promise<void> {
         if (DEBUG) {
             console.warn(
                 `[cortex.bg] F17: dropping stale ${msg.type} seq=${msg.sequence} ` +
-                `last=${lastSeqByType[msg.type] ?? 0}`,
+                `last=${frameReplayGuard.lastSequence(msg.type)}`,
             );
         }
         return;
@@ -1708,28 +1333,19 @@ async function handleMessage(raw: string): Promise<void> {
             const iid = plan.intervention_id;
             const now = Date.now();
 
-            // Check cooldown: skip if this intervention was recently dismissed
-            if (dismissedInterventions.has(iid)) {
-                const dismissedAt = dismissedInterventions.get(iid)!;
-                if (now - dismissedAt < interventionDismissCooldown) {
-                    if (DEBUG) console.log(`Cortex: skipping intervention ${iid} — dismissed ${Math.round((now - dismissedAt) / 1000)}s ago`);
-                    break;
-                }
-                dismissedInterventions.delete(iid);
-                schedulePersist();
-            }
-
-            // Check URL-based cooldown: don't re-trigger for same site within window
             const triggerUrl = plan.trigger_url;
-            const urlKey = triggerUrl ? new URL(triggerUrl).hostname : null;
-            if (urlKey && dismissedUrlPatterns.has(urlKey)) {
-                const dismissedAt = dismissedUrlPatterns.get(urlKey)!;
-                if (now - dismissedAt < urlDismissCooldown) {
-                    if (DEBUG) console.log(`Cortex: skipping intervention for ${urlKey} — dismissed ${Math.round((now - dismissedAt) / 1000)}s ago`);
-                    break;
+            const suppressedBy = interventionPresentation.suppression(
+                iid,
+                triggerUrl,
+                now,
+            );
+            if (suppressedBy !== null) {
+                if (DEBUG) {
+                    console.log(
+                        `Cortex: skipping intervention ${iid} — ${suppressedBy} cooldown active`,
+                    );
                 }
-                dismissedUrlPatterns.delete(urlKey);
-                schedulePersist();
+                break;
             }
 
             // F16: atomic swap by correlation_id. The latest INTERVENTION_TRIGGER
@@ -1741,20 +1357,16 @@ async function handleMessage(raw: string): Promise<void> {
                 ? msg.correlation_id
                 : `local_${now.toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 
-            if (activeIntervention) {
+            if (interventionPresentation.active) {
                 if (DEBUG) {
                     console.log(
-                        `Cortex: superseding intervention cid=${activeIntervention.correlation_id} ` +
+                        `Cortex: superseding intervention cid=${interventionPresentation.active.correlation_id} ` +
                         `→ cid=${inboundCid}`,
                     );
                 }
             }
 
-            activeIntervention = {
-                plan: msg.payload,
-                correlation_id: inboundCid,
-                mountedAt: now,
-            };
+            interventionPresentation.mount(msg.payload, inboundCid, now);
             // Persist so popup can load it after SW restart
             try {
                 chrome.storage.session.set({
@@ -1873,13 +1485,10 @@ async function handleMessage(raw: string): Promise<void> {
             currentExecutionMode = parseExecutionMode(
                 msg.payload.execution_mode,
             );
-            // Sync cooldown values from daemon config, keeping defaults as fallbacks
-            if (typeof msg.payload.intervention_dismiss_cooldown_ms === "number") {
-                interventionDismissCooldown = msg.payload.intervention_dismiss_cooldown_ms as number;
-            }
-            if (typeof msg.payload.url_dismiss_cooldown_ms === "number") {
-                urlDismissCooldown = msg.payload.url_dismiss_cooldown_ms as number;
-            }
+            interventionPresentation.configureCooldowns({
+                interventionMs: msg.payload.intervention_dismiss_cooldown_ms,
+                urlMs: msg.payload.url_dismiss_cooldown_ms,
+            });
             schedulePersist();
             broadcastToPopup({ type: "SETTINGS_SYNC", payload: msg.payload });
             break;
@@ -2736,37 +2345,14 @@ async function handleIntervention(
 
 async function handleContextRequest(msg: WSMessage): Promise<void> {
     try {
-        const tabs = await collectTabs();
+        const { tabs, activeTab, contentExcerpt } = await browserContextCollector.collect({
+            focusGoal: focusSession?.goal,
+            lastActivated: tabActivationTelemetry.snapshot(),
+        });
         // Save this tab list so the intervention snapshot uses the same ordering
         // the LLM will see — prevents tab_index misalignment.
         lastContextTabs = tabs;
         lastContextTabsTimestamp = Date.now();
-        const activeTab = tabs.find((t) => t.is_active);
-
-        // Get active tab content
-        let contentExcerpt = "";
-        if (activeTab) {
-            try {
-                const [tab] = await chrome.tabs.query({
-                    active: true,
-                    currentWindow: true,
-                });
-                if (tab?.id && await mayExtractPageContent(tab)) {
-                    const results = await chrome.scripting.executeScript({
-                        target: { tabId: tab.id },
-                        func: extractPageText,
-                    });
-                    if (results?.[0]?.result) {
-                        contentExcerpt = sanitizeContextText(
-                            String(results[0].result),
-                            PAGE_EXCERPT_MAX_CHARS,
-                        ).value;
-                    }
-                }
-            } catch {
-                // Content extraction failed
-            }
-        }
 
         send({
             type: "CONTEXT_RESPONSE",
@@ -2826,7 +2412,7 @@ async function handleRestore(payload: Record<string, unknown>): Promise<void> {
     // platform bug (e.g. quota exhausted) would never surface for
     // debugging. Log + still null the latch so behaviour is identical
     // but observable.
-    activeIntervention = null;
+    interventionPresentation.clear();
     try {
         chrome.storage.session.remove([
             "cortex_active_intervention",
@@ -2843,114 +2429,6 @@ async function handleRestore(payload: Record<string, unknown>): Promise<void> {
         );
     }
     broadcastToPopup({ type: "INTERVENTION_RESTORE", payload });
-}
-
-// --- Tab Management ---
-
-interface TabData {
-    title: string;
-    url: string;
-    tab_type: string;
-    is_active: boolean;
-    tab_id: number;
-    topic_hint: string;
-    last_activated_ago_seconds: number | null;
-}
-
-function extractTopicHint(title: string, url: string, tabType: string): string {
-    if (tabType === "ai_assistant") {
-        return title.replace(/\s*[-–—]\s*(Gemini|ChatGPT|Claude|Copilot|Perplexity|Phind|Poe).*$/i, "").slice(0, 100);
-    }
-    if (tabType === "video_platform") {
-        return title.replace(/\s*[-–—]\s*(YouTube|Vimeo).*$/i, "").slice(0, 100);
-    }
-    if (tabType === "search") {
-        try { return new URL(url).searchParams.get("q")?.slice(0, 100) || ""; } catch { return ""; }
-    }
-    if (tabType === "communication") {
-        return title.replace(/\s*[-–—]\s*(Slack|Discord|Microsoft Teams).*$/i, "").slice(0, 100);
-    }
-    return "";
-}
-
-async function collectTabs(): Promise<TabData[]> {
-    const chromeTabs = await chrome.tabs.query({});
-    // LAYER 2: Extract goal keywords for goal-aware classification
-    const goalKeywords: string[] = focusSession?.goal
-        ? extractGoalKeywords(focusSession.goal)
-        : [];
-
-    const now = Date.now();
-    return chromeTabs.filter((tab) => !tab.incognito).map((tab) => {
-        const rawTitle = tab.title ?? "";
-        const rawUrl = tab.url ?? "";
-        // Use goal-aware classification when a focus session is active
-        const tabType = goalKeywords.length > 0
-            ? classifyTabTypeWithGoal(rawUrl, rawTitle, goalKeywords)
-            : classifyBrowserTabType(rawUrl);
-        const lastActive = tabLastActivated.get(tab.id ?? -1);
-        return {
-            title: sanitizeContextText(rawTitle, TAB_TITLE_MAX_CHARS).value,
-            url: minimizeContextUrl(rawUrl),
-            tab_type: tabType,
-            is_active: tab.active ?? false,
-            tab_id: tab.id ?? -1,
-            topic_hint: sanitizeContextText(
-                extractTopicHint(rawTitle, rawUrl, tabType),
-                120,
-            ).value,
-            last_activated_ago_seconds: lastActive != null
-                ? Math.floor((now - lastActive) / 1000)
-                : null,
-        };
-    });
-}
-
-// --- Content extraction function (injected into page) ---
-
-function extractPageText(): string {
-    const MAX_CHARS = 2000;
-    const walker = document.createTreeWalker(
-        document.body,
-        NodeFilter.SHOW_TEXT,
-        {
-            acceptNode(node: Text): number {
-                const parent = node.parentElement;
-                if (!parent) return NodeFilter.FILTER_REJECT;
-                const tag = parent.tagName.toLowerCase();
-                if (
-                    ["script", "style", "noscript", "svg", "path"].includes(
-                        tag,
-                    )
-                ) {
-                    return NodeFilter.FILTER_REJECT;
-                }
-                if (parent.offsetWidth === 0 && parent.offsetHeight === 0) {
-                    return NodeFilter.FILTER_REJECT;
-                }
-                const text = node.textContent?.trim();
-                if (!text || text.length < 2) return NodeFilter.FILTER_REJECT;
-                return NodeFilter.FILTER_ACCEPT;
-            },
-        },
-    );
-
-    const chunks: string[] = [];
-    let totalLen = 0;
-    let node: Text | null;
-
-    while ((node = walker.nextNode() as Text | null)) {
-        const text = node.textContent?.trim();
-        if (!text) continue;
-        if (totalLen + text.length > MAX_CHARS) {
-            chunks.push(text.substring(0, MAX_CHARS - totalLen));
-            break;
-        }
-        chunks.push(text);
-        totalLen += text.length;
-    }
-
-    return chunks.join(" ");
 }
 
 // --- Daemon launch helper ---
@@ -3064,16 +2542,7 @@ async function runLaunchCortex(): Promise<LaunchResult> {
 
 function startFocusSession(goal: string): void {
     const now = Date.now();
-    focusSession = {
-        startTime: now,
-        totalFocusMs: 0,
-        distractionsBlocked: 0,
-        lastFocusCheck: now,
-        lastStateWasFocus: false,
-        longestStreakMs: 0,
-        currentStreakStart: 0,
-        goal,
-    };
+    focusSession = createFocusSession(goal, now);
     schedulePersist();
     broadcastToPopup({ type: "FOCUS_SESSION_STARTED", goal });
 }
@@ -3128,21 +2597,11 @@ function startAutoFocusSession(opts: {
         }
         return;
     }
-    focusSession = {
-        startTime: now,
-        totalFocusMs: 0,
-        distractionsBlocked: 0,
-        lastFocusCheck: now,
-        lastStateWasFocus: false,
-        longestStreakMs: 0,
-        currentStreakStart: 0,
-        goal: `Auto-focus (${opts.reason})`,
-    };
+    focusSession = createFocusSession(`Auto-focus (${opts.reason})`, now);
     autoFocusArmed = true;
     autoFocusEndsAt = now + opts.durationMinutes * 60_000;
     _activeFocusPresetName = opts.preset;
-    activeFocusPresetPatterns =
-        FOCUS_PRESET_DOMAINS[opts.preset] || FOCUS_PRESET_DOMAINS.developer;
+    activeFocusPresetPatterns = resolveFocusPreset(opts.preset);
     activeFocusCustomDomains = opts.customDomains.slice(0, 100);
     // Phase 4d Task A: mirror to chrome.storage.local before scheduling
     // the alarm so a worst-case SW eviction immediately after arming
@@ -3212,43 +2671,13 @@ function stopAutoFocusSession(reason: string): FocusSession | null {
 
 function updateFocusSession(payload: Record<string, unknown>): void {
     if (!focusSession) return;
-    const now = Date.now();
-    const elapsed = now - focusSession.lastFocusCheck;
-    const state = payload.state as string;
-    const isFocused = payload.status === "estimated"
-        && (state === "FLOW" || state === "RECOVERY");
-
-    if (isFocused) {
-        focusSession.totalFocusMs += elapsed;
-        if (!focusSession.lastStateWasFocus) {
-            focusSession.currentStreakStart = now;
-        }
-        const currentStreak = now - focusSession.currentStreakStart;
-        if (currentStreak > focusSession.longestStreakMs) {
-            focusSession.longestStreakMs = currentStreak;
-        }
-    } else {
-        focusSession.currentStreakStart = 0;
-    }
-    focusSession.lastStateWasFocus = isFocused;
-    focusSession.lastFocusCheck = now;
+    updateFocusSessionState(focusSession, payload);
     schedulePersist();
 }
 
 function getFocusSessionSnapshot() {
     if (!focusSession) return null;
-    const now = Date.now();
-    const elapsed = now - focusSession.startTime;
-    return {
-        elapsedMs: elapsed,
-        focusMs: focusSession.totalFocusMs,
-        focusPct: elapsed > 0 ? Math.round((focusSession.totalFocusMs / elapsed) * 100) : 0,
-        distractionsBlocked: focusSession.distractionsBlocked,
-        longestStreakMin: Math.round(focusSession.longestStreakMs / 60000),
-        goal: focusSession.goal,
-        currentStreakMs: focusSession.lastStateWasFocus && focusSession.currentStreakStart
-            ? now - focusSession.currentStreakStart : 0,
-    };
+    return focusSessionSnapshot(focusSession);
 }
 
 async function saveToDailyStats(session: FocusSession): Promise<void> {
@@ -3256,16 +2685,7 @@ async function saveToDailyStats(session: FocusSession): Promise<void> {
     const result = await chrome.storage.local.get("cortex_daily_stats");
     let stats: DailyStats = result.cortex_daily_stats as DailyStats;
     if (!stats || stats.date !== today) {
-        stats = {
-            date: today,
-            totalFocusMin: 0,
-            totalSessionMin: 0,
-            sessions: 0,
-            distractionsBlocked: 0,
-            longestStreakMin: 0,
-            avgHrDuringFocus: 0,
-            hrSamples: 0,
-        };
+        stats = emptyDailyStats(today);
     }
     const sessionMin = (Date.now() - session.startTime) / 60000;
     const focusMin = session.totalFocusMs / 60000;
@@ -3280,52 +2700,14 @@ async function saveToDailyStats(session: FocusSession): Promise<void> {
 
 // --- Distraction Blocking ---
 
-// Short but meaningful tech terms that should not be filtered out of goal keywords
-const TECH_SHORT_WORDS = new Set([
-    "go", "ml", "ai", "css", "sql", "vue", "rx", "aws", "gcp", "api",
-    "cli", "gui", "dom", "npm", "pip", "git", "ux", "ui", "db",
-    "os", "ci", "cd", "qa", "c++", "c#", "r", "dx", "io", "jwt",
-]);
-
-function extractGoalKeywords(goal: string): string[] {
-    return goal.toLowerCase().split(/\s+/).filter(
-        w => w.length > 1 || TECH_SHORT_WORDS.has(w.toLowerCase())
-    );
-}
-
 function isDistractionUrl(url: string, title?: string): boolean {
-    // P0 §3.10: when the daemon (or the user) armed a focus session
-    // with a preset / custom blocklist, treat any matching domain as
-    // a distraction regardless of the conditional rules below.
-    if (focusSession) {
-        if (activeFocusPresetPatterns.some((p) => p.test(url))) return true;
-        if (activeFocusCustomDomains.length > 0) {
-            const lowered = url.toLowerCase();
-            if (activeFocusCustomDomains.some((d) => lowered.includes(d.toLowerCase()))) {
-                return true;
-            }
-        }
-    }
-    if (ALWAYS_DISTRACTION.some((p) => p.test(url))) return true;
-    if (AI_ASSISTANT_URL_PATTERN.test(url)) return false;
-    if (VIDEO_PLATFORM_URL_PATTERN.test(url)) {
-        // YouTube: check title for goal-relevant keywords
-        if (focusSession?.goal && title) {
-            const goalWords = extractGoalKeywords(focusSession.goal);
-            const titleLower = title.toLowerCase();
-            if (goalWords.some(w => titleLower.includes(w))) return false;
-        }
-        return true;
-    }
-    if (CONDITIONAL_DISTRACTION.some((p) => p.test(url))) {
-        if (focusSession?.goal && title) {
-            const goalWords = extractGoalKeywords(focusSession.goal);
-            const titleLower = title.toLowerCase();
-            if (goalWords.some(w => titleLower.includes(w))) return false;
-        }
-        return true;
-    }
-    return false;
+    return isDistractionForSession({
+        url,
+        title,
+        session: focusSession,
+        presetPatterns: activeFocusPresetPatterns,
+        customDomains: activeFocusCustomDomains,
+    });
 }
 
 function injectDistractionInterceptor(
@@ -3439,7 +2821,10 @@ async function snapshotTabsForIntervention(): Promise<void> {
         if (DEBUG) console.log("Cortex: discarding stale tab context (>30s old), refreshing");
         lastContextTabs = null;
     }
-    const tabs = lastContextTabs ?? await collectTabs();
+    const tabs = lastContextTabs ?? (await browserContextCollector.collect({
+        focusGoal: focusSession?.goal,
+        lastActivated: tabActivationTelemetry.snapshot(),
+    })).tabs;
     const snapData: Record<string, { chromeTabId: number; url: string; title: string }> = {};
     for (let i = 0; i < tabs.length; i++) {
         const entry = {
@@ -3519,7 +2904,7 @@ async function validateTab(
             return { valid: false, tabId: snap.chromeTabId, message: "Tab is currently active — refusing to close" };
         }
         // LAYER 1b: Protect recently-visited tabs (activated within last 5 minutes)
-        const lastActive = tabLastActivated.get(snap.chromeTabId);
+        const lastActive = tabActivationTelemetry.lastActivation(snap.chromeTabId);
         if (lastActive && Date.now() - lastActive < RECENTLY_ACTIVE_PROTECTION_MS) {
             const agoSec = Math.round((Date.now() - lastActive) / 1000);
             return { valid: false, tabId: snap.chromeTabId, message: `Tab was recently active (${agoSec}s ago) — protected` };
@@ -4483,13 +3868,13 @@ async function authorizeActionIds(
         throw new Error("Action unavailable in suggest-only mode");
     }
     if (
-        !activeIntervention
-        || activeIntervention.plan.intervention_id !== interventionId
+        !interventionPresentation.active
+        || interventionPresentation.active.plan.intervention_id !== interventionId
     ) {
         throw new Error("Intervention is no longer active");
     }
     const verified = await verifyActionManifest(
-        activeIntervention.plan.action_manifest,
+        interventionPresentation.active.plan.action_manifest,
     );
     const approved = [...new Set(actionIds)].sort();
     if (
@@ -4499,9 +3884,9 @@ async function authorizeActionIds(
         throw new Error("Requested action is absent from the manifest");
     }
     const mountedSuggestions = Array.isArray(
-        activeIntervention.plan.suggested_actions,
+        interventionPresentation.active.plan.suggested_actions,
     )
-        ? activeIntervention.plan.suggested_actions
+        ? interventionPresentation.active.plan.suggested_actions
         : [];
     for (const actionId of approved) {
         const immutable = verified.actionsById.get(actionId);
@@ -4564,7 +3949,7 @@ async function authorizeActionIds(
             payload: request as unknown as Record<string, unknown>,
             timestamp: Date.now() / 1000,
             sequence: ++sequence,
-            correlation_id: activeIntervention?.correlation_id,
+            correlation_id: interventionPresentation.active?.correlation_id,
         });
     });
 }
@@ -5343,93 +4728,75 @@ async function handleExactRestoreCommand(payload: unknown): Promise<boolean> {
     return true;
 }
 
+interface BrowserCapabilityContext {
+    preparedInverse: Record<string, unknown>;
+    checkpointInverse: (inverse: Record<string, unknown>) => Promise<void>;
+}
+
+const browserCapabilityHandlers: CapabilityHandlers<
+    SuggestedAction,
+    BrowserCapabilityContext,
+    ActionExecuteResult
+> = {
+    close_tab: (action) => executeCloseTab(action),
+    group_tabs: (action, context) => executeGroupTabs(
+        action,
+        context.preparedInverse,
+        context.checkpointInverse,
+    ),
+    bookmark_and_close: (action, context) => executeBookmarkAndClose(
+        action,
+        context.preparedInverse,
+        context.checkpointInverse,
+    ),
+    open_url: (action, context) => executeOpenUrl(
+        action,
+        context.preparedInverse,
+        context.checkpointInverse,
+    ),
+    search_error: (action, context) => executeSearchError(
+        action,
+        context.preparedInverse,
+        context.checkpointInverse,
+    ),
+    highlight_tab: (action) => executeHighlightTab(action),
+    save_session: (action) => executeSaveSession(action),
+    copy_to_clipboard: (action) => executeCopyToClipboard(action),
+    start_timer: (action) => executeStartTimer(action),
+    resume_last_active_file: (action) => executeResumeLastActiveFile(action),
+    suggest_movement_break: (action) => executeSuggestMovementBreak(action),
+    prompt_micro_commit: (action) => executePromptMicroCommit(action),
+    take_biology_break: async (action) => ({
+        action_id: action.action_id,
+        success: true,
+        message: "Break started on desktop",
+        reversible: true,
+    }),
+};
+
+const browserCapabilityExecutor = new CapabilityExecutor(
+    browserCapabilityHandlers,
+);
+
 async function executeAction(
     action: SuggestedAction,
     preparedInverse: Record<string, unknown>,
     checkpointInverse: (inverse: Record<string, unknown>) => Promise<void>,
 ): Promise<ActionExecuteResult> {
     try {
-        // F42 closure: ``action.action_type`` is the generated
-        // ``Literal`` union from the Pydantic ``SuggestedAction``.
-        // The TS compiler narrows ``unhandled`` to ``never`` only when
-        // every member of the union is covered; adding a new
-        // ``action_type`` on the Python side will fail this file's
-        // ``tsc --noEmit`` check until a matching case is added.
-        switch (action.action_type) {
-            case "close_tab":
-                return await executeCloseTab(action);
-            case "group_tabs":
-                return await executeGroupTabs(
-                    action,
-                    preparedInverse,
-                    checkpointInverse,
-                );
-            case "bookmark_and_close":
-                return await executeBookmarkAndClose(
-                    action,
-                    preparedInverse,
-                    checkpointInverse,
-                );
-            case "open_url":
-                return await executeOpenUrl(
-                    action,
-                    preparedInverse,
-                    checkpointInverse,
-                );
-            case "search_error":
-                return await executeSearchError(
-                    action,
-                    preparedInverse,
-                    checkpointInverse,
-                );
-            case "highlight_tab":
-                return await executeHighlightTab(action);
-            case "save_session":
-                return await executeSaveSession(action);
-            case "copy_to_clipboard":
-                return await executeCopyToClipboard(action);
-            case "start_timer":
-                return await executeStartTimer(action);
-            case "resume_last_active_file":
-                return await executeResumeLastActiveFile(action);
-            case "suggest_movement_break":
-                return await executeSuggestMovementBreak(action);
-            case "prompt_micro_commit":
-                return await executePromptMicroCommit(action);
-            case "take_biology_break":
-                // P0 §3.7: biology break runs on the desktop shell's
-                // full-screen Qt overlay — the browser has nothing to
-                // do locally. Return a pass-through result so the
-                // popup card collapses; the accompanying ACTION_EXECUTE
-                // log frame already carries the action to the daemon,
-                // which routes it to the BiologyBreakController.
-                return {
-                    action_id: action.action_id,
-                    success: true,
-                    message: "Break started on desktop",
-                    reversible: true,
-                };
-            default: {
-                // Compile-time exhaustiveness: ``unhandled`` is ``never``
-                // when the switch covers every union member. Defence in
-                // depth — at runtime, if a malformed plan slipped past
-                // Pydantic somehow (it shouldn't), surface a structured
-                // error rather than crashing.
-                const unhandled: never = action.action_type;
-                return {
-                    action_id: action.action_id,
-                    success: false,
-                    message: `Unknown action type: ${String(unhandled)}`,
-                    reversible: false,
-                };
-            }
-        }
-    } catch (e) {
-        if (e instanceof IndeterminateBrowserMutationError) throw e;
+        return await browserCapabilityExecutor.execute(action, {
+            preparedInverse,
+            checkpointInverse,
+        });
+    } catch (error) {
+        if (error instanceof IndeterminateBrowserMutationError) throw error;
+        const message = error instanceof UnsupportedCapabilityError
+            ? `Unknown action type: ${error.capability}`
+            : String(error);
         return {
             action_id: action.action_id,
             success: false,
-            message: String(e),
+            message,
             reversible: false,
         };
     }
@@ -5971,14 +5338,14 @@ async function executeResumeLastActiveFile(
                 target,
                 action_id: aid,
                 intervention_id:
-                    typeof activeIntervention?.plan.intervention_id === "string"
-                        ? (activeIntervention.plan.intervention_id as string)
+                    typeof interventionPresentation.active?.plan.intervention_id === "string"
+                        ? (interventionPresentation.active.plan.intervention_id as string)
                         : undefined,
                 timestamp: Date.now() / 1000,
             },
             timestamp: Date.now() / 1000,
             sequence: ++sequence,
-            correlation_id: activeIntervention?.correlation_id,
+            correlation_id: interventionPresentation.active?.correlation_id,
         });
     } catch {
         // Daemon may be offline — fall through to the soft toast.
@@ -6155,13 +5522,13 @@ async function executeAllRecommended(
     interventionId: string,
 ): Promise<ActionExecuteResult[]> {
     if (
-        !activeIntervention
-        || activeIntervention.plan.intervention_id !== interventionId
+        !interventionPresentation.active
+        || interventionPresentation.active.plan.intervention_id !== interventionId
     ) {
         throw new Error("Intervention is no longer active");
     }
     const verified = await verifyActionManifest(
-        activeIntervention.plan.action_manifest,
+        interventionPresentation.active.plan.action_manifest,
     );
     const actionIds = [...verified.actionsById.values()]
         .filter((action) => {
@@ -6176,15 +5543,15 @@ async function executeAllRecommended(
     const results = await authorizeActionIds(interventionId, actionIds);
 
     // Clear the intervention after execution so popup doesn't show stale data
-    const hadIntervention = activeIntervention !== null;
+    const hadIntervention = interventionPresentation.active !== null;
     const mountedInterventionId =
-        typeof activeIntervention?.plan.intervention_id === "string"
-            ? (activeIntervention.plan.intervention_id as string)
+        typeof interventionPresentation.active?.plan.intervention_id === "string"
+            ? (interventionPresentation.active.plan.intervention_id as string)
             : undefined;
     // F16: outbound USER_ACTION carries the same cid the daemon stamped on
     // the plan, so a superseded ACK is ignored by `_handle_user_action`.
-    const interventionCid = activeIntervention?.correlation_id;
-    activeIntervention = null;
+    const interventionCid = interventionPresentation.active?.correlation_id;
+    interventionPresentation.clear();
     // Persist cleared state
     try { await chrome.storage.session.remove(["cortex_active_intervention", "cortex_active_intervention_cid", "cortex_active_intervention_mounted_at", "cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]); } catch {}
 
@@ -6581,8 +5948,8 @@ chrome.runtime.onMessage.addListener(
                 return true;
 
             case "GET_STATE":
-                // If activeIntervention was lost (SW restart), load from session storage
-                if (!activeIntervention) {
+                // If presentation state was lost (SW restart), rehydrate it.
+                if (!interventionPresentation.active) {
                     chrome.storage.session.get(
                         [
                             "cortex_active_intervention",
@@ -6592,20 +5959,18 @@ chrome.runtime.onMessage.addListener(
                         (data) => {
                             const stored = data?.cortex_active_intervention || null;
                             if (stored) {
-                                activeIntervention = {
-                                    plan: stored as Record<string, unknown>,
-                                    correlation_id:
-                                        (data?.cortex_active_intervention_cid as string) ||
-                                        `restore_${Date.now().toString(36)}`,
-                                    mountedAt:
-                                        (data?.cortex_active_intervention_mounted_at as number) ||
-                                        Date.now(),
-                                };
+                                interventionPresentation.mount(
+                                    stored as Record<string, unknown>,
+                                    (data?.cortex_active_intervention_cid as string)
+                                        || `restore_${Date.now().toString(36)}`,
+                                    (data?.cortex_active_intervention_mounted_at as number)
+                                        || Date.now(),
+                                );
                             }
                             sendResponse({
                                 connected,
                                 state: currentState,
-                                intervention: activeIntervention?.plan ?? null,
+                                intervention: interventionPresentation.active?.plan ?? null,
                                 focusSession: focusSession ? getFocusSessionSnapshot() : null,
                             });
                         },
@@ -6615,7 +5980,7 @@ chrome.runtime.onMessage.addListener(
                 sendResponse({
                     connected,
                     state: currentState,
-                    intervention: activeIntervention.plan,
+                    intervention: interventionPresentation.active.plan,
                     focusSession: focusSession ? getFocusSessionSnapshot() : null,
                 });
                 break;
@@ -6660,7 +6025,7 @@ chrome.runtime.onMessage.addListener(
                 stopFocusSession();
                 // Clear state
                 currentState = null;
-                activeIntervention = null;
+                interventionPresentation.clear();
                 (async () => {
                     // Clear persisted intervention/snapshot state so popup does not
                     // resurrect stale UI after service-worker restart.
@@ -6829,7 +6194,7 @@ chrome.runtime.onMessage.addListener(
                 const outboundCid =
                     typeof message.correlation_id === "string" && message.correlation_id.length > 0
                         ? (message.correlation_id as string)
-                        : activeIntervention?.correlation_id;
+                        : interventionPresentation.active?.correlation_id;
                 send({
                     type: "USER_ACTION",
                     payload: {
@@ -6843,8 +6208,8 @@ chrome.runtime.onMessage.addListener(
                 });
                 if (message.action === "dismissed") {
                     const activePlanId =
-                        typeof activeIntervention?.plan.intervention_id === "string"
-                            ? (activeIntervention.plan.intervention_id as string)
+                        typeof interventionPresentation.active?.plan.intervention_id === "string"
+                            ? (interventionPresentation.active.plan.intervention_id as string)
                             : null;
                     const interventionId =
                         typeof message.intervention_id === "string"
@@ -6854,30 +6219,23 @@ chrome.runtime.onMessage.addListener(
                     // Record dismissal for cooldown
                     const now = Date.now();
                     if (interventionId) {
-                        dismissedInterventions.set(interventionId, now);
+                        interventionPresentation.dismiss(interventionId, null, now);
                         schedulePersist();
                     }
                     // Also record URL-based cooldown from the active tab
                     chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
                         if (tab?.url) {
-                            try {
-                                dismissedUrlPatterns.set(new URL(tab.url).hostname, now);
-                                schedulePersist();
-                            } catch {}
+                            interventionPresentation.dismiss(
+                                interventionId || "",
+                                tab.url,
+                                now,
+                            );
+                            schedulePersist();
                         }
                     }).catch((err: unknown) => {
                         if (DEBUG) console.debug("[cortex.bg] tabs.query(active) for URL dismiss cooldown failed: %o", err);
                     });
-                    // Prune old entries
-                    for (const [k, t] of dismissedInterventions) {
-                        if (now - t > interventionDismissCooldown) dismissedInterventions.delete(k);
-                    }
-                    for (const [k, t] of dismissedUrlPatterns) {
-                        if (now - t > urlDismissCooldown) dismissedUrlPatterns.delete(k);
-                    }
-                    schedulePersist();
-
-                    activeIntervention = null;
+                    interventionPresentation.clear();
                     // Keep exact inverse snapshots until the daemon sends a
                     // receipt-derived INTERVENTION_RESTORE. Dismissal itself
                     // is never workspace authority.
@@ -7647,9 +7005,9 @@ function handleCommandPauseCortex(): void {
 function handleCommandDismissOverlay(): void {
     if (!connected || !ws) return;
     const interventionId =
-        activeIntervention
-        && typeof activeIntervention.plan.intervention_id === "string"
-            ? activeIntervention.plan.intervention_id
+        interventionPresentation.active
+        && typeof interventionPresentation.active.plan.intervention_id === "string"
+            ? interventionPresentation.active.plan.intervention_id
             : null;
     try {
         send({
@@ -7662,15 +7020,15 @@ function handleCommandDismissOverlay(): void {
             },
             timestamp: Date.now() / 1000,
             sequence: ++sequence,
-            correlation_id: activeIntervention?.correlation_id,
+            correlation_id: interventionPresentation.active?.correlation_id,
         });
     } catch {
         // No active intervention or WS down — both are no-ops.
     }
     // Also clear the locally-mounted overlay state so the popup
     // collapses immediately even before the daemon round-trips.
-    if (activeIntervention) {
-        activeIntervention = null;
+    if (interventionPresentation.active) {
+        interventionPresentation.clear();
         broadcastToPopup({ type: "OVERLAY_DISMISSED" });
     }
 }

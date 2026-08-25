@@ -202,7 +202,7 @@ async def _drive_frames(daemon: Any, blink_scores: list[float], n_per_frame: int
             "process_window",
             return_value=pulse_result,
         ),
-        patch("cortex.services.runtime_daemon.registry"),
+        patch.object(daemon, "_services"),
     ):
         roi_x.extract.return_value = fake_roi
         blink_d.update.side_effect = _fake_blink_update
@@ -277,7 +277,7 @@ async def test_face_lost_and_reacquired_events(daemon) -> None:  # type: ignore[
         patch.object(daemon, "_posture") as posture_d,
         patch.object(daemon, "_feature_fusion"),
         patch("cortex.services.runtime_daemon._emit_event", side_effect=_capture_event),
-        patch("cortex.services.runtime_daemon.registry"),
+        patch.object(daemon, "_services"),
     ):
         roi_x.extract.return_value = fake_roi
         blink_d.update.return_value = fake_blink
@@ -329,7 +329,7 @@ async def test_copilot_force_enabled_on_stop(daemon) -> None:  # type: ignore[no
     daemon._window_tracker.stop = MagicMock()
     daemon._session_report_started = False
     daemon._midnight_scheduler = None
-    with patch("cortex.services.runtime_daemon.registry"):
+    with patch.object(daemon, "_services"):
         await daemon.stop()
     daemon._copilot_throttle.force_enable.assert_awaited_once()
 
@@ -450,7 +450,7 @@ async def test_dismissal_uses_cached_trigger_time_features(daemon) -> None:  # t
     daemon._restore_manager.dismiss = AsyncMock(return_value=outcome)
     # Drive only the dismissal branch; the handler does more afterwards but
     # the record_outcome call is what we assert.
-    with patch("cortex.services.runtime_daemon.registry"):
+    with patch.object(daemon, "_services"):
         try:
             await daemon._handle_user_action({"intervention_id": iid, "action": "dismissed"})
         except Exception:
@@ -485,7 +485,7 @@ async def test_unpresented_proposal_cleanup_unwinds_every_local_tracker(
     daemon._transaction_coordinator.request_restore = AsyncMock(return_value=None)
     daemon._helpfulness.cancel_tracking = MagicMock(return_value=True)
 
-    with patch("cortex.services.runtime_daemon.registry") as registry_mock:
+    with patch.object(daemon, "_services") as registry_mock:
         await daemon._close_unpresented_transaction(
             iid,
             reason="presentation_delivery_race",

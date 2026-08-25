@@ -123,20 +123,25 @@ def test_intervention_failed_is_in_controller_dispatch_map(qapp) -> None:
     bridge = DaemonBridge()
     ctrl._bridge = bridge
 
-    # Stand-in ws_server whose send_message we can wrap. The observer
-    # installs a wrapper around it and builds the type→handler map.
+    # Stand-in WS server exposing the transport-neutral subscription API.
     captured: dict[str, Any] = {}
 
-    async def _send(message_type: str, payload: dict, **kwargs: Any) -> int:
-        return 0
+    class _Subscription:
+        def cancel(self) -> None:
+            return None
 
     class _WS:
-        send_message = staticmethod(_send)
+        listener: Any = None
+
+        def subscribe_outbound(self, listener: Any) -> _Subscription:
+            self.listener = listener
+            return _Subscription()
 
     class _Daemon:
         _ws_server = _WS()
 
     ctrl._daemon = _Daemon()
+    ctrl._outbound_subscription = None
     ctrl._install_ws_broadcast_observer()
 
     # After install, the wrapped send_message must, for INTERVENTION_FAILED,
@@ -146,13 +151,13 @@ def test_intervention_failed_is_in_controller_dispatch_map(qapp) -> None:
         lambda t, b, c: received.append((t, b, c))
     )
 
-    wrapped = ctrl._daemon._ws_server.send_message
-    assert getattr(wrapped, "_cortex_broadcast_wrapped", False) is True
+    from cortex.application.events import OutboundTransportEvent
 
-    asyncio.run(
-        wrapped(
-            MessageType.INTERVENTION_FAILED.value,
-            {"intervention_id": "iv-x", "error_reason": "boom"},
+    assert ctrl._daemon._ws_server.listener is not None
+    ctrl._daemon._ws_server.listener(
+        OutboundTransportEvent(
+            message_type=MessageType.INTERVENTION_FAILED.value,
+            payload={"intervention_id": "iv-x", "error_reason": "boom"},
         )
     )
     captured["after"] = list(received)

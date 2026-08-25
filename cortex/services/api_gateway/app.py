@@ -21,7 +21,6 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,6 +29,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 
 from cortex import __version__
 from cortex.application.clock import SYSTEM_CLOCK, Clock
+from cortex.application.services import ServiceRegistry as ServiceRegistry
 from cortex.libs.config.settings import APIConfig, CortexConfig
 from cortex.libs.logging.correlation import correlation_scope
 from cortex.services.api_gateway.auth import require_capability_token
@@ -40,51 +40,8 @@ _REQUEST_ID_HEADER = "X-Cortex-Request-ID"
 logger = logging.getLogger(__name__)
 
 
-class ServiceRegistry:
-    """
-    Registry for service instances used by API endpoints.
-
-    Holds references to engines and services that can be injected
-    into route handlers. Services are registered during app startup.
-    """
-
-    def __init__(self) -> None:
-        self._services: dict[str, Any] = {}
-        self._healthy: bool = False
-
-    def register(self, name: str, service: Any) -> None:
-        """Register a service by name."""
-        self._services[name] = service
-        logger.info(f"Registered service: {name}")
-
-    def get(self, name: str) -> Any | None:
-        """Get a registered service by name."""
-        return self._services.get(name)
-
-    def has(self, name: str) -> bool:
-        """Check if a service is registered."""
-        return name in self._services
-
-    @property
-    def registered_services(self) -> list[str]:
-        """List all registered service names."""
-        return list(self._services.keys())
-
-    @property
-    def healthy(self) -> bool:
-        return self._healthy
-
-    @healthy.setter
-    def healthy(self, value: bool) -> None:
-        self._healthy = value
-
-    def reset(self) -> None:
-        """Clear all registered services."""
-        self._services.clear()
-        self._healthy = False
-
-
-# Global service registry (singleton)
+# Compatibility registry for callers that construct ``create_app()`` without
+# an explicit composition root. Production passes an instance-owned registry.
 registry = ServiceRegistry()
 
 
@@ -97,13 +54,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     Shutdown: mark unhealthy, clean up services.
     """
     logger.info("Cortex API Gateway starting up")
-    registry.healthy = True
+    services: ServiceRegistry = app.state.registry
+    services.healthy = True
     logger.info(
-        f"Services registered: {registry.registered_services}"
+        "Services registered: %s",
+        services.registered_services,
     )
-    yield
-    logger.info("Cortex API Gateway shutting down")
-    registry.healthy = False
+    try:
+        yield
+    finally:
+        logger.info("Cortex API Gateway shutting down")
+        services.healthy = False
 
 
 def create_app(
@@ -111,6 +72,7 @@ def create_app(
     cortex_config: CortexConfig | None = None,
     *,
     clock: Clock | None = None,
+    services: ServiceRegistry | None = None,
 ) -> FastAPI:
     """
     Create and configure the FastAPI application.
@@ -119,12 +81,15 @@ def create_app(
         config: API configuration. Defaults to APIConfig().
         cortex_config: Full Cortex configuration for service initialization.
         clock: Explicit wall/monotonic clock shared with the application.
+        services: Instance-scoped application services. The module-level
+            registry is retained only as a compatibility default.
 
     Returns:
         Configured FastAPI application.
     """
     cfg = config or APIConfig()
     app_clock = clock or SYSTEM_CLOCK
+    app_services = services if services is not None else registry
 
     app = FastAPI(
         title="Cortex API Gateway",
@@ -182,7 +147,7 @@ def create_app(
     # Store config on app state for access in routes
     app.state.config = cfg
     app.state.cortex_config = cortex_config
-    app.state.registry = registry
+    app.state.registry = app_services
     app.state.clock = app_clock
     app.state.started_at_mono_ns = app_clock.monotonic_ns()
     app.state.started_boot_id = app_clock.boot_id

@@ -248,8 +248,11 @@ from cortex.apps.desktop_shell.tokens import (
     SP5,
     SP6,
     STATE_COLORS,
-    STATE_LABELS,
     STATE_TEXT_COLORS,
+)
+from cortex.apps.desktop_shell.view_models import (
+    advanced_state_view,
+    consumer_state_view,
 )
 
 logger = logging.getLogger(__name__)
@@ -2098,6 +2101,7 @@ class _ConsumerTab(QWidget):
         self._refresh_restore_pill()
 
     def update_state(self, payload: dict) -> None:
+        view = consumer_state_view(payload)
         # Phase J-3: first frame retires the empty state. The flag is
         # sticky so a transient WS disconnect doesn't collapse the UI
         # back to "no data yet" — the rendered numerics carry the last
@@ -2117,21 +2121,8 @@ class _ConsumerTab(QWidget):
         # because a dead camera is more user-actionable than a
         # degraded SQLite store.
         try:
-            capture_envelope = payload.get("capture") or {}
-            store_envelope = payload.get("store") or {}
-            capture_stale = bool(capture_envelope.get("stale", False))
-            store_degraded = bool(store_envelope.get("degraded", False))
-            if capture_stale:
-                self._set_text_if_changed(
-                    self._health_banner,
-                    "Camera offline — frames are not flowing",
-                )
-                self._health_banner.setVisible(True)
-            elif store_degraded:
-                self._set_text_if_changed(
-                    self._health_banner,
-                    "Storage degraded — sessions may not persist",
-                )
+            if view.health_message is not None:
+                self._set_text_if_changed(self._health_banner, view.health_message)
                 self._health_banner.setVisible(True)
             else:
                 self._health_banner.setVisible(False)
@@ -2140,29 +2131,20 @@ class _ConsumerTab(QWidget):
             # setText; the visibility flag isn't load-bearing.
             pass
 
-        status = str(payload.get("status", "insufficient_evidence"))
-        raw_state = str(payload.get("state", "UNKNOWN"))
-        state = raw_state if status == "estimated" else "UNKNOWN"
+        state = view.state
         dot_color = STATE_COLORS.get(state, _LABEL_TERTIARY)
         text_color = STATE_TEXT_COLORS.get(state, _LABEL_TERTIARY)
-        if status == "warming_up":
-            label = "Still gathering"
-        elif status == "insufficient_evidence":
-            label = "Not enough evidence"
-        else:
-            label = STATE_LABELS.get(state, state)
         self._set_style_if_changed(
             self._state_dot, f"background: {dot_color}; border-radius: 3px;"
         )
-        self._set_text_if_changed(self._state_label, label)
+        self._set_text_if_changed(self._state_label, view.label)
         self._set_style_if_changed(
             self._state_label, f"color: {text_color}; background: transparent;"
         )
 
-        bio = payload.get("biometrics", {})
-        hr = bio.get("heart_rate")
-        hrv = bio.get("hrv_rmssd")
-        blink = bio.get("blink_rate")
+        hr = view.heart_rate
+        hrv = view.hrv_rmssd
+        blink = view.blink_rate
 
         # When no heart-rate has landed yet, swap the BPM/HRV/BLK row for
         # a contextual status line so the user can tell apart "camera off"
@@ -2171,21 +2153,10 @@ class _ConsumerTab(QWidget):
         # that lack the field fall through to the "Reading your pulse…"
         # default, which is the most benign of the three states.
         if hr is None:
-            capture = payload.get("capture") or {}
-            frames_flowing = bool(capture.get("frames_flowing", True))
-            face_detected = bool(capture.get("face_detected", True))
-            if not frames_flowing:
-                status_text = (
-                    "Camera offline — check System Settings → Privacy "
-                    "& Security → Camera"
-                )
-            elif not face_detected:
-                status_text = "Looking for your face…"
-            else:
-                # Camera + face are both healthy; the rPPG sliding window
-                # is filling. First HR usually lands inside ~25 s.
-                status_text = "Reading your pulse…"
-            self._set_text_if_changed(self._bio_status_label, status_text)
+            self._set_text_if_changed(
+                self._bio_status_label,
+                view.biometrics_status or "Reading your pulse…",
+            )
             try:
                 self._bio_status_label.setVisible(True)
                 self._bio_numerics.setVisible(False)
@@ -2224,16 +2195,16 @@ class _ConsumerTab(QWidget):
         # is deliberately one-way; a daemon-side type that the dashboard
         # doesn't render is silently dropped.
         try:
-            connected = payload.get("connected_clients")
-            if isinstance(connected, list):
-                _CLIENT_TYPE_TO_DOT = {
-                    "chrome": "Chrome",
-                    "edge": "Edge",
-                    "vscode": "Editor",
-                }
-                connected_set = {str(c).lower() for c in connected}
-                for ct, dot_name in _CLIENT_TYPE_TO_DOT.items():
-                    self.set_extension_connected(dot_name, ct in connected_set)
+            _CLIENT_TYPE_TO_DOT = {
+                "chrome": "Chrome",
+                "edge": "Edge",
+                "vscode": "Editor",
+            }
+            for client_type, dot_name in _CLIENT_TYPE_TO_DOT.items():
+                self.set_extension_connected(
+                    dot_name,
+                    client_type in view.connected_surfaces,
+                )
         except Exception:
             pass
 
@@ -2866,38 +2837,14 @@ class _AdvancedTab(QWidget):
             except Exception:
                 pass
 
-        canonical_scores = payload.get("support_scores") or {}
-        scores = {
-            "flow": canonical_scores.get(
-                "flow_like", (payload.get("scores") or {}).get("flow", 0.0)
-            ),
-            "hyper": canonical_scores.get(
-                "support_likely", (payload.get("scores") or {}).get("hyper", 0.0)
-            ),
-            "hypo": canonical_scores.get(
-                "under_engaged", (payload.get("scores") or {}).get("hypo", 0.0)
-            ),
-            "recovery": canonical_scores.get(
-                "recovering", (payload.get("scores") or {}).get("recovery", 0.0)
-            ),
-        }
-        sig_q = payload.get("signal_quality", {})
-        evidence_strength = float(payload.get("confidence", 0.0))
-        coverage = float(payload.get("evidence_coverage", 0.0))
-        dwell = payload.get("dwell_seconds", 0.0)
-        status = str(payload.get("status", "insufficient_evidence"))
-        state = str(payload.get("state", "UNKNOWN"))
-        bio = payload.get("biometrics", {})
-
-        source = payload.get("source")
-        if source == "fallback":
-            badge_text = "Inference unavailable — safety fallback active"
-        elif status == "warming_up":
-            badge_text = "Gathering enough activity evidence"
-        elif status == "insufficient_evidence":
-            badge_text = "Not enough evidence for an estimate"
-        else:
-            badge_text = ""
+        view = advanced_state_view(payload)
+        scores = view.scores
+        sig_q = view.signal_quality
+        evidence_strength = view.evidence_strength
+        coverage = view.evidence_coverage
+        dwell = view.dwell_seconds
+        state = view.state
+        badge_text = view.degraded_message or ""
         self._set_text_if_changed(self._degraded_badge, badge_text)
         self._degraded_badge.setVisible(bool(badge_text))
 
@@ -2920,7 +2867,7 @@ class _AdvancedTab(QWidget):
         except Exception:
             logger.debug("physio SQI subcomponent update failed", exc_info=True)
 
-        hr = bio.get("heart_rate")
+        hr = view.heart_rate
         if hr is not None:
             self._hr_plot.add_value(hr)
 

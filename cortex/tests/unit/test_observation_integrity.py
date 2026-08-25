@@ -499,7 +499,7 @@ async def test_runtime_never_calls_pulse_estimator_for_all_missing_window() -> N
     process_window = MagicMock()
     daemon._pulse_estimator.process_window = process_window  # type: ignore[method-assign]
 
-    with patch("cortex.services.runtime_daemon.registry"):
+    with patch.object(daemon, "_services"):
         for sequence in range(12):
             unix_ms = 100_000 + sequence * 100
             mono_ns = 5_000_000_000 + sequence * 100_000_000

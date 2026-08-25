@@ -49,7 +49,7 @@ class ContextPrivacyController(QObject):
 
     @Slot(dict)
     def preview_current(self, payload: dict[str, Any]) -> None:
-        body = {
+        body: dict[str, Any] = {
             "selection": payload.get("selection")
             if isinstance(payload.get("selection"), dict)
             else {},

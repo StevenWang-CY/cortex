@@ -1842,6 +1842,39 @@ responsibility and Cortex never asserts zero retention.
 
 ### WP-10 — Orchestrator decomposition (`XL`, incremental across packages)
 
+**Implementation status (2026-08-25): complete at the bounded-application
+boundary.** `ApplicationKernel` is now the process composition root for an
+instance-scoped service compatibility container, typed runtime-data and
+runtime-health ports, synchronous typed event streams, and a named
+`TaskSupervisor`. Sensing, inference/publication, intervention command
+handling, experiment diagnostics/outcome collection, and operational
+maintenance each have a coordinator with explicit lifecycle ownership.
+Critical child exit requests fail-closed shutdown; partial coordinator startup
+rolls back the started prefix; cancellation drains each named group. The
+daemon no longer creates bare tasks or imports the process-global API registry.
+The WebSocket gateway receives its ports through construction and binds one
+immutable command bundle; individual callback setters and a registry fallback
+remain only as compatibility facades for isolated legacy consumers.
+
+The browser worker now delegates connection/replay, durable session state,
+privacy-bounded context collection, intervention presentation, authorized
+capability execution, focus sessions, telemetry, and activity persistence to
+bounded modules. Popup and desktop dashboard formatting use pure view models.
+Both desktop transport modes share the same message router and outbound event
+stream instead of patching transport methods. During this extraction a real
+goal-aware classifier defect was corrected: relevant video tabs now use the
+canonical video/social/entertainment categories and are not incorrectly
+treated as distractions.
+
+Completion evidence: the full Python matrix passes (2,583 passed, 5 skipped),
+the Qt-isolated desktop matrix passes (62/62), strict mypy passes across 514
+source files, Ruff and generated-schema drift checks pass, all 250 browser
+tests and TypeScript checks pass, and Chrome/Edge MV3 production builds
+complete. Dedicated contracts cover instance isolation, immutable command
+binding, event isolation/unsubscription, named task failure and drain,
+idempotent coordinator start, partial-start rollback, sensing/inference
+ownership, browser module boundaries, and shared desktop routing/view models.
+
 **Files:** `runtime_daemon.py`, WebSocket server, desktop controller, browser background/popup, global registry; new `cortex/application/` coordinators
 
 **Changes:**
@@ -2098,15 +2131,15 @@ Move one cohesive flow at a time behind the kernel after characterization tests.
 - [x] P1-07 manifest/authorization/receipt intervention protocol
 - [x] P1-08 event store and restart recovery
 - [x] P1-09 deterministic production policy and one finalized reward
-- [ ] P1-10 privacy context preview/redaction and optional browser permissions
+- [x] P1-10 privacy context preview/redaction and optional browser permissions
 
 ### P2 — Architecture and research quality
 
-- [ ] P2-01 application kernel and typed internal commands/events
-- [ ] P2-02 coordinator extraction from runtime daemon
-- [ ] P2-03 gateway callback/registry removal
-- [ ] P2-04 browser background/popup split
-- [ ] P2-05 one desktop domain path
+- [x] P2-01 application kernel and typed internal commands/events
+- [x] P2-02 coordinator extraction from runtime daemon
+- [x] P2-03 gateway callback/registry removal
+- [x] P2-04 browser background/popup split
+- [x] P2-05 one desktop domain path
 - [ ] P2-06 reference-sensor and participant-held-out validation program
 - [ ] P2-07 MRT/OPE research pipeline and independent statistical review — software pipeline complete; independent review outstanding
 - [ ] P2-08 reproducible dependency/build/SBOM/provenance flow
