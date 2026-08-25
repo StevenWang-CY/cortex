@@ -50,6 +50,7 @@ hardware-specific record using the templates under
 | `d756645` | Added a fail-closed, architecture-scoped Intel Protobuf exception policy with expiry, source-boundary checks, and a real bundled-model smoke |
 | `94b9195` | Made the numerical path valid and strictly typed across NumPy 1.26 and 2.3, including SciPy trapezoidal integration and explicit OpenCV/array dtype boundaries |
 | `59e5d17` | Made wheel inputs VCS-aware and deterministic, with independent rejection of local logs, state databases, environment files, interpreter debris, and credential containers |
+| `7ffb97f` | Replaced an architecture-sensitive synthetic capture timer with acquisition-free median batches and an exact production call-graph conversion contract |
 
 The wheel correction follows
 [Hatch's documented file-selection semantics](https://hatch.pypa.io/dev/config/build/):
@@ -84,10 +85,30 @@ The failed runs below are retained as diagnostic evidence rather than hidden:
    280-file hosted wheels with the 281-file local wheel then exposed the ignored
    debug-log inclusion described above.
 5. [Run 32866469753](https://github.com/StevenWang-CY/cortex/actions/runs/32866469753)
-   at `59e5d17a5d7fd4747395117f58a0c787cc6309c6` is the final source proof: all
+   at `59e5d17a5d7fd4747395117f58a0c787cc6309c6` is the immutable runtime-source proof: all
    seven jobs passed, including dependency policy, repository/link/schema
    contracts, replay regression, browser and editor gates, and both native
    Python architecture rows.
+6. [Run 32869260778](https://github.com/StevenWang-CY/cortex/actions/runs/32869260778)
+   at `a58fdce7cc89ea91eb47f0a04c227402d84b47da` passed every non-Python job and
+   the complete arm64 row, then exposed a test-validity defect in the Intel
+   row. The synthetic capture benchmark spent its timed region generating
+   1000 random 640x480 frames—about 922 MB of PRNG/allocation work that is not
+   performed by the production capture pipeline. The runtime tests themselves
+   reached 99%; the only failure was 5.54 seconds against a 5-second synthetic
+   threshold (`2559 passed, 3 skipped, 1 failed`).
+
+`7ffb97f` fixes the measurement rather than merely suppressing the result:
+frame fixtures are generated before timing, OpenCV/NumPy dispatch is warmed,
+five 100-frame samples are reduced by their median, and the synthetic stages
+retain an 8 ms/frame ceiling (less than one quarter of a 30 Hz frame interval).
+A separate test observes the real `CapturePipeline._process_frame` call graph
+and requires exactly one BGR→RGB and one BGR→gray conversion, while the existing
+subsample-invocation assertion remains independent of timing. The exact local
+Rosetta x86_64/Python 3.12.13 graph passed all four targeted capture tests; the
+full native arm64 gate passed Ruff, strict mypy over 511 files, the unchanged
+280-file wheel, 2,561 non-Qt tests with 3 declared skips, and all 62 Qt tests.
+The wheel remained byte-identical because this correction changes tests only.
 
 ### Final software evidence
 

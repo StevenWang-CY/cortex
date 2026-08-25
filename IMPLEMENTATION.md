@@ -89,6 +89,19 @@ with locked dependencies:
   import that JSON parser, and CI loads and runs the real bundled model before
   accepting the exception.
 
+A later exact-head validation, [run 32869260778](https://github.com/StevenWang-CY/cortex/actions/runs/32869260778),
+passed six of seven jobs and exposed one Intel-only defect in the *test
+measurement*: the synthetic capture timer included about 922 MB of random-frame
+generation that production capture does not perform. Commit `7ffb97f` moves
+fixture acquisition and dispatch warm-up outside timing, uses median batches,
+and adds a deterministic production call-graph assertion requiring exactly one
+RGB and one grayscale conversion per frame. The exact Rosetta x86_64/Python
+3.12.13 target passed all four capture tests, and the full native arm64 gate
+passed 2,561 non-Qt tests plus 62 Qt tests; the distributable wheel and its hash
+were unchanged. The diagnostic and remediation are retained in
+[`audit/execution-log.md`](audit/execution-log.md) rather than hiding the failed
+run.
+
 No signed DMG, Apple notarization response, physical camera/TCC matrix,
 reference-sensor dataset, participant study, penetration test, or independent
 statistical review was fabricated during this work. The repository now makes
