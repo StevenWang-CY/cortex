@@ -74,7 +74,12 @@ attest those external settings. See the [privacy disclosure](../cortex/docs/priv
   parity is therefore test-gated, not assumed; both candidate artifacts still
   require the physical validation protocol before public promotion. MediaPipe's
   capped OpenCV contrib dependency is the sole `cv2` provider so wheel install
-  order cannot silently change the runtime OpenCV major.
+  order cannot silently change the runtime OpenCV major. That final Intel
+  MediaPipe wheel also constrains Protobuf to a release affected by
+  `PYSEC-2026-1805`; Cortex does not expose the affected Protobuf JSON parser,
+  and a real-model smoke plus an Intel-only audit exception constrain the risk
+  through 2026-09-22. Intel release support must change or adopt a compatible
+  patched backend before that date.
 - Browser integration targets current Chrome/Edge MV3 behavior; browser
   updates, enterprise policy, service-worker suspension, and native-host
   installation can affect operation.

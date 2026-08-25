@@ -20,6 +20,7 @@ def _run(
     *,
     report: dict[str, object],
     exceptions: list[dict[str, object]],
+    ecosystem: str = "pnpm",
 ) -> tuple[int, dict[str, object]]:
     report_path = tmp_path / "audit.json"
     exception_path = tmp_path / "exceptions.json"
@@ -29,7 +30,7 @@ def _run(
     argv = [
         "verify_dependency_audit",
         "--ecosystem",
-        "pnpm",
+        ecosystem,
         "--report",
         str(report_path),
         "--exceptions",
@@ -145,3 +146,36 @@ def test_unreviewed_and_stale_exceptions_both_fail(
     assert code == 1
     assert any("unreviewed" in item for item in summary["problems"])
     assert any("stale exceptions" in item for item in summary["problems"])
+
+
+def test_reviewed_pip_exception_uses_the_same_fail_closed_policy(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    report: dict[str, object] = {
+        "dependencies": [
+            {
+                "name": "protobuf",
+                "version": "4.25.9",
+                "vulns": [{"id": "PYSEC-test"}],
+            }
+        ]
+    }
+    exception = _exception(
+        ecosystem="pip",
+        advisory_id="PYSEC-test",
+        package="protobuf",
+        max_severity="high",
+        path_prefixes=["protobuf"],
+    )
+
+    code, summary = _run(
+        monkeypatch,
+        tmp_path,
+        report=report,
+        exceptions=[exception],
+        ecosystem="pip",
+    )
+
+    assert code == 0
+    assert summary["status"] == "pass"

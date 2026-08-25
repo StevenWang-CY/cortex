@@ -141,9 +141,30 @@ jobs:
           EXPECTED_PYTHON: ${{ matrix.python }}
         run: uv run --project cortex --locked python -c 'import platform, os; actual=(platform.python_version(), platform.machine()); expected=(os.environ["EXPECTED_PYTHON"], os.environ["EXPECTED_ARCH"]); assert actual == expected, (actual, expected)'
       - name: Audit the resolved architecture-specific Python graph
-        run: uv run --project cortex --locked --extra dev pip-audit
+        run: |
+          mkdir -p audit-results
+          uv run --project cortex --locked --extra dev pip-audit \
+            --format json \
+            --output "audit-results/python-${{ matrix.arch }}.json" || true
+          audit_exception_args=()
+          if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
+            audit_exception_args=(--exceptions cortex/security/python-intel-audit-exceptions.json)
+          fi
+          uv run --project cortex --locked --extra dev python \
+            cortex/scripts/verify_dependency_audit.py \
+            --ecosystem pip \
+            --report "audit-results/python-${{ matrix.arch }}.json" \
+            --summary-out "audit-results/python-${{ matrix.arch }}-summary.json" \
+            "${audit_exception_args[@]}"
       - name: Canonical Python gate
         run: ./cortex/scripts/run_python_gate.sh
+      - if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: python-audit-${{ matrix.arch }}
+          path: audit-results/*.json
+          if-no-files-found: error
+          retention-days: 30
 
   eval-regression:
     name: recorded-trace-regression

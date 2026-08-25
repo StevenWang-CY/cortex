@@ -21,6 +21,16 @@ artifact metadata records the resolved architecture-specific graph. The lock
 uses `opencv-contrib-python<5` as the sole `cv2` provider on both architectures;
 the repository gate rejects co-installing the overlapping base OpenCV wheel.
 
+MediaPipe 0.10.21 also caps Intel Protobuf below 5. The resulting
+`PYSEC-2026-1805` finding concerns `google.protobuf.json_format.ParseDict` on
+attacker-controlled nested `Any` dictionaries. Neither Cortex nor the installed
+MediaPipe Python sources import that boundary, and the product accepts no
+Protobuf/JSON model graphs from clients. The reviewed Intel-only exception
+expires on 2026-09-22, is revalidated on every architecture build, and is
+included in release evidence alongside the raw audit. A compatible patched
+MediaPipe wheel, a replacement backend, or removal of Intel release support is
+required before expiry; silently extending the exception is not permitted.
+
 The locks make resolution repeatable. Apple signing/notarization timestamps and
 DMG metadata mean the final archive is not promised to be byte-for-byte
 reproducible. It is traceable to locked inputs, a commit/tag, builder identity,

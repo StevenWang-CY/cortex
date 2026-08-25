@@ -71,9 +71,14 @@ The final working tree was exercised with locked dependencies:
 - Contracts/evaluation: generated Python→TypeScript schemas, design tokens,
   versions, configuration docs, 203-setting reachability, local Markdown links,
   workflow action/tool pins, and all four committed replay-regression metrics.
-- Dependency policy: zero known Python and VS Code findings; 11 browser
-  build/test-chain advisories are path-constrained, expiry-bounded, reviewed
-  exceptions after patchable critical/high transitive versions were lifted.
+- Dependency policy: zero known Python findings on the maintained dependency
+  branch and zero VS Code findings; 11 browser build/test-chain advisories are
+  path-constrained, expiry-bounded, reviewed exceptions after patchable
+  critical/high transitive versions were lifted. The Intel-only MediaPipe
+  compatibility graph has one separately reviewed
+  Protobuf `ParseDict` denial-of-service exception through 2026-09-22; Cortex
+  and the installed MediaPipe Python sources do not import that JSON parser,
+  and CI loads and runs the real bundled model before accepting the exception.
 
 No signed DMG, Apple notarization response, physical camera/TCC matrix,
 reference-sensor dataset, participant study, penetration test, or independent
@@ -1992,6 +1997,9 @@ README/wiki pages, finding ledger, ADRs, model cards, and release templates
    graph installs only the capped `opencv-contrib-python` provider required by
    MediaPipe; a repository contract rejects a second `opencv-python` wheel
    that could overwrite the same `cv2` package and bypass the major-version cap.
+   MediaPipe's last Intel wheel also holds Protobuf below the upstream fixed
+   major; its single unreachable-API advisory is architecture-scoped,
+   evidence-bearing, expiry-gated, and backed by a real model/runtime smoke.
 2. Added one canonical Python gate for Ruff, strict mypy, wheel inspection,
    the complete non-Qt suite, and isolated Qt suite. CI exercises identical
    arm64/3.11.15 and x86_64/3.12.13 matrices, exports `UV_PYTHON` so

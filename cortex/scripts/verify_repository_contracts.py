@@ -344,6 +344,24 @@ def check_toolchain_pins() -> list[str]:
             version = str(row.get("python") or "")
             if re.fullmatch(r"\d+\.\d+\.\d+", version) is None:
                 problems.append(f"{workflow_name} job {job_name} has non-exact Python {version!r}")
+        audit_run = "\n".join(
+            str(step.get("run") or "")
+            for step in job.get("steps", [])
+            if isinstance(step, dict)
+            and step.get("name") == "Audit the resolved architecture-specific Python graph"
+        )
+        required_audit_fragments = (
+            "pip-audit",
+            "--format json",
+            "verify_dependency_audit.py",
+            "python-intel-audit-exceptions.json",
+            '[[ "${{ matrix.arch }}" == "x86_64" ]]',
+        )
+        if any(fragment not in audit_run for fragment in required_audit_fragments):
+            problems.append(
+                f"{workflow_name} job {job_name} must enforce the "
+                "architecture-scoped Python audit policy"
+            )
     if len(matrices) == len(matrix_jobs) and matrices[0] != matrices[1]:
         problems.append("CI and release Python architecture matrices must be identical")
     if matrices and not any(row.get("python") == python_version for row in matrices[0]):
@@ -397,6 +415,42 @@ def check_dependency_graph_contract() -> list[str]:
     return problems
 
 
+def check_protobuf_json_boundary() -> list[str]:
+    """Keep the Intel Protobuf exception's vulnerable API out of Cortex."""
+
+    problems: list[str] = []
+    for path in _production_sources():
+        if path.suffix != ".py":
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):
+            continue
+        imports_boundary = any(
+            (
+                isinstance(node, ast.Import)
+                and any(alias.name == "google.protobuf.json_format" for alias in node.names)
+            )
+            or (
+                isinstance(node, ast.ImportFrom)
+                and (
+                    node.module == "google.protobuf.json_format"
+                    or (
+                        node.module == "google.protobuf"
+                        and any(alias.name == "json_format" for alias in node.names)
+                    )
+                )
+            )
+            for node in ast.walk(tree)
+        )
+        if imports_boundary:
+            problems.append(
+                f"{path.relative_to(_ROOT)} imports the Protobuf JSON parser "
+                "excluded by the Intel audit boundary"
+            )
+    return problems
+
+
 def all_problems() -> list[str]:
     return [
         *check_local_markdown_links(),
@@ -406,6 +460,7 @@ def all_problems() -> list[str]:
         *check_workflow_action_pins(),
         *check_toolchain_pins(),
         *check_dependency_graph_contract(),
+        *check_protobuf_json_boundary(),
     ]
 
 
@@ -425,6 +480,7 @@ def main() -> int:
         *check_workflow_action_pins(),
         *check_toolchain_pins(),
         *check_dependency_graph_contract(),
+        *check_protobuf_json_boundary(),
     ]
     if problems:
         print("repository contracts FAILED:", file=sys.stderr)
@@ -434,7 +490,7 @@ def main() -> int:
     print(
         "repository contracts pass "
         "(links, config reachability, live messages, generated surfaces, "
-        "action/tool pins, dependency graph)"
+        "action/tool pins, dependency/security boundaries)"
     )
     return 0
 

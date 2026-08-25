@@ -115,7 +115,20 @@ jobs:
           EXPECTED_PYTHON: ${{ matrix.python }}
         run: uv run --project cortex --locked python -c 'import platform, os; actual=(platform.python_version(), platform.machine()); expected=(os.environ["EXPECTED_PYTHON"], os.environ["EXPECTED_ARCH"]); assert actual == expected, (actual, expected)'
       - name: Audit the resolved architecture-specific Python graph
-        run: uv run --project cortex --locked --extra dev pip-audit
+        run: |
+          uv run --project cortex --locked --extra dev pip-audit \
+            --format json \
+            --output "${RUNNER_TEMP}/python-${{ matrix.arch }}-audit.json" || true
+          audit_exception_args=()
+          if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
+            audit_exception_args=(--exceptions cortex/security/python-intel-audit-exceptions.json)
+          fi
+          uv run --project cortex --locked --extra dev python \
+            cortex/scripts/verify_dependency_audit.py \
+            --ecosystem pip \
+            --report "${RUNNER_TEMP}/python-${{ matrix.arch }}-audit.json" \
+            --summary-out "${RUNNER_TEMP}/python-${{ matrix.arch }}-audit-summary.json" \
+            "${audit_exception_args[@]}"
 
       - name: Import Developer ID certificate and notary credentials
         env:
@@ -161,6 +174,13 @@ jobs:
           CORTEX_RELEASE_EVIDENCE_DIR: dist/evidence-${{ matrix.arch }}
           CORTEX_RELEASE_TAG: ${{ env.RELEASE_TAG }}
         run: ./cortex/scripts/build_macos_app.sh
+
+      - name: Bind architecture audit to release evidence
+        run: |
+          cp "${RUNNER_TEMP}/python-${{ matrix.arch }}-audit.json" \
+            "dist/evidence-${{ matrix.arch }}/"
+          cp "${RUNNER_TEMP}/python-${{ matrix.arch }}-audit-summary.json" \
+            "dist/evidence-${{ matrix.arch }}/"
 
       - name: Generate application and Python dependency SBOMs
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0

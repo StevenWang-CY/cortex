@@ -45,3 +45,24 @@ version = "4.11.0.86"
     problems = verify_repository_contracts.check_dependency_graph_contract()
 
     assert any("must not co-install opencv-python" in problem for problem in problems)
+
+
+def test_protobuf_json_boundary_rejects_production_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "unsafe_parser.py"
+    source.write_text(
+        "from google.protobuf import json_format\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(verify_repository_contracts, "_ROOT", tmp_path)
+    monkeypatch.setattr(
+        verify_repository_contracts,
+        "_production_sources",
+        lambda: (source,),
+    )
+
+    problems = verify_repository_contracts.check_protobuf_json_boundary()
+
+    assert any("imports the Protobuf JSON parser" in problem for problem in problems)
