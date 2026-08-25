@@ -31,7 +31,6 @@ from cortex.libs.schemas.intervention import (
     MicroStep,
     UIPlan,
 )
-from cortex.libs.schemas.ws_message_types import MessageType
 from cortex.services.runtime_daemon import CortexDaemon
 
 
@@ -57,15 +56,18 @@ def _make_fake_daemon(plan: InterventionPlan) -> SimpleNamespace:
     """
     ws_server = MagicMock()
     ws_server.send_message = AsyncMock(return_value=1)
+    ws_server.send_intervention = AsyncMock(return_value=1)
     ws_server.send_restore = AsyncMock(return_value=1)
 
     restore_manager = MagicMock()
     restore_manager.engage = AsyncMock(
         return_value=SimpleNamespace(
             intervention_id=plan.intervention_id,
+            workspace_restored=True,
             model_dump=lambda mode="json": {
                 "intervention_id": plan.intervention_id,
                 "user_action": "natural_recovery",
+                "workspace_restored": True,
             },
         )
     )
@@ -76,12 +78,16 @@ def _make_fake_daemon(plan: InterventionPlan) -> SimpleNamespace:
     recorder = MagicMock()
     recorder.append = MagicMock()
 
+    transaction_coordinator = MagicMock()
+    transaction_coordinator.get_transaction = AsyncMock(return_value=None)
+
     import asyncio as _asyncio
     fake = SimpleNamespace(
         _ws_server=ws_server,
         _restore_manager=restore_manager,
         _helpfulness=helpfulness,
         _recorder=recorder,
+        _transaction_coordinator=transaction_coordinator,
         _active_plan=plan,
         _active_intervention_id=plan.intervention_id,
         _micro_step_recovery_fired=False,
@@ -114,11 +120,7 @@ async def test_all_done_fires_natural_recovery() -> None:
 
     # Each tick triggers a rebroadcast. send_message is called per
     # tick; engage path adds the natural_recovery restore broadcast.
-    assert fake._ws_server.send_message.call_count == 2
-    # Inspect the first send_message call to confirm it's an
-    # INTERVENTION_TRIGGER rebroadcast.
-    first_call_args = fake._ws_server.send_message.call_args_list[0]
-    assert first_call_args.args[0] == MessageType.INTERVENTION_TRIGGER.value
+    assert fake._ws_server.send_intervention.call_count == 2
 
     # send_restore fires on the engage path with natural_recovery.
     fake._ws_server.send_restore.assert_awaited_once_with(
@@ -147,6 +149,31 @@ async def test_tail_click_after_recovery_is_noop() -> None:
 
 
 @pytest.mark.asyncio
+async def test_failed_natural_recovery_restore_keeps_plan_retryable() -> None:
+    """A close gesture cannot erase retry authority without restore proof."""
+
+    plan = _make_plan()
+    fake = _make_fake_daemon(plan)
+    fake._restore_manager.engage.return_value = SimpleNamespace(
+        intervention_id=plan.intervention_id,
+        workspace_restored=False,
+        model_dump=lambda mode="json": {
+            "intervention_id": plan.intervention_id,
+            "user_action": "natural_recovery",
+            "workspace_restored": False,
+        },
+    )
+
+    await CortexDaemon.toggle_micro_step(fake, plan.intervention_id, 0, "done")
+    await CortexDaemon.toggle_micro_step(fake, plan.intervention_id, 1, "done")
+
+    assert fake._active_intervention_id == plan.intervention_id
+    assert fake._active_plan is plan
+    assert fake._micro_step_recovery_fired is False
+    fake._ws_server.send_restore.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_stale_intervention_id_is_dropped() -> None:
     """A toggle for an intervention_id that does not match the active
     plan must be silently dropped — no broadcast, no engage."""
@@ -157,7 +184,7 @@ async def test_stale_intervention_id_is_dropped() -> None:
         fake, "int_some_other_id", 0, "done"
     )
 
-    fake._ws_server.send_message.assert_not_called()
+    fake._ws_server.send_intervention.assert_not_called()
     fake._restore_manager.engage.assert_not_called()
 
 
@@ -174,7 +201,7 @@ async def test_invalid_status_rejected() -> None:
     )
 
     assert plan.micro_steps[0].status == original_status
-    fake._ws_server.send_message.assert_not_called()
+    fake._ws_server.send_intervention.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -187,7 +214,7 @@ async def test_step_index_out_of_range_rejected() -> None:
         fake, plan.intervention_id, 5, "done"
     )
 
-    fake._ws_server.send_message.assert_not_called()
+    fake._ws_server.send_intervention.assert_not_called()
     fake._restore_manager.engage.assert_not_called()
 
 
@@ -200,7 +227,7 @@ async def test_single_tick_only_rebroadcasts_no_engage() -> None:
 
     await CortexDaemon.toggle_micro_step(fake, plan.intervention_id, 0, "done")
 
-    fake._ws_server.send_message.assert_awaited_once()
+    fake._ws_server.send_intervention.assert_awaited_once()
     fake._restore_manager.engage.assert_not_called()
     assert plan.micro_steps[0].status == "done"
     assert plan.micro_steps[0].completed_at is not None

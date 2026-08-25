@@ -16,24 +16,82 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
 
+from cortex.application.clock import FakeClock
+from cortex.libs.config.settings import LLMConfig, LLMPrivacyConfig
+from cortex.libs.schemas.context import TaskContext
 from cortex.libs.schemas.intervention import InterventionPlan
+from cortex.libs.schemas.privacy import ContextFieldDisclosure
 from cortex.libs.schemas.state import (
     SignalQuality,
     StateEstimate,
     StateScores,
 )
+from cortex.libs.schemas.storage import (
+    StorageExportResponse,
+    StorageHealthReport,
+)
 from cortex.services.api_gateway.app import ServiceRegistry, create_app, registry
-from cortex.services.api_gateway.websocket_server import WebSocketClient, WebSocketServer, WSMessage
+from cortex.services.api_gateway.websocket_server import (
+    WebSocketClient,
+    WebSocketServer,
+    WSMessage,
+    _receipt_has_restorable_effect,
+)
 from cortex.services.intervention_engine.executor import InterventionExecutor
 from cortex.services.intervention_engine.restore import RestoreManager
+from cortex.services.llm_engine.context_broker import (
+    PrivacyAwarePlanner,
+    build_no_content_plan,
+)
 
 # =============================================================================
 # Fixtures
 # =============================================================================
+
+
+class _StorageMaintenanceStub:
+    retention_days = {"sessions": 7, "policy": 90, "interventions": 90}
+
+    def __init__(self) -> None:
+        self.clock = FakeClock(
+            wall_unix_ms=1_800_000_000_000,
+            mono_ns=5_000,
+            _boot_id=UUID("00000000-0000-0000-0000-000000000808"),
+        )
+
+    async def health(self) -> StorageHealthReport:
+        return StorageHealthReport(
+            healthy=True,
+            degraded=False,
+            journal_mode="delete",
+            synchronous="full",
+            foreign_keys=True,
+            schema_version=1,
+            sqlite_version="3.45.0",
+            database_filename="cortex.sqlite3",
+            database_bytes=4096,
+            pending_operations=0,
+            record_counts={"sessions": 1},
+        )
+
+    async def export(self, _categories: object) -> StorageExportResponse:
+        return StorageExportResponse.from_clock(
+            self.clock,
+            export_id=UUID("00000000-0000-0000-0000-000000000809"),
+            filename="cortex-export-test.json",
+            sha256="a" * 64,
+            bytes_written=128,
+            record_counts={"sessions": 1},
+        )
+
+    async def delete(self, _scopes: object) -> tuple[dict[str, int], bool]:
+        return {"sessions": 1, "projection_files": 2}, True
 
 
 @pytest.fixture(autouse=True)
@@ -60,9 +118,7 @@ def client(tmp_path, monkeypatch) -> TestClient:
     from cortex.libs.auth.local_token import load_or_create_token
 
     token_file = tmp_path / "auth.token"
-    monkeypatch.setattr(
-        "cortex.libs.auth.local_token.auth_token_path", lambda: token_file
-    )
+    monkeypatch.setattr("cortex.libs.auth.local_token.auth_token_path", lambda: token_file)
     token = load_or_create_token(token_file)
     app = create_app()
     with TestClient(app) as c:
@@ -78,6 +134,28 @@ def _make_physio_features() -> dict:
         "hr_delta_5s": 1.0,
         "valid": True,
     }
+
+
+@pytest.mark.parametrize(
+    ("status", "verification", "inverse", "expected"),
+    [
+        ("succeeded", "verified", '{"tabId":9}', True),
+        ("failed", "failed", '{"cortexEffectMayExist":true}', False),
+        ("already_complete", "verified", '{"noEffect":true}', False),
+    ],
+)
+def test_receipt_projection_only_marks_verified_effects_restorable(
+    status: str,
+    verification: str,
+    inverse: str,
+    expected: bool,
+) -> None:
+    receipt = SimpleNamespace(
+        status=status,
+        verification=verification,
+        inverse_payload_json=inverse,
+    )
+    assert _receipt_has_restorable_effect(receipt) is expected
 
 
 def _make_kinematic_features() -> dict:
@@ -212,6 +290,49 @@ class TestHealthEndpoint:
         assert "capture" in data["services"]
         assert "physio" in data["services"]
 
+    def test_storage_health_status_export_and_confirmed_delete(
+        self,
+        client: TestClient,
+    ) -> None:
+        registry.register("storage_maintenance", _StorageMaintenanceStub())
+
+        health = client.get("/health")
+        assert health.status_code == 200
+        assert health.json()["storage"]["journal_mode"] == "delete"
+
+        status = client.get("/storage/status")
+        assert status.status_code == 200
+        assert status.json()["retention_days"]["sessions"] == 7
+        assert status.json()["storage"]["database_filename"] == "cortex.sqlite3"
+
+        exported = client.post(
+            "/storage/export",
+            json={"categories": ["sessions"]},
+        )
+        assert exported.status_code == 200
+        assert exported.json()["sha256"] == "a" * 64
+        assert exported.json()["record_counts"] == {"sessions": 1}
+
+        unconfirmed = client.post(
+            "/storage/delete",
+            json={"scopes": ["sessions"], "confirmation": "delete"},
+        )
+        assert unconfirmed.status_code == 422
+
+        deleted = client.post(
+            "/storage/delete",
+            json={
+                "scopes": ["sessions"],
+                "confirmation": "DELETE CORTEX DATA",
+            },
+        )
+        assert deleted.status_code == 200
+        assert deleted.json()["deleted_counts"] == {
+            "sessions": 1,
+            "projection_files": 2,
+        }
+        assert deleted.json()["vacuumed"] is True
+
 
 class TestStatusEndpoint:
     """Test /status/current endpoint."""
@@ -293,7 +414,7 @@ class TestStateInferEndpoint:
     """Test /state/infer endpoint."""
 
     def test_infer_without_engine_returns_default(self, client: TestClient):
-        """Without registered engines, should return default FLOW state."""
+        """Without registered engines, inference fails closed to UNKNOWN."""
         payload = {
             "feature_vector": _make_feature_vector(),
             "signal_quality": _make_signal_quality(),
@@ -301,8 +422,12 @@ class TestStateInferEndpoint:
         resp = client.post("/state/infer", json=payload)
         assert resp.status_code == 200
         data = resp.json()
-        assert data["estimate"]["state"] == "FLOW"
-        assert "No state engine registered" in data["estimate"]["reasons"][0]
+        assert data["estimate"]["state"] == "UNKNOWN"
+        assert data["estimate"]["support_state"] == "unknown"
+        assert data["estimate"]["status"] == "insufficient_evidence"
+        assert data["estimate"]["evidence_coverage"] == 0.0
+        assert data["degraded"] is True
+        assert "unavailable" in data["estimate"]["reasons"][0].lower()
 
     def test_infer_with_engines(self, client: TestClient):
         """With registered engines, should use them."""
@@ -319,9 +444,14 @@ class TestStateInferEndpoint:
         resp = client.post("/state/infer", json=payload)
         assert resp.status_code == 200
         data = resp.json()
-        # Should use real engines, not fallback
+        # A fresh engine exposes warm-up rather than fabricating an
+        # actionable state from one sample.
+        assert data["source"] == "rules"
         est = data["estimate"]
-        assert est["state"] in ("FLOW", "HYPO", "HYPER", "RECOVERY")
+        assert est["status"] in ("warming_up", "insufficient_evidence", "estimated")
+        if est["status"] != "estimated":
+            assert est["state"] == "UNKNOWN"
+            assert est["support_state"] == "unknown"
         assert 0.0 <= est["confidence"] <= 1.0
 
 
@@ -358,6 +488,172 @@ class TestContextAndLLMEndpoints:
         data = resp.json()
         assert data["fallback_used"] is True
 
+    def test_external_context_preview_is_unavailable_without_opt_in(
+        self,
+        client: TestClient,
+    ):
+        payload = {
+            "state_estimate": _make_state_estimate(),
+            "task_context": {
+                "mode": "coding_debugging",
+                "active_app": "vscode",
+                "complexity_score": 0.7,
+            },
+        }
+        resp = client.post("/privacy/context/preview", json=payload)
+        assert resp.status_code == 409
+
+    def test_preview_then_exact_one_time_plan(self, client: TestClient):
+        class ExternalTransport:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def model_for_template(self, _template: str | None) -> str:
+                return "test-model"
+
+            async def generate_intervention_plan(
+                self,
+                context: TaskContext,
+                state: StateEstimate,
+                constraints=None,
+                *,
+                template_name: str | None = None,
+                extra_context: str = "",
+                disclosure_manifest: tuple[ContextFieldDisclosure, ...] | None = None,
+            ) -> InterventionPlan:
+                del context, state, constraints, template_name, extra_context
+                assert disclosure_manifest
+                self.calls += 1
+                plan = build_no_content_plan(reason="test")
+                plan.metadata = {"source": "llm"}
+                return plan
+
+            async def health_check(self) -> bool:
+                return True
+
+        transport = ExternalTransport()
+        cfg = LLMConfig(
+            provider="direct",
+            privacy=LLMPrivacyConfig(
+                planner_mode="external_redacted",
+                external_context_enabled=True,
+                consent_revision="context-disclosure-v1",
+            ),
+        )
+        registry.register("llm_client", PrivacyAwarePlanner(cfg, transport))
+        payload = {
+            "state_estimate": _make_state_estimate(),
+            "task_context": {
+                "mode": "coding_debugging",
+                "active_app": "vscode",
+                "complexity_score": 0.7,
+                "editor_context": {
+                    "file_path": "/Users/alice/private/auth.py",
+                    "visible_range": [1, 4],
+                    "visible_code": "token=super-secret-value-123456",
+                },
+            },
+            "selection": {
+                "workspace_aggregates": True,
+                "editor_metadata": True,
+                "editor_content": True,
+            },
+        }
+        preview_resp = client.post("/privacy/context/preview", json=payload)
+        assert preview_resp.status_code == 200
+        preview = preview_resp.json()
+        preview_json = json.dumps(preview)
+        assert "/Users/alice" not in preview_json
+        assert "super-secret-value-123456" not in preview_json
+        assert transport.calls == 0
+
+        plan_payload = {
+            "state_estimate": payload["state_estimate"],
+            "task_context": payload["task_context"],
+            "privacy_preview_id": preview["preview_id"],
+            "privacy_confirmation": "SEND PREVIEWED CONTEXT ONCE",
+        }
+        plan_resp = client.post("/llm/plan", json=plan_payload)
+        assert plan_resp.status_code == 200
+        assert plan_resp.json()["fallback_used"] is False
+        assert transport.calls == 1
+
+        replay_resp = client.post("/llm/plan", json=plan_payload)
+        assert replay_resp.status_code == 200
+        assert replay_resp.json()["fallback_used"] is True
+        assert replay_resp.json()["plan"]["metadata"]["fallback_reason"] == (
+            "context_preview_missing_or_replayed"
+        )
+        assert transport.calls == 1
+
+        registry.register(
+            "latest_task_context",
+            TaskContext.model_validate(payload["task_context"]),
+        )
+        registry.register(
+            "latest_state_estimate",
+            StateEstimate.model_validate(payload["state_estimate"]),
+        )
+        current_resp = client.post(
+            "/privacy/context/preview/current",
+            json={"selection": payload["selection"]},
+        )
+        assert current_resp.status_code == 200
+        current_preview = current_resp.json()
+        assert transport.calls == 1
+        assert "/Users/alice" not in json.dumps(current_preview)
+
+        missing_phrase = client.post(
+            "/privacy/context/confirm",
+            json={"preview_id": current_preview["preview_id"]},
+        )
+        assert missing_phrase.status_code == 422
+        assert transport.calls == 1
+
+        confirm_resp = client.post(
+            "/privacy/context/confirm",
+            json={
+                "preview_id": current_preview["preview_id"],
+                "confirmation_phrase": "SEND PREVIEWED CONTEXT ONCE",
+            },
+        )
+        assert confirm_resp.status_code == 200
+        confirmation = confirm_resp.json()
+        assert confirmation["sent"] is True
+        assert confirmation["authority_granted"] is False
+        assert confirmation["fallback_used"] is False
+        assert transport.calls == 2
+
+        replay_confirm = client.post(
+            "/privacy/context/confirm",
+            json={
+                "preview_id": current_preview["preview_id"],
+                "confirmation_phrase": "SEND PREVIEWED CONTEXT ONCE",
+            },
+        )
+        assert replay_confirm.status_code == 409
+        assert transport.calls == 2
+
+        cancel_preview_resp = client.post(
+            "/privacy/context/preview/current",
+            json={"selection": payload["selection"]},
+        )
+        assert cancel_preview_resp.status_code == 200
+        cancel_id = cancel_preview_resp.json()["preview_id"]
+        cancelled = client.delete(f"/privacy/context/preview/{cancel_id}")
+        assert cancelled.status_code == 200
+        assert cancelled.json()["cancelled"] is True
+        assert cancelled.json()["sent"] is False
+        cancelled_replay = client.post(
+            "/privacy/context/confirm",
+            json={
+                "preview_id": cancel_id,
+                "confirmation_phrase": "SEND PREVIEWED CONTEXT ONCE",
+            },
+        )
+        assert cancelled_replay.status_code == 409
+        assert transport.calls == 2
+
     def test_llm_plan_with_generate_intervention_plan_client(self, client: TestClient):
         class MockLLMClient:
             async def generate_intervention_plan(self, context, state):
@@ -392,6 +688,7 @@ class TestContextAndLLMEndpoints:
         (``metadata.source == 'fallback'``), the HTTP route must report
         ``fallback_used=True`` — pre-fix it hard-coded False on every
         production branch, masking the degradation from the caller."""
+
         class FallbackLLMClient:
             async def generate_intervention_plan(self, context, state):
                 return InterventionPlan(
@@ -424,6 +721,7 @@ class TestContextAndLLMEndpoints:
         """Finding #6: a planner client that RAISES must not surface an
         unhandled 500. The route maps it to the deterministic-fallback
         envelope (``plan=None``, ``fallback_used=True``)."""
+
         class RaisingLLMClient:
             async def generate_intervention_plan(self, context, state):
                 raise RuntimeError("anthropic SDK exploded")
@@ -474,6 +772,59 @@ class TestInterventionEndpoints:
         data = resp.json()
         assert data["applied"] is False
 
+    def test_apply_safe_default_only_broadcasts_sanitized_proposal(
+        self,
+        client: TestClient,
+    ):
+        adapter_calls: list[tuple[str, dict]] = []
+        proposals: list[InterventionPlan] = []
+
+        class BrowserAdapter:
+            async def execute(self, action: str, params: dict) -> bool:
+                adapter_calls.append((action, params))
+                return True
+
+        class WSServer:
+            async def send_intervention(self, plan: InterventionPlan) -> None:
+                proposals.append(plan)
+
+        executor = InterventionExecutor()
+        executor.register_adapter("browser", BrowserAdapter())
+        registry.register("intervention_executor", executor)
+        registry.register("ws_server", WSServer())
+
+        payload = {
+            "plan": {
+                "intervention_id": "int_safe_default",
+                "level": "simplified_workspace",
+                "situation_summary": "Several unrelated tabs are open",
+                "headline": "Review a smaller workspace",
+                "primary_focus": "Current task",
+                "micro_steps": ["Review the proposal"],
+                "hide_targets": ["browser_tabs_except_active"],
+                "ui_plan": {
+                    "dim_background": True,
+                    "show_overlay": True,
+                    "fold_unrelated_code": True,
+                    "intervention_type": "simplified_workspace",
+                },
+                "tone": "supportive",
+                "consent_level": "reversible_act",
+            },
+        }
+
+        response = client.post("/intervention/apply", json=payload)
+
+        assert response.status_code == 200
+        assert response.json()["applied"] is False
+        assert adapter_calls == []
+        assert len(proposals) == 1
+        proposal = proposals[0]
+        assert proposal.level == "overlay_only"
+        assert proposal.hide_targets == []
+        assert proposal.ui_plan.fold_unrelated_code is False
+        assert proposal.metadata["workspace_mutation_allowed"] is False
+
     def test_restore_no_engine(self, client: TestClient):
         payload = {
             "intervention_id": "int_abc123",
@@ -484,12 +835,15 @@ class TestInterventionEndpoints:
         data = resp.json()
         assert data["restored"] is False
 
-    def test_apply_with_executor_and_restore_manager(self, client: TestClient):
+    def test_legacy_apply_cannot_bypass_transaction_authority(
+        self,
+        client: TestClient,
+    ):
         class OverlayAdapter:
             async def execute(self, action: str, params: dict) -> bool:
                 return action in {"show_overlay", "hide_overlay"}
 
-        executor = InterventionExecutor()
+        executor = InterventionExecutor(execution_mode="authorized")
         executor.register_adapter("overlay", OverlayAdapter())
         restore_manager = RestoreManager(executor)
         registry.register("intervention_executor", executor)
@@ -515,16 +869,19 @@ class TestInterventionEndpoints:
         resp = client.post("/intervention/apply", json=payload)
         assert resp.status_code == 200
         data = resp.json()
-        assert data["applied"] is True
-        assert data["snapshot"]["intervention_id"] == "int_apply_123"
-        assert restore_manager.active_count == 1
+        assert data["applied"] is False
+        assert data["snapshot"] is None
+        assert restore_manager.active_count == 0
 
-    def test_restore_with_restore_manager(self, client: TestClient):
+    def test_legacy_restore_manager_cannot_bypass_daemon_transactions(
+        self,
+        client: TestClient,
+    ):
         class OverlayAdapter:
             async def execute(self, action: str, params: dict) -> bool:
                 return action in {"show_overlay", "hide_overlay"}
 
-        executor = InterventionExecutor()
+        executor = InterventionExecutor(execution_mode="authorized")
         executor.register_adapter("overlay", OverlayAdapter())
         restore_manager = RestoreManager(executor)
         registry.register("intervention_executor", executor)
@@ -556,9 +913,73 @@ class TestInterventionEndpoints:
         )
         assert restore_resp.status_code == 200
         data = restore_resp.json()
-        assert data["restored"] is True
-        assert data["outcome"]["intervention_id"] == "int_restore_123"
+        assert data["restored"] is False
+        assert data["outcome"] is None
         assert restore_manager.active_count == 0
+
+    def test_restore_prefers_daemon_transaction_boundary(
+        self,
+        client: TestClient,
+    ) -> None:
+        calls: list[tuple[str, str]] = []
+
+        class _Daemon:
+            async def restore_intervention(
+                self,
+                intervention_id: str,
+                user_action: str,
+            ) -> None:
+                calls.append((intervention_id, user_action))
+                return None
+
+        registry.register("daemon", _Daemon())
+        response = client.post(
+            "/intervention/restore",
+            json={"intervention_id": "int_exact", "user_action": "dismissed"},
+        )
+        assert response.status_code == 200
+        assert response.json()["restored"] is False
+        assert calls == [("int_exact", "dismissed")]
+
+    def test_emergency_restore_all_reports_verified_summary(
+        self,
+        client: TestClient,
+    ) -> None:
+        calls: list[tuple[str, float]] = []
+
+        class _Daemon:
+            async def restore_all_transactional_effects(
+                self,
+                *,
+                reason: str,
+                timeout_seconds: float,
+            ) -> dict[str, int]:
+                calls.append((reason, timeout_seconds))
+                return {
+                    "requested": 2,
+                    "dispatched": 2,
+                    "restored": 1,
+                    "failed": 0,
+                    "pending": 1,
+                }
+
+        registry.register("daemon", _Daemon())
+        response = client.post("/intervention/restore-all")
+        assert response.status_code == 200
+        assert response.json()["available"] is True
+        assert response.json()["complete"] is False
+        assert response.json()["restored"] == 1
+        assert response.json()["pending"] == 1
+        assert calls == [("emergency_restore", 3.0)]
+
+    def test_emergency_restore_all_fails_closed_without_daemon(
+        self,
+        client: TestClient,
+    ) -> None:
+        response = client.post("/intervention/restore-all")
+        assert response.status_code == 200
+        assert response.json()["available"] is False
+        assert response.json()["complete"] is False
 
 
 # =============================================================================
@@ -583,12 +1004,14 @@ class TestWSMessage:
         assert parsed["sequence"] == 1
 
     def test_from_json(self):
-        raw = json.dumps({
-            "type": "USER_ACTION",
-            "payload": {"action": "dismissed", "intervention_id": "int_123"},
-            "timestamp": 100.0,
-            "sequence": 5,
-        })
+        raw = json.dumps(
+            {
+                "type": "USER_ACTION",
+                "payload": {"action": "dismissed", "intervention_id": "int_123"},
+                "timestamp": 100.0,
+                "sequence": 5,
+            }
+        )
         msg = WSMessage.from_json(raw)
         assert msg.type == "USER_ACTION"
         assert msg.payload["action"] == "dismissed"
@@ -776,6 +1199,7 @@ class TestConsentEndpoints:
     def test_get_consent_level_with_ladder(self, client: TestClient):
         from cortex.services.consent.ladder import ConsentLadder
         from cortex.services.consent.policy import ConsentPolicy
+
         ladder = ConsentLadder(policy=ConsentPolicy(), store=None)
         registry.register("consent_ladder", ladder)
 
@@ -783,6 +1207,7 @@ class TestConsentEndpoints:
         # F24 made ConsentLadder methods async — use ``asyncio.run`` rather
         # than ``get_event_loop`` so Python 3.10+ does not raise.
         import asyncio
+
         asyncio.run(ladder.check("close_tab"))
 
         resp = client.get("/consent/level")
@@ -800,6 +1225,7 @@ class TestConsentEndpoints:
     def test_reset_consent_with_ladder(self, client: TestClient):
         from cortex.services.consent.ladder import ConsentLadder
         from cortex.services.consent.policy import ConsentPolicy
+
         ladder = ConsentLadder(policy=ConsentPolicy(), store=None)
         registry.register("consent_ladder", ladder)
 
@@ -808,6 +1234,7 @@ class TestConsentEndpoints:
         async def _prime() -> None:
             for _ in range(5):
                 await ladder.record_approval("close_tab")
+
         asyncio.run(_prime())
 
         # Reset
@@ -816,6 +1243,41 @@ class TestConsentEndpoints:
         data = resp.json()
         assert data["reset"] is True
         assert data["levels"] == {}  # All states cleared after reset
+
+    def test_reset_consent_requests_exact_global_restore(
+        self,
+        client: TestClient,
+    ) -> None:
+        from cortex.services.consent.ladder import ConsentLadder
+        from cortex.services.consent.policy import ConsentPolicy
+
+        calls: list[tuple[str, float]] = []
+
+        class _Daemon:
+            async def restore_all_transactional_effects(
+                self,
+                *,
+                reason: str,
+                timeout_seconds: float,
+            ) -> dict[str, int]:
+                calls.append((reason, timeout_seconds))
+                return {
+                    "requested": 0,
+                    "dispatched": 0,
+                    "restored": 0,
+                    "failed": 0,
+                    "pending": 0,
+                }
+
+        registry.register(
+            "consent_ladder",
+            ConsentLadder(policy=ConsentPolicy(), store=None),
+        )
+        registry.register("daemon", _Daemon())
+        response = client.post("/consent/reset")
+        assert response.status_code == 200
+        assert response.json()["reset"] is True
+        assert calls == [("system_cancelled", 3.0)]
 
 
 # =============================================================================
@@ -828,10 +1290,12 @@ class TestAPIGatewayImports:
 
     def test_import_create_app(self):
         from cortex.services.api_gateway import create_app
+
         assert create_app is not None
 
     def test_import_registry(self):
         from cortex.services.api_gateway import ServiceRegistry, registry
+
         assert ServiceRegistry is not None
         assert registry is not None
 

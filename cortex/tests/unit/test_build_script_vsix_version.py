@@ -1,4 +1,4 @@
-"""P2-12: Build script must NOT hard-code the VSIX version string."""
+"""Build artifacts must use the canonical pyproject version."""
 
 from __future__ import annotations
 
@@ -32,20 +32,23 @@ def test_build_script_does_not_hardcode_vsix_version() -> None:
     )
 
 
-def test_build_script_reads_vsix_version_from_package_json() -> None:
-    """Confirm VSIX_VERSION is derived from package.json via jq."""
+def test_build_script_reads_canonical_project_version() -> None:
+    """The locked build interpreter must read the drift-checked source."""
     text = _BUILD_SCRIPT.read_text(encoding="utf-8")
-    assert "VSIX_VERSION=$(jq -r .version" in text, (
-        "Build script must set VSIX_VERSION via jq from package.json"
+    assert 'PYTHON_BIN="${CORTEX_DIR}/.venv/bin/python"' in text
+    assert '"${PYTHON_BIN}" -m cortex.scripts.sync_versions --check' in text
+    assert (
+        'CORTEX_VERSION=$("${PYTHON_BIN}" -m '
+        "cortex.scripts.sync_versions --print)" in text
     )
 
 
-def test_vsix_path_uses_vsix_version_variable() -> None:
-    """Confirm the VSIX path references ${VSIX_VERSION}."""
+def test_vsix_and_dmg_paths_use_canonical_version_variable() -> None:
+    """Both shipped artifact names expose the same canonical version."""
     text = _BUILD_SCRIPT.read_text(encoding="utf-8")
-    # Find the VSIX= assignment (possibly after VSIX_VERSION definition).
     vsix_assign = re.search(r"^VSIX=.*$", text, re.MULTILINE)
     assert vsix_assign is not None
-    assert "${VSIX_VERSION}" in vsix_assign.group(0), (
-        "VSIX= assignment must use ${VSIX_VERSION} variable"
-    )
+    assert "${CORTEX_VERSION}" in vsix_assign.group(0)
+    dmg_assign = re.search(r"^DMG_PATH=.*$", text, re.MULTILINE)
+    assert dmg_assign is not None
+    assert "Cortex-${CORTEX_VERSION}-macos-${ARTIFACT_ARCH}.dmg" in dmg_assign.group(0)

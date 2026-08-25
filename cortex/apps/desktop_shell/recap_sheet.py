@@ -275,11 +275,11 @@ class RecapSheet(QWidget):
             f"  padding: 6px 14px;"
             f"  border-radius: {RADIUS_BUTTON}px;"
             f"  background: {BRAND_ACCENT};"
-            "  color: #FFFFFF;"
+            f"  color: {SEMANTIC_LIGHT['label_primary']};"
             "  border: none;"
             "}"
-            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
-            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; }}"
+            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
+            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
         )
         self._view_btn.clicked.connect(self._on_view_clicked)
         _safe_call(

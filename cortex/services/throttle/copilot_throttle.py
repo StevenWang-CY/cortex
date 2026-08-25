@@ -1,11 +1,9 @@
-"""
-Throttle — Copilot/Cursor Inline Suggestion Throttle
+"""Contained legacy Copilot/Cursor inline-suggestion policy.
 
-Connects the state engine to the VS Code API to silence inline AI
-suggestions (Copilot, Cursor, etc.) when the user is overwhelmed.
-
-When HYPER is detected with high confidence, sends a command to the
-VS Code extension to disable inline suggestions. Re-enables on FLOW.
+State estimates may inform a proposal, but they do not grant authority to
+change editor settings. The compatibility state machine remains decodable for
+old configuration and cleanup paths; its forward wire command is intentionally
+inert until represented by an exact WP6 manifest/authorization/receipt chain.
 """
 
 from __future__ import annotations
@@ -20,13 +18,10 @@ class CopilotThrottle:
     """
     Manages AI assistant throttling based on cognitive state.
 
-    Sends commands to the VS Code extension via WebSocket to toggle
-    inline suggestions. Tracks current throttle state to avoid
-    sending redundant commands.
+    Evaluates the old policy without emitting editor mutation commands.
 
-    Usage:
-        throttle = CopilotThrottle(ws_server=ws_server)
-        await throttle.on_state_change("HYPER", confidence=0.9)
+    ``on_state_change`` returns ``False`` unless a future exact adapter is
+    wired; callers therefore never claim a settings change from policy alone.
     """
 
     def __init__(
@@ -65,7 +60,7 @@ class CopilotThrottle:
         """
         React to a cognitive state change.
 
-        Throttles on HYPER with high confidence, un-throttles on FLOW.
+        Evaluate the legacy thresholds without granting workspace authority.
 
         Args:
             state: Current state ("FLOW", "HYPER", "HYPO", "RECOVERY").
@@ -78,13 +73,14 @@ class CopilotThrottle:
             return False
 
         if state == "HYPER" and confidence >= self._hyper_threshold and not self._is_throttled:
-            await self._disable_suggestions()
-            self._is_throttled = True
-            logger.info(
-                "Copilot throttled: HYPER at %.0f%% confidence",
-                confidence * 100,
-            )
-            return True
+            if await self._disable_suggestions():
+                self._is_throttled = True
+                logger.info(
+                    "Copilot throttled: HYPER at %.0f%% confidence",
+                    confidence * 100,
+                )
+                return True
+            return False
 
         # P1: re-enable on ANY confirmed transition OUT of HYPER, not just
         # a clean FLOW recovery. The previous code only un-throttled on
@@ -100,49 +96,38 @@ class CopilotThrottle:
         if self._is_throttled and state != "HYPER":
             if state == "FLOW" and confidence < self._flow_threshold:
                 return False
-            await self._enable_suggestions()
-            self._is_throttled = False
-            logger.info(
-                "Copilot un-throttled: left HYPER for %s at %.0f%% confidence",
-                state,
-                confidence * 100,
-            )
-            return True
+            if await self._enable_suggestions():
+                self._is_throttled = False
+                logger.info(
+                    "Copilot un-throttled: left HYPER for %s at %.0f%% confidence",
+                    state,
+                    confidence * 100,
+                )
+                return True
+            return False
 
         return False
 
-    async def _disable_suggestions(self) -> None:
+    async def _disable_suggestions(self) -> bool:
         """Tell VS Code to disable inline suggestions (Copilot/Cursor/…)."""
-        await self._emit("disable")
+        return await self._emit("disable")
 
-    async def _enable_suggestions(self) -> None:
+    async def _enable_suggestions(self) -> bool:
         """Tell VS Code to re-enable inline suggestions."""
-        await self._emit("enable")
+        return await self._emit("enable")
 
-    async def _emit(self, action: str) -> None:
-        """Send a ``COPILOT_THROTTLE`` message targeted at the VS Code client.
+    async def _emit(self, action: str) -> bool:
+        """Contain the legacy mutation until it uses exact authorization."""
 
-        Matches the handler at
-        ``cortex/apps/vscode_extension/src/extension.ts`` (case
-        ``COPILOT_THROTTLE``) which invokes
-        ``cortex.disableInlineSuggestions`` / ``cortex.enableInlineSuggestions``.
-        Previously this used a generic ``COMMAND`` message type with no
-        VS Code-side handler — the call site was an orphan emitter.
-        """
-        if self._ws_server is None:
-            return
-        try:
-            await self._ws_server.send_message(
-                "COPILOT_THROTTLE",
-                {"action": action},
-                target_client_types=["vscode"],
-            )
-        except Exception:
-            logger.debug("Failed to send COPILOT_THROTTLE message", exc_info=True)
+        logger.info(
+            "COPILOT_THROTTLE %s suppressed pending exact transaction support",
+            action,
+        )
+        return False
 
     async def force_enable(self) -> None:
         """Force re-enable suggestions regardless of state."""
         if self._is_throttled:
-            await self._enable_suggestions()
-            self._is_throttled = False
-            logger.info("Copilot force-enabled")
+            if await self._enable_suggestions():
+                self._is_throttled = False
+                logger.info("Copilot force-enabled")

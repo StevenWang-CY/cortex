@@ -7,7 +7,65 @@ webcam, face tracking, and telemetry sources.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, model_validator
+from enum import StrEnum
+from typing import Literal
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from cortex.libs.schemas.observations import MissingReason
+from cortex.libs.schemas.physiology import SignalEstimate
+
+
+class FeatureName(StrEnum):
+    """Stable names for measurements that may reach support inference.
+
+    The names describe measurements, not interpretations. Whether a feature
+    is eligible for a production rule or a research model is owned by the
+    versioned catalog in ``state_engine.feature_schema``.
+    """
+
+    HEART_RATE_BPM = "heart_rate_bpm"
+    BLINK_RATE_PER_MIN = "blink_rate_per_min"
+    HEAD_NECK_FLEXION_SCORE = "head_neck_flexion_score"
+    MOUSE_VELOCITY_MEAN = "mouse_velocity_mean"
+    MOUSE_VELOCITY_VARIANCE = "mouse_velocity_variance"
+    CLICK_FREQUENCY = "click_frequency"
+    KEYPRESS_RATE_PER_MIN = "keypress_rate_per_min"
+    KEYSTROKE_INTERVAL_VARIANCE = "keystroke_interval_variance"
+    CORRECTION_RATE_PER_100_KEYS = "correction_rate_per_100_keys"
+    INACTIVITY_SECONDS = "inactivity_seconds"
+    TAB_SWITCH_RATE_PER_MIN = "tab_switch_rate_per_min"
+    SCROLL_BACK_RATE_PER_MIN = "scroll_back_rate_per_min"
+    THRASHING_SCORE = "thrashing_score"
+
+
+class FeatureValue(BaseModel):
+    """One named, provenance-bearing input to the support engine."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, use_enum_values=True)
+
+    value: float | None = None
+    valid: bool = False
+    quality: float = Field(0.0, ge=0.0, le=1.0)
+    age_ms: int = Field(0, ge=0)
+    source_window_ms: int = Field(..., ge=0)
+    algorithm_version: str = Field(..., min_length=1)
+    missing_reason: MissingReason | None = None
+
+    @model_validator(mode="after")
+    def _validity_is_coherent(self) -> FeatureValue:
+        if self.valid:
+            if self.value is None:
+                raise ValueError("valid feature values must contain a value")
+            if self.missing_reason is not None:
+                raise ValueError("valid feature values cannot have a missing_reason")
+        else:
+            if self.value is not None:
+                raise ValueError("invalid feature values cannot contain a value")
+            if self.missing_reason is None:
+                raise ValueError("invalid feature values require a missing_reason")
+        return self
 
 
 class FrameMeta(BaseModel):
@@ -15,11 +73,27 @@ class FrameMeta(BaseModel):
 
     timestamp: float = Field(
         ...,
+        deprecated=True,
         description=(
             "UNIX epoch seconds (wall-clock, UTC); comparable across "
             "producer and consumer. Previously documented as 'Monotonic' "
             "but the producer uses time.time(), not time.monotonic()."
         ),
+    )
+    schema_version: Literal["2.0"] = "2.0"
+    observed_at_unix_ms: int | None = Field(
+        None,
+        ge=0,
+        description="Capture time in UTC Unix epoch milliseconds.",
+    )
+    observed_at_mono_ns: int | None = Field(
+        None,
+        ge=0,
+        description="Capture time in the producer's monotonic clock domain.",
+    )
+    boot_id: UUID | None = Field(
+        None,
+        description="Producer boot ID; required when observed_at_mono_ns is present.",
     )
     face_detected: bool = Field(..., description="Whether a face was detected")
     face_confidence: float = Field(
@@ -45,6 +119,20 @@ class FrameMeta(BaseModel):
         ),
     )
 
+    @model_validator(mode="after")
+    def _validate_v2_time_tuple(self) -> FrameMeta:
+        supplied = (
+            self.observed_at_unix_ms is not None,
+            self.observed_at_mono_ns is not None,
+            self.boot_id is not None,
+        )
+        if any(supplied) and not all(supplied):
+            raise ValueError(
+                "observed_at_unix_ms, observed_at_mono_ns, and boot_id "
+                "must be supplied together"
+            )
+        return self
+
 
 class PhysioFeatures(BaseModel):
     """Physiological features extracted from rPPG analysis."""
@@ -56,25 +144,27 @@ class PhysioFeatures(BaseModel):
         ..., ge=0.0, le=1.0, description="Signal quality (SNR-based, 0-1)"
     )
     pulse_variability_proxy: float | None = Field(
-        None, ge=0.0, description="RMSSD of inter-beat intervals in ms"
+        None,
+        ge=0.0,
+        description="Compatibility field; unavailable in product pending validation",
     )
     hrv_sdnn: float | None = Field(
-        None, ge=0.0, description="SDNN of inter-beat intervals in ms"
+        None, ge=0.0, description="Compatibility field; unavailable in product"
     )
     hrv_pnn50: float | None = Field(
-        None, ge=0.0, le=1.0, description="Fraction of adjacent IBI deltas > 50ms"
+        None, ge=0.0, le=1.0, description="Compatibility field; unavailable in product"
     )
     hrv_sd1: float | None = Field(
-        None, ge=0.0, description="Poincare SD1 in ms"
+        None, ge=0.0, description="Compatibility field; unavailable in product"
     )
     hrv_sd2: float | None = Field(
-        None, ge=0.0, description="Poincare SD2 in ms"
+        None, ge=0.0, description="Compatibility field; unavailable in product"
     )
     hrv_lf_hf_ratio: float | None = Field(
-        None, ge=0.0, description="LF/HF ratio from Lomb-Scargle PSD"
+        None, ge=0.0, description="Compatibility field; unavailable in product"
     )
     hrv_sample_entropy: float | None = Field(
-        None, ge=0.0, description="Sample entropy of IBI sequence"
+        None, ge=0.0, description="Compatibility field; unavailable in product"
     )
     physio_sqi: float | None = Field(
         None, ge=0.0, le=1.0, description="Composite physiological signal-quality index"
@@ -87,7 +177,22 @@ class PhysioFeatures(BaseModel):
         None, description="Heart rate change over last 5 seconds (BPM/5s)"
     )
     respiration_rate_bpm: float | None = Field(
-        None, ge=0.0, le=60.0, description="Respiration rate in breaths per minute"
+        None,
+        ge=0.0,
+        le=60.0,
+        description="Compatibility field; unavailable in product pending validation",
+    )
+    pulse_evidence: SignalEstimate | None = Field(
+        None,
+        description="Algorithm/version/quality/uncertainty contract for pulse",
+    )
+    hrv_evidence: dict[str, SignalEstimate] = Field(
+        default_factory=dict,
+        description="Metric-specific HRV readiness; unavailable metrics stay explicit",
+    )
+    respiration_evidence: SignalEstimate | None = Field(
+        None,
+        description="Agreement-gated breathing-rate proxy evidence contract",
     )
     valid: bool = Field(..., description="Whether physiological features are valid")
 
@@ -144,17 +249,56 @@ class KinematicFeatures(BaseModel):
     ear_variance: float | None = Field(
         None, ge=0.0, description="Variance of eye aspect ratio over rolling window"
     )
+    blink_valid_exposure_seconds: float = Field(
+        0.0,
+        ge=0.0,
+        description="Eye-visible monotonic exposure contributing to blink metrics",
+    )
     head_pitch: float | None = Field(None, description="Head pitch angle in degrees")
     head_yaw: float | None = Field(None, description="Head yaw angle in degrees")
     head_roll: float | None = Field(None, description="Head roll angle in degrees")
+    head_angular_velocity_deg_per_s: float | None = Field(
+        None,
+        ge=0.0,
+        description="Elapsed-time head angular velocity in degrees per second",
+    )
+    head_is_jittery: bool | None = None
+    head_is_frozen: bool | None = None
+    head_neck_flexion_angle: float | None = Field(
+        None,
+        ge=0.0,
+        le=90.0,
+        description="Camera-relative head/neck flexion proxy in degrees",
+    )
+    head_neck_flexion_score: float | None = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Calibrated head/neck flexion proxy score",
+    )
+    head_neck_flexion_dwell_seconds: float = Field(
+        0.0,
+        ge=0.0,
+        description="Contiguous valid time above the flexion threshold",
+    )
+    head_neck_proxy_available: bool = False
     slump_score: float | None = Field(
-        None, ge=0.0, le=1.0, description="Posture slump score (0-1)"
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Deprecated compatibility field; no body-posture model runs",
     )
     forward_lean_score: float | None = Field(
-        None, ge=0.0, le=1.0, description="Forward lean indicator (0-1)"
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Deprecated compatibility alias for head/neck flexion",
     )
     shoulder_drop_ratio: float | None = Field(
-        None, ge=0.0, le=1.0, description="Shoulder drop ratio from baseline"
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Unavailable compatibility field; shoulders are not measured",
     )
     confidence: float = Field(
         ..., ge=0.0, le=1.0, description="Overall kinematic feature confidence"
@@ -177,6 +321,11 @@ class TelemetryFeatures(BaseModel):
         ..., ge=0.0, le=1.0, description="Rapid clicking burst score"
     )
     click_frequency: float = Field(..., ge=0.0, description="Clicks per second")
+    keypress_rate_per_min: float | None = Field(
+        None,
+        ge=0.0,
+        description="Observed typing-key presses per minute over the source window",
+    )
     keyboard_burst_score: float = Field(
         ..., ge=0.0, le=1.0, description="Typing intensity burst score"
     )
@@ -202,23 +351,61 @@ class TelemetryFeatures(BaseModel):
     scroll_back_rate_per_min: float | None = Field(
         None, ge=0.0, description="Upward reread scroll bursts per minute"
     )
+    observation_window_seconds: float | None = Field(
+        None,
+        gt=0.0,
+        description="Actual telemetry aggregation window; required by v2 inference",
+    )
+    mouse_move_count: int | None = Field(None, ge=0)
+    click_press_count: int | None = Field(None, ge=0)
+    key_press_count: int | None = Field(None, ge=0)
+    scroll_event_count: int | None = Field(None, ge=0)
+    window_focus_event_count: int | None = Field(None, ge=0)
+    window_focus_source_available: bool = Field(
+        False,
+        description=(
+            "Whether window tracking was running or produced an observed event; "
+            "false means zero switch rate is not an observation."
+        ),
+    )
 
 
 class FeatureVector(BaseModel):
     """
-    Unified 14-dimensional feature vector produced every 500ms.
+    Unified feature snapshot produced every 500ms.
 
-    Combines physiological, kinematic, and telemetry features into a single
-    vector for state classification.
+    ``features`` is the canonical v2 contract. The flat fields remain for one
+    compatibility cycle while non-inference consumers migrate. A missing
+    source is represented by an invalid :class:`FeatureValue`, never by a
+    fabricated numeric zero.
     """
 
     timestamp: float = Field(
         ...,
+        deprecated=True,
         description=(
-            "UNIX epoch seconds (wall-clock, UTC); comparable across "
-            "producer and consumer. Previously documented as 'Monotonic' "
-            "but the producer uses time.time(), not time.monotonic()."
+            "Deprecated v1 state-pipeline monotonic seconds. Compare only "
+            "inside the producing process; prefer observed_at_mono_ns."
         ),
+    )
+    schema_version: Literal["2.0"] = "2.0"
+    observed_at_unix_ms: int | None = Field(
+        None,
+        ge=0,
+        description="UTC Unix epoch milliseconds for persistence/display.",
+    )
+    observed_at_mono_ns: int | None = Field(
+        None,
+        ge=0,
+        description="Monotonic nanoseconds for elapsed-time decisions.",
+    )
+    boot_id: UUID | None = Field(
+        None,
+        description="Clock domain for observed_at_mono_ns.",
+    )
+    features: dict[FeatureName, FeatureValue] = Field(
+        default_factory=dict,
+        description="Named measurements with validity, quality, age, and provenance.",
     )
 
     # Physiological features (1-3)
@@ -226,10 +413,10 @@ class FeatureVector(BaseModel):
         None, ge=30.0, le=220.0, description="Instantaneous heart rate (BPM)"
     )
     hrv_rmssd: float | None = Field(
-        None, ge=0.0, description="HRV proxy - RMSSD in ms"
+        None, ge=0.0, description="Compatibility field; unavailable in product"
     )
     hrv_sdnn: float | None = Field(
-        None, ge=0.0, description="SDNN in ms"
+        None, ge=0.0, description="Compatibility field; unavailable in product"
     )
     hr_delta: float | None = Field(
         None, description="Heart rate gradient over 5s"
@@ -251,11 +438,25 @@ class FeatureVector(BaseModel):
     ear_variance: float | None = Field(
         None, ge=0.0, description="EAR variance over rolling window"
     )
+    blink_valid_exposure_seconds: float = Field(0.0, ge=0.0)
+    head_angular_velocity_deg_per_s: float | None = Field(None, ge=0.0)
+    head_is_jittery: bool | None = None
+    head_is_frozen: bool | None = None
+    head_neck_flexion_angle: float | None = Field(None, ge=0.0, le=90.0)
+    head_neck_flexion_score: float | None = Field(None, ge=0.0, le=1.0)
+    head_neck_flexion_dwell_seconds: float = Field(0.0, ge=0.0)
+    head_neck_proxy_available: bool = False
     shoulder_drop_ratio: float | None = Field(
-        None, ge=0.0, le=1.0, description="Shoulder drop from baseline"
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Unavailable compatibility field; shoulders are not measured",
     )
     forward_lean_angle: float | None = Field(
-        None, ge=0.0, le=90.0, description="Forward lean angle in degrees"
+        None,
+        ge=0.0,
+        le=90.0,
+        description="Deprecated alias for camera-relative head/neck flexion",
     )
 
     # Telemetry features (8-12)
@@ -266,11 +467,22 @@ class FeatureVector(BaseModel):
         0.0, ge=0.0, description="Mouse velocity variance"
     )
     click_frequency: float = Field(0.0, ge=0.0, description="Clicks per second")
+    keypress_rate_per_min: float = Field(
+        0.0, ge=0.0, description="Typing-key presses per minute"
+    )
     keystroke_interval_variance: float = Field(
         0.0, ge=0.0, description="Keystroke interval variance (ms^2)"
     )
     correction_rate_per_100_keys: float | None = Field(
         None, ge=0.0, description="Backspace + undo corrections per 100 keys"
+    )
+    inactivity_seconds: float = Field(
+        0.0,
+        ge=0.0,
+        description=(
+            "Seconds since the last input event. The value is evidence only "
+            "when the named telemetry feature is valid."
+        ),
     )
     tab_switch_frequency: float = Field(
         0.0, ge=0.0, description="Tab/window switches per minute"
@@ -279,7 +491,10 @@ class FeatureVector(BaseModel):
         None, ge=0.0, description="Upward reread scroll bursts per minute"
     )
     respiration_rate: float | None = Field(
-        None, ge=0.0, le=60.0, description="Respiration rate (breaths/min)"
+        None,
+        ge=0.0,
+        le=60.0,
+        description="Compatibility field; unavailable in product",
     )
     thrashing_score: float = Field(
         0.0, ge=0.0, le=1.0, description="Focus thrashing score from transition graph"
@@ -302,8 +517,26 @@ class FeatureVector(BaseModel):
         ),
     )
 
+    @model_validator(mode="after")
+    def _validate_v2_time_tuple(self) -> FeatureVector:
+        supplied = (
+            self.observed_at_unix_ms is not None,
+            self.observed_at_mono_ns is not None,
+            self.boot_id is not None,
+        )
+        if any(supplied) and not all(supplied):
+            raise ValueError(
+                "observed_at_unix_ms, observed_at_mono_ns, and boot_id "
+                "must be supplied together"
+            )
+        return self
+
     def to_array(self) -> list[float | None]:
-        """Convert feature vector to a list for ML inference."""
+        """Legacy array projection; production inference does not use it.
+
+        New model code must use ``FeatureSchema.to_ordered_array`` so input
+        order, transformations, missingness, and exact dimension are versioned.
+        """
         return [
             self.hr,
             self.hrv_rmssd,
@@ -334,13 +567,13 @@ class FeatureVector(BaseModel):
     @property
     def has_kinematics(self) -> bool:
         """Check if kinematic features are available."""
-        return self.blink_rate is not None or self.shoulder_drop_ratio is not None
+        return self.blink_rate is not None or self.head_neck_proxy_available
 
     @property
     def has_telemetry(self) -> bool:
-        """Check if telemetry features are non-zero."""
-        return (
-            self.mouse_velocity_mean > 0
-            or self.click_frequency > 0
-            or self.keystroke_interval_variance > 0
-        )
+        """Whether a real telemetry snapshot has been observed.
+
+        Zero activity is a legitimate observation, so value-based truthiness
+        would incorrectly call an idle but connected input stream missing.
+        """
+        return self.telemetry_seen_count > 0

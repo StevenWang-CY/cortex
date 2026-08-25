@@ -13,10 +13,10 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -28,6 +28,9 @@ from cortex.libs.config.ports import (
     LAUNCHER_AGENT_PORT,
     WEBSOCKET_PORT,
 )
+
+if TYPE_CHECKING:
+    from cortex.libs.schemas.policy import MRTStudySpecification
 
 
 class StorageConfigError(RuntimeError):
@@ -80,6 +83,7 @@ def get_bedrock_token(config: CortexConfig | None = None) -> str | None:
         return None
     try:
         from cortex.libs.utils.secrets import get_password_safe
+
         token = get_password_safe(
             cfg.llm.bedrock.keychain_service,
             cfg.llm.bedrock.keychain_account,
@@ -139,6 +143,7 @@ def bedrock_token_env_scope(
         else:
             os.environ["AWS_BEARER_TOKEN_BEDROCK"] = prior
 
+
 # Bound at module-import time so Pydantic field defaults read from the
 # same constants without re-importing on every model construction.
 _PORTS: dict[str, int] = {
@@ -160,7 +165,7 @@ def _bundled_env_files() -> tuple[str, ...]:
         meipass = Path(sys._MEIPASS)  # type: ignore[attr-defined]
         return (
             str(app_support / ".env"),  # User overrides (highest priority)
-            str(meipass / ".env"),       # Bundled defaults
+            str(meipass / ".env"),  # Bundled defaults
         )
     return (".env", ".env.local")
 
@@ -170,6 +175,7 @@ def _bundled_storage_path() -> str:
     if _is_bundled():
         return str(Path.home() / "Library" / "Application Support" / "Cortex" / "Data")
     return "./storage"
+
 
 # =============================================================================
 # Sub-configuration Models
@@ -215,6 +221,45 @@ class BedrockConfig(BaseModel):
     keychain_account: str = "bearer_token"
 
 
+class LLMPrivacyConfig(BaseModel):
+    """Fail-closed policy for workspace context and external planners.
+
+    ``no_llm`` is the product default: Cortex may use local workspace context
+    in the deterministic rule planner, but it never opens a model-network
+    connection. ``no_content`` is stricter and ignores workspace content
+    entirely. ``external_redacted`` is available only when the separate
+    ``external_context_enabled`` acknowledgement is set; every individual
+    request must still pass through the short-lived preview/confirmation
+    protocol implemented by the context broker.
+
+    The acknowledgement is deliberately revision-bound.  A material change
+    to the disclosure copy or outbound field catalog increments
+    ``required_consent_revision`` and makes old configuration fail closed.
+    """
+
+    planner_mode: Literal["no_llm", "no_content", "external_redacted"] = "no_llm"
+    external_context_enabled: bool = False
+    consent_revision: str = Field(default="", max_length=64)
+    required_consent_revision: Literal["context-disclosure-v1"] = "context-disclosure-v1"
+    preview_ttl_seconds: int = Field(default=60, ge=15, le=60)
+    max_pending_previews: int = Field(default=16, ge=1, le=64)
+    provider_retention_mode: Literal[
+        "unverified",
+        "provider_default",
+        "zero_data_retention_contract",
+    ] = "unverified"
+
+    @property
+    def external_transport_enabled(self) -> bool:
+        """Whether configuration has acknowledged the current disclosure."""
+
+        return (
+            self.planner_mode == "external_redacted"
+            and self.external_context_enabled
+            and self.consent_revision == self.required_consent_revision
+        )
+
+
 class LLMConfig(BaseModel):
     """LLM engine configuration — Anthropic SDK over Bedrock (primary).
 
@@ -233,6 +278,7 @@ class LLMConfig(BaseModel):
 
     provider: Literal["bedrock", "vertex", "direct"] = "bedrock"
     bedrock: BedrockConfig = Field(default_factory=BedrockConfig)
+    privacy: LLMPrivacyConfig = Field(default_factory=LLMPrivacyConfig)
     use_keychain: bool = True
 
     # Three logical tiers — actual model selection per template lives in
@@ -245,7 +291,10 @@ class LLMConfig(BaseModel):
     temperature: float = 0.3
     # Bedrock cold starts can take 5-10s; Opus calls can exceed 20s.
     timeout_seconds: float = 30.0
-    cache_ttl_seconds: int = 300
+    # Plans can echo redacted-but-still-private workspace details. Keep them
+    # in memory briefly and bound configuration so an old environment value
+    # cannot silently turn the cache into long-lived context retention.
+    cache_ttl_seconds: int = Field(default=60, ge=0, le=60)
     # Per-template overrides keyed by template_name (e.g. {"debug_error_summary": "deep"}).
     template_tier_overrides: dict[str, Literal["fast", "default", "deep"]] = Field(
         default_factory=dict,
@@ -274,6 +323,7 @@ class LLMConfig(BaseModel):
             # Legacy values: azure, local, remote, openai_compat → bedrock
             return "bedrock"
         return v
+
     # Circuit-breaker: open after this many consecutive failures, in this window.
     circuit_failure_threshold: int = 5
     circuit_window_seconds: float = 60.0
@@ -297,15 +347,23 @@ class CaptureConfig(BaseModel):
     width: int = 640
     height: int = 480
     min_brightness: int = 50
+    # Deprecated compatibility threshold. New motion gating uses a
+    # resolution- and frame-rate-independent face-widths/second measure.
     max_jitter_px: float = 5.0
+    max_motion_face_widths_per_second: float = Field(0.75, gt=0.0)
+    # The frame-count setting remains loadable for one migration release.
+    # When the explicit duration is absent, FaceTracker derives seconds as
+    # ``face_lost_tolerance_frames / fps`` and still makes the decision on
+    # elapsed monotonic time.
     face_lost_tolerance_frames: int = 5
+    face_lost_tolerance_seconds: float | None = Field(None, ge=0.0)
+    observation_buffer_seconds: float = Field(30.0, gt=0.0)
+    observation_buffer_max_items: int = Field(3600, ge=2)
     # audit Phase-I: how often to run MediaPipe FaceLandmarker relative
     # to the capture cadence. ``1`` = every frame, ``2`` = every other
-    # frame (15 Hz at 30 Hz capture). C5 (audit): default reverted to
-    # ``1`` (every frame) — SENSING's apnea / blink-suppression timing
-    # needs the full-rate mesh so the per-frame timestamp threading is
-    # exact; the half-rate path introduced a sub-Nyquist gap on the
-    # respiration estimator that the apnea sustain timer depends on.
+    # frame (15 Hz at 30 Hz capture). The default remains ``1`` because
+    # elapsed-time blink and motion exposure require the full observation
+    # cadence; downsampling must occur after timestamps are recorded.
     face_mesh_subsample_n: int = 1
 
 
@@ -322,23 +380,42 @@ class StateWeights(BaseModel):
 
 
 class StateConfig(BaseModel):
-    """State engine configuration."""
+    """Temporal configuration for deterministic support inference."""
 
     entry_threshold: float = 0.85
     exit_threshold: float = 0.70
+    # State-label hysteresis is distinct from the higher intervention gate.
+    # Fixed-denominator Level-A scores are deliberately conservative, so a
+    # label may stabilize before an interruption becomes eligible.
+    estimate_entry_threshold: float = Field(0.40, ge=0.0, le=1.0)
+    estimate_exit_threshold: float = Field(0.25, ge=0.0, le=1.0)
+    inference_mode: Literal["deterministic", "safety_null"] = "deterministic"
     hyper_dwell_seconds: int = 30
     hypo_dwell_seconds: int = 60
     flow_dwell_seconds: int = 120
     ema_alpha: float = 0.3
-    ml_enabled: bool = False
-    ml_min_labeled_episodes: int = 30
-    ml_alpha_max: float = 0.7
-    ml_alpha_full_at_episodes: int = 150
     weights: StateWeights = Field(default_factory=StateWeights)
+
+    @model_validator(mode="after")
+    def _estimate_hysteresis_is_ordered(self) -> StateConfig:
+        if self.estimate_exit_threshold >= self.estimate_entry_threshold:
+            raise ValueError("estimate_exit_threshold must be below estimate_entry_threshold")
+        return self
 
 
 class InterventionConfig(BaseModel):
     """Intervention engine configuration."""
+
+    # Workspace authority is explicit and defaults to presentation only.
+    # Existing settings files that predate this field therefore migrate to
+    # the least-authoritative mode instead of silently preserving autonomous
+    # behaviour. ``authorized`` is reserved for exact, materialized user
+    # authorizations; ``research_autonomous`` requires separate study consent.
+    execution_mode: Literal[
+        "suggest_only",
+        "authorized",
+        "research_autonomous",
+    ] = "suggest_only"
 
     overlay_threshold: float = 0.70
     simplified_threshold: float = 0.85
@@ -406,25 +483,24 @@ class InterventionConfig(BaseModel):
     # P0 §3.5: HYPO / RECOVERY intervention catalog. Opt-in for the
     # first release — the new arms (re-engagement nudge, recovery
     # reinforcement) are only evaluated when this flag is True.
-    # AMIP starts cold for these arms, so leaving the default at False
-    # avoids any early all-in on a not-yet-trained reward signal.
+    # The production policy does not expose these experimental templates;
+    # leaving the default false avoids silently expanding its reviewed catalog.
     enable_hypo_recovery_interventions: bool = False
 
-    # P0 §3.7: biology-driven break feature flag. When True, a
-    # ``StressIntegralTracker.should_break`` False→True transition
-    # emits ``BREAK_RECOMMENDATION`` and the planner promotes
-    # ``take_biology_break`` to the primary action. Disabled in
-    # contexts where the biology-break overlay would interfere
-    # (e.g. CI smoke tests). Maps to env var
-    # ``CORTEX_INTERVENTION__ENABLE_BIOLOGY_BREAK``.
-    enable_biology_break: bool = True
+    # Transparent replacement for the retired HRV integral. Reminders are
+    # driven only by observed active-work duration and explicit preference,
+    # and default off to avoid surprising existing users.
+    enable_focus_break_reminders: bool = False
+    focus_break_interval_minutes: int = Field(50, ge=15, le=180)
+    focus_break_duration_seconds: int = Field(300, ge=60, le=1800)
+    focus_break_inactivity_pause_seconds: float = Field(60.0, ge=5.0, le=900.0)
 
     # P0 §3.7 risk mitigation (spec line 643): the spec calls for
     # audio to default off when ``mic_active`` was detected in the
     # last 5 minutes (user is on a call). The runtime daemon honours
     # this window by tracking the most recent mic_active timestamp;
     # the controller flips ``audio_cue=False`` for the duration.
-    biology_break_audio_mute_after_mic_seconds: float = 300.0
+    guided_break_audio_mute_after_mic_seconds: float = 300.0
 
     # P0 §3.10: auto-armed distraction blocking on HYPER. Defaults OFF —
     # the principle of least surprise wins for any autonomous action
@@ -446,13 +522,13 @@ class InterventionConfig(BaseModel):
     # owns this gate so the user is never silently kept in focus
     # mode after they've genuinely recovered.
     auto_distraction_block_exit_seconds: float = 300.0
-    # Default session duration the daemon proposes when arming. 20 min
-    # matches the typical Pomodoro upper bound + the spec example.
-    auto_distraction_block_session_minutes: int = 20
     # Default preset for the merged blocklist. Browser extension owns
     # the per-preset domain map. ``custom`` reads ``custom_domains``.
     auto_distraction_block_preset: Literal[
-        "developer", "student", "writer", "custom",
+        "developer",
+        "student",
+        "writer",
+        "custom",
     ] = "developer"
     # User-editable extra domains layered on top of the preset (or the
     # exclusive set when ``preset == "custom"``).
@@ -512,28 +588,64 @@ class TelemetryConfig(BaseModel):
     """Telemetry engine configuration."""
 
     mouse_sample_hz: int = 60
-    downsample_hz: int = 10
     window_seconds: int = 15
 
 
 class RPPGSignalConfig(BaseModel):
     """rPPG signal processing configuration."""
 
-    window_seconds: int = 10
-    stride_seconds: int = 1
-    backend: Literal["pos", "chrom", "green", "tscan"] = "pos"
-    model_path: str = "cortex/models/tscan.onnx"
-    bandpass_low: float = 0.7
-    bandpass_high: float = 3.5
-    bandpass_order: int = 4
-    welch_resolution: float = 0.1
+    window_seconds: int = Field(10, ge=8, le=60)
+    stride_seconds: int = Field(1, ge=1)
+    backend: Literal["pos", "chrom", "green"] = "pos"
+    backend_expected_sha256: str | None = Field(
+        None,
+        pattern=r"^[0-9a-f]{64}$",
+        description="Optional expected checksum of the packaged backend implementation",
+    )
+    dynamic_backend_selection: bool = Field(
+        False,
+        description="Requires separate held-out validation before it may be enabled",
+    )
+    bandpass_low: float = Field(0.7, gt=0.0)
+    bandpass_high: float = Field(3.5, gt=0.0)
+    bandpass_order: int = Field(4, ge=1, le=8)
     nsqi_threshold: float = 0.293
     min_cardiac_snr_db: float = 2.0
-    min_resp_snr_db: float = 1.5
-    max_face_loss_ratio: float = 0.20
-    max_head_jitter_deg: float = 7.5
-    hrv_min_window_seconds: int = 60
-    hrv_min_valid_ibi: int = 30
+    max_head_jitter_deg: float = Field(7.5, gt=0.0)
+    min_valid_coverage: float = Field(0.80, ge=0.0, le=1.0)
+    max_interpolation_gap_ms: float = Field(250.0, gt=0.0)
+    max_motion_rejected_fraction: float = Field(0.10, ge=0.0, le=1.0)
+    hrv_min_window_seconds: int = Field(180, ge=180)
+    hrv_min_valid_ibi: int = Field(120, ge=120)
+    experimental_hrv_enabled: bool = False
+    respiration_window_seconds: int = Field(45, ge=30, le=60)
+    respiration_low_hz: float = Field(0.08, gt=0.0)
+    respiration_high_hz: float = Field(0.50, gt=0.0)
+    respiration_min_channel_quality: float = Field(0.35, ge=0.0, le=1.0)
+    respiration_max_channel_disagreement_bpm: float = Field(3.0, gt=0.0)
+    experimental_respiration_enabled: bool = False
+
+    @field_validator("respiration_high_hz")
+    @classmethod
+    def _respiration_band_is_ordered(cls, value: float, info: Any) -> float:
+        low = float(info.data.get("respiration_low_hz", 0.0))
+        if value <= low:
+            raise ValueError("respiration_high_hz must exceed respiration_low_hz")
+        return value
+
+    @model_validator(mode="after")
+    def _signal_bands_and_windows_are_coherent(self) -> RPPGSignalConfig:
+        if self.stride_seconds > self.window_seconds:
+            raise ValueError("rPPG stride_seconds cannot exceed window_seconds")
+        if self.bandpass_high <= self.bandpass_low:
+            raise ValueError("bandpass_high must exceed bandpass_low")
+        if self.fps_clamp_max <= self.fps_clamp_min:
+            raise ValueError("fps_clamp_max must exceed fps_clamp_min")
+        if self.bandpass_high >= self.fps_clamp_min / 2.0:
+            raise ValueError("cardiac band must remain below the minimum Nyquist rate")
+        if self.respiration_high_hz >= self.fps_clamp_min / 2.0:
+            raise ValueError("respiration band must remain below the minimum Nyquist rate")
+        return self
 
     # --- Sampling-rate correctness (B1) -----------------------------------
     # rPPG HR estimation via Welch PSD assumes a known, *constant* sampling
@@ -544,7 +656,6 @@ class RPPGSignalConfig(BaseModel):
     # band; outside this band (or with too few timestamps) we fall back to
     # the configured fps. Refs: MDPI Sensors 25(2):588 (2025); rPPG-in-the-
     # wild, Behavior Research Methods (2024).
-    use_measured_fps: bool = True
     fps_clamp_min: float = 10.0
     fps_clamp_max: float = 60.0
 
@@ -556,29 +667,43 @@ class RPPGSignalConfig(BaseModel):
     # signal loss. Ref: PMC13000236 "Adaptive physiology-informed
     # correction"; pyVHR window-statistics post-processing.
     stabilize: bool = True
-    lock_enter_windows: int = 1          # consecutive valid windows to lock
-    lock_grace_seconds: float = 4.0      # hold last BPM through brief dropouts
-    snr_release_db: float = 0.0          # unlock only below this SNR …
-    sqi_release: float = 0.20            # … or this composite SQI (hysteresis)
-    bpm_smoothing_seconds: float = 6.0   # trailing median/EMA window
+    lock_enter_windows: int = 1  # consecutive valid windows to lock
+    lock_grace_seconds: float = 4.0  # hold last BPM through brief dropouts
+    snr_release_db: float = 0.0  # unlock only below this SNR …
+    sqi_release: float = 0.20  # … or this composite SQI (hysteresis)
+    bpm_smoothing_seconds: float = 6.0  # trailing median/EMA window
     bpm_max_slew_bpm_per_s: float = 12.0  # reject implausible window-to-window jumps
 
 
 class BlinkSignalConfig(BaseModel):
     """Blink detection configuration."""
 
-    ear_threshold: float = 0.21
-    ear_recovery: float = 0.25
-    min_frames: int = 3
-    perclos_threshold: float = 0.2
-    personalize_ear_percentile: float = 0.15
+    ear_threshold: float = Field(0.21, gt=0.0, lt=1.0)
+    ear_recovery: float = Field(0.25, gt=0.0, lt=1.0)
+    min_closed_ms: float = Field(80.0, gt=0.0)
+    max_closed_ms: float = Field(1000.0, gt=0.0)
+    min_valid_exposure_seconds: float = Field(15.0, gt=0.0)
+    history_window_seconds: float = Field(60.0, gt=0.0)
+    max_valid_gap_ms: float = Field(250.0, gt=0.0)
+
+    @model_validator(mode="after")
+    def _blink_thresholds_are_coherent(self) -> BlinkSignalConfig:
+        if self.ear_recovery <= self.ear_threshold:
+            raise ValueError("ear_recovery must exceed ear_threshold")
+        if self.max_closed_ms <= self.min_closed_ms:
+            raise ValueError("max_closed_ms must exceed min_closed_ms")
+        if self.min_valid_exposure_seconds > self.history_window_seconds:
+            raise ValueError("blink warm-up cannot exceed its history window")
+        return self
 
 
 class PostureSignalConfig(BaseModel):
-    """Posture detection configuration."""
+    """Camera-relative head/neck pose proxy configuration."""
 
-    shoulder_drop_threshold: float = 0.15
-    forward_lean_threshold: float = 20.0
+    head_neck_flexion_threshold_deg: float = Field(20.0, gt=0.0, le=60.0)
+    head_neck_sustain_seconds: float = Field(30.0, gt=0.0)
+    face_scale_change_tolerance: float = Field(0.25, gt=0.0, le=1.0)
+    max_valid_gap_ms: float = Field(250.0, gt=0.0)
 
 
 class SignalConfig(BaseModel):
@@ -589,32 +714,174 @@ class SignalConfig(BaseModel):
     posture: PostureSignalConfig = Field(default_factory=PostureSignalConfig)
 
 
-class AMIPConfig(BaseModel):
-    """Adaptive microrandomized intervention policy configuration."""
+class ProductionPolicyConfig(BaseModel):
+    """Non-learning product policy preferences."""
+
+    preferred_low_friction_arm: (
+        Literal[
+            "suggest_only",
+            "workspace_simplify",
+            "task_decompose",
+            "breath_box",
+            "nature_break",
+            "flow_shield",
+            "defusion_prompt",
+            "circuit_breaker",
+        ]
+        | None
+    ) = None
+
+
+class PolicyOutcomeConfig(BaseModel):
+    """Prespecified proximal outcome collection."""
+
+    reward_window_seconds: int = Field(300, ge=30, le=86_400)
+    reward_version: Literal["helpfulness-v2"] = "helpfulness-v2"
+    collector_interval_seconds: float = Field(5.0, ge=0.25, le=60.0)
+
+
+class ResearchPolicyConfig(BaseModel):
+    """Separately consented fixed-epoch research configuration.
+
+    Disabled by default. Enabling requires an explicit consent document and
+    a 32-byte seed so the exact randomization can be independently replayed.
+    """
+
+    enabled: bool = False
+    study_id: str = Field("", pattern=r"^$|^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
+    study_epoch: str = Field("", pattern=r"^$|^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
+    consent_version: str = Field("", pattern=r"^$|^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+    seed_hex: str = ""
+    action_catalog: tuple[Literal["no_action", "suggest_only"], ...] = (
+        "no_action",
+        "suggest_only",
+    )
+    minimum_probability: float = Field(0.10, gt=0.0, le=0.5)
+    bootstrap_samples: int = Field(1_000, ge=200, le=100_000)
+    analysis_seed: int = Field(0, ge=0, le=2**63 - 1)
+    eligibility_rule: str = Field(
+        "Eligible when the reviewed deterministic trigger gate passes and both MRT arms "
+        "remain safe and feasible.",
+        min_length=1,
+        max_length=500,
+    )
+    availability_rule: str = Field(
+        "Available when the receptivity gate passes, no repeated-dismissal suppression "
+        "is active, and no other safety exclusion applies.",
+        min_length=1,
+        max_length=500,
+    )
+    missing_outcome_rule: str = Field(
+        "Retain the decision point, mark the proximal outcome censored, and exclude it "
+        "from the complete-case primary analysis.",
+        min_length=1,
+        max_length=500,
+    )
+    contamination_rule: str = Field(
+        "Retain the decision point, record every overlapping delivery, and exclude a "
+        "contaminated proximal window from the primary analysis.",
+        min_length=1,
+        max_length=500,
+    )
+    online_learning: Literal[False] = False
+
+    @model_validator(mode="after")
+    def _research_requires_frozen_epoch(self) -> ResearchPolicyConfig:
+        if not self.enabled:
+            return self
+        if not self.study_id or not self.study_epoch or not self.consent_version:
+            raise ValueError(
+                "research mode requires study_id, study_epoch, and separate consent_version"
+            )
+        if len(self.seed_hex) != 64:
+            raise ValueError("research seed_hex must encode exactly 32 bytes")
+        try:
+            bytes.fromhex(self.seed_hex)
+        except ValueError as exc:
+            raise ValueError("research seed_hex must be hexadecimal") from exc
+        if self.seed_hex != self.seed_hex.lower():
+            raise ValueError("research seed_hex must be lowercase")
+        if self.action_catalog != ("no_action", "suggest_only"):
+            raise ValueError("the reviewed first research epoch is fixed to no_action/suggest_only")
+        return self
+
+    def mrt_specification(
+        self,
+        *,
+        policy_name: str,
+        policy_version: str,
+        reward_version: str,
+        proximal_window_seconds: int,
+    ) -> MRTStudySpecification:
+        """Build the sole frozen study specification for this config epoch."""
+
+        from cortex.libs.schemas.policy import MRTStudySpecification
+
+        return MRTStudySpecification(
+            study_id=self.study_id,
+            study_epoch=self.study_epoch,
+            consent_version=self.consent_version,
+            policy_name=policy_name,
+            policy_version=policy_version,
+            action_catalog=self.action_catalog,
+            reward_version=reward_version,
+            proximal_window_seconds=proximal_window_seconds,
+            eligibility_rule=self.eligibility_rule,
+            availability_rule=self.availability_rule,
+            missing_outcome_rule=self.missing_outcome_rule,
+            contamination_rule=self.contamination_rule,
+            bootstrap_samples=self.bootstrap_samples,
+            analysis_seed=self.analysis_seed,
+        )
+
+
+class PolicyDiagnosticsConfig(BaseModel):
+    """Descriptive operational reporting; never a causal-effect report."""
 
     enabled: bool = True
-    tau0: float = 1.0
-    tau_min: float = 0.1
-    epsilon_explore: float = 0.05
-    epsilon_explore_after_500: float = 0.01
-    safety_floor_stress_ratio: float = 1.0
-    reward_window_seconds: int = 300
-
-
-class CausalReportConfig(BaseModel):
-    """Nightly causal reporting configuration."""
-
-    enabled: bool = True
-    bootstrap_samples: int = 300
-    nightly_hour_local: int = 2
+    nightly_hour_local: int = Field(2, ge=0, le=23)
 
 
 class EvalConfig(BaseModel):
     """Evaluation and policy-learning configuration."""
 
-    policy: Literal["amip", "greedy", "uniform"] = "amip"
-    amip: AMIPConfig = Field(default_factory=AMIPConfig)
-    causal_report: CausalReportConfig = Field(default_factory=CausalReportConfig)
+    policy: Literal["deterministic", "research_randomized"] = "deterministic"
+    decision_interval_seconds: int = Field(60, ge=10, le=3_600)
+    production: ProductionPolicyConfig = Field(default_factory=ProductionPolicyConfig)
+    outcome: PolicyOutcomeConfig = Field(default_factory=PolicyOutcomeConfig)
+    research: ResearchPolicyConfig = Field(default_factory=ResearchPolicyConfig)
+    policy_diagnostics: PolicyDiagnosticsConfig = Field(default_factory=PolicyDiagnosticsConfig)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _contain_legacy_adaptive_defaults(cls, value: Any) -> Any:
+        """Map old AMIP/greedy/uniform config to safe deterministic mode."""
+
+        if not isinstance(value, dict):
+            return value
+        migrated = dict(value)
+        if migrated.get("policy") in {"amip", "greedy", "uniform"}:
+            migrated["policy"] = "deterministic"
+        old_amip = migrated.pop("amip", None)
+        if isinstance(old_amip, dict) and "reward_window_seconds" in old_amip:
+            outcome = dict(migrated.get("outcome") or {})
+            outcome.setdefault("reward_window_seconds", old_amip["reward_window_seconds"])
+            migrated["outcome"] = outcome
+        old_report = migrated.pop("causal_report", None)
+        if isinstance(old_report, dict):
+            diagnostics = dict(migrated.get("policy_diagnostics") or {})
+            if "enabled" in old_report:
+                diagnostics.setdefault("enabled", old_report["enabled"])
+            if "nightly_hour_local" in old_report:
+                diagnostics.setdefault("nightly_hour_local", old_report["nightly_hour_local"])
+            migrated["policy_diagnostics"] = diagnostics
+        return migrated
+
+    @model_validator(mode="after")
+    def _research_mode_is_explicitly_enabled(self) -> EvalConfig:
+        if self.policy == "research_randomized" and not self.research.enabled:
+            raise ValueError("research_randomized policy requires eval.research.enabled=true")
+        return self
 
 
 class LandmarksConfig(BaseModel):
@@ -625,13 +892,20 @@ class LandmarksConfig(BaseModel):
     right_cheek: list[int] = Field(default=[280, 330, 345, 346, 347, 348, 349, 350])
     left_eye: list[int] = Field(default=[33, 160, 158, 133, 153, 144])
     right_eye: list[int] = Field(default=[362, 385, 387, 263, 373, 380])
-    shoulders: list[int] = Field(default=[11, 12])
 
 
 class StorageConfig(BaseModel):
     """Storage configuration."""
 
     path: str = Field(default_factory=_bundled_storage_path)
+    sqlite_filename: str = Field(
+        "cortex.sqlite3",
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*\.sqlite3$",
+        description="Filename only; the database always remains under storage.path.",
+    )
+    sqlite_busy_timeout_ms: int = Field(5_000, ge=1, le=60_000)
+    backup_retention_count: int = Field(3, ge=1, le=20)
+    analytics_queue_capacity: int = Field(256, ge=16, le=16_384)
     session_retention_days: int = 7
     feature_retention_days: int = 7
     error_retention_days: int = 90
@@ -778,60 +1052,6 @@ def load_yaml_defaults() -> dict[str, Any]:
     return {}
 
 
-# Phase-4a Debt-1: env toggles that gate user-visible features. The
-# values are read by Pydantic from the environment / .env file; if
-# neither source carries them the field defaults apply. That is
-# semantically correct but operationally silent — a power user who
-# meant to flip ``ENABLE_AUTO_DISTRACTION_BLOCK=true`` and mistyped the
-# key would never know. We surface a one-line WARN at config load to
-# bound mis-configuration surprise.
-_REQUIRED_FEATURE_TOGGLES: tuple[str, ...] = (
-    "CORTEX_INTERVENTION__ENABLE_BIOLOGY_BREAK",
-    "CORTEX_INTERVENTION__ENABLE_AUTO_DISTRACTION_BLOCK",
-    "CORTEX_INTERVENTION__ENABLE_OS_NOTIFICATIONS",
-)
-
-
-def _check_required_feature_toggles() -> None:
-    """Warn (once per process) when documented feature toggles are
-    absent from both the environment and the .env files.
-
-    The defaults remain authoritative; this only surfaces mis-typed
-    or forgotten overrides so operations is never silent.
-
-    I5: ``CORTEX_SUPPRESS_FEATURE_TOGGLE_WARNINGS`` is honoured ONLY when
-    ``CORTEX_ENV=test``. Production deployments that inadvertently set
-    the suppression flag still emit warnings — we'd rather log-flood than
-    silently ship with a wedged feature flag. Tests that need to suppress
-    must explicitly set ``CORTEX_ENV=test`` as well.
-    """
-    if (
-        os.environ.get("CORTEX_SUPPRESS_FEATURE_TOGGLE_WARNINGS") == "1"
-        and os.environ.get("CORTEX_ENV") == "test"
-    ):
-        return
-    log = __import__("logging").getLogger(__name__)
-    env_files = _bundled_env_files()
-    env_contents = ""
-    for env_path in env_files:
-        try:
-            with open(env_path) as fp:
-                env_contents += fp.read() + "\n"
-        except OSError:
-            continue
-    for key in _REQUIRED_FEATURE_TOGGLES:
-        if key in os.environ:
-            continue
-        if env_contents and key in env_contents:
-            continue
-        log.warning(
-            "Documented feature toggle %s is not set in environment or "
-            ".env; falling back to compiled default. Set it explicitly "
-            "to silence this warning.",
-            key,
-        )
-
-
 @lru_cache
 def get_config() -> CortexConfig:
     """
@@ -849,7 +1069,6 @@ def get_config() -> CortexConfig:
         CortexConfig: The global configuration instance.
     """
     config = CortexConfig()
-    _check_required_feature_toggles()
 
     if _is_bundled():
         storage_path = Path(config.storage.path).expanduser()

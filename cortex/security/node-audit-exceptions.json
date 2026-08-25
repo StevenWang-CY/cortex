@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "exceptions": [
+    {
+      "ecosystem": "pnpm",
+      "advisory_id": "GHSA-5p2g-fcmc-qvqq",
+      "package": "image-size",
+      "max_severity": "high",
+      "path_prefixes": [
+        ".>plasmo>@plasmohq/parcel-config>@parcel/transformer-less>less>image-size",
+        ".>vite>less>image-size",
+        ".>vitest"
+      ],
+      "expires_on": "2026-09-30",
+      "reason": "No patched release is published; the package is reachable only through dormant Plasmo/Vitest Less build tooling.",
+      "mitigation": "Cortex compiles reviewed repository source only, accepts no user-supplied Less or image buffers, and ships no build tooling. Recheck upstream monthly."
+    },
+    {
+      "ecosystem": "pnpm",
+      "advisory_id": "GHSA-w3rx-r6r6-pgpr",
+      "package": "image-size",
+      "max_severity": "high",
+      "path_prefixes": [
+        ".>plasmo>@plasmohq/parcel-config>@parcel/transformer-less>less>image-size",
+        ".>vite>less>image-size",
+        ".>vitest"
+      ],
+      "expires_on": "2026-09-30",
+      "reason": "No patched release is published; the package is reachable only through dormant Plasmo/Vitest Less build tooling.",
+      "mitigation": "Cortex compiles reviewed repository source only, accepts no user-supplied Less or image buffers, and ships no build tooling. Recheck upstream monthly."
+    },
+    {
+      "ecosystem": "pnpm",
+      "advisory_id": "GHSA-qm9p-f9j5-w83w",
+      "package": "@parcel/reporter-dev-server",
+      "max_severity": "moderate",
+      "path_prefixes": [".>plasmo>@plasmohq/parcel-config>@parcel/config-default>@parcel/reporter-dev-server"],
+      "expires_on": "2026-11-22",
+      "reason": "The patched Parcel reporter requires Parcel 2.16 while Plasmo 0.90.5 pins Parcel 2.9; forcing it makes the build invalid.",
+      "mitigation": "Release and CI only run the one-shot Plasmo build and never expose its development server. Track a compatible Plasmo upgrade."
+    },
+    {
+      "ecosystem": "pnpm",
+      "advisory_id": "GHSA-3mv9-4h5g-vhg3",
+      "package": "tsup",
+      "max_severity": "low",
+      "path_prefixes": [".>plasmo>@plasmohq/parcel-config>@plasmohq/parcel-resolver-post>tsup"],
+      "expires_on": "2026-12-22",
+      "reason": "The advisory has no patched release and affects generated browser bundles only when attacker-controlled import metadata is built.",
+      "mitigation": "Only reviewed repository source enters the release build; no remote or user-authored modules are compiled by the packaged app."
+    },
+    {
+      "ecosystem": "pnpm",
+      "advisory_id": "GHSA-8266-84wp-wv5c",
+      "package": "svelte",
+      "max_severity": "moderate",
+      "path_prefixes": [".>plasmo>@plasmohq/parcel-config>@plasmohq/parcel-transformer-svelte>svelte"],
+      "expires_on": "2026-11-22",
+      "reason": "Svelte is a dormant Plasmo transformer dependency; Cortex is React-only and performs no Svelte server-side rendering.",
+      "mitigation": "No .svelte source exists in the extension and the release artifact contains no Svelte runtime. Track a compatible Plasmo upgrade."
+    },
+    {
+      "ecosystem": "pnpm",
+      "advisory_id": "GHSA-crpf-4hrx-3jrp",
+      "package": "svelte",
+      "max_severity": "moderate",
+      "path_prefixes": [".>plasmo>@plasmohq/parcel-config>@plasmohq/parcel-transformer-svelte>svelte"],
+      "expires_on": "2026-11-22",
+      "reason": "Svelte is a dormant Plasmo transformer dependency; Cortex is React-only and performs no Svelte server-side rendering.",
+      "mitigation": "No .svelte source exists in the extension and the release artifact contains no Svelte runtime. Track a compatible Plasmo upgrade."
+    },
+    {
+      "ecosystem": "pnpm",
+      "advisory_id": "GHSA-f7gr-6p89-r883",
+      "package": "svelte",
+      "max_severity": "moderate",
+      "path_prefixes": [".>plasmo>@plasmohq/parcel-config>@plasmohq/parcel-transformer-svelte>svelte"],
+      "expires_on": "2026-11-22",
+      "reason": "Svelte is a dormant Plasmo transformer dependency; Cortex is React-only and performs no Svelte server-side rendering.",
+      "mitigation": "No .svelte source exists in the extension and the release artifact contains no Svelte runtime. Track a compatible Plasmo upgrade."
+    },
+    {
+      "ecosystem": "pnpm",
+      "advisory_id": "GHSA-m56q-vw4c-c2cp",
+      "package": "svelte",
+      "max_severity": "moderate",
+      "path_prefixes": [".>plasmo>@plasmohq/parcel-config>@plasmohq/parcel-transformer-svelte>svelte"],
+      "expires_on": "2026-11-22",
+      "reason": "Svelte is a dormant Plasmo transformer dependency; Cortex is React-only and performs no Svelte server-side rendering.",
+      "mitigation": "No .svelte source exists in the extension and the release artifact contains no Svelte runtime. Track a compatible Plasmo upgrade."
+    },
+    {
+      "ecosystem": "pnpm",
+      "advisory_id": "GHSA-phwv-c562-gvmh",
+      "package": "svelte",
+      "max_severity": "moderate",
+      "path_prefixes": [".>plasmo>@plasmohq/parcel-config>@plasmohq/parcel-transformer-svelte>svelte"],
+      "expires_on": "2026-11-22",
+      "reason": "Svelte is a dormant Plasmo transformer dependency; Cortex is React-only and performs no Svelte server-side rendering.",
+      "mitigation": "No .svelte source exists in the extension and the release artifact contains no Svelte runtime. Track a compatible Plasmo upgrade."
+    },
+    {
+      "ecosystem": "pnpm",
+      "advisory_id": "GHSA-pr6f-5x2q-rwfp",
+      "package": "svelte",
+      "max_severity": "moderate",
+      "path_prefixes": [".>plasmo>@plasmohq/parcel-config>@plasmohq/parcel-transformer-svelte>svelte"],
+      "expires_on": "2026-11-22",
+      "reason": "Svelte is a dormant Plasmo transformer dependency; Cortex is React-only and performs no Svelte server-side rendering.",
+      "mitigation": "No .svelte source exists in the extension and the release artifact contains no Svelte runtime. Track a compatible Plasmo upgrade."
+    },
+    {
+      "ecosystem": "pnpm",
+      "advisory_id": "GHSA-rcqx-6q8c-2c42",
+      "package": "svelte",
+      "max_severity": "moderate",
+      "path_prefixes": [".>plasmo>@plasmohq/parcel-config>@plasmohq/parcel-transformer-svelte>svelte"],
+      "expires_on": "2026-11-22",
+      "reason": "Svelte is a dormant Plasmo transformer dependency; Cortex is React-only and performs no Svelte server-side rendering.",
+      "mitigation": "No .svelte source exists in the extension and the release artifact contains no Svelte runtime. Track a compatible Plasmo upgrade."
+    }
+  ]
+}

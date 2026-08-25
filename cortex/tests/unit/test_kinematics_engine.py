@@ -1,827 +1,431 @@
-"""
-Unit tests for Kinematics Engine — Blink detector, head pose, posture.
+"""Physical-time invariants for camera-derived kinematic proxies.
 
-Tests use synthetic landmarks to verify:
-- EAR computation and blink detection state machine
-- Blink rate and suppression score calculation
-- Head pose estimation via solvePnP
-- Posture analysis with face-only and full pose landmarks
+The production pipeline is scheduled in time, not frames. These tests use
+the same physical traces at several capture rates so a configuration change,
+load shedding, or a brief dropped frame cannot change the meaning of a blink,
+head velocity, freeze dwell, or calibrated head/neck flexion dwell.
 """
 
 from __future__ import annotations
 
-import numpy as np
+from collections.abc import Iterator
 
-from cortex.libs.config.settings import BlinkSignalConfig, LandmarksConfig, PostureSignalConfig
-from cortex.services.kinematics_engine.blink_detector import BlinkDetector, BlinkState
+import numpy as np
+import pytest
+
+from cortex.libs.config.settings import (
+    BlinkSignalConfig,
+    LandmarksConfig,
+    PostureSignalConfig,
+)
+from cortex.services.kinematics_engine.blink_detector import BlinkDetector
 from cortex.services.kinematics_engine.head_pose import HeadPoseEstimator
 from cortex.services.kinematics_engine.posture import PostureAnalyzer
 
-# =============================================================================
-# Helpers — Synthetic Landmark Generation
-# =============================================================================
+FPS_CASES = (15.0, 24.0, 30.0, 60.0)
 
 
-def make_face_landmarks(
-    n_landmarks: int = 478,
-    frame_width: int = 640,
-    frame_height: int = 480,
-) -> np.ndarray:
-    """
-    Create synthetic face landmarks centered in the frame.
-
-    Returns (478, 2) array with face-like coordinates.
-    """
-    rng = np.random.RandomState(42)
-    landmarks = np.zeros((n_landmarks, 2), dtype=np.float32)
-
-    # Center face in frame
-    cx, cy = frame_width / 2, frame_height / 2
-
-    # Place landmarks in a face-like distribution
-    for i in range(n_landmarks):
-        # Spread landmarks around center with face-shaped distribution
-        landmarks[i, 0] = cx + rng.uniform(-80, 80)
-        landmarks[i, 1] = cy + rng.uniform(-100, 100)
-
-    return landmarks
-
-
-def make_eye_landmarks_open() -> np.ndarray:
-    """
-    Create 6 eye landmarks in open-eye configuration.
-
-    Returns (6, 2) array: [p1_outer, p2_upper_outer, p3_upper_inner,
-                            p4_inner, p5_lower_inner, p6_lower_outer]
-    """
-    # Open eye: vertical opening is significant
-    return np.array(
+def _eye(*, closed: bool) -> np.ndarray:
+    vertical = 1.0 if closed else 11.0
+    return np.asarray(
         [
-            [100.0, 200.0],  # p1: outer corner
-            [115.0, 190.0],  # p2: upper outer
-            [130.0, 188.0],  # p3: upper inner
-            [145.0, 200.0],  # p4: inner corner
-            [130.0, 212.0],  # p5: lower inner
-            [115.0, 210.0],  # p6: lower outer
+            [100.0, 200.0],
+            [115.0, 200.0 - vertical],
+            [130.0, 200.0 - vertical],
+            [145.0, 200.0],
+            [130.0, 200.0 + vertical],
+            [115.0, 200.0 + vertical],
         ],
-        dtype=np.float32,
+        dtype=np.float64,
     )
 
 
-def make_eye_landmarks_closed() -> np.ndarray:
-    """
-    Create 6 eye landmarks in closed-eye configuration.
-
-    Returns (6, 2) with minimal vertical opening.
-    """
-    # Closed eye: vertical opening is near zero
-    return np.array(
-        [
-            [100.0, 200.0],  # p1: outer corner
-            [115.0, 199.0],  # p2: upper outer (barely above center)
-            [130.0, 199.0],  # p3: upper inner
-            [145.0, 200.0],  # p4: inner corner
-            [130.0, 201.0],  # p5: lower inner (barely below center)
-            [115.0, 201.0],  # p6: lower outer
-        ],
-        dtype=np.float32,
-    )
-
-
-def make_full_landmarks_with_eyes(
-    left_eye: np.ndarray,
-    right_eye: np.ndarray,
-    n_landmarks: int = 478,
-) -> np.ndarray:
-    """
-    Create full face landmarks with specific eye landmark configurations.
-
-    Inserts the given eye landmarks at the correct FaceMesh indices.
-    """
-    config = LandmarksConfig()
-    landmarks = make_face_landmarks(n_landmarks)
-
-    # Insert left eye landmarks at configured indices
-    for i, idx in enumerate(config.left_eye):
-        landmarks[idx] = left_eye[i]
-
-    # Insert right eye landmarks at configured indices
-    for i, idx in enumerate(config.right_eye):
-        landmarks[idx] = right_eye[i]
-
-    # Set up PnP landmarks in reasonable positions
-    # Nose tip (1)
+def _face(*, closed: bool = False) -> np.ndarray:
+    rng = np.random.default_rng(42)
+    landmarks = np.empty((478, 2), dtype=np.float64)
+    landmarks[:, 0] = 320.0 + rng.uniform(-80.0, 80.0, len(landmarks))
+    landmarks[:, 1] = 240.0 + rng.uniform(-100.0, 100.0, len(landmarks))
     landmarks[1] = [320.0, 260.0]
-    # Chin (152)
     landmarks[152] = [320.0, 360.0]
-    # Left eye outer (33)
-    landmarks[33] = left_eye[0]
-    # Right eye outer (263)
-    landmarks[263] = right_eye[3]
-    # Left mouth corner (61)
+    landmarks[33] = [280.0, 225.0]
+    landmarks[263] = [360.0, 225.0]
     landmarks[61] = [290.0, 320.0]
-    # Right mouth corner (291)
     landmarks[291] = [350.0, 320.0]
-
-    # FaceMesh ear landmarks for posture
-    landmarks[234] = [220.0, 240.0]  # Left ear
-    landmarks[454] = [420.0, 240.0]  # Right ear
-    # Forehead (10)
-    landmarks[10] = [320.0, 180.0]
-
+    # Eye indices overlap several solvePnP points. Set the full six-point
+    # eye geometry last so the blink trace is internally consistent.
+    config = LandmarksConfig()
+    eye = _eye(closed=closed)
+    landmarks[config.left_eye] = eye
+    landmarks[config.right_eye] = eye + np.asarray([180.0, 0.0])
     return landmarks
 
 
-# =============================================================================
-# Blink Detector Tests
-# =============================================================================
+def _blink_config(*, min_exposure: float = 1.0) -> BlinkSignalConfig:
+    return BlinkSignalConfig(
+        ear_threshold=0.21,
+        ear_recovery=0.25,
+        min_closed_ms=80.0,
+        max_closed_ms=1000.0,
+        min_valid_exposure_seconds=min_exposure,
+        history_window_seconds=60.0,
+        max_valid_gap_ms=250.0,
+    )
 
 
-class TestBlinkDetectorEAR:
-    """Test Eye Aspect Ratio computation."""
+def _run_blink_trace(fps: float, *, drop_inside_blink: bool = False):
+    detector = BlinkDetector(
+        blink_config=_blink_config(),
+        baseline_blink_rate=17.0,
+    )
+    state = None
+    times = np.arange(0.0, 20.0 + 0.5 / fps, 1.0 / fps)
+    blink_starts = (2.0, 6.0, 10.0, 14.0, 18.0)
+    for timestamp in times:
+        in_blink = any(start <= timestamp < start + 0.16 for start in blink_starts)
+        if drop_inside_blink and 10.04 <= timestamp <= 10.10:
+            # No call is the normal scheduler-load-shedding case. The next
+            # valid observation remains inside the bounded 250 ms gap.
+            continue
+        state = detector.update(_face(closed=in_blink), float(timestamp))
+    assert state is not None
+    return state
 
-    def test_open_eye_ear_above_threshold(self):
-        """Open eye should have EAR above blink threshold (0.21)."""
-        eye = make_eye_landmarks_open()
-        ear = BlinkDetector.compute_ear(eye)
-        assert ear > 0.21, f"Open eye EAR={ear:.3f} should be > 0.21"
 
-    def test_closed_eye_ear_below_threshold(self):
-        """Closed eye should have EAR below blink threshold."""
-        eye = make_eye_landmarks_closed()
-        ear = BlinkDetector.compute_ear(eye)
-        assert ear < 0.21, f"Closed eye EAR={ear:.3f} should be < 0.21"
+class TestEyeAspectRatio:
+    def test_open_and_closed_geometry(self) -> None:
+        assert BlinkDetector.compute_ear(_eye(closed=False)) > 0.21
+        assert BlinkDetector.compute_ear(_eye(closed=True)) < 0.21
 
-    def test_ear_symmetry(self):
-        """EAR should be the same for horizontally mirrored eyes."""
-        eye = make_eye_landmarks_open()
+    def test_rejects_malformed_or_nonfinite_geometry(self) -> None:
+        with pytest.raises(ValueError, match=r"finite \(6, 2\)"):
+            BlinkDetector.compute_ear(np.zeros((5, 2)))
+        eye = _eye(closed=False)
+        eye[0, 0] = np.nan
+        with pytest.raises(ValueError, match=r"finite \(6, 2\)"):
+            BlinkDetector.compute_ear(eye)
 
-        # Mirror horizontally
-        mirrored = eye.copy()
-        mirrored[:, 0] = 2 * eye[:, 0].mean() - eye[:, 0]
-        # Reorder to match mirrored eye convention
-        # p1↔p4, p2↔p3, p5↔p6 swap positions
-        mirrored_reordered = mirrored[[3, 2, 1, 0, 5, 4]]
+    def test_degenerate_horizontal_axis_is_zero(self) -> None:
+        eye = _eye(closed=False)
+        eye[3] = eye[0]
+        assert BlinkDetector.compute_ear(eye) == 0.0
 
-        ear_orig = BlinkDetector.compute_ear(eye)
-        ear_mirror = BlinkDetector.compute_ear(mirrored_reordered)
 
-        assert abs(ear_orig - ear_mirror) < 0.01
+class TestElapsedBlinkMetrics:
+    @pytest.mark.parametrize("fps", FPS_CASES)
+    def test_same_physical_trace_is_fps_invariant(self, fps: float) -> None:
+        state = _run_blink_trace(fps)
+        assert state.readiness == "ready"
+        assert state.blink_count_60s == 5
+        assert state.blink_rate == pytest.approx(15.0, abs=0.2)
+        assert state.perclos_60s == pytest.approx(0.04, abs=0.012)
+        assert state.mean_blink_duration_ms == pytest.approx(160.0, abs=70.0)
+        assert state.valid_exposure_seconds == pytest.approx(20.0, abs=0.08)
 
-    def test_ear_zero_horizontal_distance(self):
-        """EAR should return 0 when horizontal distance is zero."""
-        eye = np.array(
-            [
-                [100.0, 200.0],
-                [100.0, 190.0],
-                [100.0, 190.0],
-                [100.0, 200.0],  # Same x as p1 — zero horizontal
-                [100.0, 210.0],
-                [100.0, 210.0],
-            ],
-            dtype=np.float32,
+    def test_rates_match_across_supported_capture_rates(self) -> None:
+        states = [_run_blink_trace(fps) for fps in FPS_CASES]
+        rates = [state.blink_rate for state in states]
+        perclos = [state.perclos_60s for state in states]
+        assert (
+            max(float(value) for value in rates if value is not None)
+            - min(float(value) for value in rates if value is not None)
+            < 0.2
         )
-        ear = BlinkDetector.compute_ear(eye)
-        assert ear == 0.0
-
-    def test_ear_range(self):
-        """EAR should be a reasonable positive value for normal eyes."""
-        eye = make_eye_landmarks_open()
-        ear = BlinkDetector.compute_ear(eye)
-        assert 0.0 < ear < 1.0, f"EAR={ear:.3f} should be in (0, 1)"
-
-
-class TestBlinkDetection:
-    """Test blink event detection state machine."""
-
-    def _make_detector(self) -> BlinkDetector:
-        """Create a blink detector with default config."""
-        return BlinkDetector(
-            blink_config=BlinkSignalConfig(
-                ear_threshold=0.21,
-                ear_recovery=0.25,
-                min_frames=3,
-            ),
+        assert (
+            max(float(value) for value in perclos if value is not None)
+            - min(float(value) for value in perclos if value is not None)
+            < 0.01
         )
 
-    def test_no_blink_when_eyes_open(self):
-        """No blink events when eyes stay open."""
-        detector = self._make_detector()
-        open_eye = make_eye_landmarks_open()
-        landmarks = make_full_landmarks_with_eyes(open_eye, open_eye)
+    def test_dropped_frames_do_not_shorten_elapsed_blink(self) -> None:
+        complete = _run_blink_trace(30.0)
+        dropped = _run_blink_trace(30.0, drop_inside_blink=True)
+        assert dropped.blink_count_60s == complete.blink_count_60s
+        assert dropped.mean_blink_duration_ms == pytest.approx(
+            complete.mean_blink_duration_ms,
+            abs=1.0 / 30.0 * 1000.0,
+        )
+        assert dropped.valid_exposure_seconds == pytest.approx(complete.valid_exposure_seconds)
 
-        for i in range(30):
-            state = detector.update(landmarks, timestamp=i / 30.0)
-
-        assert state.blink_count_60s == 0
-        assert state.is_closed is False
-
-    def test_single_blink_detection(self):
-        """Detect a single blink event."""
-        detector = self._make_detector()
-        open_eye = make_eye_landmarks_open()
-        closed_eye = make_eye_landmarks_closed()
-
-        t = 0.0
-        dt = 1 / 30.0
-
-        # 10 frames open
-        for _ in range(10):
-            landmarks = make_full_landmarks_with_eyes(open_eye, open_eye)
-            detector.update(landmarks, timestamp=t)
-            t += dt
-
-        # 4 frames closed (>= min_frames=3)
-        for _ in range(4):
-            landmarks = make_full_landmarks_with_eyes(closed_eye, closed_eye)
-            state = detector.update(landmarks, timestamp=t)
-            t += dt
-
-        assert state.is_closed is True
-
-        # Recovery: eyes open again
-        for _ in range(5):
-            landmarks = make_full_landmarks_with_eyes(open_eye, open_eye)
-            state = detector.update(landmarks, timestamp=t)
-            t += dt
-
-        # Should have detected 1 blink
-        assert state.blink_count_60s == 1
-        assert state.is_closed is False
-
-    def test_blink_too_short_not_detected(self):
-        """Closure shorter than min_frames should not be a blink."""
-        detector = self._make_detector()
-        open_eye = make_eye_landmarks_open()
-        closed_eye = make_eye_landmarks_closed()
-
-        t = 0.0
-        dt = 1 / 30.0
-
-        # 10 frames open
-        for _ in range(10):
-            landmarks = make_full_landmarks_with_eyes(open_eye, open_eye)
-            detector.update(landmarks, timestamp=t)
-            t += dt
-
-        # 2 frames closed (< min_frames=3)
-        for _ in range(2):
-            landmarks = make_full_landmarks_with_eyes(closed_eye, closed_eye)
-            detector.update(landmarks, timestamp=t)
-            t += dt
-
-        # Recovery
-        for _ in range(10):
-            landmarks = make_full_landmarks_with_eyes(open_eye, open_eye)
-            state = detector.update(landmarks, timestamp=t)
-            t += dt
-
-        assert state.blink_count_60s == 0
-
-    def test_multiple_blinks(self):
-        """Detect multiple sequential blinks."""
-        detector = self._make_detector()
-        open_eye = make_eye_landmarks_open()
-        closed_eye = make_eye_landmarks_closed()
-
-        t = 0.0
-        dt = 1 / 30.0
-        n_blinks = 5
-
-        for _ in range(n_blinks):
-            # Open for a bit
-            for _ in range(10):
-                landmarks = make_full_landmarks_with_eyes(open_eye, open_eye)
-                detector.update(landmarks, timestamp=t)
-                t += dt
-
-            # Close for min_frames
-            for _ in range(4):
-                landmarks = make_full_landmarks_with_eyes(closed_eye, closed_eye)
-                detector.update(landmarks, timestamp=t)
-                t += dt
-
-            # Recovery
-            for _ in range(5):
-                landmarks = make_full_landmarks_with_eyes(open_eye, open_eye)
-                state = detector.update(landmarks, timestamp=t)
-                t += dt
-
-        assert state.blink_count_60s == n_blinks
-
-
-class TestBlinkRate:
-    """Test blink rate and suppression score computation."""
-
-    def _make_detector_with_blinks(
-        self, n_blinks: int, duration_seconds: float = 60.0
-    ) -> tuple[BlinkDetector, BlinkState]:
-        """Create detector and simulate n_blinks over duration."""
-        detector = BlinkDetector(baseline_blink_rate=17.0)
-        open_eye = make_eye_landmarks_open()
-        closed_eye = make_eye_landmarks_closed()
-
-        fps = 30.0
-        total_frames = int(duration_seconds * fps)
-        frames_per_blink = total_frames // max(n_blinks, 1)
-
-        t = 0.0
-        dt = 1 / fps
+    def test_cold_start_without_events_remains_warming_up(self) -> None:
+        detector = BlinkDetector(blink_config=_blink_config(min_exposure=15.0))
         state = None
+        for timestamp in np.arange(0.0, 10.0, 1.0 / 30.0):
+            state = detector.update(_face(), float(timestamp))
+        assert state is not None
+        assert state.readiness == "warming_up"
+        assert state.blink_rate is None
+        assert state.blink_rate_delta is None
+        assert state.blink_suppression_score is None
+        assert state.perclos_60s is None
 
-        for frame_idx in range(total_frames):
-            # Determine if we're in a blink phase
-            phase = frame_idx % frames_per_blink if n_blinks > 0 else frames_per_blink
-            is_blink_frame = n_blinks > 0 and 5 <= phase < 9  # 4 frames closed
+    def test_missing_observations_add_no_exposure_or_blink(self) -> None:
+        detector = BlinkDetector(blink_config=_blink_config(min_exposure=0.5))
+        detector.update(_face(), 0.0)
+        detector.update(_face(closed=True), 0.1)
+        detector.observe_missing(0.2)
+        detector.update(_face(), 0.4)
+        state = detector.update(_face(), 0.5)
+        assert state.blink_count_60s == 0
+        assert state.valid_exposure_seconds == pytest.approx(0.2)
+        assert state.readiness == "warming_up"
 
-            if is_blink_frame:
-                landmarks = make_full_landmarks_with_eyes(closed_eye, closed_eye)
-            else:
-                landmarks = make_full_landmarks_with_eyes(open_eye, open_eye)
-
-            state = detector.update(landmarks, timestamp=t)
-            t += dt
-
-        return detector, state
-
-    def test_blink_rate_normal(self):
-        """~15 blinks in 60s should give ~15 blinks/min."""
-        _, state = self._make_detector_with_blinks(15, 60.0)
-        assert state.blink_rate is not None
-        assert 10.0 < state.blink_rate < 25.0, f"Rate={state.blink_rate}"
-
-    def test_blink_suppression_low_rate(self):
-        """Very few blinks should have high suppression score."""
-        _, state = self._make_detector_with_blinks(3, 60.0)
-        assert state.blink_rate is not None
-        assert state.blink_suppression_score > 0.3, (
-            f"Suppression={state.blink_suppression_score} for rate={state.blink_rate}"
+    def test_history_window_clips_exposure_by_time(self) -> None:
+        detector = BlinkDetector(
+            blink_config=_blink_config(min_exposure=1.0),
+            history_window_seconds=2.0,
         )
+        state = None
+        for timestamp in np.arange(0.0, 5.01, 0.1):
+            state = detector.update(_face(), float(timestamp))
+        assert state is not None
+        assert state.valid_exposure_seconds == pytest.approx(2.0)
 
-    def test_blink_suppression_normal_rate(self):
-        """Normal blink rate should have low/zero suppression."""
-        _, state = self._make_detector_with_blinks(18, 60.0)
-        assert state.blink_rate is not None
-        assert state.blink_suppression_score < 0.3
+    def test_timestamp_contract_is_strict(self) -> None:
+        detector = BlinkDetector(blink_config=_blink_config())
+        detector.update(_face(), 1.0)
+        with pytest.raises(ValueError, match="strictly increasing"):
+            detector.update(_face(), 1.0)
+        with pytest.raises(ValueError, match="non-negative"):
+            BlinkDetector(blink_config=_blink_config()).update(_face(), -1.0)
 
-    def test_blink_rate_delta(self):
-        """Blink rate delta should reflect difference from baseline."""
-        BlinkDetector(baseline_blink_rate=17.0)
-        _, state = self._make_detector_with_blinks(5, 60.0)
-        # With ~5 blinks/min vs baseline 17, delta should be negative
-        assert state.blink_rate_delta is not None
-        assert state.blink_rate_delta < 0.0
-
-    def test_get_blink_features(self):
-        """get_blink_features should return proper dict."""
-        detector, _ = self._make_detector_with_blinks(10, 30.0)
-        features = detector.get_blink_features()
-        assert "blink_rate" in features
-        assert "blink_rate_delta" in features
-        assert "blink_suppression_score" in features
-
-    def test_reset_clears_state(self):
-        """Reset should clear all blink history."""
-        detector, _ = self._make_detector_with_blinks(10, 30.0)
+    def test_reset_clears_temporal_state(self) -> None:
+        detector = BlinkDetector(blink_config=_blink_config())
+        detector.update(_face(), 0.0)
+        detector.update(_face(closed=True), 0.1)
         detector.reset()
         assert detector.latest_state is None
-        features = detector.get_blink_features()
-        assert features["blink_rate"] is None
+        state = detector.update(_face(), 0.0)
+        assert state.valid_exposure_seconds == 0.0
 
 
-# =============================================================================
-# Head Pose Estimator Tests
-# =============================================================================
+def _pose_sequence(
+    estimator: HeadPoseEstimator,
+    poses: Iterator[tuple[float, float, float]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(estimator, "_solve_head_pose", lambda _points: next(poses))
 
 
-class TestHeadPoseEstimator:
-    """Test head pose estimation."""
-
-    def _make_estimator(self) -> HeadPoseEstimator:
-        return HeadPoseEstimator(frame_width=640, frame_height=480)
-
-    def _make_front_facing_landmarks(self) -> np.ndarray:
-        """Create landmarks for a roughly front-facing head."""
-        landmarks = make_face_landmarks()
-
-        # Set PnP key landmarks for front-facing
-        landmarks[1] = [320.0, 260.0]  # Nose tip — center
-        landmarks[152] = [320.0, 370.0]  # Chin — below nose
-        landmarks[33] = [250.0, 230.0]  # Left eye outer
-        landmarks[263] = [390.0, 230.0]  # Right eye outer
-        landmarks[61] = [285.0, 320.0]  # Left mouth
-        landmarks[291] = [355.0, 320.0]  # Right mouth
-
-        return landmarks
-
-    def test_front_facing_near_zero_angles(self):
-        """Front-facing head should have near-zero pitch/yaw."""
-        estimator = self._make_estimator()
-        landmarks = self._make_front_facing_landmarks()
-
-        result = estimator.update(landmarks)
-
-        # Front-facing should have relatively small angles
-        assert abs(result.yaw) < 30.0, f"Yaw={result.yaw:.1f} too large for front-facing"
-        assert isinstance(result.pitch, float)
-        assert isinstance(result.roll, float)
-
-    def test_turned_head_yaw(self):
-        """Head turned to the side should show significant yaw change."""
-        estimator = self._make_estimator()
-
-        # Front facing first
-        front = self._make_front_facing_landmarks()
-        result_front = estimator.update(front)
-
-        # Shift landmarks to simulate head turn (nose moves laterally)
-        turned = front.copy()
-        turned[1, 0] += 40.0  # Nose tip moves right
-        turned[33, 0] += 30.0  # Left eye moves right
-        turned[263, 0] += 50.0  # Right eye moves more right
-        turned[61, 0] += 35.0
-        turned[291, 0] += 45.0
-        result_turned = estimator.update(turned)
-
-        # Yaw should differ between front and turned
-        yaw_diff = abs(result_turned.yaw - result_front.yaw)
-        assert yaw_diff > 1.0, f"Yaw difference={yaw_diff:.1f} too small for head turn"
-
-    def test_angular_velocity_on_movement(self):
-        """Angular velocity should be positive when head moves."""
-        estimator = self._make_estimator()
-
-        landmarks = self._make_front_facing_landmarks()
-        estimator.update(landmarks, timestamp=0.0)
-
-        # Move landmarks
-        moved = landmarks.copy()
-        moved[1, 0] += 30.0  # Shift nose
-        moved[1, 1] -= 20.0
-        result = estimator.update(moved, timestamp=0.033)
-
-        assert result.angular_velocity > 0.0
-
-    def test_angular_velocity_zero_when_static(self):
-        """Angular velocity should be near zero for static head."""
-        estimator = self._make_estimator()
-
-        landmarks = self._make_front_facing_landmarks()
-        estimator.update(landmarks, timestamp=0.0)
-        result = estimator.update(landmarks, timestamp=0.033)
-
-        assert result.angular_velocity < 0.5
-
-    def test_jitter_detection(self):
-        """Rapid pose changes should trigger jitter detection."""
-        estimator = HeadPoseEstimator(
-            frame_width=640, frame_height=480, jitter_threshold_deg=2.0
+class TestHeadPosePhysicalTime:
+    @pytest.mark.parametrize("fps", FPS_CASES)
+    def test_angular_velocity_is_degrees_per_second(
+        self,
+        fps: float,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        times = list(np.arange(0.0, 2.0 + 0.5 / fps, 1.0 / fps))
+        estimator = HeadPoseEstimator(jitter_threshold_deg_per_s=20.0)
+        _pose_sequence(
+            estimator,
+            iter((10.0 * t, 0.0, 0.0) for t in times),
+            monkeypatch,
         )
-
-        landmarks = self._make_front_facing_landmarks()
-        estimator.update(landmarks, timestamp=0.0)
-
-        # Large sudden movement
-        moved = landmarks.copy()
-        moved[1] += [50.0, -40.0]  # Big nose shift
-        moved[33] += [40.0, -30.0]
-        moved[263] += [60.0, -30.0]
-        moved[61] += [45.0, -10.0]
-        moved[291] += [55.0, -10.0]
-        moved[152] += [50.0, -20.0]
-        result = estimator.update(moved, timestamp=0.033)
-
-        assert result.is_jittery is True
-
-    def test_freeze_detection(self):
-        """No movement for extended period should trigger freeze."""
-        estimator = HeadPoseEstimator(
-            frame_width=640,
-            frame_height=480,
-            freeze_window_frames=10,  # Small window for testing
-            freeze_threshold_deg=0.5,
-        )
-
-        landmarks = self._make_front_facing_landmarks()
-
-        # Feed identical landmarks for many frames
         result = None
-        for i in range(15):
-            result = estimator.update(landmarks, timestamp=i / 30.0)
+        for timestamp in times:
+            result = estimator.update(_face(), float(timestamp))
+        assert result is not None
+        assert result.angular_velocity_deg_per_s == pytest.approx(10.0, abs=1e-7)
+        assert result.is_jittery is False
 
+    @pytest.mark.parametrize("fps", FPS_CASES)
+    def test_freeze_uses_contiguous_elapsed_dwell(
+        self,
+        fps: float,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        times = list(np.arange(0.0, 3.0 + 0.5 / fps, 1.0 / fps))
+        estimator = HeadPoseEstimator(
+            freeze_threshold_deg=0.5,
+            freeze_window_seconds=3.0,
+        )
+        _pose_sequence(estimator, iter((1.0, 2.0, 3.0) for _ in times), monkeypatch)
+        result = None
+        for timestamp in times:
+            result = estimator.update(_face(), float(timestamp))
         assert result is not None
         assert result.is_frozen is True
+        assert result.valid_history_seconds == pytest.approx(3.0, abs=1.0 / fps)
 
-    def test_get_head_pose_features(self):
-        """get_head_pose_features should return proper dict."""
-        estimator = self._make_estimator()
-        landmarks = self._make_front_facing_landmarks()
-        estimator.update(landmarks)
+    def test_missing_sample_breaks_freeze_contiguity(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        estimator = HeadPoseEstimator(
+            freeze_window_seconds=1.0,
+            max_valid_gap_ms=600.0,
+        )
+        _pose_sequence(estimator, iter([(0.0, 0.0, 0.0)] * 4), monkeypatch)
+        estimator.update(_face(), 0.0)
+        estimator.update(_face(), 0.5)
+        estimator.observe_missing(0.75)
+        estimator.update(_face(), 1.0)
+        result = estimator.update(_face(), 1.5)
+        assert result.is_frozen is False
+        assert result.valid_history_seconds == pytest.approx(0.5)
 
-        features = estimator.get_head_pose_features()
-        assert "head_pitch" in features
-        assert "head_yaw" in features
-        assert "head_roll" in features
-        assert features["head_pitch"] is not None
+    def test_angles_unwrap_at_180_degrees(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        estimator = HeadPoseEstimator(
+            jitter_threshold_deg_per_s=10.0,
+            max_valid_gap_ms=1100.0,
+        )
+        _pose_sequence(
+            estimator,
+            iter([(0.0, 179.0, 0.0), (0.0, -179.0, 0.0)]),
+            monkeypatch,
+        )
+        estimator.update(_face(), 0.0)
+        result = estimator.update(_face(), 1.0)
+        assert result.angular_velocity_deg_per_s == pytest.approx(2.0)
+        assert result.is_jittery is False
 
-    def test_get_head_pose_features_no_data(self):
-        """Features should be None when no frames processed."""
-        estimator = self._make_estimator()
-        features = estimator.get_head_pose_features()
-        assert features["head_pitch"] is None
+    def test_real_pnp_path_is_finite(self) -> None:
+        result = HeadPoseEstimator().update(_face(), 0.0)
+        assert np.isfinite([result.pitch, result.yaw, result.roll]).all()
 
-    def test_reset(self):
-        """Reset should clear all state."""
-        estimator = self._make_estimator()
-        landmarks = self._make_front_facing_landmarks()
-        estimator.update(landmarks)
+    def test_timestamp_contract_and_reset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        estimator = HeadPoseEstimator()
+        _pose_sequence(estimator, iter([(0.0, 0.0, 0.0)] * 3), monkeypatch)
+        estimator.update(_face(), 1.0)
+        with pytest.raises(ValueError, match="strictly increasing"):
+            estimator.update(_face(), 1.0)
         estimator.reset()
         assert estimator.latest_result is None
+        estimator.update(_face(), 0.0)
 
 
-# =============================================================================
-# Posture Analyzer Tests
-# =============================================================================
+def _posture_config(*, dwell_seconds: float = 2.0) -> PostureSignalConfig:
+    return PostureSignalConfig(
+        head_neck_flexion_threshold_deg=20.0,
+        head_neck_sustain_seconds=dwell_seconds,
+        face_scale_change_tolerance=0.25,
+        max_valid_gap_ms=250.0,
+    )
 
 
-class TestPostureAnalyzerFace:
-    """Test posture analysis with FaceMesh-only landmarks (fallback mode)."""
-
-    def _make_analyzer(self) -> PostureAnalyzer:
-        return PostureAnalyzer(config=PostureSignalConfig())
-
-    def _make_upright_face_landmarks(self) -> np.ndarray:
-        """Create face landmarks for upright posture."""
-        landmarks = make_face_landmarks()
-
-        # Upright: forehead above nose above chin, ears at sides
-        landmarks[10] = [320.0, 160.0]   # Forehead — top
-        landmarks[1] = [320.0, 260.0]    # Nose — middle
-        landmarks[152] = [320.0, 360.0]  # Chin — bottom
-        landmarks[234] = [220.0, 230.0]  # Left ear
-        landmarks[454] = [420.0, 230.0]  # Right ear
-
-        return landmarks
-
-    def _make_leaning_face_landmarks(self, lean_deg: float = 25.0) -> np.ndarray:
-        """Create face landmarks for forward lean posture."""
-        landmarks = self._make_upright_face_landmarks()
-
-        # Forward lean: rotate the forehead-chin axis
-        # In image coords, forward lean tilts the face so chin moves forward
-        # This shifts the chin horizontally relative to forehead
-        angle_rad = np.radians(lean_deg)
-
-        # Pivot around the center of the face
-        cx, cy = 320.0, 260.0
-
-        # Rotate forehead and chin around center
-        for idx in [10, 152]:
-            dx = landmarks[idx, 0] - cx
-            dy = landmarks[idx, 1] - cy
-            new_dx = dx * np.cos(angle_rad) - dy * np.sin(angle_rad)
-            new_dy = dx * np.sin(angle_rad) + dy * np.cos(angle_rad)
-            landmarks[idx] = [cx + new_dx, cy + new_dy]
-
-        return landmarks
-
-    def test_upright_low_lean(self):
-        """Upright posture should have low forward lean."""
-        analyzer = self._make_analyzer()
-        landmarks = self._make_upright_face_landmarks()
-
-        state = analyzer.update_with_face(landmarks, timestamp=0.0)
-
-        assert state.forward_lean_angle is not None
-        assert state.forward_lean_angle < 10.0, (
-            f"Upright lean={state.forward_lean_angle:.1f} should be < 10°"
+class TestCalibratedHeadNeckProxy:
+    def test_is_unavailable_before_explicit_calibration(self) -> None:
+        analyzer = PostureAnalyzer(_posture_config())
+        state = analyzer.update(
+            pitch_deg=30.0,
+            face_scale=100.0,
+            timestamp=0.0,
+            camera_identity_key="camera-a",
         )
-        assert state.slump_score < 0.3
-
-    def test_leaning_high_lean(self):
-        """Forward leaning posture should have higher lean score."""
-        analyzer = self._make_analyzer()
-        upright = self._make_upright_face_landmarks()
-        leaning = self._make_leaning_face_landmarks(25.0)
-
-        state_upright = analyzer.update_with_face(upright, timestamp=0.0)
-        state_leaning = analyzer.update_with_face(leaning, timestamp=0.033)
-
-        assert state_leaning.forward_lean_angle > state_upright.forward_lean_angle
-        assert state_leaning.forward_lean_score > state_upright.forward_lean_score
-
-    def test_posture_collapse_on_big_lean(self):
-        """Big forward lean should trigger posture collapse."""
-        analyzer = self._make_analyzer()
-        landmarks = self._make_leaning_face_landmarks(30.0)
-
-        state = analyzer.update_with_face(landmarks, timestamp=0.0)
-
-        # With 30° lean and threshold of 20°, should be collapsed
-        assert state.is_collapsed is True
-
-    def test_no_shoulder_drop_in_face_mode(self):
-        """Face-only mode should not provide shoulder drop."""
-        analyzer = self._make_analyzer()
-        landmarks = self._make_upright_face_landmarks()
-
-        state = analyzer.update_with_face(landmarks)
-
+        assert state.proxy_available is False
+        assert state.head_neck_flexion_angle is None
+        assert state.invalidated_reason == "calibration_required"
         assert state.shoulder_drop_ratio is None
         assert state.has_pose_landmarks is False
 
-    def test_get_posture_features(self):
-        """get_posture_features should return proper dict."""
-        analyzer = self._make_analyzer()
-        landmarks = self._make_upright_face_landmarks()
-        analyzer.update_with_face(landmarks)
-
-        features = analyzer.get_posture_features()
-        assert "slump_score" in features
-        assert "forward_lean_score" in features
-        assert "shoulder_drop_ratio" in features
-
-    def test_get_posture_features_no_data(self):
-        """Features should be None when no frames processed."""
-        analyzer = self._make_analyzer()
-        features = analyzer.get_posture_features()
-        assert features["slump_score"] is None
-
-    def test_lean_responds_to_ear_nose_geometry(self):
-        """P1-4: the forward-lean origin uses the ear-midpoint AND nose tip.
-
-        Pre-fix, update_with_face computed the ear midpoint and read the
-        nose tip then DISCARDED both (dead statements) and used the
-        forehead->chin axis instead. Moving ONLY the ear and nose landmarks
-        (forehead/chin fixed) must now change the reported lean angle,
-        proving the documented ear/nose geometry is actually used.
-        """
-        analyzer = self._make_analyzer()
-        base = self._make_upright_face_landmarks()
-        state_base = analyzer.update_with_face(base, timestamp=0.0)
-
-        # Shift ears UP and nose DOWN/forward without touching forehead(10)
-        # or chin(152). With the old forehead->chin geometry this would be a
-        # no-op; with the ear/nose geometry it changes the lean origin.
-        moved = base.copy()
-        moved[234] = [base[234][0] - 30.0, base[234][1] - 40.0]  # left ear up
-        moved[454] = [base[454][0] + 30.0, base[454][1] - 40.0]  # right ear up
-        moved[1] = [base[1][0] + 40.0, base[1][1] + 30.0]        # nose fwd/down
-        state_moved = analyzer.update_with_face(moved, timestamp=0.033)
-
-        assert state_base.forward_lean_angle is not None
-        assert state_moved.forward_lean_angle is not None
-        assert state_moved.forward_lean_angle != state_base.forward_lean_angle
-
-    def test_nose_tip_shift_alone_changes_lean(self):
-        """Moving only the nose tip must shift the lean origin (nose is used)."""
-        analyzer = self._make_analyzer()
-        base = self._make_upright_face_landmarks()
-        s0 = analyzer.update_with_face(base, timestamp=0.0)
-
-        nose_only = base.copy()
-        nose_only[1] = [base[1][0] + 60.0, base[1][1]]  # nose laterally forward
-        s1 = analyzer.update_with_face(nose_only, timestamp=0.033)
-
-        assert s0.forward_lean_angle is not None
-        assert s1.forward_lean_angle is not None
-        assert s1.forward_lean_angle > s0.forward_lean_angle
-
-
-class TestPostureAnalyzerPose:
-    """Test posture analysis with full Pose landmarks."""
-
-    def _make_analyzer(self) -> PostureAnalyzer:
-        return PostureAnalyzer(config=PostureSignalConfig())
-
-    def _make_pose_landmarks(
-        self, shoulder_y: float = 300.0, shoulder_spread: float = 200.0
-    ) -> np.ndarray:
-        """Create synthetic pose landmarks (33 landmarks)."""
-        landmarks = np.zeros((33, 2), dtype=np.float32)
-
-        # Shoulders (indices 11, 12)
-        landmarks[11] = [220.0, shoulder_y]  # Left shoulder
-        landmarks[12] = [220.0 + shoulder_spread, shoulder_y]  # Right shoulder
-
-        return landmarks
-
-    def test_auto_calibration(self):
-        """Analyzer should auto-calibrate after 30 frames."""
-        analyzer = self._make_analyzer()
-        pose = self._make_pose_landmarks(shoulder_y=300.0)
-
-        assert not analyzer.is_calibrated
-
-        for i in range(35):
-            analyzer.update_with_pose(pose, timestamp=i / 30.0)
-
-        assert analyzer.is_calibrated
-
-    def test_shoulder_drop_detection(self):
-        """Shoulder drop should be detected after calibration."""
-        analyzer = self._make_analyzer()
-
-        # Calibrate with normal posture
-        normal = self._make_pose_landmarks(shoulder_y=300.0)
-        for i in range(35):
-            analyzer.update_with_pose(normal, timestamp=i / 30.0)
-
-        # Now simulate shoulder drop (shoulders move down = higher Y)
-        dropped = self._make_pose_landmarks(shoulder_y=350.0)
-        state = analyzer.update_with_pose(dropped, timestamp=1.5)
-
-        assert state.shoulder_drop_ratio is not None
-        assert state.shoulder_drop_ratio > 0.0
-
-    def test_no_shoulder_drop_at_baseline(self):
-        """No drop at baseline position."""
-        analyzer = self._make_analyzer()
-        pose = self._make_pose_landmarks(shoulder_y=300.0)
-
-        # Calibrate
-        for i in range(35):
-            analyzer.update_with_pose(pose, timestamp=i / 30.0)
-
-        # Same position — no drop
-        state = analyzer.update_with_pose(pose, timestamp=1.5)
-
-        assert state.shoulder_drop_ratio is not None
-        assert state.shoulder_drop_ratio < 0.05
-
-    def test_pose_mode_flag(self):
-        """update_with_pose should set has_pose_landmarks=True."""
-        analyzer = self._make_analyzer()
-        pose = self._make_pose_landmarks()
-        state = analyzer.update_with_pose(pose)
-        assert state.has_pose_landmarks is True
-
-    def test_manual_calibration(self):
-        """calibrate_from_samples should set baseline."""
-        analyzer = self._make_analyzer()
-        analyzer.calibrate_from_samples(
-            shoulder_y_values=[300.0, 305.0, 298.0],
-            torso_lengths=[250.0, 255.0, 248.0],
+    def test_calibrated_value_is_camera_relative(self) -> None:
+        analyzer = PostureAnalyzer(_posture_config())
+        analyzer.apply_calibration(
+            neutral_pitch_deg=5.0,
+            neutral_face_scale=100.0,
+            camera_identity_key="camera-a",
         )
-        assert analyzer.is_calibrated
+        state = analyzer.update(
+            pitch_deg=30.0,
+            face_scale=100.0,
+            timestamp=0.0,
+            camera_identity_key="camera-a",
+        )
+        assert state.proxy_available is True
+        assert state.head_neck_flexion_angle == pytest.approx(25.0)
+        assert state.head_neck_flexion_score == pytest.approx(25.0 / 45.0)
+        assert state.is_sustained is False
 
-    def test_reset_preserves_calibration(self):
-        """reset() should preserve calibration."""
-        analyzer = self._make_analyzer()
-        analyzer.calibrate_from_samples(
-            shoulder_y_values=[300.0],
-            torso_lengths=[250.0],
+    @pytest.mark.parametrize("fps", FPS_CASES)
+    def test_sustained_dwell_is_fps_invariant(self, fps: float) -> None:
+        analyzer = PostureAnalyzer(_posture_config(dwell_seconds=2.0))
+        analyzer.apply_calibration(
+            neutral_pitch_deg=0.0,
+            neutral_face_scale=100.0,
+            camera_identity_key="camera-a",
+        )
+        result = None
+        for timestamp in np.arange(0.0, 2.0 + 0.5 / fps, 1.0 / fps):
+            result = analyzer.update(
+                pitch_deg=25.0,
+                face_scale=100.0,
+                timestamp=float(timestamp),
+                camera_identity_key="camera-a",
+            )
+        assert result is not None
+        assert result.sustained_flexion_seconds == pytest.approx(2.0, abs=1.0 / fps)
+        assert result.is_sustained is True
+
+    def test_missing_observation_resets_dwell(self) -> None:
+        analyzer = PostureAnalyzer(_posture_config(dwell_seconds=1.0))
+        analyzer.apply_calibration(
+            neutral_pitch_deg=0.0,
+            neutral_face_scale=100.0,
+            camera_identity_key="camera-a",
+        )
+        analyzer.update(
+            pitch_deg=25.0,
+            face_scale=100.0,
+            timestamp=0.0,
+            camera_identity_key="camera-a",
+        )
+        analyzer.observe_missing(0.5)
+        state = analyzer.update(
+            pitch_deg=25.0,
+            face_scale=100.0,
+            timestamp=0.75,
+            camera_identity_key="camera-a",
+        )
+        assert state.sustained_flexion_seconds == 0.0
+        assert state.is_sustained is False
+
+    @pytest.mark.parametrize(
+        ("camera_key", "scale", "reason"),
+        [
+            ("camera-b", 100.0, "camera_identity_changed"),
+            ("camera-a", 130.0, "face_scale_changed"),
+        ],
+    )
+    def test_camera_or_scale_change_invalidates_calibration(
+        self,
+        camera_key: str,
+        scale: float,
+        reason: str,
+    ) -> None:
+        analyzer = PostureAnalyzer(_posture_config())
+        analyzer.apply_calibration(
+            neutral_pitch_deg=0.0,
+            neutral_face_scale=100.0,
+            camera_identity_key="camera-a",
+        )
+        state = analyzer.update(
+            pitch_deg=10.0,
+            face_scale=scale,
+            timestamp=0.0,
+            camera_identity_key=camera_key,
+        )
+        assert state.proxy_available is False
+        assert state.invalidated_reason == reason
+        assert analyzer.is_calibrated is False
+
+    def test_face_scale_is_geometry_based_and_finite(self) -> None:
+        scale = PostureAnalyzer.face_scale(_face())
+        assert scale > 0.0
+        malformed = _face()
+        malformed[0, 0] = np.nan
+        with pytest.raises(ValueError, match="finite"):
+            PostureAnalyzer.face_scale(malformed)
+
+    def test_reset_preserves_calibration_but_reset_calibration_does_not(self) -> None:
+        analyzer = PostureAnalyzer(_posture_config())
+        analyzer.apply_calibration(
+            neutral_pitch_deg=0.0,
+            neutral_face_scale=100.0,
+            camera_identity_key="camera-a",
         )
         analyzer.reset()
-        assert analyzer.is_calibrated
-        assert analyzer.latest_state is None
-
-    def test_reset_calibration(self):
-        """reset_calibration() should clear everything."""
-        analyzer = self._make_analyzer()
-        analyzer.calibrate_from_samples(
-            shoulder_y_values=[300.0],
-            torso_lengths=[250.0],
-        )
+        assert analyzer.is_calibrated is True
         analyzer.reset_calibration()
-        assert not analyzer.is_calibrated
-
-    def test_smoothed_slump(self):
-        """get_smoothed_slump should return a value."""
-        analyzer = self._make_analyzer()
-        pose = self._make_pose_landmarks()
-
-        # Calibrate and add some data
-        for i in range(35):
-            analyzer.update_with_pose(pose, timestamp=i / 30.0)
-
-        slump = analyzer.get_smoothed_slump()
-        assert 0.0 <= slump <= 1.0
-
-
-# =============================================================================
-# Integration: Module Imports
-# =============================================================================
-
-
-class TestKinematicsEngineImports:
-    """Test that all kinematics engine exports are importable."""
-
-    def test_import_blink_detector(self):
-        from cortex.services.kinematics_engine import BlinkDetector, BlinkEvent, BlinkState
-
-        assert BlinkDetector is not None
-        assert BlinkEvent is not None
-        assert BlinkState is not None
-
-    def test_import_head_pose(self):
-        from cortex.services.kinematics_engine import HeadPoseEstimator, HeadPoseResult
-
-        assert HeadPoseEstimator is not None
-        assert HeadPoseResult is not None
-
-    def test_import_posture(self):
-        from cortex.services.kinematics_engine import PostureAnalyzer, PostureState
-
-        assert PostureAnalyzer is not None
-        assert PostureState is not None
+        assert analyzer.is_calibrated is False

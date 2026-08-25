@@ -20,15 +20,25 @@ parser, matching the rest of the schemas in this package.
 
 from __future__ import annotations
 
-import time
-from datetime import UTC, datetime
 from typing import Literal
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from cortex.application.clock import SYSTEM_CLOCK, utc_datetime
 from cortex.libs.schemas.intervention import CausalSignal, InterventionPlan
+from cortex.libs.schemas.intervention_transaction import ActionManifest
 from cortex.libs.schemas.session_report import SessionReport
-from cortex.libs.schemas.state import SignalQuality, StateScores
+from cortex.libs.schemas.state import (
+    EstimateStatus,
+    FeatureContribution,
+    InferenceModelIdentity,
+    SignalQuality,
+    StateScores,
+    SupportScores,
+    SupportState,
+)
+from cortex.libs.schemas.temporal import DualClockModel
 
 # ─── Shared Literal vocabularies ──────────────────────────────────────
 
@@ -61,16 +71,11 @@ DistractionBlockPreset = Literal["developer", "student", "writer", "custom"]
 
 
 class BreakRecommendation(BaseModel):
-    """P0 §3.7: BREAK_RECOMMENDATION wire payload.
+    """Opt-in elapsed-focus BREAK_RECOMMENDATION wire payload.
 
-    Emitted exactly once per ``StressIntegralTracker.should_break``
-    False → True transition. The popup / desktop overlay surfaces a
-    soft pill with a single CTA that fires ``take_biology_break`` via
-    ``ACTION_EXECUTE``.
-
-    The ``urgency`` literal mirrors what the daemon's
-    ``_classify_break_urgency`` actually emits (``"low" | "medium" |
-    "high"``); see ``cortex.services.runtime_daemon.CortexDaemon._classify_break_urgency``.
+    The old HRV-integral fields remain optional decode aliases for one release;
+    production recommendations use ``basis``, elapsed time, and the user's
+    preferred interval.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -85,21 +90,22 @@ class BreakRecommendation(BaseModel):
     )
     urgency: Literal["low", "medium", "high"] = Field(
         "low",
-        description=(
-            "Daemon-classified urgency derived from "
-            "``StressIntegralTracker.load_ratio``. The UI uses this to "
-            "decide pill colour / tone, never to gate the action."
-        ),
+        description="Presentation tone only; elapsed-time reminders use low.",
     )
-    stress_load: float = Field(
-        ...,
+    basis: Literal["elapsed_focus", "legacy_stress_integral"] = "elapsed_focus"
+    focus_elapsed_seconds: float | None = Field(None, ge=0.0)
+    preferred_interval_seconds: float | None = Field(None, gt=0.0)
+    stress_load: float | None = Field(
+        None,
         ge=0.0,
-        description="Current cumulative stress-integral load",
+        deprecated=True,
+        description="Legacy compatibility field; never populated in production.",
     )
-    threshold: float = Field(
-        ...,
+    threshold: float | None = Field(
+        None,
         ge=0.0,
-        description="Threshold the tracker crossed to fire this recommendation",
+        deprecated=True,
+        description="Legacy compatibility field; never populated in production.",
     )
     duration_seconds: int = Field(
         ...,
@@ -112,11 +118,10 @@ class BreakRecommendation(BaseModel):
         ),
     )
     breathing_pattern: Literal["4-7-8", "box", "coherent"] = Field(
-        "4-7-8",
+        "box",
         description=(
-            "Pacer cadence variant. Picked by the daemon based on the "
-            "user's recent HRV (4-7-8 = relaxation / parasympathetic; "
-            "box = balanced; coherent = 5.5 BPM resonance breathing)."
+            "Optional user-facing pacer cadence; it is not selected from "
+            "biometrics."
         ),
     )
 
@@ -159,11 +164,16 @@ class QuietModeState(BaseModel):
     )
     ends_at: float | None = Field(
         None,
+        deprecated=True,
         description=(
-            "UNIX epoch seconds (wall-clock) when the mode lapses. None "
-            "when kind=='off'. Clients compute a countdown from "
-            "(ends_at - Date.now() / 1000)."
+            "Deprecated v1 UTC Unix-seconds expiry mirror. Prefer "
+            "ends_at_unix_ms."
         ),
+    )
+    ends_at_unix_ms: int | None = Field(
+        None,
+        ge=0,
+        description="UTC Unix epoch milliseconds when the mode lapses.",
     )
     source: QuietModeSource = Field(
         "daemon",
@@ -343,7 +353,7 @@ class SessionRecap(BaseModel):
         ..., description="The full on-disk session report"
     )
     generated_at: str = Field(
-        default_factory=lambda: datetime.now(UTC).isoformat(),
+        default_factory=lambda: utc_datetime(SYSTEM_CLOCK).isoformat(),
         description=(
             "ISO-8601 instant the recap envelope was constructed "
             "(wall-clock). C4 (audit): typed as ``str`` so the daemon's "
@@ -366,7 +376,7 @@ class SessionRecap(BaseModel):
 # ─── CostResponse (COST_RESPONSE payload, §3.15) ──────────────────────
 
 
-class CostResponse(BaseModel):
+class CostResponse(DualClockModel):
     """P0 §3.15: COST_RESPONSE wire payload (unified HTTP + WS envelope).
 
     Emitted as a reply to :attr:`MessageType.COST_REQUEST` (WebSocket path)
@@ -410,13 +420,6 @@ class CostResponse(BaseModel):
     budget_exhausted: bool = Field(
         False,
         description="True when today's spend exceeded the budget cap.",
-    )
-    timestamp: float = Field(
-        default_factory=lambda: time.time(),
-        description=(
-            "UNIX epoch seconds (wall-clock UTC) when this cost snapshot "
-            "was taken. Comparable across producer and consumer."
-        ),
     )
     prompt_tokens: int | None = Field(
         None, ge=0,
@@ -529,10 +532,8 @@ class CaptureStatus(BaseModel):
 class StoreHealth(BaseModel):
     """Persistence-layer health indicator surfaced on every STATE_UPDATE.
 
-    The desktop dashboard uses ``degraded`` to render an in-memory
-    "you'll lose state on restart" hint when Redis is unavailable; the
-    DMG default deployment now uses :func:`make_default_store` so this
-    flag is only True when both Redis is configured AND unreachable.
+    The desktop dashboard uses ``degraded`` to render a durable-storage
+    warning. WP7's shipped backend is rollback-journal SQLite.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -540,15 +541,14 @@ class StoreHealth(BaseModel):
     degraded: bool = Field(
         False,
         description=(
-            "True when the daemon is running on the InMemoryStore "
-            "fallback (intended Redis unreachable). The dashboard uses "
-            "this to surface a soft 'no Redis' hint."
+            "True when the authoritative local database is unavailable or "
+            "failed its integrity/durability checks."
         ),
     )
     backend: str | None = Field(
         None,
         description=(
-            "Backend identifier (``redis`` / ``in_memory``). Optional — "
+            "Backend identifier (normally ``sqlite``). Optional — "
             "present when the daemon plants it in the registry; None "
             "otherwise."
         ),
@@ -583,7 +583,7 @@ class BiometricsSummary(BaseModel):
         None, description="rPPG heart-rate estimate in BPM"
     )
     hrv_rmssd: float | None = Field(
-        None, description="HRV RMSSD in milliseconds"
+        None, description="Compatibility field; unavailable in product"
     )
     hr_delta: float | None = Field(
         None,
@@ -602,23 +602,52 @@ class BiometricsSummary(BaseModel):
             "always populated."
         ),
     )
+    head_neck_flexion_score: float | None = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Camera-relative head/neck flexion proxy versus the user's "
+            "camera-bound neutral pose; unavailable when calibration is invalid."
+        ),
+    )
+    head_neck_flexion_angle: float | None = Field(
+        None,
+        description=(
+            "Camera-relative pitch delta in degrees versus the calibrated neutral pose. "
+            "This is not an upper-body posture or shoulder measurement."
+        ),
+    )
+    head_neck_flexion_dwell_seconds: float | None = Field(
+        None,
+        ge=0.0,
+        description="Contiguous valid exposure above the configured proxy threshold.",
+    )
+    head_neck_proxy_available: bool = Field(
+        False,
+        description=(
+            "True only while camera identity, face scale, and neutral-pose "
+            "calibration remain compatible."
+        ),
+    )
     forward_lean: float | None = Field(
         None,
         description=(
-            "Forward-lean score rescaled to 0..1. Browser-side posture "
-            "alert threshold (0.6) is compared against this rescaled "
-            "value, not raw degrees."
+            "Deprecated compatibility field. New consumers must use "
+            "head_neck_flexion_score; Cortex does not measure torso posture."
         ),
+        deprecated=True,
     )
     forward_lean_angle: float | None = Field(
         None,
         description=(
-            "Forward-lean angle in degrees (legacy / debug). Consumers "
-            "preferring a score should read ``forward_lean`` instead."
+            "Deprecated compatibility field. New consumers must use "
+            "head_neck_flexion_angle."
         ),
+        deprecated=True,
     )
     respiration_rate: float | None = Field(
-        None, description="Respiration rate in breaths/minute"
+        None, description="Compatibility field; unavailable in product"
     )
     thrashing_score: float | None = Field(
         None,
@@ -630,10 +659,7 @@ class BiometricsSummary(BaseModel):
     stress_integral: float | None = Field(
         None,
         ge=0.0,
-        description=(
-            "Cumulative stress-integral load tracked by "
-            "``StressIntegralTracker``. Used by the break-readiness UI."
-        ),
+        description="Compatibility field; unavailable pending validation",
     )
 
 
@@ -655,16 +681,30 @@ class StateUpdatePayload(BaseModel):
 
     model_config = ConfigDict(extra="ignore", use_enum_values=True)
 
-    state: Literal["FLOW", "HYPO", "HYPER", "RECOVERY"] = Field(
+    state: Literal["UNKNOWN", "FLOW", "HYPO", "HYPER", "RECOVERY"] = Field(
         ...,
-        description="Classified user state (mirrors ``StateEstimate.state``)",
+        description="Deprecated uppercase compatibility state",
     )
+    support_state: SupportState | None = None
+    status: EstimateStatus = EstimateStatus.ESTIMATED
     confidence: float = Field(
-        ..., ge=0.0, le=1.0, description="Confidence in state classification"
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Compatibility name for evidence strength; not a probability.",
     )
     scores: StateScores = Field(
         ...,
-        description="Raw scores for each state",
+        description="Deprecated uppercase projection of heuristic scores",
+    )
+    support_scores: SupportScores | None = None
+    evidence_coverage: float = Field(1.0, ge=0.0, le=1.0)
+    contributing_features: list[FeatureContribution] = Field(default_factory=list)
+    exclusions: list[str] = Field(default_factory=list)
+    model: InferenceModelIdentity | None = None
+    probabilities: SupportScores | None = Field(
+        None,
+        description="Absent unless a registered calibrated model produced them.",
     )
     signal_quality: SignalQuality = Field(
         ...,
@@ -680,11 +720,12 @@ class StateUpdatePayload(BaseModel):
     stress_integral: float | None = Field(
         None,
         ge=0.0,
-        description="Cumulative stress-integral load (ms*s)",
+        description="Compatibility field; unavailable pending validation",
     )
     calibrated_probabilities: StateScores | None = Field(
         None,
-        description="Calibrated class probabilities (optional ML/rule ensemble output)",
+        deprecated=True,
+        description="Deprecated; deterministic support rules never populate it.",
     )
     classifier_source: Literal["rule", "ml", "ensemble"] | None = Field(
         None,
@@ -696,31 +737,54 @@ class StateUpdatePayload(BaseModel):
         le=1.0,
         description="Ensemble weight on ML branch when used",
     )
-    source: Literal["classifier", "fallback"] = Field(
-        "classifier",
+    source: Literal["rules", "classifier", "fallback"] = Field(
+        "rules",
         description=(
-            "Envelope-level source (mirrors ``StateInferResponse.source``). "
-            "``fallback`` when no real classifier ran; the dashboard's "
-            "'classifier unavailable' banner reads this."
+            "Inference source. ``rules`` is the production Level-A engine, "
+            "``classifier`` is a decode-only legacy value, and ``fallback`` "
+            "means no inference engine ran."
         ),
     )
     degraded: bool = Field(
         False,
         description=(
-            "True when no real classifier ran (``classifier_source is "
-            "None``) — same condition the ``/state/infer`` fallback "
-            "branch uses to flag synthetic confidence."
+            "True when the estimate is warming, insufficient, or produced "
+            "by the explicit API fallback."
         ),
     )
     timestamp: float | str | None = Field(
         None,
+        deprecated=True,
         description=(
-            "Wall-clock timestamp the estimate was produced. May be an "
-            "ISO string (datetime path) or float (monotonic-style "
-            "producer); consumers must accept both shapes for "
-            "backwards-compatibility."
+            "Deprecated v1 producer timestamp with legacy mixed provenance. "
+            "Use observed_at_unix_ms/observed_at_mono_ns/boot_id."
         ),
     )
+    observed_at_unix_ms: int | None = Field(None, ge=0)
+    observed_at_mono_ns: int | None = Field(None, ge=0)
+    boot_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def _validate_v2_time_tuple(self) -> StateUpdatePayload:
+        supplied = (
+            self.observed_at_unix_ms is not None,
+            self.observed_at_mono_ns is not None,
+            self.boot_id is not None,
+        )
+        if any(supplied) and not all(supplied):
+            raise ValueError("state update v2 time fields must be supplied together")
+        if self.status != EstimateStatus.ESTIMATED and self.state != "UNKNOWN":
+            raise ValueError("non-estimated state updates must use UNKNOWN")
+        legacy_probabilities = self.__dict__.get("calibrated_probabilities")
+        if self.probabilities is not None or legacy_probabilities is not None:
+            if (
+                self.model is None
+                or self.model.probability_calibration_artifact_id is None
+            ):
+                raise ValueError(
+                    "probability output requires a registered calibration artifact"
+                )
+        return self
     connected_clients: list[str] = Field(
         default_factory=list,
         description=(
@@ -791,6 +855,25 @@ class InterventionTriggerPayload(InterventionPlan):
     """
 
     model_config = ConfigDict(extra="ignore")
+
+    execution_mode: Literal[
+        "suggest_only", "authorized", "research_autonomous",
+    ] = Field(
+        "suggest_only",
+        description=(
+            "Daemon-owned workspace authority mode. Missing or legacy values "
+            "decode to suggest_only so protocol downgrade cannot increase authority."
+        ),
+    )
+
+    action_manifest: ActionManifest | None = Field(
+        None,
+        description=(
+            "Daemon-authored immutable effect manifest. The trigger remains a "
+            "non-mutating proposal; clients must request a separate one-time "
+            "authorization against this exact digest before executing actions."
+        ),
+    )
 
     desktop_not_focused: bool | None = Field(
         None,

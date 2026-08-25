@@ -9,17 +9,109 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 from typing import Literal
+from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 
 class UserState(StrEnum):
-    """User cognitive state classification."""
+    """One-cycle compatibility aliases used by existing clients."""
 
-    FLOW = "FLOW"  # Optimal engagement
-    HYPO = "HYPO"  # Under-arousal, disengagement
-    HYPER = "HYPER"  # Over-arousal, overwhelm
-    RECOVERY = "RECOVERY"  # Transitioning back to flow
+    UNKNOWN = "UNKNOWN"
+    FLOW = "FLOW"  # Compatibility alias for flow_like
+    HYPO = "HYPO"  # Compatibility alias for under_engaged
+    HYPER = "HYPER"  # Compatibility alias for support_likely
+    RECOVERY = "RECOVERY"  # Compatibility alias for recovering
+
+
+class SupportState(StrEnum):
+    """Decision-support target names that avoid diagnostic claims."""
+
+    SUPPORT_LIKELY = "support_likely"
+    UNDER_ENGAGED = "under_engaged"
+    FLOW_LIKE = "flow_like"
+    RECOVERING = "recovering"
+    UNKNOWN = "unknown"
+
+
+class EstimateStatus(StrEnum):
+    """Whether the current support estimate is actionable."""
+
+    ESTIMATED = "estimated"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+    WARMING_UP = "warming_up"
+
+
+class SupportScores(BaseModel):
+    """Bounded deterministic support scores; these are not probabilities."""
+
+    support_likely: float = Field(0.0, ge=0.0, le=1.0)
+    under_engaged: float = Field(0.0, ge=0.0, le=1.0)
+    flow_like: float = Field(0.0, ge=0.0, le=1.0)
+    recovering: float = Field(0.0, ge=0.0, le=1.0)
+
+    def dominant(self) -> tuple[SupportState, float]:
+        values = {
+            SupportState.SUPPORT_LIKELY: self.support_likely,
+            SupportState.UNDER_ENGAGED: self.under_engaged,
+            SupportState.FLOW_LIKE: self.flow_like,
+            SupportState.RECOVERING: self.recovering,
+        }
+        state = max(values, key=lambda candidate: values[candidate])
+        score = values[state]
+        if score <= 0.0:
+            return SupportState.UNKNOWN, 0.0
+        return state, score
+
+    def to_legacy(self) -> StateScores:
+        return StateScores(
+            flow=self.flow_like,
+            hypo=self.under_engaged,
+            hyper=self.support_likely,
+            recovery=self.recovering,
+        )
+
+
+class FeatureContribution(BaseModel):
+    """Auditable contribution of one observed or missing feature."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, use_enum_values=True)
+
+    feature: str = Field(..., min_length=1)
+    support_state: SupportState
+    direction: Literal["positive", "negative", "missing"]
+    contribution: float = Field(..., ge=-1.0, le=1.0)
+    quality: float = Field(..., ge=0.0, le=1.0)
+    observed: bool
+    note: str = Field(..., min_length=1)
+
+
+class InferenceModelIdentity(BaseModel):
+    """Identity and evidence maturity of a support inference implementation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: str = Field(..., min_length=1)
+    version: str = Field(..., min_length=1)
+    feature_schema_version: str = Field(..., min_length=1)
+    implementation_sha256: str | None = Field(None, pattern=r"^[0-9a-f]{64}$")
+    validation_status: Literal[
+        "deterministic_rules", "research_only", "validated", "unregistered"
+    ]
+    probability_calibration_artifact_id: str | None = None
+
+
+def legacy_inference_identity() -> InferenceModelIdentity:
+    """Identity for compatibility callers that construct estimates directly."""
+
+    return InferenceModelIdentity(
+        name="legacy-compatibility-input",
+        version="unregistered",
+        feature_schema_version="legacy-flat-v1",
+        implementation_sha256=None,
+        validation_status="unregistered",
+        probability_calibration_artifact_id=None,
+    )
 
 
 class SignalQuality(BaseModel):
@@ -53,10 +145,10 @@ class SignalQuality(BaseModel):
 class StateScores(BaseModel):
     """Scores for each possible user state."""
 
-    flow: float = Field(0.0, ge=0.0, le=1.0, description="Flow state score")
-    hypo: float = Field(0.0, ge=0.0, le=1.0, description="Hypo-arousal score")
-    hyper: float = Field(0.0, ge=0.0, le=1.0, description="Hyper-arousal score")
-    recovery: float = Field(0.0, ge=0.0, le=1.0, description="Recovery state score")
+    flow: float = Field(0.0, ge=0.0, le=1.0, description="Legacy flow-like score")
+    hypo: float = Field(0.0, ge=0.0, le=1.0, description="Legacy under-engaged score")
+    hyper: float = Field(0.0, ge=0.0, le=1.0, description="Legacy support-likely score")
+    recovery: float = Field(0.0, ge=0.0, le=1.0, description="Legacy recovering score")
 
     def dominant_state(self) -> tuple[UserState, float]:
         """Get the dominant state and its score."""
@@ -67,7 +159,22 @@ class StateScores(BaseModel):
             UserState.RECOVERY: self.recovery,
         }
         dominant = max(scores, key=lambda k: scores[k])
-        return dominant, scores[dominant]
+        score = scores[dominant]
+        if score <= 0.0:
+            return UserState.UNKNOWN, 0.0
+        return dominant, score
+
+
+class RuleEvaluation(BaseModel):
+    """Stateless Level-A rule output consumed by the temporal smoother."""
+
+    status: EstimateStatus
+    scores: SupportScores
+    evidence_coverage: float = Field(..., ge=0.0, le=1.0)
+    state_coverage: dict[SupportState, float] = Field(default_factory=dict)
+    contributing_features: list[FeatureContribution] = Field(default_factory=list)
+    exclusions: list[str] = Field(default_factory=list)
+    model: InferenceModelIdentity
 
 
 class StateEstimate(BaseModel):
@@ -79,14 +186,34 @@ class StateEstimate(BaseModel):
 
     model_config = ConfigDict(use_enum_values=True)
 
+    estimate_id: UUID = Field(default_factory=uuid4)
     state: UserState = Field(
-        ..., description="Classified user state"
+        ..., description="Deprecated uppercase compatibility alias"
     )
+    support_state: SupportState | None = Field(
+        None, description="Canonical decision-support state"
+    )
+    status: EstimateStatus = EstimateStatus.ESTIMATED
     confidence: float = Field(
-        ..., ge=0.0, le=1.0, description="Confidence in state classification"
+        ...,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Deprecated compatibility name for bounded evidence strength; "
+            "not a probability or diagnostic confidence."
+        ),
     )
     scores: StateScores = Field(
-        ..., description="Raw scores for each state"
+        ..., description="Deprecated uppercase projection of heuristic scores"
+    )
+    support_scores: SupportScores | None = None
+    evidence_coverage: float = Field(1.0, ge=0.0, le=1.0)
+    contributing_features: list[FeatureContribution] = Field(default_factory=list)
+    exclusions: list[str] = Field(default_factory=list)
+    model: InferenceModelIdentity = Field(default_factory=legacy_inference_identity)
+    probabilities: SupportScores | None = Field(
+        None,
+        description="Only present for a registered model with a calibration artifact.",
     )
     reasons: list[str] = Field(
         default_factory=list,
@@ -97,21 +224,28 @@ class StateEstimate(BaseModel):
     )
     timestamp: float = Field(
         ...,
+        deprecated=True,
         description=(
-            "UNIX epoch seconds (wall-clock, UTC); comparable across "
-            "producer and consumer. Previously documented as 'Monotonic' "
-            "but the producer uses time.time(), not time.monotonic()."
+            "Deprecated v1 state-pipeline monotonic seconds. Prefer the "
+            "explicit observed_at_* fields."
         ),
     )
+    schema_version: Literal["2.0"] = "2.0"
+    observed_at_unix_ms: int | None = Field(None, ge=0)
+    observed_at_mono_ns: int | None = Field(None, ge=0)
+    boot_id: UUID | None = None
     dwell_seconds: float = Field(
         0.0, ge=0.0, description="Seconds in current state"
     )
     stress_integral: float | None = Field(
-        None, ge=0.0, description="Cumulative stress load integral (ms*s)"
+        None,
+        ge=0.0,
+        description="Compatibility field; unavailable pending reference validation",
     )
     calibrated_probabilities: StateScores | None = Field(
         None,
-        description="Calibrated class probabilities (optional ML/rule ensemble output)",
+        deprecated=True,
+        description="Deprecated compatibility field; absent for deterministic rules.",
     )
     classifier_source: Literal["rule", "ml", "ensemble"] | None = Field(
         None, description="Classifier source used for this estimate"
@@ -120,14 +254,57 @@ class StateEstimate(BaseModel):
         None, ge=0.0, le=1.0, description="Ensemble weight on ML branch when used"
     )
 
+    @model_validator(mode="after")
+    def _validate_contract(self) -> StateEstimate:
+        supplied = (
+            self.observed_at_unix_ms is not None,
+            self.observed_at_mono_ns is not None,
+            self.boot_id is not None,
+        )
+        if any(supplied) and not all(supplied):
+            raise ValueError("state estimate v2 time fields must be supplied together")
+        state_to_support = {
+            UserState.HYPER.value: SupportState.SUPPORT_LIKELY,
+            UserState.HYPO.value: SupportState.UNDER_ENGAGED,
+            UserState.FLOW.value: SupportState.FLOW_LIKE,
+            UserState.RECOVERY.value: SupportState.RECOVERING,
+            UserState.UNKNOWN.value: SupportState.UNKNOWN,
+        }
+        expected_support = state_to_support[str(self.state)]
+        if self.support_state is None:
+            self.support_state = expected_support
+        elif self.support_state != expected_support:
+            raise ValueError("support_state and compatibility state disagree")
+        if self.support_scores is None:
+            self.support_scores = SupportScores(
+                support_likely=self.scores.hyper,
+                under_engaged=self.scores.hypo,
+                flow_like=self.scores.flow,
+                recovering=self.scores.recovery,
+            )
+        if self.status != EstimateStatus.ESTIMATED and self.state != UserState.UNKNOWN:
+            raise ValueError("non-estimated outputs must use UNKNOWN/unknown state")
+        # Read the deprecated compatibility slot without triggering Pydantic's
+        # access warning inside validation itself.
+        legacy_probabilities = self.__dict__.get("calibrated_probabilities")
+        has_probability_output = self.probabilities is not None or legacy_probabilities is not None
+        if (
+            has_probability_output
+            and self.model.probability_calibration_artifact_id is None
+        ):
+            raise ValueError(
+                "probability output requires a registered calibration artifact"
+            )
+        return self
+
     @property
     def is_overwhelmed(self) -> bool:
-        """Check if user is in overwhelmed (HYPER) state."""
+        """Compatibility predicate for the HYPER/support-likely alias."""
         return self.state == "HYPER"
 
     @property
     def is_flow(self) -> bool:
-        """Check if user is in flow state."""
+        """Compatibility predicate for the FLOW/flow-like alias."""
         return self.state == "FLOW"
 
     @property
@@ -139,6 +316,9 @@ class StateEstimate(BaseModel):
         """
         return (
             self.is_overwhelmed
+            and self.status == EstimateStatus.ESTIMATED
+            and self.support_state == SupportState.SUPPORT_LIKELY
+            and self.evidence_coverage >= 0.45
             and self.confidence >= 0.85
             and self.signal_quality.acceptable
         )
@@ -164,13 +344,10 @@ class UserBaselines(BaseModel):
         17.0, ge=5.0, le=30.0, description="Baseline blink rate (blinks/min)"
     )
     mouse_velocity_baseline: float = Field(
-        500.0, ge=100.0, le=2000.0, description="Baseline mouse velocity (px/s)"
+        500.0, ge=0.0, description="Baseline mouse velocity (px/s)"
     )
     mouse_variance_baseline: float = Field(
-        10000.0, ge=1000.0, le=100000.0, description="Baseline mouse variance"
-    )
-    shoulder_neutral_y: float = Field(
-        0.5, ge=0.0, le=1.0, description="Neutral shoulder Y position (normalized)"
+        10000.0, ge=0.0, description="Baseline mouse variance"
     )
     resp_baseline: float = Field(
         15.0, ge=4.0, le=30.0, description="Baseline respiration rate (breaths/min)"
@@ -208,15 +385,19 @@ class StateTransition(BaseModel):
 
     timestamp: float = Field(
         ...,
+        deprecated=True,
         description=(
-            "UNIX epoch seconds (wall-clock, UTC) when the transition "
-            "occurred; comparable across producer and consumer."
+            "Deprecated v1 monotonic seconds in the producing boot."
         ),
     )
-    from_state: Literal["FLOW", "HYPO", "HYPER", "RECOVERY"] = Field(
+    schema_version: Literal["2.0"] = "2.0"
+    observed_at_unix_ms: int | None = Field(None, ge=0)
+    observed_at_mono_ns: int | None = Field(None, ge=0)
+    boot_id: UUID | None = None
+    from_state: Literal["UNKNOWN", "FLOW", "HYPO", "HYPER", "RECOVERY"] = Field(
         ..., description="Previous state"
     )
-    to_state: Literal["FLOW", "HYPO", "HYPER", "RECOVERY"] = Field(
+    to_state: Literal["UNKNOWN", "FLOW", "HYPO", "HYPER", "RECOVERY"] = Field(
         ..., description="New state"
     )
     from_confidence: float = Field(
@@ -231,6 +412,17 @@ class StateTransition(BaseModel):
     trigger_reasons: list[str] = Field(
         default_factory=list, description="Reasons for transition"
     )
+
+    @model_validator(mode="after")
+    def _validate_v2_time_tuple(self) -> StateTransition:
+        supplied = (
+            self.observed_at_unix_ms is not None,
+            self.observed_at_mono_ns is not None,
+            self.boot_id is not None,
+        )
+        if any(supplied) and not all(supplied):
+            raise ValueError("state transition v2 time fields must be supplied together")
+        return self
 
     @property
     def is_escalation(self) -> bool:

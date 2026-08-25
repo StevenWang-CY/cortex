@@ -16,9 +16,12 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
-import time
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from typing import Any
 
+from cortex.application.clock import SYSTEM_CLOCK, Clock, unix_seconds
+from cortex.libs.schemas.consent import ConsentDecision
 from cortex.services.consent.policy import ConsentPolicy
 
 logger = logging.getLogger(__name__)
@@ -44,24 +47,6 @@ _RECENCY_WINDOW_SECONDS = 30 * 24 * 3600
 _DECAY_HALF_LIFE_SECONDS = 10 * 24 * 3600
 
 
-class ConsentDecision:
-    """Result of a consent check."""
-
-    __slots__ = ("allowed", "effective_level", "requested_level", "reason")
-
-    def __init__(
-        self,
-        allowed: bool,
-        effective_level: int,
-        requested_level: int,
-        reason: str = "",
-    ) -> None:
-        self.allowed = allowed
-        self.effective_level = effective_level
-        self.requested_level = requested_level
-        self.reason = reason
-
-
 class ConsentLadder:
     """
     Manages consent levels for each action type.
@@ -73,10 +58,12 @@ class ConsentLadder:
         ladder = ConsentLadder(policy=ConsentPolicy(), store=redis_store)
         decision = await ladder.check("close_tab", requested_level=REVERSIBLE_ACT)
         if decision.allowed:
-            execute_action()
-            await ladder.record_approval("close_tab")
+            # A positive ladder decision is necessary but not executable
+            # authority. Materialize and consume an exact ActionAuthorization;
+            # only a verified adapter receipt may then count as approval.
+            await authorize_exact_manifest()
         else:
-            downgrade_to(decision.effective_level)
+            present_lower_authority_proposal(decision.effective_level)
     """
 
     def __init__(
@@ -84,7 +71,9 @@ class ConsentLadder:
         policy: ConsentPolicy | None = None,
         store: Any = None,
         escalation_threshold: int = _DEFAULT_ESCALATION_THRESHOLD,
+        clock: Clock | None = None,
     ) -> None:
+        self._clock = clock or SYSTEM_CLOCK
         self._policy = policy or ConsentPolicy()
         self._store = store
         self._escalation_threshold = escalation_threshold
@@ -92,6 +81,10 @@ class ConsentLadder:
         # In-memory state: action_type → {level, approvals, rejections}
         self._action_states: dict[str, dict[str, Any]] = {}
         self._loaded = False
+        # Every consent/policy mutation increments this persisted revision.
+        # Exact authorizations capture it and are invalidated if it changes
+        # before atomic consumption (e.g. concurrent reset/apply).
+        self._revision = 0
 
         # F24: serialize concurrent reads and writes against the
         # in-memory state. The TriggerPolicy reads consent levels while
@@ -160,8 +153,22 @@ class ConsentLadder:
                 data = await self._store.get_json("consent_ladder_state")
                 if data and isinstance(data, dict):
                     self._action_states = data.get("action_states", {})
-                    if "global_max" in data:
+                    policy_state = data.get("policy")
+                    if isinstance(policy_state, dict):
+                        levels = policy_state.get("levels", {})
+                        if isinstance(levels, dict):
+                            for action_type, level in levels.items():
+                                if isinstance(action_type, str) and isinstance(level, int):
+                                    self._policy.set_level(action_type, level)
+                        policy_global_max = policy_state.get("global_max")
+                        if isinstance(policy_global_max, int):
+                            self._policy.global_max_level = policy_global_max
+                    elif "global_max" in data:
+                        # Decode-only support for the pre-SQLite state shape.
                         self._policy.global_max_level = data["global_max"]
+                    revision = data.get("revision", 0)
+                    if isinstance(revision, int) and revision >= 0:
+                        self._revision = revision
             except Exception:
                 logger.debug("No stored consent state found, using defaults")
             # Flip the flag only after the await resolves so a concurrent
@@ -177,6 +184,8 @@ class ConsentLadder:
             await self._store.set_json("consent_ladder_state", {
                 "action_states": self._action_states,
                 "global_max": self._policy.global_max_level,
+                "policy": self._policy.to_dict(),
+                "revision": self._revision,
             })
         except Exception:
             logger.exception("Failed to persist consent state")
@@ -212,39 +221,133 @@ class ConsentLadder:
             ConsentDecision with allowed/denied and effective level.
         """
         await self._ensure_loaded()
-        # F24: read the state under the lock so a concurrent reset()
-        # cannot leave us looking at a half-cleared dict.
-        async with self._get_lock():
-            state = self._get_state(action_type)
-            current_level = state["level"]
-            min_level = self._policy.get_minimum_level(action_type)
-            global_max = self._policy.global_max_level
+        if requested_level not in _LEVEL_NAMES:
+            raise ValueError(
+                f"requested_level must be in 0..4, got {requested_level!r}"
+            )
 
-        # Effective level is capped by global max and current earned level
+        # F24: calculate the complete decision under the same lock reset and
+        # policy changes use. Returning a decision assembled after releasing
+        # the lock would permit a mixed-revision read.
+        async with self._get_lock():
+            return self._decision_unlocked(action_type, requested_level)
+
+    def _decision_unlocked(
+        self,
+        action_type: str,
+        requested_level: int,
+    ) -> ConsentDecision:
+        """Evaluate one action while ``self._lock`` is held."""
+
+        state = self._get_state(action_type)
+        current_level = int(state["level"])
+        min_level = self._policy.get_minimum_level(action_type)
+        global_max = self._policy.global_max_level
+
+        # Effective level is capped by global max and current earned level.
+        # An action may only execute when the *exact requested manifest* is
+        # both at least the action's minimum and no more authoritative than
+        # the earned/global ceiling. A lower effective level is information
+        # for materializing a new plan; it is never permission to execute the
+        # original request.
         max_allowed = min(current_level, global_max)
 
-        if requested_level <= max_allowed:
+        if min_level <= requested_level <= max_allowed:
             return ConsentDecision(
                 allowed=True,
                 effective_level=requested_level,
                 requested_level=requested_level,
+                outcome="permit",
                 reason=f"Action '{action_type}' allowed at level {_LEVEL_NAMES.get(requested_level, '?')}",
             )
 
-        # Downgrade to what's allowed
+        # A downgrade is explicitly non-executable. The caller may present a
+        # newly materialized lower-authority plan and request consent again.
         effective = min(max_allowed, requested_level)
+        outcome = (
+            "downgrade"
+            if requested_level > max_allowed and effective >= min_level
+            else "deny"
+        )
+        disposition = "downgraded" if outcome == "downgrade" else "denied"
         return ConsentDecision(
-            allowed=effective >= min_level,
+            allowed=False,
             effective_level=effective,
             requested_level=requested_level,
+            outcome=outcome,
             reason=(
-                f"Action '{action_type}' downgraded from "
-                f"{_LEVEL_NAMES.get(requested_level, '?')} to "
-                f"{_LEVEL_NAMES.get(effective, '?')} "
+                f"Action '{action_type}' {disposition} at "
+                f"{_LEVEL_NAMES.get(requested_level, '?')}; effective ceiling "
+                f"is {_LEVEL_NAMES.get(effective, '?')} "
                 f"(earned: {_LEVEL_NAMES.get(current_level, '?')}, "
-                f"cap: {_LEVEL_NAMES.get(global_max, '?')})"
+                f"cap: {_LEVEL_NAMES.get(global_max, '?')}, "
+                f"minimum: {_LEVEL_NAMES.get(min_level, '?')})"
             ),
         )
+
+    async def check_batch(
+        self,
+        requests: Sequence[tuple[str, int]],
+    ) -> tuple[tuple[ConsentDecision, ...], int]:
+        """Atomically evaluate an exact manifest subset.
+
+        The returned revision describes every decision in the tuple.  No
+        reset, approval, rejection, or policy update can interleave between
+        individual action checks.
+        """
+
+        async with self.exact_decision_scope(requests) as evaluated:
+            return evaluated
+
+    @asynccontextmanager
+    async def exact_decision_scope(
+        self,
+        requests: Sequence[tuple[str, int]],
+    ) -> AsyncIterator[tuple[tuple[ConsentDecision, ...], int]]:
+        """Hold the consent lock through an authorization commit.
+
+        The coordinator performs its durable one-time consumption while this
+        scope is open. A reset is therefore ordered wholly before the
+        decision or wholly after consumption; it cannot slip between them.
+        """
+
+        await self._ensure_loaded()
+        for _action_type, requested_level in requests:
+            if requested_level not in _LEVEL_NAMES:
+                raise ValueError(
+                    f"requested_level must be in 0..4, got {requested_level!r}"
+                )
+        async with self._get_lock():
+            decisions = tuple(
+                self._decision_unlocked(action_type, requested_level)
+                for action_type, requested_level in requests
+            )
+            yield decisions, self._revision
+
+    async def revision(self) -> int:
+        """Return the current persisted consent revision."""
+
+        await self._ensure_loaded()
+        async with self._get_lock():
+            return self._revision
+
+    async def set_policy_level(self, action_type: str, level: int) -> None:
+        """Mutate one policy override and invalidate issued authorizations."""
+
+        await self._ensure_loaded()
+        async with self._get_lock():
+            self._policy.set_level(action_type, level)
+            self._revision += 1
+            await self._persist()
+
+    async def set_global_max_level(self, level: int) -> None:
+        """Set the global autonomy ceiling under the consent revision lock."""
+
+        await self._ensure_loaded()
+        async with self._get_lock():
+            self._policy.global_max_level = level
+            self._revision += 1
+            await self._persist()
 
     async def record_approval(self, action_type: str) -> None:
         """
@@ -260,7 +363,7 @@ class ConsentLadder:
             state = self._get_state(action_type)
             state["approvals"] += 1
             state["total_approvals"] += 1
-            state["last_approval"] = time.time()
+            state["last_approval"] = unix_seconds(self._clock)
             state.setdefault("approval_timestamps", []).append(state["last_approval"])
             self._prune_old_timestamps(state)
 
@@ -273,7 +376,7 @@ class ConsentLadder:
             # timestamps list is still used for the recency-weighted
             # trust factor, but only the counter decides "have we
             # earned the next tier yet?".
-            now = time.time()
+            now = unix_seconds(self._clock)
             weighted_approvals = self._weighted_recent_approvals(state, now)
             recent_rejections = len(state.get("rejection_timestamps", []))
             tier_approvals = int(state["approvals"])
@@ -301,6 +404,7 @@ class ConsentLadder:
                     self._escalation_threshold,
                 )
 
+            self._revision += 1
             await self._persist()
 
     async def record_rejection(self, action_type: str) -> None:
@@ -313,7 +417,7 @@ class ConsentLadder:
         async with self._get_lock():
             state = self._get_state(action_type)
             state["rejections"] += 1
-            state["last_rejection"] = time.time()
+            state["last_rejection"] = unix_seconds(self._clock)
             state.setdefault("rejection_timestamps", []).append(state["last_rejection"])
             self._prune_old_timestamps(state)
 
@@ -330,10 +434,11 @@ class ConsentLadder:
                     _LEVEL_NAMES.get(state["level"], "?"),
                 )
 
+            self._revision += 1
             await self._persist()
 
     def _prune_old_timestamps(self, state: dict[str, Any]) -> None:
-        now = time.time()
+        now = unix_seconds(self._clock)
         cutoff = now - _RECENCY_WINDOW_SECONDS
         approvals = [t for t in state.get("approval_timestamps", []) if t >= cutoff]
         rejections = [t for t in state.get("rejection_timestamps", []) if t >= cutoff]
@@ -374,9 +479,11 @@ class ConsentLadder:
         # plan being constructed cannot bake a now-rescinded level into
         # an outgoing intervention. Lock is released even on exception
         # because ``async with`` always runs ``__aexit__``.
+        await self._ensure_loaded()
         async with self._get_lock():
             if action_type:
                 self._action_states.pop(action_type, None)
             else:
                 self._action_states.clear()
+            self._revision += 1
             await self._persist()

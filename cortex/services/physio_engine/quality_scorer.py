@@ -4,7 +4,7 @@ Physio Engine — Signal Quality Scorer & Algorithm Switching
 Evaluates rPPG signal quality using SNR (peak power to noise floor ratio)
 and manages automatic algorithm switching based on quality degradation:
 
-    POS (best accuracy) → CHROM (better skin-tone robustness) → Green (simplest)
+    POS → CHROM → Green (configured research order)
 
 When the primary algorithm's quality drops below threshold, the scorer
 evaluates the fallback and switches if it produces better results.
@@ -61,16 +61,22 @@ class QualityScorer:
         # scorer.current_algorithm may change
     """
 
-    # Algorithm priority order (best to worst)
+    # Research comparison order; not an accuracy ranking.
     PRIORITY = [RPPGAlgorithm.POS, RPPGAlgorithm.CHROM, RPPGAlgorithm.GREEN]
 
     def __init__(
         self,
         initial_algorithm: RPPGAlgorithm = RPPGAlgorithm.POS,
         quality_history_size: int = 10,
+        *,
+        dynamic_selection_validated: bool = False,
     ) -> None:
         self._current = initial_algorithm
         self._history_size = quality_history_size
+        # Switching is an algorithm policy, not a harmless fallback. It is
+        # disabled until a held-out evaluation shows it improves the fixed
+        # backend across the declared conditions and subgroups.
+        self._dynamic_selection_validated = dynamic_selection_validated
 
         # Per-algorithm quality history
         self._quality_history: dict[RPPGAlgorithm, deque[float]] = {
@@ -161,14 +167,14 @@ class QualityScorer:
         self._latest_assessment = assessment
 
         # Check if we should consider switching
-        if (
+        if self._dynamic_selection_validated and (
             self._windows_since_switch >= _SWITCH_COOLDOWN_WINDOWS
             and assessment.overall_quality < _QUALITY_POOR
         ):
             self._consider_switch(rgb_window, fs)
 
         # Also try to switch back to a higher-priority algorithm if quality is good
-        elif (
+        elif self._dynamic_selection_validated and (
             self._windows_since_switch >= _SWITCH_COOLDOWN_WINDOWS * 2
             and self._current != self.PRIORITY[0]
             and assessment.overall_quality >= _QUALITY_GOOD

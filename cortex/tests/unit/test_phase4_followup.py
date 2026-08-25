@@ -54,9 +54,9 @@ def test_weekly_schedule_monday_morning_off_blocks_trigger() -> None:
     ``monday[morning] = "off"`` must be suppressed with reason
     ``weekly_schedule_off``.
     """
-    import datetime as _dt
-    from unittest.mock import patch
+    from datetime import datetime
 
+    from cortex.application.clock import FakeClock
     from cortex.libs.config.settings import InterventionConfig, StateConfig
     from cortex.libs.schemas.state import (
         SignalQuality,
@@ -66,8 +66,15 @@ def test_weekly_schedule_monday_morning_off_blocks_trigger() -> None:
     from cortex.services.state_engine.trigger_policy import TriggerPolicy
 
     cfg = InterventionConfig(cooldown_seconds=0, max_interventions_per_hour=0)
+    monday_morning = datetime(2024, 1, 1, 9, 0).astimezone()
+    clock = FakeClock(
+        wall_unix_ms=int(monday_morning.timestamp() * 1_000),
+        mono_ns=1_000_000_000_000,
+    )
     p = TriggerPolicy(
-        config=cfg, state_config=StateConfig(hyper_dwell_seconds=5),
+        config=cfg,
+        state_config=StateConfig(hyper_dwell_seconds=5),
+        clock=clock,
     )
     p.set_weekly_schedule({
         "monday": ["off", "on", "on", "on"],
@@ -83,21 +90,7 @@ def test_weekly_schedule_monday_morning_off_blocks_trigger() -> None:
         dwell_seconds=30.0,
     )
 
-    # Patch datetime.now() inside the trigger_policy module to a Monday
-    # at 09:00 local time.
-    monday_morning = _dt.datetime(2024, 1, 1, 9, 0)  # 2024-01-01 is Monday
-
-    class _FakeDT(_dt.datetime):
-        @classmethod
-        def now(cls, tz: Any = None) -> _dt.datetime:  # type: ignore[override]
-            return monday_morning
-
-        @classmethod
-        def fromtimestamp(cls, ts: float, tz: Any = None) -> _dt.datetime:  # type: ignore[override]
-            return monday_morning
-
-    with patch.object(_dt, "datetime", _FakeDT):
-        decision = p.evaluate(est, current_time=1000.0)
+    decision = p.evaluate(est, current_time=1000.0)
 
     assert decision.should_trigger is False, decision.reason
     assert decision.reason == "weekly_schedule_off"

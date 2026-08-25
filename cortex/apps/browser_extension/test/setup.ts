@@ -7,7 +7,7 @@
  * helpers directly.
  */
 
-import { afterEach, beforeEach } from "vitest";
+import { afterEach, beforeEach, vi } from "vitest";
 
 // Suppress React 18 act() warning during component-mount tests; vitest
 // runs them synchronously and we wrap explicit state changes already.
@@ -29,6 +29,30 @@ if (typeof window !== "undefined" && !window.matchMedia) {
             removeEventListener: () => {},
             dispatchEvent: () => false,
         }),
+    });
+}
+
+// jsdom deliberately leaves CanvasRenderingContext2D unimplemented and logs
+// an error before returning null. The new-tab animation already treats a null
+// context as a graceful no-animation fallback; tests use this deterministic
+// surface so mounting the component remains quiet and can exercise cleanup.
+if (typeof HTMLCanvasElement !== "undefined") {
+    const canvasContext = {
+        arc: vi.fn(),
+        beginPath: vi.fn(),
+        clearRect: vi.fn(),
+        fill: vi.fn(),
+        fillRect: vi.fn(),
+        scale: vi.fn(),
+        stroke: vi.fn(),
+        fillStyle: "",
+        globalAlpha: 1,
+        lineWidth: 1,
+        strokeStyle: "",
+    } as unknown as CanvasRenderingContext2D;
+    Object.defineProperty(HTMLCanvasElement.prototype, "getContext", {
+        configurable: true,
+        value: vi.fn(() => canvasContext),
     });
 }
 import {

@@ -1,325 +1,245 @@
 name: ci
 
-# Cortex CI gates two layers:
-#
-# 1. ``schema-codegen-check`` — audit Debt-1 drift gate. The committed
-#    ``cortex/apps/browser_extension/types/generated/cortex_schemas.d.ts``
-#    must stay in sync with the Pydantic source of truth in
-#    ``cortex/libs/schemas/``. Any divergence fails the build and
-#    blocks the merge until the developer runs
-#    ``python -m cortex.scripts.generate_ts_schemas`` and commits the
-#    refreshed file.
-# 2. ``python`` + ``extension`` — F40 (TypeScript test infra) +
-#    pytest/ruff/mypy. Standard quality gates.
-
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: "23 8 * * 1"
+  workflow_dispatch:
 
-# Cancel in-flight runs on PR updates — saves runner minutes and
-# guarantees the merge-gate result reflects the latest commit.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: "0.10.12"
+  PYTHON_PRIMARY: "3.11.15"
+  NODE_VERSION: "22.23.2"
+  PNPM_VERSION: "9.15.9"
+
 jobs:
-  schema-codegen-check:
-    name: schema-codegen-check (Debt-1 drift gate)
+  repository-contracts:
+    name: docs-links-config-version-schema
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          python-version: "3.11"
-
-      - name: Set up Node (for json2ts)
-        uses: actions/setup-node@v6
+          persist-credentials: false
+      # Run before dependency installation so ignored package READMEs are not
+      # part of the crawl; repository-local targets have a separate checker.
+      - name: External Markdown links
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
         with:
-          node-version: "20"
-
-      # ``pydantic-to-typescript`` shells out to ``json2ts`` from the
-      # ``json-schema-to-typescript`` npm package. We install both
-      # halves here; the Python script discovers ``json2ts`` on PATH.
-      - name: Install json-schema-to-typescript
-        run: npm install -g json-schema-to-typescript
-
-      - name: Install Python codegen extras
-        run: pip install -e "./cortex[codegen]"
-
-      # The drift gate: regenerate into a tempfile and diff against
-      # the committed copy. Exit 1 prints the diff and fails the job.
-      - name: Verify cortex_schemas.d.ts is in sync
-        run: python -m cortex.scripts.generate_ts_schemas --check
-
-  ci-release-parity:
-    # ci-parity-guard (audit): ci.yml's ``python`` job and release.yml's
-    # ``ci-gate`` job MUST run the identical ruff + mypy + pytest
-    # invocations, otherwise a PR can pass CI and then break the tag build
-    # (exactly the drift this whole remediation closed). This job parses
-    # both workflow files and fails if the ruff ``Lint``, mypy, or pytest
-    # ``run:`` blocks diverge. Keeps the two surfaces honest with zero
-    # extra deps beyond PyYAML (already a dev dependency).
-    name: ci-release-parity (mypy/pytest drift gate)
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
+          args: --config .lychee.toml --no-progress "./**/*.md"
+          fail: true
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          python-version: "3.11"
-
-      - name: Assert ci.yml and release.yml share ruff + mypy + pytest steps
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_PRIMARY }}
+          enable-cache: true
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Activate exact pnpm without the action-setup version shim
         run: |
-          python - <<'PY'
-          import sys
-          import yaml
-
-          ci = yaml.safe_load(open(".github/workflows/ci.yml"))
-          rel = yaml.safe_load(open(".github/workflows/release.yml"))
-
-          def step_runs(job_steps):
-              """Map each named step to its ``run:`` block."""
-              out = {}
-              for step in job_steps:
-                  name = step.get("name", "")
-                  if "run" in step:
-                      out[name] = step["run"]
-              return out
-
-          ci_steps = step_runs(ci["jobs"]["python"]["steps"])
-          rel_steps = step_runs(rel["jobs"]["ci-gate"]["steps"])
-
-          mypy_name = "Typecheck (mypy --strict — blocking, full project)"
-          pytest_name = "Test (pytest)"
-
-          problems = []
-          # ── name-matched steps (mypy + pytest): the display names are
-          #    identical across both files, so we look each up by name and
-          #    compare the ``run:`` command verbatim. ──
-          for name in (mypy_name, pytest_name):
-              c = ci_steps.get(name)
-              r = rel_steps.get(name)
-              if c is None:
-                  problems.append(f"ci.yml python job is missing step {name!r}")
-              if r is None:
-                  problems.append(f"release.yml ci-gate job is missing step {name!r}")
-              if c is not None and r is not None and c != r:
-                  problems.append(
-                      f"step {name!r} diverges between ci.yml and release.yml:\n"
-                      f"  ci.yml:      {c!r}\n"
-                      f"  release.yml: {r!r}"
-                  )
-
-          # ── command-matched step (ruff Lint): the two files use DIFFERENT
-          #    display names ("Lint (ruff)" in ci.yml vs "Lint" in
-          #    release.yml). Matching by name would make a harmless rename a
-          #    false "missing step", so instead we LOCATE the lint step in
-          #    each job by its command shape (a ``run:`` whose first non-
-          #    blank token is ``ruff``) and compare the full command. A real
-          #    flag divergence (e.g. one side adds ``--select``/``--fix`` or
-          #    changes the target path) still fails the gate. ──
-          def find_ruff_run(steps_by_name):
-              hits = [
-                  run for run in steps_by_name.values()
-                  if run.strip().split(None, 1)[0:1] == ["ruff"]
-              ]
-              return hits
-
-          ci_ruff = find_ruff_run(ci_steps)
-          rel_ruff = find_ruff_run(rel_steps)
-          if not ci_ruff:
-              problems.append("ci.yml python job has no ruff Lint step")
-          if not rel_ruff:
-              problems.append("release.yml ci-gate job has no ruff Lint step")
-          if len(ci_ruff) > 1:
-              problems.append(f"ci.yml python job has >1 ruff step: {ci_ruff!r}")
-          if len(rel_ruff) > 1:
-              problems.append(f"release.yml ci-gate job has >1 ruff step: {rel_ruff!r}")
-          if ci_ruff and rel_ruff and ci_ruff[0] != rel_ruff[0]:
-              problems.append(
-                  "ruff Lint command diverges between ci.yml and release.yml:\n"
-                  f"  ci.yml:      {ci_ruff[0]!r}\n"
-                  f"  release.yml: {rel_ruff[0]!r}"
-              )
-
-          if problems:
-              print("ci/release parity FAILED:")
-              for p in problems:
-                  print(" -", p)
-              sys.exit(1)
-          print("ci.yml and release.yml ruff + mypy + pytest steps are in sync.")
-          PY
-
-  design-tokens-check:
-    name: design-tokens-check (drift gate)
+          corepack enable
+          corepack prepare "pnpm@${PNPM_VERSION}" --activate
+          test "$(pnpm --version)" = "${PNPM_VERSION}"
+      - name: Install frozen dependency graphs
+        run: |
+          uv sync --project cortex --locked --extra codegen
+          pnpm --dir cortex/apps/browser_extension install --frozen-lockfile
+      - name: Generated schema drift
+        run: uv run --project cortex --locked --extra codegen python -m cortex.scripts.generate_ts_schemas --check
+      - name: Repository contracts
+        run: uv run --project cortex --locked --extra codegen python -m cortex.scripts.verify_repository_contracts
+  dependency-audit:
+    name: dependency-audit-policy
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          python-version: "3.11"
-
-      - name: Install package (for PyYAML + cortex.scripts)
-        run: pip install -e "./cortex[dev]"
-
-      # P1-18: Regenerate all three token surfaces in memory and diff against
-      # the committed copies. Exit 1 with a unified diff if any file is stale.
-      # Developers fix by running:
-      #   python -m cortex.scripts.sync_design_tokens --apply
-      # and committing the result.
-      - name: Verify design tokens are in sync
-        run: python -m cortex.scripts.sync_design_tokens --check
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_PRIMARY }}
+          enable-cache: true
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Activate exact pnpm without the action-setup version shim
+        run: |
+          corepack enable
+          corepack prepare "pnpm@${PNPM_VERSION}" --activate
+          test "$(pnpm --version)" = "${PNPM_VERSION}"
+      - name: Install frozen dependency graphs
+        run: |
+          uv sync --project cortex --locked --extra dev --extra codegen
+          pnpm --dir cortex/apps/browser_extension install --frozen-lockfile
+          npm --prefix cortex/apps/vscode_extension ci
+      - name: Generate machine-readable audit reports
+        run: |
+          mkdir -p audit-results
+          uv run --project cortex --locked --extra dev pip-audit --format json --output audit-results/python.json || true
+          pnpm --dir cortex/apps/browser_extension audit --json > audit-results/browser.json || true
+          npm --prefix cortex/apps/vscode_extension audit --json > audit-results/vscode.json || true
+      - name: Enforce vulnerability and exception policy
+        run: |
+          status=0
+          uv run --project cortex --locked --extra dev python cortex/scripts/verify_dependency_audit.py --ecosystem pip --report audit-results/python.json --summary-out audit-results/python-summary.json || status=1
+          uv run --project cortex --locked --extra dev python cortex/scripts/verify_dependency_audit.py --ecosystem pnpm --report audit-results/browser.json --exceptions cortex/security/node-audit-exceptions.json --summary-out audit-results/browser-summary.json || status=1
+          uv run --project cortex --locked --extra dev python cortex/scripts/verify_dependency_audit.py --ecosystem npm --report audit-results/vscode.json --summary-out audit-results/vscode-summary.json || status=1
+          exit "${status}"
+      - if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: dependency-audit-reports
+          path: audit-results/*.json
+          if-no-files-found: error
+          retention-days: 30
 
   python:
-    name: python (pytest + ruff + mypy)
-    # Cortex is macOS-only — many of the PySide6 / pyobjc / AVFoundation
-    # test paths can't run on Linux. Match the dev environment so the
-    # gate reflects what local ``make ci`` produces.
-    runs-on: macos-14
+    name: python-full-${{ matrix.arch }}-py${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+            python: "3.11.15"
+          - runner: macos-15-intel
+            arch: x86_64
+            python: "3.12.13"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 55
+    env:
+      # Override the repository's primary .python-version for the compatibility
+      # matrix row; every uv invocation in the shared gate inherits this.
+      UV_PYTHON: ${{ matrix.python }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          python-version: "3.11"
-          cache: "pip"
-      - name: Install package
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e "./cortex[dev]"
-      - name: Lint (ruff)
-        run: ruff check cortex/
-      - name: Typecheck (mypy --strict — blocking, full project)
-        # Audit fix: previously the blocking scope was a curated subset
-        # (libs/design + libs/llm) and the full tree ran with
-        # ``|| true``. Tag release builds (release.yml) ran the full
-        # ``mypy cortex/ --strict`` gate, so a PR could land green and
-        # break the next release. Promote the strict full-project gate
-        # to block PR merges as well so the two CI surfaces stay
-        # aligned and tag-time surprises stop happening.
-        #
-        # ``--config-file cortex/pyproject.toml`` is REQUIRED: the job
-        # runs from the repo root where mypy would otherwise never
-        # discover ``[tool.mypy]`` (it lives under ``cortex/``). Without
-        # it the pydantic plugin + per-module overrides are silently
-        # dropped and the gate reports false errors. Kept byte-identical
-        # with release.yml's pre-release gate.
-        run: mypy --config-file cortex/pyproject.toml cortex/ --strict
-      - name: Test (pytest)
-        # ci-pytest-split (audit): a single ``pytest cortex/tests/``
-        # SEGFAULTs during collection because PySide6/shiboken loads
-        # after scipy/pyobjc have already initialised their own copies of
-        # the same native libs. Split into TWO invocations: the whole suite
-        # EXCEPT the PySide6 desktop_shell test (covers unit, integration,
-        # services, state_engine, eval, physio, performance), then the
-        # desktop_shell test isolated in its own interpreter. The earlier
-        # three-way split silently dropped integration/state_engine/eval/
-        # physio/performance coverage. ``QT_QPA_PLATFORM`` stays offscreen
-        # for both. Kept byte-identical with the other workflow's gate
-        # (enforced by the ci-release-parity job).
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - name: Resolve only from committed lock
+        run: uv sync --project cortex --locked --extra dev --extra codegen
+      - name: Verify exact interpreter architecture
         env:
-          QT_QPA_PLATFORM: offscreen
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          EXPECTED_PYTHON: ${{ matrix.python }}
+        run: uv run --project cortex --locked python -c 'import platform, os; actual=(platform.python_version(), platform.machine()); expected=(os.environ["EXPECTED_PYTHON"], os.environ["EXPECTED_ARCH"]); assert actual == expected, (actual, expected)'
+      - name: Audit the resolved architecture-specific Python graph
         run: |
-          pytest cortex/tests/ --ignore=cortex/tests/unit/test_desktop_shell.py
-          pytest cortex/tests/unit/test_desktop_shell.py
+          mkdir -p audit-results
+          uv run --project cortex --locked --extra dev pip-audit \
+            --format json \
+            --output "audit-results/python-${{ matrix.arch }}.json" || true
+          audit_exception_args=()
+          if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
+            audit_exception_args=(--exceptions cortex/security/python-intel-audit-exceptions.json)
+          fi
+          uv run --project cortex --locked --extra dev python \
+            cortex/scripts/verify_dependency_audit.py \
+            --ecosystem pip \
+            --report "audit-results/python-${{ matrix.arch }}.json" \
+            --summary-out "audit-results/python-${{ matrix.arch }}-summary.json" \
+            "${audit_exception_args[@]}"
+      - name: Canonical Python gate
+        run: ./cortex/scripts/run_python_gate.sh
+      - if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: python-audit-${{ matrix.arch }}
+          path: audit-results/*.json
+          if-no-files-found: error
+          retention-days: 30
 
   eval-regression:
-    name: eval-regression (F41 baseline gate)
+    name: recorded-trace-regression
     runs-on: ubuntu-latest
-    # Audit-2 fix: the previous ``contains(github.event.pull_request.changed_files.*.filename, ...)``
-    # expression was syntactically broken — ``changed_files`` on
-    # ``pull_request`` is an integer count, not a list, so the filter
-    # always evaluated to false and the job only ran on push. The new
-    # ``dorny/paths-filter`` action correctly inspects the diff.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
-      - name: Path filter
-        id: filter
-        uses: dorny/paths-filter@v4
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          filters: |
-            eval:
-              - 'cortex/services/llm_engine/**'
-              - 'cortex/services/state_engine/**'
-              - 'cortex/services/eval/**'
-              - 'cortex/libs/schemas/intervention.py'
-      - name: Skip if no relevant changes
-        if: github.event_name == 'pull_request' && steps.filter.outputs.eval != 'true'
-        run: echo "No eval-relevant changes; skipping regression harness."
-      - uses: actions/setup-python@v6
-        if: github.event_name == 'push' || steps.filter.outputs.eval == 'true'
-        with:
-          python-version: "3.11"
-          cache: "pip"
-      - name: Install package
-        if: github.event_name == 'push' || steps.filter.outputs.eval == 'true'
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e "./cortex[dev]"
-      - name: Run regression harness against committed baseline
-        if: github.event_name == 'push' || steps.filter.outputs.eval == 'true'
-        # Exits 1 on any metric outside its tolerance band. The harness
-        # prints a human-readable report on stdout so the CI log shows
-        # exactly which metric drifted; the developer either fixes the
-        # regression or re-runs locally with --update-baseline.
-        run: python -m cortex.services.eval.regression_harness
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_PRIMARY }}
+          enable-cache: true
+      - name: Install from lock
+        run: uv sync --project cortex --locked --extra dev
+      - name: Run committed regression baseline
+        run: uv run --project cortex --locked --extra dev python -m cortex.services.eval.regression_harness
 
   extension:
-    name: extension (lint + vitest)
+    name: browser-type-test-build
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: cortex/apps/browser_extension
     steps:
-      - uses: actions/checkout@v6
-      - uses: pnpm/action-setup@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          version: 9
-      - uses: actions/setup-node@v6
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          node-version: "22"
-          cache: "pnpm"
-          cache-dependency-path: cortex/apps/browser_extension/pnpm-lock.yaml
-      - name: Install
-        run: pnpm install --frozen-lockfile
-      - name: Typecheck
-        run: pnpm exec tsc --noEmit
-      - name: Test
-        run: pnpm test
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_PRIMARY }}
+          enable-cache: true
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Activate exact pnpm without the action-setup version shim
+        run: |
+          corepack enable
+          corepack prepare "pnpm@${PNPM_VERSION}" --activate
+          test "$(pnpm --version)" = "${PNPM_VERSION}"
+      - name: Install frozen Python/native and browser graphs
+        run: |
+          uv sync --project ../.. --locked
+          echo "${GITHUB_WORKSPACE}/cortex/.venv/bin" >> "${GITHUB_PATH}"
+          pnpm install --frozen-lockfile
+      - name: Typecheck and test
+        run: |
+          pnpm exec tsc --noEmit
+          pnpm test
+      - name: Build Chrome and Edge MV3
+        run: |
+          pnpm exec plasmo build
+          pnpm exec plasmo build --target=edge-mv3
 
   extension-vscode:
-    # vscode-tsc-gate (audit): the VS Code extension ships as a .vsix
-    # bundled into Cortex.app. A type error in its TypeScript breaks
-    # ``vsce package`` at release time with no PR-level signal. This job
-    # compiles the extension exactly as ``vscode:prepublish`` does so
-    # vsix-breaking type errors surface on every PR.
-    name: extension-vscode (tsc compile)
+    name: vscode-compile-test-package
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: cortex/apps/vscode_extension
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          node-version: "20"
-          cache: "npm"
+          persist-credentials: false
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
           cache-dependency-path: cortex/apps/vscode_extension/package-lock.json
-      - name: Install
-        run: npm ci
-      - name: Compile (tsc -p ./)
-        run: npm run compile
+      - name: Frozen install, compile, and test
+        run: |
+          npm ci
+          npm run compile
+          npm test
+      - name: Package locked VSIX
+        run: npm exec -- vsce package --out "${{ runner.temp }}/cortex-somatic.vsix"

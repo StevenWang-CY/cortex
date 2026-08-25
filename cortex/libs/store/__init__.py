@@ -19,9 +19,11 @@ from typing import Any
 
 from cortex.libs.store.memory_store import InMemoryStore
 from cortex.libs.store.redis_store import RedisStore
+from cortex.storage.database import SQLiteDatabase
+from cortex.storage.key_value_store import SQLiteKeyValueStore
 
 
-def _default_persist_path() -> Path:
+def default_legacy_store_path() -> Path:
     """OS-appropriate path for the in-memory store's persisted JSON.
 
     * macOS (Darwin): ``~/Library/Application Support/Cortex/store.json``
@@ -40,11 +42,18 @@ def _default_persist_path() -> Path:
     return home / ".cortex" / "store.json"
 
 
+# Compatibility alias for external deployments and older tests. New code uses
+# the public name so user-data maintenance can discover the exact legacy file.
+_default_persist_path = default_legacy_store_path
+
+
 def make_default_store(
     config: Any | None = None,
     *,
     persist_path: Path | None = None,
-) -> InMemoryStore | RedisStore:
+    database: SQLiteDatabase | None = None,
+    consent_overrides_path: Path | None = None,
+) -> InMemoryStore | RedisStore | SQLiteKeyValueStore:
     """Return the default store for the active deployment.
 
     The DMG ships without Redis (no service to manage, no extra
@@ -75,8 +84,22 @@ def make_default_store(
     redis_cfg = getattr(config, "redis", None) if config is not None else None
     redis_enabled = bool(getattr(redis_cfg, "enabled", False))
     key_prefix = (
-        getattr(redis_cfg, "key_prefix", "cortex") or "cortex"
-    ) if redis_cfg is not None else "cortex"
+        (getattr(redis_cfg, "key_prefix", "cortex") or "cortex")
+        if redis_cfg is not None
+        else "cortex"
+    )
+
+    if database is not None:
+        # WP7: the embedded database is the authoritative store in the app.
+        # Redis remains a compatibility option for external/test composition
+        # that does not supply the database; it is not part of the atomic
+        # intervention/consent/policy persistence path.
+        return SQLiteKeyValueStore(
+            database,
+            key_prefix=key_prefix,
+            legacy_store_path=persist_path or default_legacy_store_path(),
+            legacy_consent_overrides_path=consent_overrides_path,
+        )
 
     if redis_enabled and redis_cfg is not None:
         return RedisStore(
@@ -88,17 +111,19 @@ def make_default_store(
             # degrades to a persistent InMemoryStore at the same OS path
             # the no-Redis branch uses, so consent / calibration state
             # survives a daemon restart in BOTH deployments.
-            fallback_persist_path=persist_path or _default_persist_path(),
+            fallback_persist_path=persist_path or default_legacy_store_path(),
         )
 
     return InMemoryStore(
         key_prefix=key_prefix,
-        persist_path=persist_path or _default_persist_path(),
+        persist_path=persist_path or default_legacy_store_path(),
     )
 
 
 __all__ = [
     "InMemoryStore",
     "RedisStore",
+    "SQLiteKeyValueStore",
+    "default_legacy_store_path",
     "make_default_store",
 ]

@@ -122,3 +122,59 @@ def test_callback_invoked_on_real_dispatch(monkeypatch: pytest.MonkeyPatch) -> N
 
     asyncio.run(server._process_message(client, identify))
     assert fired == [("chrome", True)]
+
+
+def test_stable_instance_reconnect_supersedes_old_socket_without_false_offline() -> None:
+    class _Socket:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self, **_kwargs: object) -> None:
+            self.closed = True
+
+    async def scenario() -> None:
+        server = WebSocketServer()
+        fired: list[tuple[str, bool]] = []
+        server.set_client_identified_callback(
+            lambda client_type, connected: fired.append(
+                (client_type, connected)
+            )
+        )
+        stable_id = "browser-profile-stable-001"
+        old_socket = _Socket()
+        old = WebSocketClient(
+            client_id="old",
+            websocket=old_socket,
+            client_type="chrome",
+            client_instance_id=stable_id,
+            authenticated=True,
+        )
+        replacement = WebSocketClient(
+            client_id="replacement",
+            websocket=_Socket(),
+            authenticated=True,
+        )
+        server._clients.update({"old": old, "replacement": replacement})
+
+        identify = WSMessage(
+            type=MessageType.IDENTIFY.value,
+            payload={
+                "client_type": "chrome",
+                "client_instance_id": stable_id,
+            },
+            sequence=0,
+        ).to_json()
+        await server._process_message(replacement, identify)
+
+        assert old_socket.closed is True
+        assert old.authenticated is False
+        assert "old" not in server._clients
+        assert server.connected_client_types() == ["chrome"]
+        assert fired == [("chrome", True)]
+
+        # The old handler's eventual finally block reports aggregate truth,
+        # not a raw false disconnect for the still-live replacement.
+        await server._notify_client_type_connectivity("chrome")
+        assert fired[-1] == ("chrome", True)
+
+    asyncio.run(scenario())

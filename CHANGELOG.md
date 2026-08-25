@@ -4,6 +4,89 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.3.0] — 2026-08-25
+
+This minor release rebuilds Cortex's safety-critical path around truthful
+observations, conservative support inference, explicit user authority, durable
+recovery, and a traceable dual-architecture macOS release. It remains an alpha
+research prototype: physiological outputs are quality-gated estimates, and the
+support state is not a medical diagnosis or a calibrated probability.
+
+### Added
+
+* **Canonical observation and time contracts.** Typed envelopes carry wall and
+  monotonic clocks, sequence identity, provenance, quality, missingness, and
+  reason codes across capture, fusion, inference, transports, and storage.
+* **Evidence-aware sensing.** Capture continuity, face-loss invalidation,
+  elapsed-time kinematics, continuous rPPG beat tracking, IBI/HRV eligibility,
+  low-frequency respiration estimation, posture evidence, and calibration now
+  share explicit quality and publication policies.
+* **Conservative support inference.** Missing or stale channels reduce evidence
+  instead of silently biasing the result toward FLOW. Published support states
+  expose evidence coverage and abstain or degrade when inputs cannot justify a
+  stronger claim.
+* **Transactional intervention authority.** Immutable action manifests,
+  proposal-only presentation, exact authorization records, per-effect receipts,
+  postcondition checks, and idempotent restore make workspace mutations
+  inspectable and recoverable across disconnects and restarts.
+* **Transactional local persistence.** Versioned SQLite migrations, durable
+  intent/effect/recovery records, startup reconciliation, retention controls,
+  scoped export, and guarded deletion replace fragmented attribution files.
+* **Policy and evaluation lifecycle.** One decision maps to at most one durable
+  outcome; the no-action arm is explicit; safeguards remain outside learned
+  choice; observational summaries no longer overclaim causal identification.
+* **Privacy context broker.** Browser/editor context is minimized by purpose,
+  consent, origin, age, and field; optional access revocation clears stored
+  content; planner inputs expose provenance without transferring raw page or
+  code bodies by default.
+* **Application architecture.** A shared application kernel, coordinators,
+  typed events, runtime-data ownership, and supervised task lifecycle reduce
+  transport duplication and decompose the former daemon, desktop, browser, and
+  editor orchestrators.
+* **Refined interaction surfaces.** Desktop privacy controls, context previews,
+  truthful degraded/empty states, accessible dialogs and focus behavior,
+  restrained reduced-motion-aware transitions, contrast contracts, and
+  transactional browser/editor prompts align UI feedback with actual authority.
+* **Traceable release pipeline.** Locked arm64 and Intel builders now require
+  Developer ID signing, Apple notarization/stapling, installed-artifact smoke
+  checks, architecture-specific dependency audits, SBOMs, checksums, GitHub
+  provenance attestations, and complete independent real-device evidence before
+  a draft may become public.
+
+### Changed
+
+* Runtime schemas are generated from the Pydantic boundary and dispatch sites
+  use exhaustive message catalogs; configuration, version, design-token, link,
+  action-pin, and CI/release-parity contracts are enforced in the main gate.
+* Browser and VS Code intervention adapters now stage, apply, acknowledge, and
+  restore effects through the same transaction semantics as the daemon.
+* The macOS package builds architecture-specific DMGs from one reviewed source
+  wheel, embeds verified browser/editor artifacts, scans for secrets and local
+  paths, and emits machine-readable release evidence.
+* Release notarization accepts exactly one complete credential set: an App
+  Store Connect API key or an Apple ID with app-specific password. Partial or
+  mixed credentials fail closed before keychain creation.
+
+### Security
+
+* Capability authentication, bounded sequencing, manifest validation, least-
+  authority execution, privacy revocation, secret scanning, and durable restore
+  recovery are enforced at the daemon/browser/editor trust boundaries.
+* macOS Intel remains pinned to the final compatible MediaPipe/NumPy branch.
+  Its reviewed Protobuf exception is narrowly scoped, continuously audited, and
+  expires on 2026-09-22; the excluded parser boundary is rejected in production
+  source by a repository contract.
+
+### Fixed
+
+* Corrected clock-epoch mixing, synthetic valid data after face loss,
+  duplicated overlapping-window beats, incomplete IBI validation, unreachable
+  low-rate respiration logic, nominal-frame kinematics, and parallel
+  lower-fidelity calibration paths.
+* Removed silent consent downgrade execution, mutation-before-presentation,
+  non-durable restore, ambiguous no-action behavior, dead classifier/adaptation
+  paths, and shutdown/task ownership gaps that could leave unresolved work.
+
 ## [v0.2.2] — 2026-06-23
 
 Patch release closing a full multi-phase production audit: real,

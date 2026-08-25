@@ -44,9 +44,12 @@ async def test_b1_capture_unavailable_emits_stale_broadcast() -> None:
     server._broadcast = _capture_send  # type: ignore[assignment]
 
     estimate = StateEstimate(
-        state="FLOW",
+        state="UNKNOWN",
+        support_state="unknown",
+        status="insufficient_evidence",
         confidence=0.0,
         scores=StateScores(flow=0.0, hypo=0.0, hyper=0.0, recovery=0.0),
+        evidence_coverage=0.0,
         signal_quality=SignalQuality(physio=0.0, kinematics=0.0, telemetry=0.0),
         timestamp=0.0,
         reasons=["capture_unavailable"],
@@ -61,6 +64,9 @@ async def test_b1_capture_unavailable_emits_stale_broadcast() -> None:
 
     assert sent, "broadcast_state did not emit"
     payload = sent[0]
+    assert payload["state"] == "UNKNOWN"
+    assert payload["support_state"] == "unknown"
+    assert payload["status"] == "insufficient_evidence"
     assert "capture" in payload
     assert payload["capture"].get("stale") is True, (
         f"expected capture.stale=True, got {payload['capture']}"
@@ -615,7 +621,10 @@ async def test_b17_executor_adapter_missing_counter() -> None:
     """
     from cortex.services.intervention_engine.executor import InterventionExecutor
 
-    executor = InterventionExecutor()
+    executor = InterventionExecutor(execution_mode="authorized")
+    # This test isolates the missing-adapter counter rather than the WP6
+    # manifest gate; production callers never enable this escape hatch.
+    executor._allow_unwired_consent = True
     assert executor._adapter_missing_total == 0
     # Skip the 500ms retry sleep so the test runs fast.
     with patch("asyncio.sleep", return_value=None):

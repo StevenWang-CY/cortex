@@ -11,7 +11,7 @@
 
 import * as vscode from "vscode";
 import { CortexWSClient } from "./ws-client";
-import { PANEL_STATE_HEX_LIGHT } from "./design-tokens";
+import { PANEL_STATE_HEX_LIGHT, PANEL_STATE_LABELS } from "./design-tokens";
 
 /**
  * Webview provider for the Cortex intervention side panel.
@@ -138,22 +138,6 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
         try {
             this._view.webview.postMessage({
                 type: 'whyDetail',
-                payload,
-            });
-        } catch {
-            // webview may be tearing down
-        }
-    }
-
-    /**
-     * P0 §3.7: route a BREAK_RECOMMENDATION pulse into the webview so
-     * the panel can render a soft pill above the intervention card.
-     */
-    public applyBreakRecommendation(payload: Record<string, unknown>): void {
-        if (!this._view) return;
-        try {
-            this._view.webview.postMessage({
-                type: 'breakRecommendation',
                 payload,
             });
         } catch {
@@ -315,12 +299,20 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             return;
         }
         const state = this._currentState;
-        const stateStr = (state.state as string) ?? "—";
+        const ready = state.status === "estimated";
+        const stateStr = ready ? ((state.state as string) ?? "UNKNOWN") : "UNKNOWN";
+        const label = state.status === "warming_up"
+            ? "Still gathering"
+            : state.status === "insufficient_evidence"
+            ? "Not enough evidence"
+            : PANEL_STATE_LABELS[stateStr] ?? "Status unavailable";
         const confidence = state.confidence as number | undefined;
         try {
             this._view.webview.postMessage({
                 type: "state",
                 state: stateStr,
+                label,
+                status: state.status,
                 color: PANEL_STATE_HEX_LIGHT[stateStr] ?? "#888",
                 confidence: confidence ?? 0,
             });
@@ -339,7 +331,13 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
         const state = this._currentState;
         const payload = this._currentPayload;
 
-        const stateStr = (state.state as string) ?? "—";
+        const ready = state.status === "estimated";
+        const stateStr = ready ? ((state.state as string) ?? "UNKNOWN") : "UNKNOWN";
+        const stateLabel = state.status === "warming_up"
+            ? "Still gathering"
+            : state.status === "insufficient_evidence"
+            ? "Not enough evidence"
+            : PANEL_STATE_LABELS[stateStr] ?? "Status unavailable";
         const confidence = state.confidence as number | undefined;
         const confPct =
             confidence !== undefined ? Math.round(confidence * 100) : 0;
@@ -414,13 +412,6 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                     <div class="causal" style="font-size:11px;color:#71717a;margin-top:6px;cursor:pointer;" onclick="this.querySelector('.causal-body').style.display = this.querySelector('.causal-body').style.display === 'none' ? 'block' : 'none'">
                         <span style="font-weight:500;">Why this?</span> ›
                         <div class="causal-body" style="display:none;margin-top:4px;line-height:1.5;">${causalExplanation}</div>
-                    </div>
-                    <!-- P0 §3.7: BREAK_RECOMMENDATION pill — hidden by
-                         default; populated when the daemon emits the
-                         pulse. The CTA fires the desktop-side break. -->
-                    <div id="break-recommendation" class="break-rec" style="display:none;">
-                        <span class="break-rec-text"></span>
-                        <button class="break-rec-cta" type="button">Take 4 min</button>
                     </div>
                     <!-- P0 §3.9: structured rationale drilldown. The
                          "Why?" link expands the panel; when no
@@ -614,13 +605,12 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             cursor: pointer;
             font-size: var(--fs-footnote);
             font-weight: 500;
+            transition: background-color 120ms cubic-bezier(.23, 1, .32, 1),
+                border-color 120ms cubic-bezier(.23, 1, .32, 1),
+                transform 120ms cubic-bezier(.23, 1, .32, 1);
         }
 
-        .dismiss-btn:hover {
-            background: var(--cx-dismiss-bg-hover);
-        }
-
-        .dismiss-btn:focus-visible {
+        button:focus-visible {
             outline: 2px solid var(--cx-focus-ring);
             outline-offset: 1px;
         }
@@ -631,9 +621,8 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             color: var(--cx-text-secondary);
         }
 
-        /* P1 (audit Phase 4d, Task B): explicit empty-state for the
-           daemon-offline case so the user can tell "no overwhelm yet"
-           apart from "client can't reach the daemon". */
+        /* Explicit empty state: daemon offline is distinct from an
+           evidence-aware UNKNOWN/quiet support state. */
         .daemon-offline {
             text-align: center;
             padding: 20px 12px;
@@ -652,9 +641,9 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             cursor: pointer;
             font-size: var(--fs-caption);
             font-weight: 600;
+            transition: filter 120ms cubic-bezier(.23, 1, .32, 1),
+                transform 120ms cubic-bezier(.23, 1, .32, 1);
         }
-
-        .daemon-offline button:hover { filter: brightness(1.08); }
 
         /* P2-6: "Connected, awaiting state" empty state */
         .cx-awaiting-state {
@@ -671,7 +660,7 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             height: 7px;
             border-radius: 50%;
             background: var(--cx-text-tertiary);
-            animation: cx-pulse 1.2s ease-in-out infinite;
+            animation: cx-pulse 1.2s cubic-bezier(.77, 0, .175, 1) infinite;
             vertical-align: middle;
             margin-right: 4px;
         }
@@ -679,32 +668,6 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
         @keyframes cx-pulse {
             0%, 100% { opacity: 0.3; transform: scale(0.85); }
             50%       { opacity: 1.0; transform: scale(1.15); }
-        }
-
-        /* P0 §3.7: BREAK_RECOMMENDATION pill */
-        .break-rec {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            margin: 8px 0 12px;
-            padding: 8px 10px;
-            border-radius: 6px;
-            background: rgba(217, 119, 87, 0.10);
-            border: 1px solid rgba(217, 119, 87, 0.45);
-            font-size: var(--fs-caption);
-        }
-
-        .break-rec-text { flex: 1; color: var(--cx-text); }
-
-        .break-rec-cta {
-            background: var(--cx-accent);
-            color: white;
-            border: none;
-            border-radius: 5px;
-            padding: 4px 10px;
-            cursor: pointer;
-            font-size: var(--fs-caption);
-            font-weight: 600;
         }
 
         /* P0 §3.8: rating row */
@@ -723,9 +686,11 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             padding: 4px 12px;
             font-size: 14px;
             cursor: pointer;
+            transition: background-color 120ms cubic-bezier(.23, 1, .32, 1),
+                border-color 120ms cubic-bezier(.23, 1, .32, 1),
+                transform 120ms cubic-bezier(.23, 1, .32, 1);
         }
 
-        .rating-btn:hover { background: rgba(255, 255, 255, 0.12); }
         .rating-btn.selected { background: var(--cx-accent); color: white; }
 
         .rating-text {
@@ -751,9 +716,39 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             font-size: var(--fs-caption);
             text-decoration: underline;
             cursor: pointer;
+            transition: color 120ms cubic-bezier(.23, 1, .32, 1),
+                transform 120ms cubic-bezier(.23, 1, .32, 1);
         }
 
-        .why-toggle:hover { color: var(--cx-text); }
+        .dismiss-btn:active,
+        .daemon-offline button:active,
+        .rating-btn:active,
+        .why-toggle:active { transform: scale(.97); }
+
+        @media (hover: hover) and (pointer: fine) {
+            .dismiss-btn:hover { background: var(--cx-dismiss-bg-hover); }
+            .daemon-offline button:hover { filter: brightness(1.08); }
+            .rating-btn:hover { background: rgba(255, 255, 255, 0.12); }
+            .why-toggle:hover { color: var(--cx-text); }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .cx-spinner {
+                animation: none;
+                opacity: .75;
+                transform: none;
+                transition: opacity 160ms cubic-bezier(.23, 1, .32, 1),
+                    background-color 160ms cubic-bezier(.23, 1, .32, 1);
+            }
+            .dismiss-btn,
+            .daemon-offline button,
+            .rating-btn,
+            .why-toggle { transition-property: background-color, border-color, color, filter; }
+            .dismiss-btn:active,
+            .daemon-offline button:active,
+            .rating-btn:active,
+            .why-toggle:active { transform: none; }
+        }
 
         .why-panel {
             margin-top: 4px;
@@ -780,8 +775,8 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
 <body>
     <div class="state-bar">
         <div class="state-dot" id="cx-state-dot" style="background: ${stateColor};"></div>
-        <span class="state-label" id="cx-state-label">${stateStr}</span>
-        <span class="state-conf" id="cx-state-conf">${confPct}%</span>
+        <span class="state-label" id="cx-state-label">${stateLabel}</span>
+        <span class="state-conf" id="cx-state-conf">${ready ? `Evidence ${confPct}%` : "No estimate"}</span>
     </div>
 
     ${interventionHtml || this._getEmptyStateHtml()}
@@ -799,11 +794,13 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                 const label = document.getElementById('cx-state-label');
                 const dot = document.getElementById('cx-state-dot');
                 const conf = document.getElementById('cx-state-conf');
-                if (label) label.textContent = msg.state;
+                if (label) label.textContent = msg.label || msg.state;
                 if (dot) dot.style.background = msg.color;
                 if (conf) {
                     const pct = Math.round((Number(msg.confidence) || 0) * 100);
-                    conf.textContent = pct + '%';
+                    conf.textContent = msg.status === 'estimated'
+                        ? 'Evidence ' + pct + '%'
+                        : 'No estimate';
                 }
             }
         });
@@ -953,7 +950,6 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             });
         }
 
-        // P0 §3.7: BREAK_RECOMMENDATION pill listener.
         window.addEventListener('message', (event) => {
             const m = event.data || {};
             if (m.type === 'whyDetail') {
@@ -963,28 +959,6 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                 whyOpen = true;
                 if (whyToggle) whyToggle.textContent = 'Hide why';
                 return;
-            }
-            if (m.type === 'breakRecommendation') {
-                const p = m.payload || {};
-                const durationS = Number(p.duration_seconds || 240);
-                const mins = Math.max(1, Math.round(durationS / 60));
-                const pill = document.getElementById('break-recommendation');
-                if (pill) {
-                    pill.style.display = 'flex';
-                    const txt = pill.querySelector('.break-rec-text');
-                    if (txt) txt.textContent = 'Your HRV has been suppressed — take a ' + mins + '-minute break?';
-                    const cta = pill.querySelector('.break-rec-cta');
-                    if (cta) {
-                        cta.textContent = 'Take ' + mins + ' min';
-                        cta.onclick = () => {
-                            vscode.postMessage({
-                                command: 'userRating',
-                                rating: 'thumbs_up',
-                            });
-                            pill.style.display = 'none';
-                        };
-                    }
-                }
             }
         });
 

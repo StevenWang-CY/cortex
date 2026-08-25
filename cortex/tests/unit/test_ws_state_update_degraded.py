@@ -1,4 +1,4 @@
-"""Audit Wave-2 follow-up: STATE_UPDATE WS payload carries F18 envelope.
+"""STATE_UPDATE carries explicit engine source and evidence status.
 
 The F18 fix (audit/findings.md) added ``source`` and ``degraded`` to the
 HTTP ``/state/infer`` response envelope, and the dashboard's advanced tab
@@ -48,10 +48,12 @@ def _fallback_estimate() -> StateEstimate:
     """A synthetic estimate produced when the engines were unavailable —
     mirrors what ``routes.py`` constructs in the F18 fallback branch."""
     return StateEstimate(
-        state="FLOW",
-        confidence=0.5,
-        scores=StateScores(flow=0.5, hypo=0.0, hyper=0.0, recovery=0.0),
-        reasons=["No state engine registered, using default"],
+        state="UNKNOWN",
+        status="insufficient_evidence",
+        confidence=0.0,
+        scores=StateScores(),
+        evidence_coverage=0.0,
+        reasons=["No state engine registered"],
         signal_quality=SignalQuality(
             physio=0.0, kinematics=0.0, telemetry=0.0,
         ),
@@ -62,7 +64,7 @@ def _fallback_estimate() -> StateEstimate:
     )
 
 
-def _low_signal_estimate() -> StateEstimate:
+def _low_evidence_estimate() -> StateEstimate:
     """A REAL classifier estimate (``classifier_source`` populated) but
     produced on a signal whose fused quality fell below the
     acceptability floor (``SignalQuality.overall < 0.3``).
@@ -74,10 +76,12 @@ def _low_signal_estimate() -> StateEstimate:
     signal. overall = 0.4*0.1 + 0.3*0.1 + 0.3*0.1 = 0.10 < 0.3.
     """
     return StateEstimate(
-        state="HYPER",
-        confidence=0.61,
-        scores=StateScores(flow=0.1, hypo=0.1, hyper=0.61, recovery=0.0),
-        reasons=["thrashing"],
+        state="UNKNOWN",
+        status="insufficient_evidence",
+        confidence=0.0,
+        scores=StateScores(flow=0.1, hypo=0.1, hyper=0.2, recovery=0.0),
+        evidence_coverage=0.2,
+        reasons=["not enough evidence"],
         signal_quality=SignalQuality(
             physio=0.1, kinematics=0.1, telemetry=0.1,
         ),
@@ -87,13 +91,13 @@ def _low_signal_estimate() -> StateEstimate:
     )
 
 
-def test_state_update_classifier_payload_marks_source_classifier() -> None:
-    """A normal scorer-derived estimate produces ``source=classifier`` and
+def test_state_update_rule_payload_marks_source_rules() -> None:
+    """A normal scorer-derived estimate produces ``source=rules`` and
     ``degraded=False`` on the WS frame so the dashboard banner stays
     hidden during healthy operation."""
     server = WebSocketServer()
     msg = server._make_state_update(_classifier_estimate())
-    assert msg.payload["source"] == "classifier"
+    assert msg.payload["source"] == "rules"
     assert msg.payload["degraded"] is False
 
 
@@ -107,16 +111,12 @@ def test_state_update_fallback_payload_marks_source_fallback() -> None:
     assert msg.payload["degraded"] is True
 
 
-def test_state_update_low_signal_marks_degraded_despite_classifier() -> None:
-    """Finding #3: a real classifier estimate (``classifier_source`` set)
-    whose fused signal quality fell below the acceptability floor MUST
-    still broadcast ``degraded=True`` / ``source=fallback`` so the
-    dashboard banner fires. The old ``classifier_source is None`` test
-    never caught this because the live smoother always names a source."""
+def test_state_update_low_evidence_marks_degraded_but_keeps_rule_source() -> None:
+    """An executed rule frame can be insufficient without being a fallback."""
     server = WebSocketServer()
-    msg = server._make_state_update(_low_signal_estimate())
+    msg = server._make_state_update(_low_evidence_estimate())
     assert msg.payload["degraded"] is True
-    assert msg.payload["source"] == "fallback"
+    assert msg.payload["source"] == "rules"
     # The debug-overlay field is preserved — the real engine is still
     # named even though the envelope is flagged degraded.
     assert msg.payload["classifier_source"] == "rule"

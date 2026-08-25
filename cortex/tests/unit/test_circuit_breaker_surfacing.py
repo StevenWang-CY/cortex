@@ -119,7 +119,7 @@ def _make_planner(sdk: MagicMock | None = None) -> AnthropicPlanner:
         sdk = MagicMock()
         sdk.messages = MagicMock()
         sdk.messages.create = AsyncMock(return_value=_stub_response())
-    return AnthropicPlanner(cfg, sdk=sdk)
+    return AnthropicPlanner(cfg, sdk=sdk, _allow_unbrokered_test_requests=True)
 
 
 # ---------------------------------------------------------------------------

@@ -53,7 +53,7 @@ class SessionReportGenerator:
         self._hourly_flow: dict[int, float] = defaultdict(float)
         self._hourly_total: dict[int, float] = defaultdict(float)
         # P0 §3.7: per-break audit trail. Populated by the
-        # BiologyBreakController on session end so the recap card can
+        # GuidedBreakController on session end so the recap card can
         # show "+24 HRV recovery during break" without re-reading
         # storage.
         self._break_records: list[BreakRecord] = []

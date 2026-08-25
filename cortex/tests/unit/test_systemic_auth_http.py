@@ -57,9 +57,7 @@ def _feature_vector_payload() -> dict:
 def token_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Redirect the capability-token file into ``tmp_path`` for the test."""
     target = tmp_path / "auth.token"
-    monkeypatch.setattr(
-        "cortex.libs.auth.local_token.auth_token_path", lambda: target
-    )
+    monkeypatch.setattr("cortex.libs.auth.local_token.auth_token_path", lambda: target)
     return target
 
 
@@ -80,7 +78,8 @@ def client(token_file: Path) -> TestClient:
 
 
 def test_state_infer_without_token_returns_401(
-    client: TestClient, auth_token: str,
+    client: TestClient,
+    auth_token: str,
 ) -> None:
     """Case 1: no Authorization header → 401."""
     resp = client.post("/state/infer", json=_feature_vector_payload())
@@ -88,8 +87,38 @@ def test_state_infer_without_token_returns_401(
     assert "Bearer" in resp.headers.get("WWW-Authenticate", "")
 
 
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        ("get", "/storage/status", None),
+        ("post", "/storage/export", {"categories": ["sessions"]}),
+        ("post", "/policy/diagnostics", {}),
+        ("post", "/research/mrt/export", {}),
+        ("post", "/research/mrt/analyze", {}),
+        (
+            "post",
+            "/storage/delete",
+            {
+                "scopes": ["sessions"],
+                "confirmation": "DELETE CORTEX DATA",
+            },
+        ),
+    ],
+)
+def test_storage_operations_require_capability_token(
+    client: TestClient,
+    auth_token: str,
+    method: str,
+    path: str,
+    body: dict[str, object] | None,
+) -> None:
+    response = client.request(method, path, json=body)
+    assert response.status_code == 401
+
+
 def test_state_infer_with_bearer_token_returns_200(
-    client: TestClient, auth_token: str,
+    client: TestClient,
+    auth_token: str,
 ) -> None:
     """Case 2: Authorization: Bearer <token> succeeds."""
     resp = client.post(
@@ -101,7 +130,8 @@ def test_state_infer_with_bearer_token_returns_200(
 
 
 def test_state_infer_with_x_cortex_header_returns_200(
-    client: TestClient, auth_token: str,
+    client: TestClient,
+    auth_token: str,
 ) -> None:
     """Case 3: legacy X-Cortex-Auth-Token header also works.
 
@@ -118,7 +148,8 @@ def test_state_infer_with_x_cortex_header_returns_200(
 
 
 def test_health_always_reachable(
-    client: TestClient, auth_token: str,
+    client: TestClient,
+    auth_token: str,
 ) -> None:
     """Case 4: ``/health`` does not require a token in any configuration.
 
@@ -129,17 +160,26 @@ def test_health_always_reachable(
     # No header.
     assert client.get("/health").status_code == 200
     # Wrong header.
-    assert client.get(
-        "/health", headers={"Authorization": "Bearer not-it"},
-    ).status_code == 200
+    assert (
+        client.get(
+            "/health",
+            headers={"Authorization": "Bearer not-it"},
+        ).status_code
+        == 200
+    )
     # Right header.
-    assert client.get(
-        "/health", headers={"Authorization": f"Bearer {auth_token}"},
-    ).status_code == 200
+    assert (
+        client.get(
+            "/health",
+            headers={"Authorization": f"Bearer {auth_token}"},
+        ).status_code
+        == 200
+    )
 
 
 def test_wrong_token_returns_401(
-    client: TestClient, auth_token: str,
+    client: TestClient,
+    auth_token: str,
 ) -> None:
     """Case 5: a well-formed but non-matching token still 401s.
 
@@ -171,12 +211,10 @@ def test_auth_rejected_event_emitted(
         resp = client.post("/state/infer", json=_feature_vector_payload())
     assert resp.status_code == 401
     rejection_lines = [
-        rec for rec in caplog.records
-        if EventType.AUTH_REJECTED.value in rec.getMessage()
+        rec for rec in caplog.records if EventType.AUTH_REJECTED.value in rec.getMessage()
     ]
     assert rejection_lines, (
-        f"expected AUTH_REJECTED event, saw: "
-        f"{[rec.getMessage() for rec in caplog.records]}"
+        f"expected AUTH_REJECTED event, saw: {[rec.getMessage() for rec in caplog.records]}"
     )
     # The path of the rejected request is in the structured message.
     assert any("/state/infer" in rec.getMessage() for rec in rejection_lines)

@@ -21,6 +21,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from cortex.apps.desktop_shell import mac_native
 from cortex.apps.desktop_shell.tokens import STATE_COLORS as _STATE_HEX
+from cortex.apps.desktop_shell.tokens import STATE_LABELS
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +104,7 @@ class CortexTrayIcon(QSystemTrayIcon):
     def __init__(self, app: QApplication) -> None:
         super().__init__(app)
         self._app = app
-        self._state = "FLOW"
+        self._state = "UNKNOWN"
         self._confidence = 0.0
         self._connected = False
         self._paused = False
@@ -278,7 +279,13 @@ class CortexTrayIcon(QSystemTrayIcon):
     # State / connection updates (public API preserved)
     # ------------------------------------------------------------------
 
-    def update_state(self, state: str, confidence: float) -> None:
+    def update_state(
+        self,
+        state: str,
+        confidence: float,
+        status: str = "estimated",
+        evidence_coverage: float = 1.0,
+    ) -> None:
         self._state = state
         self._confidence = confidence
 
@@ -287,12 +294,21 @@ class CortexTrayIcon(QSystemTrayIcon):
         if self._native_status is not None:
             self._native_status.set_state_tint(color.name())
 
-        tooltip = f"Cortex — {state} ({confidence:.0%})"
+        if status == "warming_up":
+            label = "Still gathering"
+        elif status != "estimated":
+            label = "Not enough evidence"
+        else:
+            label = STATE_LABELS.get(state, state)
+        tooltip = (
+            f"Cortex — {label} · {confidence:.0%} evidence strength · "
+            f"{evidence_coverage:.0%} coverage"
+        )
         if self._paused:
             tooltip += " [Paused]"
         self.setToolTip(tooltip)
 
-        self._state_action.setText(f"State: {state} ({confidence:.0%})")
+        self._state_action.setText(f"Support: {label}")
 
     def set_connected(self, connected: bool) -> None:
         self._connected = connected

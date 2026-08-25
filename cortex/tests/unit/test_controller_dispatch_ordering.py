@@ -1,16 +1,8 @@
-"""Controller ``_on_action_invoked`` ordering test.
+"""Controller exact-action scheduling tests.
 
-The in-process desktop_shell controller schedules dispatch +
-engaged-USER_ACTION + action_executed-log onto the daemon's loop. The
-dispatch must reach the daemon BEFORE engagement (which clears
-``_active_intervention_id`` and would invalidate the dispatch liveness
-gate).
-
-The fix bundles all three into a single coroutine so ordering is
-enforced lexically by ``await``, not by FIFO scheduling of three
-separate ``run_coroutine_threadsafe`` calls. This test asserts the
-ordering by recording the daemon-side calls and verifying
-``dispatch_action_to_browser`` lands first.
+The in-process desktop shell is a user-gesture surface only. Every action is
+submitted once to ``dispatch_intervention_action`` and the controller never
+performs a native capability or emits an optimistic engaged/result record.
 
 Run with:
     ``QT_QPA_PLATFORM=offscreen pytest cortex/tests/unit/test_controller_dispatch_ordering.py``
@@ -53,15 +45,17 @@ def qapp():
 class _RecordingDaemon:
     """Captures the order in which the controller calls daemon methods.
 
-    ``dispatch_action_to_browser`` is an async coroutine on the real
-    daemon; ``_handle_user_action`` is the same. We mirror those
-    signatures so the controller's ``await`` semantics are preserved.
+    ``dispatch_intervention_action`` is an async coroutine on the real daemon.
     """
 
     def __init__(self) -> None:
+        self.workspace_mutation_allowed = True
         self.call_order: list[tuple[str, dict[str, Any]]] = []
 
-    async def dispatch_action_to_browser(
+    async def start_biology_break(self, **_kwargs: Any) -> dict[str, bool]:
+        return {"ok": True}
+
+    async def dispatch_intervention_action(
         self, intervention_id: str, action: dict
     ) -> int:
         # Sleep a beat to expose an ordering bug if one is reintroduced
@@ -112,40 +106,27 @@ def _valid_action() -> dict[str, Any]:
     }
 
 
-def test_dispatch_lands_before_engage_under_real_loop(
+def test_exact_dispatch_is_the_only_effect_under_real_loop(
     controller_with_loop,
 ) -> None:
-    """Even with a deliberate sleep inside dispatch, the engage call
-    must arrive at the daemon AFTER dispatch. The fix's single
-    coroutine wrapper enforces this with ``await``; the prior
-    three-separate-schedule implementation would race here.
-    """
+    """Even with a delayed daemon call, no optimistic side path runs."""
     ctrl = controller_with_loop
     ctrl._on_action_invoked("iv_active", _valid_action())
 
     # Wait for the daemon-side queue to drain.
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
-        if len(ctrl._daemon.call_order) >= 3:
+        if len(ctrl._daemon.call_order) >= 1:
             break
         time.sleep(0.01)
 
     kinds = [k for k, _ in ctrl._daemon.call_order]
-    assert kinds == ["dispatch", "user_action", "user_action"], (
-        f"unexpected call order: {kinds}"
-    )
-
-    engage_payload = ctrl._daemon.call_order[1][1]
-    assert engage_payload.get("action") == "engaged"
-    log_payload = ctrl._daemon.call_order[2][1]
-    assert log_payload.get("action_id") == "act-1"
-    assert log_payload.get("result", {}).get("source") == "desktop_overlay"
+    assert kinds == ["dispatch"]
 
 
-def test_native_action_skips_dispatch(controller_with_loop) -> None:
-    """For ``copy_to_clipboard`` / ``start_timer`` the controller
-    executes natively and must NOT call dispatch — only engage + log.
-    """
+def test_irreversible_suggestion_is_still_only_an_exact_request(
+    controller_with_loop,
+) -> None:
     ctrl = controller_with_loop
     ctrl._on_action_invoked(
         "iv_active",
@@ -159,15 +140,12 @@ def test_native_action_skips_dispatch(controller_with_loop) -> None:
 
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
-        if len(ctrl._daemon.call_order) >= 2:
+        if len(ctrl._daemon.call_order) >= 1:
             break
         time.sleep(0.01)
 
     kinds = [k for k, _ in ctrl._daemon.call_order]
-    assert kinds == ["user_action", "user_action"], (
-        f"unexpected call order (native should skip dispatch): {kinds}"
-    )
-    assert ctrl._daemon.call_order[1][1].get("result", {}).get("native") is True
+    assert kinds == ["dispatch"]
 
 
 def test_no_daemon_loop_returns_silently(qapp) -> None:

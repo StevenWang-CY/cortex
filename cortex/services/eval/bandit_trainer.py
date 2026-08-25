@@ -1,16 +1,10 @@
-"""
-Eval — Offline Bandit Trainer
+"""Retired offline trainer for the pre-v2 contextual-bandit experiment.
 
-Batch training script for the contextual bandit using historical
-session data. Can be run on the V100 GPU for large datasets.
-
-Usage:
-    python -m cortex.services.eval.bandit_trainer --data storage/sessions/ --output storage/models/
-
-For GPU training on a remote server:
-    scp storage/sessions/*.jsonl user@gpu-server:~/cortex_data/
-    ssh user@gpu-server "python -m cortex.services.eval.bandit_trainer --data ~/cortex_data/"
-    scp user@gpu-server:~/cortex_models/bandit_weights.json storage/models/
+The old observational helpfulness files do not contain the assignment,
+availability, propensity, delivery, contamination, and reward-window data
+required for defensible training or evaluation. Every training/evaluation
+entry point therefore fails closed. Loading remains available only so legacy
+records can be inventoried during migration.
 """
 
 from __future__ import annotations
@@ -19,13 +13,20 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from typing import Any
-
-import numpy as np
-
-from cortex.services.eval.bandit import N_ARMS, N_FEATURES, ContextualBandit
+from typing import Any, NoReturn
 
 logger = logging.getLogger(__name__)
+
+
+class RetiredPolicyTrainingError(RuntimeError):
+    """Raised when invalid legacy policy training is requested."""
+
+
+_RETIRED_MESSAGE = (
+    "retired: legacy helpfulness logs lack assignment, availability, propensity, "
+    "delivery, contamination, and outcome-window records; use an immutable, "
+    "separately consented MRT export and the prespecified research-analysis pipeline"
+)
 
 
 def load_training_data(data_dir: str) -> list[dict[str, Any]]:
@@ -50,123 +51,26 @@ def load_training_data(data_dir: str) -> list[dict[str, Any]]:
     return records
 
 
-def train_bandit(records: list[dict[str, Any]], alpha: float = 1.0, epochs: int = 3) -> ContextualBandit:
-    """
-    Train a contextual bandit on historical data.
+def train_bandit(records: list[dict[str, Any]], alpha: float = 1.0, epochs: int = 3) -> NoReturn:
+    """Reject structurally invalid observational policy training."""
 
-    Runs multiple epochs over the data to improve convergence.
-
-    Args:
-        records: List of helpfulness record dicts.
-        alpha: UCB exploration parameter.
-        epochs: Number of passes over the data.
-
-    Returns:
-        Trained ContextualBandit.
-    """
-    bandit = ContextualBandit(n_arms=N_ARMS, n_features=N_FEATURES, alpha=alpha)
-
-    for epoch in range(epochs):
-        np.random.shuffle(records)  # type: ignore[arg-type]
-        total_reward = 0.0
-        count = 0
-
-        for record in records:
-            features = record.get("context_features", [])
-            arm_idx = record.get("arm_index", 0)
-            reward = record.get("reward_signal", 0.0)
-
-            if len(features) != N_FEATURES:
-                continue
-
-            context = np.array(features, dtype=np.float64)
-            bandit.update(context, arm_idx, reward)
-            total_reward += reward
-            count += 1
-
-        if count > 0:
-            logger.info(
-                "Epoch %d/%d: %d records, mean reward = %.3f",
-                epoch + 1, epochs, count, total_reward / count,
-            )
-
-    return bandit
+    del records, alpha, epochs
+    raise RetiredPolicyTrainingError(_RETIRED_MESSAGE)
 
 
-def evaluate_bandit(bandit: ContextualBandit, records: list[dict[str, Any]]) -> dict[str, Any]:
-    """Evaluate the trained bandit on held-out data."""
-    correct = 0
-    total = 0
-    cumulative_reward = 0.0
+def evaluate_bandit(bandit: object, records: list[dict[str, Any]]) -> NoReturn:
+    """Reject invalid evaluation of a policy trained from legacy logs."""
 
-    for record in records:
-        features = record.get("context_features", [])
-        reward = record.get("reward_signal", 0.0)
-
-        if len(features) != N_FEATURES:
-            continue
-
-        context = np.array(features, dtype=np.float64)
-        bandit.select_arm(context)
-
-        # Check if bandit would have selected a positive-reward arm
-        if reward > 0:
-            correct += 1
-        cumulative_reward += reward
-        total += 1
-
-    return {
-        "total": total,
-        "mean_reward": cumulative_reward / total if total > 0 else 0.0,
-        "arm_stats": bandit.get_arm_stats(),
-    }
+    del bandit, records
+    raise RetiredPolicyTrainingError(_RETIRED_MESSAGE)
 
 
 def main() -> None:
-    """CLI entry point for offline bandit training."""
-    parser = argparse.ArgumentParser(description="Train contextual bandit offline")
-    parser.add_argument("--data", required=True, help="Directory with JSONL session files")
-    parser.add_argument("--output", default="storage/models/", help="Output directory for weights")
-    parser.add_argument("--alpha", type=float, default=1.0, help="UCB exploration parameter")
-    parser.add_argument("--epochs", type=int, default=3, help="Training epochs")
-    args = parser.parse_args()
+    """Refuse to train on structurally invalid legacy observational logs."""
 
-    logging.basicConfig(level=logging.INFO)
-
-    # Load data
-    records = load_training_data(args.data)
-    if not records:
-        logger.warning("No helpfulness records found. Exiting.")
-        return
-
-    # Split train/eval (80/20)
-    split = int(len(records) * 0.8)
-    train_records = records[:split]
-    eval_records = records[split:]
-
-    # Train
-    bandit = train_bandit(train_records, alpha=args.alpha, epochs=args.epochs)
-
-    # Evaluate
-    if eval_records:
-        eval_results = evaluate_bandit(bandit, eval_records)
-        logger.info(
-            "Evaluation (%d records): mean reward = %.3f",
-            len(eval_records),
-            eval_results["mean_reward"],
-        )
-        for stat in eval_results["arm_stats"]:
-            logger.info(
-                "  %s: theta_norm=%.3f", stat["arm"], stat["theta_norm"],
-            )
-
-    # Save weights
-    output_dir = Path(args.output)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    weights_path = output_dir / "bandit_weights.json"
-    with weights_path.open("w", encoding="utf-8") as f:
-        json.dump(bandit._to_dict(), f, indent=2)
-    logger.info("Weights saved to %s", weights_path)
+    parser = argparse.ArgumentParser(description="Retired Cortex bandit trainer")
+    parser.parse_args()
+    parser.error(_RETIRED_MESSAGE)
 
 
 if __name__ == "__main__":

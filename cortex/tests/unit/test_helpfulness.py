@@ -122,6 +122,15 @@ class TestLifecycle:
         result = _run(tracker.end_tracking("nonexistent", "FLOW", 0.9))
         assert result is None
 
+    def test_cancel_discards_an_undelivered_proposal_without_reward(self, tracker):
+        tracker.start_tracking("not-delivered", "overlay_only", "HYPER", 0.9)
+        assert tracker.cancel_tracking("not-delivered") is True
+        assert tracker.cancel_tracking("not-delivered") is False
+        assert _run(
+            tracker.end_tracking("not-delivered", "FLOW", 0.95)
+        ) is None
+        assert _run(tracker.get_summary())["total_tracked"] == 0
+
     def test_double_end_returns_none_second_time(self, tracker):
         tracker.start_tracking("id2", "overlay_only", "HYPER", 0.85)
         first = _run(tracker.end_tracking("id2", "FLOW", 0.9))

@@ -1,6 +1,4 @@
-"""
-Eval — Policy replay utility for AMIP WAL logs.
-"""
+"""Read-only summary utility for historical, pre-v2 adaptive-policy logs."""
 
 from __future__ import annotations
 
@@ -8,18 +6,33 @@ import json
 from pathlib import Path
 from typing import Any
 
-from cortex.services.eval.amip import ARMS
+LEGACY_AMIP_ARMS = (
+    "no_action",
+    "workspace_simplify",
+    "task_decompose",
+    "breath_box",
+    "nature_break",
+    "flow_shield",
+    "defusion_prompt",
+    "circuit_breaker",
+)
 
 
-def replay_policy_log(storage_root: str, day: str) -> dict[str, Any]:
+def replay_legacy_policy_log(storage_root: str, day: str) -> dict[str, Any]:
     """
     Replay one daily policy log and return deterministic summary stats.
     """
     path = Path(storage_root) / "policy_log" / f"{day}.jsonl"
     if not path.exists():
-        return {"day": day, "decisions": 0, "rewards": 0, "by_arm": dict.fromkeys(ARMS, 0)}
+        return {
+            "day": day,
+            "decisions": 0,
+            "rewards": 0,
+            "by_arm": dict.fromkeys(LEGACY_AMIP_ARMS, 0),
+            "evidence_class": "legacy_diagnostic_only",
+        }
 
-    by_arm = dict.fromkeys(ARMS, 0)
+    by_arm = dict.fromkeys(LEGACY_AMIP_ARMS, 0)
     reward_total = 0.0
     reward_count = 0
     decisions = 0
@@ -45,4 +58,13 @@ def replay_policy_log(storage_root: str, day: str) -> dict[str, Any]:
         "rewards": reward_count,
         "mean_reward": (reward_total / reward_count) if reward_count > 0 else 0.0,
         "by_arm": by_arm,
+        "evidence_class": "legacy_diagnostic_only",
     }
+
+
+# Compatibility name for callers that consumed the original diagnostic. The
+# function does not recreate, train, or evaluate the retired policy.
+replay_policy_log = replay_legacy_policy_log
+
+
+__all__ = ["LEGACY_AMIP_ARMS", "replay_legacy_policy_log", "replay_policy_log"]

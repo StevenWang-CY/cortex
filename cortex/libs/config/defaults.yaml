@@ -6,6 +6,17 @@ llm:
   # AsyncAnthropic (direct) and AsyncAnthropicVertex are escape hatches
   # selected by ANTHROPIC_PROVIDER / config.llm.provider.
   provider: bedrock
+  # Safe by default: local deterministic planning, with no model network call.
+  # External planning additionally requires the current disclosure revision
+  # and a one-time, user-confirmed payload preview for every request.
+  privacy:
+    planner_mode: no_llm
+    external_context_enabled: false
+    consent_revision: ""
+    required_consent_revision: context-disclosure-v1
+    preview_ttl_seconds: 60
+    max_pending_previews: 16
+    provider_retention_mode: unverified
   bedrock:
     aws_region: us-east-2
     keychain_service: cortex.bedrock
@@ -17,7 +28,7 @@ llm:
   max_tokens: 1024
   temperature: 0.3
   timeout_seconds: 30.0
-  cache_ttl_seconds: 300
+  cache_ttl_seconds: 60
   fallback_mode: rule_based
   max_concurrent_requests: 3
   circuit_failure_threshold: 5
@@ -31,12 +42,20 @@ capture:
   height: 480
   min_brightness: 50
   max_jitter_px: 5.0
+  max_motion_face_widths_per_second: 0.75
   face_lost_tolerance_frames: 5
+  face_lost_tolerance_seconds: null
+  observation_buffer_seconds: 30.0
+  observation_buffer_max_items: 3600
 
 state:
   # Hysteresis thresholds
   entry_threshold: 0.85
   exit_threshold: 0.70
+  estimate_entry_threshold: 0.40
+  estimate_exit_threshold: 0.25
+  # Set to safety_null for an operational fail-closed rollback.
+  inference_mode: deterministic
 
   # Dwell times (seconds before state transition)
   hyper_dwell_seconds: 30
@@ -45,10 +64,6 @@ state:
 
   # Exponential moving average alpha for smoothing
   ema_alpha: 0.3
-  ml_enabled: false
-  ml_min_labeled_episodes: 30
-  ml_alpha_max: 0.7
-  ml_alpha_full_at_episodes: 150
 
   # Overwhelm score weights (should sum to 1.0)
   weights:
@@ -61,6 +76,11 @@ state:
     workspace_complexity: 0.15
 
 intervention:
+  # Safety boundary: proposals are presentation-only until an exact
+  # authorization transaction is available. Existing configs missing this
+  # key inherit the same least-authority default from InterventionConfig.
+  execution_mode: suggest_only
+
   # Confidence thresholds for intervention levels
   overlay_threshold: 0.70
   simplified_threshold: 0.85
@@ -91,9 +111,13 @@ intervention:
   dismissal_model_enabled: true
   dismissal_model_threshold: 0.6
 
-  # P0 §3.7 — Biology-driven break. When true, StressIntegralTracker
-  # transitions emit BREAK_RECOMMENDATION and promote take_biology_break.
-  enable_biology_break: true
+  # Opt-in, preference-based reminder. Active time pauses while input is idle;
+  # camera, pulse, HRV, and support labels are never inputs to this policy.
+  enable_focus_break_reminders: false
+  focus_break_interval_minutes: 50
+  focus_break_duration_seconds: 300
+  focus_break_inactivity_pause_seconds: 60.0
+  guided_break_audio_mute_after_mic_seconds: 300.0
 
   # P0 §3.10 — Auto-armed distraction blocking on sustained HYPER.
   # Defaults OFF (principle of least surprise; users opt in from Settings).
@@ -113,7 +137,6 @@ api:
 
 telemetry:
   mouse_sample_hz: 60
-  downsample_hz: 10
   window_seconds: 15
 
 signal:
@@ -121,21 +144,28 @@ signal:
     window_seconds: 10
     stride_seconds: 1
     backend: pos
-    model_path: cortex/models/tscan.onnx
+    backend_expected_sha256: null
+    dynamic_backend_selection: false
     bandpass_low: 0.7
     bandpass_high: 3.5
     bandpass_order: 4
-    welch_resolution: 0.1
     nsqi_threshold: 0.293
     min_cardiac_snr_db: 2.0
-    min_resp_snr_db: 1.5
-    max_face_loss_ratio: 0.20
     max_head_jitter_deg: 7.5
-    hrv_min_window_seconds: 60
-    hrv_min_valid_ibi: 30
+    min_valid_coverage: 0.80
+    max_interpolation_gap_ms: 250.0
+    max_motion_rejected_fraction: 0.10
+    hrv_min_window_seconds: 180
+    hrv_min_valid_ibi: 120
+    experimental_hrv_enabled: false
+    respiration_window_seconds: 45
+    respiration_low_hz: 0.08
+    respiration_high_hz: 0.50
+    respiration_min_channel_quality: 0.35
+    respiration_max_channel_disagreement_bpm: 3.0
+    experimental_respiration_enabled: false
     # Sampling-rate correctness (B1): derive fps from real frame
     # timestamps instead of trusting the configured rate.
-    use_measured_fps: true
     fps_clamp_min: 10.0
     fps_clamp_max: 60.0
     # Temporal stabilizer (B2): Schmitt-trigger + last-valid hold + BPM
@@ -151,13 +181,17 @@ signal:
   blink:
     ear_threshold: 0.21
     ear_recovery: 0.25
-    min_frames: 3
-    perclos_threshold: 0.2
-    personalize_ear_percentile: 0.15
+    min_closed_ms: 80.0
+    max_closed_ms: 1000.0
+    min_valid_exposure_seconds: 15.0
+    history_window_seconds: 60.0
+    max_valid_gap_ms: 250.0
 
   posture:
-    shoulder_drop_threshold: 0.15
-    forward_lean_threshold: 20.0  # degrees
+    head_neck_flexion_threshold_deg: 20.0
+    head_neck_sustain_seconds: 30.0
+    face_scale_change_tolerance: 0.25
+    max_valid_gap_ms: 250.0
 
 # MediaPipe FaceMesh landmark indices for ROI extraction
 landmarks:
@@ -166,10 +200,13 @@ landmarks:
   right_cheek: [280, 330, 345, 346, 347, 348, 349, 350]
   left_eye: [33, 160, 158, 133, 153, 144]
   right_eye: [362, 385, 387, 263, 373, 380]
-  shoulders: [11, 12]  # MediaPipe Pose landmarks
 
 storage:
   path: ./storage
+  sqlite_filename: cortex.sqlite3
+  sqlite_busy_timeout_ms: 5000
+  backup_retention_count: 3
+  analytics_queue_capacity: 256
   session_retention_days: 7
   feature_retention_days: 7
   error_retention_days: 90
@@ -187,16 +224,37 @@ logging:
   include_timestamp: true
 
 eval:
-  policy: amip
-  amip:
-    enabled: true
-    tau0: 1.0
-    tau_min: 0.1
-    epsilon_explore: 0.05
-    epsilon_explore_after_500: 0.01
-    safety_floor_stress_ratio: 1.0
+  policy: deterministic
+  decision_interval_seconds: 60
+  production:
+    preferred_low_friction_arm: null
+  outcome:
     reward_window_seconds: 300
-  causal_report:
+    reward_version: helpfulness-v2
+    collector_interval_seconds: 5.0
+  research:
+    enabled: false
+    study_id: ""
+    study_epoch: ""
+    consent_version: ""
+    seed_hex: ""
+    action_catalog: [no_action, suggest_only]
+    minimum_probability: 0.1
+    bootstrap_samples: 1000
+    analysis_seed: 0
+    eligibility_rule: >-
+      Eligible when the reviewed deterministic trigger gate passes and both MRT arms
+      remain safe and feasible.
+    availability_rule: >-
+      Available when the receptivity gate passes, no repeated-dismissal suppression
+      is active, and no other safety exclusion applies.
+    missing_outcome_rule: >-
+      Retain the decision point, mark the proximal outcome censored, and exclude it
+      from the complete-case primary analysis.
+    contamination_rule: >-
+      Retain the decision point, record every overlapping delivery, and exclude a
+      contaminated proximal window from the primary analysis.
+    online_learning: false
+  policy_diagnostics:
     enabled: true
-    bootstrap_samples: 300
     nightly_hour_local: 2

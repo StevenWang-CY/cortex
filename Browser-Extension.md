@@ -1,163 +1,69 @@
-# Browser Extension
+# Chrome and Edge extension
 
-The Cortex browser extension runs in Chrome and Edge (Manifest V3, built with Plasmo/React). It handles daemon launch/stop, displays the intervention overlay, provides ambient somatic feedback, tracks activity, and shows the Pulse Room new tab.
+The Plasmo/React Manifest V3 extension is an authenticated, untrusted client of
+the local Cortex daemon. It provides connection controls, proposal UI, focus
+sessions, bounded activity/resume metadata, learning-site helpers, and optional
+active-page context.
 
----
+## Authority boundary
 
-## Installation
+Receiving an intervention or break message renders information only. It does
+not close/group/hide tabs, block a site, or change a page. An optional browser
+effect runs only after the daemon sends an exact, unexpired authorization for
+the displayed manifest. The capability executor validates target, digest,
+nonce, mode, and idempotency, then returns a typed receipt for verification and
+restore.
 
-### Build
+Production policy is deterministic. The extension does not run a contextual
+bandit, infer biology-driven breaks, or autonomously restructure tabs.
+
+## Privacy
+
+- Static content scripts are limited to declared learning sites.
+- Incognito exits before initialization and background rejects incognito
+  senders.
+- Activity records contain sanitized bounded metadata, not page excerpts or
+  source code, and are capped at 200.
+- Optional page context requires both Cortex consent for the exact origin and
+  browser host permission. Revocation clears current content and attempts to
+  remove optional permission.
+- URL userinfo, fragments, tracking/secret-like query parameters, and
+  credentials are removed before storage.
+
+## Install from source
 
 ```bash
 cd cortex/apps/browser_extension
-pnpm install
-
-# Chrome
-npx plasmo build
-
-# Edge
-npx plasmo build --target=edge-mv3
-
-# Development with hot reload
-pnpm dev
+pnpm install --frozen-lockfile
+pnpm exec plasmo build
+pnpm exec plasmo build --target=edge-mv3
 ```
 
-### Load in Browser
+Load `build/chrome-mv3-prod` or `build/edge-mv3-prod` from the browser's
+extensions page in Developer mode.
 
-**Chrome:** `chrome://extensions` → Enable Developer mode → Load unpacked → `build/chrome-mv3-prod/`
-
-**Edge:** `edge://extensions` → Enable Developer mode → Load unpacked → `build/edge-mv3-prod/`
-
----
-
-## Native Messaging Setup
-
-> **DMG users:** If you installed Cortex via the desktop app (DMG), native messaging is auto-installed when you click the **Connect Chrome/Edge** button in the app. No terminal command needed -- just restart your browser after connecting.
-
-Native messaging lets the extension start and stop the daemon without using the terminal.
+Install the native host once from the repository environment:
 
 ```bash
-# From the repo root (developer setup only)
-python -m cortex.scripts.install_native_host
+uv run --project cortex --locked python -m cortex.scripts.install_native_host
 ```
 
-Then **fully restart your browser** (Cmd+Q, reopen). Reloading the extension is not enough — Chrome only reads native messaging manifests at startup.
+Then fully quit Chrome/Edge with Cmd+Q and reopen it. Reloading the extension
+or closing tabs is insufficient after a native-host manifest change. The
+installer uses an absolute interpreter in the installed host copy and includes
+detected extension origins; the tracked source shebang remains portable.
 
-First use: macOS will ask *"Chrome/Edge wants to control Terminal. Allow?"* — click **Allow** once.
+## Development gates
 
----
+```bash
+pnpm exec tsc --noEmit
+pnpm test
+pnpm exec plasmo build
+pnpm exec plasmo build --target=edge-mv3
+```
 
-## Popup
-
-Click the Cortex icon in the browser toolbar.
-
-| Button | Action |
-|--------|--------|
-| **Start Cortex** | Launches daemon via Terminal.app (required for camera TCC access) |
-| **Stop Cortex** | Sends multi-layer kill chain: WebSocket → HTTP → process kill |
-| **Restart Camera** | Stops and restarts the daemon (useful after turning off iPhone) |
-
-The popup shows current cognitive state, signal quality, and camera status when the daemon is running.
-
----
-
-## Intervention Overlay
-
-When Cortex detects HYPER, the intervention overlay appears in the bottom-right of your active tab:
-
-- **Headline** — ≤15-word focus instruction from the LLM
-- **Situation summary** — why it triggered, referencing observable behavior
-- **Micro-steps** — 1-3 concrete actions
-- **Tab recommendations** — keep/close/group suggestions per open tab
-- **Error analysis** — root cause and suggested fix when errors are detected
-
-Overlay controls:
-- **Execute actions** — apply suggested tab changes with one click (preview mode shows what will change before confirming)
-- **Dismiss** — restore workspace to pre-intervention state
-- **Snooze** — quiet mode for 15/30/60 minutes
-- **Rate** — thumbs up/down to teach the bandit what helps you
-
----
-
-## Pulse Room (New Tab)
-
-The new tab page is the Pulse Room — a bio-responsive ambient environment:
-
-- **Ambient particles** — count and speed respond to rPPG pulse rate
-- **Color vignette** — sub-threshold color shift based on cognitive state (invisible during FLOW, warm during HYPER)
-- **Flow shield** — fades distraction elements during sustained focus sessions
-- **Resume cards** — one-click cards to return to interrupted learning sessions (YouTube, Coursera, LeetCode, etc.)
-
----
-
-## Focus Sessions
-
-Start a focus session from the popup or new tab:
-
-- Distraction blocking — auto-close tabs matching distraction patterns
-- Session timer with biology-driven extension (the session extends while you're in FLOW)
-- End-of-session summary showing sustained focus time and interventions received
-
----
-
-## LeetCode Observer
-
-When a LeetCode problem tab is active, the extension injects a DOM observer that:
-
-- Detects current problem-solving stage (READ / PLAN / IMPLEMENT / DEBUG / REFLECT)
-- Shows stage-appropriate hints from the pattern ladder
-- Detects panic-coding patterns and activates the amygdala hijack lockout
-- Guards against low-quality submissions (no test coverage, rapid re-submit)
-
----
-
-## Activity Tracking
-
-The extension tracks learning progress across:
-
-| Platform | What's tracked |
-|----------|---------------|
-| YouTube / Bilibili | Video timestamp, title, channel |
-| Coursera | Module, lesson, completion % |
-| LeetCode | Problem name, attempt count, accepted/rejected |
-| PDFs | Scroll position, page estimate |
-| Jupyter Notebooks | Cell index |
-| GitHub | Repo + file |
-
-Resume cards appear on return to previously-visited content.
-
----
-
-## Permissions
-
-| Permission | Purpose |
-|------------|---------|
-| `activeTab` | Read current tab URL and title |
-| `scripting` | Inject overlay and content scripts |
-| `tabs` | Read all open tabs for context building |
-| `tabGroups` | Create and manage tab groups |
-| `storage` | Save settings and activity state |
-| `alarms` | Schedule focus session timers |
-| `bookmarks` | Bookmark-and-close action |
-| `webNavigation` | Detect tab navigation for activity tracker |
-| `nativeMessaging` | Communicate with the Python daemon launcher |
-| `<all_urls>` | Inject overlay on any page |
-
----
-
-## WebSocket Connection
-
-The extension connects to the daemon WebSocket at `ws://127.0.0.1:9473`. The very first frame on every connection is `AUTH`, carrying the capability token the native host reads from `~/Library/Application Support/Cortex/auth.token`; the extension only sends `IDENTIFY` and other frames once it receives `AUTH_OK`. A pre-`AUTH` frame causes the server to close the socket with WebSocket close code 1011.
-
-After the handshake the extension:
-
-- Receives `STATE_UPDATE` every 500ms (updates popup state indicator)
-- Receives `INTERVENTION_TRIGGER` (shows overlay)
-- Receives the LeetCode adapter cues (`LEETCODE_SHOW_*`, `LEETCODE_AI_*`) when a LeetCode problem tab is active
-- Sends `USER_ACTION` / `ACTION_EXECUTE` / `USER_RATING` when the user interacts with the overlay
-- Sends `ACTIVITY_SYNC` when learning progress changes
-- Sends `CONTEXT_RESPONSE` with tab data in reply to `CONTEXT_REQUEST`
-
-The extension implements exponential backoff reconnection if the daemon is not running, replaying the `AUTH` → `IDENTIFY` handshake on every reconnect.
-
-All wire-level types the extension consumes are generated from the Pydantic schemas in `cortex/libs/schemas/` into `cortex/apps/browser_extension/types/generated/cortex_schemas.d.ts`; never hand-edit that file. See [API Reference](API-Reference) for the full message catalog.
+Never edit `.plasmo/`; it is generated. New capabilities must add required
+manifest permissions, generated wire schemas, producer/consumer tests,
+authorization/receipt behavior if mutating, and reduced-motion/keyboard/focus
+coverage. See [UI design](cortex/docs/ui-design.md) and
+[privacy](cortex/docs/privacy.md).

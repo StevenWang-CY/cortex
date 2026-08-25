@@ -577,6 +577,13 @@ class TestFeatureAggregatorPipeline:
         features = aggregator.build_features(current_time=t_end)
 
         assert features.window_switch_rate > 0.0
+        assert features.window_focus_source_available is True
+
+        first_score = aggregator.thrashing_score
+        aggregator.build_features(current_time=t_end)
+        assert aggregator.thrashing_score == first_score, (
+            "re-reading a sliding window must not duplicate focus transitions"
+        )
 
     def test_build_features_with_tab_count(self):
         """build_features should include tab count from provider."""
@@ -609,6 +616,7 @@ class TestFeatureAggregatorPipeline:
         assert features.keystroke_interval_variance == 0.0
         assert features.backspace_density == 0.0
         assert features.window_switch_rate == 0.0
+        assert features.window_focus_source_available is False
 
     def test_features_all_valid_ranges(self):
         """All feature values should be in their valid ranges."""

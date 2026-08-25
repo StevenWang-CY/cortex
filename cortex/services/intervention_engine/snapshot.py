@@ -7,8 +7,7 @@ everything can be restored after the intervention ends.
 
 from __future__ import annotations
 
-import time
-
+from cortex.application.clock import SYSTEM_CLOCK, Clock
 from cortex.libs.schemas.context import BrowserContext, EditorContext, TaskContext
 from cortex.libs.schemas.intervention import (
     FoldState,
@@ -23,6 +22,7 @@ def capture_snapshot(
     intervention_id: str | None = None,
     *,
     timestamp: float | None = None,
+    clock: Clock | None = None,
 ) -> WorkspaceSnapshot:
     """
     Capture a snapshot of the current workspace state.
@@ -37,8 +37,15 @@ def capture_snapshot(
     """
     if intervention_id is None:
         intervention_id = generate_intervention_id()
+    active_clock = clock or SYSTEM_CLOCK
+    observed_at_unix_ms: int | None = None
+    observed_at_mono_ns: int | None = None
+    boot_id = None
     if timestamp is None:
-        timestamp = time.monotonic()
+        observed_at_unix_ms = active_clock.unix_ms()
+        observed_at_mono_ns = active_clock.monotonic_ns()
+        boot_id = active_clock.boot_id
+        timestamp = observed_at_mono_ns / 1_000_000_000.0
 
     fold_states: list[FoldState] = []
     editor_visible_range: tuple[int, int] | None = None
@@ -67,6 +74,9 @@ def capture_snapshot(
     return WorkspaceSnapshot(
         intervention_id=intervention_id,
         timestamp=timestamp,
+        observed_at_unix_ms=observed_at_unix_ms,
+        observed_at_mono_ns=observed_at_mono_ns,
+        boot_id=boot_id,
         fold_states=fold_states,
         editor_visible_range=editor_visible_range,
         tab_visibility=tab_visibility,

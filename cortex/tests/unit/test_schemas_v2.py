@@ -74,12 +74,12 @@ class TestFeatureVector:
 
 class TestStateSchemas:
     def test_all_states(self):
-        """UserState exposes exactly the four states consumed by the
-        StateEstimate/StateTransition Literals. HYPO_APNEA was removed as
-        dead enum drift — it was never produced by the scorer and was
-        excluded from every Literal in the schema.
+        """UserState includes an explicit fail-closed UNKNOWN state.
+
+        HYPO_APNEA remains removed as dead enum drift; UNKNOWN represents
+        warm-up or insufficient evidence and is never an inferred condition.
         """
-        expected = {"FLOW", "HYPO", "HYPER", "RECOVERY"}
+        expected = {"UNKNOWN", "FLOW", "HYPO", "HYPER", "RECOVERY"}
         actual = {s.value for s in UserState}
         assert expected == actual
 

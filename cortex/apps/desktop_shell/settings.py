@@ -21,7 +21,7 @@ import logging
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QMutex, QSettings, Qt, QTimer, Signal
+from PySide6.QtCore import QMutex, QSettings, Qt, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -45,9 +45,12 @@ from cortex.apps.desktop_shell.a11y import (
     set_accessible_name,
 )
 from cortex.apps.desktop_shell.components import install_elide, wrap_capped
+from cortex.apps.desktop_shell.context_privacy_dialog import ContextPrivacyDialog
 from cortex.apps.desktop_shell.tokens import (
     BRAND_ACCENT,
     BRAND_ACCENT_HOVER,
+    BRAND_ACCENT_PRESSED,
+    BRAND_ACCENT_TEXT,
     BRAND_DISPLAY_FONT,
     CX_TEXT_SECONDARY,
     CX_TEXT_TERTIARY,
@@ -166,18 +169,23 @@ _SECTION_HEADING_QSS = (
 )
 
 
-def _baseline_default_path() -> Path:
-    """Return the path to `storage/baselines/default.json`.
+def _active_calibration_measured_at() -> float | None:
+    """Return the canonical active profile's measurement time in seconds."""
 
-    Lazy-imported config so the settings dialog stays importable even
-    when the config layer is mocked out by the test harness.
-    """
     try:
         from cortex.libs.config.settings import get_config
+        from cortex.services.capture_service.calibration_store import (
+            CalibrationProfileStore,
+        )
 
-        return Path(get_config().storage.path) / "baselines" / "default.json"
+        config = get_config()
+        profile = CalibrationProfileStore(config.storage.path).load_active()
+        if profile is None:
+            return None
+        return profile.created_at_unix_ms / 1000.0
     except Exception:
-        return Path("storage") / "baselines" / "default.json"
+        logger.debug("active calibration metadata unavailable", exc_info=True)
+        return None
 
 
 def _format_relative_time(mtime: float, now: float | None = None) -> str:
@@ -205,17 +213,15 @@ def _format_relative_time(mtime: float, now: float | None = None) -> str:
 def _format_baseline_freshness_label(path: Path | None = None) -> str:
     """Label text used by the Sensing section's recalibrate row.
 
-    Returns "Last calibrated: <relative time>" when a baseline file is
-    present, or a softer prompt to calibrate when it isn't.
+    The optional path remains only for compatibility with older callers; the
+    immutable active profile is authoritative rather than a compatibility
+    file's modification time.
     """
-    target = path or _baseline_default_path()
-    try:
-        if not target.exists():
-            return "Last calibrated: never · calibrate for personal baselines"
-        mtime = target.stat().st_mtime
-        return f"Last calibrated: {_format_relative_time(mtime)}"
-    except OSError:
-        return "Last calibrated: unknown"
+    del path
+    measured_at = _active_calibration_measured_at()
+    if measured_at is None:
+        return "No measured profile active · calibrate when ready"
+    return f"Measured profile: {_format_relative_time(measured_at)}"
 
 
 class SettingsDialog(QWidget):
@@ -251,6 +257,14 @@ class SettingsDialog(QWidget):
     # palette in the dropdown. Payload is the palette name
     # ("default" / "deuteranopia" / "protanopia" / "tritanopia").
     palette_changed = Signal(str)
+    # WP-9: one shared authenticated loopback controller serves both desktop
+    # launch modes.  These signals carry only source booleans, an optional
+    # user-authored note, or an opaque one-time preview handle — never raw
+    # workspace context.
+    context_privacy_status_requested = Signal()
+    context_preview_requested = Signal(dict)
+    context_preview_confirm_requested = Signal(str, str)
+    context_preview_cancel_requested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -274,6 +288,8 @@ class SettingsDialog(QWidget):
         # P1-14: timestamp guard so a burst of apply failures does not spam
         # the user with QMessageBox dialogs. At most one dialog per second.
         self._last_error_dialog_ts: float = 0.0
+        self._privacy_dialog: ContextPrivacyDialog | None = None
+        self._saved_context_sources: dict[str, bool] = {}
         self._build_ui()
         self._load_persisted_settings()
 
@@ -409,7 +425,7 @@ class SettingsDialog(QWidget):
         recal_row.addWidget(self._baseline_freshness_label)
         recal_row.addStretch()
 
-        self._recalibrate_btn = QPushButton("Recalibrate baselines")
+        self._recalibrate_btn = QPushButton("Recalibrate profile")
         self._recalibrate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._recalibrate_btn.setMinimumHeight(28)
         self._recalibrate_btn.setFont(
@@ -420,15 +436,16 @@ class SettingsDialog(QWidget):
             "  padding: 4px 14px;"
             f"  border-radius: {RADIUS_BUTTON}px;"
             f"  background: {BRAND_ACCENT};"
-            "  color: #FFF; border: none;"
+            f"  color: {_LABEL}; border: none;"
             "}"
-            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
+            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
+            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
         )
         self._recalibrate_btn.clicked.connect(self.recalibrate_requested.emit)
-        set_accessible_name(self._recalibrate_btn, "Recalibrate baselines")
+        set_accessible_name(self._recalibrate_btn, "Recalibrate measured profile")
         set_accessible_description(
             self._recalibrate_btn,
-            "Re-run the 2-minute calibration capture to refresh your personal baselines.",
+            "Run the guided quality, rest, and representative-work protocol; review evidence before replacing the active profile.",
         )
         recal_row.addWidget(self._recalibrate_btn)
         sensing_inner.addLayout(recal_row)
@@ -461,7 +478,7 @@ class SettingsDialog(QWidget):
         self._sensitivity_label = QLabel("3")
         self._sensitivity_label.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
         self._sensitivity_label.setStyleSheet(
-            f"color: {BRAND_ACCENT}; min-width: 20px; background: transparent;"
+            f"color: {BRAND_ACCENT_TEXT}; min-width: 20px; background: transparent;"
         )
         self._sensitivity_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sens_row.addWidget(self._sensitivity_label)
@@ -540,16 +557,17 @@ class SettingsDialog(QWidget):
         fp_inner.setSpacing(SP3)
 
         self._auto_distraction_block = QCheckBox(
-            "Auto-arm focus session when overwhelmed",
+            "Auto-arm a focus session when support may help",
         )
         self._auto_distraction_block.setChecked(False)
         self._auto_distraction_block.setStyleSheet(_CHECKBOX_QSS)
         fp_inner.addWidget(self._auto_distraction_block)
 
         fp_help = QLabel(
-            "When Cortex detects sustained overwhelm (HYPER state), "
-            "block known-distracting sites for a focus session. You "
-            "can disarm at any time."
+            "When sustained behavior-only evidence reaches your support "
+            "threshold, block known-distracting sites for a focus session. "
+            "Camera and biometric signals are not used. You can disarm at "
+            "any time."
         )
         fp_help.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         fp_help.setStyleSheet(
@@ -654,6 +672,7 @@ class SettingsDialog(QWidget):
         ])
         self._llm_backend.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         self._llm_backend.setStyleSheet(_COMBO_QSS)
+        self._llm_backend.currentIndexChanged.connect(self._on_llm_backend_changed)
         llm_inner.addWidget(self._llm_backend)
 
         # P0 §3.19: provider status pill + "Test connection" button.
@@ -695,6 +714,83 @@ class SettingsDialog(QWidget):
         self._test_provider_btn.clicked.connect(self._on_test_provider_clicked)
         provider_row.addWidget(self._test_provider_btn)
         llm_inner.addLayout(provider_row)
+
+        llm_divider = QFrame()
+        llm_divider.setFixedHeight(1)
+        llm_divider.setStyleSheet(f"background: {_SEPARATOR};")
+        llm_inner.addWidget(llm_divider)
+
+        planner_label = QLabel("Planning privacy")
+        planner_label.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
+        planner_label.setStyleSheet(
+            f"color: {_LABEL_SECONDARY}; background: transparent;"
+        )
+        llm_inner.addWidget(planner_label)
+
+        self._llm_privacy_mode = QComboBox()
+        self._llm_privacy_mode.addItems(
+            [
+                "Local planner — no network",
+                "Generic planner — no workspace content",
+                "External model — preview every request",
+            ]
+        )
+        self._llm_privacy_mode.setFont(
+            mac_native.system_font(FS_FOOTNOTE, "regular")
+        )
+        self._llm_privacy_mode.setStyleSheet(_COMBO_QSS)
+        self._llm_privacy_mode.currentIndexChanged.connect(
+            self._on_llm_privacy_mode_changed
+        )
+        llm_inner.addWidget(self._llm_privacy_mode)
+
+        self._llm_privacy_help = QLabel(
+            "Default: deterministic planning runs entirely on this Mac."
+        )
+        self._llm_privacy_help.setWordWrap(True)
+        self._llm_privacy_help.setFont(
+            mac_native.system_font(FS_CAPTION, "regular")
+        )
+        self._llm_privacy_help.setStyleSheet(
+            f"color: {_LABEL_SECONDARY}; background: transparent;"
+        )
+        llm_inner.addWidget(self._llm_privacy_help)
+
+        self._external_context_ack = QCheckBox(
+            "I understand that only the exact preview I confirm will leave this Mac"
+        )
+        self._external_context_ack.setChecked(False)
+        self._external_context_ack.setStyleSheet(_CHECKBOX_QSS)
+        self._external_context_ack.setVisible(False)
+        llm_inner.addWidget(self._external_context_ack)
+
+        privacy_action_row = QHBoxLayout()
+        self._privacy_summary = QLabel("Workspace context sharing is off")
+        self._privacy_summary.setFont(
+            mac_native.system_font(FS_CAPTION, "regular")
+        )
+        self._privacy_summary.setStyleSheet(
+            f"color: {_LABEL_SECONDARY}; background: transparent;"
+        )
+        privacy_action_row.addWidget(self._privacy_summary, stretch=1)
+        self._review_context_btn = QPushButton("Review request…")
+        self._review_context_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._review_context_btn.setFont(
+            mac_native.system_font(FS_CAPTION, "medium")
+        )
+        self._review_context_btn.setStyleSheet(
+            "QPushButton {"
+            "  padding: 4px 10px;"
+            f"  border-radius: {RADIUS_BUTTON}px;"
+            "  background: transparent;"
+            f"  color: {BRAND_ACCENT_TEXT};"
+            f"  border: 0.5px solid {_SEPARATOR};"
+            "}"
+            "QPushButton:hover { background: rgba(217,119,87,0.08); }"
+        )
+        self._review_context_btn.clicked.connect(self._open_context_privacy_dialog)
+        privacy_action_row.addWidget(self._review_context_btn)
+        llm_inner.addLayout(privacy_action_row)
 
         layout.addWidget(llm_card)
 
@@ -962,11 +1058,11 @@ class SettingsDialog(QWidget):
             f"  padding: 6px 16px;"
             f"  border-radius: {RADIUS_BUTTON}px;"
             f"  background: {BRAND_ACCENT};"
-            "  color: #FFF;"
+            f"  color: {_LABEL};"
             "  border: none;"
             "}"
-            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
-            "QPushButton:pressed { background: #B05439; }"
+            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
+            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
         )
         apply_btn.clicked.connect(self._apply_settings)
         # F04: keep a handle on the Apply button so _apply_settings can
@@ -1000,6 +1096,19 @@ class SettingsDialog(QWidget):
         set_accessible_name(self._quiet_mode, "Quiet mode")
         set_accessible_name(self._quiet_duration, "Quiet duration (minutes)")
         set_accessible_name(self._llm_backend, "LLM backend provider")
+        set_accessible_name(self._llm_privacy_mode, "Planner privacy mode")
+        set_accessible_description(
+            self._llm_privacy_mode,
+            "Choose local planning, a generic no-content plan, or an external model with an exact preview before every request.",
+        )
+        set_accessible_name(
+            self._external_context_ack,
+            "Acknowledge exact external context disclosure",
+        )
+        set_accessible_name(
+            self._review_context_btn,
+            "Review exact external model request",
+        )
         set_accessible_name(self._debug_capture, "Capture debug logging")
         set_accessible_name(self._debug_rppg, "rPPG debug logging")
         set_accessible_name(self._debug_state, "State engine debug logging")
@@ -1023,6 +1132,9 @@ class SettingsDialog(QWidget):
             self._distraction_custom_domains,
             self._os_notifications,
             self._llm_backend,
+            self._llm_privacy_mode,
+            self._external_context_ack,
+            self._review_context_btn,
             self._debug_capture,
             self._debug_rppg,
             self._debug_state,
@@ -1034,12 +1146,13 @@ class SettingsDialog(QWidget):
         # them by purpose rather than "checkbox" / "combo box".
         set_accessible_name(
             self._auto_distraction_block,
-            "Auto-arm focus session when overwhelmed",
+            "Auto-arm a focus session when support may help",
         )
         set_accessible_description(
             self._auto_distraction_block,
-            "When Cortex detects sustained overwhelm (HYPER state), "
-            "block known-distracting sites for a focus session.",
+            "When sustained behavior-only evidence reaches the support "
+            "threshold, block known-distracting sites. Camera and biometric "
+            "signals are not used.",
         )
         set_accessible_name(self._distraction_preset, "Blocklist preset")
         set_accessible_name(
@@ -1191,7 +1304,7 @@ class SettingsDialog(QWidget):
             base = row["label_not_granted"]
             label.setText(
                 f'<a href="cortex://open-system-settings/{target}" '
-                f'style="color: {BRAND_ACCENT}; text-decoration: underline;">'
+                f'style="color: {BRAND_ACCENT_TEXT}; text-decoration: underline;">'
                 f"{base} ›</a>"
             )
             label.setStyleSheet(
@@ -1275,6 +1388,17 @@ class SettingsDialog(QWidget):
         # Literal in cortex.libs.config.settings.
         llm_modes = ["bedrock", "vertex", "direct", "rule_based"]
         llm_mode = llm_modes[self._llm_backend.currentIndex()]
+        privacy_modes = ["no_llm", "no_content", "external_redacted"]
+        privacy_index = self._llm_privacy_mode.currentIndex()
+        planner_mode = (
+            privacy_modes[privacy_index]
+            if 0 <= privacy_index < len(privacy_modes)
+            else "no_llm"
+        )
+        external_acknowledged = (
+            planner_mode == "external_redacted"
+            and self._external_context_ack.isChecked()
+        )
 
         preset_idx = self._distraction_preset.currentIndex()
         preset_values = ["developer", "student", "writer", "custom"]
@@ -1310,6 +1434,12 @@ class SettingsDialog(QWidget):
             "quiet_mode": self._quiet_mode.isChecked(),
             "quiet_duration_minutes": self._quiet_duration.value(),
             "llm_mode": llm_mode,
+            "llm_planner_mode": planner_mode,
+            "external_context_enabled": external_acknowledged,
+            "llm_context_consent_revision": (
+                "context-disclosure-v1" if external_acknowledged else ""
+            ),
+            "llm_context_sources": dict(self._saved_context_sources),
             "debug_capture": self._debug_capture.isChecked(),
             "debug_rppg": self._debug_rppg.isChecked(),
             "debug_state": self._debug_state.isChecked(),
@@ -1469,6 +1599,88 @@ class SettingsDialog(QWidget):
                 )
             except Exception:
                 logger.debug("palette restart dialog failed", exc_info=True)
+
+    def _on_llm_backend_changed(self, index: int) -> None:
+        """The explicit offline backend cannot be paired with external mode."""
+
+        if index == 3 and self._llm_privacy_mode.currentIndex() != 0:
+            self._llm_privacy_mode.setCurrentIndex(0)
+
+    def _on_llm_privacy_mode_changed(self, index: int) -> None:
+        """Keep disclosure copy and controls aligned with the actual mode."""
+
+        external = index == 2
+        self._external_context_ack.setVisible(external)
+        if index == 0:
+            self._llm_privacy_help.setText(
+                "Deterministic planning runs entirely on this Mac and may use local context without transmitting it."
+            )
+            self._privacy_summary.setText("Workspace context sharing is off")
+        elif index == 1:
+            self._llm_privacy_help.setText(
+                "A deterministic generic plan ignores editor, terminal, browser, goal, and inferred-state content. No model network connection is opened."
+            )
+            self._privacy_summary.setText("Workspace content is ignored")
+        else:
+            self._llm_privacy_help.setText(
+                "External planning is fail-closed: choose sources for each request, inspect the redacted prompt, then send that exact preview once."
+            )
+            self._privacy_summary.setText("Per-request review required")
+
+    def _ensure_context_privacy_dialog(self) -> ContextPrivacyDialog:
+        if self._privacy_dialog is None:
+            dialog = ContextPrivacyDialog(self)
+            dialog.status_requested.connect(
+                self.context_privacy_status_requested.emit
+            )
+            dialog.preview_requested.connect(self._relay_context_preview_request)
+            dialog.confirmation_requested.connect(
+                self.context_preview_confirm_requested.emit
+            )
+            dialog.cancellation_requested.connect(
+                self.context_preview_cancel_requested.emit
+            )
+            self._privacy_dialog = dialog
+        return self._privacy_dialog
+
+    def _open_context_privacy_dialog(self) -> None:
+        """Open the source picker; preview creation itself remains local."""
+
+        dialog = self._ensure_context_privacy_dialog()
+        dialog.open_with_selection(self._saved_context_sources)
+
+    @Slot(dict)
+    def _relay_context_preview_request(self, payload: dict) -> None:
+        selection = payload.get("selection")
+        if isinstance(selection, dict):
+            self._saved_context_sources = {
+                str(key): bool(value) for key, value in selection.items()
+            }
+        self.context_preview_requested.emit(payload)
+
+    @Slot(dict)
+    def apply_context_privacy_status(self, payload: dict) -> None:
+        dialog = self._privacy_dialog
+        if dialog is not None:
+            dialog.apply_status(payload)
+
+    @Slot(dict)
+    def apply_context_preview(self, payload: dict) -> None:
+        dialog = self._privacy_dialog
+        if dialog is not None:
+            dialog.apply_preview(payload)
+
+    @Slot(dict)
+    def apply_context_preview_confirmation(self, payload: dict) -> None:
+        dialog = self._privacy_dialog
+        if dialog is not None:
+            dialog.apply_confirmation(payload)
+
+    @Slot(dict)
+    def apply_context_privacy_error(self, payload: dict) -> None:
+        dialog = self._privacy_dialog
+        if dialog is not None:
+            dialog.apply_error(payload)
 
     def _on_test_provider_clicked(self) -> None:
         """P0 §3.19: emit ``test_provider_requested`` carrying the
@@ -1655,6 +1867,36 @@ class SettingsDialog(QWidget):
             llm_modes = ["bedrock", "vertex", "direct", "rule_based"]
             if llm_mode in llm_modes:
                 self._llm_backend.setCurrentIndex(llm_modes.index(llm_mode))
+            planner_mode = str(self._qs.value("llm_planner_mode", "no_llm"))
+            planner_modes = ["no_llm", "no_content", "external_redacted"]
+            if planner_mode in planner_modes and llm_mode != "rule_based":
+                self._llm_privacy_mode.setCurrentIndex(
+                    planner_modes.index(planner_mode)
+                )
+            self._external_context_ack.setChecked(
+                _get_bool("external_context_enabled", False)
+                and str(
+                    self._qs.value("llm_context_consent_revision", "")
+                )
+                == "context-disclosure-v1"
+            )
+            try:
+                import json as _json
+
+                context_sources_raw = self._qs.value("llm_context_sources", "")
+                if isinstance(context_sources_raw, str) and context_sources_raw:
+                    context_sources = _json.loads(context_sources_raw)
+                elif isinstance(context_sources_raw, dict):
+                    context_sources = context_sources_raw
+                else:
+                    context_sources = {}
+                if isinstance(context_sources, dict):
+                    self._saved_context_sources = {
+                        str(key): bool(value)
+                        for key, value in context_sources.items()
+                    }
+            except (TypeError, ValueError):
+                self._saved_context_sources = {}
             self._debug_capture.setChecked(_get_bool("debug_capture", False))
             self._debug_rppg.setChecked(_get_bool("debug_rppg", False))
             self._debug_state.setChecked(_get_bool("debug_state", False))

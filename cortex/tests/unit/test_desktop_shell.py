@@ -685,7 +685,7 @@ class TestTrayIcon:
         from PySide6.QtWidgets import QApplication
         app = QApplication()
         tray = CortexTrayIcon(app)
-        assert tray._state == "FLOW"
+        assert tray._state == "UNKNOWN"
         assert tray._confidence == 0.0
         assert not tray._connected
         assert not tray._paused
@@ -754,6 +754,40 @@ class TestDashboard:
         dash = DashboardWindow()
         dash.set_connected(True)
         assert dash._connected
+
+    def test_undo_surface_requires_verified_transaction_receipts(self):
+        dash = DashboardWindow()
+        consumer = dash._consumer
+
+        # A legacy optimistic payload cannot mint an Undo affordance even if
+        # it names an action that older builds treated as reversible.
+        dash.apply_intervention_applied({
+            "intervention_id": "legacy-close",
+            "action_type": "close_tab",
+            "mutations_applied_count": 1,
+            "is_reversible": True,
+        })
+        assert consumer._reversible_actions == []
+
+        dash.apply_intervention_transaction_state({
+            "intervention_id": "exact-open",
+            "state": "applied",
+            "receipt_results": [{
+                "action_id": "open-1",
+                "status": "succeeded",
+                "reversible": True,
+            }],
+        })
+        assert [entry[1] for entry in consumer._reversible_actions] == [
+            "exact-open"
+        ]
+
+        dash.apply_intervention_transaction_state({
+            "intervention_id": "exact-open",
+            "state": "restored",
+            "receipt_results": [],
+        })
+        assert consumer._reversible_actions == []
 
 
 class TestHRTracePlot:
@@ -965,6 +999,25 @@ class TestWebSocketBridge:
         assert len(received) == 1
         assert received[0]["intervention_id"] == "int_123"
 
+    def test_handle_intervention_transaction_state(self):
+        bridge = WebSocketBridge()
+        received = []
+        bridge.intervention_transaction_state.connect(lambda p: received.append(p))
+
+        bridge._handle_message(json.dumps({
+            "type": "INTERVENTION_TRANSACTION_STATE",
+            "payload": {
+                "intervention_id": "int_exact",
+                "state": "applied",
+                "receipt_results": [],
+            },
+        }))
+        assert received == [{
+            "intervention_id": "int_exact",
+            "state": "applied",
+            "receipt_results": [],
+        }]
+
     def test_handle_invalid_json(self):
         bridge = WebSocketBridge()
         received = []
@@ -978,6 +1031,28 @@ class TestWebSocketBridge:
         bridge.state_updated.connect(lambda p: received.append(p))
         bridge._handle_message(json.dumps({"type": "UNKNOWN", "payload": {}}))
         assert len(received) == 0
+
+    def test_handle_calibration_failure(self):
+        bridge = WebSocketBridge()
+        received = []
+        bridge.calibration_update_failed.connect(lambda p: received.append(p))
+        bridge._handle_message(json.dumps({
+            "type": "CALIBRATION_UPDATE_FAILED",
+            "payload": {
+                "code": "calibration_apply_failed",
+                "profile_id": "profile-1",
+                "previous_calibration_unchanged": True,
+            },
+        }))
+        assert received == [{
+            "code": "calibration_apply_failed",
+            "profile_id": "profile-1",
+            "previous_calibration_unchanged": True,
+        }]
+
+    def test_calibration_reload_reports_disconnected_delivery(self):
+        bridge = WebSocketBridge()
+        assert bridge.send_calibration_reload("profile-1", "a" * 64) is False
 
 
 # ===========================================================================
@@ -996,6 +1071,33 @@ class TestCortexApp:
         assert not app._paused
         app._paused = True
         assert app._paused
+
+    def test_lost_calibration_ack_reconciles_authoritative_pointer(self):
+        app = CortexApp()
+
+        class Runner:
+            applied: list[str] = []
+            failed: list[str] = []
+
+            def is_committed_profile_active(self, profile_id):
+                return profile_id == "profile-1"
+
+            def mark_applied(self, profile_id):
+                self.applied.append(profile_id)
+
+            def mark_failed(self, reason):
+                self.failed.append(reason)
+
+        runner = Runner()
+        app._calibration_runner = runner
+        app._pending_calibration_profile_id = "profile-1"
+        app._on_calibration_update_failed(
+            {"profile_id": "profile-1", "message": "acknowledgement lost"}
+        )
+
+        assert runner.applied == ["profile-1"]
+        assert runner.failed == []
+        assert app._calibration_runner is None
 
 
 # ===========================================================================
@@ -1018,6 +1120,7 @@ class _RecordingDaemon:
 
     def __init__(self) -> None:
         self.active_intervention_id = "int_1"
+        self.workspace_mutation_allowed = True
         self.calls: list[tuple[str, tuple, dict]] = []
 
     async def start_biology_break(self, **kwargs):
@@ -1035,6 +1138,12 @@ class _RecordingDaemon:
     async def dispatch_action_to_browser(self, intervention_id, action):
         self.calls.append(
             ("dispatch_action_to_browser", (intervention_id, action), {})
+        )
+        return 1
+
+    async def dispatch_intervention_action(self, intervention_id, action):
+        self.calls.append(
+            ("dispatch_intervention_action", (intervention_id, action), {})
         )
         return 1
 
@@ -1083,67 +1192,61 @@ def _run_action_invoked(action_type: str, *, extra: dict | None = None):
     return daemon
 
 
-class TestControllerNativeActionRouting:
+class TestControllerExactActionRouting:
 
-    def test_take_biology_break_routes_to_daemon_not_browser(self):
+    def test_take_biology_break_is_compatibility_only(self):
         daemon = _run_action_invoked(
             "take_biology_break",
             extra={"metadata": {"duration_seconds": 60, "audio_cue": False}},
         )
         names = daemon.names()
-        assert "start_biology_break" in names
+        assert "start_biology_break" not in names
         assert "dispatch_action_to_browser" not in names
-        # The break-break kwargs were threaded through.
-        bb = next(c for c in daemon.calls if c[0] == "start_biology_break")
-        assert bb[2]["duration_seconds"] == 60
-        assert bb[2]["audio_cue"] is False
+        assert "dispatch_intervention_action" in names
 
     def test_resume_last_active_file_routes_to_editor_adapter(self):
         daemon = _run_action_invoked("resume_last_active_file")
         names = daemon.names()
-        assert "_resume_last_active_file" in names
+        assert "_resume_last_active_file" not in names
         assert "dispatch_action_to_browser" not in names
+        assert "dispatch_intervention_action" in names
 
     def test_prompt_micro_commit_is_native_log_only(self):
         daemon = _run_action_invoked(
             "prompt_micro_commit", extra={"prompt": "ship X", "text": "ship X"}
         )
         names = daemon.names()
-        assert "_broadcast_prompt" in names
+        assert "_broadcast_prompt" not in names
         assert "dispatch_action_to_browser" not in names
+        assert "dispatch_intervention_action" in names
 
     def test_suggest_movement_break_is_native_log_only(self):
         daemon = _run_action_invoked(
             "suggest_movement_break", extra={"duration_seconds": 60}
         )
         names = daemon.names()
-        assert "_broadcast_prompt" in names
+        assert "_broadcast_prompt" not in names
         assert "dispatch_action_to_browser" not in names
+        assert "dispatch_intervention_action" in names
 
     def test_browser_action_still_dispatches_to_browser(self):
         # A genuine browser action_type MUST reach the browser dispatch.
         assert "close_tab" in OverlayWindow._BROWSER_ACTION_TYPES
         daemon = _run_action_invoked("close_tab", extra={"tab_index": 2})
         names = daemon.names()
-        assert "dispatch_action_to_browser" in names
+        assert "dispatch_action_to_browser" not in names
+        assert "dispatch_intervention_action" in names
         assert "start_biology_break" not in names
 
     def test_routing_sets_are_unambiguous(self):
-        # Native + browser sets must be disjoint so the controller's
-        # ``in _BROWSER_ACTION_TYPES`` routing decision is unambiguous.
-        overlap = (
-            OverlayWindow._NATIVE_ACTION_TYPES
+        assert OverlayWindow._NATIVE_ACTION_TYPES == frozenset()
+        assert OverlayWindow._EDITOR_ACTION_TYPES == frozenset(
+            {"resume_last_active_file"}
+        )
+        assert not (
+            OverlayWindow._EDITOR_ACTION_TYPES
             & OverlayWindow._BROWSER_ACTION_TYPES
         )
-        assert overlap == frozenset()
-        # The native action types the controller handles natively.
-        for at in (
-            "take_biology_break",
-            "resume_last_active_file",
-            "prompt_micro_commit",
-            "suggest_movement_break",
-        ):
-            assert at not in OverlayWindow._BROWSER_ACTION_TYPES
 
 
 class TestControllerOnboardingDashboard:

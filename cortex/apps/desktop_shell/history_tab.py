@@ -119,6 +119,7 @@ from cortex.apps.desktop_shell.tokens import (
     BRAND_ACCENT,
     BRAND_ACCENT_DIM,
     BRAND_ACCENT_HOVER,
+    BRAND_ACCENT_TEXT,
     BRAND_DISPLAY_FONT,
     CX_TEXT_SECONDARY,
     CX_TEXT_TERTIARY,
@@ -476,7 +477,7 @@ class _SessionRow(_RenderCacheMixin, QFrame):
 
         flow_pct = float(summary.get("flow_percentage") or 0.0)
         if flow_pct >= 60.0:
-            flow_color = BRAND_ACCENT
+            flow_color = BRAND_ACCENT_TEXT
         elif flow_pct < 30.0:
             flow_color = _LABEL_TERTIARY
         else:
@@ -1819,7 +1820,7 @@ class _TrendsPanel(_RenderCacheMixin, QWidget):
             f"  color: {text_color};"
             f"  border: 0.5px solid {border_color};"
             "}"
-            f"QPushButton:hover {{ color: {BRAND_ACCENT_HOVER};"
+            f"QPushButton:hover {{ color: {BRAND_ACCENT_TEXT}; background: {BRAND_ACCENT_DIM};"
             f" border-color: {BRAND_ACCENT}; }}"
             "QPushButton:disabled {"
             f"  color: {_LABEL_TERTIARY};"
@@ -1895,7 +1896,7 @@ class _TrendsPanel(_RenderCacheMixin, QWidget):
             iso = chronotype.get("last_updated")
         text, stale = _format_relative_age(iso if isinstance(iso, str) else None)
         self._set_text_if_changed(self._updated_label, text)
-        colour = BRAND_ACCENT if stale else _LABEL_SECONDARY
+        colour = BRAND_ACCENT_TEXT if stale else _LABEL_SECONDARY
         self._set_style_if_changed(
             self._updated_label,
             f"color: {colour}; background: transparent;",

@@ -12,11 +12,12 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from cortex.libs.adapters.registry import AdapterRegistry
 from cortex.libs.observability.metrics import INTERVENTIONS_APPLIED_TOTAL
 from cortex.libs.schemas.intervention import AdapterCommand, InterventionPlan
+from cortex.libs.schemas.intervention_transaction import InterventionApplyCommand
 from cortex.services.consent.policy import canonical_action_type
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,9 @@ _CONSENT_LEVEL_LABELS: dict[int, str] = {
 # crashing the workspace.
 
 ConsentDecisionFn = Callable[[str, int], Awaitable[bool]]
+AuthorizationVerifierFn = Callable[
+    [InterventionApplyCommand], Awaitable[bool]
+]
 
 
 # ---------------------------------------------------------------------------
@@ -99,19 +103,28 @@ _REVERSE_ACTIONS: dict[str, str] = {
     "fold_except_current": "unfold_all",
     "dim_background": "remove_dim",
     "show_overlay": "hide_overlay",
-    # Phase-4a Debt-1: round out the reversibility map for the suggested-
-    # action vocabulary (``intervention.py::SuggestedAction.action_type``).
-    # Tab actions are reversible via the standard browser undo paths; the
-    # extension owns the actual reopen via captured tab metadata.
+    # Legacy compatibility inverses. These entries let an upgraded daemon
+    # attempt to unwind effects recorded before the WP-6 exact-transaction
+    # protocol; membership is NOT evidence that a capability is safe to mint
+    # in a new manifest. In particular, reopening a URL does not reconstruct a
+    # closed browser-owned session, and ungrouping cannot recover raced group
+    # ownership. The transaction catalog is the sole new-authority source.
     "close_tab": "reopen_tab",
     "group_tabs": "ungroup_tabs",
     "bookmark_and_close": "reopen_from_bookmark",
-    # NOTE: ``take_biology_break``, ``resume_last_active_file``,
-    # ``prompt_micro_commit``, ``suggest_movement_break``, ``open_url``,
-    # ``search_error``, ``highlight_tab``, ``save_session``,
-    # ``copy_to_clipboard`` and ``start_timer`` are intentionally
-    # omitted — they have no sensible single-step reverse mutation.
+    # NOTE: ``open_url``, ``search_error``, ``highlight_tab`` and
+    # ``resume_last_active_file`` are intentionally absent from this *legacy*
+    # map: the exact transaction adapters own their inverse payloads and
+    # post-condition checks. The remaining omitted actions have no sensible
+    # single-step reverse mutation.
 }
+
+_PRESENTATION_ACTIONS = frozenset({
+    "show_overlay",
+    "dim_background",
+    "prompt_micro_commit",
+    "suggest_movement_break",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -126,10 +139,18 @@ class InterventionExecutor:
     Tracks all mutations for restoration. Ensures no destructive operations.
     """
 
-    def __init__(self, adapter_registry: AdapterRegistry | None = None) -> None:
+    def __init__(
+        self,
+        adapter_registry: AdapterRegistry | None = None,
+        *,
+        execution_mode: Literal[
+            "suggest_only", "authorized", "research_autonomous"
+        ] = "suggest_only",
+    ) -> None:
         self._adapters: dict[str, WorkspaceAdapter] = {}
         self._registry: AdapterRegistry | None = adapter_registry
         self._active_mutations: dict[str, list[Mutation]] = {}
+        self._execution_mode = execution_mode
         # B17 (Phase 4.1): cumulative count of permanently-missing
         # adapter dispatches. Increments only after the one-shot retry
         # below also fails, so a transient adapter registration race
@@ -141,6 +162,10 @@ class InterventionExecutor:
         # consent level is below the action's policy minimum. When unset
         # (legacy callers / test rigs) the gate is permissive.
         self._consent_check: ConsentDecisionFn | None = None
+        # Final adapter-boundary verifier. A plan and a positive consent
+        # decision are not authority; every workspace command must also be
+        # covered by an exact, durably-consumed ActionAuthorization.
+        self._authorization_verifier: AuthorizationVerifierFn | None = None
         # P1-7: when the consent gate is not wired, default-deny any plan
         # that requires workspace mutation (i.e. not overlay-only). Set
         # this flag to True ONLY in unit tests that want to exercise the
@@ -166,10 +191,37 @@ class InterventionExecutor:
         The gate runs BEFORE adapter dispatch inside :meth:`apply`. A
         denial short-circuits the command into a Mutation with
         ``success=False, reason="consent_denied"`` so the daemon can
-        record the outcome and inform AMIP that this plan should have
-        been gated at LLM time.
+        record the outcome and diagnose that this plan should have been
+        gated before authorization.
         """
         self._consent_check = fn
+
+    def set_authorization_verifier(
+        self,
+        fn: AuthorizationVerifierFn | None,
+    ) -> None:
+        """Bind the one-time authorization ledger verifier."""
+
+        self._authorization_verifier = fn
+
+    def set_execution_mode(
+        self,
+        mode: Literal["suggest_only", "authorized", "research_autonomous"],
+    ) -> None:
+        """Update the outer workspace-authority kill switch."""
+        self._execution_mode = mode
+
+    @property
+    def execution_mode(
+        self,
+    ) -> Literal["suggest_only", "authorized", "research_autonomous"]:
+        """Expose the fail-closed authority mode to transport adapters.
+
+        The executor remains the final enforcement point, but transport
+        adapters also need to avoid snapshots, restore registrations, and
+        optimistic success responses for a proposal-only request.
+        """
+        return self._execution_mode
 
     def set_editor_focus_hook(
         self,
@@ -245,6 +297,7 @@ class InterventionExecutor:
         commands: list[AdapterCommand],
         *,
         timestamp: float | None = None,
+        authorization: InterventionApplyCommand | None = None,
     ) -> list[Mutation]:
         """
         Apply intervention commands to workspace adapters.
@@ -268,6 +321,61 @@ class InterventionExecutor:
             "reversible_act": 3, "autonomous_act": 4,
         }
         plan_level_int = _CONSENT_LEVELS.get(plan.consent_level, 2)
+
+        effect_commands = [
+            command
+            for command in commands
+            if command.action not in _PRESENTATION_ACTIONS
+        ]
+        if effect_commands and not self._allow_unwired_consent:
+            authorization_reason: str | None = None
+            if authorization is None:
+                authorization_reason = "exact_authorization_required"
+            elif authorization.authorization.intervention_id != plan.intervention_id:
+                authorization_reason = "authorization_intervention_mismatch"
+            else:
+                expected = [
+                    (action.executor, action.capability, action.parameters)
+                    for action in authorization.actions
+                ]
+                actual = [
+                    (command.adapter, command.action, dict(command.params))
+                    for command in effect_commands
+                ]
+                if expected != actual:
+                    authorization_reason = "authorization_action_mismatch"
+                elif self._authorization_verifier is None:
+                    authorization_reason = "authorization_verifier_not_wired"
+                else:
+                    try:
+                        valid = await self._authorization_verifier(authorization)
+                    except Exception:
+                        logger.exception(
+                            "authorization verifier raised for intervention=%s",
+                            plan.intervention_id,
+                        )
+                        valid = False
+                    if not valid:
+                        authorization_reason = "authorization_not_consumed"
+            if authorization_reason is not None:
+                logger.warning(
+                    "executor refused workspace effect for %s: %s",
+                    plan.intervention_id,
+                    authorization_reason,
+                )
+                for command in commands:
+                    mutations.append(
+                        Mutation(
+                            adapter=command.adapter,
+                            action=command.action,
+                            params=dict(command.params),
+                            timestamp=now,
+                            success=False,
+                            reason=authorization_reason,
+                        )
+                    )
+                self._active_mutations[plan.intervention_id] = mutations
+                return mutations
 
         # P1-7: default-deny when consent handler is not wired and the
         # plan requires workspace mutation (i.e. anything beyond a pure
@@ -315,6 +423,18 @@ class InterventionExecutor:
                 timestamp=now,
                 reverse_action=_REVERSE_ACTIONS.get(cmd.action),
             )
+
+            # Defence in depth: callers cannot bypass the runtime's plan
+            # containment by invoking the executor directly. Suggest-only
+            # permits presentation effects, never workspace changes.
+            if (
+                self._execution_mode == "suggest_only"
+                and cmd.action not in _PRESENTATION_ACTIONS
+            ):
+                mutation.success = False
+                mutation.reason = "execution_mode_suggest_only"
+                mutations.append(mutation)
+                continue
 
             # Phase-4b TASK M: per-action consent gate. Runs BEFORE
             # adapter dispatch so a denied command never touches the
@@ -447,18 +567,55 @@ class InterventionExecutor:
         self._active_mutations[plan.intervention_id] = mutations
         return mutations
 
+    async def apply_authorized(
+        self,
+        plan: InterventionPlan,
+        command: InterventionApplyCommand,
+        *,
+        timestamp: float | None = None,
+    ) -> list[Mutation]:
+        """Execute only the exact action objects in a consumed command."""
+
+        commands = [
+            AdapterCommand(
+                adapter=action.executor,
+                action=action.capability,
+                params=action.parameters,
+            )
+            for action in command.actions
+        ]
+        return await self.apply(
+            plan,
+            commands,
+            timestamp=timestamp,
+            authorization=command,
+        )
+
     async def reverse(self, intervention_id: str) -> list[Mutation]:
         """
         Reverse all mutations for a given intervention.
 
         Returns list of reversal mutations (success/fail status set).
         """
-        mutations = self._active_mutations.pop(intervention_id, [])
+        mutations = list(self._active_mutations.get(intervention_id, []))
         reversals: list[Mutation] = []
+        still_active: list[Mutation] = []
 
         # Reverse in opposite order
         for m in reversed(mutations):
-            if not m.success or not m.is_reversible:
+            if not m.success:
+                continue
+            if not m.is_reversible:
+                reversals.append(
+                    Mutation(
+                        adapter=m.adapter,
+                        action=m.action,
+                        timestamp=time.monotonic(),
+                        success=False,
+                        reason="reverse_action_unavailable",
+                    )
+                )
+                still_active.append(m)
                 continue
 
             adapter = self._get_adapter(m.adapter)
@@ -484,6 +641,7 @@ class InterventionExecutor:
                     success=False,
                     reason="reverse_adapter_missing",
                 ))
+                still_active.append(m)
                 continue
 
             reversal = Mutation(
@@ -499,6 +657,9 @@ class InterventionExecutor:
             try:
                 success = await adapter.execute(reversal.action, {})
                 reversal.success = success
+                if not success:
+                    reversal.reason = "reverse_adapter_returned_false"
+                    still_active.append(m)
             except Exception:
                 logger.exception(
                     "Error reversing '%s' on adapter '%s'",
@@ -506,9 +667,15 @@ class InterventionExecutor:
                     m.adapter,
                 )
                 reversal.success = False
+                reversal.reason = "reverse_adapter_raised"
+                still_active.append(m)
 
             reversals.append(reversal)
 
+        if still_active:
+            self._active_mutations[intervention_id] = still_active
+        else:
+            self._active_mutations.pop(intervention_id, None)
         return reversals
 
     def get_active_mutations(

@@ -23,12 +23,16 @@ from pathlib import Path
 from typing import Any, Literal
 
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from cortex.apps.desktop_shell import mac_native
 from cortex.apps.desktop_shell.break_overlay import BreakOverlayWindow
 from cortex.apps.desktop_shell.connections import ConnectionsPanel
+from cortex.apps.desktop_shell.context_privacy_controller import (
+    ContextPrivacyController,
+)
 from cortex.apps.desktop_shell.dashboard import DashboardWindow
+from cortex.apps.desktop_shell.message_router import DesktopMessageRouter
 from cortex.apps.desktop_shell.onboarding import OnboardingWindow, onboarding_marker_path
 from cortex.apps.desktop_shell.overlay import OverlayWindow
 from cortex.apps.desktop_shell.settings import SettingsDialog
@@ -67,6 +71,7 @@ class DaemonBridge(QObject):
 
     state_updated = Signal(dict)
     intervention_triggered = Signal(dict)
+    intervention_transaction_state = Signal(dict)
     connection_changed = Signal(bool)
     # F34: emitted on the Qt main thread when the daemon's ``stop()`` future
     # resolves (or the safety timer fires). UI surfaces (dashboard, tray)
@@ -101,6 +106,7 @@ class DaemonBridge(QObject):
     # stay in sync with the running capture loop. Payload is a plain
     # dict so Qt's queued-connection marshalling is cheap.
     calibration_progress = Signal(dict)
+    calibration_review = Signal(dict)
 
     # -- callbacks invoked from daemon thread ---------------------------------
     #
@@ -155,6 +161,19 @@ class DaemonBridge(QObject):
                 return
             self._last_intervention_seq = seq
         self.intervention_triggered.emit(payload)
+
+    def on_intervention_transaction_state(self, payload: dict) -> None:
+        """Queue an exact transaction outcome onto the Qt main thread."""
+
+        try:
+            self.intervention_transaction_state.emit(
+                dict(payload) if payload else {}
+            )
+        except Exception:
+            logger.debug(
+                "intervention transaction state emit failed",
+                exc_info=True,
+            )
 
     def reset_sequence_counters(self) -> None:
         """F17: reset both sequence counters. Called when the underlying
@@ -230,19 +249,9 @@ class DaemonBridge(QObject):
             logger.debug("on_stop_focus_auto emit failed", exc_info=True)
 
     def on_break_recommendation(self, payload: dict) -> None:
-        """P0 §3.7: relay BREAK_RECOMMENDATION onto the Qt main thread.
+        """Decode-only compatibility sink for an unsupported metric claim."""
 
-        Mirrors the other on_* handlers — dict is shallow-copied so the
-        bridge can re-broadcast without callers mutating shared state.
-        """
-        try:
-            self.break_recommendation_received.emit(
-                dict(payload) if payload else {}
-            )
-        except Exception:
-            logger.debug(
-                "break_recommendation_received emit failed", exc_info=True,
-            )
+        del payload
 
     def on_intervention_failed(self, payload: dict) -> None:
         """P1-FC-INTERVENTION-FAILED: a total mutation failure was
@@ -335,6 +344,9 @@ class CortexAppController:
         self._daemon: Any = None  # CortexDaemon (lazy import to avoid heavy deps at module level)
         self._daemon_loop: asyncio.AbstractEventLoop | None = None
         self._daemon_thread: threading.Thread | None = None
+        self._state_subscription: Any = None
+        self._intervention_subscription: Any = None
+        self._outbound_subscription: Any = None
         # P0 §3.4: in-flight calibration runner. None when idle. Guards
         # against double-click re-entry and lets ``_stop_daemon_and_quit``
         # cooperatively abort the runner on shutdown.
@@ -379,6 +391,7 @@ class CortexAppController:
         # boot cost.
         self._break_overlay: BreakOverlayWindow | None = None
         self._settings = SettingsDialog()
+        self._context_privacy_controller = ContextPrivacyController(self._settings)
         self._onboarding = OnboardingWindow()
 
         self._tray = CortexTrayIcon(self._app)
@@ -409,6 +422,10 @@ class CortexAppController:
         # -- Wire bridge signals to UI ----------------------------------------
         self._bridge.state_updated.connect(self._on_state_update)
         self._bridge.intervention_triggered.connect(self._on_intervention)
+        if hasattr(self._dashboard, "apply_intervention_transaction_state"):
+            self._bridge.intervention_transaction_state.connect(
+                self._dashboard.apply_intervention_transaction_state,
+            )
         self._bridge.connection_changed.connect(self._on_connection_changed)
         # F34: re-enable dashboard + tray Stop affordances when the daemon
         # actually reports stopped (or the dashboard/tray's own safety-timer
@@ -439,20 +456,13 @@ class CortexAppController:
         self._bridge.quiet_mode_state_received.connect(
             self._on_quiet_mode_state_to_tray,
         )
-        # P0 §3.7 desktop dispatch: route BREAK_RECOMMENDATION into the
-        # dashboard's break pill (and tray notification helper). The
-        # dashboard handler is the source of truth — if it isn't wired
-        # (legacy lightweight test stub) we fall through silently.
-        if hasattr(self._dashboard, "apply_break_recommendation"):
-            self._bridge.break_recommendation_received.connect(
-                self._dashboard.apply_break_recommendation,
-            )
+        # BREAK_RECOMMENDATION remains a decode-only compatibility message;
+        # unsupported HRV/stress claims are never connected to product UI.
 
         self._overlay.dismissed.connect(self._on_overlay_dismissed)
-        # G4 (audit-prod): overlay action buttons emit ``action_invoked``;
-        # the in-process controller has a direct daemon reference so it
-        # can route native actions (clipboard, timer) directly and call
-        # ``dispatch_action_to_browser`` for everything else.
+        # Overlay buttons are proposal gestures. The controller forwards the
+        # exact action id to the daemon transaction boundary; it never calls a
+        # browser/editor/clipboard capability itself.
         if hasattr(self._overlay, "action_invoked"):
             self._overlay.action_invoked.connect(self._on_action_invoked)
         # P0 §3.6: micro-step checkbox round-trip. The overlay emits
@@ -479,6 +489,30 @@ class CortexAppController:
         if hasattr(self._overlay, "quiet_requested"):
             self._overlay.quiet_requested.connect(self._on_quiet_requested)
         self._settings.settings_changed.connect(self._on_settings_changed)
+        self._settings.context_privacy_status_requested.connect(
+            self._context_privacy_controller.refresh_status
+        )
+        self._settings.context_preview_requested.connect(
+            self._context_privacy_controller.preview_current
+        )
+        self._settings.context_preview_confirm_requested.connect(
+            self._context_privacy_controller.confirm_once
+        )
+        self._settings.context_preview_cancel_requested.connect(
+            self._context_privacy_controller.cancel_preview
+        )
+        self._context_privacy_controller.status_received.connect(
+            self._settings.apply_context_privacy_status
+        )
+        self._context_privacy_controller.preview_received.connect(
+            self._settings.apply_context_preview
+        )
+        self._context_privacy_controller.confirmation_received.connect(
+            self._settings.apply_context_preview_confirmation
+        )
+        self._context_privacy_controller.request_failed.connect(
+            self._settings.apply_context_privacy_error
+        )
         self._settings.back_requested.connect(self._show_dashboard)
         self._connections.back_requested.connect(self._show_dashboard)
         self._onboarding.open_settings_requested.connect(self._show_settings)
@@ -489,6 +523,7 @@ class CortexAppController:
         # apply_calibration_progress slot. Queued connection by default —
         # Qt marshals the dict payload onto the Qt main thread.
         self._bridge.calibration_progress.connect(self._on_calibration_progress)
+        self._bridge.calibration_review.connect(self._on_calibration_review)
         # P0 §3.4: Settings → Sensing → Recalibrate baselines. Re-uses
         # the same _run_calibration path as onboarding so both surfaces
         # drive one CalibrationRunner.
@@ -744,12 +779,14 @@ class CortexAppController:
         from cortex.services.runtime_daemon import CortexDaemon
 
         self._daemon = CortexDaemon(config=self._config)
-        self._daemon.set_state_callback(self._bridge.on_state)
-        self._daemon.set_intervention_callback(self._bridge.on_intervention)
+        self._state_subscription = self._daemon.subscribe_state(self._bridge.on_state)
+        self._intervention_subscription = self._daemon.subscribe_intervention(
+            self._bridge.on_intervention
+        )
         # P0 §3.7: hand the desktop shell's full-screen break overlay to
         # the daemon. The handler is async because the controller has
         # to marshal back onto the Qt thread; the daemon owns the
-        # asyncio loop and the BiologyBreakController calls our handler
+        # asyncio loop and the GuidedBreakController calls our handler
         # whenever the user takes a break.
         self._daemon.set_break_overlay_ui_handler(self._run_break_overlay)
         # P0 §3.12: register the desktop-focus probe so the daemon
@@ -793,36 +830,17 @@ class CortexAppController:
         self._bridge.connection_changed.emit(True)
 
     def _install_ws_broadcast_observer(self) -> None:
-        """P0 §3.1 / §3.2 / §3.3: wrap ``_ws_server.send_message`` so the
-        in-process controller observes outbound SESSION_LIST /
-        SESSION_DETAIL / TRENDS_PAYLOAD / SESSION_RECAP frames in
-        addition to relaying them to attached WS clients.
-
-        Why a wrapper, not a callback API? The daemon's WS server has no
-        broadcast-observer hook today (the existing
-        ``set_state_callback`` / ``set_intervention_callback`` mechanism
-        is daemon-internal and predates these frames). A monkey-patched
-        wrapper is the smallest non-invasive way to keep the backend
-        contract intact while still surfacing the frames to the
-        in-process dashboard. The wrapper preserves the original return
-        value (a client count) and is idempotent — re-installs are
-        no-ops via the ``_cortex_broadcast_wrapped`` sentinel attr.
-        """
+        """Subscribe the in-process desktop to transport-neutral events."""
         if self._daemon is None:
             return
         ws_server = getattr(self._daemon, "_ws_server", None)
         if ws_server is None:
             logger.debug("Daemon has no _ws_server; broadcast observer skipped")
             return
-        send_message = getattr(ws_server, "send_message", None)
-        if send_message is None or getattr(send_message, "_cortex_broadcast_wrapped", False):
+        subscribe = getattr(ws_server, "subscribe_outbound", None)
+        if not callable(subscribe) or self._outbound_subscription is not None:
             return
         bridge = self._bridge
-
-        # Map of message-type strings → bridge methods. We import the
-        # enum locally so a missing schemas package on a stripped CI
-        # harness doesn't crash boot — the wrapper degrades to passing
-        # through without fan-out in that case.
         try:
             from cortex.libs.schemas.ws_message_types import MessageType
 
@@ -831,61 +849,40 @@ class CortexAppController:
                 MessageType.SESSION_DETAIL.value: bridge.on_session_detail,
                 MessageType.TRENDS_PAYLOAD.value: bridge.on_trends,
                 MessageType.SESSION_RECAP.value: bridge.on_session_recap,
-                # P0 §3.11 / §3.10: route quiet-mode + auto-focus
-                # broadcasts to the bridge so the dashboard reflects
-                # them in DMG mode (the WS-client path picks them up
-                # via the WebSocketBridge separately).
                 MessageType.QUIET_MODE_STATE.value: bridge.on_quiet_mode_state,
                 MessageType.START_FOCUS_AUTO.value: bridge.on_start_focus_auto,
                 MessageType.STOP_FOCUS_AUTO.value: bridge.on_stop_focus_auto,
-                # P0 §3.7 desktop dispatch.
-                MessageType.BREAK_RECOMMENDATION.value: bridge.on_break_recommendation,
-                # P1-FC-INTERVENTION-FAILED: total mutation failure → toast.
                 MessageType.INTERVENTION_FAILED.value: bridge.on_intervention_failed,
-                # P1-FC-INTERVENTION-PROMPT: cross-surface prompt sync. The
-                # desktop overlay renders the prompt inline already; this
-                # entry only completes the dispatch map (informational).
+                MessageType.INTERVENTION_TRANSACTION_STATE.value: (
+                    bridge.on_intervention_transaction_state
+                ),
                 MessageType.INTERVENTION_PROMPT.value: bridge.on_intervention_prompt,
             }
+            router = DesktopMessageRouter(type_to_handler)
         except Exception:
             logger.debug("MessageType import failed; broadcast observer disabled", exc_info=True)
             return
 
-        async def _wrapped_send_message(message_type: str, payload: dict, **kwargs: Any) -> int:
-            # Phase 4.B fix (#26): respect ``target_client_types``.
-            # The daemon's WS dispatch arms now use
-            # ``send_to_client(client_id, ...)`` for targeted replies, so
-            # this observer should normally only see broadcasts. But a
-            # caller that goes through ``send_message`` with a non-empty
-            # ``target_client_types`` list that excludes "desktop" is
-            # explicitly opting out of the in-process bridge; we must
-            # honour that to avoid leaking targeted SESSION_RECAP
-            # replies into the desktop dashboard.
-            targets = kwargs.get("target_client_types")
-            if isinstance(targets, (list, tuple, set)) and targets:
-                if "desktop" not in targets:
-                    logger.debug(
-                        "broadcast observer: skipping %s — targets=%r excludes 'desktop'",
-                        message_type, targets,
-                    )
-                    return await send_message(message_type, payload, **kwargs)
-            handler = type_to_handler.get(message_type)
-            if handler is not None:
-                try:
-                    handler(dict(payload) if payload else {})
-                except Exception:
-                    logger.debug(
-                        "Broadcast observer handler raised for %s",
-                        message_type, exc_info=True,
-                    )
-            return await send_message(message_type, payload, **kwargs)
-
-        _wrapped_send_message._cortex_broadcast_wrapped = True  # type: ignore[attr-defined]
+        def _observe(event: Any) -> None:
+            targets = tuple(getattr(event, "target_client_types", ()) or ())
+            message_type = str(getattr(event, "message_type", ""))
+            try:
+                router.dispatch(
+                    message_type,
+                    getattr(event, "payload", {}),
+                    target_client_types=targets,
+                )
+            except Exception:
+                logger.debug(
+                    "Broadcast observer handler raised for %s",
+                    message_type,
+                    exc_info=True,
+                )
         try:
-            ws_server.send_message = _wrapped_send_message
+            self._outbound_subscription = subscribe(_observe)
         except Exception:
             logger.debug(
-                "Failed to install ws_server.send_message wrapper",
+                "Failed to subscribe to outbound application events",
                 exc_info=True,
             )
 
@@ -1101,8 +1098,10 @@ class CortexAppController:
             self._dashboard.update_state(payload)
         if self._tray is not None:
             self._tray.update_state(
-                payload.get("state", "FLOW"),
+                payload.get("state", "UNKNOWN"),
                 payload.get("confidence", 0.0),
+                payload.get("status", "insufficient_evidence"),
+                payload.get("evidence_coverage", 0.0),
             )
 
     @Slot(dict)
@@ -1188,147 +1187,48 @@ class CortexAppController:
 
     @Slot(str, dict)
     def _on_action_invoked(self, intervention_id: str, action: dict) -> None:
-        """G4 (audit-prod): handle a desktop overlay action button click.
+        """Route one desktop gesture through the exact transaction boundary.
 
-        Native action types execute in the desktop shell directly so the
-        user gets immediate feedback without a WS roundtrip; browser-bound
-        actions are forwarded to chrome/edge via the daemon's
-        ``dispatch_action_to_browser`` helper. Either way we record an
-        engaged USER_ACTION on the daemon so the dismissal/engagement
-        ledger reflects what happened.
+        The Qt shell never executes a workspace capability directly. The
+        daemon validates the action against the immutable manifest, consumes
+        one authorization, durably binds the owning browser/editor client,
+        and waits for that adapter's typed receipt.
         """
         if self._daemon is None or self._daemon_loop is None:
             return
-        action_type = str(action.get("action_type") or "")
-        action_id = str(action.get("action_id") or "")
-        # Native vs browser routing is authoritative on the overlay's
-        # frozensets so a single source of truth governs which clicks
-        # reach ``dispatch_action_to_browser``. Anything NOT in
-        # ``OverlayWindow._BROWSER_ACTION_TYPES`` must execute natively
-        # (or via a daemon-local helper) — previously every native type
-        # except copy/timer fell through to the browser dispatch path
-        # and was dropped (the SuggestedAction-bound extension never
-        # recognised ``take_biology_break`` / ``resume_last_active_file``
-        # / ``prompt_micro_commit`` / ``suggest_movement_break``).
-        is_browser_action = action_type in OverlayWindow._BROWSER_ACTION_TYPES
-        executed_natively = not is_browser_action
-        # A daemon-local coroutine to run for the native action types
-        # that need real daemon-side work (a break session, an editor
-        # focus, or a prompt broadcast). ``None`` means "log only".
-        native_coro: Any = None
-        try:
-            if action_type == "copy_to_clipboard":
-                self._copy_to_clipboard(str(action.get("target") or ""))
-            elif action_type == "start_timer":
-                # P2-FE-START-TIMER: a real LLM-emitted native action.
-                # Reuse the existing break/countdown overlay
-                # (BreakOverlayWindow, driven by the daemon's break
-                # controller) as a plain countdown — no breathing pattern
-                # and no audio cue. The duration comes from the action
-                # metadata; absent that we fall back to a 5-minute timer.
-                meta = action.get("metadata")
-                meta = meta if isinstance(meta, dict) else {}
-                duration = int(meta.get("duration_seconds", 300) or 300)
-                native_coro = self._daemon.start_biology_break(
-                    intervention_id=str(intervention_id or ""),
-                    duration_seconds=duration,
-                    breathing_pattern=None,
-                    audio_cue=False,
-                    reason=str(meta.get("reason", "user_requested_timer"))[:120],
-                )
-            elif action_type == "take_biology_break":
-                # P0 §3.7: the breathing session is a full-screen Qt
-                # overlay driven by the daemon (it owns the HRV context).
-                # Route to ``start_biology_break`` — NEVER the browser.
-                meta = action.get("metadata")
-                meta = meta if isinstance(meta, dict) else {}
-                duration = int(meta.get("duration_seconds", 240) or 240)
-                pattern = meta.get("breathing_pattern")
-                native_coro = self._daemon.start_biology_break(
-                    intervention_id=str(intervention_id or ""),
-                    duration_seconds=duration,
-                    breathing_pattern=pattern if isinstance(pattern, str) else None,
-                    audio_cue=bool(meta.get("audio_cue", True)),
-                    reason=str(meta.get("reason", "user_requested_break"))[:120],
-                )
-            elif action_type == "resume_last_active_file":
-                # Editor/native adapter — focus the last active file in
-                # the connected VS Code / editor adapter.
-                native_coro = self._daemon._resume_last_active_file(dict(action))
-            elif action_type in ("prompt_micro_commit", "suggest_movement_break"):
-                # Native inline widgets (confirmed in the overlay). Mirror
-                # the engagement to peer surfaces via a prompt broadcast,
-                # then record natively. Nothing is dispatched to chrome.
-                params = {
-                    k: v for k, v in action.items()
-                    if k not in ("action_type", "action_id", "label", "reason")
-                }
-                native_coro = self._daemon._broadcast_prompt(action_type, params)
-        except Exception:
-            logger.debug("Native action execution failed", exc_info=True)
-
-        # Audit-prod fix: dispatch + engage + log are composed into a
-        # single coroutine so the ordering invariant ("dispatch BEFORE
-        # engage") is enforced lexically by ``await``, not implicitly by
-        # FIFO scheduling of three separate ``run_coroutine_threadsafe``
-        # calls. The engage handler invokes ``_restore_manager.engage``
-        # which clears ``_active_intervention_id``; the dispatch
-        # liveness gate reads that same field. If the gate ran after
-        # engage, every legitimate browser-action click would be
-        # rejected as stale.
+        if not self._daemon.workspace_mutation_allowed:
+            logger.info(
+                "Desktop action ignored in suggest-only mode "
+                "(intervention_id=%s)",
+                intervention_id,
+            )
+            return
         action_copy = dict(action)
-        log_payload = {
-            "action_id": action_id,
-            "action_type": action_type,
-            "intervention_id": intervention_id,
-            "result": {"native": executed_natively, "source": "desktop_overlay"},
-        }
-        engage_payload = {
-            "action": "engaged",
-            "intervention_id": intervention_id,
-        }
-
-        async def _dispatch_then_record() -> None:
-            if executed_natively:
-                # Native action types run a daemon-local coroutine (break
-                # session / countdown timer / editor focus / prompt
-                # broadcast) when one was prepared; copy_to_clipboard is
-                # log-only (handled synchronously above).
-                if native_coro is not None:
-                    try:
-                        await native_coro
-                    except Exception:
-                        logger.debug(
-                            "native action coroutine failed", exc_info=True,
-                        )
-            else:
-                try:
-                    await self._daemon.dispatch_action_to_browser(
-                        intervention_id, action_copy,
-                    )
-                except Exception:
-                    logger.debug(
-                        "dispatch_action_to_browser failed", exc_info=True,
-                    )
+        async def _authorize_and_dispatch() -> None:
             try:
-                await self._daemon._handle_user_action(engage_payload)
-            except Exception:
-                logger.debug(
-                    "Engaged USER_ACTION submission failed", exc_info=True,
+                sent = await self._daemon.dispatch_intervention_action(
+                    intervention_id,
+                    action_copy,
                 )
-            try:
-                await self._daemon._handle_user_action(log_payload)
+                if sent == 0:
+                    logger.info(
+                        "Desktop exact action was not dispatched "
+                        "(intervention_id=%s action_id=%s)",
+                        intervention_id,
+                        action_copy.get("action_id"),
+                    )
             except Exception:
                 logger.debug(
-                    "action_executed log submission failed", exc_info=True,
+                    "desktop exact action dispatch failed",
+                    exc_info=True,
                 )
 
         try:
             asyncio.run_coroutine_threadsafe(
-                _dispatch_then_record(), self._daemon_loop,
+                _authorize_and_dispatch(), self._daemon_loop,
             )
         except Exception:
-            logger.debug("dispatch/engage scheduling failed", exc_info=True)
+            logger.debug("exact action scheduling failed", exc_info=True)
 
     @Slot(str, int, str)
     def _on_micro_step_toggled(
@@ -1606,7 +1506,7 @@ class CortexAppController:
         ``run`` returns.
 
         The contract returned to the controller — ``(elapsed_seconds,
-        completed)`` — feeds the daemon's BiologyBreakController which
+        completed)`` — feeds the daemon's GuidedBreakController which
         in turn computes ``recovery_delta`` and persists the BreakRecord.
         """
         import concurrent.futures
@@ -1684,46 +1584,9 @@ class CortexAppController:
 
     @Slot(dict)
     def _on_break_pill_clicked(self, payload: dict) -> None:
-        """P0 §3.7: user clicked the "Take a break" pill on the dashboard.
+        """Legacy pill callbacks cannot start an unvalidated biology break."""
 
-        Schedules ``daemon.start_biology_break`` directly so the desktop
-        full-screen overlay drives the same breathing controller as a
-        daemon-initiated promotion. Pulls duration / pattern / audio cue
-        out of the cached BREAK_RECOMMENDATION payload that the dashboard
-        echoes back; falls back to the controller's existing defaults
-        when fields are missing.
-        """
-        if self._daemon is None or self._daemon_loop is None:
-            return
-        if not isinstance(payload, dict):
-            payload = {}
-        # The payload mirrors MessageType.BREAK_RECOMMENDATION fields.
-        # ``duration_seconds`` defaults to 240 (4 min) per the spec.
-        try:
-            duration_seconds = int(payload.get("duration_seconds") or 240)
-        except (TypeError, ValueError):
-            duration_seconds = 240
-        pattern_raw = payload.get("breathing_pattern")
-        pattern: str | None = (
-            str(pattern_raw) if isinstance(pattern_raw, str) and pattern_raw else None
-        )
-        audio_cue = bool(payload.get("audio_cue", True))
-        reason = str(payload.get("reason") or "user_break_pill_click")[:120]
-        try:
-            asyncio.run_coroutine_threadsafe(
-                self._daemon.start_biology_break(
-                    intervention_id=None,
-                    duration_seconds=duration_seconds,
-                    breathing_pattern=pattern,
-                    audio_cue=audio_cue,
-                    reason=reason,
-                ),
-                self._daemon_loop,
-            )
-        except Exception:
-            logger.debug(
-                "start_biology_break scheduling failed", exc_info=True,
-            )
+        del payload
 
     @Slot(str)
     def _on_undo_action_requested(self, intervention_id: str) -> None:
@@ -1920,6 +1783,7 @@ class CortexAppController:
         # the module-level dependency graph until calibration starts).
         from cortex.services.capture_service.calibration_runner import (
             CalibrationRunner,
+            calibration_review_payload,
         )
 
         # Guard against re-entry: a second click on Begin while a run
@@ -1941,6 +1805,16 @@ class CortexAppController:
                     "face_ok": bool(getattr(progress, "face_ok", False)),
                     "pct_complete": float(getattr(progress, "pct_complete", 0.0)),
                     "status": str(getattr(progress, "status", "running")),
+                    "phase": str(getattr(progress, "phase", "camera_quality_check")),
+                    "phase_instruction": str(
+                        getattr(progress, "phase_instruction", "")
+                    ),
+                    "valid_duration_seconds": float(
+                        getattr(progress, "valid_duration_seconds", 0.0)
+                    ),
+                    "missing_fraction": float(
+                        getattr(progress, "missing_fraction", 1.0)
+                    ),
                 }
                 self._bridge.calibration_progress.emit(payload)
             except Exception:
@@ -1951,6 +1825,7 @@ class CortexAppController:
 
         async def _drive() -> None:
             paused_capture = False
+            ready_for_review = False
             try:
                 if (
                     self._daemon is not None
@@ -1966,11 +1841,19 @@ class CortexAppController:
                             exc_info=True,
                         )
                 await runner.start(on_progress=_progress_cb)
-                await runner.finish()
+                if runner.last_progress is not None and (
+                    runner.last_progress.status == "review_required"
+                ):
+                    profile = runner.preview_profile()
+                    self._bridge.calibration_review.emit(
+                        calibration_review_payload(profile)
+                    )
+                    ready_for_review = True
             except Exception:
                 logger.exception("calibration run failed")
             finally:
-                self._calibration_runner = None
+                if not ready_for_review:
+                    self._calibration_runner = None
                 if paused_capture and self._daemon is not None:
                     try:
                         await self._daemon._capture_pipeline.start()
@@ -2001,6 +1884,125 @@ class CortexAppController:
             name="cortex-calibration",
             daemon=True,
         ).start()
+
+    def _on_calibration_review(self, payload: dict) -> None:
+        """Present measured evidence before the active-pointer commit."""
+
+        metrics = payload.get("metrics", [])
+        lines: list[str] = []
+        if isinstance(metrics, list):
+            for item in metrics:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name", "metric")).replace("_", " ").title()
+                maturity = str(item.get("maturity", "unavailable"))
+                value = item.get("value")
+                unit = str(item.get("unit", ""))
+                rendered = "Unavailable" if value is None else f"{float(value):.2f} {unit}"
+                valid_seconds = float(item.get("valid_duration_seconds", 0.0))
+                missing_pct = float(item.get("missing_fraction", 1.0)) * 100.0
+                quality = float(item.get("quality_median", 0.0))
+                lines.append(
+                    f"{name}: {rendered} · {maturity}\n"
+                    f"  {valid_seconds:.0f}s valid · median quality {quality:.2f} "
+                    f"· {missing_pct:.0f}% missing/rejected"
+                )
+        box = QMessageBox(self._onboarding or self._dashboard)
+        box.setWindowTitle("Review calibration")
+        box.setIcon(QMessageBox.Icon.Information)
+        provenance = str(payload.get("provenance", "unknown"))
+        camera_name = str(payload.get("camera_name") or "Current camera")
+        box.setText("Apply this measured calibration profile?")
+        box.setInformativeText(
+            f"Source: {provenance} · Camera: {camera_name}. "
+            "Cortex will apply observed work and head/neck baselines now. "
+            "Webcam heart and breathing estimates remain experimental and "
+            "will not affect scoring."
+        )
+        box.setDetailedText("\n".join(lines) or "No metrics were available.")
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard
+        )
+        save_button = box.button(QMessageBox.StandardButton.Save)
+        if save_button is not None:
+            save_button.setText("Save measured profile")
+        if box.exec() == QMessageBox.StandardButton.Save:
+            self._commit_calibration()
+        else:
+            self._discard_calibration()
+
+    def _commit_calibration(self) -> None:
+        runner = self._calibration_runner
+        if runner is None:
+            return
+
+        async def _commit() -> None:
+            try:
+                from cortex.services.capture_service.calibration_store import (
+                    calibration_profile_sha256,
+                )
+
+                profile = await runner.finish(approved_by_user=True)
+                if self._daemon is None:
+                    raise RuntimeError("daemon is unavailable")
+                event = self._daemon.activate_calibration_profile(
+                    str(profile.profile_id),
+                    expected_sha256=calibration_profile_sha256(profile),
+                )
+                runner.mark_applied(str(event.profile_id))
+            except Exception as exc:
+                logger.exception("calibration commit or live reload failed")
+                try:
+                    runner.mark_failed(str(exc))
+                except Exception:
+                    logger.debug("calibration failure progress failed", exc_info=True)
+                self._bridge.error_occurred.emit(
+                    "Calibration not applied",
+                    (
+                        "Cortex could not validate and apply the measured profile. "
+                        "The previous calibration remains active."
+                    ),
+                    "calibration_apply_failed",
+                )
+            finally:
+                self._calibration_runner = None
+
+        if self._daemon_loop is not None and self._daemon_loop.is_running():
+            asyncio.run_coroutine_threadsafe(_commit(), self._daemon_loop)
+            return
+
+        def _worker() -> None:
+            asyncio.run(_commit())
+
+        threading.Thread(
+            target=_worker,
+            name="cortex-calibration-commit",
+            daemon=True,
+        ).start()
+
+    def _discard_calibration(self) -> None:
+        runner = self._calibration_runner
+        if runner is not None:
+            runner.abort()
+        self._calibration_runner = None
+        self._on_calibration_progress(
+            {
+                "elapsed_seconds": 0.0,
+                "total_seconds": 0.0,
+                "current_hr": None,
+                "current_hrv": None,
+                "current_sqi": None,
+                "lighting_ok": False,
+                "motion_ok": False,
+                "face_ok": False,
+                "pct_complete": 0.0,
+                "status": "aborted",
+                "phase": "review",
+                "phase_instruction": "Profile discarded; the previous calibration is unchanged.",
+                "valid_duration_seconds": 0.0,
+                "missing_fraction": 1.0,
+            }
+        )
 
     def _on_calibration_progress(self, payload: dict) -> None:
         """Marshal calibration progress (queued from the daemon thread)

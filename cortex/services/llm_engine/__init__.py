@@ -8,6 +8,7 @@ SDK and selects ``AsyncAnthropicBedrock`` / ``AsyncAnthropic`` /
 ``AsyncAnthropicVertex`` via the ``ANTHROPIC_PROVIDER`` env var.
 """
 
+from cortex.application.clock import Clock
 from cortex.libs.config.settings import LLMConfig
 from cortex.services.llm_engine.anthropic_planner import AnthropicPlanner
 from cortex.services.llm_engine.cache import LLMCache
@@ -16,6 +17,12 @@ from cortex.services.llm_engine.client import (
     LLMError,
     RuleBasedLLMClient,
     build_fallback_plan,
+)
+from cortex.services.llm_engine.context_broker import (
+    ContextBroker,
+    NoContentPlanner,
+    PrivacyAwarePlanner,
+    build_no_content_plan,
 )
 from cortex.services.llm_engine.parser import (
     parse_and_validate,
@@ -38,10 +45,14 @@ __all__ = [
     "LLMError",
     "PROMPT_TEMPLATES",
     "RuleBasedLLMClient",
+    "ContextBroker",
+    "NoContentPlanner",
+    "PrivacyAwarePlanner",
     "SYSTEM_PROMPT",
     "build_anthropic_messages",
     "build_fallback_plan",
     "build_messages",
+    "build_no_content_plan",
     "build_user_prompt",
     "create_llm_client",
     "parse_and_validate",
@@ -53,26 +64,30 @@ __all__ = [
 
 def create_llm_client(
     config: LLMConfig | None = None,
+    *,
+    clock: Clock | None = None,
 ) -> LLMClient:
     """Construct the production LLM client.
 
-    Always returns an :class:`AnthropicPlanner` unless the user has
-    explicitly opted in to ``fallback_mode="rule_based"`` AND no Bedrock
-    bearer token is available — in that case the deterministic
-    :class:`RuleBasedLLMClient` is returned so the daemon never crashes.
+    Network access is opt-in. The default ``no_llm`` mode constructs no SDK
+    and uses the deterministic local rule planner. ``no_content`` constructs
+    neither an SDK nor a context-dependent planner. External mode is always
+    wrapped in :class:`PrivacyAwarePlanner`, which requires a fresh exact
+    preview confirmation for every request.
     """
     cfg = config or LLMConfig()
 
-    if cfg.fallback_mode == "rule_based":
-        # The planner itself degrades gracefully on circuit-open / credential
-        # failure, so this branch is reached only when callers opt out of
-        # any Anthropic call (e.g. tests, air-gapped environments).
-        import os
+    if cfg.privacy.planner_mode == "no_content":
+        return NoContentPlanner()
 
-        if cfg.provider == "bedrock" and not os.getenv("AWS_BEARER_TOKEN_BEDROCK"):
-            try:
-                return AnthropicPlanner(cfg)
-            except RuntimeError:
-                return RuleBasedLLMClient()
+    if cfg.privacy.planner_mode == "no_llm":
+        return RuleBasedLLMClient()
 
-    return AnthropicPlanner(cfg)
+    if not cfg.privacy.external_transport_enabled:
+        return PrivacyAwarePlanner(cfg, None, clock=clock)
+
+    try:
+        transport = AnthropicPlanner(cfg, clock=clock)
+    except RuntimeError:
+        transport = None
+    return PrivacyAwarePlanner(cfg, transport, clock=clock)

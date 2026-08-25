@@ -89,7 +89,11 @@ def test_401_returns_auth_error_fallback(
             raise _FakeAPIStatusError(401)
 
     sdk = _SDK()
-    planner = AnthropicPlanner(config=cfg, sdk=sdk)
+    planner = AnthropicPlanner(
+        config=cfg,
+        sdk=sdk,
+        _allow_unbrokered_test_requests=True,
+    )
 
     # Swap the SDK-error class the planner catches against ours.
     import cortex.services.llm_engine.anthropic_planner as ap
@@ -121,7 +125,11 @@ def test_403_also_short_circuits(monkeypatch: pytest.MonkeyPatch) -> None:
             raise _FakeAPIStatusError(403)
 
     sdk = _SDK()
-    planner = AnthropicPlanner(config=cfg, sdk=sdk)
+    planner = AnthropicPlanner(
+        config=cfg,
+        sdk=sdk,
+        _allow_unbrokered_test_requests=True,
+    )
 
     import cortex.services.llm_engine.anthropic_planner as ap
 

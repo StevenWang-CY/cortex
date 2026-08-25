@@ -119,6 +119,7 @@ def _make_planner(
         cfg,
         sdk=sdk or _make_stub_sdk(),
         cost_tracker=cost_tracker,
+        _allow_unbrokered_test_requests=True,
     )
 
 
@@ -196,7 +197,7 @@ def test_per_day_rollover(tmp_path: Path) -> None:
 def test_persistence_survives_restart(tmp_path: Path) -> None:
     ledger = tmp_path / "cost_ledger.json"
     tracker = CostTracker(ledger, warn_usd=5.0, kill_usd=20.0)
-    now = datetime(2026, 5, 19, 12, 0, 0)
+    now = datetime.now().replace(hour=12, minute=0, second=0, microsecond=0)
     tracker.record("cid_persist", "claude-haiku-4-5", 3.5, now=now)
 
     # Simulate a daemon restart: build a fresh tracker on the same file.

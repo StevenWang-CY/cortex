@@ -1,4 +1,4 @@
-# Physio Engine - rPPG heart rate, HRV extraction, and signal quality
+# Physio Engine - evidence-gated rPPG and signal quality
 from cortex.services.physio_engine.pulse_estimator import (
     PulseEstimate,
     PulseEstimator,

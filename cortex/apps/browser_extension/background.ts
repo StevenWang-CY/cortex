@@ -8,23 +8,85 @@
  */
 
 import {
-    classifyTabType as classifyBrowserTabType,
-    classifyTabTypeWithGoal,
     groupSpecificTabs,
-    hideNonActiveTabs as hideTabsForIntervention,
+    hideNonActiveTabs,
+    getSnapshot as getTabManagerSnapshot,
     restoreAllTabs,
     restoreHiddenTabs as restoreTabsForIntervention,
     saveTabSession,
     restoreTabSession,
+    IndeterminateBrowserMutationError,
 } from "./tab-manager";
 import { getAuthToken } from "./lib/auth";
 import { detectBrowser } from "./lib/browser";
+import {
+    PAGE_EXCERPT_MAX_CHARS,
+    sanitizeContextText,
+} from "./lib/context-privacy";
+import {
+    sanitizeActivityRecord,
+    type ActivityRecord,
+} from "./lib/activity-privacy";
+import {
+    canonicalizeActivityUrl as canonicalizeUrl,
+    configureActivityStore,
+    enrichWithRelatedTabs,
+    loadActivities,
+    prepareActivityRecordForStorage,
+    saveActivities,
+    scrubStoredActivityContent,
+    upsertActivity,
+} from "./lib/activity-store";
+export { prepareActivityRecordForStorage } from "./lib/activity-store";
 import {
     isCortexState,
     isSuggestedAction,
     normaliseInterventionPayload,
     truncatePayloadForLog,
 } from "./lib/state-guards";
+import {
+    canonicalJson,
+    sha256Hex,
+    verifyActionManifest,
+    verifyApplyCommand,
+    verifiedPresentedActionIds,
+    verifyRestoreCommand,
+} from "./lib/intervention-transaction";
+import { mayExtractPageContent } from "./lib/site-access";
+import {
+    createFocusSession,
+    emptyDailyStats,
+    focusSessionSnapshot,
+    isDistractionForSession,
+    resolveFocusPreset,
+    updateFocusSessionState,
+    type DailyStats,
+    type FocusSession,
+} from "./lib/focus-session";
+import {
+    BrowserContextCollector,
+    type TabData,
+} from "./lib/context-collector";
+import {
+    BrowserSessionStore,
+    type PersistedSessionState,
+} from "./lib/persisted-session";
+import {
+    ClientIdentityStore,
+    FrameReplayGuard,
+    ParseErrorWindow,
+    ReconnectBackoff,
+    SerialCommandQueue,
+    WireEnvelopeEncoder,
+    newWireId,
+} from "./lib/daemon-connection";
+import {
+    CapabilityExecutor,
+    UnsupportedCapabilityError,
+    type CapabilityHandlers,
+} from "./lib/capability-executor";
+import { InterventionPresentationState } from "./lib/intervention-presentation";
+import { TabActivationTelemetry } from "./lib/browser-telemetry";
 import {
     DAEMON_WS_URL,
     DAEMON_HTTP_URL,
@@ -48,6 +110,14 @@ import type {
     InterventionTriggerPayload,
     SessionRecap as SessionRecapSchema,
     CostResponse as CostResponseSchema,
+    ActionManifest,
+    ActionReceipt,
+    InterventionApplyCommand,
+    InterventionAuthorizationRequest,
+    InterventionReceiptBatch,
+    InterventionRestoreCommand,
+    ManifestAction,
+    RestoreAction,
 } from "./types/generated/cortex_schemas";
 
 // The Pydantic JSON Schema marks default-having fields as optional
@@ -57,7 +127,15 @@ import type {
 // optional. We promote the always-emitted fields back to required here
 // so consumers below can rely on them existing. Genuinely-optional
 // fields (``correlation_id`` etc.) stay optional.
-type WSMessage = Omit<WSMessageSchema, "payload"> & {
+type WSMetadataKeys =
+    | "schema_version"
+    | "protocol_version"
+    | "event_id"
+    | "sent_at_unix_ms"
+    | "sent_at_mono_ns"
+    | "boot_id";
+type WSMessage = Omit<WSMessageSchema, "payload" | WSMetadataKeys> &
+    Partial<Pick<WSMessageSchema, WSMetadataKeys>> & {
     payload: Record<string, unknown>;
 };
 
@@ -84,7 +162,10 @@ type SuggestedAction = Omit<
 
 interface CortexState {
     state: string;
+    support_state?: string;
+    status?: "estimated" | "insufficient_evidence" | "warming_up";
     confidence: number;
+    evidence_coverage?: number;
     scores: Record<string, number>;
     signal_quality: Record<string, number>;
     dwell_seconds: number;
@@ -146,13 +227,42 @@ export function _getDebugFlag(): boolean {
 let ws: WebSocket | null = null;
 let connected = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-// F32: keep the initial delay symbolic so the reset on `open` is
-// obviously paired with the doubling in `scheduleReconnect`.
-const INITIAL_RECONNECT_DELAY = 3000;
-let reconnectDelay = INITIAL_RECONNECT_DELAY;
-const MAX_RECONNECT_DELAY = 30000;
+const reconnectBackoff = new ReconnectBackoff(3_000, 30_000);
 let intentionalDisconnect = false;
 let sequence = 0;
+// Browser WebSocket callbacks do not await an async `onmessage` handler. The
+// envelope is still parsed and sequence-checked synchronously, while exact
+// APPLY/RESTORE capability work is serialized on this dedicated chain.
+const transactionCommands = new SerialCommandQueue((error: unknown) => {
+    console.warn(
+        "[cortex.bg] transaction command failed closed:",
+        String(error),
+    );
+});
+
+function enqueueTransactionCommand(
+    operation: () => Promise<void>,
+): Promise<void> {
+    return transactionCommands.enqueue(operation);
+}
+const PROTOCOL_VERSION = "2.0";
+const SUPPORTED_PROTOCOL_VERSIONS = ["2.0", "1.0"] as const;
+let negotiatedProtocolVersion: (typeof SUPPORTED_PROTOCOL_VERSIONS)[number] =
+    PROTOCOL_VERSION;
+const clientIdentityStore = new ClientIdentityStore();
+const wireEncoder = new WireEnvelopeEncoder({
+    schemaVersion: "2.0",
+    protocolVersion: () => negotiatedProtocolVersion,
+});
+const CLIENT_BOOT_ID = wireEncoder.bootId;
+
+async function getClientInstanceId(): Promise<string> {
+    return clientIdentityStore.get();
+}
+
+function withWireMetadata(msg: WSMessage): WSMessage {
+    return wireEncoder.encode(msg as WSMessage & Record<string, unknown>) as WSMessage;
+}
 // DAEMON_WS_URL, DAEMON_HTTP_URL, LAUNCHER_HTTP_URL — imported from "./config"
 
 let currentState: CortexState | null = null;
@@ -166,48 +276,294 @@ let currentState: CortexState | null = null;
  * same cid so the daemon can ignore stale ACKs from a now-superseded
  * plan. `mountedAt` is the local mount timestamp (ms since epoch).
  */
-interface ActiveInterventionRecord {
-    plan: Record<string, unknown>;
-    correlation_id: string;
-    mountedAt: number;
-}
-
-let activeIntervention: ActiveInterventionRecord | null = null;
+const interventionPresentation = new InterventionPresentationState();
+const browserContextCollector = new BrowserContextCollector();
 let quietMode = false;
 
-// Dismissal cooldown: maps intervention_id → timestamp when dismissed
-// Prevents the same intervention from re-triggering within the cooldown window
-const dismissedInterventions = new Map<string, number>();
-const DEFAULT_INTERVENTION_DISMISS_COOLDOWN = 30 * 60 * 1000; // 30 min cooldown after dismiss
-let interventionDismissCooldown = DEFAULT_INTERVENTION_DISMISS_COOLDOWN;
-// Also track by URL pattern to prevent same-site re-triggers
-const dismissedUrlPatterns = new Map<string, number>();
-const DEFAULT_URL_DISMISS_COOLDOWN = 10 * 60 * 1000; // 10 min cooldown for same URL
-let urlDismissCooldown = DEFAULT_URL_DISMISS_COOLDOWN;
+type ExecutionMode = "suggest_only" | "authorized" | "research_autonomous";
+let currentExecutionMode: ExecutionMode = "suggest_only";
+
+function parseExecutionMode(value: unknown): ExecutionMode {
+    return value === "authorized" || value === "research_autonomous"
+        ? value
+        : "suggest_only";
+}
+
+function workspaceMutationAllowed(): boolean {
+    return currentExecutionMode !== "suggest_only";
+}
+
+interface BrowserOperationRecord {
+    intervention_id: string;
+    manifest_sha256: string;
+    action_id: string;
+    authorization_id: string;
+    capability: string;
+    state: "applying" | "applied" | "failed" | "restored";
+    inverse_payload_json: string;
+    after_fingerprint: string | null;
+    updated_at_unix_ms: number;
+}
+
+interface ConsumedAuthorizationRecord {
+    manifest_sha256: string;
+    nonce: string;
+    consumed_at_unix_ms: number;
+}
+
+interface BrowserTransactionJournal {
+    schema_version: "1";
+    consumed_authorizations: Record<string, ConsumedAuthorizationRecord>;
+    operations: Record<string, BrowserOperationRecord>;
+    attempt_counters: Record<string, number>;
+    receipt_outbox: InterventionReceiptBatch[];
+}
+
+const TRANSACTION_JOURNAL_KEY = "cortex_intervention_transaction_journal_v1";
+const MAX_TRANSACTION_OPERATIONS = 512;
+const MAX_TRANSACTION_COUNTERS = 2_048;
+const MAX_RECEIPT_OUTBOX = 256;
+const MAX_INVERSE_JSON_BYTES = 65_536;
+const CREATED_TAB_STAGE_PREFIX = "about:blank#cortex-created-tab=";
+let transactionJournalLock: Promise<void> = Promise.resolve();
+
+function emptyTransactionJournal(): BrowserTransactionJournal {
+    return {
+        schema_version: "1",
+        consumed_authorizations: {},
+        operations: {},
+        attempt_counters: {},
+        receipt_outbox: [],
+    };
+}
+
+function isJournalRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isBoundedJournalString(
+    value: unknown,
+    maximum = 256,
+): value is string {
+    return typeof value === "string" && value.length > 0 && value.length <= maximum;
+}
+
+function isCanonicalObjectJson(value: unknown): value is string {
+    if (
+        typeof value !== "string"
+        || value.length === 0
+        || value.length > MAX_INVERSE_JSON_BYTES
+    ) return false;
+    try {
+        const parsed = JSON.parse(value) as unknown;
+        return isJournalRecord(parsed) && canonicalJson(parsed) === value;
+    } catch {
+        return false;
+    }
+}
+
+function validateJournalReceiptBatch(value: unknown): InterventionReceiptBatch {
+    if (!isJournalRecord(value)) throw new Error("receipt outbox batch is malformed");
+    const interventionId = value.intervention_id;
+    const authorizationId = value.authorization_id;
+    const manifestSha256 = value.manifest_sha256;
+    if (
+        !isBoundedJournalString(interventionId)
+        || !isBoundedJournalString(authorizationId)
+        || typeof manifestSha256 !== "string"
+        || !/^[0-9a-f]{64}$/.test(manifestSha256)
+        || !Array.isArray(value.receipts)
+        || value.receipts.length < 1
+        || value.receipts.length > 96
+    ) {
+        throw new Error("receipt outbox batch fields are invalid");
+    }
+    for (const receipt of value.receipts) {
+        if (!isJournalRecord(receipt)) throw new Error("receipt outbox entry is malformed");
+        const numericFields = [
+            receipt.started_at_unix_ms,
+            receipt.ended_at_unix_ms,
+            receipt.started_at_mono_ns,
+            receipt.ended_at_mono_ns,
+            receipt.duration_ms,
+        ];
+        if (
+            !isBoundedJournalString(receipt.receipt_id, 128)
+            || receipt.intervention_id !== interventionId
+            || receipt.authorization_id !== authorizationId
+            || receipt.manifest_sha256 !== manifestSha256
+            || !isBoundedJournalString(receipt.action_id, 128)
+            || !new Set(["apply", "compensate", "restore"]).has(String(receipt.phase))
+            || !Number.isInteger(receipt.attempt)
+            || Number(receipt.attempt) < 1
+            || Number(receipt.attempt) > 100
+            || !isBoundedJournalString(receipt.idempotency_key, 512)
+            || !new Set(["succeeded", "failed", "already_complete"]).has(String(receipt.status))
+            || numericFields.some((item) => typeof item !== "number" || !Number.isFinite(item) || item < 0)
+            || Number(receipt.ended_at_unix_ms) < Number(receipt.started_at_unix_ms)
+            || Number(receipt.ended_at_mono_ns) < Number(receipt.started_at_mono_ns)
+            || !isBoundedJournalString(receipt.boot_id, 128)
+            || !new Set(["verified", "failed", "not_applicable"]).has(String(receipt.verification))
+            || (
+                receipt.inverse_payload_json !== null
+                && receipt.inverse_payload_json !== undefined
+                && !isCanonicalObjectJson(receipt.inverse_payload_json)
+            )
+            || (
+                receipt.after_fingerprint !== null
+                && receipt.after_fingerprint !== undefined
+                && (
+                    typeof receipt.after_fingerprint !== "string"
+                    || !/^[0-9a-f]{64}$/.test(receipt.after_fingerprint)
+                )
+            )
+            || (receipt.source_client_type !== null && receipt.source_client_type !== undefined)
+            || (receipt.source_client_id !== null && receipt.source_client_id !== undefined)
+        ) {
+            throw new Error("receipt outbox entry fields are invalid");
+        }
+    }
+    return value as unknown as InterventionReceiptBatch;
+}
+
+function validateBrowserTransactionJournal(raw: unknown): BrowserTransactionJournal {
+    if (!isJournalRecord(raw) || raw.schema_version !== "1") {
+        throw new Error("Cortex transaction journal is corrupt");
+    }
+    const consumed = raw.consumed_authorizations;
+    const operations = raw.operations;
+    const counters = raw.attempt_counters ?? {};
+    const outbox = raw.receipt_outbox ?? [];
+    if (
+        !isJournalRecord(consumed)
+        || !isJournalRecord(operations)
+        || !isJournalRecord(counters)
+        || !Array.isArray(outbox)
+        || Object.keys(consumed).length > 256
+        || Object.keys(operations).length > MAX_TRANSACTION_OPERATIONS
+        || Object.keys(counters).length > MAX_TRANSACTION_COUNTERS
+        || outbox.length > MAX_RECEIPT_OUTBOX
+    ) {
+        throw new Error("Cortex transaction journal is corrupt");
+    }
+    const validatedConsumed: Record<string, ConsumedAuthorizationRecord> = {};
+    for (const [authorizationId, candidate] of Object.entries(consumed)) {
+        if (
+            !isBoundedJournalString(authorizationId)
+            || !isJournalRecord(candidate)
+            || typeof candidate.manifest_sha256 !== "string"
+            || !/^[0-9a-f]{64}$/.test(candidate.manifest_sha256)
+            || !isBoundedJournalString(candidate.nonce, 256)
+            || typeof candidate.consumed_at_unix_ms !== "number"
+            || !Number.isFinite(candidate.consumed_at_unix_ms)
+            || candidate.consumed_at_unix_ms < 0
+        ) throw new Error("consumed authorization journal entry is invalid");
+        validatedConsumed[authorizationId] = candidate as unknown as ConsumedAuthorizationRecord;
+    }
+    const knownCapabilities = new Set([
+        "open_url", "search_error", "highlight_tab",
+    ]);
+    const validatedOperations: Record<string, BrowserOperationRecord> = {};
+    for (const [key, candidate] of Object.entries(operations)) {
+        if (
+            !isBoundedJournalString(key, 300)
+            || !isJournalRecord(candidate)
+            || !isBoundedJournalString(candidate.intervention_id)
+            || !isBoundedJournalString(candidate.action_id, 128)
+            || key !== operationKey(candidate.intervention_id, candidate.action_id)
+            || typeof candidate.manifest_sha256 !== "string"
+            || !/^[0-9a-f]{64}$/.test(candidate.manifest_sha256)
+            || !isBoundedJournalString(candidate.authorization_id)
+            || typeof candidate.capability !== "string"
+            || !knownCapabilities.has(candidate.capability)
+            || !new Set(["applying", "applied", "failed", "restored"]).has(String(candidate.state))
+            || !isCanonicalObjectJson(candidate.inverse_payload_json)
+            || (
+                candidate.after_fingerprint !== null
+                && (
+                    typeof candidate.after_fingerprint !== "string"
+                    || !/^[0-9a-f]{64}$/.test(candidate.after_fingerprint)
+                )
+            )
+            || typeof candidate.updated_at_unix_ms !== "number"
+            || !Number.isFinite(candidate.updated_at_unix_ms)
+            || candidate.updated_at_unix_ms < 0
+        ) throw new Error("browser operation journal entry is invalid");
+        validatedOperations[key] = candidate as unknown as BrowserOperationRecord;
+    }
+    const validatedCounters: Record<string, number> = {};
+    for (const [key, value] of Object.entries(counters)) {
+        if (
+            !isBoundedJournalString(key, 512)
+            || !Number.isInteger(value)
+            || Number(value) < 0
+            || Number(value) > 100
+        ) throw new Error("receipt attempt counter is invalid");
+        validatedCounters[key] = Number(value);
+    }
+    const validatedOutbox = outbox.map(validateJournalReceiptBatch);
+    const receiptIds = new Set<string>();
+    for (const batch of validatedOutbox) {
+        for (const receipt of batch.receipts) {
+            const receiptId = String(receipt.receipt_id);
+            if (receiptIds.has(receiptId)) {
+                throw new Error("duplicate receipt id in transaction outbox");
+            }
+            receiptIds.add(receiptId);
+        }
+    }
+    return {
+        schema_version: "1",
+        consumed_authorizations: validatedConsumed,
+        operations: validatedOperations,
+        attempt_counters: validatedCounters,
+        receipt_outbox: validatedOutbox,
+    };
+}
+
+async function readTransactionJournal(): Promise<BrowserTransactionJournal> {
+    const data = await chrome.storage.local.get(TRANSACTION_JOURNAL_KEY);
+    const raw = data[TRANSACTION_JOURNAL_KEY] as unknown;
+    if (raw === undefined) return emptyTransactionJournal();
+    return validateBrowserTransactionJournal(raw);
+}
+
+async function mutateTransactionJournal<T>(
+    mutate: (journal: BrowserTransactionJournal) => T | Promise<T>,
+): Promise<T> {
+    let resolveTurn: (() => void) | undefined;
+    const prior = transactionJournalLock;
+    transactionJournalLock = new Promise<void>((resolve) => {
+        resolveTurn = resolve;
+    });
+    await prior;
+    try {
+        const journal = await readTransactionJournal();
+        const result = await mutate(journal);
+        await chrome.storage.local.set({ [TRANSACTION_JOURNAL_KEY]: journal });
+        return result;
+    } finally {
+        resolveTurn?.();
+    }
+}
+
+interface PendingAuthorization {
+    interventionId: string;
+    actionIds: string[];
+    authorizationId?: string;
+    localResults: Map<string, ActionExecuteResult>;
+    resolve: (results: ActionExecuteResult[]) => void;
+    timeout: ReturnType<typeof setTimeout>;
+}
+
+const pendingAuthorizations = new Map<string, PendingAuthorization>();
+
+/** Test-only witness for the fail-closed client authority state. */
+export function _getExecutionMode(): ExecutionMode {
+    return currentExecutionMode;
+}
 
 // --- Focus Session State ---
-
-interface FocusSession {
-    startTime: number;
-    totalFocusMs: number;      // biometrically-verified focus milliseconds
-    distractionsBlocked: number;
-    lastFocusCheck: number;
-    lastStateWasFocus: boolean;
-    longestStreakMs: number;
-    currentStreakStart: number;
-    goal: string;
-}
-
-interface DailyStats {
-    date: string; // YYYY-MM-DD
-    totalFocusMin: number;
-    totalSessionMin: number;
-    sessions: number;
-    distractionsBlocked: number;
-    longestStreakMin: number;
-    avgHrDuringFocus: number;
-    hrSamples: number;
-}
 
 let focusSession: FocusSession | null = null;
 
@@ -221,25 +577,6 @@ let autoFocusAlarmName: string | null = null;
 // stable preset → patterns map. The browser extension is the source
 // of truth for the per-preset list; the daemon ships only the preset
 // name + any user custom_domains.
-const FOCUS_PRESET_DOMAINS: Record<string, RegExp[]> = {
-    developer: [
-        /reddit\.com/i, /twitter\.com/i, /x\.com/i, /facebook\.com/i,
-        /instagram\.com/i, /tiktok\.com/i, /youtube\.com/i, /netflix\.com/i,
-        /9gag\.com/i, /buzzfeed\.com/i, /tumblr\.com/i, /twitch\.tv/i,
-    ],
-    student: [
-        /instagram\.com/i, /tiktok\.com/i, /youtube\.com/i, /reddit\.com/i,
-        /twitter\.com/i, /x\.com/i, /netflix\.com/i, /twitch\.tv/i,
-        /facebook\.com/i, /snapchat\.com/i,
-    ],
-    writer: [
-        /twitter\.com/i, /x\.com/i, /reddit\.com/i, /facebook\.com/i,
-        /instagram\.com/i, /tiktok\.com/i, /youtube\.com/i, /netflix\.com/i,
-        /hacker-news\.firebaseio\.com/i, /news\.ycombinator\.com/i,
-    ],
-    custom: [],
-};
-
 let activeFocusPresetPatterns: RegExp[] = [];
 let activeFocusCustomDomains: string[] = [];
 // Phase-3 P1-DF-10.4: persisted preset name so the SW can rebuild
@@ -247,100 +584,50 @@ let activeFocusCustomDomains: string[] = [];
 // survive chrome.storage round-trips, but the string preset name does).
 let _activeFocusPresetName: string = "developer";
 
-// Two-tier distraction detection
-const ALWAYS_DISTRACTION = [
-    /instagram\.com/i, /tiktok\.com/i, /netflix\.com/i,
-    /twitch\.tv/i, /9gag\.com/i, /buzzfeed\.com/i, /tumblr\.com/i,
-];
-const CONDITIONAL_DISTRACTION = [
-    /reddit\.com/i, /twitter\.com/i, /x\.com/i, /facebook\.com/i,
-];
-const AI_ASSISTANT_URL_PATTERN = /gemini\.google\.com|chatgpt\.com|chat\.openai\.com|claude\.ai|copilot\.microsoft\.com|perplexity\.ai/i;
-const VIDEO_PLATFORM_URL_PATTERN = /youtube\.com|youtu\.be/i;
-
 // --- Recently-visited tab protection ---
 // Track when each tab was last activated so we can protect recently-used tabs from closing
-const tabLastActivated = new Map<number, number>();
+const tabActivationTelemetry = new TabActivationTelemetry();
 const RECENTLY_ACTIVE_PROTECTION_MS = 5 * 60 * 1000; // 5 minutes
 
 chrome.tabs.onActivated.addListener((activeInfo) => {
-    tabLastActivated.set(activeInfo.tabId, Date.now());
+    tabActivationTelemetry.recordActivation(activeInfo.tabId);
     schedulePersist();
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-    tabLastActivated.delete(tabId);
+    tabActivationTelemetry.recordRemoval(tabId);
     schedulePersist();
 });
 
 // --- State Persistence (survives MV3 service worker restarts) ---
 
-let persistTimer: ReturnType<typeof setTimeout> | null = null;
-// Phase-3 P1-DF-10.4: auto-focus state must survive MV3 SW eviction
-// or ``isDistractionUrl`` falls back to an empty blocklist while the
-// daemon still believes the session is armed.
-const PERSIST_KEYS = [
-    "focusSession", "undoStack", "dismissedInterventions",
-    "dismissedUrlPatterns", "quietMode", "tabLastActivated",
-    "autoFocusArmed", "autoFocusEndsAt", "autoFocusPreset",
-    "autoFocusCustomDomains",
-] as const;
-
-// Phase 4d Task A: auto-focus state mirrored to ``chrome.storage.local``
-// under a single key. ``chrome.storage.session`` clears whenever the
-// browser fully restarts (or when SW eviction races a profile restart),
-// but the daemon's ``STOP_FOCUS_AUTO`` is symmetric — if the extension
-// forgot it ever armed, the stop becomes a no-op and the daemon's
-// _auto_focus_armed bit gets stuck on. Local storage is the durable
-// floor that survives the worst restart scenarios.
-const AUTO_FOCUS_STATE_KEY = "cortex_auto_focus_state";
-let _autoFocusStatePersistTimer: ReturnType<typeof setTimeout> | null = null;
+const browserSessionStore = new BrowserSessionStore();
 
 async function persistAutoFocusState(): Promise<void> {
-    // Debounce so a rapid arm → tick → stop sequence collapses to one
-    // chrome.storage.local.set; matches the schedulePersist pattern.
-    if (_autoFocusStatePersistTimer) clearTimeout(_autoFocusStatePersistTimer);
-    _autoFocusStatePersistTimer = setTimeout(async () => {
-        try {
-            await chrome.storage.local.set({
-                [AUTO_FOCUS_STATE_KEY]: {
-                    autoFocusArmed,
-                    _activeFocusPresetName,
-                    activeFocusPresetPatterns: activeFocusPresetPatterns
-                        .map((p) => p.source),
-                },
-            });
-        } catch {
-            // storage.local may transiently fail (quota / extension reload).
-        }
-    }, 200);
+    browserSessionStore.scheduleAutoFocus({
+        autoFocusArmed,
+        presetName: _activeFocusPresetName,
+        presetPatternSources: activeFocusPresetPatterns.map(
+            (pattern) => pattern.source,
+        ),
+    });
 }
 
 async function restoreAutoFocusStateLocal(): Promise<void> {
     try {
-        const data = await chrome.storage.local.get(AUTO_FOCUS_STATE_KEY);
-        const blob = data[AUTO_FOCUS_STATE_KEY] as
-            | {
-                  autoFocusArmed?: boolean;
-                  _activeFocusPresetName?: string;
-                  activeFocusPresetPatterns?: string[];
-              }
-            | undefined;
+        const blob = await browserSessionStore.loadAutoFocus();
         if (!blob) return;
         // session storage takes precedence — it's the freshest source
         // when both are available. Only adopt local-state fields the
         // session restore left unset.
-        if (typeof blob._activeFocusPresetName === "string"
-            && !_activeFocusPresetName) {
-            _activeFocusPresetName = blob._activeFocusPresetName;
-        }
         if (blob.autoFocusArmed === true && !autoFocusArmed) {
+            _activeFocusPresetName = blob.presetName;
             autoFocusArmed = true;
             // Rebuild patterns from the preset name (regex literals
             // don't survive JSON; the preset string does).
-            activeFocusPresetPatterns =
-                FOCUS_PRESET_DOMAINS[_activeFocusPresetName]
-                || FOCUS_PRESET_DOMAINS.developer;
+            activeFocusPresetPatterns = resolveFocusPreset(
+                _activeFocusPresetName,
+            );
         }
         // Sanity check (spec): inconsistent state where we claim
         // ``autoFocusArmed=true`` but there is no ``focusSession`` means
@@ -378,22 +665,23 @@ async function restoreAutoFocusStateLocal(): Promise<void> {
 }
 
 function schedulePersist(): void {
-    if (persistTimer) clearTimeout(persistTimer);
-    persistTimer = setTimeout(async () => {
-        await chrome.storage.session.set({
-            focusSession,
-            undoStack,
-            dismissedInterventions: [...dismissedInterventions.entries()],
-            dismissedUrlPatterns: [...dismissedUrlPatterns.entries()],
-            quietMode,
-            tabLastActivated: [...tabLastActivated.entries()],
-            // Phase-3 P1-DF-10.4: auto-focus session bookkeeping.
-            autoFocusArmed,
-            autoFocusEndsAt,
-            autoFocusPreset: _activeFocusPresetName,
-            autoFocusCustomDomains: activeFocusCustomDomains,
-        });
-    }, 500);
+    browserSessionStore.scheduleSession(persistedSessionSnapshot());
+}
+
+function persistedSessionSnapshot(): PersistedSessionState<FocusSession, UndoEntry> {
+    const cooldowns = interventionPresentation.cooldownSnapshot();
+    return {
+        focusSession,
+        undoStack,
+        dismissedInterventions: cooldowns.interventions,
+        dismissedUrlPatterns: cooldowns.urls,
+        quietMode,
+        tabLastActivated: tabActivationTelemetry.entries(),
+        autoFocusArmed,
+        autoFocusEndsAt,
+        autoFocusPreset: _activeFocusPresetName,
+        autoFocusCustomDomains: activeFocusCustomDomains,
+    };
 }
 
 /**
@@ -402,39 +690,19 @@ function schedulePersist(): void {
  * `--strict`, so we cast the result to this explicit shape to recover the
  * per-key element types (Map entries round-trip as `[K, V][]` arrays).
  */
-interface PersistedSessionState {
-    focusSession?: FocusSession;
-    undoStack?: UndoEntry[];
-    dismissedInterventions?: [string, number][];
-    dismissedUrlPatterns?: [string, number][];
-    quietMode?: boolean;
-    tabLastActivated?: [number, number][];
-    autoFocusArmed?: boolean;
-    autoFocusEndsAt?: number | null;
-    autoFocusPreset?: string;
-    autoFocusCustomDomains?: string[];
-}
-
 async function restoreState(): Promise<void> {
-    const data = (await chrome.storage.session.get(
-        PERSIST_KEYS as unknown as (keyof PersistedSessionState)[],
-    )) as PersistedSessionState;
+    const data = await browserSessionStore.loadSession<FocusSession, UndoEntry>();
     if (data.focusSession) focusSession = data.focusSession;
     if (data.undoStack) {
         undoStack.splice(0, undoStack.length, ...data.undoStack);
     }
-    if (data.dismissedInterventions) {
-        dismissedInterventions.clear();
-        for (const [k, v] of data.dismissedInterventions) dismissedInterventions.set(k, v);
-    }
-    if (data.dismissedUrlPatterns) {
-        dismissedUrlPatterns.clear();
-        for (const [k, v] of data.dismissedUrlPatterns) dismissedUrlPatterns.set(k, v);
-    }
+    interventionPresentation.hydrateCooldowns({
+        interventions: data.dismissedInterventions,
+        urls: data.dismissedUrlPatterns,
+    });
     if (data.quietMode !== undefined) quietMode = data.quietMode;
     if (data.tabLastActivated) {
-        tabLastActivated.clear();
-        for (const [k, v] of data.tabLastActivated) tabLastActivated.set(k, v);
+        tabActivationTelemetry.hydrate(data.tabLastActivated);
     }
     // Phase-3 P1-DF-10.4: rehydrate auto-focus state so isDistractionUrl
     // keeps blocking even across MV3 SW eviction.
@@ -446,8 +714,9 @@ async function restoreState(): Promise<void> {
     }
     if (typeof data.autoFocusPreset === "string") {
         _activeFocusPresetName = data.autoFocusPreset;
-        activeFocusPresetPatterns = FOCUS_PRESET_DOMAINS[_activeFocusPresetName]
-            || FOCUS_PRESET_DOMAINS.developer;
+        activeFocusPresetPatterns = resolveFocusPreset(
+            _activeFocusPresetName,
+        );
     }
     if (Array.isArray(data.autoFocusCustomDomains)) {
         activeFocusCustomDomains = data.autoFocusCustomDomains
@@ -470,249 +739,29 @@ async function restoreState(): Promise<void> {
 restoreState();
 
 // Health alert state
-let lastPostureAlert = 0;
+let lastHeadNeckAlert = 0;
 let lastBlinkAlert = 0;
 let lowBlinkStart = 0;
-let leaningStart = 0;
+let headNeckFlexionStart = 0;
 const HEALTH_ALERT_COOLDOWN = 300_000; // 5 min between alerts
-const POSTURE_ALERT_THRESHOLD = 180_000; // 3 min leaning
+const HEAD_NECK_ALERT_THRESHOLD = 180_000; // 3 min beyond calibrated neutral range
 const BLINK_ALERT_THRESHOLD = 180_000;  // 3 min low blink rate
 
 // Break recommendation state
-let lastBreakSuggestion = 0;
-let consecutiveStressUpdates = 0;
 
 // --- Activity Tracking State ---
 
-interface ActivityPosition {
-    type: "video" | "scroll" | "code_problem" | "notebook" | "pdf" | "slides" | "general";
-    [key: string]: unknown;
-}
-
-interface ActivityRecord {
-    content_id: string;
-    platform: string;
-    content_type: "video" | "article" | "code_problem" | "documentation"
-        | "course_lecture" | "notebook" | "pdf" | "slides" | "general";
-    title: string;
-    url: string;
-    favicon_url: string;
-    position: ActivityPosition;
-    content_duration_s: number;
-    duration_spent_s: number;
-    session_duration_s: number;
-    first_visited: number;
-    last_visited: number;
-    context_snapshot: string;
-    topic_tags: string[];
-    completion_pct: number;
-    max_completion_pct: number;
-    cognitive_state: string;
-    visit_count: number;
-    dismissed: boolean;
-    is_playlist: boolean;
-    playlist_id: string;
-    playlist_index: number;
-    related_tabs: string[];
-}
-
-let lastActivitySyncTime = 0;
-const ACTIVITY_SYNC_INTERVAL = 60_000; // Sync to daemon every 60s
-const ACTIVITY_STORAGE_KEY = "cortex_activities";
-const MAX_ACTIVITIES = 200;
-
-async function loadActivities(): Promise<Record<string, ActivityRecord>> {
-    const data = await chrome.storage.local.get(ACTIVITY_STORAGE_KEY);
-    return (data[ACTIVITY_STORAGE_KEY] as Record<string, ActivityRecord>) || {};
-}
-
-async function saveActivities(activities: Record<string, ActivityRecord>): Promise<void> {
-    await chrome.storage.local.set({ [ACTIVITY_STORAGE_KEY]: activities });
-}
-
-async function upsertActivity(record: ActivityRecord): Promise<void> {
-    const activities = await loadActivities();
-    const existing = activities[record.content_id];
-
-    if (existing) {
-        // Determine if this is a continuation of the same session or a new visit.
-        // Same session: first_visited matches (content script uses sessionStartTime).
-        // New visit: first_visited differs (content script reset via resetForNewPage).
-        const isSameSession = existing.first_visited === record.first_visited
-            || (record.first_visited > existing.last_visited - 10_000); // within 10s = same session
-
-        if (isSameSession) {
-            // Replace session contribution: subtract old session time, add new
-            existing.duration_spent_s = (existing.duration_spent_s - existing.session_duration_s) + record.duration_spent_s;
-            existing.session_duration_s = record.duration_spent_s;
-        } else {
-            // New visit: add the new session's dwell time
-            existing.duration_spent_s += record.duration_spent_s;
-            existing.session_duration_s = record.duration_spent_s;
-            existing.visit_count++;
-            // Re-visiting means user may want resume card next time
-            existing.dismissed = false;
-        }
-
-        existing.position = record.position;
-        existing.last_visited = record.last_visited;
-        existing.context_snapshot = record.context_snapshot;
-        if (record.cognitive_state) existing.cognitive_state = record.cognitive_state;
-        // Only increase completion, never decrease
-        existing.completion_pct = Math.max(existing.completion_pct, record.completion_pct);
-        existing.max_completion_pct = Math.max(existing.max_completion_pct, record.completion_pct);
-        // Merge related tabs
-        const tabSet = new Set([...existing.related_tabs, ...record.related_tabs]);
-        existing.related_tabs = Array.from(tabSet).slice(0, 5);
-        // Update title if non-empty
-        if (record.title) existing.title = record.title;
-        // Keep the original first_visited
-        activities[record.content_id] = existing;
-    } else {
-        activities[record.content_id] = record;
-    }
-
-    // Enforce cap with LRU eviction
-    const entries = Object.entries(activities);
-    if (entries.length > MAX_ACTIVITIES) {
-        const now = Date.now();
-        const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000;
-        // Sort by last_visited ascending (oldest first)
-        entries.sort((a, b) => a[1].last_visited - b[1].last_visited);
-        while (entries.length > MAX_ACTIVITIES) {
-            const oldest = entries[0];
-            // Prefer evicting entries older than 7 days
-            if (now - oldest[1].last_visited > SEVEN_DAYS || entries.length > MAX_ACTIVITIES + 10) {
-                delete activities[oldest[0]];
-                entries.shift();
-            } else {
-                break;
-            }
-        }
-        // If still over cap, evict oldest regardless
-        while (Object.keys(activities).length > MAX_ACTIVITIES) {
-            const allEntries = Object.entries(activities).sort((a, b) => a[1].last_visited - b[1].last_visited);
-            delete activities[allEntries[0][0]];
-        }
-    }
-
-    await saveActivities(activities);
-
-    // Sync to daemon if connected and enough time has passed
-    const now = Date.now();
-    if (connected && now - lastActivitySyncTime > ACTIVITY_SYNC_INTERVAL) {
-        lastActivitySyncTime = now;
-        syncActivitiesToDaemon(activities);
-    }
-}
-
-function syncActivitiesToDaemon(activities: Record<string, ActivityRecord>): void {
-    const top10 = Object.values(activities)
-        .sort((a, b) => b.last_visited - a.last_visited)
-        .slice(0, 10)
-        .map(a => ({
-            content_id: a.content_id,
-            platform: a.platform,
-            content_type: a.content_type,
-            title: a.title,
-            url: a.url,
-            position_description: formatPositionDescription(a),
-            duration_spent_s: a.duration_spent_s,
-            last_visited: a.last_visited,
-            completion_pct: a.completion_pct,
-            topic_tags: a.topic_tags,
-            context_snapshot: a.context_snapshot,
-        }));
-
-    send({
-        type: "ACTIVITY_SYNC",
-        payload: { activities: top10 },
-        timestamp: Date.now() / 1000,
-        sequence: ++sequence,
-    });
-}
-
-function formatPositionDescription(a: ActivityRecord): string {
-    const pos = a.position;
-    switch (pos.type) {
-        case "video": {
-            const ts = pos.timestamp_s as number;
-            const dur = pos.duration_s as number;
-            return `${formatTime(ts)} / ${formatTime(dur)}`;
-        }
-        case "scroll":
-            return `${Math.round(pos.scroll_pct as number)}% read`;
-        case "code_problem":
-            return `Stage: ${pos.stage} · ${pos.wrong_answer_count} WA`;
-        case "notebook":
-            return `Cell ${(pos.cell_index as number) + 1}`;
-        case "pdf":
-            return `Page ${pos.page}/${pos.total_pages}`;
-        case "slides":
-            return `Slide ${(pos.slide_index as number) + 1}/${pos.total_slides}`;
-        case "general":
-            return `${Math.round(pos.scroll_pct as number)}% scrolled`;
-        default:
-            return "";
-    }
-}
-
-function formatTime(seconds: number): string {
-    const s = Math.floor(seconds);
-    const h = Math.floor(s / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    const sec = s % 60;
-    if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
-    return `${m}:${String(sec).padStart(2, "0")}`;
-}
-
-function canonicalizeUrl(rawUrl: string): string {
-    let u: URL;
-    try { u = new URL(rawUrl); } catch { return rawUrl; }
-
-    const STRIP = ["utm_source","utm_medium","utm_campaign","utm_term","utm_content",
-                    "fbclid","gclid","ref","source","si","feature","pp"];
-    for (const p of STRIP) u.searchParams.delete(p);
-    u.hostname = u.hostname.replace(/^www\./, "");
-
-    if (u.hostname.includes("youtube.com") || u.hostname.includes("youtu.be")) {
-        const v = u.searchParams.get("v");
-        if (v) return `https://youtube.com/watch?v=${v}`;
-        if (u.hostname === "youtu.be") return `https://youtube.com/watch?v=${u.pathname.slice(1)}`;
-    }
-    if (u.hostname.includes("bilibili.com")) {
-        const match = u.pathname.match(/\/video\/(BV\w+)/);
-        const p = u.searchParams.get("p") || "1";
-        if (match) return `https://bilibili.com/video/${match[1]}?p=${p}`;
-    }
-    if (u.hostname.includes("leetcode")) {
-        const match = u.pathname.match(/\/problems\/([^/]+)/);
-        if (match) return `https://${u.hostname}/problems/${match[1]}`;
-    }
-
-    const KEEP_HASH = [/docs\.google\.com\/presentation/, /\.pdf$/i];
-    if (!KEEP_HASH.some(p => p.test(rawUrl))) u.hash = "";
-
-    return u.toString();
-}
-
-async function enrichWithRelatedTabs(record: ActivityRecord): Promise<void> {
-    try {
-        const allTabs = await chrome.tabs.query({});
-        const activities = await loadActivities();
-        const relatedIds: string[] = [];
-        for (const tab of allTabs) {
-            if (!tab.url || tab.url === record.url) continue;
-            const canonical = canonicalizeUrl(tab.url);
-            if (activities[canonical]) {
-                relatedIds.push(canonical);
-            }
-        }
-        record.related_tabs = relatedIds.slice(0, 5);
-    } catch {
-        // tabs query may fail
-    }
-}
+configureActivityStore({
+    isConnected: () => connected,
+    sync: (activities) => {
+        send({
+            type: "ACTIVITY_SYNC",
+            payload: { activities },
+            timestamp: Date.now() / 1000,
+            sequence: ++sequence,
+        });
+    },
+});
 
 // --- WebSocket Connection ---
 
@@ -730,7 +779,8 @@ function connect(): void {
             // F32: reset the reconnect backoff on every successful open so a
             // long-running disconnect cycle that finally succeeds doesn't
             // keep waiting 30s on the next transient drop.
-            reconnectDelay = INITIAL_RECONNECT_DELAY;
+            reconnectBackoff.reset();
+            negotiatedProtocolVersion = PROTOCOL_VERSION;
             // F17 (audit): clear the per-type sequence tracker. The
             // daemon restarts its WSMessage.sequence counter from 0
             // each boot; keeping the pre-restart values would reject
@@ -756,12 +806,16 @@ function connect(): void {
                     if (!ws || ws.readyState !== WebSocket.OPEN) {
                         return;
                     }
-                    ws.send(JSON.stringify({
+                    ws.send(JSON.stringify(withWireMetadata({
                         type: "AUTH",
-                        payload: { auth_token: authToken },
+                        payload: {
+                            auth_token: authToken,
+                            protocol_version: PROTOCOL_VERSION,
+                            supported_protocol_versions: [...SUPPORTED_PROTOCOL_VERSIONS],
+                        },
                         timestamp: Date.now() / 1000,
                         sequence: ++sequence,
-                    }));
+                    } as WSMessage)));
                     // Identify the host browser (AFTER auth so the
                     // daemon-side ``IDENTIFY`` handler runs in the
                     // authenticated branch of dispatch). The same JS
@@ -771,9 +825,13 @@ function connect(): void {
                     // and downstream broadcasts that target a specific
                     // browser ("send only to Edge") work as advertised.
                     const browserClientType = detectBrowser();
+                    const clientInstanceId = await getClientInstanceId();
                     send({
                         type: "IDENTIFY",
-                        payload: { client_type: browserClientType },
+                        payload: {
+                            client_type: browserClientType,
+                            client_instance_id: clientInstanceId,
+                        },
                         timestamp: Date.now() / 1000,
                         sequence: ++sequence,
                     });
@@ -813,7 +871,7 @@ function connect(): void {
         };
 
         ws.onmessage = (event) => {
-            handleMessage(event.data as string);
+            void handleMessage(event.data as string);
         };
 
         ws.onclose = () => {
@@ -848,7 +906,7 @@ function disconnect(): void {
 function send(msg: WSMessage): void {
     if (!ws || !connected) return;
     try {
-        ws.send(JSON.stringify(msg));
+        ws.send(JSON.stringify(withWireMetadata(msg)));
     } catch {
         // Connection may have dropped
     }
@@ -980,11 +1038,11 @@ async function probeConnectivity(trigger: string): Promise<void> {
 
 function scheduleReconnect(): void {
     if (reconnectTimer || intentionalDisconnect) return;
+    const delay = reconnectBackoff.takeAndAdvance();
     reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
         connect();
-    }, reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
+    }, delay);
 }
 
 // swift-concurrency-pro rule (transferred to JS): tear down all in-flight
@@ -997,10 +1055,8 @@ if (typeof chrome !== "undefined" && chrome.runtime?.onSuspend) {
             clearTimeout(reconnectTimer);
             reconnectTimer = null;
         }
-        if (persistTimer) {
-            clearTimeout(persistTimer);
-            persistTimer = null;
-        }
+        browserSessionStore.cancelPendingWrites();
+        void browserSessionStore.saveSessionNow(persistedSessionSnapshot());
         try {
             disconnect();
         } catch {
@@ -1048,24 +1104,27 @@ async function scrapeVisibleText(tabId?: number): Promise<string> {
  */
 const WS_PARSE_ERROR_WINDOW_MS = 10_000;
 const WS_PARSE_ERROR_RECONNECT_THRESHOLD = 3;
-let wsParseErrorTimestamps: number[] = [];
+const parseErrors = new ParseErrorWindow(
+    WS_PARSE_ERROR_WINDOW_MS,
+    WS_PARSE_ERROR_RECONNECT_THRESHOLD,
+);
 
 export function _resetWsParseErrorCounter(): void {
-    wsParseErrorTimestamps = [];
+    parseErrors.reset();
 }
 
 export function _getWsParseErrorCount(): number {
-    return wsParseErrorTimestamps.length;
+    return parseErrors.count;
 }
 
 /** Test-only: expose the F32 reconnect delay so tests can verify it
  * resets on every successful WS open. */
 export function _getReconnectDelay(): number {
-    return reconnectDelay;
+    return reconnectBackoff.current;
 }
 
 export function _getInitialReconnectDelay(): number {
-    return INITIAL_RECONNECT_DELAY;
+    return reconnectBackoff.initialDelay;
 }
 
 /**
@@ -1087,14 +1146,14 @@ export function _getInitialReconnectDelay(): number {
  * starts at 0 each restart, so retaining the pre-restart values would
  * reject every post-restart frame as "stale".
  */
-const lastSeqByType: Record<string, number> = {};
+const frameReplayGuard = new FrameReplayGuard(512);
 
 export function _resetLastSeqByType(): void {
-    for (const key of Object.keys(lastSeqByType)) delete lastSeqByType[key];
+    frameReplayGuard.reset();
 }
 
 export function _getLastSeq(msgType: string): number {
-    return lastSeqByType[msgType] ?? 0;
+    return frameReplayGuard.lastSequence(msgType);
 }
 
 /**
@@ -1105,12 +1164,7 @@ export function _getLastSeq(msgType: string): number {
  * the counter only moves forward.
  */
 function acceptSequencedFrame(msg: WSMessage): boolean {
-    const seq = typeof msg.sequence === "number" ? msg.sequence : 0;
-    if (seq <= 0 || !msg.type) return true; // unsequenced — bypass
-    const last = lastSeqByType[msg.type] ?? 0;
-    if (seq <= last) return false; // stale
-    lastSeqByType[msg.type] = seq;
-    return true;
+    return frameReplayGuard.accept(msg);
 }
 
 /** Test-only: expose the sequence-drop predicate so vitest can exercise
@@ -1125,20 +1179,13 @@ function recordWsParseError(err: unknown, msg: Partial<WSMessage> | null): void 
             ? (msg as { correlation_id?: string }).correlation_id
             : "-";
     console.warn(`cortex.ws.parse_error cid=${cid} err=${String(err)}`);
-    const now = Date.now();
-    wsParseErrorTimestamps.push(now);
-    wsParseErrorTimestamps = wsParseErrorTimestamps.filter(
-        (t) => now - t <= WS_PARSE_ERROR_WINDOW_MS,
-    );
-    if (
-        wsParseErrorTimestamps.length >= WS_PARSE_ERROR_RECONNECT_THRESHOLD &&
-        ws !== null
-    ) {
+    const storm = parseErrors.record();
+    if (storm && ws !== null) {
         console.warn(
-            `cortex.ws.parse_error_storm count=${wsParseErrorTimestamps.length} ` +
+            `cortex.ws.parse_error_storm count=${parseErrors.count} ` +
                 `window_ms=${WS_PARSE_ERROR_WINDOW_MS} — forcing reconnect`,
         );
-        wsParseErrorTimestamps = [];
+        parseErrors.reset();
         try {
             // Bypass `disconnect()` because that sets intentionalDisconnect
             // and suppresses the reconnect we want.
@@ -1159,8 +1206,8 @@ async function handleMessage(raw: string): Promise<void> {
     }
     // Reset the rolling counter on a clean parse so transient flakes do
     // not stay armed forever.
-    if (wsParseErrorTimestamps.length > 0) {
-        wsParseErrorTimestamps = [];
+    if (parseErrors.count > 0) {
+        parseErrors.reset();
     }
 
     // F17 (audit): drop reordered or duplicated frames before they reach
@@ -1172,20 +1219,42 @@ async function handleMessage(raw: string): Promise<void> {
         if (DEBUG) {
             console.warn(
                 `[cortex.bg] F17: dropping stale ${msg.type} seq=${msg.sequence} ` +
-                `last=${lastSeqByType[msg.type] ?? 0}`,
+                `last=${frameReplayGuard.lastSequence(msg.type)}`,
             );
         }
         return;
     }
 
     switch (msg.type) {
-        case "AUTH_OK":
+        case "AUTH_OK": {
             // Debt-2 (audit): the daemon ACKed our AUTH frame. Nothing
             // to do — the daemon will start broadcasting STATE_UPDATE
             // and other types on its own cadence. We accept this frame
             // as a known type so the legacy `default` branch (which
             // would otherwise treat it as "unknown") cannot accidentally
             // re-classify it as a parse error.
+            const selected = msg.payload.selected_protocol_version;
+            if (selected === "1.0" || selected === "2.0") {
+                negotiatedProtocolVersion = selected;
+            }
+            // Receipts are persisted before their first send. Replaying the
+            // bounded outbox after authentication closes the socket-drop
+            // window between a workspace effect and daemon acknowledgement;
+            // server-side receipt/idempotency keys make this safe.
+            void flushReceiptOutbox();
+            break;
+        }
+
+        case "PROTOCOL_ERROR":
+            console.error(
+                `[cortex.bg] protocol negotiation failed: ${JSON.stringify(msg.payload)}`,
+            );
+            intentionalDisconnect = true;
+            try {
+                ws?.close(1002, "unsupported Cortex protocol");
+            } catch {
+                // Socket may already be closing after the server error frame.
+            }
             break;
 
         case "STATE_UPDATE":
@@ -1209,7 +1278,10 @@ async function handleMessage(raw: string): Promise<void> {
             // from the guard's interface only in optional fields.
             currentState = {
                 state: msg.payload.state,
+                support_state: msg.payload.support_state,
+                status: msg.payload.status,
                 confidence: msg.payload.confidence,
+                evidence_coverage: msg.payload.evidence_coverage,
                 scores: msg.payload.scores,
                 signal_quality: msg.payload.signal_quality,
                 dwell_seconds: msg.payload.dwell_seconds,
@@ -1217,7 +1289,6 @@ async function handleMessage(raw: string): Promise<void> {
             };
             updateFocusSession(msg.payload);
             checkHealthAlerts(msg.payload);
-            checkBreakNeeded(msg.payload);
             broadcastToPopup({
                 type: "STATE_UPDATE",
                 payload: msg.payload,
@@ -1254,31 +1325,27 @@ async function handleMessage(raw: string): Promise<void> {
             const triggerPayload = msg.payload as
                 & InterventionTriggerPayload
                 & Record<string, unknown>;
+            // Missing and unknown modes fail closed. A legacy trigger can
+            // therefore never inherit authority from an earlier frame.
+            currentExecutionMode = parseExecutionMode(
+                triggerPayload.execution_mode,
+            );
             const iid = plan.intervention_id;
             const now = Date.now();
 
-            // Check cooldown: skip if this intervention was recently dismissed
-            if (dismissedInterventions.has(iid)) {
-                const dismissedAt = dismissedInterventions.get(iid)!;
-                if (now - dismissedAt < interventionDismissCooldown) {
-                    if (DEBUG) console.log(`Cortex: skipping intervention ${iid} — dismissed ${Math.round((now - dismissedAt) / 1000)}s ago`);
-                    break;
-                }
-                dismissedInterventions.delete(iid);
-                schedulePersist();
-            }
-
-            // Check URL-based cooldown: don't re-trigger for same site within window
             const triggerUrl = plan.trigger_url;
-            const urlKey = triggerUrl ? new URL(triggerUrl).hostname : null;
-            if (urlKey && dismissedUrlPatterns.has(urlKey)) {
-                const dismissedAt = dismissedUrlPatterns.get(urlKey)!;
-                if (now - dismissedAt < urlDismissCooldown) {
-                    if (DEBUG) console.log(`Cortex: skipping intervention for ${urlKey} — dismissed ${Math.round((now - dismissedAt) / 1000)}s ago`);
-                    break;
+            const suppressedBy = interventionPresentation.suppression(
+                iid,
+                triggerUrl,
+                now,
+            );
+            if (suppressedBy !== null) {
+                if (DEBUG) {
+                    console.log(
+                        `Cortex: skipping intervention ${iid} — ${suppressedBy} cooldown active`,
+                    );
                 }
-                dismissedUrlPatterns.delete(urlKey);
-                schedulePersist();
+                break;
             }
 
             // F16: atomic swap by correlation_id. The latest INTERVENTION_TRIGGER
@@ -1290,20 +1357,16 @@ async function handleMessage(raw: string): Promise<void> {
                 ? msg.correlation_id
                 : `local_${now.toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 
-            if (activeIntervention) {
+            if (interventionPresentation.active) {
                 if (DEBUG) {
                     console.log(
-                        `Cortex: superseding intervention cid=${activeIntervention.correlation_id} ` +
+                        `Cortex: superseding intervention cid=${interventionPresentation.active.correlation_id} ` +
                         `→ cid=${inboundCid}`,
                     );
                 }
             }
 
-            activeIntervention = {
-                plan: msg.payload,
-                correlation_id: inboundCid,
-                mountedAt: now,
-            };
+            interventionPresentation.mount(msg.payload, inboundCid, now);
             // Persist so popup can load it after SW restart
             try {
                 chrome.storage.session.set({
@@ -1347,27 +1410,10 @@ async function handleMessage(raw: string): Promise<void> {
         }
 
         case "START_FOCUS_AUTO": {
-            // P0 §3.10: daemon detected sustained HYPER + user opted
-            // in. Arm a focus session with the daemon-provided preset
-            // and duration. The session is marked auto-armed so the
-            // symmetric STOP_FOCUS_AUTO can tear down only when WE
-            // armed (never tear down a manually-started session).
-            const preset = (msg.payload.preset as string | undefined) || "developer";
-            const customDomains = (msg.payload.custom_domains as string[] | undefined) || [];
-            const durationMinutes = typeof msg.payload.duration_minutes === "number"
-                ? msg.payload.duration_minutes
-                : 20;
-            const reason = (msg.payload.reason as string | undefined) || "biometric_hyper";
-            try {
-                startAutoFocusSession({
-                    preset,
-                    customDomains,
-                    durationMinutes,
-                    reason,
-                });
-            } catch (e) {
-                console.warn("Cortex: failed to arm auto focus session", e);
-            }
+            // A daemon state transition is not a one-time workspace grant.
+            // Manual START_FOCUS remains available; autonomous arming stays
+            // contained until it is expressed as a manifest-bound capability.
+            console.warn("[cortex.bg] rejected legacy START_FOCUS_AUTO");
             break;
         }
 
@@ -1411,78 +1457,53 @@ async function handleMessage(raw: string): Promise<void> {
             handleContextRequest(msg);
             break;
 
+        case "INTERVENTION_APPLY":
+            await enqueueTransactionCommand(
+                () => handleInterventionApplyCommand(msg.payload),
+            );
+            break;
+
+        case "INTERVENTION_AUTHORIZATION_DENIED":
+            settleDeniedAuthorization(msg.payload);
+            break;
+
+        case "INTERVENTION_TRANSACTION_STATE":
+            void acknowledgeReceiptOutbox(msg.payload);
+            settleAuthorizationFromState(msg.payload);
+            broadcastToPopup({
+                type: "INTERVENTION_TRANSACTION_STATE",
+                payload: msg.payload,
+            });
+            break;
+
         case "INTERVENTION_RESTORE":
-            handleRestore(msg.payload);
+            await enqueueTransactionCommand(() => handleRestore(msg.payload));
             break;
 
         case "SETTINGS_SYNC":
             quietMode = Boolean(msg.payload.quiet_mode);
-            // Sync cooldown values from daemon config, keeping defaults as fallbacks
-            if (typeof msg.payload.intervention_dismiss_cooldown_ms === "number") {
-                interventionDismissCooldown = msg.payload.intervention_dismiss_cooldown_ms as number;
-            }
-            if (typeof msg.payload.url_dismiss_cooldown_ms === "number") {
-                urlDismissCooldown = msg.payload.url_dismiss_cooldown_ms as number;
-            }
+            currentExecutionMode = parseExecutionMode(
+                msg.payload.execution_mode,
+            );
+            interventionPresentation.configureCooldowns({
+                interventionMs: msg.payload.intervention_dismiss_cooldown_ms,
+                urlMs: msg.payload.url_dismiss_cooldown_ms,
+            });
             schedulePersist();
             broadcastToPopup({ type: "SETTINGS_SYNC", payload: msg.payload });
             break;
 
         case "ACTION_DISPATCH": {
-            // G4 (audit-prod): daemon-forwarded request to execute a
-            // suggested action that the desktop-shell overlay's button
-            // initiated. The extension runs the action via the existing
-            // ``executeAction`` helper and reports back the standard
-            // ACTION_EXECUTE log so the daemon can record success.
-            const dispatchPayload = msg.payload;
-            const interventionId = String(dispatchPayload.intervention_id || "");
-            // P1-13: use isSuggestedAction runtime guard instead of a bare cast
-            // so a malformed daemon frame cannot reach executeAction unchecked.
-            const rawAction = dispatchPayload.action;
-            const action = isSuggestedAction(rawAction) ? rawAction : undefined;
-            if (action && action.action_id && action.action_type) {
-                executeAction(action as SuggestedAction)
-                    .then((result) => {
-                        send({
-                            type: "ACTION_EXECUTE",
-                            payload: {
-                                intervention_id: interventionId,
-                                action_id: action.action_id,
-                                action_type: action.action_type,
-                                result,
-                                source: "desktop_overlay_dispatch",
-                            },
-                            timestamp: Date.now() / 1000,
-                            sequence: ++sequence,
-                        });
-                    })
-                    .catch(() => {
-                        send({
-                            type: "ACTION_EXECUTE",
-                            payload: {
-                                intervention_id: interventionId,
-                                action_id: action.action_id,
-                                action_type: action.action_type,
-                                result: { success: false, error: "executeAction threw" },
-                                source: "desktop_overlay_dispatch",
-                            },
-                            timestamp: Date.now() / 1000,
-                            sequence: ++sequence,
-                        });
-                    });
-            }
+            // Compatibility frames are presentation-only. Since WP-6, the
+            // sole mutation entry point is an exact INTERVENTION_APPLY whose
+            // authorization and immutable manifest both validate locally.
+            console.warn("[cortex.bg] rejected legacy ACTION_DISPATCH");
             break;
         }
 
         case "BREATHING_OVERLAY": {
-            // Route to active tab's content script
-            const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-            if (activeTab?.id) {
-                chrome.tabs.sendMessage(activeTab.id, {
-                    type: "SHOW_BREATHING_OVERLAY",
-                    payload: msg.payload,
-                });
-            }
+            // Disabled compatibility message: the producing algorithm has
+            // not passed reference validation, so do not present its claim.
             break;
         }
         case "ACTIVE_RECALL": {
@@ -1499,31 +1520,16 @@ async function handleMessage(raw: string): Promise<void> {
         }
 
         case "PRE_BREAK_WARNING": {
-            const headline = String(msg.payload.headline || "Biological load rising");
-            const summary = String(
-                msg.payload.situation_summary || "Consider a short reset before stress load crosses the break threshold.",
-            );
-            injectToast(headline, summary);
-            broadcastToPopup({ type: "PRE_BREAK_WARNING", payload: msg.payload });
+            // Disabled compatibility message; see BREATHING_OVERLAY above.
             break;
         }
 
 
 
         case "LEETCODE_SHOW_LOCKOUT": {
-            // Inject lockout overlay into the active tab
-            try {
-                const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-                if (tab?.id) {
-                    await chrome.scripting.executeScript({
-                        target: { tabId: tab.id },
-                        func: injectLockoutOverlay,
-                        args: [msg.payload],
-                    });
-                }
-            } catch (e) {
-                if (DEBUG) console.error("Cortex: failed to inject lockout overlay", e);
-            }
+            // A lockout changes what the user can do on the page. Keep this
+            // compatibility message inert until it has an exact authorization
+            // and receipt-backed escape/restore path.
             break;
         }
 
@@ -1556,14 +1562,14 @@ async function handleMessage(raw: string): Promise<void> {
         }
 
         case "BREAK_RECOMMENDATION": {
-            // P0 §3.7: relay the soft "take a break" pulse to the popup.
-            // The popup renders a terracotta pill above the intervention
-            // card with a single CTA; the daemon already deduplicates
-            // per ``should_break`` False→True transition.
-            broadcastToPopup({
-                type: "BREAK_RECOMMENDATION",
-                payload: msg.payload,
-            });
+            // Only explicit elapsed-focus reminders are product-eligible.
+            // Legacy stress-integral messages remain a silent decode sink.
+            if (msg.payload.basis !== "elapsed_focus") break;
+            const reason = typeof msg.payload.reason === "string"
+                ? msg.payload.reason
+                : "You've reached your preferred focus interval.";
+            injectToast("Break reminder", reason);
+            broadcastToPopup({ type: "BREAK_SUGGESTED", reason });
             break;
         }
 
@@ -1737,19 +1743,10 @@ async function handleMessage(raw: string): Promise<void> {
         }
 
         default: {
-            // audit-w2 (audit contract sweep): the schema catalogue in
-            // ``ws_message_types.py`` registers wire types the daemon
-            // may emit (e.g. nine ``LEETCODE_*`` cues such as
-            // ``LEETCODE_LOCK_EDITOR`` / ``LEETCODE_AI_*``) that no
-            // active runtime selector emits today — they are reserved
-            // for the leetcode adapter's future capabilities. Without a
-            // default arm the switch silently dropped any frame whose
-            // type isn't enumerated above, which makes a future
-            // regression (extension drifts behind a new daemon-side
-            // emit) invisible in logs. A debug log line here lets a
-            // developer see "extension received a known-but-unhandled
-            // frame" without breaking the wire (the schema's
-            // round-trip parse already validated ``msg.type``).
+            // Defensive visibility for a schema-valid frame introduced
+            // before this client has gained a dedicated handler. The
+            // repository contract gate separately rejects catalogue
+            // members without a production producer or consumer.
             if (DEBUG) {
                 console.warn(
                     "Cortex: received WS frame with no handler",
@@ -1768,9 +1765,17 @@ async function handleMessage(raw: string): Promise<void> {
  * Design: dark, high-end tech (Linear/Raycast-inspired).
  * Consistent with popup and all other Cortex UI.
  */
-function injectOverlay(payload: Record<string, unknown>): void {
+export function injectOverlay(
+    payload: Record<string, unknown>,
+    executableActionIds: string[] = [],
+): void {
     const OID = "cortex-somatic-overlay";
-    document.getElementById(OID)?.remove();
+    type ManagedOverlayHost = HTMLElement & {
+        __cortexCleanup?: () => void;
+    };
+    const existingHost = document.getElementById(OID) as ManagedOverlayHost | null;
+    existingHost?.__cortexCleanup?.();
+    const isUpdate = existingHost !== null;
 
     const headline = String(payload.headline || "");
     const summary = String(payload.situation_summary || "");
@@ -1778,47 +1783,22 @@ function injectOverlay(payload: Record<string, unknown>): void {
     const esc = (s: string) =>
         s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
-    const actions: Array<Record<string, unknown>> = [...((payload.suggested_actions as Array<Record<string, unknown>>) || [])];
+    const actions: Array<Record<string, unknown>> = [
+        ...((payload.suggested_actions as Array<Record<string, unknown>>) || []),
+    ];
     const tabRecs = payload.tab_recommendations as { tabs: Array<Record<string, unknown>>; summary: string } | undefined;
     const errA = payload.error_analysis as Record<string, string> | undefined;
-
-    // F52: synthesise close actions from tab_recommendations only for
-    // tab_index values NOT already covered by suggested_actions. The
-    // tab card carries the close button when an existing action covers
-    // the same tab, so we avoid duplicate close affordances.
-    if (tabRecs && tabRecs.tabs && tabRecs.tabs.length > 0) {
-        const coveredIndices = new Set<number>();
-        for (const a of actions) {
-            const at = a.action_type;
-            if (at !== "close_tab" && at !== "bookmark_and_close") continue;
-            const ti = typeof a.tab_index === "number" ? a.tab_index : Number(a.tab_index);
-            if (Number.isFinite(ti)) coveredIndices.add(ti);
-        }
-        const closeable = tabRecs.tabs.filter(t => t.action === "close" || t.action === "bookmark_and_close");
-        for (let ci = 0; ci < closeable.length; ci++) {
-            const t = closeable[ci];
-            const ti = typeof t.tab_index === "number" ? t.tab_index : Number(t.tab_index);
-            if (!Number.isFinite(ti)) continue;
-            if (coveredIndices.has(ti)) continue;
-            actions.push({
-                action_id: `synth_${Date.now()}_${ci}`,
-                action_type: t.action === "bookmark_and_close" ? "bookmark_and_close" : "close_tab",
-                tab_index: ti,
-                target: "",
-                label: `Close ${t.tab_title || "tab"}`,
-                reason: t.reason || "",
-                category: "recommended",
-                reversible: true,
-                metadata: {
-                    expected_title: t.tab_title || "",
-                    expected_url: t.url || "",
-                },
-            });
-            coveredIndices.add(ti);
-        }
-    }
-
-    const recommended = actions.filter(a => a.category === "recommended");
+    // The background worker verified these IDs against the digest-covered
+    // manifest immediately before injection. Recommendations absent from
+    // that set remain readable guidance; they never acquire an affordance.
+    const executableIdSet = new Set(executableActionIds);
+    const executableRecommended = actions.filter((action) =>
+        action.category === "recommended"
+        && typeof action.action_id === "string"
+        && executableIdSet.has(action.action_id)
+    );
+    const canExecute = payload.execution_mode === "authorized"
+        || payload.execution_mode === "research_autonomous";
 
     // --- Build tab list with per-tab Keep buttons (LAYER 5) ---
     let closingHtml = "";
@@ -1841,7 +1821,7 @@ function injectOverlay(payload: Record<string, unknown>): void {
                 const rawReason = String(t.reason || "");
                 const cleanReason = genericReasonPhrases.some(p => rawReason.toLowerCase().includes(p)) ? "" : rawReason;
                 const tabReason = cleanReason ? `<div class="trr">${esc(cleanReason)}</div>` : "";
-                closingHtml += `<div class="tr" id="tr-${ti}" data-tab-idx="${ti}"><span class="tx">\u00d7</span><div class="tc"><span class="tn">${tabTitle}</span>${tabReason}</div><button class="kb" data-keep-idx="${ti}">Keep</button></div>`;
+                closingHtml += `<div class="tr"><span class="tx">\u00b7</span><div class="tc"><span class="tn">${tabTitle}</span>${tabReason}</div></div>`;
             }
             closingHtml += `</div>`;
         }
@@ -1875,27 +1855,41 @@ function injectOverlay(payload: Record<string, unknown>): void {
     }
 
     // --- CTA label ---
-    let ctaLabel = "Clean up";
-    if (closeCount > 0) {
-        ctaLabel = `Close ${closeCount} tab${closeCount !== 1 ? "s" : ""}`;
-    } else if (hasRealError) {
-        ctaLabel = "Help me fix this";
-    } else if (recommended.length > 0) {
-        ctaLabel = `Apply ${recommended.length} change${recommended.length !== 1 ? "s" : ""}`;
+    let ctaLabel = `Apply ${executableRecommended.length} change${executableRecommended.length !== 1 ? "s" : ""}`;
+    if (executableRecommended.length === 1) {
+        const actionType = String(executableRecommended[0].action_type || "");
+        if (actionType === "search_error") ctaLabel = "Search this error";
+        if (actionType === "open_url") ctaLabel = "Open recommended page";
+        if (actionType === "highlight_tab") ctaLabel = "Switch to recommended tab";
+    }
+    const hasManualSuggestions = closeCount > 0
+        || actions.some((action) =>
+            action.category === "recommended"
+            && typeof action.action_id === "string"
+            && !executableIdSet.has(action.action_id)
+        );
+    const actionNote = !canExecute && executableRecommended.length > 0
+        ? "Suggestions only — workspace changes are off."
+        : hasManualSuggestions
+            ? "Manual review — Cortex won’t close or regroup existing tabs automatically."
+            : "";
+
+    const host = (existingHost ?? document.createElement("div")) as ManagedOverlayHost;
+    if (!existingHost) {
+        host.id = OID;
+        host.style.cssText = "position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483647;pointer-events:none;";
     }
 
-    const host = document.createElement("div");
-    host.id = OID;
-    host.style.cssText = "position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483647;pointer-events:none;";
-
-    const shadow = host.attachShadow({ mode: "open" });
+    const shadow = host.shadowRoot ?? host.attachShadow({ mode: "open" });
     shadow.innerHTML = `
 <style>
-@keyframes panelIn{from{transform:translateY(12px) scale(.99);opacity:0}to{transform:translateY(0) scale(1);opacity:1}}
+@keyframes panelIn{from{transform:translateY(8px) scale(.98);opacity:0}to{transform:translateY(0) scale(1);opacity:1}}
+@keyframes panelOut{from{transform:translateY(0) scale(1);opacity:1}to{transform:translateY(8px) scale(.98);opacity:0}}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes fadeOut{from{opacity:1}to{opacity:0}}
 *{box-sizing:border-box;margin:0;padding:0}
 
-.bk{position:fixed;inset:0;background:transparent;pointer-events:none;animation:fadeIn .25s ease}
+.bk{position:fixed;inset:0;background:transparent;pointer-events:none;animation:fadeIn 160ms cubic-bezier(.23,1,.32,1)}
 
 .pn{
   position:fixed;bottom:20px;right:20px;width:340px;max-height:calc(100vh - 40px);overflow-y:auto;
@@ -1906,13 +1900,17 @@ function injectOverlay(payload: Record<string, unknown>): void {
   box-shadow:0 0 0 .5px rgba(0,0,0,.3),0 4px 20px rgba(0,0,0,.4),0 16px 40px rgba(0,0,0,.2);
   font-family:-apple-system,BlinkMacSystemFont,'Inter','SF Pro Text',system-ui,sans-serif;
   color:#e4e4e7;padding:18px 16px 14px;
-  animation:panelIn .3s cubic-bezier(.16,1,.3,1);
+  animation:panelIn 200ms cubic-bezier(.23,1,.32,1);
 }
+.pn.cx-update{animation:none}
+.pn.cx-exit{animation:panelOut 160ms cubic-bezier(.4,0,1,1) forwards}
+.bk.cx-exit{animation:fadeOut 160ms cubic-bezier(.4,0,1,1) forwards}
 .pn::-webkit-scrollbar{width:0}
 
 /* Close */
-.xb{position:absolute;top:14px;right:14px;width:22px;height:22px;border:none;background:rgba(255,255,255,.04);border-radius:6px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .12s}
-.xb:hover{background:rgba(255,255,255,.08)}
+.xb{position:absolute;top:10px;right:10px;width:30px;height:30px;border:none;background:rgba(255,255,255,.04);border-radius:7px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background-color 120ms cubic-bezier(.23,1,.32,1),transform 120ms cubic-bezier(.23,1,.32,1)}
+.xb:active{transform:scale(.96)}
+.xb:focus-visible,.btn:focus-visible,.dm:focus-visible,.ul:focus-visible{outline:2px solid #dfb15b;outline-offset:2px}
 .xb svg{width:9px;height:9px;stroke:#71717a;stroke-width:2}
 
 /* Text */
@@ -1930,6 +1928,7 @@ function injectOverlay(payload: Record<string, unknown>): void {
 .trr{font-size:10px;color:#3f3f46;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .kn{font-size:11px;color:#3f3f46;margin-bottom:12px}
 .kc{color:#10b981}
+.nt{font-size:10px;color:#71717a;line-height:1.45;margin:0 0 12px;padding:8px 10px;background:rgba(255,255,255,.025);border-radius:6px}
 
 /* Error */
 .eb{padding:10px 12px;background:rgba(239,68,68,.08);border-radius:8px;border:1px solid rgba(239,68,68,.06);margin-bottom:12px}
@@ -1943,44 +1942,46 @@ function injectOverlay(payload: Record<string, unknown>): void {
 .si::before{content:'';position:absolute;left:3px;top:8px;width:3px;height:3px;border-radius:50%;background:#3f3f46}
 
 /* CTA */
-.btn{display:block;width:100%;padding:9px;border:none;border-radius:8px;background:#e4e4e7;color:#09090b;font-size:12px;font-weight:600;cursor:pointer;transition:all .12s;letter-spacing:-.1px;text-align:center;font-family:inherit}
-.btn:hover{background:#f4f4f5}
+.btn{display:block;width:100%;padding:9px;border:none;border-radius:8px;background:#e4e4e7;color:#09090b;font-size:12px;font-weight:600;cursor:pointer;transition:background-color 120ms cubic-bezier(.23,1,.32,1),transform 120ms cubic-bezier(.23,1,.32,1);letter-spacing:-.1px;text-align:center;font-family:inherit}
 .btn:active{transform:scale(.98)}
 .btn.ok{background:#10b981;color:#fff;cursor:default;pointer-events:none}
 
 .ur{display:flex;align-items:center;justify-content:center;gap:6px;padding:6px 0;font-size:11px;color:#3f3f46;margin-top:4px}
 .ul{color:#3b82f6;cursor:pointer;font-weight:500;text-decoration:none;border:none;background:none;font-size:11px;font-family:inherit;padding:0}
-.ul:hover{text-decoration:underline}
-
-/* Keep button (per-tab) */
-.kb{margin-left:auto;padding:2px 8px;border:1px solid rgba(255,255,255,.08);border-radius:4px;background:none;color:#71717a;font-size:10px;cursor:pointer;font-family:inherit;flex-shrink:0;transition:all .12s}
-.kb:hover{color:#10b981;border-color:rgba(16,185,129,.3)}
-.tr.kept{opacity:.35;text-decoration:line-through}
-.tr.kept .kb{color:#10b981;border-color:#10b981}
-.tr.kept .tx{color:#3f3f46}
 
 /* Dismiss */
-.dm{display:block;width:100%;padding:6px;margin-top:6px;border:none;border-radius:6px;background:none;color:#3f3f46;cursor:pointer;font-size:11px;font-family:inherit;transition:color .12s}
-.dm:hover{color:#71717a}
+.dm{display:block;width:100%;padding:8px;margin-top:4px;border:none;border-radius:6px;background:none;color:#a1a1aa;cursor:pointer;font-size:11px;font-family:inherit;transition:color 120ms cubic-bezier(.23,1,.32,1),background-color 120ms cubic-bezier(.23,1,.32,1),transform 120ms cubic-bezier(.23,1,.32,1)}
+.dm:active{transform:scale(.98)}
+@media (hover:hover) and (pointer:fine){.xb:hover{background:rgba(255,255,255,.08)}.btn:hover{background:#f4f4f5}.ul:hover{text-decoration:underline}.dm:hover{color:#e4e4e7;background:rgba(255,255,255,.04)}}
+@media (prefers-reduced-motion:reduce){.pn,.bk{animation:none!important}.btn,.xb,.dm{transition-property:background-color,color!important}.btn:active,.xb:active,.dm:active{transform:none}}
 </style>
 
 <div class="bk" id="bk"></div>
-<div class="pn">
-  <button class="xb" id="xb"><svg viewBox="0 0 10 10" fill="none"><path d="M1 1l8 8M9 1l-8 8"/></svg></button>
+<div class="pn${isUpdate ? " cx-update" : ""}">
+  <button class="xb" id="xb" type="button" aria-label="Dismiss intervention"><svg viewBox="0 0 10 10" fill="none"><path d="M1 1l8 8M9 1l-8 8"/></svg></button>
   <div class="hd">${esc(headline)}</div>
   <div class="ds">${esc(summary)}</div>
   <div class="dv"></div>
-  ${closingHtml ? `<div class="sh">Closing ${closeCount} tab${closeCount !== 1 ? "s" : ""}</div>${closingHtml}` : ""}
+  ${closingHtml ? `<div class="sh">Review ${closeCount} tab suggestion${closeCount !== 1 ? "s" : ""}</div>${closingHtml}` : ""}
   ${keepCount > 0 ? `<div class="kn">Keeping <span class="kc">${keepCount}</span> you need</div>` : ""}
+  ${actionNote ? `<div class="nt">${esc(actionNote)}</div>` : ""}
   ${errHtml}
   ${stepsHtml ? `<div class="dv"></div>${stepsHtml}` : ""}
-  ${recommended.length > 0 ? `<button class="btn" id="cta">${esc(ctaLabel)}</button><div class="ur" id="undo-bar" style="display:none"><span>Done.</span><button class="ul" id="undo-btn">Undo</button></div>` : ""}
+  ${canExecute && executableRecommended.length > 0 ? `<button class="btn" id="cta">${esc(ctaLabel)}</button><div class="ur" id="undo-bar" style="display:none"><span>Done.</span><button class="ul" id="undo-btn">Undo</button></div>` : ""}
   <button class="dm" id="dm">Dismiss</button>
 </div>`;
 
-    document.body.appendChild(host);
+    if (!existingHost) document.body.appendChild(host);
 
     let dismissed = false;
+    let removalTimer = 0;
+    let autoDismissTimer = 0;
+    const reducedMotion = window.matchMedia(
+        "(prefers-reduced-motion: reduce)",
+    ).matches;
+    const handleKeydown = (event: KeyboardEvent) => {
+        if (event.key === "Escape") dismiss();
+    };
     const dismiss = () => {
         if (dismissed) return;
         dismissed = true;
@@ -1996,94 +1997,37 @@ function injectOverlay(payload: Record<string, unknown>): void {
             // see it in the page console; the UI still tears down.
             console.warn("[cortex.overlay] dismiss notify failed:", err);
         });
-        const el = document.getElementById(OID);
-        if (el) {
-            el.style.transition = "opacity .2s ease";
-            el.style.opacity = "0";
-            setTimeout(() => el.remove(), 220);
+        window.clearTimeout(autoDismissTimer);
+        document.removeEventListener("keydown", handleKeydown);
+        const panel = shadow.querySelector<HTMLElement>(".pn");
+        const backdrop = shadow.querySelector<HTMLElement>(".bk");
+        if (reducedMotion || !panel) {
+            host.remove();
+            return;
         }
+        panel.classList.add("cx-exit");
+        backdrop?.classList.add("cx-exit");
+        removalTimer = window.setTimeout(() => host.remove(), 170);
     };
     shadow.getElementById("xb")?.addEventListener("click", dismiss);
     shadow.getElementById("dm")?.addEventListener("click", dismiss);
     shadow.getElementById("bk")?.addEventListener("click", dismiss);
-    document.addEventListener("keydown", (e) => {
-        if (e.key === "Escape") dismiss();
-    }, { once: true });
-
-    // LAYER 5: Per-tab Keep buttons — remove individual tabs from pending closes
-    const keptIndices = new Set<number>();
-    const keepBtns = shadow.querySelectorAll(".kb");
-    const updateCtaLabel = () => {
-        const remaining = closeCount - keptIndices.size;
-        if (ctaEl) {
-            if (remaining <= 0) {
-                (ctaEl as HTMLButtonElement).disabled = true;
-                ctaEl.textContent = "All tabs kept";
-                ctaEl.style.opacity = "0.4";
-            } else {
-                (ctaEl as HTMLButtonElement).disabled = false;
-                ctaEl.textContent = `Close ${remaining} tab${remaining !== 1 ? "s" : ""}`;
-                ctaEl.style.opacity = "1";
-            }
-        }
-    };
-    keepBtns.forEach(btn => {
-        btn.addEventListener("click", (e) => {
-            const idx = Number((e.currentTarget as HTMLElement).dataset.keepIdx);
-            const row = shadow.getElementById(`tr-${idx}`);
-            if (keptIndices.has(idx)) {
-                keptIndices.delete(idx);
-                row?.classList.remove("kept");
-                (e.currentTarget as HTMLElement).textContent = "Keep";
-            } else {
-                keptIndices.add(idx);
-                row?.classList.add("kept");
-                (e.currentTarget as HTMLElement).textContent = "Kept";
-            }
-            updateCtaLabel();
-        });
-    });
+    document.addEventListener("keydown", handleKeydown);
 
     // CTA
     const ctaEl = shadow.getElementById("cta");
     if (ctaEl) {
         ctaEl.addEventListener("click", () => {
-            // Filter out actions for tabs the user chose to keep
-            const toExecute = actions.filter((a) => {
-                if (a.category !== "recommended") return false;
-                // Match kept indices to close actions by their position among recommended close actions
-                const closeActions = actions.filter(x =>
-                    x.category === "recommended" && (x.action_type === "close_tab" || x.action_type === "bookmark_and_close"));
-                const closeIdx = closeActions.indexOf(a);
-                if (closeIdx >= 0 && keptIndices.has(closeIdx)) return false;
-                return true;
-            });
+            const toExecute = executableRecommended;
             if (toExecute.length === 0) return;
             (ctaEl as HTMLButtonElement).disabled = true;
             ctaEl.textContent = "Working\u2026";
             ctaEl.style.opacity = "0.5";
 
-            // Build per-tab feedback: which tabs were kept vs closed
-            const closeTabs = tabRecs?.tabs?.filter(
-                t => t.action === "close" || t.action === "bookmark_and_close"
-            ) || [];
-            const keptTabData = Array.from(keptIndices).map(i => ({
-                url: String(closeTabs[i]?.url || ""),
-                title: String(closeTabs[i]?.tab_title || ""),
-            })).filter(t => t.url);
-            const closedTabData = closeTabs
-                .filter((_, i) => !keptIndices.has(i))
-                .map(t => ({
-                    url: String(t.url || ""),
-                    title: String(t.tab_title || ""),
-                })).filter(t => t.url);
-
             chrome.runtime.sendMessage({
                 type: "EXECUTE_ALL_RECOMMENDED",
                 actions: toExecute,
                 intervention_id: payload.intervention_id,
-                kept_tabs: keptTabData,
-                closed_tabs: closedTabData,
             }, (results: Array<Record<string, unknown>>) => {
                 const failCount = Array.isArray(results) ? results.filter(r => !r.success).length : 0;
                 const successCount = (Array.isArray(results) ? results.length : 0) - failCount;
@@ -2092,7 +2036,7 @@ function injectOverlay(payload: Record<string, unknown>): void {
                 ctaEl.classList.add("ok");
                 ctaEl.textContent = failCount > 0
                     ? `Done (${failCount} skipped)`
-                    : `${successCount} tab${successCount !== 1 ? "s" : ""} closed`;
+                    : `${successCount} change${successCount !== 1 ? "s" : ""} applied`;
 
                 const undoBar = shadow.getElementById("undo-bar");
                 if (undoBar) undoBar.style.display = "flex";
@@ -2119,7 +2063,12 @@ function injectOverlay(payload: Record<string, unknown>): void {
         });
     }
 
-    setTimeout(dismiss, 5 * 60 * 1000);
+    autoDismissTimer = window.setTimeout(dismiss, 5 * 60 * 1000);
+    host.__cortexCleanup = () => {
+        window.clearTimeout(autoDismissTimer);
+        window.clearTimeout(removalTimer);
+        document.removeEventListener("keydown", handleKeydown);
+    };
 }
 
 
@@ -2130,9 +2079,14 @@ function injectOverlay(payload: Record<string, unknown>): void {
  * payload.duration_s  — lockout duration in seconds
  * payload.reason      — brief message explaining why
  */
-function injectLockoutOverlay(payload: Record<string, unknown>): void {
+export function injectLockoutOverlay(payload: Record<string, unknown>): void {
     const OID = "cortex-lockout-overlay";
-    document.getElementById(OID)?.remove();
+    type ManagedLockoutHost = HTMLElement & {
+        __cortexCleanup?: () => void;
+    };
+    const existingHost = document.getElementById(OID) as ManagedLockoutHost | null;
+    existingHost?.__cortexCleanup?.();
+    const isUpdate = existingHost !== null;
 
     const durationS = Math.max(1, Math.round(Number(payload.duration_s) || 60));
     const reason = String(
@@ -2147,18 +2101,22 @@ function injectLockoutOverlay(payload: Record<string, unknown>): void {
         return `${m}:${String(s).padStart(2, "0")}`;
     }
 
-    const host = document.createElement("div");
-    host.id = OID;
-    host.style.cssText =
-        "position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483647;pointer-events:none;";
+    const host = (existingHost ?? document.createElement("div")) as ManagedLockoutHost;
+    if (!existingHost) {
+        host.id = OID;
+        host.style.cssText =
+            "position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483647;pointer-events:none;";
+    }
 
-    const shadow = host.attachShadow({ mode: "open" });
+    const shadow = host.shadowRoot ?? host.attachShadow({ mode: "open" });
     shadow.innerHTML = `
 <style>
-@keyframes panelIn{from{transform:translateY(12px) scale(.99);opacity:0}to{transform:translateY(0) scale(1);opacity:1}}
+@keyframes panelIn{from{transform:translate(-50%,calc(-50% + 8px)) scale(.98);opacity:0}to{transform:translate(-50%,-50%) scale(1);opacity:1}}
+@keyframes panelOut{from{transform:translate(-50%,-50%) scale(1);opacity:1}to{transform:translate(-50%,calc(-50% + 8px)) scale(.98);opacity:0}}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes fadeOut{from{opacity:1}to{opacity:0}}
 *{box-sizing:border-box;margin:0;padding:0}
-.bk{position:fixed;inset:0;background:rgba(0,0,0,.55);pointer-events:auto;animation:fadeIn .25s ease}
+.bk{position:fixed;inset:0;background:rgba(0,0,0,.55);pointer-events:auto;animation:fadeIn 160ms cubic-bezier(.23,1,.32,1)}
 .pn{
   position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:360px;
   pointer-events:auto;
@@ -2168,29 +2126,49 @@ function injectLockoutOverlay(payload: Record<string, unknown>): void {
   box-shadow:0 0 0 .5px rgba(0,0,0,.3),0 4px 20px rgba(0,0,0,.4),0 16px 40px rgba(0,0,0,.2);
   font-family:-apple-system,BlinkMacSystemFont,'Inter','SF Pro Text',system-ui,sans-serif;
   color:#e4e4e7;padding:28px 24px 22px;text-align:center;
-  animation:panelIn .3s cubic-bezier(.16,1,.3,1);
+  animation:panelIn 200ms cubic-bezier(.23,1,.32,1);
 }
+.pn.cx-update{animation:none}
+.pn.cx-exit{animation:panelOut 160ms cubic-bezier(.4,0,1,1) forwards}
+.bk.cx-exit{animation:fadeOut 160ms cubic-bezier(.4,0,1,1) forwards}
 .hd{font-size:15px;font-weight:600;color:#e4e4e7;margin-bottom:8px;letter-spacing:-.2px}
 .rs{font-size:12px;color:#71717a;line-height:1.5;margin-bottom:20px}
 .tm{font-size:40px;font-weight:700;color:#e4e4e7;font-variant-numeric:tabular-nums;margin-bottom:20px;font-family:'SF Mono','Fira Code',ui-monospace,monospace}
-.sk{display:inline-block;padding:7px 18px;border:1px solid rgba(255,255,255,.08);border-radius:8px;background:none;color:#71717a;font-size:11px;cursor:pointer;font-family:inherit;transition:all .12s}
-.sk:hover{color:#e4e4e7;border-color:rgba(255,255,255,.15)}
+.sk{display:inline-block;padding:7px 18px;border:1px solid rgba(255,255,255,.08);border-radius:8px;background:none;color:#71717a;font-size:11px;cursor:pointer;font-family:inherit;transition:color 120ms cubic-bezier(.23,1,.32,1),border-color 120ms cubic-bezier(.23,1,.32,1),transform 120ms cubic-bezier(.23,1,.32,1)}
+.sk:active{transform:scale(.97)}
+.sk:focus-visible{outline:2px solid #dfb15b;outline-offset:2px}
+@media (hover:hover) and (pointer:fine){.sk:hover{color:#e4e4e7;border-color:rgba(255,255,255,.15)}}
+@media (prefers-reduced-motion:reduce){.pn,.bk{animation:none!important}.sk{transition:color 120ms cubic-bezier(.23,1,.32,1),border-color 120ms cubic-bezier(.23,1,.32,1)!important}.sk:active{transform:none}}
 </style>
 <div class="bk" id="bk"></div>
-<div class="pn">
-  <div class="hd">Lockout Active</div>
+<div class="pn${isUpdate ? " cx-update" : ""}" role="dialog" aria-modal="true" aria-labelledby="cortex-lockout-title">
+  <div class="hd" id="cortex-lockout-title">Lockout Active</div>
   <div class="rs">${esc(reason)}</div>
   <div class="tm" id="countdown">${formatCountdown(durationS)}</div>
   <button class="sk" id="skip">I need to continue</button>
 </div>
 `;
 
-    document.body.appendChild(host);
+    if (!existingHost) document.body.appendChild(host);
 
     let remaining = durationS;
+    let dismissed = false;
+    let removalTimer = 0;
+    const reducedMotion = window.matchMedia(
+        "(prefers-reduced-motion: reduce)",
+    ).matches;
 
     function dismiss(): void {
-        host.remove();
+        if (dismissed) return;
+        dismissed = true;
+        window.clearInterval(timer);
+        if (reducedMotion) {
+            host.remove();
+            return;
+        }
+        shadow.querySelector(".pn")?.classList.add("cx-exit");
+        shadow.querySelector(".bk")?.classList.add("cx-exit");
+        removalTimer = window.setTimeout(() => host.remove(), 170);
     }
 
     const timer = setInterval(() => {
@@ -2206,16 +2184,25 @@ function injectLockoutOverlay(payload: Record<string, unknown>): void {
     // Skip button — no penalty, just dismiss. Lives in injected page-context
     // (executeScript), so the service-worker DEBUG flag is out of scope here.
     shadow.getElementById("skip")?.addEventListener("click", () => {
-        clearInterval(timer);
         dismiss();
     });
+
+    host.__cortexCleanup = () => {
+        window.clearInterval(timer);
+        window.clearTimeout(removalTimer);
+    };
 
     // Clicking backdrop does NOT dismiss — lockout must be waited out or explicitly skipped
 }
 
-function injectLeetCodeCoachOverlay(kind: string, payload: Record<string, unknown>): void {
+export function injectLeetCodeCoachOverlay(kind: string, payload: Record<string, unknown>): void {
     const OID = "cortex-leetcode-coach";
-    document.getElementById(OID)?.remove();
+    type ManagedCoachHost = HTMLElement & {
+        __cortexCleanup?: () => void;
+    };
+    const existingHost = document.getElementById(OID) as ManagedCoachHost | null;
+    existingHost?.__cortexCleanup?.();
+    const isUpdate = existingHost !== null;
 
     const esc = (s: string) =>
         s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -2250,190 +2237,113 @@ function injectLeetCodeCoachOverlay(kind: string, payload: Record<string, unknow
         extra = `<textarea id="lc-note" placeholder="The transferable pattern was..." spellcheck="false"></textarea>`;
     }
 
-    const host = document.createElement("div");
-    host.id = OID;
-    host.style.cssText = "position:fixed;inset:0;z-index:2147483647;pointer-events:none;";
-    const shadow = host.attachShadow({ mode: "open" });
+    const host = (existingHost ?? document.createElement("div")) as ManagedCoachHost;
+    if (!existingHost) {
+        host.id = OID;
+        host.style.cssText = "position:fixed;inset:0;z-index:2147483647;pointer-events:none;";
+    }
+    const shadow = host.shadowRoot ?? host.attachShadow({ mode: "open" });
     shadow.innerHTML = `
 <style>
 *{box-sizing:border-box}
-.card{position:fixed;right:22px;bottom:22px;width:min(380px,calc(100vw - 28px));pointer-events:auto;background:#101112;color:#f3f0e8;border:1px solid rgba(243,240,232,.12);border-radius:18px;box-shadow:0 18px 60px rgba(0,0,0,.35);font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;padding:18px;animation:in .22s cubic-bezier(.16,1,.3,1)}
+.card{position:fixed;right:22px;bottom:22px;width:min(380px,calc(100vw - 28px));pointer-events:auto;background:#101112;color:#f3f0e8;border:1px solid rgba(243,240,232,.12);border-radius:18px;box-shadow:0 18px 60px rgba(0,0,0,.35);font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;padding:18px;animation:in 200ms cubic-bezier(.23,1,.32,1)}
 @keyframes in{from{opacity:0;transform:translateY(10px) scale(.98)}to{opacity:1;transform:translateY(0) scale(1)}}
-.top{display:flex;align-items:center;gap:10px;margin-bottom:10px}.dot{width:9px;height:9px;border-radius:99px;background:#dfb15b;box-shadow:0 0 18px rgba(223,177,91,.55)}.ttl{font-size:14px;font-weight:700;letter-spacing:-.02em;flex:1}.x{border:0;background:transparent;color:#9b9488;font-size:18px;line-height:1;cursor:pointer}.body{font-size:13px;line-height:1.5;color:#cfc7b7;margin-bottom:13px}textarea{width:100%;height:92px;resize:vertical;background:#18191a;color:#f3f0e8;border:1px solid rgba(243,240,232,.14);border-radius:12px;padding:10px;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;outline:none}textarea:focus{border-color:#dfb15b}.tags{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}.tags span{font-size:11px;color:#dfb15b;border:1px solid rgba(223,177,91,.25);border-radius:99px;padding:4px 8px;background:rgba(223,177,91,.08)}button{border:1px solid rgba(243,240,232,.14);background:#dfb15b;color:#15110a;border-radius:10px;padding:8px 11px;font-size:12px;font-weight:700;cursor:pointer}.hint{margin-top:10px;font-size:12px;line-height:1.45;color:#cfc7b7;background:#18191a;border-radius:10px;padding:10px}label{display:flex;gap:8px;align-items:center;font-size:12px;color:#cfc7b7}
+@keyframes out{from{opacity:1;transform:translateY(0) scale(1)}to{opacity:0;transform:translateY(10px) scale(.98)}}
+.card.cx-update{animation:none}.card.cx-exit{animation:out 160ms cubic-bezier(.4,0,1,1) forwards}
+.top{display:flex;align-items:center;gap:10px;margin-bottom:10px}.dot{width:9px;height:9px;border-radius:99px;background:#dfb15b;box-shadow:0 0 18px rgba(223,177,91,.55)}.ttl{font-size:14px;font-weight:700;letter-spacing:-.02em;flex:1}.x{display:grid;place-items:center;width:32px;height:32px;padding:0;border:0;background:transparent;color:#9b9488;font-size:18px;line-height:1;cursor:pointer}.body{font-size:13px;line-height:1.5;color:#cfc7b7;margin-bottom:13px}textarea{width:100%;height:92px;resize:vertical;background:#18191a;color:#f3f0e8;border:1px solid rgba(243,240,232,.14);border-radius:12px;padding:10px;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;outline:none}textarea:focus{border-color:#dfb15b}.tags{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}.tags span{font-size:11px;color:#dfb15b;border:1px solid rgba(223,177,91,.25);border-radius:99px;padding:4px 8px;background:rgba(223,177,91,.08)}button{border:1px solid rgba(243,240,232,.14);background:#dfb15b;color:#15110a;border-radius:10px;padding:8px 11px;font-size:12px;font-weight:700;cursor:pointer;transition:transform 120ms cubic-bezier(.23,1,.32,1),filter 120ms cubic-bezier(.23,1,.32,1),background-color 120ms cubic-bezier(.23,1,.32,1)}button:active{transform:scale(.97)}button:focus-visible{outline:2px solid #f3f0e8;outline-offset:2px}.hint{margin-top:10px;font-size:12px;line-height:1.45;color:#cfc7b7;background:#18191a;border-radius:10px;padding:10px}label{display:flex;gap:8px;align-items:center;font-size:12px;color:#cfc7b7}@media (hover:hover) and (pointer:fine){button:hover{filter:brightness(.94)}.x:hover{background:rgba(243,240,232,.08);filter:none}}@media (prefers-reduced-motion:reduce){.card{animation:none!important}button{transition:filter 120ms cubic-bezier(.23,1,.32,1),background-color 120ms cubic-bezier(.23,1,.32,1)!important}button:active{transform:none}}
 </style>
-<div class="card">
-  <div class="top"><span class="dot"></span><div class="ttl">${esc(title)}</div><button class="x" id="lc-close">×</button></div>
+<div class="card${isUpdate ? " cx-update" : ""}" role="dialog" aria-labelledby="cortex-coach-title">
+  <div class="top"><span class="dot"></span><div class="ttl" id="cortex-coach-title">${esc(title)}</div><button class="x" id="lc-close" type="button" aria-label="Dismiss Cortex coach">×</button></div>
   <div class="body">${body}</div>
   ${extra}
 </div>`;
-    document.body.appendChild(host);
+    if (!existingHost) document.body.appendChild(host);
 
-    shadow.getElementById("lc-close")?.addEventListener("click", () => host.remove());
+    let dismissed = false;
+    let removalTimer = 0;
+    const reducedMotion = window.matchMedia(
+        "(prefers-reduced-motion: reduce)",
+    ).matches;
+    const dismiss = () => {
+        if (dismissed) return;
+        dismissed = true;
+        const card = shadow.querySelector<HTMLElement>(".card");
+        if (reducedMotion || !card) {
+            host.remove();
+            return;
+        }
+        card.classList.add("cx-exit");
+        removalTimer = window.setTimeout(() => host.remove(), 170);
+    };
+    shadow.getElementById("lc-close")?.addEventListener("click", dismiss);
     shadow.getElementById("lc-reveal")?.addEventListener("click", () => {
         const hint = shadow.getElementById("lc-hint");
         if (hint) {
             hint.textContent = "Hint 2: define the state transition and one invariant before writing more code.";
         }
     });
+    host.__cortexCleanup = () => window.clearTimeout(removalTimer);
 }
 
 async function handleIntervention(
     payload: Record<string, unknown>,
 ): Promise<void> {
-    // B.2: track what we actually applied so the ack at the bottom is
-    // truthful instead of theatrical. Each successful effect appends
-    // a descriptor; failures push to ``errors``.
-    const appliedActions: string[] = [];
-    const errors: string[] = [];
-    // P1-9: track whether we have hidden tabs so the recovery path can
-    // unconditionally restore them if an unhandled exception escapes
-    // after the hide step. This prevents the user from being stranded
-    // with a half-applied workspace.
-    let tabsWereHidden = false;
-
-    // Snapshot tabs so action executor can resolve tab_index → chrome tab ID
-    await snapshotTabsForIntervention();
-
     const uiPlan = payload.ui_plan as Record<string, boolean> | undefined;
+    let executableActionIds: string[] = [];
+    try {
+        executableActionIds = await verifiedPresentedActionIds(
+            payload,
+            "browser",
+        );
+    } catch (error) {
+        // A proposal may still contain useful manual guidance, but an invalid,
+        // stale, or absent manifest must never produce an enabled affordance.
+        if (DEBUG) {
+            console.debug(
+                "[cortex.bg] intervention has no valid executable manifest:",
+                String(error),
+            );
+        }
+    }
 
-    // Directly inject overlay into the active tab via executeScript.
-    // This bypasses content script messaging entirely — most reliable approach.
+    // INTERVENTION_TRIGGER is a proposal event, never an apply command.
+    // Presentation is allowed; tab grouping/hiding and action execution require
+    // a separate exact authorization transaction. Legacy triggers therefore
+    // remain safe even when they contain hide_targets.
     if (uiPlan?.show_overlay || uiPlan?.dim_background) {
         try {
             const [tab] = await chrome.tabs.query({
                 active: true,
                 currentWindow: true,
             });
-            if (tab?.id) {
+            if (tab?.id && !tab.incognito) {
                 await chrome.scripting.executeScript({
                     target: { tabId: tab.id },
                     func: injectOverlay,
-                    args: [payload],
+                    args: [payload, executableActionIds],
                 });
-                appliedActions.push("inject_overlay");
             }
         } catch (e) {
             if (DEBUG) console.error("Cortex: failed to inject overlay", e);
-            errors.push(`inject_overlay: ${(e as Error)?.message ?? String(e)}`);
         }
     }
 
-    // Hide tabs if simplified workspace — but protect goal-relevant and recently-active tabs
-    if (payload.hide_targets) {
-        const targets = payload.hide_targets as string[];
-        const interventionId = payload.intervention_id;
-        if (
-            targets.includes("browser_tabs_except_active") &&
-            typeof interventionId === "string"
-        ) {
-            // Build set of protected tab IDs: recently-active tabs + goal-relevant tabs
-            const protectedIds = new Set<number>();
-            const now = Date.now();
-            for (const [tabId, lastActive] of tabLastActivated) {
-                if (now - lastActive < RECENTLY_ACTIVE_PROTECTION_MS) {
-                    protectedIds.add(tabId);
-                }
-            }
-            // Also protect tabs that match goal keywords
-            if (focusSession?.goal) {
-                const goalKw = extractGoalKeywords(focusSession.goal);
-                if (goalKw.length > 0) {
-                    try {
-                        const allTabs = await chrome.tabs.query({});
-                        for (const tab of allTabs) {
-                            if (!tab.id) continue;
-                            const titleLower = (tab.title ?? "").toLowerCase();
-                            if (goalKw.some(kw => titleLower.includes(kw))) {
-                                protectedIds.add(tab.id);
-                            }
-                        }
-                    } catch (err) {
-                        // F12 (Phase-4 audit): query may transiently fail
-                        // mid-extension-reload; we degrade to "no extra
-                        // protection" which is safer than crashing.
-                        console.warn(
-                            "[cortex.bg] goal-keyword tab protection failed:",
-                            err,
-                        );
-                    }
-                }
-            }
-            try {
-                await hideTabsForIntervention(interventionId, protectedIds);
-                tabsWereHidden = true;
-                appliedActions.push("hide_tabs_except_active");
-            } catch (e) {
-                errors.push(`hide_tabs: ${(e as Error)?.message ?? String(e)}`);
-            }
-        }
-    }
-
-    try {
-        broadcastToPopup({
-            type: "INTERVENTION_TRIGGER",
-            payload,
-        });
-
-        // B.2: ack the apply so the daemon can replace the optimistic
-        // _OptimisticInterventionAdapter mutation tracking with real
-        // browser-side outcomes. Without this, InterventionOutcome.workspace_restored
-        // is theatrical for tab/overlay mutations (which are the majority).
-        const interventionId = payload.intervention_id;
-        if (typeof interventionId === "string") {
-            sendInterventionApplied(
-                interventionId,
-                "apply",
-                errors.length === 0,
-                appliedActions,
-                errors,
-            );
-        }
-    } catch (applyErr) {
-        // P1-9: if an unexpected error escapes after we already hid tabs,
-        // restore all tabs immediately so the user is not stranded with a
-        // half-applied workspace. Log the original error so it's visible.
-        if (DEBUG) {
-            console.error("[cortex.bg] P1-9: intervention apply threw after hideTabsForIntervention — restoring all tabs", applyErr);
-        }
-        if (tabsWereHidden) {
-            await restoreAllTabs().catch((restoreErr: unknown) => {
-                if (DEBUG) console.debug("[cortex.bg] P1-9: restoreAllTabs recovery also failed: %o", restoreErr);
-            });
-        }
-        throw applyErr;
-    }
+    broadcastToPopup({
+        type: "INTERVENTION_TRIGGER",
+        payload,
+    });
 }
 
 async function handleContextRequest(msg: WSMessage): Promise<void> {
     try {
-        const tabs = await collectTabs();
+        const { tabs, activeTab, contentExcerpt } = await browserContextCollector.collect({
+            focusGoal: focusSession?.goal,
+            lastActivated: tabActivationTelemetry.snapshot(),
+        });
         // Save this tab list so the intervention snapshot uses the same ordering
         // the LLM will see — prevents tab_index misalignment.
         lastContextTabs = tabs;
         lastContextTabsTimestamp = Date.now();
-        const activeTab = tabs.find((t) => t.is_active);
-
-        // Get active tab content
-        let contentExcerpt = "";
-        if (activeTab) {
-            try {
-                const [tab] = await chrome.tabs.query({
-                    active: true,
-                    currentWindow: true,
-                });
-                if (tab?.id) {
-                    const results = await chrome.scripting.executeScript({
-                        target: { tabId: tab.id },
-                        func: extractPageText,
-                    });
-                    if (results?.[0]?.result) {
-                        contentExcerpt = results[0].result as string;
-                    }
-                }
-            } catch {
-                // Content extraction failed
-            }
-        }
 
         send({
             type: "CONTEXT_RESPONSE",
@@ -2443,6 +2353,13 @@ async function handleContextRequest(msg: WSMessage): Promise<void> {
                     active_tab_url: activeTab?.url ?? "",
                     active_tab_content_excerpt: contentExcerpt,
                     all_tabs: tabs,
+                    tab_type_classification: tabs.reduce<Record<string, number>>(
+                        (counts, tab) => {
+                            counts[tab.tab_type] = (counts[tab.tab_type] ?? 0) + 1;
+                            return counts;
+                        },
+                        {},
+                    ),
                     focus_goal: focusSession?.goal ?? null,
                 },
             },
@@ -2462,25 +2379,10 @@ async function handleContextRequest(msg: WSMessage): Promise<void> {
 }
 
 async function handleRestore(payload: Record<string, unknown>): Promise<void> {
-    // B.2: track real restore outcome so the daemon's
-    // InterventionOutcome.workspace_restored reflects truth, not
-    // optimistic defaults. Each effect either appends an applied descriptor
-    // or pushes an error.
-    const appliedActions: string[] = [];
-    const errors: string[] = [];
-
-    const interventionId = payload.intervention_id;
-    try {
-        if (typeof interventionId === "string") {
-            await restoreTabsForIntervention(interventionId);
-            appliedActions.push("restore_tabs_for_intervention");
-        } else {
-            await restoreAllTabs();
-            appliedActions.push("restore_all_tabs");
-        }
-    } catch (e) {
-        errors.push(`restore_tabs: ${(e as Error)?.message ?? String(e)}`);
-    }
+    // A legacy restore frame closes presentation only. Workspace restoration
+    // requires an exact restore_id plus receipt-derived inverse actions and is
+    // handled by the fail-closed transaction adapter below.
+    const exactRestore = await handleExactRestoreCommand(payload);
     try {
         const tabs = await chrome.tabs.query({});
         await Promise.all(
@@ -2494,24 +2396,22 @@ async function handleRestore(payload: Record<string, unknown>): Promise<void> {
                     }),
                 ),
         );
-        appliedActions.push("remove_overlay");
-    } catch {
-        errors.push("remove_overlay");
-    }
+    } catch { /* best-effort presentation cleanup */ }
     // F4 (Phase-4 audit): the in-memory latch MUST be nulled even if
     // session-storage clearing throws. The earlier ``try { ... } catch {}``
     // both swallowed the failure and worked correctly, but a noisy
     // platform bug (e.g. quota exhausted) would never surface for
     // debugging. Log + still null the latch so behaviour is identical
     // but observable.
-    activeIntervention = null;
+    interventionPresentation.clear();
     try {
         chrome.storage.session.remove([
             "cortex_active_intervention",
             "cortex_active_intervention_cid",
             "cortex_active_intervention_mounted_at",
-            "cortex_tab_snapshot",
-            "cortex_tab_mgr_snapshots",
+            ...(exactRestore
+                ? ["cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]
+                : []),
         ]);
     } catch (err) {
         console.warn(
@@ -2520,119 +2420,6 @@ async function handleRestore(payload: Record<string, unknown>): Promise<void> {
         );
     }
     broadcastToPopup({ type: "INTERVENTION_RESTORE", payload });
-
-    if (typeof interventionId === "string") {
-        sendInterventionApplied(
-            interventionId,
-            "restore",
-            errors.length === 0,
-            appliedActions,
-            errors,
-        );
-    }
-}
-
-// --- Tab Management ---
-
-interface TabData {
-    title: string;
-    url: string;
-    tab_type: string;
-    is_active: boolean;
-    tab_id: number;
-    topic_hint: string;
-    last_activated_ago_seconds: number | null;
-}
-
-function extractTopicHint(title: string, url: string, tabType: string): string {
-    if (tabType === "ai_assistant") {
-        return title.replace(/\s*[-–—]\s*(Gemini|ChatGPT|Claude|Copilot|Perplexity|Phind|Poe).*$/i, "").slice(0, 100);
-    }
-    if (tabType === "video_platform") {
-        return title.replace(/\s*[-–—]\s*(YouTube|Vimeo).*$/i, "").slice(0, 100);
-    }
-    if (tabType === "search") {
-        try { return new URL(url).searchParams.get("q")?.slice(0, 100) || ""; } catch { return ""; }
-    }
-    if (tabType === "communication") {
-        return title.replace(/\s*[-–—]\s*(Slack|Discord|Microsoft Teams).*$/i, "").slice(0, 100);
-    }
-    return "";
-}
-
-async function collectTabs(): Promise<TabData[]> {
-    const chromeTabs = await chrome.tabs.query({});
-    // LAYER 2: Extract goal keywords for goal-aware classification
-    const goalKeywords: string[] = focusSession?.goal
-        ? extractGoalKeywords(focusSession.goal)
-        : [];
-
-    const now = Date.now();
-    return chromeTabs.map((tab) => {
-        // Use goal-aware classification when a focus session is active
-        const tabType = goalKeywords.length > 0
-            ? classifyTabTypeWithGoal(tab.url ?? "", tab.title ?? "", goalKeywords)
-            : classifyBrowserTabType(tab.url ?? "");
-        const lastActive = tabLastActivated.get(tab.id ?? -1);
-        return {
-            title: tab.title ?? "",
-            url: tab.url ?? "",
-            tab_type: tabType,
-            is_active: tab.active ?? false,
-            tab_id: tab.id ?? -1,
-            topic_hint: extractTopicHint(tab.title ?? "", tab.url ?? "", tabType),
-            last_activated_ago_seconds: lastActive != null
-                ? Math.floor((now - lastActive) / 1000)
-                : null,
-        };
-    });
-}
-
-// --- Content extraction function (injected into page) ---
-
-function extractPageText(): string {
-    const MAX_CHARS = 8000; // ~2000 tokens
-    const walker = document.createTreeWalker(
-        document.body,
-        NodeFilter.SHOW_TEXT,
-        {
-            acceptNode(node: Text): number {
-                const parent = node.parentElement;
-                if (!parent) return NodeFilter.FILTER_REJECT;
-                const tag = parent.tagName.toLowerCase();
-                if (
-                    ["script", "style", "noscript", "svg", "path"].includes(
-                        tag,
-                    )
-                ) {
-                    return NodeFilter.FILTER_REJECT;
-                }
-                if (parent.offsetWidth === 0 && parent.offsetHeight === 0) {
-                    return NodeFilter.FILTER_REJECT;
-                }
-                const text = node.textContent?.trim();
-                if (!text || text.length < 2) return NodeFilter.FILTER_REJECT;
-                return NodeFilter.FILTER_ACCEPT;
-            },
-        },
-    );
-
-    const chunks: string[] = [];
-    let totalLen = 0;
-    let node: Text | null;
-
-    while ((node = walker.nextNode() as Text | null)) {
-        const text = node.textContent?.trim();
-        if (!text) continue;
-        if (totalLen + text.length > MAX_CHARS) {
-            chunks.push(text.substring(0, MAX_CHARS - totalLen));
-            break;
-        }
-        chunks.push(text);
-        totalLen += text.length;
-    }
-
-    return chunks.join(" ");
 }
 
 // --- Daemon launch helper ---
@@ -2746,16 +2533,7 @@ async function runLaunchCortex(): Promise<LaunchResult> {
 
 function startFocusSession(goal: string): void {
     const now = Date.now();
-    focusSession = {
-        startTime: now,
-        totalFocusMs: 0,
-        distractionsBlocked: 0,
-        lastFocusCheck: now,
-        lastStateWasFocus: false,
-        longestStreakMs: 0,
-        currentStreakStart: 0,
-        goal,
-    };
+    focusSession = createFocusSession(goal, now);
     schedulePersist();
     broadcastToPopup({ type: "FOCUS_SESSION_STARTED", goal });
 }
@@ -2810,21 +2588,11 @@ function startAutoFocusSession(opts: {
         }
         return;
     }
-    focusSession = {
-        startTime: now,
-        totalFocusMs: 0,
-        distractionsBlocked: 0,
-        lastFocusCheck: now,
-        lastStateWasFocus: false,
-        longestStreakMs: 0,
-        currentStreakStart: 0,
-        goal: `Auto-focus (${opts.reason})`,
-    };
+    focusSession = createFocusSession(`Auto-focus (${opts.reason})`, now);
     autoFocusArmed = true;
     autoFocusEndsAt = now + opts.durationMinutes * 60_000;
     _activeFocusPresetName = opts.preset;
-    activeFocusPresetPatterns =
-        FOCUS_PRESET_DOMAINS[opts.preset] || FOCUS_PRESET_DOMAINS.developer;
+    activeFocusPresetPatterns = resolveFocusPreset(opts.preset);
     activeFocusCustomDomains = opts.customDomains.slice(0, 100);
     // Phase 4d Task A: mirror to chrome.storage.local before scheduling
     // the alarm so a worst-case SW eviction immediately after arming
@@ -2894,42 +2662,13 @@ function stopAutoFocusSession(reason: string): FocusSession | null {
 
 function updateFocusSession(payload: Record<string, unknown>): void {
     if (!focusSession) return;
-    const now = Date.now();
-    const elapsed = now - focusSession.lastFocusCheck;
-    const state = payload.state as string;
-    const isFocused = state === "FLOW" || state === "RECOVERY";
-
-    if (isFocused) {
-        focusSession.totalFocusMs += elapsed;
-        if (!focusSession.lastStateWasFocus) {
-            focusSession.currentStreakStart = now;
-        }
-        const currentStreak = now - focusSession.currentStreakStart;
-        if (currentStreak > focusSession.longestStreakMs) {
-            focusSession.longestStreakMs = currentStreak;
-        }
-    } else {
-        focusSession.currentStreakStart = 0;
-    }
-    focusSession.lastStateWasFocus = isFocused;
-    focusSession.lastFocusCheck = now;
+    updateFocusSessionState(focusSession, payload);
     schedulePersist();
 }
 
 function getFocusSessionSnapshot() {
     if (!focusSession) return null;
-    const now = Date.now();
-    const elapsed = now - focusSession.startTime;
-    return {
-        elapsedMs: elapsed,
-        focusMs: focusSession.totalFocusMs,
-        focusPct: elapsed > 0 ? Math.round((focusSession.totalFocusMs / elapsed) * 100) : 0,
-        distractionsBlocked: focusSession.distractionsBlocked,
-        longestStreakMin: Math.round(focusSession.longestStreakMs / 60000),
-        goal: focusSession.goal,
-        currentStreakMs: focusSession.lastStateWasFocus && focusSession.currentStreakStart
-            ? now - focusSession.currentStreakStart : 0,
-    };
+    return focusSessionSnapshot(focusSession);
 }
 
 async function saveToDailyStats(session: FocusSession): Promise<void> {
@@ -2937,16 +2676,7 @@ async function saveToDailyStats(session: FocusSession): Promise<void> {
     const result = await chrome.storage.local.get("cortex_daily_stats");
     let stats: DailyStats = result.cortex_daily_stats as DailyStats;
     if (!stats || stats.date !== today) {
-        stats = {
-            date: today,
-            totalFocusMin: 0,
-            totalSessionMin: 0,
-            sessions: 0,
-            distractionsBlocked: 0,
-            longestStreakMin: 0,
-            avgHrDuringFocus: 0,
-            hrSamples: 0,
-        };
+        stats = emptyDailyStats(today);
     }
     const sessionMin = (Date.now() - session.startTime) / 60000;
     const focusMin = session.totalFocusMs / 60000;
@@ -2961,52 +2691,14 @@ async function saveToDailyStats(session: FocusSession): Promise<void> {
 
 // --- Distraction Blocking ---
 
-// Short but meaningful tech terms that should not be filtered out of goal keywords
-const TECH_SHORT_WORDS = new Set([
-    "go", "ml", "ai", "css", "sql", "vue", "rx", "aws", "gcp", "api",
-    "cli", "gui", "dom", "npm", "pip", "git", "ux", "ui", "db",
-    "os", "ci", "cd", "qa", "c++", "c#", "r", "dx", "io", "jwt",
-]);
-
-function extractGoalKeywords(goal: string): string[] {
-    return goal.toLowerCase().split(/\s+/).filter(
-        w => w.length > 1 || TECH_SHORT_WORDS.has(w.toLowerCase())
-    );
-}
-
 function isDistractionUrl(url: string, title?: string): boolean {
-    // P0 §3.10: when the daemon (or the user) armed a focus session
-    // with a preset / custom blocklist, treat any matching domain as
-    // a distraction regardless of the conditional rules below.
-    if (focusSession) {
-        if (activeFocusPresetPatterns.some((p) => p.test(url))) return true;
-        if (activeFocusCustomDomains.length > 0) {
-            const lowered = url.toLowerCase();
-            if (activeFocusCustomDomains.some((d) => lowered.includes(d.toLowerCase()))) {
-                return true;
-            }
-        }
-    }
-    if (ALWAYS_DISTRACTION.some((p) => p.test(url))) return true;
-    if (AI_ASSISTANT_URL_PATTERN.test(url)) return false;
-    if (VIDEO_PLATFORM_URL_PATTERN.test(url)) {
-        // YouTube: check title for goal-relevant keywords
-        if (focusSession?.goal && title) {
-            const goalWords = extractGoalKeywords(focusSession.goal);
-            const titleLower = title.toLowerCase();
-            if (goalWords.some(w => titleLower.includes(w))) return false;
-        }
-        return true;
-    }
-    if (CONDITIONAL_DISTRACTION.some((p) => p.test(url))) {
-        if (focusSession?.goal && title) {
-            const goalWords = extractGoalKeywords(focusSession.goal);
-            const titleLower = title.toLowerCase();
-            if (goalWords.some(w => titleLower.includes(w))) return false;
-        }
-        return true;
-    }
-    return false;
+    return isDistractionForSession({
+        url,
+        title,
+        session: focusSession,
+        presetPatterns: activeFocusPresetPatterns,
+        customDomains: activeFocusCustomDomains,
+    });
 }
 
 function injectDistractionInterceptor(
@@ -3120,7 +2812,10 @@ async function snapshotTabsForIntervention(): Promise<void> {
         if (DEBUG) console.log("Cortex: discarding stale tab context (>30s old), refreshing");
         lastContextTabs = null;
     }
-    const tabs = lastContextTabs ?? await collectTabs();
+    const tabs = lastContextTabs ?? (await browserContextCollector.collect({
+        focusGoal: focusSession?.goal,
+        lastActivated: tabActivationTelemetry.snapshot(),
+    })).tabs;
     const snapData: Record<string, { chromeTabId: number; url: string; title: string }> = {};
     for (let i = 0; i < tabs.length; i++) {
         const entry = {
@@ -3133,7 +2828,9 @@ async function snapshotTabsForIntervention(): Promise<void> {
     }
     // Verify all snapshot tab IDs still exist (tabs may have been closed)
     try {
-        const liveTabs = await chrome.tabs.query({});
+        const liveTabs = (await chrome.tabs.query({})).filter(
+            (tab) => !tab.incognito,
+        );
         const liveIds = new Set(liveTabs.map(t => t.id));
         for (const [idx, entry] of interventionTabSnapshot) {
             if (!liveIds.has(entry.chromeTabId)) {
@@ -3198,7 +2895,7 @@ async function validateTab(
             return { valid: false, tabId: snap.chromeTabId, message: "Tab is currently active — refusing to close" };
         }
         // LAYER 1b: Protect recently-visited tabs (activated within last 5 minutes)
-        const lastActive = tabLastActivated.get(snap.chromeTabId);
+        const lastActive = tabActivationTelemetry.lastActivation(snap.chromeTabId);
         if (lastActive && Date.now() - lastActive < RECENTLY_ACTIVE_PROTECTION_MS) {
             const agoSec = Math.round((Date.now() - lastActive) / 1000);
             return { valid: false, tabId: snap.chromeTabId, message: `Tab was recently active (${agoSec}s ago) — protected` };
@@ -3244,72 +2941,1853 @@ function pushUndo(entry: UndoEntry): void {
     schedulePersist();
 }
 
-async function executeAction(action: SuggestedAction): Promise<ActionExecuteResult> {
+interface BrowserCapabilityResult {
+    result: ActionExecuteResult;
+    inverse: Record<string, unknown>;
+    status: "succeeded" | "failed" | "already_complete";
+}
+
+interface BrowserEffectVerification {
+    verified: boolean;
+    detail: string;
+    fingerprint: Record<string, unknown>;
+}
+
+function urlsMatch(left: unknown, right: unknown): boolean {
+    if (typeof left !== "string" || typeof right !== "string") return false;
     try {
-        // F42 closure: ``action.action_type`` is the generated
-        // ``Literal`` union from the Pydantic ``SuggestedAction``.
-        // The TS compiler narrows ``unhandled`` to ``never`` only when
-        // every member of the union is covered; adding a new
-        // ``action_type`` on the Python side will fail this file's
-        // ``tsc --noEmit`` check until a matching case is added.
-        switch (action.action_type) {
-            case "close_tab":
-                return await executeCloseTab(action);
-            case "group_tabs":
-                return await executeGroupTabs(action);
-            case "bookmark_and_close":
-                return await executeBookmarkAndClose(action);
-            case "open_url":
-                return await executeOpenUrl(action);
-            case "search_error":
-                return await executeSearchError(action);
-            case "highlight_tab":
-                return await executeHighlightTab(action);
-            case "save_session":
-                return await executeSaveSession(action);
-            case "copy_to_clipboard":
-                return await executeCopyToClipboard(action);
-            case "start_timer":
-                return await executeStartTimer(action);
-            case "resume_last_active_file":
-                return await executeResumeLastActiveFile(action);
-            case "suggest_movement_break":
-                return await executeSuggestMovementBreak(action);
-            case "prompt_micro_commit":
-                return await executePromptMicroCommit(action);
-            case "take_biology_break":
-                // P0 §3.7: biology break runs on the desktop shell's
-                // full-screen Qt overlay — the browser has nothing to
-                // do locally. Return a pass-through result so the
-                // popup card collapses; the accompanying ACTION_EXECUTE
-                // log frame already carries the action to the daemon,
-                // which routes it to the BiologyBreakController.
-                return {
-                    action_id: action.action_id,
-                    success: true,
-                    message: "Break started on desktop",
-                    reversible: true,
-                };
-            default: {
-                // Compile-time exhaustiveness: ``unhandled`` is ``never``
-                // when the switch covers every union member. Defence in
-                // depth — at runtime, if a malformed plan slipped past
-                // Pydantic somehow (it shouldn't), surface a structured
-                // error rather than crashing.
-                const unhandled: never = action.action_type;
-                return {
-                    action_id: action.action_id,
-                    success: false,
-                    message: `Unknown action type: ${String(unhandled)}`,
-                    reversible: false,
-                };
+        return new URL(left).href === new URL(right).href;
+    } catch {
+        return left === right;
+    }
+}
+
+async function verifyBrowserEffect(
+    action: ManifestAction,
+    inverse: Record<string, unknown>,
+): Promise<BrowserEffectVerification> {
+    if (inverse.noEffect === true) {
+        return {
+            verified: true,
+            detail: "No eligible workspace object required a change",
+            fingerprint: { capability: action.capability, noEffect: true },
+        };
+    }
+    if (action.capability === "hide_tabs_except_active") {
+        const groupId = typeof inverse.groupId === "number" ? inverse.groupId : null;
+        const tabIds = Array.isArray(inverse.hiddenTabIds)
+            ? inverse.hiddenTabIds.filter((id): id is number => typeof id === "number")
+            : [];
+        const tabs = (await chrome.tabs.query({})).filter((tab) => !tab.incognito);
+        const grouped = tabs.filter(
+            (tab) => typeof tab.id === "number" && tabIds.includes(tab.id),
+        );
+        let collapsed = false;
+        if (groupId !== null) {
+            try {
+                collapsed = (await chrome.tabGroups.get(groupId)).collapsed === true;
+            } catch {
+                collapsed = false;
             }
         }
-    } catch (e) {
+        const verified = groupId !== null
+            && tabIds.length > 0
+            && grouped.length === tabIds.length
+            && grouped.every((tab) => tab.groupId === groupId)
+            && collapsed;
+        return {
+            verified,
+            detail: verified
+                ? "Exact Cortex tab group verified"
+                : "Tab group postcondition could not be verified",
+            fingerprint: {
+                groupId,
+                tabIds: [...tabIds].sort((a, b) => a - b),
+                collapsed,
+            },
+        };
+    }
+    const originalTabId = typeof inverse.originalTabId === "number"
+        ? inverse.originalTabId
+        : null;
+    if (action.capability === "close_tab" || action.capability === "bookmark_and_close") {
+        let originalAbsent = originalTabId !== null;
+        if (originalTabId !== null) {
+            try {
+                await chrome.tabs.get(originalTabId);
+                originalAbsent = false;
+            } catch {
+                originalAbsent = true;
+            }
+        }
+        let bookmarkVerified = true;
+        const bookmarkId = typeof inverse.bookmarkId === "string"
+            ? inverse.bookmarkId
+            : "";
+        if (action.capability === "bookmark_and_close") {
+            bookmarkVerified = false;
+            if (bookmarkId) {
+                try {
+                    const [bookmark] = await chrome.bookmarks.get(bookmarkId);
+                    bookmarkVerified = Boolean(
+                        bookmark && urlsMatch(bookmark.url, inverse.url),
+                    );
+                } catch {
+                    bookmarkVerified = false;
+                }
+            }
+        }
+        const verified = originalAbsent && bookmarkVerified;
+        return {
+            verified,
+            detail: verified
+                ? "Exact closed-tab postcondition verified"
+                : "Closed-tab postcondition could not be verified",
+            fingerprint: { originalTabId, originalAbsent, bookmarkId, bookmarkVerified },
+        };
+    }
+    if (action.capability === "group_tabs") {
+        const groupId = typeof inverse.groupId === "number" ? inverse.groupId : null;
+        const tabIds = Array.isArray(inverse.tabIds)
+            ? inverse.tabIds.filter((id): id is number => typeof id === "number")
+            : [];
+        const tabs = await chrome.tabs.query({});
+        const grouped = tabs.filter(
+            (tab) => typeof tab.id === "number" && tabIds.includes(tab.id),
+        );
+        let collapsed = false;
+        if (groupId !== null) {
+            try {
+                collapsed = (await chrome.tabGroups.get(groupId)).collapsed === true;
+            } catch {
+                collapsed = false;
+            }
+        }
+        const verified = groupId !== null
+            && tabIds.length > 0
+            && grouped.length === tabIds.length
+            && grouped.every((tab) => tab.groupId === groupId)
+            && collapsed;
+        return {
+            verified,
+            detail: verified
+                ? "Exact grouped tabs verified"
+                : "Grouped-tab postcondition could not be verified",
+            fingerprint: {
+                groupId,
+                tabIds: [...tabIds].sort((a, b) => a - b),
+                collapsed,
+            },
+        };
+    }
+    if (action.capability === "open_url" || action.capability === "search_error") {
+        const tabId = typeof inverse.tabId === "number" ? inverse.tabId : null;
+        let actualUrl: string | null = null;
+        let pendingUrl: string | null = null;
+        if (tabId !== null) {
+            try {
+                const tab = await chrome.tabs.get(tabId);
+                actualUrl = tab.url ?? null;
+                pendingUrl = tab.pendingUrl ?? null;
+            } catch {
+                actualUrl = null;
+                pendingUrl = null;
+            }
+        }
+        const verified = tabId !== null && (
+            urlsMatch(actualUrl, inverse.url)
+            || urlsMatch(pendingUrl, inverse.url)
+        );
+        return {
+            verified,
+            detail: verified
+                ? "Exact Cortex-created tab verified"
+                : "Created-tab postcondition could not be verified",
+            fingerprint: { tabId, actualUrl, pendingUrl },
+        };
+    }
+    if (action.capability === "highlight_tab") {
+        const targetTabId = typeof inverse.targetTabId === "number"
+            ? inverse.targetTabId
+            : null;
+        const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+        const verified = targetTabId !== null && active?.id === targetTabId;
+        return {
+            verified,
+            detail: verified
+                ? "Exact active tab verified"
+                : "Active-tab postcondition could not be verified",
+            fingerprint: { targetTabId, activeTabId: active?.id ?? null },
+        };
+    }
+    return {
+        verified: false,
+        detail: `No verifier exists for ${action.capability}`,
+        fingerprint: { capability: action.capability },
+    };
+}
+
+function monotonicNowNs(): number {
+    const milliseconds = typeof globalThis.performance?.now === "function"
+        ? globalThis.performance.now()
+        : 0;
+    return Math.max(0, Math.round(milliseconds * 1_000_000));
+}
+
+function operationKey(interventionId: string, actionId: string): string {
+    return `${interventionId}:${actionId}`;
+}
+
+function newCreatedTabStageUrl(): string {
+    return `${CREATED_TAB_STAGE_PREFIX}${newWireId()}`;
+}
+
+function validCreatedTabStageUrl(value: unknown): value is string {
+    if (typeof value !== "string" || !value.startsWith(CREATED_TAB_STAGE_PREFIX)) {
+        return false;
+    }
+    const token = value.slice(CREATED_TAB_STAGE_PREFIX.length);
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+        .test(token);
+}
+
+/**
+ * Recover the identity of a tab created immediately before an MV3 worker
+ * termination. A created tab receives a unique, inert staging URL before
+ * Cortex checkpoints its Chrome tab id; navigation to the requested URL only
+ * happens after that checkpoint is durable. Therefore zero marker matches
+ * proves that no created-tab effect remains, while one match is the exact
+ * Cortex-owned object that compensation may remove.
+ */
+async function reconcileCreatedTabInverse(
+    inverse: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+    if (typeof inverse.tabId === "number") return { ...inverse };
+    if (!validCreatedTabStageUrl(inverse.stagingUrl)) return { ...inverse };
+
+    const tabs = await chrome.tabs.query({});
+    const matches = tabs.filter((tab) =>
+        typeof tab.id === "number"
+        && (
+            urlsMatch(tab.url, inverse.stagingUrl)
+            || urlsMatch(tab.pendingUrl, inverse.stagingUrl)
+        )
+    );
+    if (matches.length === 0) {
+        const recovered: Record<string, unknown> = { ...inverse, noEffect: true };
+        delete recovered.tabId;
+        delete recovered.cortexEffectMayExist;
+        return recovered;
+    }
+    if (matches.length === 1) {
+        const recovered: Record<string, unknown> = {
+            ...inverse,
+            tabId: matches[0].id,
+            cortexEffectMayExist: true,
+        };
+        delete recovered.noEffect;
+        return recovered;
+    }
+    throw new IndeterminateBrowserMutationError(
+        "Multiple tabs share a Cortex recovery marker; automatic ownership is ambiguous",
+        {
+            ...inverse,
+            cortexEffectMayExist: true,
+            recoveryConflictCount: matches.length,
+        },
+    );
+}
+
+function suggestedActionFromManifest(action: ManifestAction): SuggestedAction {
+    const parameters = JSON.parse(action.parameters_json || "{}") as Record<string, unknown>;
+    const raw = parameters.suggested_action;
+    if (!isSuggestedAction(raw)) {
+        throw new Error("manifest suggested action failed runtime validation");
+    }
+    if (raw.action_id !== action.action_id || raw.action_type !== action.capability) {
+        throw new Error("suggested action differs from manifest capability");
+    }
+    const candidate = raw as unknown as Record<string, unknown>;
+    const target = candidate.target;
+    const label = candidate.label;
+    const reason = candidate.reason;
+    const tabIndex = candidate.tab_index;
+    const metadata = candidate.metadata;
+    if (
+        (target !== undefined && (typeof target !== "string" || target.length > 500))
+        || typeof label !== "string"
+        || label.length === 0
+        || label.length > 200
+        || (reason !== undefined && (typeof reason !== "string" || reason.length > 300))
+        || (
+            tabIndex !== undefined
+            && tabIndex !== null
+            && (
+                typeof tabIndex !== "number"
+                || !Number.isInteger(tabIndex)
+                || tabIndex < 0
+            )
+        )
+        || (
+            metadata !== undefined
+            && (
+                typeof metadata !== "object"
+                || metadata === null
+                || Array.isArray(metadata)
+            )
+        )
+    ) {
+        throw new Error("suggested action fields are invalid");
+    }
+    if (
+        new Set(["close_tab", "bookmark_and_close", "highlight_tab"])
+            .has(action.capability)
+        && (typeof tabIndex !== "number" || !Number.isInteger(tabIndex))
+    ) {
+        throw new Error("tab action lacks an exact non-negative index");
+    }
+    const metadataRecord = (metadata ?? {}) as Record<string, unknown>;
+    if (action.capability === "group_tabs") {
+        const rawIndices = metadataRecord.tab_indices;
+        const indices = Array.isArray(rawIndices) ? [...rawIndices] : [];
+        if (typeof tabIndex === "number" && Number.isInteger(tabIndex)) {
+            indices.push(tabIndex);
+        }
+        if (
+            indices.length === 0
+            || indices.length > 32
+            || indices.some((value) =>
+                typeof value !== "number"
+                || !Number.isInteger(value)
+                || value < 0
+            )
+        ) {
+            throw new Error("group_tabs lacks bounded exact tab indices");
+        }
+    }
+    if (action.capability === "open_url") {
+        try {
+            const parsed = new URL(String(target ?? ""));
+            if (!new Set(["http:", "https:"]).has(parsed.protocol) || !parsed.hostname) {
+                throw new Error("unsafe URL");
+            }
+        } catch {
+            throw new Error("open_url target must be an absolute HTTP(S) URL");
+        }
+    }
+    if (action.capability === "search_error") {
+        const query = String(metadataRecord.search_query ?? target ?? "");
+        if (!query || query.length > 200 || /[\r\n]/.test(query)) {
+            throw new Error("search_error query is invalid");
+        }
+    }
+    if (action.capability === "start_timer") {
+        const minutes = metadataRecord.minutes ?? 5;
+        if (
+            typeof minutes !== "number"
+            || !Number.isInteger(minutes)
+            || minutes < 1
+            || minutes > 240
+        ) {
+            throw new Error("timer duration must be 1..240 minutes");
+        }
+    }
+    return raw as SuggestedAction;
+}
+
+function normalizedSuggestionForConsent(
+    value: unknown,
+): Record<string, unknown> | null {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        return null;
+    }
+    const candidate = value as Record<string, unknown>;
+    if (
+        typeof candidate.action_id !== "string"
+        || !candidate.action_id
+        || typeof candidate.action_type !== "string"
+        || !candidate.action_type
+        || typeof candidate.label !== "string"
+        || !candidate.label
+    ) {
+        return null;
+    }
+    const tabIndex = candidate.tab_index ?? null;
+    const target = candidate.target ?? "";
+    const reason = candidate.reason ?? "";
+    const category = candidate.category ?? "recommended";
+    const reversible = candidate.reversible ?? false;
+    const groupId = candidate.group_id ?? null;
+    const metadata = candidate.metadata ?? {};
+    const catalogId = candidate.catalog_id ?? null;
+    if (
+        (tabIndex !== null && (
+            typeof tabIndex !== "number"
+            || !Number.isInteger(tabIndex)
+            || tabIndex < 0
+        ))
+        || typeof target !== "string"
+        || typeof reason !== "string"
+        || !new Set(["recommended", "optional", "informational"]).has(
+            String(category),
+        )
+        || typeof reversible !== "boolean"
+        || (groupId !== null && typeof groupId !== "string")
+        || typeof metadata !== "object"
+        || metadata === null
+        || Array.isArray(metadata)
+        || (catalogId !== null && typeof catalogId !== "string")
+    ) {
+        return null;
+    }
+    return {
+        action_id: candidate.action_id,
+        action_type: candidate.action_type,
+        tab_index: tabIndex,
+        target,
+        label: candidate.label,
+        reason,
+        category,
+        reversible,
+        group_id: groupId,
+        metadata,
+        catalog_id: catalogId,
+    };
+}
+
+function presentationMatchesManifestAction(
+    action: ManifestAction,
+    candidate: unknown,
+): boolean {
+    if (action.source !== "suggested_action") return false;
+    try {
+        const expected = normalizedSuggestionForConsent(
+            suggestedActionFromManifest(action),
+        );
+        const displayed = normalizedSuggestionForConsent(candidate);
+        return expected !== null
+            && displayed !== null
+            && canonicalJson(expected) === canonicalJson(displayed);
+    } catch {
+        return false;
+    }
+}
+
+async function prepareBrowserInverse(
+    interventionId: string,
+    action: ManifestAction,
+): Promise<Record<string, unknown>> {
+    if (action.capability === "hide_tabs_except_active") {
+        const tabs = await chrome.tabs.query({ currentWindow: true });
+        return {
+            interventionId,
+            activeTabId: tabs.find((tab) => tab.active)?.id ?? null,
+            candidateTabIds: tabs
+                .filter((tab) => !tab.active && typeof tab.id === "number")
+                .map((tab) => tab.id),
+        };
+    }
+    if (action.source !== "suggested_action") return {};
+    const suggested = suggestedActionFromManifest(action);
+    if (
+        suggested.action_type === "close_tab"
+        || suggested.action_type === "bookmark_and_close"
+    ) {
+        await loadSnapshotFromStorage();
+        const index = suggested.tab_index;
+        const snapshot = typeof index === "number"
+            ? interventionTabSnapshot.get(index)
+            : undefined;
+        let live: chrome.tabs.Tab | null = null;
+        if (typeof snapshot?.chromeTabId === "number") {
+            try {
+                live = await chrome.tabs.get(snapshot.chromeTabId);
+            } catch {
+                live = null;
+            }
+        }
+        return {
+            url: snapshot?.url || "",
+            title: snapshot?.title || "",
+            originalTabId: snapshot?.chromeTabId ?? null,
+            windowId: live?.windowId ?? null,
+            index: live?.index ?? null,
+            pinned: live?.pinned ?? false,
+        };
+    }
+    if (suggested.action_type === "group_tabs") {
+        await loadSnapshotFromStorage();
+        const metadata = suggested.metadata || {};
+        const indices = Array.isArray(metadata.tab_indices)
+            ? metadata.tab_indices.filter(
+                (value): value is number => Number.isInteger(value),
+            )
+            : [];
+        if (typeof suggested.tab_index === "number") indices.push(suggested.tab_index);
+        return {
+            tabIds: indices
+                .map((index) => interventionTabSnapshot.get(index)?.chromeTabId)
+                .filter((value): value is number => typeof value === "number"),
+        };
+    }
+    if (
+        suggested.action_type === "open_url"
+        || suggested.action_type === "search_error"
+    ) {
+        const query = String((suggested.metadata || {}).search_query || suggested.target || "");
+        const [active] = await chrome.tabs.query({
+            active: true,
+            currentWindow: true,
+        });
+        return {
+            url: suggested.action_type === "search_error"
+                ? `https://www.google.com/search?q=${encodeURIComponent(query)}`
+                : suggested.target,
+            stagingUrl: newCreatedTabStageUrl(),
+            createdAfterUnixMs: Date.now(),
+            blockedIncognito: active?.incognito === true,
+            windowId: active?.incognito === true ? null : active?.windowId ?? null,
+        };
+    }
+    if (suggested.action_type === "highlight_tab") {
+        const [prior] = await chrome.tabs.query({ active: true, currentWindow: true });
+        const target = typeof suggested.tab_index === "number"
+            ? interventionTabSnapshot.get(suggested.tab_index)
+            : undefined;
+        return {
+            priorActiveTabId: prior?.id ?? null,
+            targetTabId: target?.chromeTabId ?? null,
+            noEffect: typeof prior?.id === "number"
+                && prior.id === target?.chromeTabId,
+        };
+    }
+    return {};
+}
+
+function latestUndoData(actionId: string): Record<string, unknown> | null {
+    for (let index = undoStack.length - 1; index >= 0; index--) {
+        if (undoStack[index]?.action_id === actionId) {
+            return { ...undoStack[index].undo_data };
+        }
+    }
+    return null;
+}
+
+async function executeBrowserManifestAction(
+    interventionId: string,
+    action: ManifestAction,
+    preparedInverse: Record<string, unknown>,
+    checkpointInverse: (inverse: Record<string, unknown>) => Promise<void>,
+): Promise<BrowserCapabilityResult> {
+    if (action.capability === "hide_tabs_except_active") {
+        const existing = getTabManagerSnapshot(interventionId);
+        if (existing) {
+            return {
+                result: {
+                    action_id: action.action_id,
+                    success: true,
+                    message: "Tabs were already simplified by Cortex",
+                    reversible: true,
+                },
+                inverse: { ...existing },
+                status: "already_complete",
+            };
+        }
+        const snapshot = await hideNonActiveTabs(
+            interventionId,
+            undefined,
+            async (grouped) => checkpointInverse({
+                ...preparedInverse,
+                ...grouped,
+            }),
+        );
+        if (snapshot === null) {
+            const candidates = Array.isArray(preparedInverse.candidateTabIds)
+                ? preparedInverse.candidateTabIds
+                : [];
+            if (candidates.length > 0) {
+                return {
+                    result: {
+                        action_id: action.action_id,
+                        success: false,
+                        message: "Could not create the exact Cortex tab group",
+                        reversible: false,
+                    },
+                    inverse: { ...preparedInverse },
+                    status: "failed",
+                };
+            }
+            return {
+                result: {
+                    action_id: action.action_id,
+                    success: true,
+                    message: "No eligible tabs needed hiding",
+                    reversible: true,
+                },
+                inverse: { ...preparedInverse, noEffect: true },
+                status: "already_complete",
+            };
+        }
+        return {
+            result: {
+                action_id: action.action_id,
+                success: true,
+                message: `${snapshot.hiddenTabIds.length} tabs simplified`,
+                reversible: true,
+            },
+            inverse: { ...snapshot },
+            status: "succeeded",
+        };
+    }
+    if (action.source !== "suggested_action") {
+        throw new Error(`unsupported browser capability ${action.capability}`);
+    }
+    const suggested = suggestedActionFromManifest(action);
+    if (action.capability === "highlight_tab" && preparedInverse.noEffect === true) {
+        return {
+            result: {
+                action_id: action.action_id,
+                success: true,
+                message: "The exact target tab was already active",
+                reversible: false,
+            },
+            inverse: { ...preparedInverse },
+            status: "already_complete",
+        };
+    }
+    const result = await executeAction(
+        suggested,
+        preparedInverse,
+        checkpointInverse,
+    );
+    const inverse = {
+        ...preparedInverse,
+        ...(latestUndoData(action.action_id) || {}),
+    };
+    if (
+        (suggested.action_type === "open_url"
+            || suggested.action_type === "search_error")
+        && typeof inverse.tabId === "number"
+    ) {
+        inverse.url = preparedInverse.url;
+    }
+    return {
+        result: {
+            ...result,
+            reversible: result.success && Boolean(action.reverse_capability),
+        },
+        inverse,
+        status: result.success ? "succeeded" : "failed",
+    };
+}
+
+async function makeActionReceipt(args: {
+    interventionId: string;
+    authorizationId: string;
+    manifestSha256: string;
+    actionId: string;
+    phase: "apply" | "compensate" | "restore";
+    status: "succeeded" | "failed" | "already_complete";
+    startedWallMs: number;
+    startedMonoNs: number;
+    inverse: Record<string, unknown>;
+    verification: "verified" | "failed" | "not_applicable";
+    verificationDetail: string;
+    afterFingerprint: string | null;
+    errorCode?: string;
+    errorMessage?: string;
+    retryable?: boolean;
+}): Promise<ActionReceipt> {
+    const counterKey = [
+        args.authorizationId,
+        args.actionId,
+        args.phase,
+    ].join(":");
+    const attempt = await mutateTransactionJournal((journal) => {
+        const next = (journal.attempt_counters[counterKey] ?? 0) + 1;
+        if (next > 100) {
+            throw new Error("receipt retry limit exceeded");
+        }
+        journal.attempt_counters[counterKey] = next;
+        return next;
+    });
+    const endedMonoNs = Math.max(args.startedMonoNs, monotonicNowNs());
+    const endedWallMs = Math.max(args.startedWallMs, Date.now());
+    return {
+        receipt_id: `rcpt_${newWireId().replace(/-/g, "")}`,
+        intervention_id: args.interventionId,
+        authorization_id: args.authorizationId,
+        manifest_sha256: args.manifestSha256,
+        action_id: args.actionId,
+        phase: args.phase,
+        attempt,
+        idempotency_key: `${args.authorizationId}:${args.actionId}:${args.phase}:${attempt}`,
+        status: args.status,
+        started_at_unix_ms: args.startedWallMs,
+        ended_at_unix_ms: endedWallMs,
+        started_at_mono_ns: args.startedMonoNs,
+        ended_at_mono_ns: endedMonoNs,
+        duration_ms: Math.floor((endedMonoNs - args.startedMonoNs) / 1_000_000),
+        boot_id: CLIENT_BOOT_ID,
+        inverse_payload_json: canonicalJson(args.inverse),
+        verification: args.verification,
+        verification_detail: args.verificationDetail.slice(0, 500),
+        after_fingerprint: args.afterFingerprint,
+        error_code: args.errorCode,
+        error_message: args.errorMessage?.slice(0, 500),
+        retryable: args.retryable ?? false,
+        source_client_type: null,
+        source_client_id: null,
+    };
+}
+
+async function sendReceiptBatch(batch: InterventionReceiptBatch): Promise<void> {
+    await mutateTransactionJournal((journal) => {
+        const receiptIds = new Set(batch.receipts.map((receipt) => receipt.receipt_id));
+        const alreadyQueued = journal.receipt_outbox.some((queued) =>
+            queued.receipts.some((receipt) => receiptIds.has(receipt.receipt_id))
+        );
+        if (!alreadyQueued) {
+            if (journal.receipt_outbox.length >= MAX_RECEIPT_OUTBOX) {
+                throw new Error("transaction receipt outbox is full");
+            }
+            journal.receipt_outbox.push(batch);
+        }
+    });
+    send({
+        type: "INTERVENTION_RECEIPT",
+        payload: batch as unknown as Record<string, unknown>,
+        timestamp: Date.now() / 1000,
+        sequence: ++sequence,
+    });
+}
+
+async function flushReceiptOutbox(): Promise<void> {
+    let journal: BrowserTransactionJournal;
+    try {
+        journal = await readTransactionJournal();
+    } catch (error) {
+        console.warn("[cortex.bg] cannot flush corrupt receipt outbox:", String(error));
+        return;
+    }
+    for (const batch of journal.receipt_outbox) {
+        send({
+            type: "INTERVENTION_RECEIPT",
+            payload: batch as unknown as Record<string, unknown>,
+            timestamp: Date.now() / 1000,
+            sequence: ++sequence,
+        });
+    }
+}
+
+async function acknowledgeReceiptOutbox(payload: Record<string, unknown>): Promise<void> {
+    const authorizationId = typeof payload.authorization_id === "string"
+        ? payload.authorization_id
+        : "";
+    const interventionId = typeof payload.intervention_id === "string"
+        ? payload.intervention_id
+        : "";
+    const state = typeof payload.state === "string" ? payload.state : "";
+    if (
+        !authorizationId
+        || !new Set([
+            "applied", "partial", "failed", "restored", "restore_failed",
+        ]).has(state)
+    ) {
+        return;
+    }
+    try {
+        await mutateTransactionJournal((journal) => {
+            journal.receipt_outbox = journal.receipt_outbox.filter(
+                (batch) => batch.authorization_id !== authorizationId,
+            );
+            if (
+                state === "restored"
+                && interventionId
+                && !journal.receipt_outbox.some(
+                    (batch) => batch.intervention_id === interventionId,
+                )
+            ) {
+                const retired: BrowserOperationRecord[] = [];
+                for (const [key, operation] of Object.entries(journal.operations)) {
+                    if (
+                        operation.intervention_id === interventionId
+                        && operation.state === "restored"
+                    ) {
+                        retired.push(operation);
+                        delete journal.operations[key];
+                        delete journal.consumed_authorizations[
+                            operation.authorization_id
+                        ];
+                    }
+                }
+                for (const counterKey of Object.keys(journal.attempt_counters)) {
+                    if (retired.some((operation) =>
+                        counterKey === [
+                            operation.authorization_id,
+                            operation.action_id,
+                            "apply",
+                        ].join(":")
+                        || counterKey.endsWith(`:${operation.action_id}:restore`)
+                        || counterKey.endsWith(`:${operation.action_id}:compensate`)
+                    )) {
+                        delete journal.attempt_counters[counterKey];
+                    }
+                }
+            }
+        });
+    } catch (error) {
+        console.warn("[cortex.bg] receipt acknowledgement persistence failed:", String(error));
+    }
+}
+
+function pendingAuthorizationForPayload(
+    payload: Record<string, unknown>,
+): [string, PendingAuthorization] | null {
+    const requestId = typeof payload.authorization_request_id === "string"
+        ? payload.authorization_request_id
+        : null;
+    if (requestId) {
+        const pending = pendingAuthorizations.get(requestId);
+        if (pending) return [requestId, pending];
+    }
+    const authorizationId = typeof payload.authorization_id === "string"
+        ? payload.authorization_id
+        : null;
+    if (!authorizationId) return null;
+    for (const [candidateRequestId, pending] of pendingAuthorizations) {
+        if (pending.authorizationId === authorizationId) {
+            return [candidateRequestId, pending];
+        }
+    }
+    return null;
+}
+
+function settleDeniedAuthorization(payload: Record<string, unknown>): void {
+    const match = pendingAuthorizationForPayload(payload);
+    if (!match) return;
+    const [requestId, pending] = match;
+    clearTimeout(pending.timeout);
+    pendingAuthorizations.delete(requestId);
+    const detail = typeof payload.detail === "string" && payload.detail.length > 0
+        ? payload.detail
+        : "The action was not authorized";
+    pending.resolve(pending.actionIds.map((actionId) => ({
+        action_id: actionId,
+        success: false,
+        message: detail,
+        reversible: false,
+    })));
+}
+
+function settleAuthorizationFromState(payload: Record<string, unknown>): void {
+    const match = pendingAuthorizationForPayload(payload);
+    if (!match) return;
+    const [requestId, pending] = match;
+    if (typeof payload.authorization_id === "string") {
+        pending.authorizationId = payload.authorization_id;
+    }
+
+    const rawResults = Array.isArray(payload.receipt_results)
+        ? payload.receipt_results
+        : [];
+    for (const raw of rawResults) {
+        if (typeof raw !== "object" || raw === null || Array.isArray(raw)) continue;
+        const result = raw as Record<string, unknown>;
+        const actionId = typeof result.action_id === "string"
+            ? result.action_id
+            : "";
+        if (!pending.actionIds.includes(actionId)) continue;
+        const status = typeof result.status === "string" ? result.status : "failed";
+        pending.localResults.set(actionId, {
+            action_id: actionId,
+            success: status === "succeeded" || status === "already_complete",
+            message: typeof result.detail === "string" && result.detail.length > 0
+                ? result.detail
+                : status === "succeeded" || status === "already_complete"
+                    ? "Action verified"
+                    : "Action failed verification",
+            reversible: Boolean(result.reversible),
+        });
+    }
+
+    const state = typeof payload.state === "string" ? payload.state : "";
+    if (!new Set([
+        "applied", "partial", "failed", "restored", "restore_failed",
+    ]).has(state)) return;
+    clearTimeout(pending.timeout);
+    pendingAuthorizations.delete(requestId);
+    if (state === "restored" || state === "restore_failed") {
+        pending.resolve(pending.actionIds.map((actionId) => ({
+            action_id: actionId,
+            success: false,
+            message: state === "restored"
+                ? "The apply acknowledgement was lost, so Cortex safely restored the action"
+                : "Cortex could not verify recovery after the apply acknowledgement was lost",
+            reversible: state === "restore_failed",
+        })));
+        return;
+    }
+    pending.resolve(pending.actionIds.map((actionId) => {
+        const exact = pending.localResults.get(actionId);
+        if (exact) return exact;
+        if (state === "applied") {
+            return {
+                action_id: actionId,
+                success: true,
+                message: "Action was applied and verified",
+                reversible: true,
+            };
+        }
+        return {
+            action_id: actionId,
+            success: false,
+            message: state === "partial"
+                ? "The transaction only partially completed"
+                : "The transaction failed",
+            reversible: false,
+        };
+    }));
+}
+
+async function authorizeActionIds(
+    interventionId: string,
+    actionIds: string[],
+    presentedActions?: unknown[],
+): Promise<ActionExecuteResult[]> {
+    if (!workspaceMutationAllowed()) {
+        throw new Error("Action unavailable in suggest-only mode");
+    }
+    if (
+        !interventionPresentation.active
+        || interventionPresentation.active.plan.intervention_id !== interventionId
+    ) {
+        throw new Error("Intervention is no longer active");
+    }
+    const verified = await verifyActionManifest(
+        interventionPresentation.active.plan.action_manifest,
+    );
+    const approved = [...new Set(actionIds)].sort();
+    if (
+        approved.length === 0
+        || approved.some((actionId) => !verified.actionsById.has(actionId))
+    ) {
+        throw new Error("Requested action is absent from the manifest");
+    }
+    const mountedSuggestions = Array.isArray(
+        interventionPresentation.active.plan.suggested_actions,
+    )
+        ? interventionPresentation.active.plan.suggested_actions
+        : [];
+    for (const actionId of approved) {
+        const immutable = verified.actionsById.get(actionId);
+        const mounted = mountedSuggestions.find((candidate) =>
+            typeof candidate === "object"
+            && candidate !== null
+            && !Array.isArray(candidate)
+            && (candidate as Record<string, unknown>).action_id === actionId
+        );
+        const supplied = presentedActions?.find((candidate) =>
+            typeof candidate === "object"
+            && candidate !== null
+            && !Array.isArray(candidate)
+            && (candidate as Record<string, unknown>).action_id === actionId
+        );
+        if (
+            !immutable
+            || !presentationMatchesManifestAction(immutable, mounted)
+            || (
+                presentedActions !== undefined
+                && !presentationMatchesManifestAction(immutable, supplied)
+            )
+        ) {
+            throw new Error(
+                "Displayed action differs from the immutable manifest",
+            );
+        }
+    }
+    const requestId = `req_browser_${newWireId().replace(/-/g, "")}`;
+    const nowMono = monotonicNowNs();
+    const request: InterventionAuthorizationRequest = {
+        authorization_request_id: requestId,
+        intervention_id: interventionId,
+        manifest_sha256: verified.manifest.manifest_sha256,
+        approved_action_ids: approved as [string, ...string[]],
+        source_surface: "browser",
+        requested_at_unix_ms: Date.now(),
+        requested_at_mono_ns: nowMono,
+        boot_id: CLIENT_BOOT_ID,
+    };
+    return await new Promise<ActionExecuteResult[]>((resolve) => {
+        const timeout = setTimeout(() => {
+            pendingAuthorizations.delete(requestId);
+            resolve(approved.map((actionId) => ({
+                action_id: actionId,
+                success: false,
+                message: "Authorization timed out before execution",
+                reversible: false,
+            })));
+        }, 35_000);
+        pendingAuthorizations.set(requestId, {
+            interventionId,
+            actionIds: approved,
+            localResults: new Map(),
+            resolve,
+            timeout,
+        });
+        send({
+            type: "INTERVENTION_AUTHORIZE",
+            payload: request as unknown as Record<string, unknown>,
+            timestamp: Date.now() / 1000,
+            sequence: ++sequence,
+            correlation_id: interventionPresentation.active?.correlation_id,
+        });
+    });
+}
+
+async function handleInterventionApplyCommand(payload: unknown): Promise<void> {
+    let verified: Awaited<ReturnType<typeof verifyApplyCommand>>;
+    try {
+        const stableClientInstanceId = await getClientInstanceId();
+        verified = await verifyApplyCommand(
+            payload,
+            "browser",
+            CLIENT_BOOT_ID,
+            Date.now(),
+            stableClientInstanceId,
+        );
+    } catch (error) {
+        console.warn("[cortex.bg] rejected INTERVENTION_APPLY:", String(error));
+        return;
+    }
+    const authorization = verified.command.authorization;
+    const authorizationId = String(authorization.authorization_id || "");
+    const nonce = String(authorization.nonce || "");
+    if (!authorizationId || !nonce) return;
+    if (!workspaceMutationAllowed()) {
+        const receipts = await Promise.all(verified.ownActions.map((action) => {
+            const startedWallMs = Date.now();
+            const startedMonoNs = monotonicNowNs();
+            return makeActionReceipt({
+                interventionId: verified.manifest.intervention_id,
+                authorizationId,
+                manifestSha256: verified.manifest.manifest_sha256,
+                actionId: action.action_id,
+                phase: "apply",
+                status: "failed",
+                startedWallMs,
+                startedMonoNs,
+                inverse: {},
+                verification: "failed",
+                verificationDetail: "Local execution mode denies workspace mutation",
+                afterFingerprint: null,
+                errorCode: "execution_mode_denied",
+                errorMessage: "Local execution mode denies workspace mutation",
+                retryable: false,
+            });
+        }));
+        await sendReceiptBatch({
+            intervention_id: verified.manifest.intervention_id,
+            manifest_sha256: verified.manifest.manifest_sha256,
+            authorization_id: authorizationId,
+            receipts: receipts as [ActionReceipt, ...ActionReceipt[]],
+        });
+        return;
+    }
+
+    try {
+        await mutateTransactionJournal((journal) => {
+            if (journal.receipt_outbox.length >= MAX_RECEIPT_OUTBOX) {
+                throw new Error("transaction receipt outbox is full");
+            }
+            const newOperationCount = verified.ownActions.filter((action) =>
+                journal.operations[
+                    operationKey(verified.manifest.intervention_id, action.action_id)
+                ] === undefined
+            ).length;
+            if (
+                Object.keys(journal.operations).length + newOperationCount
+                > MAX_TRANSACTION_OPERATIONS
+            ) {
+                throw new Error("transaction operation journal is full");
+            }
+            for (const action of verified.ownActions) {
+                const counterKey = [
+                    authorizationId,
+                    action.action_id,
+                    "apply",
+                ].join(":");
+                if ((journal.attempt_counters[counterKey] ?? 0) >= 100) {
+                    throw new Error("receipt retry limit reached before apply");
+                }
+            }
+            const prior = journal.consumed_authorizations[authorizationId];
+            if (
+                prior
+                && (
+                    prior.manifest_sha256 !== verified.manifest.manifest_sha256
+                    || prior.nonce !== nonce
+                )
+            ) {
+                throw new Error("authorization replayed with different content");
+            }
+            if (!prior) {
+                journal.consumed_authorizations[authorizationId] = {
+                    manifest_sha256: verified.manifest.manifest_sha256,
+                    nonce,
+                    consumed_at_unix_ms: Date.now(),
+                };
+            }
+            const authorizationIds = Object.keys(journal.consumed_authorizations);
+            if (authorizationIds.length > 256) {
+                authorizationIds
+                    .sort((left, right) =>
+                        journal.consumed_authorizations[left].consumed_at_unix_ms
+                        - journal.consumed_authorizations[right].consumed_at_unix_ms
+                    )
+                    .slice(0, authorizationIds.length - 256)
+                    .forEach((id) => delete journal.consumed_authorizations[id]);
+            }
+        });
+    } catch (error) {
+        console.warn("[cortex.bg] authorization consumption failed:", String(error));
+        return;
+    }
+
+    if (verified.ownActions.some((action) => action.source === "suggested_action")) {
+        await snapshotTabsForIntervention();
+    }
+
+    const receipts: ActionReceipt[] = [];
+    const localResults: ActionExecuteResult[] = [];
+    for (const action of verified.ownActions) {
+        const startedWallMs = Date.now();
+        const startedMonoNs = monotonicNowNs();
+        const key = operationKey(verified.manifest.intervention_id, action.action_id);
+        const existing = await readTransactionJournal().then(
+            (journal) => journal.operations[key],
+        );
+        let existingInverse: Record<string, unknown> = {};
+        if (existing) {
+            let durableRecordValid = true;
+            try {
+                const parsed = JSON.parse(existing.inverse_payload_json) as unknown;
+                durableRecordValid = (
+                    typeof parsed === "object"
+                    && parsed !== null
+                    && !Array.isArray(parsed)
+                    && canonicalJson(parsed) === existing.inverse_payload_json
+                );
+                if (durableRecordValid) {
+                    existingInverse = parsed as Record<string, unknown>;
+                }
+            } catch {
+                durableRecordValid = false;
+            }
+            durableRecordValid = durableRecordValid
+                && existing.intervention_id === verified.manifest.intervention_id
+                && existing.manifest_sha256 === verified.manifest.manifest_sha256
+                && existing.action_id === action.action_id
+                && existing.authorization_id === authorizationId
+                && existing.capability === action.capability;
+            if (!durableRecordValid) {
+                const message = "Durable Cortex operation does not match this authorization";
+                localResults.push({
+                    action_id: action.action_id,
+                    success: false,
+                    message,
+                    reversible: Boolean(action.reverse_capability),
+                });
+                receipts.push(await makeActionReceipt({
+                    interventionId: verified.manifest.intervention_id,
+                    authorizationId,
+                    manifestSha256: verified.manifest.manifest_sha256,
+                    actionId: action.action_id,
+                    phase: "apply",
+                    status: "failed",
+                    startedWallMs,
+                    startedMonoNs,
+                    inverse: {},
+                    verification: "failed",
+                    verificationDetail: message,
+                    afterFingerprint: null,
+                    errorCode: "durable_operation_mismatch",
+                    errorMessage: message,
+                    retryable: false,
+                }));
+                continue;
+            }
+        }
+        if (existing?.state === "applied") {
+            const result: ActionExecuteResult = {
+                action_id: action.action_id,
+                success: true,
+                message: "Action was already applied by Cortex",
+                reversible: Boolean(action.reverse_capability),
+            };
+            localResults.push(result);
+            receipts.push(await makeActionReceipt({
+                interventionId: verified.manifest.intervention_id,
+                authorizationId,
+                manifestSha256: verified.manifest.manifest_sha256,
+                actionId: action.action_id,
+                phase: "apply",
+                status: "already_complete",
+                startedWallMs,
+                startedMonoNs,
+                inverse: existingInverse,
+                verification: action.workspace_mutation === false
+                    ? "not_applicable"
+                    : "verified",
+                verificationDetail: "durable Cortex operation already active",
+                afterFingerprint: existing.after_fingerprint,
+            }));
+            continue;
+        }
+        if (existing?.state === "applying" && (
+            action.capability === "open_url"
+            || action.capability === "search_error"
+        )) {
+            try {
+                existingInverse = await reconcileCreatedTabInverse(existingInverse);
+            } catch (error) {
+                existingInverse = error instanceof IndeterminateBrowserMutationError
+                    ? { ...existingInverse, ...error.inverse }
+                    : {
+                        ...existingInverse,
+                        cortexEffectMayExist: true,
+                        recoveryError: String(error).slice(0, 300),
+                    };
+            }
+            await mutateTransactionJournal((journal) => {
+                const operation = journal.operations[key];
+                if (
+                    operation
+                    && operation.state === "applying"
+                    && operation.authorization_id === authorizationId
+                    && operation.manifest_sha256 === verified.manifest.manifest_sha256
+                ) {
+                    operation.inverse_payload_json = canonicalJson(existingInverse);
+                    if (existingInverse.noEffect === true) operation.state = "failed";
+                    operation.updated_at_unix_ms = Date.now();
+                }
+            });
+        }
+        if (
+            existing?.state === "applying"
+            || existing?.state === "failed"
+            || existing?.state === "restored"
+        ) {
+            const message = existing.state === "applying"
+                ? "Prior apply attempt is indeterminate; recovery required"
+                : existing.state === "restored"
+                    ? "Authorization replay rejected after restoration"
+                    : "Authorization replay rejected after a failed attempt";
+            const result: ActionExecuteResult = {
+                action_id: action.action_id,
+                success: false,
+                message,
+                reversible: Boolean(action.reverse_capability),
+            };
+            localResults.push(result);
+            receipts.push(await makeActionReceipt({
+                interventionId: verified.manifest.intervention_id,
+                authorizationId,
+                manifestSha256: verified.manifest.manifest_sha256,
+                actionId: action.action_id,
+                phase: "apply",
+                status: "failed",
+                startedWallMs,
+                startedMonoNs,
+                inverse: existingInverse,
+                verification: "failed",
+                verificationDetail: message,
+                afterFingerprint: existing.after_fingerprint,
+                errorCode: existing.state === "applying"
+                    ? "indeterminate_prior_attempt"
+                    : "authorization_replay",
+                errorMessage: message,
+                retryable: existing.state === "applying"
+                    && existingInverse.noEffect !== true,
+            }));
+            continue;
+        }
+
+        let preparedInverse: Record<string, unknown> = {};
+        try {
+            preparedInverse = await prepareBrowserInverse(
+                verified.manifest.intervention_id,
+                action,
+            );
+            await mutateTransactionJournal((journal) => {
+                journal.operations[key] = {
+                    intervention_id: verified.manifest.intervention_id,
+                    manifest_sha256: verified.manifest.manifest_sha256,
+                    action_id: action.action_id,
+                    authorization_id: authorizationId,
+                    capability: action.capability,
+                    state: "applying",
+                    inverse_payload_json: canonicalJson(preparedInverse),
+                    after_fingerprint: null,
+                    updated_at_unix_ms: Date.now(),
+                };
+            });
+            const executed = await executeBrowserManifestAction(
+                verified.manifest.intervention_id,
+                action,
+                preparedInverse,
+                async (inverse) => {
+                    await mutateTransactionJournal((journal) => {
+                        const operation = journal.operations[key];
+                        if (
+                            !operation
+                            || operation.state !== "applying"
+                            || operation.authorization_id !== authorizationId
+                            || operation.manifest_sha256 !== verified.manifest.manifest_sha256
+                        ) {
+                            throw new Error("durable operation changed before inverse checkpoint");
+                        }
+                        operation.inverse_payload_json = canonicalJson(inverse);
+                        operation.updated_at_unix_ms = Date.now();
+                    });
+                },
+            );
+            let effectVerification: BrowserEffectVerification = {
+                verified: false,
+                detail: executed.result.message,
+                fingerprint: { capability: action.capability },
+            };
+            if (executed.result.success) {
+                try {
+                    effectVerification = await verifyBrowserEffect(
+                        action,
+                        executed.inverse,
+                    );
+                } catch (error) {
+                    effectVerification = {
+                        verified: false,
+                        detail: `Postcondition verification failed: ${String(error)}`,
+                        fingerprint: { capability: action.capability },
+                    };
+                }
+            }
+            const effectMayExist = executed.result.success
+                && !effectVerification.verified;
+            const receiptInverse = effectMayExist
+                ? { ...executed.inverse, cortexEffectMayExist: true }
+                : executed.inverse;
+            const inverseJson = canonicalJson(receiptInverse);
+            const fingerprint = executed.result.success
+                ? await sha256Hex(canonicalJson(effectVerification.fingerprint))
+                : null;
+            await mutateTransactionJournal((journal) => {
+                journal.operations[key] = {
+                    intervention_id: verified.manifest.intervention_id,
+                    manifest_sha256: verified.manifest.manifest_sha256,
+                    action_id: action.action_id,
+                    authorization_id: authorizationId,
+                    capability: action.capability,
+                    state: executed.result.success && effectVerification.verified
+                        ? "applied"
+                        : executed.result.success
+                            ? "applying"
+                            : "failed",
+                    inverse_payload_json: inverseJson,
+                    after_fingerprint: fingerprint,
+                    updated_at_unix_ms: Date.now(),
+                };
+            });
+            const truthfulResult = executed.result.success
+                && effectVerification.verified
+                ? executed.result
+                : {
+                    ...executed.result,
+                    success: false,
+                    message: executed.result.success
+                        ? effectVerification.detail
+                        : executed.result.message,
+                };
+            localResults.push(truthfulResult);
+            receipts.push(await makeActionReceipt({
+                interventionId: verified.manifest.intervention_id,
+                authorizationId,
+                manifestSha256: verified.manifest.manifest_sha256,
+                actionId: action.action_id,
+                phase: "apply",
+                status: truthfulResult.success ? executed.status : "failed",
+                startedWallMs,
+                startedMonoNs,
+                inverse: receiptInverse,
+                verification: truthfulResult.success ? "verified" : "failed",
+                verificationDetail: truthfulResult.success
+                    ? effectVerification.detail
+                    : truthfulResult.message,
+                afterFingerprint: fingerprint,
+                errorCode: truthfulResult.success
+                    ? undefined
+                    : effectMayExist
+                        ? "postcondition_unverified"
+                        : "capability_failed",
+                errorMessage: truthfulResult.success
+                    ? undefined
+                    : truthfulResult.message,
+                retryable: effectMayExist,
+            }));
+        } catch (error) {
+            const message = String(error);
+            let latestInverse = preparedInverse;
+            try {
+                const journal = await readTransactionJournal();
+                const operation = journal.operations[key];
+                if (operation?.inverse_payload_json) {
+                    latestInverse = JSON.parse(
+                        operation.inverse_payload_json,
+                    ) as Record<string, unknown>;
+                }
+            } catch {
+                // The pre-effect inverse remains the safest available proof.
+            }
+            if (error instanceof IndeterminateBrowserMutationError) {
+                latestInverse = { ...latestInverse, ...error.inverse };
+            }
+            const uncertainInverse = {
+                ...latestInverse,
+                cortexEffectMayExist: true,
+            };
+            await mutateTransactionJournal((journal) => {
+                const operation = journal.operations[key];
+                if (operation) {
+                    operation.state = "applying";
+                    operation.inverse_payload_json = canonicalJson(
+                        uncertainInverse,
+                    );
+                    operation.updated_at_unix_ms = Date.now();
+                }
+            });
+            const result: ActionExecuteResult = {
+                action_id: action.action_id,
+                success: false,
+                message,
+                reversible: Boolean(action.reverse_capability),
+            };
+            localResults.push(result);
+            receipts.push(await makeActionReceipt({
+                interventionId: verified.manifest.intervention_id,
+                authorizationId,
+                manifestSha256: verified.manifest.manifest_sha256,
+                actionId: action.action_id,
+                phase: "apply",
+                status: "failed",
+                startedWallMs,
+                startedMonoNs,
+                inverse: uncertainInverse,
+                verification: "failed",
+                verificationDetail: message,
+                afterFingerprint: null,
+                errorCode: "capability_exception",
+                errorMessage: message,
+                retryable: true,
+            }));
+        }
+    }
+    const pending = pendingAuthorizations.get(
+        authorization.authorization_request_id,
+    );
+    if (pending) {
+        pending.authorizationId = authorizationId;
+        for (const result of localResults) {
+            pending.localResults.set(result.action_id, result);
+        }
+    }
+    if (receipts.length > 0) {
+        await sendReceiptBatch({
+            intervention_id: verified.manifest.intervention_id,
+            manifest_sha256: verified.manifest.manifest_sha256,
+            authorization_id: authorizationId,
+            receipts: receipts as [ActionReceipt, ...ActionReceipt[]],
+        });
+    }
+}
+
+async function verifyBrowserRestoreEffect(
+    action: RestoreAction,
+    inverse: Record<string, unknown>,
+): Promise<BrowserEffectVerification> {
+    if (inverse.noEffect === true) {
+        return {
+            verified: true,
+            detail: "No Cortex-owned effect exists",
+            fingerprint: { reverseCapability: action.reverse_capability, noEffect: true },
+        };
+    }
+    if (action.reverse_capability === "close_created_tab") {
+        const tabId = typeof inverse.tabId === "number" ? inverse.tabId : null;
+        let absent = tabId !== null;
+        if (tabId !== null) {
+            try {
+                await chrome.tabs.get(tabId);
+                absent = false;
+            } catch {
+                absent = true;
+            }
+        }
+        return {
+            verified: absent,
+            detail: absent
+                ? "Exact Cortex-created tab is absent"
+                : "Cortex-created tab still exists",
+            fingerprint: { tabId, absent },
+        };
+    }
+    if (action.reverse_capability === "restore_active_tab") {
+        const targetId = typeof inverse.targetTabId === "number"
+            ? inverse.targetTabId
+            : null;
+        const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+        const verified = targetId !== null && active?.id !== targetId;
+        return {
+            verified,
+            detail: verified
+                ? "Cortex-selected tab no longer owns focus"
+                : "Cortex-selected tab still owns focus",
+            fingerprint: { targetId, activeTabId: active?.id ?? null },
+        };
+    }
+    return {
+        verified: false,
+        detail: `No restore verifier exists for ${action.reverse_capability}`,
+        fingerprint: { reverseCapability: action.reverse_capability },
+    };
+}
+
+async function performBrowserRestore(
+    action: RestoreAction,
+    inverse: Record<string, unknown>,
+): Promise<{ status: "succeeded" | "failed" | "already_complete"; detail: string }> {
+    if (inverse.noEffect === true) {
+        return {
+            status: "already_complete",
+            detail: "No Cortex-owned workspace effect was created",
+        };
+    }
+    switch (action.reverse_capability) {
+        case "close_created_tab": {
+            const tabId = typeof inverse.tabId === "number" ? inverse.tabId : null;
+            if (tabId === null) {
+                return { status: "failed", detail: "Missing Cortex-created tab id" };
+            }
+            let tab: chrome.tabs.Tab;
+            try {
+                tab = await chrome.tabs.get(tabId);
+            } catch {
+                return { status: "already_complete", detail: "Created tab already closed" };
+            }
+            const expectedUrl = typeof inverse.url === "string" ? inverse.url : "";
+            const expectedStagingUrl = validCreatedTabStageUrl(inverse.stagingUrl)
+                ? inverse.stagingUrl
+                : "";
+            const ownsCurrentUrl = (
+                (Boolean(expectedUrl) && (
+                    urlsMatch(tab.url, expectedUrl)
+                    || urlsMatch(tab.pendingUrl, expectedUrl)
+                ))
+                || (Boolean(expectedStagingUrl) && (
+                    urlsMatch(tab.url, expectedStagingUrl)
+                    || urlsMatch(tab.pendingUrl, expectedStagingUrl)
+                ))
+            );
+            if (!ownsCurrentUrl) {
+                return { status: "failed", detail: "Created tab was reused or navigated" };
+            }
+            try {
+                await chrome.tabs.remove(tabId);
+            } catch {
+                return { status: "failed", detail: "Could not close the Cortex-created tab" };
+            }
+            return { status: "succeeded", detail: "Cortex-created tab closed" };
+        }
+        case "restore_active_tab": {
+            const priorId = typeof inverse.priorActiveTabId === "number"
+                ? inverse.priorActiveTabId
+                : null;
+            if (priorId === null) return { status: "failed", detail: "Prior active tab missing" };
+            const targetId = typeof inverse.targetTabId === "number"
+                ? inverse.targetTabId
+                : null;
+            const [current] = await chrome.tabs.query({ active: true, currentWindow: true });
+            if (targetId !== null && current?.id !== targetId) {
+                return {
+                    status: "already_complete",
+                    detail: "User focus superseded the Cortex tab focus",
+                };
+            }
+            const tab = await chrome.tabs.get(priorId);
+            if (tab.active) return { status: "already_complete", detail: "Prior tab already active" };
+            await chrome.tabs.update(priorId, { active: true });
+            return { status: "succeeded", detail: "Prior active tab restored" };
+        }
+        default:
+            return {
+                status: "failed",
+                detail: `Unsupported reverse capability ${action.reverse_capability}`,
+            };
+    }
+}
+
+async function handleExactRestoreCommand(payload: unknown): Promise<boolean> {
+    let verified: ReturnType<typeof verifyRestoreCommand>;
+    try {
+        verified = verifyRestoreCommand(
+            payload,
+            "browser",
+            await getClientInstanceId(),
+        );
+    } catch {
+        return false;
+    }
+    const phase = verified.command.reason === "partial_compensation"
+        ? "compensate"
+        : "restore";
+    const receipts: ActionReceipt[] = [];
+    for (const action of verified.ownActions) {
+        const startedWallMs = Date.now();
+        const startedMonoNs = monotonicNowNs();
+        const key = operationKey(verified.command.intervention_id, action.action_id);
+        const journal = await readTransactionJournal();
+        const operation = journal.operations[key];
+        let inverse: Record<string, unknown>;
+        try {
+            inverse = JSON.parse(action.inverse_payload_json) as Record<string, unknown>;
+        } catch {
+            inverse = {};
+        }
+        const expectedReverse: Record<string, string | undefined> = {
+            open_url: "close_created_tab",
+            search_error: "close_created_tab",
+            highlight_tab: "restore_active_tab",
+        };
+        let restored: Awaited<ReturnType<typeof performBrowserRestore>>;
+        let restoreVerification: BrowserEffectVerification = {
+            verified: false,
+            detail: "Restore did not run",
+            fingerprint: { actionId: action.action_id, state: "not_run" },
+        };
+        try {
+            if (!operation) {
+                restored = {
+                    status: "already_complete",
+                    detail: "No Cortex-owned effect was durably started on this client",
+                };
+                inverse = { noEffect: true };
+                restoreVerification = {
+                    verified: true,
+                    detail: "The write-ahead journal contains no Cortex-owned effect",
+                    fingerprint: {
+                        actionId: action.action_id,
+                        state: "never_started",
+                    },
+                };
+            } else {
+                const durableInverseBeforeRecovery = operation.inverse_payload_json;
+                if (
+                    operation.state === "applying"
+                    && (
+                        operation.capability === "open_url"
+                        || operation.capability === "search_error"
+                    )
+                ) {
+                    let localInverse = JSON.parse(
+                        durableInverseBeforeRecovery,
+                    ) as Record<string, unknown>;
+                    localInverse = await reconcileCreatedTabInverse(localInverse);
+                    const reconciledJson = canonicalJson(localInverse);
+                    if (reconciledJson !== operation.inverse_payload_json) {
+                        await mutateTransactionJournal((mutable) => {
+                            const record = mutable.operations[key];
+                            if (
+                                !record
+                                || record.state !== "applying"
+                                || record.authorization_id !== action.original_authorization_id
+                                || record.inverse_payload_json !== durableInverseBeforeRecovery
+                            ) {
+                                throw new Error(
+                                    "durable operation changed during created-tab recovery",
+                                );
+                            }
+                            record.inverse_payload_json = reconciledJson;
+                            record.updated_at_unix_ms = Date.now();
+                        });
+                        operation.inverse_payload_json = reconciledJson;
+                    }
+                }
+                const commandAcceptsLocalRecovery =
+                    action.inverse_payload_json === "{}"
+                    || action.inverse_payload_json === durableInverseBeforeRecovery;
+                const effectiveInverseJson = commandAcceptsLocalRecovery
+                    && operation.state === "applying"
+                    ? operation.inverse_payload_json
+                    : action.inverse_payload_json;
+                inverse = JSON.parse(effectiveInverseJson) as Record<string, unknown>;
+                if (
+                operation.intervention_id !== verified.command.intervention_id
+                || operation.manifest_sha256 !== verified.command.manifest_sha256
+                || operation.authorization_id !== action.original_authorization_id
+                || expectedReverse[operation.capability] !== action.reverse_capability
+                || operation.inverse_payload_json !== effectiveInverseJson
+                ) {
+                    restored = {
+                        status: "failed",
+                        detail: "Restore action does not match the durable Cortex operation",
+                    };
+                } else if (operation.state === "restored") {
+                    restored = {
+                        status: "already_complete",
+                        detail: "Cortex operation was already restored",
+                    };
+                    restoreVerification = {
+                        verified: true,
+                        detail: "Durable restore completion was already recorded",
+                        fingerprint: {
+                            actionId: action.action_id,
+                            state: "restored",
+                            priorFingerprint: operation.after_fingerprint,
+                        },
+                    };
+                } else {
+                    restored = await performBrowserRestore(
+                        action,
+                        inverse,
+                    );
+                    if (restored.status !== "failed") {
+                        restoreVerification = await verifyBrowserRestoreEffect(
+                            action,
+                            inverse,
+                        );
+                        if (!restoreVerification.verified) {
+                            restored = {
+                                status: "failed",
+                                detail: restoreVerification.detail,
+                            };
+                        }
+                    }
+                }
+            }
+        } catch (error) {
+            restored = { status: "failed", detail: String(error) };
+        }
+        if (restored.status !== "failed") {
+            const restoreFingerprint = await sha256Hex(canonicalJson(
+                restoreVerification.fingerprint,
+            ));
+            await mutateTransactionJournal((mutable) => {
+                const record = mutable.operations[key];
+                if (record) {
+                    record.state = "restored";
+                    record.after_fingerprint = restoreFingerprint;
+                    record.updated_at_unix_ms = Date.now();
+                }
+            });
+        }
+        receipts.push(await makeActionReceipt({
+            interventionId: verified.command.intervention_id,
+            authorizationId: verified.command.restore_id,
+            manifestSha256: verified.command.manifest_sha256,
+            actionId: action.action_id,
+            phase,
+            status: restored.status,
+            startedWallMs,
+            startedMonoNs,
+            inverse,
+            verification: restored.status === "failed" ? "failed" : "verified",
+            verificationDetail: restored.status === "failed"
+                ? restored.detail
+                : restoreVerification.detail,
+            afterFingerprint: restored.status === "failed"
+                ? null
+                : await sha256Hex(canonicalJson(restoreVerification.fingerprint)),
+            errorCode: restored.status === "failed" ? "restore_failed" : undefined,
+            errorMessage: restored.status === "failed" ? restored.detail : undefined,
+            retryable: restored.status === "failed",
+        }));
+    }
+    await sendReceiptBatch({
+        intervention_id: verified.command.intervention_id,
+        manifest_sha256: verified.command.manifest_sha256,
+        authorization_id: verified.command.restore_id,
+        receipts: receipts as [ActionReceipt, ...ActionReceipt[]],
+    });
+    return true;
+}
+
+interface BrowserCapabilityContext {
+    preparedInverse: Record<string, unknown>;
+    checkpointInverse: (inverse: Record<string, unknown>) => Promise<void>;
+}
+
+const browserCapabilityHandlers: CapabilityHandlers<
+    SuggestedAction,
+    BrowserCapabilityContext,
+    ActionExecuteResult
+> = {
+    close_tab: (action) => executeCloseTab(action),
+    group_tabs: (action, context) => executeGroupTabs(
+        action,
+        context.preparedInverse,
+        context.checkpointInverse,
+    ),
+    bookmark_and_close: (action, context) => executeBookmarkAndClose(
+        action,
+        context.preparedInverse,
+        context.checkpointInverse,
+    ),
+    open_url: (action, context) => executeOpenUrl(
+        action,
+        context.preparedInverse,
+        context.checkpointInverse,
+    ),
+    search_error: (action, context) => executeSearchError(
+        action,
+        context.preparedInverse,
+        context.checkpointInverse,
+    ),
+    highlight_tab: (action) => executeHighlightTab(action),
+    save_session: (action) => executeSaveSession(action),
+    copy_to_clipboard: (action) => executeCopyToClipboard(action),
+    start_timer: (action) => executeStartTimer(action),
+    resume_last_active_file: (action) => executeResumeLastActiveFile(action),
+    suggest_movement_break: (action) => executeSuggestMovementBreak(action),
+    prompt_micro_commit: (action) => executePromptMicroCommit(action),
+    take_biology_break: async (action) => ({
+        action_id: action.action_id,
+        success: true,
+        message: "Break started on desktop",
+        reversible: true,
+    }),
+};
+
+const browserCapabilityExecutor = new CapabilityExecutor(
+    browserCapabilityHandlers,
+);
+
+async function executeAction(
+    action: SuggestedAction,
+    preparedInverse: Record<string, unknown>,
+    checkpointInverse: (inverse: Record<string, unknown>) => Promise<void>,
+): Promise<ActionExecuteResult> {
+    try {
+        return await browserCapabilityExecutor.execute(action, {
+            preparedInverse,
+            checkpointInverse,
+        });
+    } catch (error) {
+        if (error instanceof IndeterminateBrowserMutationError) throw error;
+        const message = error instanceof UnsupportedCapabilityError
+            ? `Unknown action type: ${error.capability}`
+            : String(error);
         return {
             action_id: action.action_id,
             success: false,
-            message: String(e),
+            message,
             reversible: false,
         };
     }
@@ -3346,37 +4824,22 @@ async function executeCloseTab(action: SuggestedAction): Promise<ActionExecuteRe
     }
     const tabIndex = action.tab_index;
 
-    // Primary path: use snapshot
+    // Exact target ownership: a missing/stale snapshot fails closed. Title
+    // matching can select a different tab and is therefore never an
+    // acceptable fallback for an authorized transaction.
     const v = await validateTab(tabIndex);
-    let tabId = v.valid ? v.tabId : -1;
-    let tabUrl = "";
-    let tabTitle = "";
-
-    if (v.valid) {
-        const snap = interventionTabSnapshot.get(tabIndex);
-        tabUrl = snap?.url || "";
-        tabTitle = snap?.title || "";
-    } else {
-        // Fallback: find the tab by matching title from the action label.
-        // This handles cases where the snapshot was lost (SW restart) or stale.
-        const targetTitle = action.label?.replace(/^Close\s+/i, "") || "";
-        if (targetTitle) {
-            try {
-                const allTabs = await chrome.tabs.query({});
-                const match = allTabs.find(t => t.title?.includes(targetTitle));
-                if (match?.id) {
-                    tabId = match.id;
-                    tabUrl = match.url || "";
-                    tabTitle = match.title || "";
-                }
-            } catch {
-                // query failed
-            }
-        }
-        if (tabId === -1) {
-            return { action_id: aid, success: false, message: v.message || "Tab not found", reversible: false };
-        }
+    if (!v.valid) {
+        return {
+            action_id: aid,
+            success: false,
+            message: v.message || "Exact tab target is unavailable",
+            reversible: false,
+        };
     }
+    const tabId = v.tabId;
+    const snap = interventionTabSnapshot.get(tabIndex);
+    const tabUrl = snap?.url || "";
+    const tabTitle = snap?.title || "";
 
     // LAYER 0: Minimum tab count — never leave fewer than MIN_TABS_TO_KEEP tabs open
     try {
@@ -3424,22 +4887,62 @@ async function executeCloseTab(action: SuggestedAction): Promise<ActionExecuteRe
     return { action_id: aid, success: true, message: "Tab closed", reversible: true };
 }
 
-async function executeGroupTabs(action: SuggestedAction): Promise<ActionExecuteResult> {
+async function executeGroupTabs(
+    action: SuggestedAction,
+    preparedInverse: Record<string, unknown>,
+    checkpointInverse: (inverse: Record<string, unknown>) => Promise<void>,
+): Promise<ActionExecuteResult> {
     const meta = action.metadata || {};
-    const tabIndices = (meta.tab_indices as number[]) || [];
+    const tabIndices = Array.isArray(meta.tab_indices)
+        ? [...meta.tab_indices]
+        : [];
     if (action.tab_index !== null && action.tab_index !== undefined) {
         tabIndices.push(action.tab_index);
     }
+    const exactIndices = [...new Set(tabIndices)];
     const tabIds: number[] = [];
-    for (const idx of tabIndices) {
+    for (const idx of exactIndices) {
+        if (typeof idx !== "number" || !Number.isInteger(idx) || idx < 0) {
+            return {
+                action_id: action.action_id,
+                success: false,
+                message: "A requested tab index is invalid",
+                reversible: false,
+            };
+        }
         const v = await validateTab(idx);
-        if (v.valid) tabIds.push(v.tabId);
+        if (!v.valid) {
+            return {
+                action_id: action.action_id,
+                success: false,
+                message: v.message || "An exact tab target is unavailable",
+                reversible: false,
+            };
+        }
+        tabIds.push(v.tabId);
     }
     if (tabIds.length === 0) {
         return { action_id: action.action_id, success: false, message: "No valid tabs to group", reversible: false };
     }
     const groupName = ((action.metadata || {}).group_name as string) || action.label || "Grouped";
-    const groupId = await groupSpecificTabs(tabIds, groupName, "blue");
+    const groupId = await groupSpecificTabs(
+        tabIds,
+        groupName,
+        "blue",
+        async (createdGroupId) => checkpointInverse({
+            ...preparedInverse,
+            tabIds,
+            groupId: createdGroupId,
+        }),
+    );
+    if (groupId === null) {
+        return {
+            action_id: action.action_id,
+            success: false,
+            message: "Could not create the exact requested tab group",
+            reversible: false,
+        };
+    }
     pushUndo({
         action_id: action.action_id,
         action_type: "group_tabs",
@@ -3449,7 +4952,11 @@ async function executeGroupTabs(action: SuggestedAction): Promise<ActionExecuteR
     return { action_id: action.action_id, success: true, message: `${tabIds.length} tabs grouped`, reversible: true };
 }
 
-async function executeBookmarkAndClose(action: SuggestedAction): Promise<ActionExecuteResult> {
+async function executeBookmarkAndClose(
+    action: SuggestedAction,
+    preparedInverse: Record<string, unknown>,
+    checkpointInverse: (inverse: Record<string, unknown>) => Promise<void>,
+): Promise<ActionExecuteResult> {
     const aid = action.action_id || `bmc_${Date.now()}`;
 
     // Check if tab closing is disabled by user toggle
@@ -3478,31 +4985,18 @@ async function executeBookmarkAndClose(action: SuggestedAction): Promise<ActionE
     const tabIndex = action.tab_index;
 
     const v = await validateTab(tabIndex);
-    let tabId = v.valid ? v.tabId : -1;
-    let tabUrl = "";
-    let tabTitle = "";
-
-    if (v.valid) {
-        const snap = interventionTabSnapshot.get(tabIndex);
-        tabUrl = snap?.url || "";
-        tabTitle = snap?.title || "";
-    } else {
-        const targetTitle = action.label?.replace(/^Close\s+/i, "") || "";
-        if (targetTitle) {
-            try {
-                const allTabs = await chrome.tabs.query({});
-                const match = allTabs.find(t => t.title?.includes(targetTitle));
-                if (match?.id) {
-                    tabId = match.id;
-                    tabUrl = match.url || "";
-                    tabTitle = match.title || "";
-                }
-            } catch { /* query failed */ }
-        }
-        if (tabId === -1) {
-            return { action_id: aid, success: false, message: v.message || "Tab not found", reversible: false };
-        }
+    if (!v.valid) {
+        return {
+            action_id: aid,
+            success: false,
+            message: v.message || "Exact tab target is unavailable",
+            reversible: false,
+        };
     }
+    const tabId = v.tabId;
+    const snap = interventionTabSnapshot.get(tabIndex);
+    const tabUrl = snap?.url || "";
+    const tabTitle = snap?.title || "";
 
     // LAYER 1: Final active-tab guard
     try {
@@ -3514,30 +5008,150 @@ async function executeBookmarkAndClose(action: SuggestedAction): Promise<ActionE
         return { action_id: aid, success: false, message: "Tab already closed", reversible: false };
     }
 
+    if (!tabUrl) {
+        return {
+            action_id: aid,
+            success: false,
+            message: "Exact tab URL is unavailable",
+            reversible: false,
+        };
+    }
+    let bookmarkId: string;
+    let bookmark;
     try {
-        await chrome.bookmarks.create({ title: tabTitle || "Cortex bookmark", url: tabUrl });
+        bookmark = await chrome.bookmarks.create({
+            title: tabTitle || "Cortex bookmark",
+            url: tabUrl,
+        });
+        bookmarkId = bookmark.id;
     } catch {
-        // Bookmark permission may not be available
+        return {
+            action_id: aid,
+            success: false,
+            message: "Could not create the requested bookmark",
+            reversible: false,
+        };
+    }
+    try {
+        await checkpointInverse({
+            ...preparedInverse,
+            bookmarkId,
+        });
+    } catch (error) {
+        try {
+            await chrome.bookmarks.remove(bookmarkId);
+        } catch {
+            throw new IndeterminateBrowserMutationError(
+                "Bookmark exists but its inverse checkpoint failed",
+                { ...preparedInverse, bookmarkId },
+                error,
+            );
+        }
+        return {
+            action_id: aid,
+            success: false,
+            message: "Bookmark checkpoint failed; the bookmark was rolled back",
+            reversible: false,
+        };
     }
     try {
         await chrome.tabs.remove(tabId);
     } catch {
+        try {
+            await chrome.bookmarks.remove(bookmarkId);
+        } catch {
+            throw new IndeterminateBrowserMutationError(
+                "Tab close failed and the Cortex bookmark may still exist",
+                { ...preparedInverse, bookmarkId },
+            );
+        }
         return { action_id: aid, success: false, message: "Failed to close tab", reversible: false };
     }
     pushUndo({
         action_id: aid,
         action_type: "bookmark_and_close",
-        undo_data: { url: tabUrl, title: tabTitle },
+        undo_data: {
+            url: tabUrl,
+            title: tabTitle,
+            bookmarkId,
+        },
         timestamp: Date.now(),
     });
     return { action_id: aid, success: true, message: "Bookmarked & closed", reversible: true };
 }
 
-async function executeOpenUrl(action: SuggestedAction): Promise<ActionExecuteResult> {
+async function executeOpenUrl(
+    action: SuggestedAction,
+    preparedInverse: Record<string, unknown>,
+    checkpointInverse: (inverse: Record<string, unknown>) => Promise<void>,
+): Promise<ActionExecuteResult> {
     if (!action.target) {
         return { action_id: action.action_id, success: false, message: "No URL provided", reversible: false };
     }
-    const tab = await chrome.tabs.create({ url: action.target, active: false });
+    if (preparedInverse.blockedIncognito === true) {
+        return {
+            action_id: action.action_id,
+            success: false,
+            message: "Cortex never changes incognito windows",
+            reversible: false,
+        };
+    }
+    const stagingUrl = preparedInverse.stagingUrl;
+    if (!validCreatedTabStageUrl(stagingUrl)) {
+        throw new Error("Created-tab recovery marker is missing or invalid");
+    }
+    const windowId = typeof preparedInverse.windowId === "number"
+        ? preparedInverse.windowId
+        : undefined;
+    const tab = await chrome.tabs.create({
+        url: stagingUrl,
+        active: false,
+        ...(windowId === undefined ? {} : { windowId }),
+    });
+    if (typeof tab.id !== "number") {
+        throw new IndeterminateBrowserMutationError(
+            "Chrome created a staged tab without returning its identity",
+            preparedInverse,
+        );
+    }
+    try {
+        await checkpointInverse({ ...preparedInverse, tabId: tab.id });
+    } catch (error) {
+        try {
+            await chrome.tabs.remove(tab.id);
+        } catch {
+            throw new IndeterminateBrowserMutationError(
+                "Created tab exists but its inverse checkpoint failed",
+                { ...preparedInverse, tabId: tab.id },
+                error,
+            );
+        }
+        return {
+            action_id: action.action_id,
+            success: false,
+            message: "Tab checkpoint failed; the created tab was rolled back",
+            reversible: false,
+        };
+    }
+    try {
+        await chrome.tabs.update(tab.id, { url: action.target });
+    } catch (error) {
+        try {
+            await chrome.tabs.remove(tab.id);
+        } catch {
+            throw new IndeterminateBrowserMutationError(
+                "Created tab could not navigate or be removed",
+                { ...preparedInverse, tabId: tab.id },
+                error,
+            );
+        }
+        return {
+            action_id: action.action_id,
+            success: false,
+            message: "Tab navigation failed; the staged tab was rolled back",
+            reversible: false,
+        };
+    }
     pushUndo({
         action_id: action.action_id,
         action_type: "open_url",
@@ -3547,13 +5161,80 @@ async function executeOpenUrl(action: SuggestedAction): Promise<ActionExecuteRes
     return { action_id: action.action_id, success: true, message: "Opened in background", reversible: true };
 }
 
-async function executeSearchError(action: SuggestedAction): Promise<ActionExecuteResult> {
+async function executeSearchError(
+    action: SuggestedAction,
+    preparedInverse: Record<string, unknown>,
+    checkpointInverse: (inverse: Record<string, unknown>) => Promise<void>,
+): Promise<ActionExecuteResult> {
     const query = ((action.metadata || {}).search_query as string) || action.target || "";
     if (!query) {
         return { action_id: action.action_id, success: false, message: "No search query", reversible: false };
     }
+    if (preparedInverse.blockedIncognito === true) {
+        return {
+            action_id: action.action_id,
+            success: false,
+            message: "Cortex never changes incognito windows",
+            reversible: false,
+        };
+    }
     const url = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
-    const tab = await chrome.tabs.create({ url, active: false });
+    const stagingUrl = preparedInverse.stagingUrl;
+    if (!validCreatedTabStageUrl(stagingUrl)) {
+        throw new Error("Created-tab recovery marker is missing or invalid");
+    }
+    const windowId = typeof preparedInverse.windowId === "number"
+        ? preparedInverse.windowId
+        : undefined;
+    const tab = await chrome.tabs.create({
+        url: stagingUrl,
+        active: false,
+        ...(windowId === undefined ? {} : { windowId }),
+    });
+    if (typeof tab.id !== "number") {
+        throw new IndeterminateBrowserMutationError(
+            "Chrome created a staged search tab without returning its identity",
+            preparedInverse,
+        );
+    }
+    try {
+        await checkpointInverse({ ...preparedInverse, tabId: tab.id, url });
+    } catch (error) {
+        try {
+            await chrome.tabs.remove(tab.id);
+        } catch {
+            throw new IndeterminateBrowserMutationError(
+                "Created search tab exists but its inverse checkpoint failed",
+                { ...preparedInverse, tabId: tab.id, url },
+                error,
+            );
+        }
+        return {
+            action_id: action.action_id,
+            success: false,
+            message: "Search-tab checkpoint failed; the tab was rolled back",
+            reversible: false,
+        };
+    }
+    try {
+        await chrome.tabs.update(tab.id, { url });
+    } catch (error) {
+        try {
+            await chrome.tabs.remove(tab.id);
+        } catch {
+            throw new IndeterminateBrowserMutationError(
+                "Created search tab could not navigate or be removed",
+                { ...preparedInverse, tabId: tab.id, url },
+                error,
+            );
+        }
+        return {
+            action_id: action.action_id,
+            success: false,
+            message: "Search navigation failed; the staged tab was rolled back",
+            reversible: false,
+        };
+    }
     pushUndo({
         action_id: action.action_id,
         action_type: "search_error",
@@ -3648,14 +5329,14 @@ async function executeResumeLastActiveFile(
                 target,
                 action_id: aid,
                 intervention_id:
-                    typeof activeIntervention?.plan.intervention_id === "string"
-                        ? (activeIntervention.plan.intervention_id as string)
+                    typeof interventionPresentation.active?.plan.intervention_id === "string"
+                        ? (interventionPresentation.active.plan.intervention_id as string)
                         : undefined,
                 timestamp: Date.now() / 1000,
             },
             timestamp: Date.now() / 1000,
             sequence: ++sequence,
-            correlation_id: activeIntervention?.correlation_id,
+            correlation_id: interventionPresentation.active?.correlation_id,
         });
     } catch {
         // Daemon may be offline — fall through to the soft toast.
@@ -3829,35 +5510,49 @@ async function undoAction(actionId: string): Promise<boolean> {
 }
 
 async function executeAllRecommended(
-    actions: SuggestedAction[],
+    interventionId: string,
 ): Promise<ActionExecuteResult[]> {
-    const results: ActionExecuteResult[] = [];
-    for (const action of actions) {
-        if (action.category === "recommended") {
-            results.push(await executeAction(action));
-        }
+    if (
+        !interventionPresentation.active
+        || interventionPresentation.active.plan.intervention_id !== interventionId
+    ) {
+        throw new Error("Intervention is no longer active");
     }
+    const verified = await verifyActionManifest(
+        interventionPresentation.active.plan.action_manifest,
+    );
+    const actionIds = [...verified.actionsById.values()]
+        .filter((action) => {
+            if (action.source !== "suggested_action") return false;
+            try {
+                return suggestedActionFromManifest(action).category === "recommended";
+            } catch {
+                return false;
+            }
+        })
+        .map((action) => action.action_id);
+    const results = await authorizeActionIds(interventionId, actionIds);
 
     // Clear the intervention after execution so popup doesn't show stale data
-    const hadIntervention = activeIntervention !== null;
-    const interventionId =
-        typeof activeIntervention?.plan.intervention_id === "string"
-            ? (activeIntervention.plan.intervention_id as string)
+    const hadIntervention = interventionPresentation.active !== null;
+    const mountedInterventionId =
+        typeof interventionPresentation.active?.plan.intervention_id === "string"
+            ? (interventionPresentation.active.plan.intervention_id as string)
             : undefined;
     // F16: outbound USER_ACTION carries the same cid the daemon stamped on
     // the plan, so a superseded ACK is ignored by `_handle_user_action`.
-    const interventionCid = activeIntervention?.correlation_id;
-    activeIntervention = null;
+    const interventionCid = interventionPresentation.active?.correlation_id;
+    interventionPresentation.clear();
     // Persist cleared state
     try { await chrome.storage.session.remove(["cortex_active_intervention", "cortex_active_intervention_cid", "cortex_active_intervention_mounted_at", "cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]); } catch {}
 
     // Notify daemon that user engaged with the intervention
-    if (hadIntervention && interventionId) {
+    if (hadIntervention && mountedInterventionId) {
         send({
             type: "USER_ACTION",
             payload: {
                 action: "engaged",
-                intervention_id: interventionId,
+                intervention_id: mountedInterventionId,
                 timestamp: Date.now() / 1000,
             },
             timestamp: Date.now() / 1000,
@@ -3867,7 +5562,10 @@ async function executeAllRecommended(
     }
 
     // Broadcast to popup so it clears the intervention card
-    broadcastToPopup({ type: "INTERVENTION_RESTORE", payload: { intervention_id: interventionId } });
+    broadcastToPopup({
+        type: "INTERVENTION_RESTORE",
+        payload: { intervention_id: mountedInterventionId },
+    });
 
     return results;
 }
@@ -3881,10 +5579,14 @@ async function undoAllRecent(): Promise<void> {
     }
 }
 
-// --- Health Alerts (Posture & Eye Strain) ---
+// --- Comfort Alerts (Head/Neck Proxy & Eye Strain) ---
 
 function checkHealthAlerts(payload: Record<string, unknown>): void {
-    const bio = payload.biometrics as Record<string, number | null> | undefined;
+    const bio = payload.biometrics as {
+        blink_rate?: number | null;
+        head_neck_flexion_score?: number | null;
+        head_neck_proxy_available?: boolean;
+    } | undefined;
     if (!bio) return;
     const now = Date.now();
 
@@ -3907,27 +5609,31 @@ function checkHealthAlerts(payload: Record<string, unknown>): void {
         lowBlinkStart = 0;
     }
 
-    // Forward lean → posture. Audit-2 fix: ``forward_lean`` is the
-    // 0-1 normalized score the daemon now publishes (rescaled from the
-    // raw 0-45° angle). The 0.6 threshold corresponds to ~27° forward
-    // tilt sustained for 3 min, which is a real slump signal — not the
-    // 5-20° natural sitting range that previously fired on every user.
-    const lean = bio.forward_lean;
-    if (lean !== null && lean !== undefined && lean > 0.6) {
-        if (leaningStart === 0) leaningStart = now;
+    // Camera-relative head/neck proxy. This is intentionally not called
+    // posture: no torso or shoulder landmarks are measured. The daemon marks
+    // the proxy unavailable after a camera/scale/calibration mismatch.
+    const proxyAvailable = bio.head_neck_proxy_available === true;
+    const flexion = bio.head_neck_flexion_score;
+    if (
+        proxyAvailable &&
+        flexion !== null &&
+        flexion !== undefined &&
+        flexion > 0.6
+    ) {
+        if (headNeckFlexionStart === 0) headNeckFlexionStart = now;
         if (
-            now - leaningStart > POSTURE_ALERT_THRESHOLD &&
-            now - lastPostureAlert > HEALTH_ALERT_COOLDOWN
+            now - headNeckFlexionStart > HEAD_NECK_ALERT_THRESHOLD &&
+            now - lastHeadNeckAlert > HEALTH_ALERT_COOLDOWN
         ) {
-            lastPostureAlert = now;
+            lastHeadNeckAlert = now;
             showHealthNotification(
-                "Posture check",
-                "You've been leaning forward. Sit back, relax your shoulders, and straighten up.",
+                "Head and neck comfort check",
+                "Your camera-relative head angle has stayed beyond your calibrated neutral range. Adjust only if a different position feels more comfortable.",
             );
-            leaningStart = 0;
+            headNeckFlexionStart = 0;
         }
     } else {
-        leaningStart = 0;
+        headNeckFlexionStart = 0;
     }
 }
 
@@ -3940,75 +5646,103 @@ function showHealthNotification(title: string, body: string): void {
 async function injectToast(title: string, body: string): Promise<void> {
     try {
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (tab?.id && tab.url && !tab.url.startsWith("chrome://")) {
+        if (tab?.id && tab.url && !tab.incognito && !tab.url.startsWith("chrome://")) {
             await chrome.scripting.executeScript({
                 target: { tabId: tab.id },
                 func: (t: string, b: string) => {
                     const id = "cortex-toast";
                     document.getElementById(id)?.remove();
-                    const el = document.createElement("div");
-                    el.id = id;
-                    el.style.cssText =
-                        "position:fixed;top:16px;right:16px;z-index:2147483647;max-width:300px;" +
-                        "padding:12px 14px;border-radius:10px;font-family:-apple-system,BlinkMacSystemFont,'Inter','SF Pro Text',system-ui,sans-serif;" +
-                        "background:#111113;color:#e4e4e7;border:1px solid rgba(255,255,255,.06);" +
-                        "box-shadow:0 4px 20px rgba(0,0,0,.4);animation:cortexSlideIn .25s ease;font-size:12px;line-height:1.5;" +
-                        "cursor:pointer;";
+                    const host = document.createElement("div");
+                    host.id = id;
+                    host.style.cssText =
+                        "position:fixed;top:16px;right:16px;z-index:2147483647;";
+                    host.setAttribute("role", "status");
+                    host.setAttribute("aria-live", "polite");
+                    const shadow = host.attachShadow({ mode: "open" });
                     const style = document.createElement("style");
-                    style.textContent = "@keyframes cortexSlideIn{from{transform:translateY(-12px);opacity:0}to{transform:translateY(0);opacity:1}}";
+                    style.textContent = `
+                        *{box-sizing:border-box}
+                        .toast{position:relative;width:min(320px,calc(100vw - 32px));padding:12px 42px 12px 14px;border-radius:10px;font-family:-apple-system,BlinkMacSystemFont,'Inter','SF Pro Text',system-ui,sans-serif;background:#111113;color:#e4e4e7;border:1px solid rgba(255,255,255,.06);box-shadow:0 4px 20px rgba(0,0,0,.4);font-size:12px;line-height:1.5}
+                        .title{font-weight:600;margin-bottom:3px;font-size:12px;color:#e4e4e7}
+                        .body{color:#a1a1aa;font-size:11px}
+                        .close{position:absolute;top:6px;right:6px;width:32px;height:32px;border:0;border-radius:7px;background:transparent;color:#a1a1aa;font:16px/1 system-ui;cursor:pointer;transition:background-color 120ms cubic-bezier(.23,1,.32,1),color 120ms cubic-bezier(.23,1,.32,1),transform 120ms cubic-bezier(.23,1,.32,1)}
+                        .close:active{transform:scale(.96)}
+                        .close:focus-visible{outline:2px solid #dfb15b;outline-offset:1px}
+                        @media (hover:hover) and (pointer:fine){.close:hover{background:rgba(255,255,255,.07);color:#e4e4e7}}
+                        @media (prefers-reduced-motion:reduce){.close{transition:background-color 120ms cubic-bezier(.23,1,.32,1),color 120ms cubic-bezier(.23,1,.32,1)}.close:active{transform:none}}
+                    `;
+                    const toast = document.createElement("div");
+                    toast.className = "toast";
                     const titleEl = document.createElement("div");
-                    titleEl.style.cssText = "font-weight:600;margin-bottom:3px;font-size:12px;color:#e4e4e7";
+                    titleEl.className = "title";
                     titleEl.textContent = t;
                     const bodyEl = document.createElement("div");
-                    bodyEl.style.cssText = "color:#71717a;font-size:11px";
+                    bodyEl.className = "body";
                     bodyEl.textContent = b;
-                    el.append(style, titleEl, bodyEl);
-                    el.addEventListener("click", () => el.remove());
-                    document.body.appendChild(el);
-                    setTimeout(() => el.remove(), 8000);
+                    const close = document.createElement("button");
+                    close.className = "close";
+                    close.type = "button";
+                    close.setAttribute("aria-label", "Dismiss health notification");
+                    close.textContent = "×";
+                    toast.append(titleEl, bodyEl, close);
+                    shadow.append(style, toast);
+                    document.body.appendChild(host);
+
+                    const reduced = window.matchMedia(
+                        "(prefers-reduced-motion: reduce)",
+                    ).matches;
+                    let dismissed = false;
+                    let timeoutId = 0;
+                    const dismiss = () => {
+                        if (dismissed) return;
+                        dismissed = true;
+                        window.clearTimeout(timeoutId);
+                        toast.getAnimations().forEach((animation) =>
+                            animation.cancel(),
+                        );
+                        if (reduced) {
+                            host.remove();
+                            return;
+                        }
+                        const exit = toast.animate(
+                            [
+                                { opacity: 1, transform: "translateY(0)" },
+                                {
+                                    opacity: 0,
+                                    transform: "translateY(-8px)",
+                                },
+                            ],
+                            {
+                                duration: 140,
+                                easing: "cubic-bezier(.4,0,1,1)",
+                                fill: "forwards",
+                            },
+                        );
+                        exit.onfinish = () => host.remove();
+                    };
+                    close.addEventListener("click", dismiss);
+                    if (!reduced) {
+                        toast.animate(
+                            [
+                                {
+                                    opacity: 0,
+                                    transform: "translateY(-8px)",
+                                },
+                                { opacity: 1, transform: "translateY(0)" },
+                            ],
+                            {
+                                duration: 160,
+                                easing: "cubic-bezier(.23,1,.32,1)",
+                            },
+                        );
+                    }
+                    timeoutId = window.setTimeout(dismiss, 8000);
                 },
                 args: [title, body],
             });
         }
     } catch {
         // Injection failed
-    }
-}
-
-// --- Smart Break Recommendations ---
-
-function checkBreakNeeded(payload: Record<string, unknown>): void {
-    if (!focusSession) return;
-    const now = Date.now();
-    const state = payload.state as string;
-    const bio = payload.biometrics as Record<string, number | null> | undefined;
-
-    // Track consecutive stress signals
-    if (state === "HYPER") {
-        consecutiveStressUpdates++;
-    } else {
-        consecutiveStressUpdates = Math.max(0, consecutiveStressUpdates - 1);
-    }
-
-    // Suggest break if: stressed for 2+ min OR session > 50 min without break
-    const sessionMin = (now - focusSession.startTime) / 60000;
-    const shouldSuggestBreak =
-        (consecutiveStressUpdates > 12 && now - lastBreakSuggestion > 600_000) || // Stressed 2+ min, max every 10 min
-        (sessionMin > 50 && now - lastBreakSuggestion > 1800_000); // 50+ min, max every 30 min
-
-    if (shouldSuggestBreak) {
-        lastBreakSuggestion = now;
-        consecutiveStressUpdates = 0;
-
-        let reason = "You've been working for a while.";
-        if (state === "HYPER" && bio?.heart_rate && bio.heart_rate > 85) {
-            reason = `Your heart rate is elevated (${Math.round(bio.heart_rate)} BPM). Your body needs a reset.`;
-        } else if (sessionMin > 50) {
-            reason = `You've been in this session for ${Math.round(sessionMin)} minutes. A short break boosts retention.`;
-        }
-
-        injectToast("Time for a break", reason + " Step away for 5 minutes.");
-        broadcastToPopup({ type: "BREAK_SUGGESTED", reason });
     }
 }
 
@@ -4161,7 +5895,9 @@ async function broadcastToContentScripts(
     lastAmbientBroadcast = now;
 
     try {
-        const tabs = await chrome.tabs.query({});
+        const tabs = (await chrome.tabs.query({})).filter(
+            (tab) => !tab.incognito,
+        );
         for (const tab of tabs) {
             if (tab.id && tab.url && !tab.url.startsWith("chrome://")) {
                 chrome.tabs.sendMessage(tab.id, message).catch(() => {
@@ -4179,7 +5915,7 @@ async function broadcastToContentScripts(
 chrome.runtime.onMessage.addListener(
     (
         message: Record<string, unknown>,
-        _sender: chrome.runtime.MessageSender,
+        sender: chrome.runtime.MessageSender,
         sendResponse: (response: unknown) => void,
     ) => {
         // F19b: every popup/newtab message can carry a correlation_id minted
@@ -4190,9 +5926,21 @@ chrome.runtime.onMessage.addListener(
             console.debug(`cortex.bg.recv cid=${__cid} type=${String(message.type)}`);
         }
         switch (message.type) {
+            case "SITE_ACCESS_REVOKED":
+                // Drop the only context-time tab snapshot immediately. Page
+                // excerpts are never persisted; subsequent daemon requests
+                // will fail the optional-host check and return an empty
+                // excerpt. Incognito tabs are excluded independently.
+                lastContextTabs = null;
+                lastContextTabsTimestamp = 0;
+                scrubStoredActivityContent()
+                    .then(() => sendResponse({ ok: true }))
+                    .catch(() => sendResponse({ ok: false }));
+                return true;
+
             case "GET_STATE":
-                // If activeIntervention was lost (SW restart), load from session storage
-                if (!activeIntervention) {
+                // If presentation state was lost (SW restart), rehydrate it.
+                if (!interventionPresentation.active) {
                     chrome.storage.session.get(
                         [
                             "cortex_active_intervention",
@@ -4202,20 +5950,18 @@ chrome.runtime.onMessage.addListener(
                         (data) => {
                             const stored = data?.cortex_active_intervention || null;
                             if (stored) {
-                                activeIntervention = {
-                                    plan: stored as Record<string, unknown>,
-                                    correlation_id:
-                                        (data?.cortex_active_intervention_cid as string) ||
-                                        `restore_${Date.now().toString(36)}`,
-                                    mountedAt:
-                                        (data?.cortex_active_intervention_mounted_at as number) ||
-                                        Date.now(),
-                                };
+                                interventionPresentation.mount(
+                                    stored as Record<string, unknown>,
+                                    (data?.cortex_active_intervention_cid as string)
+                                        || `restore_${Date.now().toString(36)}`,
+                                    (data?.cortex_active_intervention_mounted_at as number)
+                                        || Date.now(),
+                                );
                             }
                             sendResponse({
                                 connected,
                                 state: currentState,
-                                intervention: activeIntervention?.plan ?? null,
+                                intervention: interventionPresentation.active?.plan ?? null,
                                 focusSession: focusSession ? getFocusSessionSnapshot() : null,
                             });
                         },
@@ -4225,7 +5971,7 @@ chrome.runtime.onMessage.addListener(
                 sendResponse({
                     connected,
                     state: currentState,
-                    intervention: activeIntervention.plan,
+                    intervention: interventionPresentation.active.plan,
                     focusSession: focusSession ? getFocusSessionSnapshot() : null,
                 });
                 break;
@@ -4270,7 +6016,7 @@ chrome.runtime.onMessage.addListener(
                 stopFocusSession();
                 // Clear state
                 currentState = null;
-                activeIntervention = null;
+                interventionPresentation.clear();
                 (async () => {
                     // Clear persisted intervention/snapshot state so popup does not
                     // resurrect stale UI after service-worker restart.
@@ -4439,7 +6185,7 @@ chrome.runtime.onMessage.addListener(
                 const outboundCid =
                     typeof message.correlation_id === "string" && message.correlation_id.length > 0
                         ? (message.correlation_id as string)
-                        : activeIntervention?.correlation_id;
+                        : interventionPresentation.active?.correlation_id;
                 send({
                     type: "USER_ACTION",
                     payload: {
@@ -4453,8 +6199,8 @@ chrome.runtime.onMessage.addListener(
                 });
                 if (message.action === "dismissed") {
                     const activePlanId =
-                        typeof activeIntervention?.plan.intervention_id === "string"
-                            ? (activeIntervention.plan.intervention_id as string)
+                        typeof interventionPresentation.active?.plan.intervention_id === "string"
+                            ? (interventionPresentation.active.plan.intervention_id as string)
                             : null;
                     const interventionId =
                         typeof message.intervention_id === "string"
@@ -4464,40 +6210,33 @@ chrome.runtime.onMessage.addListener(
                     // Record dismissal for cooldown
                     const now = Date.now();
                     if (interventionId) {
-                        dismissedInterventions.set(interventionId, now);
+                        interventionPresentation.dismiss(interventionId, null, now);
                         schedulePersist();
                     }
                     // Also record URL-based cooldown from the active tab
                     chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
                         if (tab?.url) {
-                            try {
-                                dismissedUrlPatterns.set(new URL(tab.url).hostname, now);
-                                schedulePersist();
-                            } catch {}
+                            interventionPresentation.dismiss(
+                                interventionId || "",
+                                tab.url,
+                                now,
+                            );
+                            schedulePersist();
                         }
                     }).catch((err: unknown) => {
                         if (DEBUG) console.debug("[cortex.bg] tabs.query(active) for URL dismiss cooldown failed: %o", err);
                     });
-                    // Prune old entries
-                    for (const [k, t] of dismissedInterventions) {
-                        if (now - t > interventionDismissCooldown) dismissedInterventions.delete(k);
-                    }
-                    for (const [k, t] of dismissedUrlPatterns) {
-                        if (now - t > urlDismissCooldown) dismissedUrlPatterns.delete(k);
-                    }
-                    schedulePersist();
-
-                    activeIntervention = null;
-                    try { chrome.storage.session.remove(["cortex_active_intervention", "cortex_active_intervention_cid", "cortex_active_intervention_mounted_at", "cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]); } catch {}
-                    if (interventionId) {
-                        void restoreTabsForIntervention(interventionId).catch((err: unknown) => {
-                            if (DEBUG) console.debug("[cortex.bg] restoreTabsForIntervention failed on dismiss: %o", err);
-                        });
-                    } else {
-                        void restoreAllTabs().catch((err: unknown) => {
-                            if (DEBUG) console.debug("[cortex.bg] restoreAllTabs failed on dismiss: %o", err);
-                        });
-                    }
+                    interventionPresentation.clear();
+                    // Keep exact inverse snapshots until the daemon sends a
+                    // receipt-derived INTERVENTION_RESTORE. Dismissal itself
+                    // is never workspace authority.
+                    try {
+                        chrome.storage.session.remove([
+                            "cortex_active_intervention",
+                            "cortex_active_intervention_cid",
+                            "cortex_active_intervention_mounted_at",
+                        ]);
+                    } catch {}
                 }
                 sendResponse({ ok: true });
                 break;
@@ -4582,26 +6321,50 @@ chrome.runtime.onMessage.addListener(
                 break;
 
             case "EXECUTE_ACTION":
-                executeAction(message.action as SuggestedAction)
-                    .then((result) => {
-                        sendResponse(result);
-                        // Notify daemon
-                        send({
-                            type: "ACTION_EXECUTE",
-                            payload: {
-                                intervention_id: message.intervention_id,
-                                action_id: (message.action as SuggestedAction).action_id,
-                                action_type: (message.action as SuggestedAction).action_type,
-                                result,
-                            },
-                            timestamp: Date.now() / 1000,
-                            sequence: ++sequence,
-                        });
+                if (!workspaceMutationAllowed()) {
+                    sendResponse({
+                        action_id: String(
+                            (message.action as Partial<SuggestedAction> | undefined)
+                                ?.action_id ?? "",
+                        ),
+                        success: false,
+                        message: "Action unavailable in suggest-only mode",
+                        reversible: false,
                     });
+                    break;
+                }
+                authorizeActionIds(
+                    String(message.intervention_id || ""),
+                    [String(
+                        (message.action as Partial<SuggestedAction> | undefined)
+                            ?.action_id || "",
+                    )],
+                    [message.action],
+                )
+                    .then(([result]) => sendResponse(result))
+                    .catch((error: unknown) => sendResponse({
+                        action_id: String(
+                            (message.action as Partial<SuggestedAction> | undefined)
+                                ?.action_id || "",
+                        ),
+                        success: false,
+                        message: String(error),
+                        reversible: false,
+                    }));
                 return true; // async
 
             case "EXECUTE_ALL_RECOMMENDED":
-                executeAllRecommended(message.actions as SuggestedAction[])
+                if (!workspaceMutationAllowed()) {
+                    sendResponse({
+                        success: false,
+                        message: "Actions unavailable in suggest-only mode",
+                        results: [],
+                    });
+                    break;
+                }
+                executeAllRecommended(
+                    String(message.intervention_id || ""),
+                )
                     .then((results) => {
                         sendResponse(results);
                         // Send per-tab relevance feedback to daemon
@@ -4619,7 +6382,12 @@ chrome.runtime.onMessage.addListener(
                                 sequence: ++sequence,
                             });
                         }
-                    });
+                    })
+                    .catch((error: unknown) => sendResponse({
+                        success: false,
+                        message: String(error),
+                        results: [],
+                    }));
                 return true; // async
 
             case "UNDO_ACTION":
@@ -4652,23 +6420,41 @@ chrome.runtime.onMessage.addListener(
 
             case "LEETCODE_CONTEXT_UPDATE": {
                 const payload = (message.payload || {}) as Record<string, unknown>;
-                send({
-                    type: "LEETCODE_CONTEXT_UPDATE",
-                    payload,
-                    timestamp: Date.now() / 1000,
-                    sequence: ++sequence,
-                });
-                sendResponse({ ok: true });
-                break;
+                const tab = sender.tab;
+                (async () => {
+                    const allowPageContent = Boolean(
+                        tab && !tab.incognito && await mayExtractPageContent(tab),
+                    );
+                    const safePayload = { ...payload };
+                    if (!allowPageContent) safePayload.code_snapshot = "";
+                    else safePayload.code_snapshot = sanitizeContextText(
+                        String(payload.code_snapshot ?? ""),
+                        PAGE_EXCERPT_MAX_CHARS,
+                    ).value;
+                    send({
+                        type: "LEETCODE_CONTEXT_UPDATE",
+                        payload: safePayload,
+                        timestamp: Date.now() / 1000,
+                        sequence: ++sequence,
+                    });
+                    sendResponse({ ok: true });
+                })().catch(() => sendResponse({ ok: false }));
+                return true;
             }
 
             case "ACTIVITY_UPDATE": {
-                const record = message.record as ActivityRecord;
-                if (record?.content_id) {
-                    enrichWithRelatedTabs(record).then(() => upsertActivity(record));
-                }
-                sendResponse({ ok: true });
-                break;
+                prepareActivityRecordForStorage(message.record, sender.tab)
+                    .then(async (record) => {
+                        if (!record) {
+                            sendResponse({ ok: false, ignored: true });
+                            return;
+                        }
+                        await enrichWithRelatedTabs(record);
+                        await upsertActivity(record);
+                        sendResponse({ ok: true });
+                    })
+                    .catch(() => sendResponse({ ok: false }));
+                return true;
             }
 
             case "GET_RECENT_ACTIVITIES":
@@ -4988,14 +6774,15 @@ chrome.storage.onChanged.addListener((changes, area) => {
             wrong_answer_count: session.wrong_answer_count || 0,
             accepted: session.accepted || false,
             time_elapsed_s: session.time_elapsed_s || 0,
-            code_snapshot: session.code_snapshot,
+            // Session persistence deliberately excludes raw source text.
+            code_snapshot: undefined,
         },
         content_duration_s: 0,
         duration_spent_s: session.time_elapsed_s || 0,
         session_duration_s: session.time_elapsed_s || 0,
         first_visited: (session.saved_at || Date.now()) - (session.time_elapsed_s || 0) * 1000,
         last_visited: session.saved_at || Date.now(),
-        context_snapshot: `${session.difficulty || ""} — ${session.tags?.join(", ") || ""}`,
+        context_snapshot: "",
         topic_tags: session.tags || [],
         completion_pct: session.accepted ? 100 : Math.min((session.time_elapsed_s || 0) / 1800 * 50, 50),
         max_completion_pct: session.accepted ? 100 : 0,
@@ -5007,7 +6794,8 @@ chrome.storage.onChanged.addListener((changes, area) => {
         playlist_index: -1,
         related_tabs: [],
     };
-    upsertActivity(record);
+    const safeRecord = sanitizeActivityRecord(record, false);
+    if (safeRecord) upsertActivity(safeRecord);
 });
 
 // --- Distraction Blocking (tab navigation listener) ---
@@ -5208,9 +6996,9 @@ function handleCommandPauseCortex(): void {
 function handleCommandDismissOverlay(): void {
     if (!connected || !ws) return;
     const interventionId =
-        activeIntervention
-        && typeof activeIntervention.plan.intervention_id === "string"
-            ? activeIntervention.plan.intervention_id
+        interventionPresentation.active
+        && typeof interventionPresentation.active.plan.intervention_id === "string"
+            ? interventionPresentation.active.plan.intervention_id
             : null;
     try {
         send({
@@ -5223,15 +7011,15 @@ function handleCommandDismissOverlay(): void {
             },
             timestamp: Date.now() / 1000,
             sequence: ++sequence,
-            correlation_id: activeIntervention?.correlation_id,
+            correlation_id: interventionPresentation.active?.correlation_id,
         });
     } catch {
         // No active intervention or WS down — both are no-ops.
     }
     // Also clear the locally-mounted overlay state so the popup
     // collapses immediately even before the daemon round-trips.
-    if (activeIntervention) {
-        activeIntervention = null;
+    if (interventionPresentation.active) {
+        interventionPresentation.clear();
         broadcastToPopup({ type: "OVERLAY_DISMISSED" });
     }
 }

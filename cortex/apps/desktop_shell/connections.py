@@ -37,6 +37,8 @@ from cortex.apps.desktop_shell.a11y import (
 from cortex.apps.desktop_shell.tokens import (
     BRAND_ACCENT,
     BRAND_ACCENT_HOVER,
+    BRAND_ACCENT_PRESSED,
+    BRAND_ACCENT_TEXT,
     BRAND_DISPLAY_FONT,
     CX_TEXT_SECONDARY,
     CX_TEXT_TERTIARY,
@@ -446,9 +448,10 @@ class ConnectionsPanel(QWidget):
             "  padding: 6px 16px;"
             f"  border-radius: {RADIUS_BUTTON}px;"
             f"  background: {BRAND_ACCENT};"
-            "  color: #FFF; border: none;"
+            f"  color: {SEMANTIC_LIGHT['label_primary']}; border: none;"
             "}"
-            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
+            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
+            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
             "QPushButton:disabled { background: rgba(0,0,0,0.12); color: rgba(0,0,0,0.35); }"
         )
         return btn
@@ -468,7 +471,7 @@ class ConnectionsPanel(QWidget):
             "  padding: 5px 14px;"
             f"  border-radius: {RADIUS_BUTTON}px;"
             "  background: transparent;"
-            f"  color: {BRAND_ACCENT};"
+            f"  color: {BRAND_ACCENT_TEXT};"
             f"  border: 1px solid {BRAND_ACCENT};"
             "}"
             "QPushButton:hover { background: rgba(0,0,0,0.04); }"

@@ -10,8 +10,8 @@
 # change without the regenerated TypeScript declarations.
 #
 # Install:
-#   pip install pre-commit
-#   pre-commit install
+#   make setup
+#   make precommit
 #
 # Run manually (does not require commit):
 #   pre-commit run --all-files
@@ -29,7 +29,7 @@ repos:
       # F45).
       - id: cortex-schema-codegen
         name: cortex schema codegen (Debt-1 drift gate)
-        entry: python -m cortex.scripts.generate_ts_schemas --check
+        entry: uv run --project cortex --locked --extra codegen python -m cortex.scripts.generate_ts_schemas --check
         language: system
         pass_filenames: false
         files: |
@@ -49,7 +49,7 @@ repos:
       # cannot land drift.
       - id: cortex-design-tokens-check
         name: cortex design tokens (drift gate)
-        entry: python -m cortex.scripts.sync_design_tokens --check
+        entry: uv run --project cortex --locked --extra codegen python -m cortex.scripts.sync_design_tokens --check
         language: system
         pass_filenames: false
         files: |
@@ -59,4 +59,21 @@ repos:
             cortex/apps/desktop_shell/tokens\.py|
             cortex/apps/browser_extension/design-tokens\.ts|
             cortex/apps/vscode_extension/src/design-tokens\.ts
+          )$
+
+      - id: cortex-repository-contracts
+        name: cortex repository contracts (links/config/live schemas/generated docs)
+        entry: uv run --project cortex --locked --extra dev --extra codegen python -m cortex.scripts.verify_repository_contracts
+        language: system
+        pass_filenames: false
+        files: |
+          (?x)^(
+            .*\.md|
+            cortex/\.env\.example|
+            cortex/libs/config/.*|
+            cortex/libs/schemas/ws_message_types\.py|
+            cortex/scripts/(sync_config_docs|sync_design_tokens|sync_versions|verify_repository_contracts)\.py|
+            cortex/apps/.*\.(py|ts|tsx)|
+            cortex/services/.*\.py|
+            cortex/storage/.*\.py
           )$

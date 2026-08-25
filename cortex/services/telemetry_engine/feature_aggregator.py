@@ -22,11 +22,12 @@ Derived features:
 from __future__ import annotations
 
 import logging
-import time
+from collections import deque
 from collections.abc import Callable
 
 import numpy as np
 
+from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 from cortex.libs.config.settings import TelemetryConfig
 from cortex.libs.schemas.features import TelemetryFeatures
 from cortex.services.telemetry_engine.focus_graph import FocusGraphBuilder
@@ -54,6 +55,7 @@ _MAX_MOUSE_VELOCITY = 5000.0
 
 # Maximum expected jerk for normalization
 _MAX_JERK_VARIANCE = 1e8
+_MAX_FOCUS_EVENT_IDENTITIES = 2048
 
 
 class FeatureAggregator:
@@ -80,12 +82,21 @@ class FeatureAggregator:
         window_tracker: WindowTracker | None = None,
         config: TelemetryConfig | None = None,
         tab_count_provider: Callable[[], int | None] | None = None,
+        *,
+        clock: Clock | None = None,
     ) -> None:
+        self._clock = clock or SYSTEM_CLOCK
         self._hooks = input_hooks
         self._window_tracker = window_tracker
         self._config = config or TelemetryConfig()
         self._tab_count_provider = tab_count_provider
-        self._focus_graph = FocusGraphBuilder()
+        self._focus_graph = FocusGraphBuilder(clock=self._clock)
+        self._observation_started_at: float | None = None
+        # WindowTracker exposes a sliding window, so the same event appears in
+        # many successive snapshots. Keep a bounded identity ledger to feed
+        # each real focus transition to the graph exactly once.
+        self._seen_focus_events: set[tuple[float, str, str]] = set()
+        self._seen_focus_event_order: deque[tuple[float, str, str]] = deque()
 
     def build_features(
         self,
@@ -103,7 +114,13 @@ class FeatureAggregator:
             TelemetryFeatures Pydantic model with all computed features.
         """
         window = window_seconds or self._config.window_seconds
-        now = current_time or time.monotonic()
+        now = (
+            monotonic_seconds(self._clock)
+            if current_time is None
+            else current_time
+        )
+        if self._observation_started_at is None:
+            self._observation_started_at = now
 
         # Gather events
         events = self._hooks.get_events_in_window(window, now)
@@ -117,25 +134,42 @@ class FeatureAggregator:
         if self._window_tracker is not None:
             window_events = self._window_tracker.get_events_in_window(window, now)
 
-        # Feed window events to focus graph for thrashing detection
-        for we in window_events:
-            self._focus_graph.add_event(
-                app_name=we.app_name,
-                window_title=we.window_title,
-                timestamp=we.timestamp,
+        # Feed each source event exactly once. Replaying the entire rolling
+        # window every 500 ms creates false A→B→C→A→B→C switches.
+        self._ingest_new_focus_events(window_events)
+        window_focus_source_available = bool(
+            self._window_tracker is not None
+            and (
+                bool(getattr(self._window_tracker, "is_running", False))
+                or bool(window_events)
             )
+        )
 
         # Compute all features
         vel_mean, vel_var = self._compute_mouse_velocity(mouse_moves)
         jerk_score = self._compute_mouse_jerk(mouse_moves)
         click_burst = self._compute_click_burst_score(mouse_clicks)
         click_freq = self._compute_click_frequency(mouse_clicks, window)
+        typing_presses = [
+            event
+            for event in key_events
+            if event.pressed
+            and event.key_type in (KeyType.REGULAR, KeyType.BACKSPACE)
+        ]
+        keypress_rate = len(typing_presses) / window * 60.0 if window > 0 else 0.0
         kb_burst = self._compute_keyboard_burst_score(key_events)
         ks_variance = self._compute_keystroke_interval_variance(key_events)
         bs_density = self._compute_backspace_density(key_events)
         correction_rate = self._compute_correction_rate_per_100_keys(key_events)
         inactivity = self._compute_inactivity(
-            mouse_moves, mouse_clicks, mouse_scrolls, key_events, now
+            mouse_moves,
+            mouse_clicks,
+            mouse_scrolls,
+            key_events,
+            now,
+            no_event_fallback_seconds=min(
+                window, max(0.0, now - self._observation_started_at)
+            ),
         )
         switch_rate = self._compute_window_switch_rate(window_events, window)
         scroll_rev = self._compute_scroll_reversal_score(mouse_scrolls)
@@ -160,6 +194,7 @@ class FeatureAggregator:
             mouse_jerk_score=jerk_score,
             click_burst_score=click_burst,
             click_frequency=click_freq,
+            keypress_rate_per_min=keypress_rate,
             keyboard_burst_score=kb_burst,
             keystroke_interval_variance=ks_variance,
             backspace_density=bs_density,
@@ -169,7 +204,32 @@ class FeatureAggregator:
             tab_count=tab_count,
             scroll_reversal_score=scroll_rev,
             scroll_back_rate_per_min=scroll_back_rate,
+            observation_window_seconds=window,
+            mouse_move_count=len(mouse_moves),
+            click_press_count=sum(1 for event in mouse_clicks if event.pressed),
+            key_press_count=len(typing_presses),
+            scroll_event_count=len(mouse_scrolls),
+            window_focus_event_count=len(window_events),
+            window_focus_source_available=window_focus_source_available,
         )
+
+    def _ingest_new_focus_events(self, events: list[WindowFocusEvent]) -> None:
+        """Add each sliding-window focus event to the graph exactly once."""
+
+        for event in events:
+            identity = (event.timestamp, event.app_name, event.window_title)
+            if identity in self._seen_focus_events:
+                continue
+            if len(self._seen_focus_event_order) >= _MAX_FOCUS_EVENT_IDENTITIES:
+                expired = self._seen_focus_event_order.popleft()
+                self._seen_focus_events.discard(expired)
+            self._seen_focus_event_order.append(identity)
+            self._seen_focus_events.add(identity)
+            self._focus_graph.add_event(
+                app_name=event.app_name,
+                window_title=event.window_title,
+                timestamp=event.timestamp,
+            )
 
     @property
     def thrashing_score(self) -> float:
@@ -380,6 +440,7 @@ class FeatureAggregator:
         scrolls: list[MouseScrollEvent],
         keys: list[KeyEvent],
         current_time: float,
+        no_event_fallback_seconds: float | None = None,
     ) -> float:
         """
         Compute seconds since last input event.
@@ -399,7 +460,14 @@ class FeatureAggregator:
             latest = max(latest, keys[-1].timestamp)
 
         if latest == 0.0:
-            return current_time  # No events at all — full window is inactive
+            # ``current_time`` is commonly a machine-uptime monotonic value.
+            # Production supplies elapsed collector exposure so a fresh
+            # process cannot fabricate hours of inactivity.
+            return (
+                max(0.0, no_event_fallback_seconds)
+                if no_event_fallback_seconds is not None
+                else current_time
+            )
 
         return max(0.0, current_time - latest)
 

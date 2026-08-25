@@ -8,14 +8,38 @@
  * the legacy thumbs-up / thumbs-down emoji for historical clarity.)
  */
 
-import React, { useCallback, useEffect, useState } from "react";
-import { CX, STATE_COLORS, STATE_LABELS, CX_KEYFRAMES } from "./design-tokens";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import "./page-reset.css";
+import {
+    CX,
+    CX_KEYFRAMES,
+    STATE_COLORS,
+    STATE_LABELS,
+    STATE_TEXT_COLORS,
+} from "./design-tokens";
 import { newCorrelationId } from "./lib/correlation";
 import { getLastRuntimeError } from "./lib/chrome-runtime";
+import { verifiedPresentedActionIds } from "./lib/intervention-transaction";
 import { DAEMON_HTTP_URL } from "./config";
 import { getAuthToken } from "./lib/auth";
+import {
+    getSiteAccessState,
+    requestSiteAccess,
+    revokeSiteAccess,
+} from "./lib/site-access";
+import {
+    classifyConnectivity,
+    connectivityViewModel,
+    normaliseMicroSteps,
+    parseExecutionMode,
+    supportStateViewModel,
+    type CortexState,
+    type DailyStats,
+    type ExecutionMode,
+    type FocusSnapshot,
+} from "./lib/popup-view-model";
+export { classifyConnectivity, normaliseMicroSteps } from "./lib/popup-view-model";
 import type {
-    BreakRecommendation as BreakRecommendationSchema,
     CausalSignal as CausalSignalSchema,
     WhyDetail as WhyDetailSchema,
 } from "./types/generated/cortex_schemas";
@@ -122,8 +146,6 @@ import type {
     DailyBaseline,
     SessionReport,
     SessionRecap,
-    SuggestedAction,
-    TabRecommendation,
     TabRecommendations,
     TrendsResponse,
 } from "./types/generated/cortex_schemas";
@@ -162,86 +184,11 @@ const CortexLogo = () => (
 
 // --- Types ---
 
-interface Biometrics {
-    heart_rate: number | null;
-    hrv_rmssd: number | null;
-    blink_rate: number | null;
-    forward_lean: number | null;
-}
-
-interface CortexState {
-    state: string;
-    confidence: number;
-    scores: Record<string, number>;
-    signal_quality: Record<string, number>;
-    dwell_seconds: number;
-    biometrics?: Biometrics;
-    // Phase-4 audit (F5/F16): the daemon stamps capture-pipeline and
-    // session-store health flags onto the STATE_UPDATE envelope. The
-    // popup mirrors them into the BPM/HRV status banner and the
-    // warning strip at the top of the panel.
-    capture?: {
-        frames_flowing?: boolean;
-        face_detected?: boolean;
-        stale?: boolean;
-    };
-    store?: {
-        degraded?: boolean;
-    };
-}
-
-interface FocusSnapshot {
-    elapsedMs: number;
-    focusMs: number;
-    focusPct: number;
-    distractionsBlocked: number;
-    longestStreakMin: number;
-    currentStreakMs: number;
-    goal: string;
-    // P0 §3.10 / Phase-3 P0-N? + Audit-1.2 F3: daemon-armed focus
-    // sessions carry an auto-arm flag + preset name so the popup
-    // surfaces a distinct "Auto-armed · developer" pill instead of
-    // the generic focus chip.
-    autoArmed?: boolean;
-    preset?: string;
-    endsAt?: number | null;
-}
-
-interface DailyStats {
-    date: string;
-    totalFocusMin: number;
-    totalSessionMin: number;
-    sessions: number;
-    distractionsBlocked: number;
-    longestStreakMin: number;
-}
-
 interface MorningBriefing {
     summary: string;
     action_items: string[];
     left_off_at: string;
 }
-
-/**
- * F52: synthesize close_tab actions from tab_recommendations *only*
- * for tab_index values not already covered by suggested_actions, and
- * type the action with the generated ``SuggestedAction["action_type"]``
- * literal union so a future Pydantic-side rename surfaces as a
- * compile error here (Debt-1).
- *
- * Previously two bugs:
- *   - If any suggested_action with a close intent existed, we skipped
- *     synthesis entirely — dropping the close affordance for any
- *     *other* recommended tab.
- *   - When no suggested_action close existed, we synthesised one per
- *     closeable rec, which could duplicate the close button when the
- *     LLM emitted a partial suggested_action AND a tab_recommendation
- *     for the same tab.
- *
- * The rule: if a suggested_action with the same `tab_index` already
- * exists, drop the synthesised action so the tab card alone carries
- * the close button.
- */
 
 /**
  * P0 §3.6: normalise the wire-format ``micro_steps`` payload into the
@@ -251,76 +198,6 @@ interface MorningBriefing {
  * however older daemons or future test fixtures may still ship the
  * raw ``string[]`` shape, so we accept both.
  */
-export function normaliseMicroSteps(
-    raw: unknown,
-): Array<{ text: string; status: "pending" | "done" | "skipped" }> {
-    if (!Array.isArray(raw)) return [];
-    const out: Array<{ text: string; status: "pending" | "done" | "skipped" }> = [];
-    for (const entry of raw) {
-        if (typeof entry === "string") {
-            if (entry.length > 0) out.push({ text: entry, status: "pending" });
-            continue;
-        }
-        if (entry && typeof entry === "object") {
-            const e = entry as Record<string, unknown>;
-            const text = typeof e.text === "string" ? e.text : "";
-            const rawStatus = typeof e.status === "string" ? e.status : "pending";
-            const status: "pending" | "done" | "skipped" =
-                rawStatus === "done" || rawStatus === "skipped" ? rawStatus : "pending";
-            if (text.length > 0) out.push({ text, status });
-        }
-    }
-    return out;
-}
-
-export function synthesizeActions(
-    actions: Record<string, unknown>[],
-    tabRecs: TabRecommendations | null,
-): Record<string, unknown>[] {
-    if (!tabRecs || !tabRecs.tabs || tabRecs.tabs.length === 0) return actions;
-    const closeable = tabRecs.tabs.filter(
-        (t: TabRecommendation) =>
-            t.action === "close" || t.action === "bookmark_and_close"
-    );
-    if (closeable.length === 0) return actions;
-
-    // Collect tab_index values already represented by an existing
-    // close-style suggested_action.
-    const coveredIndices = new Set<number>();
-    for (const a of actions) {
-        const at = a.action_type;
-        if (at !== "close_tab" && at !== "bookmark_and_close") continue;
-        const ti = typeof a.tab_index === "number" ? a.tab_index : Number(a.tab_index);
-        if (Number.isFinite(ti)) coveredIndices.add(ti);
-    }
-
-    const synthesised: Record<string, unknown>[] = [];
-    for (let i = 0; i < closeable.length; i++) {
-        const t = closeable[i];
-        const ti = typeof t.tab_index === "number" ? t.tab_index : Number(t.tab_index);
-        if (!Number.isFinite(ti)) continue;
-        if (coveredIndices.has(ti)) continue; // dedup: card already has close
-        // Narrow the inferred action_type to the generated literal union
-        // so a future rename in the Pydantic catalog surfaces here at
-        // compile time (Debt-1).
-        const action_type: SuggestedAction["action_type"] =
-            t.action === "bookmark_and_close" ? "bookmark_and_close" : "close_tab";
-        synthesised.push({
-            action_id: `synth_${Date.now()}_${i}`,
-            action_type,
-            tab_index: ti,
-            target: "",
-            label: `Close ${t.tab_title || "tab"}`,
-            reason: t.reason || "",
-            category: "recommended" as SuggestedAction["category"],
-            reversible: true,
-            metadata: {},
-        });
-    }
-    if (synthesised.length === 0) return actions;
-    return [...actions, ...synthesised];
-}
-
 // --- State dot animation helper ---
 
 function getStateDotStyle(stateStr: string, stateColor: string): React.CSSProperties {
@@ -334,9 +211,9 @@ function getStateDotStyle(stateStr: string, stateColor: string): React.CSSProper
 
     switch (stateStr) {
         case "FLOW":
-            return { ...base, animation: "cxPulse 2s ease-in-out infinite" };
+            return { ...base, animation: `cxPulse 2s ${CX.easeInOut} infinite` };
         case "HYPO":
-            return { ...base, animation: "cxFadeSlow 4s ease-in-out infinite" };
+            return { ...base, animation: `cxFadeSlow 4s ${CX.easeInOut} infinite` };
         case "HYPER":
             // No animation, no glow — student is already overwhelmed
             return base;
@@ -358,35 +235,6 @@ function getStateDotStyle(stateStr: string, stateColor: string): React.CSSProper
  * disambiguates the failure modes so each can carry its own
  * diagnostic and fix-action button. `ok` is the happy path.
  */
-export type ConnectivityState =
-    | "ok"
-    | "not_installed"
-    | "installed_no_daemon"
-    | "installed_version_mismatch"
-    | "handshake_failed";
-
-export function classifyConnectivity(input: {
-    connected: boolean;
-    nativeHostStatus: "present" | "missing" | "unknown";
-    daemonVersion: string | null;
-    expectedVersion: string;
-    handshakeError: string | null;
-}): ConnectivityState {
-    if (input.connected && input.handshakeError) return "handshake_failed";
-    if (input.connected) {
-        if (
-            input.daemonVersion &&
-            input.expectedVersion &&
-            input.daemonVersion !== input.expectedVersion
-        ) {
-            return "installed_version_mismatch";
-        }
-        return "ok";
-    }
-    if (input.nativeHostStatus === "missing") return "not_installed";
-    return "installed_no_daemon";
-}
-
 // --- "Last 7 days" sparkbar strip (P0 §3.2) ---
 
 /**
@@ -699,9 +547,17 @@ function CortexPopup(): React.ReactElement {
     const [goalInput, setGoalInput] = useState("");
     const [alert, setAlert] = useState<{ title: string; body: string } | null>(null);
     const [activeActions, setActiveActions] = useState<Record<string, unknown>[]>([]);
+    const [presentedManifest, setPresentedManifest] = useState<{
+        interventionId: string;
+        status: "pending" | "verified" | "invalid";
+        executableActionIds: string[];
+    } | null>(null);
     const [tabRecs, setTabRecs] = useState<TabRecommendations | null>(null);
     const [errAnalysis, setErrAnalysis] = useState<Record<string, string> | null>(null);
     const [interventionId, setInterventionId] = useState<string>("");
+    const [executionMode, setExecutionMode] = useState<ExecutionMode>(
+        "suggest_only",
+    );
     const [applied, setApplied] = useState(false);
     // P1-FC-INTERVENTION-FAILED: when the daemon reports that an
     // intervention's mutations ALL failed (workspace NOT changed), the
@@ -738,6 +594,11 @@ function CortexPopup(): React.ReactElement {
     // ``useState`` only for the initial-paint value; the useEffect
     // below replaces it with a tick-on-every-second update.
     const [quietModeDurationMin, setQuietModeDurationMin] = useState<number | null>(null);
+    const [siteAccess, setSiteAccess] = useState<
+        "checking" | "granted" | "denied" | "unavailable" | "busy"
+    >("checking");
+    const [siteAccessOrigin, setSiteAccessOrigin] = useState<string | null>(null);
+    const [siteAccessError, setSiteAccessError] = useState("");
     useEffect(() => {
         // F8 (Phase-4 audit): include ``quietMode`` in the dep array so
         // the interval restarts (and the tick re-evaluates) when the
@@ -791,17 +652,6 @@ function CortexPopup(): React.ReactElement {
     // a blank panel when the daemon returns ``error="not_found"`` or
     // similar. Reset on each new INTERVENTION_TRIGGER.
     const [whyError, setWhyError] = useState<string | null>(null);
-    // P0 §3.7: BREAK_RECOMMENDATION pulse from the daemon. When set we
-    // render a soft pill above the intervention card with a one-click
-    // "Take a 4-minute break" CTA.
-    const [breakRec, setBreakRec] = useState<{
-        reason: string;
-        urgency: "low" | "medium" | "high";
-        stress_load: number;
-        threshold: number;
-        duration_seconds: number;
-        breathing_pattern: "box" | "4-7-8" | "coherent";
-    } | null>(null);
     // P0 §3.3: end-of-session recap card. ``recap`` is the cached
     // SessionReport; ``recapTimestamp`` is when the background script
     // wrote it. ``historyStatus`` carries the response from
@@ -822,6 +672,56 @@ function CortexPopup(): React.ReactElement {
         "idle" | "submitting" | "saved" | "queued" | "error"
     >("idle");
     const [bugReportError, setBugReportError] = useState<string>("");
+    const bugDialogRef = useRef<HTMLDivElement>(null);
+    const bugTextareaRef = useRef<HTMLTextAreaElement>(null);
+
+    const closeBugReport = useCallback(() => {
+        setBugReportOpen(false);
+        setBugReportStatus("idle");
+        setBugReportError("");
+    }, []);
+
+    // Keep the privacy-sensitive report sheet keyboard-contained. Escape
+    // dismisses, Tab wraps inside the sheet, and closing restores the control
+    // that opened it instead of dropping focus at the document root.
+    useEffect(() => {
+        if (!bugReportOpen) return;
+        const previousFocus = document.activeElement instanceof HTMLElement
+            ? document.activeElement
+            : null;
+        const focusFrame = window.requestAnimationFrame(() => {
+            bugTextareaRef.current?.focus({ preventScroll: true });
+        });
+        const handleKeydown = (event: KeyboardEvent) => {
+            if (event.key === "Escape") {
+                event.preventDefault();
+                closeBugReport();
+                return;
+            }
+            if (event.key !== "Tab" || !bugDialogRef.current) return;
+            const focusable = Array.from(
+                bugDialogRef.current.querySelectorAll<HTMLElement>(
+                    'button:not([disabled]), textarea:not([disabled]), input:not([disabled])',
+                ),
+            );
+            if (focusable.length === 0) return;
+            const first = focusable[0];
+            const last = focusable[focusable.length - 1];
+            if (event.shiftKey && document.activeElement === first) {
+                event.preventDefault();
+                last.focus();
+            } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault();
+                first.focus();
+            }
+        };
+        document.addEventListener("keydown", handleKeydown);
+        return () => {
+            window.cancelAnimationFrame(focusFrame);
+            document.removeEventListener("keydown", handleKeydown);
+            previousFocus?.focus({ preventScroll: true });
+        };
+    }, [bugReportOpen, closeBugReport]);
 
     // F21 (Phase-4 audit / §3.15 follow-up): poll the daemon's
     // /api/cost endpoint every 30s while the popup is open. The
@@ -882,35 +782,122 @@ function CortexPopup(): React.ReactElement {
                 outline: 2px solid ${CX.accent};
                 outline-offset: 2px;
             }
-            /* Primary button — hover / active / keyboard focus */
-            .cortex-primary-btn:hover:not(:disabled) {
-                opacity: 0.85;
+            button:not(:disabled) {
+                transition: transform 120ms ${CX.easeOut},
+                    background-color 120ms ${CX.easeOut},
+                    border-color 120ms ${CX.easeOut},
+                    color 120ms ${CX.easeOut},
+                    opacity 120ms ${CX.easeOut},
+                    box-shadow 120ms ${CX.easeOut} !important;
             }
+            button:active:not(:disabled) {
+                transform: scale(0.97);
+            }
+            button:focus-visible {
+                outline: 2px solid ${CX.accent};
+                outline-offset: 2px;
+            }
+            /* Primary button — active / keyboard focus */
             .cortex-primary-btn:active:not(:disabled) {
-                opacity: 0.72;
-                transform: scale(0.985);
+                box-shadow: inset 0 0 0 1px rgba(17, 17, 17, 0.24);
+                transform: scale(0.97);
             }
             .cortex-primary-btn:focus-visible {
                 outline: 2px solid ${CX.accent};
                 outline-offset: 2px;
             }
-            /* Ghost button — hover / active / keyboard focus */
-            .cortex-ghost-btn:hover:not(:disabled) {
-                background: ${CX.accentDim};
-                border-color: ${CX.borderEmphasis};
-            }
+            /* Ghost button — active / keyboard focus */
             .cortex-ghost-btn:active:not(:disabled) {
                 background: rgba(217, 119, 87, 0.20);
-                transform: scale(0.985);
+                transform: scale(0.97);
             }
             .cortex-ghost-btn:focus-visible {
                 outline: 2px solid ${CX.accent};
                 outline-offset: 2px;
             }
+            .cortex-progress-motion {
+                transform-origin: left center;
+            }
+            @media (hover: hover) and (pointer: fine) {
+                .cortex-primary-btn:hover:not(:disabled) {
+                    box-shadow: inset 0 0 0 1px rgba(17, 17, 17, 0.16),
+                        0 2px 8px rgba(17, 17, 17, 0.10);
+                }
+                .cortex-ghost-btn:hover:not(:disabled) {
+                    background: ${CX.accentDim};
+                    border-color: ${CX.borderEmphasis};
+                }
+            }
+            @media (prefers-reduced-motion: reduce) {
+                button:not(:disabled) {
+                    transition-property: background-color, border-color, color, opacity !important;
+                }
+                button:active:not(:disabled) {
+                    transform: none;
+                }
+                .cortex-progress-motion {
+                    transition: none !important;
+                }
+            }
         `;
         document.head.appendChild(style);
         return () => { style.remove(); };
     }, []);
+
+    useEffect(() => {
+        let active = true;
+        void getSiteAccessState().then((result) => {
+            if (!active) return;
+            setSiteAccessOrigin(result.origin);
+            setSiteAccess(
+                !result.available
+                    ? "unavailable"
+                    : result.granted
+                    ? "granted"
+                    : "denied",
+            );
+        });
+        return () => { active = false; };
+    }, []);
+
+    const handleSiteAccess = useCallback(async () => {
+        if (
+            siteAccess === "busy"
+            || siteAccess === "checking"
+            || siteAccess === "unavailable"
+            || !siteAccessOrigin
+        ) return;
+        const wasGranted = siteAccess === "granted";
+        setSiteAccess("busy");
+        setSiteAccessError("");
+        try {
+            const changed = wasGranted
+                ? await revokeSiteAccess(siteAccessOrigin)
+                : await requestSiteAccess(siteAccessOrigin);
+            const current = await getSiteAccessState();
+            setSiteAccessOrigin(current.origin);
+            setSiteAccess(
+                !current.available
+                    ? "unavailable"
+                    : current.granted
+                    ? "granted"
+                    : "denied",
+            );
+            if (!changed && current.granted === wasGranted) {
+                setSiteAccessError(
+                    wasGranted
+                        ? "Chrome could not revoke site access."
+                        : "Site access was not granted.",
+                );
+            }
+            if (wasGranted && !current.granted) {
+                safeSendMessage({ type: "SITE_ACCESS_REVOKED" });
+            }
+        } catch {
+            setSiteAccess(wasGranted ? "granted" : "denied");
+            setSiteAccessError("Chrome could not update site access.");
+        }
+    }, [siteAccess, siteAccessOrigin]);
 
     // Load tab-close and quiet-mode toggle states on mount
     useEffect(() => {
@@ -935,7 +922,9 @@ function CortexPopup(): React.ReactElement {
                     const kind = cached.kind as string;
                     setQuietModeKind(kind);
                     setQuietMode(kind !== "off");
-                    if (typeof cached.ends_at === "number") {
+                    if (typeof cached.ends_at_unix_ms === "number") {
+                        setQuietModeEndsAt(cached.ends_at_unix_ms / 1000);
+                    } else if (typeof cached.ends_at === "number") {
                         setQuietModeEndsAt(cached.ends_at as number);
                     }
                     if (typeof cached.duration_minutes === "number") {
@@ -1038,12 +1027,30 @@ function CortexPopup(): React.ReactElement {
             setFocus(resp.focusSession);
             if (resp.intervention) {
                 const p = resp.intervention;
+                setExecutionMode(parseExecutionMode(p.execution_mode));
                 const rawActions = (p.suggested_actions as Record<string, unknown>[]) || [];
                 const recs = (p.tab_recommendations as TabRecommendations | undefined) ?? null;
-                setActiveActions(synthesizeActions(rawActions, recs));
+                setActiveActions(rawActions);
                 setTabRecs(recs);
                 setErrAnalysis((p.error_analysis as Record<string, string>) || null);
-                setInterventionId(String(p.intervention_id || ""));
+                const incomingInterventionId = String(p.intervention_id || "");
+                setInterventionId(incomingInterventionId);
+                setPresentedManifest({
+                    interventionId: incomingInterventionId,
+                    status: "pending",
+                    executableActionIds: [],
+                });
+                void verifiedPresentedActionIds(p, "browser")
+                    .then((ids) => setPresentedManifest({
+                        interventionId: incomingInterventionId,
+                        status: "verified",
+                        executableActionIds: ids,
+                    }))
+                    .catch(() => setPresentedManifest({
+                        interventionId: incomingInterventionId,
+                        status: "invalid",
+                        executableActionIds: [],
+                    }));
                 setMicroSteps(normaliseMicroSteps(p.micro_steps));
                 setApplied(false);
             }
@@ -1139,12 +1146,30 @@ function CortexPopup(): React.ReactElement {
                 break;
             case "INTERVENTION_TRIGGER": {
                 const p = msg.payload as Record<string, unknown>;
+                setExecutionMode(parseExecutionMode(p.execution_mode));
                 const rawActions = (p.suggested_actions as Record<string, unknown>[]) || [];
                 const recs = (p.tab_recommendations as TabRecommendations | undefined) ?? null;
-                setActiveActions(synthesizeActions(rawActions, recs));
+                setActiveActions(rawActions);
                 setTabRecs(recs);
                 setErrAnalysis((p.error_analysis as Record<string, string>) || null);
-                setInterventionId(String(p.intervention_id || ""));
+                const incomingInterventionId = String(p.intervention_id || "");
+                setInterventionId(incomingInterventionId);
+                setPresentedManifest({
+                    interventionId: incomingInterventionId,
+                    status: "pending",
+                    executableActionIds: [],
+                });
+                void verifiedPresentedActionIds(p, "browser")
+                    .then((ids) => setPresentedManifest({
+                        interventionId: incomingInterventionId,
+                        status: "verified",
+                        executableActionIds: ids,
+                    }))
+                    .catch(() => setPresentedManifest({
+                        interventionId: incomingInterventionId,
+                        status: "invalid",
+                        executableActionIds: [],
+                    }));
                 setCausalExplanation(String(p.causal_explanation || ""));
                 // P0 §3.8 audit fix (spec line 710): only show the
                 // rating row on guided_mode + simplified_workspace
@@ -1208,6 +1233,7 @@ function CortexPopup(): React.ReactElement {
             }
             case "INTERVENTION_RESTORE":
                 setActiveActions([]);
+                setPresentedManifest(null);
                 setTabRecs(null);
                 setErrAnalysis(null);
                 setCausalExplanation("");
@@ -1219,13 +1245,6 @@ function CortexPopup(): React.ReactElement {
                 setWhyOpen(false);
                 setWhyError(null);
                 setApplied(false);
-                // P0 §3.7 audit fix: when the underlying intervention
-                // ends (dismiss / engage / restore), the standalone
-                // BREAK_RECOMMENDATION pill must clear too. Without
-                // this, a stale pill from the prior intervention
-                // remained on screen and clicking its CTA dispatched
-                // EXECUTE_ACTION with a dangling intervention_id.
-                setBreakRec(null);
                 setInterventionError(null);
                 setInterventionPrompt(null);
                 break;
@@ -1262,26 +1281,8 @@ function CortexPopup(): React.ReactElement {
                 break;
             }
             case "BREAK_RECOMMENDATION": {
-                // P0 §3.7: BREAK_RECOMMENDATION pulse relayed from
-                // background.ts. Typed against the generated
-                // ``BreakRecommendationSchema`` so a future schema-rename
-                // produces a TS error instead of a silent fallthrough.
-                const p = msg.payload as Partial<BreakRecommendationSchema> & Record<string, unknown>;
-                setBreakRec({
-                    reason: String(p.reason ?? "stress_integral_crossed_threshold"),
-                    urgency:
-                        p.urgency === "high" || p.urgency === "low"
-                            ? (p.urgency as "low" | "high")
-                            : "medium",
-                    stress_load: Number(p.stress_load ?? 0),
-                    threshold: Number(p.threshold ?? 0),
-                    duration_seconds: Number(p.duration_seconds ?? 240),
-                    breathing_pattern:
-                        p.breathing_pattern === "4-7-8" ||
-                        p.breathing_pattern === "coherent"
-                            ? (p.breathing_pattern as "4-7-8" | "coherent")
-                            : "box",
-                });
+                // Compatibility-only message. Never render an unsupported
+                // HRV/stress claim, even if an older daemon emits one.
                 break;
             }
             case "WHY_DETAIL": {
@@ -1323,6 +1324,7 @@ function CortexPopup(): React.ReactElement {
             }
             case "SETTINGS_SYNC": {
                 const settings = msg.payload as Record<string, unknown>;
+                setExecutionMode(parseExecutionMode(settings.execution_mode));
                 if (typeof settings.quiet_mode === "boolean") {
                     setQuietMode(settings.quiet_mode);
                 }
@@ -1337,7 +1339,11 @@ function CortexPopup(): React.ReactElement {
                 setQuietModeKind(kind);
                 setQuietMode(kind !== "off");
                 setQuietModeEndsAt(
-                    typeof state.ends_at === "number" ? (state.ends_at as number) : null,
+                    typeof state.ends_at_unix_ms === "number"
+                        ? state.ends_at_unix_ms / 1000
+                        : typeof state.ends_at === "number"
+                            ? (state.ends_at as number)
+                            : null,
                 );
                 setQuietModeDurationMin(
                     typeof state.duration_minutes === "number"
@@ -1632,21 +1638,14 @@ function CortexPopup(): React.ReactElement {
         sendWithCid({ type: "STOP_FOCUS" });
     }, []);
 
-    // Derived
-    const stateStr = state?.state ?? "";
+    // Derived presentation models keep transport semantics out of the JSX.
+    const supportView = supportStateViewModel(state, connected, STATE_LABELS);
+    const estimateReady = state?.status === undefined || state.status === "estimated";
+    const stateStr = supportView.stateKey;
     const stateColor = STATE_COLORS[stateStr] || CX.textTertiary;
-    // ``Idle`` only when we've actually received a STATE_UPDATE whose
-    // ``state`` field is missing/unknown. Pre-first-frame (the WS has
-    // opened but the daemon hasn't broadcast yet because AUTH is still
-    // round-tripping the native host) shows ``Connecting…`` instead —
-    // ``Idle`` would mis-attribute the wait to the user being inactive.
-    const stateLabel = state
-        ? STATE_LABELS[stateStr] || "Idle"
-        : connected
-            ? "Connecting…"
-            : "Idle";
+    const stateTextColor = STATE_TEXT_COLORS[stateStr] || CX.textSecondary;
+    const stateLabel = supportView.label;
     const hr = state?.biometrics?.heart_rate;
-    const hrv = state?.biometrics?.hrv_rmssd;
     const blink = state?.biometrics?.blink_rate;
     // Capture-pipeline status mirrored from the daemon (set in
     // ``WebSocketServer._make_state_update``). Drives the
@@ -1658,20 +1657,9 @@ function CortexPopup(): React.ReactElement {
     // F5 (Phase-4 audit): ``capture`` is now part of the CortexState
     // interface, so no double cast is needed — TS narrows the optional
     // field directly.
-    const captureRaw = state?.capture;
-    const framesFlowing = captureRaw?.frames_flowing ?? true;
-    const faceDetected = captureRaw?.face_detected ?? true;
-    // F16: ``capture.stale`` and ``store.degraded`` are the two
-    // health-warning surfaces the daemon raises at the envelope level.
-    const captureStale = captureRaw?.stale === true;
-    const storeDegraded = state?.store?.degraded === true;
-    const bioStatusMessage = !state
-        ? "Connecting to daemon…"
-        : !framesFlowing
-            ? "Camera offline — open System Settings → Privacy & Security → Camera"
-            : !faceDetected
-                ? "Looking for your face…"
-                : "Reading your pulse…";
+    const captureStale = supportView.captureStale;
+    const storeDegraded = supportView.storeDegraded;
+    const bioStatusMessage = supportView.bioStatusMessage;
 
     const focusMin = focus ? Math.round(focus.focusMs / 60000) : 0;
     const elapsedMin = focus ? Math.round(focus.elapsedMs / 60000) : 0;
@@ -1685,6 +1673,25 @@ function CortexPopup(): React.ReactElement {
     const closeTabs = tabRecs?.tabs?.filter(t => t.action === "close" || t.action === "bookmark_and_close") || [];
     const keepTabs = tabRecs?.tabs?.filter(t => t.action === "keep") || [];
     const rec = activeActions.filter(a => a.category === "recommended");
+    const manifestForCurrent = presentedManifest?.interventionId === interventionId
+        ? presentedManifest
+        : null;
+    const executableIdSet = new Set(
+        manifestForCurrent?.status === "verified"
+            ? manifestForCurrent.executableActionIds
+            : [],
+    );
+    const executableRec = rec.filter((action) =>
+        typeof action.action_id === "string"
+        && executableIdSet.has(action.action_id)
+    );
+    const manualRec = rec.filter((action) =>
+        typeof action.action_id !== "string"
+        || !executableIdSet.has(action.action_id)
+    );
+    const canExecutePresented = executionMode !== "suggest_only"
+        && manifestForCurrent?.status === "verified"
+        && executableRec.length > 0;
 
     const visibleCloseTabs = tabsExpanded ? closeTabs : closeTabs.slice(0, 5);
     const overflowCount = tabsExpanded ? 0 : closeTabs.length - visibleCloseTabs.length;
@@ -1726,15 +1733,37 @@ function CortexPopup(): React.ReactElement {
         });
     };
 
+    const connectivityView = connectivityViewModel({
+        state: connectivity,
+        launching,
+        launchError,
+        launchStatus,
+        expectedVersion: EXPECTED_VERSION,
+        daemonVersion,
+        handshakeError,
+    });
+    const handleConnectivityAction = (): void => {
+        if (connectivityView.action === "install") {
+            void chrome.tabs.create({
+                url: chrome.runtime.getURL("tabs/onboarding.html"),
+            });
+        } else if (connectivityView.action === "handshake") {
+            sendWithCid({ type: "CONNECT" });
+        } else {
+            handleLaunchCortex();
+        }
+    };
+
     return (
         <div style={S.root}>
             {/* Alert toast — top-right, auto-dismiss 10s */}
             {alert && (
-                <div style={S.alertBox}>
+                <div className="cortex-motion-enter" style={S.alertBox}>
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
                         <div style={S.alertTitle}>{alert.title}</div>
                         <button
-                            style={{ background: "none", border: "none", color: CX.textTertiary, cursor: "pointer", fontSize: 13, padding: 0, fontFamily: CX.font, lineHeight: 1 }}
+                            aria-label="Dismiss health notification"
+                            style={S.iconButton}
                             onClick={() => setAlert(null)}
                         >{"\u00d7"}</button>
                     </div>
@@ -1749,11 +1778,16 @@ function CortexPopup(): React.ReactElement {
                     <span style={{ ...S.logoText, fontFamily: CX.fontBrand, fontStyle: "italic", letterSpacing: "0.02em" }}>Cortex.</span>
                 </div>
                 {!connected ? (
-                    <button style={S.connectBtn} onClick={handleConnect}>CONNECT</button>
+                    <button style={S.connectBtn} onClick={handleConnect}>Connect</button>
                 ) : (
                     <div style={S.statusRow} aria-live="polite">
-                        <div style={getStateDotStyle(stateStr, stateColor)} />
-                        <span style={{ ...S.statusLabel, color: stateColor }}>{stateLabel}</span>
+                        <div aria-hidden="true" style={getStateDotStyle(stateStr, stateColor)} />
+                        <span
+                            style={{ ...S.statusLabel, color: stateTextColor }}
+                            title={estimateReady && state?.evidence_coverage !== undefined
+                                ? `Evidence coverage ${Math.round(state.evidence_coverage * 100)}%`
+                                : "No actionable estimate yet"}
+                        >{stateLabel}</span>
                     </div>
                 )}
             </div>
@@ -1876,7 +1910,8 @@ function CortexPopup(): React.ReactElement {
                             <div style={S.briefingBody}>{briefing.summary}</div>
                         </div>
                         <button
-                            style={{ background: "none", border: "none", color: CX.textTertiary, cursor: "pointer", fontSize: 13, padding: 0, fontFamily: CX.font, lineHeight: 1, flexShrink: 0, marginLeft: 8 }}
+                            aria-label="Dismiss briefing"
+                            style={{ ...S.iconButton, marginLeft: 8 }}
                             onClick={() => setBriefing(null)}
                         >{"\u00d7"}</button>
                     </div>
@@ -1915,7 +1950,7 @@ function CortexPopup(): React.ReactElement {
                                 height: 8,
                                 borderRadius: "50%",
                                 background: CX.accent,
-                                animation: "cxPulse 1.5s ease-in-out infinite",
+                                animation: `cxPulse 1.5s ${CX.easeInOut} infinite`,
                             }} />
                         ) : (
                             <div style={{
@@ -1928,66 +1963,27 @@ function CortexPopup(): React.ReactElement {
                             }} />
                         )}
                     </div>
-                    {(() => {
-                        // F54: pick title/body/CTA per distinct connectivity state.
-                        let title: string;
-                        let body: string;
-                        let ctaLabel: string;
-                        let ctaHandler: () => void = handleLaunchCortex;
-                        let testId: string;
-                        if (launching) {
-                            title = "Starting Cortex";
-                            body = launchStatus || "Launching daemon\u2026";
-                            ctaLabel = "Starting\u2026";
-                            testId = "conn-state-launching";
-                        } else if (connectivity === "not_installed") {
-                            title = "Native host not installed";
-                            body = "Cortex needs its native messaging host registered. Run `python -m cortex.scripts.install_native_host` once, then relaunch your browser.";
-                            ctaLabel = "Open install instructions";
-                            ctaHandler = () => {
-                                chrome.tabs.create({ url: chrome.runtime.getURL("tabs/onboarding.html") });
-                            };
-                            testId = "conn-state-not_installed";
-                        } else if (connectivity === "installed_version_mismatch") {
-                            title = "Daemon version mismatch";
-                            body = `Extension expects v${EXPECTED_VERSION}; daemon is v${daemonVersion ?? "?"}. Update the daemon or downgrade the extension to match.`;
-                            ctaLabel = "Restart daemon";
-                            ctaHandler = handleLaunchCortex;
-                            testId = "conn-state-installed_version_mismatch";
-                        } else if (connectivity === "handshake_failed") {
-                            title = "Handshake failed";
-                            body = handshakeError || "The daemon answered but rejected this extension's handshake. Check the local auth token.";
-                            ctaLabel = "Retry handshake";
-                            ctaHandler = () => sendWithCid({ type: "CONNECT" });
-                            testId = "conn-state-handshake_failed";
-                        } else {
-                            // installed_no_daemon (default disconnect path)
-                            title = "Not connected";
-                            body = launchStatus || "Launch daemon with camera";
-                            ctaLabel = launchError ? "Retry" : "Start Cortex";
-                            testId = "conn-state-installed_no_daemon";
-                        }
-                        return (
-                            <>
-                                <div style={S.disconnectedTitle} data-testid={testId}>{title}</div>
-                                <div style={S.disconnectedBody}>{body}</div>
-                                <button
-                                    className="cortex-primary-btn"
-                                    style={{
-                                        ...S.primaryBtn,
-                                        marginTop: 16,
-                                        opacity: launching ? 0.5 : 1,
-                                        pointerEvents: launching ? "none" as const : "auto" as const,
-                                        maxWidth: 240,
-                                    }}
-                                    onClick={ctaHandler}
-                                    disabled={launching}
-                                >
-                                    {ctaLabel}
-                                </button>
-                            </>
-                        );
-                    })()}
+                    <div
+                        style={S.disconnectedTitle}
+                        data-testid={connectivityView.testId}
+                    >
+                        {connectivityView.title}
+                    </div>
+                    <div style={S.disconnectedBody}>{connectivityView.body}</div>
+                    <button
+                        className="cortex-primary-btn"
+                        style={{
+                            ...S.primaryBtn,
+                            marginTop: 16,
+                            opacity: connectivityView.disabled ? 0.5 : 1,
+                            pointerEvents: connectivityView.disabled ? "none" : "auto",
+                            maxWidth: 240,
+                        }}
+                        onClick={handleConnectivityAction}
+                        disabled={connectivityView.disabled}
+                    >
+                        {connectivityView.ctaLabel}
+                    </button>
                     {launchError && launchStatus && (
                         <div style={{
                             fontSize: 10,
@@ -2012,6 +2008,7 @@ function CortexPopup(): React.ReactElement {
                         className="cortex-goal-input"
                         style={S.goalInput}
                         placeholder="What are you working on?"
+                        aria-label="Focus goal"
                         value={goalInput}
                         // F15 (Phase-4 audit): cap at 500 chars so the
                         // text never breaches the daemon's GoalSet
@@ -2031,7 +2028,7 @@ function CortexPopup(): React.ReactElement {
                 <div style={{ ...S.sessionCard, position: "sticky" as const, top: 0, zIndex: 10 }}>
                     {/* First row: "Study session · Xm" + End */}
                     <div style={S.focusHeader}>
-                        <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+                        <div style={{ display: "flex", alignItems: "baseline", gap: 6, minWidth: 0 }}>
                             <span style={S.focusTitle}>{focus.goal}</span>
                             <span style={S.focusDuration}>{"\u00b7"} {elapsedMin}m</span>
                         </div>
@@ -2050,7 +2047,7 @@ function CortexPopup(): React.ReactElement {
                                 fontSize: 11,
                                 fontFamily: CX.font,
                                 fontWeight: 500,
-                                color: CX.accent,
+                                color: CX.accentText,
                                 background: "rgba(217,119,87,0.16)",
                                 border: "1px solid rgba(217,119,87,0.36)",
                                 borderRadius: CX.radiusMd,
@@ -2073,14 +2070,13 @@ function CortexPopup(): React.ReactElement {
                         <span style={{ ...S.bigNum, color: stateColor }}>{focusMin}</span>
                         <span style={S.bigPct}>{focus.focusPct}%</span>
                     </div>
-                    <div style={S.bigLabel}>min focused</div>
+                    <div style={S.bigLabel}>min steady activity</div>
 
                     {/* Progress bar — 6px tall */}
                     <div style={S.trackOuter}>
-                        <div style={{
+                        <div className="cortex-progress-motion" style={{
                             ...S.trackFill,
-                            width: `${Math.max(Math.min(focus.focusPct, 100), 0)}%`,
-                            minWidth: 6,
+                            transform: `scaleX(${Math.max(Math.min(focus.focusPct, 100), 0) / 100})`,
                             background: stateColor,
                         }} />
                     </div>
@@ -2103,80 +2099,6 @@ function CortexPopup(): React.ReactElement {
                 </div>
             )}
 
-            {/* P0 §3.7: BREAK_RECOMMENDATION pill. Surfaces above the
-                intervention card whenever the daemon's stress integral
-                crosses threshold. Single CTA dispatches the bound
-                ``take_biology_break`` action through the EXECUTE_ACTION
-                channel. */}
-            {breakRec && (
-                <div
-                    data-testid="break-recommendation-pill"
-                    style={{
-                        background: "rgba(217, 119, 87, 0.10)",
-                        border: `1px solid ${CX.accent}55`,
-                        borderRadius: CX.radiusMd,
-                        padding: "10px 12px",
-                        marginBottom: 10,
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 10,
-                        fontFamily: CX.font,
-                    }}
-                >
-                    <div style={{ flex: 1, fontSize: 12, color: CX.text }}>
-                        Your HRV has been suppressed — take a {Math.round(breakRec.duration_seconds / 60)}-minute break?
-                    </div>
-                    <button
-                        style={{
-                            padding: "6px 12px",
-                            border: "none",
-                            borderRadius: CX.radiusSm,
-                            background: CX.accent,
-                            color: "white",
-                            fontSize: 11,
-                            fontWeight: 600,
-                            cursor: "pointer",
-                            fontFamily: CX.font,
-                        }}
-                        data-testid="break-recommendation-cta"
-                        onClick={() => {
-                            safeSendMessage({
-                                type: "EXECUTE_ACTION",
-                                action: {
-                                    action_id: `bk_${Date.now()}`,
-                                    action_type: "take_biology_break",
-                                    label: "Take a break",
-                                    target: "",
-                                    metadata: {
-                                        duration_seconds: breakRec.duration_seconds,
-                                        breathing_pattern: breakRec.breathing_pattern,
-                                        audio_cue: true,
-                                        reason: breakRec.reason,
-                                    },
-                                },
-                                intervention_id: interventionId || `break_${Date.now()}`,
-                            });
-                            setBreakRec(null);
-                        }}
-                    >
-                        Take {Math.round(breakRec.duration_seconds / 60)} min
-                    </button>
-                    <button
-                        aria-label="Dismiss break recommendation"
-                        style={{
-                            border: "none",
-                            background: "transparent",
-                            color: CX.textSecondary,
-                            cursor: "pointer",
-                            fontSize: 14,
-                        }}
-                        onClick={() => setBreakRec(null)}
-                    >
-                        {"×"}
-                    </button>
-                </div>
-            )}
-
             {/* Intervention preview */}
             {hasIntervention && (
                 <div style={S.interventionCard}>
@@ -2195,7 +2117,7 @@ function CortexPopup(): React.ReactElement {
                                 background: "rgba(228, 122, 110, 0.12)",
                                 border: "1px solid rgba(228, 122, 110, 0.4)",
                                 borderRadius: CX.radiusSm,
-                                color: "#E47A6E",
+                                color: CX.danger,
                                 fontSize: 12,
                                 fontFamily: CX.font,
                                 lineHeight: 1.4,
@@ -2215,7 +2137,7 @@ function CortexPopup(): React.ReactElement {
                             style={{
                                 marginBottom: 12,
                                 padding: "8px 10px",
-                                background: "rgba(255, 255, 255, 0.04)",
+                                background: CX.tertiary,
                                 borderRadius: CX.radiusSm,
                                 color: CX.textSecondary,
                                 fontSize: 12,
@@ -2272,7 +2194,7 @@ function CortexPopup(): React.ReactElement {
                                     style={{
                                         marginTop: 6,
                                         padding: "6px 10px",
-                                        background: "rgba(255, 255, 255, 0.03)",
+                                        background: CX.tertiary,
                                         borderRadius: CX.radiusSm,
                                         color: CX.textSecondary,
                                         fontSize: 10,
@@ -2288,7 +2210,7 @@ function CortexPopup(): React.ReactElement {
                                     style={{
                                         marginTop: 6,
                                         padding: "8px 10px",
-                                        background: "rgba(255, 255, 255, 0.03)",
+                                        background: CX.tertiary,
                                         borderRadius: CX.radiusSm,
                                     }}
                                     data-testid="why-rows"
@@ -2329,7 +2251,7 @@ function CortexPopup(): React.ReactElement {
                                                 {delta != null && (
                                                     <span
                                                         style={{
-                                                            color: delta < 0 ? "#E47A6E" : CX.accent,
+                                                            color: delta < 0 ? CX.danger : CX.accentText,
                                                             fontWeight: 600,
                                                             fontSize: 10,
                                                         }}
@@ -2389,26 +2311,50 @@ function CortexPopup(): React.ReactElement {
 
                     {visibleCloseTabs.length > 0 && (
                         <div style={{ marginBottom: 12 }}>
+                            <div
+                                style={{
+                                    color: CX.textSecondary,
+                                    fontFamily: CX.font,
+                                    fontSize: 10,
+                                    fontWeight: 600,
+                                    letterSpacing: "0.02em",
+                                    marginBottom: 6,
+                                }}
+                            >
+                                Manual tab review
+                            </div>
                             {visibleCloseTabs.map((t, i) => {
                                 const title = String(t.tab_title || "Untitled");
                                 const rawReason = String(t.reason || "");
                                 const reason = genericReasonPhrases.some(p => rawReason.toLowerCase().includes(p)) ? "" : rawReason;
                                 return (
                                     <div key={`c${i}`} style={S.tabRow}>
-                                        <span style={S.tabXMark}>{"\u2715"}</span>
+                                        <span style={{ ...S.tabXMark, color: CX.textTertiary }}>{"\u00b7"}</span>
                                         <span style={S.tabName}>{title}</span>
                                     </div>
                                 );
                             })}
                             {overflowCount > 0 && (
                                 <button
-                                    style={{ fontSize: 10, color: CX.accent, marginTop: 4, background: "none", border: "none", cursor: "pointer", padding: 0, fontFamily: CX.font }}
+                                    style={{ fontSize: 10, color: CX.accentText, marginTop: 4, background: "none", border: "none", cursor: "pointer", padding: 0, fontFamily: CX.font }}
                                     onClick={() => setTabsExpanded(true)}
                                 >+{overflowCount} more</button>
                             )}
                             {keepTabs.length > 0 && (
                                 <div style={S.keepLine}>Keeping {keepTabs.length} you need</div>
                             )}
+                            <div
+                                data-testid="manual-tab-review-note"
+                                style={{
+                                    color: CX.textTertiary,
+                                    fontFamily: CX.font,
+                                    fontSize: 10,
+                                    lineHeight: 1.45,
+                                    marginTop: 7,
+                                }}
+                            >
+                                Cortex won’t close or regroup existing tabs automatically.
+                            </div>
                         </div>
                     )}
 
@@ -2429,6 +2375,22 @@ function CortexPopup(): React.ReactElement {
                                     <span style={{ ...S.tabName, color: CX.text }}>{String(a.label || "")}</span>
                                 </div>
                             ))}
+                            {manualRec.length > 0 && (
+                                <div
+                                    data-testid="manual-action-review-note"
+                                    style={{
+                                        color: CX.textTertiary,
+                                        fontFamily: CX.font,
+                                        fontSize: 10,
+                                        lineHeight: 1.45,
+                                        marginTop: 7,
+                                    }}
+                                >
+                                    {executableRec.length > 0
+                                        ? "Other items are guidance for manual review."
+                                        : "Manual review only — no workspace change will run."}
+                                </div>
+                            )}
                         </div>
                     )}
 
@@ -2436,18 +2398,29 @@ function CortexPopup(): React.ReactElement {
                     {rec.length > 0 && (
                         <>
                             <button
+                                data-testid="intervention-primary-action"
                                 className="cortex-primary-btn"
                                 style={
-                                    applied || interventionError
+                                    applied || interventionError || !canExecutePresented
                                         ? { ...S.primaryBtn, ...S.doneBtnStyle }
                                         : S.primaryBtn
                                 }
-                                disabled={applied || interventionError !== null}
+                                aria-disabled={
+                                    applied
+                                    || interventionError !== null
+                                    || !canExecutePresented
+                                }
+                                disabled={
+                                    applied
+                                    || interventionError !== null
+                                    || !canExecutePresented
+                                }
                                 onClick={() => {
+                                    if (!canExecutePresented) return;
                                     sendWithCid(
                                         {
                                             type: "EXECUTE_ALL_RECOMMENDED",
-                                            actions: rec,
+                                            actions: executableRec,
                                             intervention_id: interventionId,
                                         },
                                         (raw: unknown) => {
@@ -2457,6 +2430,7 @@ function CortexPopup(): React.ReactElement {
                                                 setApplied(true);
                                                 setTimeout(() => {
                                                     setActiveActions([]);
+                                                    setPresentedManifest(null);
                                                     setTabRecs(null);
                                                     setErrAnalysis(null);
                                                     setApplied(false);
@@ -2470,13 +2444,23 @@ function CortexPopup(): React.ReactElement {
                             >
                                 {interventionError
                                     ? "Couldn't apply"
+                                    : executionMode === "suggest_only"
+                                    ? "Suggestions only"
+                                    : manifestForCurrent?.status === "pending"
+                                    ? "Checking actions…"
+                                    : !canExecutePresented
+                                    ? "Manual review only"
                                     : applied
                                     ? "Done"
-                                    : closeTabs.length > 0
-                                        ? `Close ${closeTabs.length} tab${closeTabs.length !== 1 ? "s" : ""}`
-                                        : errAnalysis
-                                            ? "Help me fix this"
-                                            : `Apply ${rec.length} change${rec.length !== 1 ? "s" : ""}`}
+                                    : executableRec.length === 1
+                                        ? String(executableRec[0].action_type || "") === "search_error"
+                                            ? "Search this error"
+                                            : String(executableRec[0].action_type || "") === "open_url"
+                                                ? "Open recommended page"
+                                                : String(executableRec[0].action_type || "") === "highlight_tab"
+                                                    ? "Switch to recommended tab"
+                                                    : "Apply change"
+                                        : `Apply ${executableRec.length} changes`}
                             </button>
                             {applied && (
                                 <div style={S.undoRow}>
@@ -2532,11 +2516,13 @@ function CortexPopup(): React.ReactElement {
                                 style={{
                                     background: rating === "thumbs_up"
                                         ? CX.accent
-                                        : "rgba(255,255,255,0.06)",
+                                        : CX.tertiary,
                                     color: rating === "thumbs_up"
-                                        ? "white"
+                                        ? CX.text
                                         : CX.textSecondary,
-                                    border: "none",
+                                    border: `1px solid ${rating === "thumbs_up"
+                                        ? CX.accent
+                                        : CX.borderDefault}`,
                                     borderRadius: CX.radiusSm,
                                     padding: "6px 12px",
                                     cursor: "pointer",
@@ -2561,12 +2547,14 @@ function CortexPopup(): React.ReactElement {
                                 }}
                                 style={{
                                     background: rating === "thumbs_down"
-                                        ? "#E47A6E"
-                                        : "rgba(255,255,255,0.06)",
+                                        ? CX.dangerDim
+                                        : CX.tertiary,
                                     color: rating === "thumbs_down"
-                                        ? "white"
+                                        ? CX.danger
                                         : CX.textSecondary,
-                                    border: "none",
+                                    border: `1px solid ${rating === "thumbs_down"
+                                        ? CX.danger
+                                        : CX.borderDefault}`,
                                     borderRadius: CX.radiusSm,
                                     padding: "6px 12px",
                                     cursor: "pointer",
@@ -2608,9 +2596,9 @@ function CortexPopup(): React.ReactElement {
                                 width: "100%",
                                 padding: "6px 10px",
                                 fontSize: 11,
-                                background: "rgba(255,255,255,0.04)",
+                                background: CX.tertiary,
                                 color: CX.text,
-                                border: `1px solid ${CX.accent}55`,
+                                border: `1px solid ${CX.accent}`,
                                 borderRadius: CX.radiusSm,
                                 fontFamily: CX.font,
                                 boxSizing: "border-box",
@@ -2626,10 +2614,6 @@ function CortexPopup(): React.ReactElement {
                     <div style={S.bioCol}>
                         <span style={{ ...S.bioLabel, color: `${CX.bioHr}80` }}>BPM</span>
                         <span style={S.bioVal} aria-label={`${Math.round(hr)} beats per minute`}>{Math.round(hr)}</span>
-                    </div>
-                    <div style={S.bioCol}>
-                        <span style={{ ...S.bioLabel, color: `${CX.bioHrv}80` }}>HRV</span>
-                        <span style={S.bioVal} aria-label={hrv ? `${Math.round(hrv)} milliseconds heart rate variability` : "no HRV data"}>{hrv ? `${Math.round(hrv)}ms` : "\u2014"}</span>
                     </div>
                     <div style={S.bioCol}>
                         <span style={{ ...S.bioLabel, color: `${CX.bioBlink}80` }}>BLK</span>
@@ -2654,9 +2638,13 @@ function CortexPopup(): React.ReactElement {
                     <button
                         style={{
                             ...S.toggleTrack,
-                            background: tabCloseDisabled ? "rgba(255, 255, 255, 0.04)" : CX.accent,
+                            background: tabCloseDisabled
+                                ? "rgba(60, 60, 67, 0.24)"
+                                : CX.accent,
                         }}
                         onClick={handleTabCloseToggle}
+                        role="switch"
+                        aria-checked={!tabCloseDisabled}
                         aria-label={tabCloseDisabled ? "Enable tab closing" : "Disable tab closing"}
                     >
                         <div style={{
@@ -2671,15 +2659,66 @@ function CortexPopup(): React.ReactElement {
                     <button
                         style={{
                             ...S.toggleTrack,
-                            background: quietMode ? CX.accent : "rgba(255, 255, 255, 0.04)",
+                            background: quietMode
+                                ? CX.accent
+                                : "rgba(60, 60, 67, 0.24)",
                         }}
                         onClick={handleQuietModeToggle}
+                        role="switch"
+                        aria-checked={quietMode}
                         aria-label={quietMode ? "Disable quiet mode" : "Enable quiet mode"}
                     >
                         <div style={{
                             ...S.toggleThumb,
                             transform: quietMode ? "translateX(16px)" : "translateX(0)",
                         }} />
+                    </button>
+                </div>
+
+                <div style={S.siteAccessRow}>
+                    <div style={{ minWidth: 0, paddingRight: 12 }}>
+                        <div style={S.toggleLabel}>Page context</div>
+                        <div style={S.siteAccessDetail}>
+                            {siteAccess === "granted"
+                                ? "Body text allowed for this site · never incognito"
+                                : siteAccess === "unavailable"
+                                ? "Unavailable on this page"
+                                : "Off for this site · page body stays out of context"}
+                        </div>
+                        {siteAccessError && (
+                            <div role="status" style={S.siteAccessError}>
+                                {siteAccessError}
+                            </div>
+                        )}
+                    </div>
+                    <button
+                        className="cortex-ghost-btn"
+                        data-testid="site-access-button"
+                        style={{
+                            ...S.siteAccessButton,
+                            opacity: siteAccess === "busy"
+                                || siteAccess === "checking"
+                                || siteAccess === "unavailable"
+                                ? 0.55
+                                : 1,
+                        }}
+                        disabled={siteAccess === "busy"
+                            || siteAccess === "checking"
+                            || siteAccess === "unavailable"}
+                        onClick={() => { void handleSiteAccess(); }}
+                        aria-label={siteAccess === "granted"
+                            ? "Revoke Cortex page context access"
+                            : "Allow Cortex page context access"}
+                    >
+                        {siteAccess === "checking"
+                            ? "Checking"
+                            : siteAccess === "busy"
+                            ? "Updating"
+                            : siteAccess === "unavailable"
+                            ? "Unavailable"
+                            : siteAccess === "granted"
+                            ? "Revoke"
+                            : "Allow"}
                     </button>
                 </div>
 
@@ -2714,13 +2753,13 @@ function CortexPopup(): React.ReactElement {
                                     fontSize: 11,
                                     fontFamily: CX.font,
                                     fontWeight: 500,
-                                    color: active ? CX.accent : "rgba(255,255,255,0.72)",
+                                    color: active ? CX.accentText : CX.textSecondary,
                                     background: active
-                                        ? "rgba(217,119,87,0.16)"
-                                        : "rgba(255,255,255,0.04)",
+                                        ? CX.accentDim
+                                        : CX.tertiary,
                                     border: active
                                         ? `1px solid ${CX.accent}`
-                                        : "1px solid rgba(255,255,255,0.06)",
+                                        : `1px solid ${CX.borderDefault}`,
                                     borderRadius: CX.radiusMd,
                                     cursor: "pointer",
                                     transition: `background ${CX.durationFast} ${CX.easeDefault}`,
@@ -2737,7 +2776,7 @@ function CortexPopup(): React.ReactElement {
                         style={{
                             marginTop: 8,
                             fontSize: 11,
-                            color: CX.accent,
+                            color: CX.accentText,
                             fontFamily: CX.font,
                         }}
                     >
@@ -2753,7 +2792,7 @@ function CortexPopup(): React.ReactElement {
                                 marginLeft: 10,
                                 background: "transparent",
                                 border: "none",
-                                color: CX.accent,
+                                color: CX.accentText,
                                 textDecoration: "underline",
                                 cursor: "pointer",
                                 fontSize: 11,
@@ -2795,7 +2834,7 @@ function CortexPopup(): React.ReactElement {
                 <div style={S.todayFooter}>
                     <div style={S.todayCol}>
                         <span style={S.todayVal}>{Math.round(dailyStats.totalFocusMin)}m</span>
-                        <span style={S.todayLabel}>FOCUS</span>
+                        <span style={S.todayLabel}>STEADY</span>
                     </div>
                     <div style={S.todayCol}>
                         <span style={S.todayVal}>{dailyStats.sessions}</span>
@@ -2825,27 +2864,25 @@ function CortexPopup(): React.ReactElement {
                 renders a one-line install hint if the native host is
                 unavailable. */}
             <div style={S.historyFooter}>
-                <button
-                    style={S.historyLink}
-                    onClick={handleOpenDashboardHistory}
-                    data-testid="view-history-link"
-                    aria-label="Open History tab in desktop dashboard"
-                >View history <span aria-hidden="true">{"→"}</span></button>
-                <span
-                    aria-hidden="true"
-                    style={{
-                        color: CX.textTertiary,
-                        margin: "0 8px",
-                        fontSize: 11,
-                    }}
-                >·</span>
-                {/* Phase 4d Task H / §3.24: in-app bug report. */}
-                <button
-                    style={S.historyLink}
-                    onClick={() => setBugReportOpen(true)}
-                    data-testid="report-bug-link"
-                    aria-label="Report a bug"
-                >Report bug</button>
+                <div style={S.historyLinkRow}>
+                    <button
+                        style={S.historyLink}
+                        onClick={handleOpenDashboardHistory}
+                        data-testid="view-history-link"
+                        aria-label="Open History tab in desktop dashboard"
+                    >View history <span aria-hidden="true">{"→"}</span></button>
+                    <span
+                        aria-hidden="true"
+                        style={{ color: CX.textTertiary, fontSize: 11 }}
+                    >·</span>
+                    {/* Phase 4d Task H / §3.24: in-app bug report. */}
+                    <button
+                        style={S.historyLink}
+                        onClick={() => setBugReportOpen(true)}
+                        data-testid="report-bug-link"
+                        aria-label="Report a bug"
+                    >Report bug</button>
+                </div>
                 {historyStatus !== "" && (
                     <div
                         style={S.historyStatusLine}
@@ -2888,7 +2925,7 @@ function CortexPopup(): React.ReactElement {
                         data-testid="bug-report-success"
                         style={{
                             ...S.historyStatusLine,
-                            color: CX.accent,
+                            color: CX.accentText,
                         }}
                     >Thanks — report sent.</div>
                 )}
@@ -2907,6 +2944,7 @@ function CortexPopup(): React.ReactElement {
                     role="dialog"
                     aria-modal="true"
                     aria-labelledby="cortex-bug-report-title"
+                    aria-describedby="cortex-bug-report-description"
                     data-testid="bug-report-modal"
                     style={{
                         position: "fixed",
@@ -2919,13 +2957,12 @@ function CortexPopup(): React.ReactElement {
                     }}
                     onClick={(e) => {
                         if (e.target === e.currentTarget) {
-                            setBugReportOpen(false);
-                            setBugReportStatus("idle");
-                            setBugReportError("");
+                            closeBugReport();
                         }
                     }}
                 >
                     <div
+                        ref={bugDialogRef}
                         style={{
                             background: CX.surface,
                             border: `1px solid ${CX.borderDefault}`,
@@ -2945,7 +2982,18 @@ function CortexPopup(): React.ReactElement {
                                 fontFamily: CX.fontSerif,
                             }}
                         >Report a bug</h2>
+                        <p
+                            id="cortex-bug-report-description"
+                            style={{
+                                margin: "0 0 12px",
+                                color: CX.textSecondary,
+                                fontSize: 12,
+                                lineHeight: 1.45,
+                                fontFamily: CX.font,
+                            }}
+                        >Describe what happened, then review whether to include recent diagnostic logs.</p>
                         <textarea
+                            ref={bugTextareaRef}
                             data-testid="bug-report-textarea"
                             value={bugReportText}
                             onChange={(e) => setBugReportText(e.target.value)}
@@ -2955,7 +3003,7 @@ function CortexPopup(): React.ReactElement {
                             aria-label="Bug description"
                             style={{
                                 width: "100%",
-                                background: "rgba(255,255,255,0.04)",
+                                background: CX.tertiary,
                                 color: CX.text,
                                 border: `1px solid ${CX.borderDefault}`,
                                 borderRadius: CX.radiusSm,
@@ -2994,7 +3042,7 @@ function CortexPopup(): React.ReactElement {
                                 role="alert"
                                 data-testid="bug-report-error"
                                 style={{
-                                    color: "#E47A6E",
+                                color: CX.danger,
                                     fontSize: 11,
                                     marginBottom: 10,
                                     fontFamily: CX.font,
@@ -3009,11 +3057,7 @@ function CortexPopup(): React.ReactElement {
                             }}
                         >
                             <button
-                                onClick={() => {
-                                    setBugReportOpen(false);
-                                    setBugReportStatus("idle");
-                                    setBugReportError("");
-                                }}
+                                onClick={closeBugReport}
                                 style={{
                                     padding: "6px 12px",
                                     background: "transparent",
@@ -3034,7 +3078,7 @@ function CortexPopup(): React.ReactElement {
                                     background: CX.accent,
                                     border: "none",
                                     borderRadius: CX.radiusSm,
-                                    color: "white",
+                                    color: CX.text,
                                     fontSize: 12,
                                     fontWeight: 600,
                                     cursor: bugReportStatus === "submitting"
@@ -3082,10 +3126,27 @@ const S: Record<string, React.CSSProperties> = {
         border: `1px solid ${CX.borderDefault}`,
         boxShadow: CX.shadowFloat,
         marginBottom: 16,
-        animation: "cxAlertIn 0.3s cubic-bezier(0.16, 1, 0.3, 1)",
+        animation: `cxAlertIn ${CX.durationNormal} ${CX.easeOut}`,
     },
     alertTitle: { fontSize: 14, fontWeight: 600, marginBottom: 4, color: CX.text, fontFamily: CX.fontSerif },
     alertBody: { fontSize: 13, color: CX.textSecondary, lineHeight: 1.5 },
+    iconButton: {
+        display: "grid",
+        placeItems: "center",
+        width: 32,
+        height: 32,
+        flexShrink: 0,
+        margin: "-8px -8px -8px 8px",
+        padding: 0,
+        border: "none",
+        borderRadius: CX.radiusSm,
+        background: "transparent",
+        color: CX.textSecondary,
+        cursor: "pointer",
+        fontSize: 16,
+        lineHeight: 1,
+        fontFamily: CX.font,
+    },
 
     // Header 
     header: {
@@ -3173,7 +3234,7 @@ const S: Record<string, React.CSSProperties> = {
         boxSizing: "border-box" as const,
         fontFamily: CX.font,
         marginBottom: 16,
-        transition: "border-color 0.2s",
+        transition: `border-color ${CX.durationNormal} ${CX.easeOut}`,
     },
     goalEnterIcon: {
         position: "absolute" as const,
@@ -3199,8 +3260,17 @@ const S: Record<string, React.CSSProperties> = {
         justifyContent: "space-between",
         marginBottom: 20,
     },
-    focusTitle: { fontSize: 18, fontWeight: 600, color: CX.text, fontFamily: CX.fontSerif },
-    focusDuration: { fontSize: 13, color: CX.textSecondary },
+    focusTitle: {
+        minWidth: 0,
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap" as const,
+        fontSize: 18,
+        fontWeight: 600,
+        color: CX.text,
+        fontFamily: CX.fontSerif,
+    },
+    focusDuration: { flexShrink: 0, fontSize: 13, color: CX.textSecondary },
     endBtn: {
         padding: "6px 14px",
         border: `1px solid ${CX.borderDefault}`,
@@ -3244,9 +3314,10 @@ const S: Record<string, React.CSSProperties> = {
         overflow: "hidden",
     },
     trackFill: {
+        width: "100%",
         height: "100%",
         borderRadius: CX.radiusFull,
-        transition: `width 1s ease`,
+        transition: `transform ${CX.durationNormal} ${CX.easeOut}`,
     },
 
     // Stats row
@@ -3289,7 +3360,7 @@ const S: Record<string, React.CSSProperties> = {
     },
     errBody: { fontSize: 13, color: CX.text, lineHeight: 1.5 },
     errCode: {
-        fontSize: 13, color: CX.accent, marginTop: 12, fontFamily: CX.mono,
+        fontSize: 13, color: CX.accentText, marginTop: 12, fontFamily: CX.mono,
         lineHeight: 1.5, whiteSpace: "pre-wrap" as const, margin: 0,
     },
 
@@ -3306,11 +3377,11 @@ const S: Record<string, React.CSSProperties> = {
         fontWeight: 500,
         cursor: "pointer",
         fontFamily: CX.font,
-        transition: "opacity 0.2s ease",
+        transition: `opacity ${CX.durationNormal} ${CX.easeOut}`,
     },
     doneBtnStyle: {
         background: STATE_COLORS.FLOW,
-        color: CX.textInverse,
+        color: CX.text,
         cursor: "default",
         pointerEvents: "none" as const,
     },
@@ -3388,6 +3459,40 @@ const S: Record<string, React.CSSProperties> = {
         padding: "8px 0",
     },
     toggleLabel: { fontSize: 14, color: CX.text },
+    siteAccessRow: {
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        marginTop: 12,
+        padding: "14px 0 8px",
+        borderTop: `1px solid ${CX.borderDefault}`,
+    },
+    siteAccessDetail: {
+        marginTop: 3,
+        color: CX.textTertiary,
+        fontSize: 11,
+        lineHeight: 1.4,
+    },
+    siteAccessError: {
+        marginTop: 4,
+        color: CX.danger,
+        fontSize: 11,
+        lineHeight: 1.35,
+    },
+    siteAccessButton: {
+        minWidth: 68,
+        minHeight: 32,
+        padding: "6px 12px",
+        borderRadius: CX.radiusMd,
+        border: `1px solid ${CX.borderEmphasis}`,
+        background: "transparent",
+        color: CX.textSecondary,
+        fontFamily: CX.font,
+        fontSize: 11,
+        fontWeight: 600,
+        cursor: "pointer",
+        transition: `background ${CX.durationFast} ${CX.easeDefault}, border-color ${CX.durationFast} ${CX.easeDefault}, opacity ${CX.durationFast} ${CX.easeDefault}`,
+    },
     toggleTrack: {
         position: "relative" as const,
         width: 40,
@@ -3490,15 +3595,21 @@ const S: Record<string, React.CSSProperties> = {
         lineHeight: 1.3,
     },
     recapDismissIcon: {
+        display: "grid",
+        placeItems: "center",
+        width: 32,
+        height: 32,
+        flexShrink: 0,
+        margin: "-8px -8px -8px 0",
         background: "none",
         border: "none",
-        color: CX.textTertiary,
+        borderRadius: CX.radiusSm,
+        color: CX.textSecondary,
         cursor: "pointer",
         fontSize: 16,
         padding: 0,
         fontFamily: CX.font,
         lineHeight: 1,
-        flexShrink: 0,
     },
     recapBody: {
         fontSize: 13,
@@ -3523,7 +3634,7 @@ const S: Record<string, React.CSSProperties> = {
         border: `1px solid ${CX.accent}`,
         borderRadius: CX.radiusFull,
         background: CX.accent,
-        color: CX.textInverse,
+        color: CX.text,
         fontSize: 12,
         fontWeight: 500,
         fontFamily: CX.font,
@@ -3551,10 +3662,16 @@ const S: Record<string, React.CSSProperties> = {
         gap: 4,
         padding: "16px 8px 4px 8px",
     },
+    historyLinkRow: {
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 8,
+    },
     historyLink: {
         background: "none",
         border: "none",
-        color: CX.accent,
+        color: CX.accentText,
         cursor: "pointer",
         fontSize: 12,
         fontWeight: 500,

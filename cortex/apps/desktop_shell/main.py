@@ -19,14 +19,20 @@ import logging
 import signal
 import sys
 import threading
+import time
 from collections.abc import Callable
 from typing import Any
+from uuid import uuid4
 
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from cortex.apps.desktop_shell import mac_native
+from cortex.apps.desktop_shell.context_privacy_controller import (
+    ContextPrivacyController,
+)
 from cortex.apps.desktop_shell.dashboard import DashboardWindow
+from cortex.apps.desktop_shell.message_router import DesktopMessageRouter
 from cortex.apps.desktop_shell.onboarding import OnboardingWindow, onboarding_marker_path
 from cortex.apps.desktop_shell.overlay import OverlayWindow
 from cortex.apps.desktop_shell.settings import SettingsDialog
@@ -34,6 +40,10 @@ from cortex.apps.desktop_shell.tray import CortexTrayIcon
 from cortex.libs.auth import load_or_create_token
 from cortex.libs.config.settings import APIConfig, get_config
 from cortex.libs.logging import configure_logging
+from cortex.libs.schemas.intervention_transaction import (
+    ActionManifest,
+    manifest_suggestion_matches,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +58,7 @@ class WebSocketBridge(QObject):
     state_updated = Signal(dict)
     intervention_triggered = Signal(dict)
     intervention_restored = Signal(dict)
+    intervention_transaction_state = Signal(dict)
     settings_synced = Signal(dict)
     connection_changed = Signal(bool)
     # P1-FC-INTERVENTION-FAILED: daemon broadcast of a total mutation
@@ -67,6 +78,10 @@ class WebSocketBridge(QObject):
     # the WebSocket — the runner is in-process). Lives here so the
     # CortexApp's wiring sites have a single thread-safe queueing point.
     calibration_progress = Signal(dict)
+    calibration_review = Signal(dict)
+    calibration_updated = Signal(dict)
+    calibration_update_failed = Signal(dict)
+    calibration_apply_waiting = Signal(str)
 
     def __init__(self, host: str = "127.0.0.1", port: int = 9473) -> None:
         super().__init__()
@@ -86,7 +101,7 @@ class WebSocketBridge(QObject):
         # is not strictly greater than the last applied value for its
         # type. Reset to {} on every fresh connect so a daemon restart
         # always wins.
-        self._last_seq_by_type: dict[str, int] = {}
+        self._boot_id = uuid4()
         self._reconnect_delay_max = 30.0
         # Debt-2 (audit): cache the capability token at startup so we can
         # AUTH on every (re)connect without re-reading the file. The
@@ -98,6 +113,45 @@ class WebSocketBridge(QObject):
         except Exception:
             logger.exception("Could not load capability token; AUTH will fail")
             self._auth_token = None
+        self._message_router = DesktopMessageRouter(
+            {
+                "STATE_UPDATE": lambda payload: self.state_updated.emit(payload),
+                "INTERVENTION_TRIGGER": lambda payload: (
+                    self.intervention_triggered.emit(payload)
+                ),
+                "INTERVENTION_RESTORE": lambda payload: (
+                    self.intervention_restored.emit(payload)
+                ),
+                "INTERVENTION_TRANSACTION_STATE": (
+                    lambda payload: self.intervention_transaction_state.emit(payload)
+                ),
+                "INTERVENTION_FAILED": lambda payload: (
+                    self.intervention_failed.emit(payload)
+                ),
+                "INTERVENTION_PROMPT": lambda payload: (
+                    self.intervention_prompt.emit(payload)
+                ),
+                "SETTINGS_SYNC": lambda payload: self.settings_synced.emit(payload),
+                "CALIBRATION_UPDATED": lambda payload: (
+                    self.calibration_updated.emit(payload)
+                ),
+                "CALIBRATION_UPDATE_FAILED": lambda payload: (
+                    self.calibration_update_failed.emit(payload)
+                ),
+                "SESSION_LIST": lambda payload: (
+                    self.session_list_received.emit(payload)
+                ),
+                "SESSION_DETAIL": lambda payload: (
+                    self.session_detail_received.emit(payload)
+                ),
+                "TRENDS_PAYLOAD": lambda payload: self.trends_received.emit(payload),
+                "SESSION_RECAP": lambda payload: (
+                    self.session_recap_received.emit(payload)
+                ),
+            }
+        )
+        # One-release compatibility facade. New code calls router.reset().
+        self._last_seq_by_type = self._message_router.sequence_state
 
     def start(self) -> None:
         """Start the WebSocket listener in a background thread."""
@@ -185,6 +239,35 @@ class WebSocketBridge(QObject):
             "sequence": 0,
         })
         asyncio.run_coroutine_threadsafe(self._send(msg), self._loop)
+
+    def send_intervention_authorization(
+        self,
+        intervention_id: str,
+        manifest_sha256: str,
+        action_id: str,
+    ) -> bool:
+        """Send one manifest-bound desktop user gesture to the daemon."""
+
+        if self._loop is None or self._ws is None:
+            return False
+        now_unix_ms = time.time_ns() // 1_000_000
+        msg = json.dumps({
+            "type": "INTERVENTION_AUTHORIZE",
+            "payload": {
+                "authorization_request_id": f"desktop_{uuid4().hex}",
+                "intervention_id": intervention_id,
+                "manifest_sha256": manifest_sha256,
+                "approved_action_ids": [action_id],
+                "source_surface": "desktop",
+                "requested_at_unix_ms": now_unix_ms,
+                "requested_at_mono_ns": time.monotonic_ns(),
+                "boot_id": str(self._boot_id),
+            },
+            "timestamp": now_unix_ms / 1_000,
+            "sequence": 0,
+        })
+        asyncio.run_coroutine_threadsafe(self._send(msg), self._loop)
+        return True
 
     def send_shutdown(self) -> None:
         """E.1 (WS-mode Stop button): send a top-level SHUTDOWN message.
@@ -286,6 +369,33 @@ class WebSocketBridge(QObject):
         })
         asyncio.run_coroutine_threadsafe(self._send(msg), self._loop)
 
+    def send_calibration_reload(
+        self,
+        profile_id: str,
+        profile_sha256: str,
+    ) -> bool:
+        """Ask the daemon to activate a staged measured profile.
+
+        ``False`` is an immediate, observable delivery failure; successful
+        queueing is acknowledged later by exactly one CALIBRATION_UPDATED or
+        CALIBRATION_UPDATE_FAILED frame.
+        """
+
+        if self._loop is None or self._ws is None:
+            return False
+        msg = json.dumps({
+            "type": "CALIBRATION_RELOAD",
+            "payload": {
+                "profile_id": str(profile_id),
+                "profile_sha256": str(profile_sha256),
+            },
+            "timestamp": 0,
+            "sequence": 0,
+            "correlation_id": f"calibration_{uuid4()}",
+        })
+        asyncio.run_coroutine_threadsafe(self._send(msg), self._loop)
+        return True
+
     def send_quiet_mode_toggle(
         self, kind: str, *, source: str = "settings_sync",
     ) -> None:
@@ -372,7 +482,7 @@ class WebSocketBridge(QObject):
                     # here the receiver would reject every post-restart
                     # frame as "stale" until the new daemon's counter
                     # caught up with the pre-restart value.
-                    self._last_seq_by_type.clear()
+                    self._message_router.reset()
 
                     # Debt-2 (audit): AUTH is the contractual first
                     # frame. The daemon refuses every other type until
@@ -440,63 +550,9 @@ class WebSocketBridge(QObject):
                     )
 
     def _handle_message(self, raw: str) -> None:
-        """Parse and dispatch a WebSocket message."""
-        try:
-            msg = json.loads(raw)
-        except json.JSONDecodeError:
-            return
+        """Decode through the same router used by in-process events."""
 
-        msg_type = msg.get("type", "")
-        payload = msg.get("payload", {})
-
-        # F17 (audit): per-type drop-stale on the WSMessage envelope
-        # ``sequence`` field. The daemon increments this once per
-        # outbound message; receivers maintain a per-type last-applied
-        # value and ignore any frame whose sequence isn't strictly
-        # greater. ``sequence=0`` from older daemons or test fixtures
-        # bypasses the check (the default goes through on the first
-        # frame only, which is the safe behaviour at connect time).
-        seq = msg.get("sequence", 0)
-        if isinstance(seq, int) and seq > 0 and msg_type:
-            last = self._last_seq_by_type.get(msg_type, 0)
-            if seq <= last:
-                logger.debug(
-                    "F17: dropping stale %s frame seq=%d last=%d",
-                    msg_type, seq, last,
-                )
-                return
-            self._last_seq_by_type[msg_type] = seq
-
-        if msg_type == "STATE_UPDATE":
-            self.state_updated.emit(payload)
-        elif msg_type == "INTERVENTION_TRIGGER":
-            self.intervention_triggered.emit(payload)
-        elif msg_type == "INTERVENTION_RESTORE":
-            self.intervention_restored.emit(payload)
-        # P1-FC-INTERVENTION-FAILED / -PROMPT: surface the daemon's
-        # total-failure broadcast (toast) and the cross-surface prompt
-        # (informational) in WS mode as well.
-        elif msg_type == "INTERVENTION_FAILED":
-            self.intervention_failed.emit(payload if isinstance(payload, dict) else {})
-        elif msg_type == "INTERVENTION_PROMPT":
-            self.intervention_prompt.emit(payload if isinstance(payload, dict) else {})
-        elif msg_type == "SETTINGS_SYNC":
-            self.settings_synced.emit(payload)
-        # P0 §3.1 / §3.2 / §3.3: history / trends / recap inbound dispatch.
-        elif msg_type == "SESSION_LIST":
-            self.session_list_received.emit(payload if isinstance(payload, dict) else {})
-        elif msg_type == "SESSION_DETAIL":
-            self.session_detail_received.emit(payload if isinstance(payload, dict) else {})
-        elif msg_type == "TRENDS_PAYLOAD":
-            self.trends_received.emit(payload if isinstance(payload, dict) else {})
-        elif msg_type == "SESSION_RECAP":
-            # Phase 4.B fix (#30): empty payloads ARE meaningful — the
-            # daemon broadcasts ``{}`` for short sessions to tell the
-            # dashboard to finalise its stop flow without opening the
-            # recap sheet. Forward an empty dict in that case; the
-            # dashboard's ``apply_session_recap`` handles the empty
-            # payload as the synthetic short-session signal.
-            self.session_recap_received.emit(payload if isinstance(payload, dict) else {})
+        self._message_router.dispatch_json(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -522,8 +578,11 @@ class CortexApp:
         self._bridge: WebSocketBridge | None = None
         self._paused = False
         self._active_intervention_id: str | None = None
+        self._active_action_manifest: ActionManifest | None = None
         # P0 §3.4: in-flight CalibrationRunner. None when idle.
         self._calibration_runner: Any = None
+        self._pending_calibration_profile_id: str | None = None
+        self._calibration_apply_timer: QTimer | None = None
         # E.4: Connect Extensions panel, lazily created (Any-typed to keep
         # the heavy ConnectionsPanel import lazy in ``_show_connections``).
         self._connections_panel: Any = None
@@ -542,7 +601,14 @@ class CortexApp:
         self._dashboard = DashboardWindow()
         self._overlay = OverlayWindow()
         self._settings = SettingsDialog()
+        self._context_privacy_controller = ContextPrivacyController(self._settings)
         self._onboarding = OnboardingWindow()
+        self._calibration_apply_timer = QTimer()
+        self._calibration_apply_timer.setSingleShot(True)
+        self._calibration_apply_timer.setInterval(15_000)
+        self._calibration_apply_timer.timeout.connect(
+            self._on_calibration_apply_timeout
+        )
 
         # Create tray icon
         self._tray = CortexTrayIcon(self._app)
@@ -622,6 +688,12 @@ class CortexApp:
         self._bridge.state_updated.connect(self._on_state_update)
         self._bridge.intervention_triggered.connect(self._on_intervention)
         self._bridge.intervention_restored.connect(self._on_restore)
+        if self._dashboard is not None and hasattr(
+            self._dashboard, "apply_intervention_transaction_state",
+        ):
+            self._bridge.intervention_transaction_state.connect(
+                self._dashboard.apply_intervention_transaction_state,
+            )
         # P1-FC-INTERVENTION-FAILED / -PROMPT: route to the toast + log.
         self._bridge.intervention_failed.connect(self._on_intervention_failed)
         self._bridge.intervention_prompt.connect(self._on_intervention_prompt)
@@ -652,13 +724,13 @@ class CortexApp:
             self._bridge.calibration_progress.connect(
                 self._on_calibration_progress
             )
-
-        # P0 §3.4: queue calibration progress onto the Qt main thread so
-        # the onboarding card and dashboard freshness pill stay in sync
-        # with the worker-thread runner.
-        if self._bridge is not None and hasattr(self._bridge, "calibration_progress"):
-            self._bridge.calibration_progress.connect(
-                self._on_calibration_progress
+            self._bridge.calibration_review.connect(self._on_calibration_review)
+            self._bridge.calibration_updated.connect(self._on_calibration_updated)
+            self._bridge.calibration_update_failed.connect(
+                self._on_calibration_update_failed
+            )
+            self._bridge.calibration_apply_waiting.connect(
+                self._on_calibration_apply_waiting
             )
 
         # Connect overlay dismiss to user action
@@ -673,6 +745,30 @@ class CortexApp:
 
         # Connect settings changes
         self._settings.settings_changed.connect(self._on_settings_changed)
+        self._settings.context_privacy_status_requested.connect(
+            self._context_privacy_controller.refresh_status
+        )
+        self._settings.context_preview_requested.connect(
+            self._context_privacy_controller.preview_current
+        )
+        self._settings.context_preview_confirm_requested.connect(
+            self._context_privacy_controller.confirm_once
+        )
+        self._settings.context_preview_cancel_requested.connect(
+            self._context_privacy_controller.cancel_preview
+        )
+        self._context_privacy_controller.status_received.connect(
+            self._settings.apply_context_privacy_status
+        )
+        self._context_privacy_controller.preview_received.connect(
+            self._settings.apply_context_preview
+        )
+        self._context_privacy_controller.confirmation_received.connect(
+            self._settings.apply_context_preview_confirmation
+        )
+        self._context_privacy_controller.request_failed.connect(
+            self._settings.apply_context_privacy_error
+        )
         # Debt-2 Commit 5: rotation drops the bridge's cached token,
         # forces a reconnect, and surfaces a confirmation toast.
         if hasattr(self._settings, "auth_token_rotated"):
@@ -804,6 +900,17 @@ class CortexApp:
         if self._paused:
             return
         self._active_intervention_id = payload.get("intervention_id")
+        try:
+            manifest = ActionManifest.model_validate(
+                payload.get("action_manifest")
+            )
+            self._active_action_manifest = (
+                manifest
+                if manifest.intervention_id == self._active_intervention_id
+                else None
+            )
+        except Exception:
+            self._active_action_manifest = None
         if self._overlay is not None:
             self._overlay.show_intervention(payload)
         # Audit-2 fix: bump the Today/Blocked counter so the dashboard
@@ -823,6 +930,17 @@ class CortexApp:
             self._tray.set_connected(connected)
         if self._dashboard is not None:
             self._dashboard.set_connected(connected)
+        if not connected and self._pending_calibration_profile_id is not None:
+            self._on_calibration_update_failed(
+                {
+                    "code": "calibration_connection_lost",
+                    "message": (
+                        "The daemon connection closed before calibration was "
+                        "acknowledged. Cortex could not confirm a live change."
+                    ),
+                    "profile_id": self._pending_calibration_profile_id,
+                }
+            )
 
     @Slot(str)
     def _on_overlay_dismissed(self, intervention_id: str) -> None:
@@ -865,51 +983,42 @@ class CortexApp:
 
     @Slot(str, dict)
     def _on_action_invoked(self, intervention_id: str, action: dict) -> None:
-        """G4 (audit-prod): handle a desktop overlay action button click
-        in WS mode.
-
-        Native action types (clipboard, timer) execute in the shell
-        directly. Everything else goes to the daemon as ACTION_EXECUTE
-        with ``request_dispatch=True`` so the daemon broadcasts an
-        ACTION_DISPATCH frame to the connected chrome / edge client.
-        """
+        """Submit one WS-mode desktop gesture for exact authorization."""
         if self._bridge is None:
             return
-        action_type = str(action.get("action_type") or "")
-        executed_natively = False
-        if action_type == "copy_to_clipboard":
-            try:
-                from PySide6.QtGui import QGuiApplication
-
-                clip = QGuiApplication.clipboard()
-                target = str(action.get("target") or "")
-                if clip is not None and target:
-                    clip.setText(target)
-                    executed_natively = True
-            except Exception:
-                logger.debug("Clipboard copy failed", exc_info=True)
-        # P2-FE-START-TIMER: 'start_timer' is a real LLM-emitted native
-        # action that previously set executed_natively=True here, which
-        # made the ACTION_EXECUTE a pure log (request_dispatch=False) — so
-        # the button did nothing in WS mode. WS mode has no in-process
-        # break overlay, so we mirror the take_biology_break path: leave
-        # executed_natively False and let send_action_execute reach the
-        # daemon with request_dispatch=True. The daemon drives its
-        # break/countdown overlay (a plain countdown for start_timer).
-
-        # Audit-prod fix: ACTION_EXECUTE (with request_dispatch) must
-        # arrive at the daemon BEFORE the engaged USER_ACTION. The
-        # daemon's engage handler clears ``_active_intervention_id`` to
-        # None as part of recording the outcome; ``dispatch_action_to_browser``
-        # gates on that id being live, so the prior order silently
-        # rejected every legitimate browser-action click.
-        self._bridge.send_action_execute(
+        if (
+            self._overlay is None
+            or not self._overlay.workspace_actions_enabled
+        ):
+            logger.info(
+                "Desktop WS action ignored in suggest-only mode "
+                "(intervention_id=%s)",
+                intervention_id,
+            )
+            return
+        manifest = getattr(self, "_active_action_manifest", None)
+        action_id = str(action.get("action_id") or "")
+        if (
+            manifest is None
+            or manifest.intervention_id != intervention_id
+            or not any(
+                item.action_id == action_id
+                for item in manifest.body.actions
+            )
+            or not manifest_suggestion_matches(manifest, action)
+        ):
+            logger.warning(
+                "Desktop action is absent from the active exact manifest "
+                "(intervention_id=%s action_id=%s)",
+                intervention_id,
+                action_id,
+            )
+            return
+        self._bridge.send_intervention_authorization(
             intervention_id,
-            dict(action),
-            request_dispatch=not executed_natively,
+            manifest.manifest_sha256,
+            action_id,
         )
-        # Then record engagement on the daemon (engaged USER_ACTION).
-        self._bridge.send_user_action("engaged", intervention_id)
 
     @Slot(dict)
     def _on_settings_changed(self, settings: dict) -> None:
@@ -922,6 +1031,7 @@ class CortexApp:
     def _on_restore(self, payload: dict) -> None:
         """Handle explicit restore events from the daemon."""
         self._active_intervention_id = None
+        self._active_action_manifest = None
         if self._overlay is not None:
             self._overlay.hide()
 
@@ -1206,6 +1316,7 @@ class CortexApp:
         """
         from cortex.services.capture_service.calibration_runner import (
             CalibrationRunner,
+            calibration_review_payload,
         )
 
         if getattr(self, "_calibration_runner", None) is not None:
@@ -1224,6 +1335,16 @@ class CortexApp:
                 "face_ok": bool(getattr(progress, "face_ok", False)),
                 "pct_complete": float(getattr(progress, "pct_complete", 0.0)),
                 "status": str(getattr(progress, "status", "running")),
+                "phase": str(getattr(progress, "phase", "camera_quality_check")),
+                "phase_instruction": str(
+                    getattr(progress, "phase_instruction", "")
+                ),
+                "valid_duration_seconds": float(
+                    getattr(progress, "valid_duration_seconds", 0.0)
+                ),
+                "missing_fraction": float(
+                    getattr(progress, "missing_fraction", 1.0)
+                ),
             }
             try:
                 if hasattr(self._bridge, "calibration_progress"):
@@ -1249,6 +1370,7 @@ class CortexApp:
             # daemon to release the camera (quiet-mode ``pause``) before
             # we open ours, and resume it in ``finally``.
             paused_daemon = False
+            ready_for_review = False
             try:
                 if self._bridge is not None:
                     try:
@@ -1273,11 +1395,20 @@ class CortexApp:
                 if bool(getattr(runner, "used_simulation", False)):
                     self._on_calibration_simulation_fallback()
                     return
-                await runner.finish()
+                if runner.last_progress is not None and (
+                    runner.last_progress.status == "review_required"
+                ):
+                    profile = runner.preview_profile()
+                    if self._bridge is not None:
+                        self._bridge.calibration_review.emit(
+                            calibration_review_payload(profile)
+                        )
+                    ready_for_review = True
             except Exception:
                 logger.exception("calibration run failed")
             finally:
-                self._calibration_runner = None
+                if not ready_for_review:
+                    self._calibration_runner = None
                 if paused_daemon and self._bridge is not None:
                     try:
                         self._bridge.send_quiet_mode_toggle(
@@ -1305,6 +1436,217 @@ class CortexApp:
             name="cortex-calibration",
             daemon=True,
         ).start()
+
+    def _on_calibration_review(self, payload: dict) -> None:
+        """Let the user inspect evidence before replacing the active pointer."""
+
+        metrics = payload.get("metrics", [])
+        lines: list[str] = []
+        if isinstance(metrics, list):
+            for item in metrics:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name", "metric")).replace("_", " ").title()
+                value = item.get("value")
+                unit = str(item.get("unit", ""))
+                maturity = str(item.get("maturity", "unavailable"))
+                rendered = "Unavailable" if value is None else f"{float(value):.2f} {unit}"
+                valid_seconds = float(item.get("valid_duration_seconds", 0.0))
+                missing_pct = float(item.get("missing_fraction", 1.0)) * 100.0
+                quality = float(item.get("quality_median", 0.0))
+                lines.append(
+                    f"{name}: {rendered} · {maturity}\n"
+                    f"  {valid_seconds:.0f}s valid · median quality {quality:.2f} "
+                    f"· {missing_pct:.0f}% missing/rejected"
+                )
+        box = QMessageBox(self._onboarding or self._dashboard)
+        box.setWindowTitle("Review calibration")
+        box.setIcon(QMessageBox.Icon.Information)
+        provenance = str(payload.get("provenance", "unknown"))
+        camera_name = str(payload.get("camera_name") or "Current camera")
+        box.setText("Apply this measured calibration profile?")
+        box.setInformativeText(
+            f"Source: {provenance} · Camera: {camera_name}. "
+            "Observed work and head/neck baselines can be applied. Webcam "
+            "heart and breathing estimates remain experimental and will not affect scoring."
+        )
+        box.setDetailedText("\n".join(lines) or "No metrics were available.")
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard
+        )
+        save_button = box.button(QMessageBox.StandardButton.Save)
+        if save_button is not None:
+            save_button.setText("Save measured profile")
+        if box.exec() == QMessageBox.StandardButton.Save:
+            self._commit_calibration()
+        else:
+            self._discard_calibration()
+
+    def _commit_calibration(self) -> None:
+        runner = self._calibration_runner
+        if runner is None:
+            return
+
+        async def _commit() -> None:
+            profile_id: str | None = None
+            try:
+                from cortex.services.capture_service.calibration_store import (
+                    calibration_profile_sha256,
+                )
+
+                profile = await runner.finish(approved_by_user=True)
+                if self._bridge is None:
+                    raise RuntimeError("daemon bridge unavailable for calibration reload")
+                profile_id = str(profile.profile_id)
+                self._bridge.calibration_apply_waiting.emit(profile_id)
+                queued = self._bridge.send_calibration_reload(
+                    profile_id,
+                    calibration_profile_sha256(profile),
+                )
+                if not queued:
+                    raise RuntimeError("daemon is not connected")
+            except Exception as exc:
+                logger.exception("calibration commit failed")
+                if self._bridge is not None:
+                    self._bridge.calibration_update_failed.emit(
+                        {
+                            "code": "calibration_delivery_failed",
+                            "message": (
+                                "Calibration could not be sent to the daemon; "
+                                "the previous profile remains active."
+                            ),
+                            "profile_id": profile_id,
+                        }
+                    )
+                else:
+                    try:
+                        runner.mark_failed(str(exc))
+                    except Exception:
+                        logger.debug(
+                            "calibration failure progress failed",
+                            exc_info=True,
+                        )
+                    self._calibration_runner = None
+
+        def _worker() -> None:
+            asyncio.run(_commit())
+
+        threading.Thread(
+            target=_worker,
+            name="cortex-calibration-commit",
+            daemon=True,
+        ).start()
+
+    def _on_calibration_updated(self, payload: dict) -> None:
+        runner = self._calibration_runner
+        if runner is None:
+            return
+        try:
+            profile_id = str(payload.get("profile_id", ""))
+            if (
+                self._pending_calibration_profile_id is not None
+                and profile_id != self._pending_calibration_profile_id
+            ):
+                raise ValueError("received a stale calibration acknowledgement")
+            runner.mark_applied(profile_id)
+        except Exception:
+            logger.exception("calibration update acknowledgement did not match commit")
+            return
+        if self._calibration_apply_timer is not None:
+            self._calibration_apply_timer.stop()
+        self._pending_calibration_profile_id = None
+        self._calibration_runner = None
+
+    def _on_calibration_apply_waiting(self, profile_id: str) -> None:
+        """Start the bounded acknowledgement window on the Qt thread."""
+
+        if self._calibration_runner is None:
+            return
+        self._pending_calibration_profile_id = str(profile_id)
+        if self._calibration_apply_timer is not None:
+            self._calibration_apply_timer.start()
+
+    def _on_calibration_apply_timeout(self) -> None:
+        profile_id = self._pending_calibration_profile_id
+        if profile_id is None:
+            return
+        self._on_calibration_update_failed(
+            {
+                "code": "calibration_apply_timeout",
+                "message": (
+                    "The daemon did not confirm calibration in time. "
+                    "Cortex could not confirm a live change."
+                ),
+                "profile_id": profile_id,
+            }
+        )
+
+    def _on_calibration_update_failed(self, payload: dict) -> None:
+        """Resolve every rejected/disconnected/timed-out calibration visibly."""
+
+        profile_id = payload.get("profile_id")
+        pending = self._pending_calibration_profile_id
+        if profile_id is not None and pending is not None and str(profile_id) != pending:
+            logger.warning("Ignoring stale calibration failure for %s", profile_id)
+            return
+        runner = self._calibration_runner
+        reconciliation_id = str(profile_id or pending or "") or None
+        if (
+            runner is not None
+            and reconciliation_id is not None
+            and runner.is_committed_profile_active(reconciliation_id)
+        ):
+            # The daemon may have committed and swapped the profile while its
+            # acknowledgement was lost. The checksum-bound active pointer is
+            # authoritative, so reconcile that outcome as success.
+            self._on_calibration_updated(
+                {"profile_id": reconciliation_id}
+            )
+            return
+        if self._calibration_apply_timer is not None:
+            self._calibration_apply_timer.stop()
+        self._pending_calibration_profile_id = None
+        message = str(
+            payload.get(
+                "message",
+                "Calibration application could not be confirmed.",
+            )
+        )
+        if runner is not None:
+            try:
+                runner.mark_failed(message)
+            except Exception:
+                logger.debug("calibration failure progress failed", exc_info=True)
+        self._calibration_runner = None
+        QMessageBox.warning(
+            self._onboarding or self._dashboard,
+            "Calibration not applied",
+            message,
+        )
+
+    def _discard_calibration(self) -> None:
+        runner = self._calibration_runner
+        if runner is not None:
+            runner.abort()
+        self._calibration_runner = None
+        self._on_calibration_progress(
+            {
+                "elapsed_seconds": 0.0,
+                "total_seconds": 0.0,
+                "current_hr": None,
+                "current_hrv": None,
+                "current_sqi": None,
+                "lighting_ok": False,
+                "motion_ok": False,
+                "face_ok": False,
+                "pct_complete": 0.0,
+                "status": "aborted",
+                "phase": "review",
+                "phase_instruction": "Profile discarded; the previous calibration is unchanged.",
+                "valid_duration_seconds": 0.0,
+                "missing_fraction": 1.0,
+            }
+        )
 
     def _on_calibration_progress(self, payload: dict) -> None:
         """Queue-connected slot — receives calibration progress on the
@@ -1439,6 +1781,14 @@ def main() -> None:
     :class:`CortexAppController`.  In dev mode, falls back to the
     WebSocket-based :class:`CortexApp` unless ``--in-process`` is passed.
     """
+    if "--release-smoke" in sys.argv:
+        # This path deliberately runs before QApplication, camera ownership,
+        # network listeners, or user storage. The release verifier executes it
+        # from the mounted DMG to prove the frozen resource graph is complete.
+        from cortex.scripts.release_smoke import main as release_smoke_main
+
+        sys.exit(release_smoke_main())
+
     # C6 (audit): install the structured-logging pipeline once, before any
     # logger is used, replacing the bare ``logging.basicConfig`` so the
     # desktop shell emits the same JSON event stream as the daemon and

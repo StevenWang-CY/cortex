@@ -1,7 +1,10 @@
-# Cortex — The Somatic Workspace Engine
+# Cortex — local workspace support research prototype
 """
-Real-time biofeedback workspace engine that detects cognitive overwhelm
-and autonomously restructures the user's digital workspace.
+Local sensing and conservative, user-controlled workspace suggestions.
 """
 
-__version__ = "0.1.0"
+from cortex._version import VERSION
+
+__version__ = VERSION
+
+__all__ = ["__version__"]

@@ -8,10 +8,16 @@ Manages intervention lifecycle: auto-timeout (5 min), recovery detection
 from __future__ import annotations
 
 import logging
-import time
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from cortex.application.clock import (
+    SYSTEM_CLOCK,
+    Clock,
+    monotonic_seconds,
+    utc_datetime,
+)
 from cortex.libs.schemas.intervention import (
     InterventionOutcome,
     MicroStep,
@@ -21,6 +27,8 @@ from cortex.libs.schemas.state import StateEstimate
 from cortex.services.intervention_engine.executor import InterventionExecutor
 
 logger = logging.getLogger(__name__)
+
+TransactionRestoreCallback = Callable[[str, str], Awaitable[bool]]
 
 
 def merge_micro_steps(
@@ -71,6 +79,8 @@ class ActiveIntervention:
     timeout_seconds: float = 300.0  # 5 min
     recovery_threshold: float = 0.70
     recovery_dwell_seconds: float = 15.0
+    started_at_unix_ms: int = 0
+    clock: Clock = field(default=SYSTEM_CLOCK, repr=False, compare=False)
 
     # Recovery tracking
     flow_start_time: float | None = None
@@ -78,7 +88,9 @@ class ActiveIntervention:
     @property
     def is_timed_out(self) -> bool:
         """Check if intervention has exceeded timeout (using real time)."""
-        return (time.monotonic() - self.started_at) > self.timeout_seconds
+        return (
+            monotonic_seconds(self.clock) - self.started_at
+        ) > self.timeout_seconds
 
     def timed_out_at(self, t: float) -> bool:
         """Check if intervention has exceeded timeout at a given time."""
@@ -108,7 +120,7 @@ class ActiveIntervention:
     @property
     def duration_seconds(self) -> float:
         """Duration since intervention started."""
-        return time.monotonic() - self.started_at
+        return monotonic_seconds(self.clock) - self.started_at
 
     def duration_at(self, t: float) -> float:
         """Duration at a given timestamp."""
@@ -128,13 +140,25 @@ class RestoreManager:
         timeout_seconds: float = 300.0,
         recovery_threshold: float = 0.70,
         recovery_dwell_seconds: float = 15.0,
+        clock: Clock | None = None,
+        restore_callback: TransactionRestoreCallback | None = None,
     ) -> None:
+        self._clock = clock or SYSTEM_CLOCK
         self._executor = executor
         self._timeout = timeout_seconds
         self._recovery_threshold = recovery_threshold
         self._recovery_dwell = recovery_dwell_seconds
+        self._restore_callback = restore_callback
         self._active: dict[str, ActiveIntervention] = {}
         self._outcomes: list[InterventionOutcome] = []
+
+    def set_restore_callback(
+        self,
+        callback: TransactionRestoreCallback | None,
+    ) -> None:
+        """Bind the durable transactional restore path."""
+
+        self._restore_callback = callback
 
     def start_intervention(
         self,
@@ -144,7 +168,11 @@ class RestoreManager:
         started_at: float | None = None,
     ) -> ActiveIntervention:
         """Register a new active intervention."""
-        now = started_at if started_at is not None else time.monotonic()
+        now = (
+            started_at
+            if started_at is not None
+            else monotonic_seconds(self._clock)
+        )
         active = ActiveIntervention(
             intervention_id=intervention_id,
             snapshot=snapshot,
@@ -152,6 +180,8 @@ class RestoreManager:
             timeout_seconds=self._timeout,
             recovery_threshold=self._recovery_threshold,
             recovery_dwell_seconds=self._recovery_dwell,
+            started_at_unix_ms=self._clock.unix_ms(),
+            clock=self._clock,
         )
         self._active[intervention_id] = active
         return active
@@ -169,7 +199,11 @@ class RestoreManager:
 
         Returns list of outcomes for any interventions that ended.
         """
-        now = current_time if current_time is not None else time.monotonic()
+        now = (
+            current_time
+            if current_time is not None
+            else monotonic_seconds(self._clock)
+        )
         ended: list[InterventionOutcome] = []
 
         for iid in list(self._active.keys()):
@@ -208,7 +242,11 @@ class RestoreManager:
         if active is None:
             return None
 
-        now = current_time if current_time is not None else time.monotonic()
+        now = (
+            current_time
+            if current_time is not None
+            else monotonic_seconds(self._clock)
+        )
         return await self._end_intervention(active, "dismissed", now)
 
     async def engage(
@@ -222,7 +260,11 @@ class RestoreManager:
         if active is None:
             return None
 
-        now = current_time if current_time is not None else time.monotonic()
+        now = (
+            current_time
+            if current_time is not None
+            else monotonic_seconds(self._clock)
+        )
         return await self._end_intervention(active, "engaged", now)
 
     async def snooze(
@@ -236,7 +278,11 @@ class RestoreManager:
         if active is None:
             return None
 
-        now = current_time if current_time is not None else time.monotonic()
+        now = (
+            current_time
+            if current_time is not None
+            else monotonic_seconds(self._clock)
+        )
         return await self._end_intervention(active, "snoozed", now)
 
     async def cancel(
@@ -250,7 +296,11 @@ class RestoreManager:
         if active is None:
             return None
 
-        now = current_time if current_time is not None else time.monotonic()
+        now = (
+            current_time
+            if current_time is not None
+            else monotonic_seconds(self._clock)
+        )
         return await self._end_intervention(active, "system_cancelled", now)
 
     async def _end_intervention(
@@ -280,7 +330,22 @@ class RestoreManager:
         workspace_restored = False
         restore_errors: list[str] = []
 
-        if self._executor is None:
+        if self._restore_callback is not None:
+            try:
+                workspace_restored = await self._restore_callback(
+                    iid,
+                    user_action,
+                )
+                if not workspace_restored:
+                    restore_errors.append("transaction_restore_unverified")
+            except Exception as exc:
+                logger.exception(
+                    "Transactional restore failed for %s",
+                    iid,
+                )
+                restore_errors.append(str(exc))
+                workspace_restored = False
+        elif self._executor is None:
             # No executor wired: we genuinely cannot have mutated the
             # workspace, so it is trivially in its original state.
             workspace_restored = True
@@ -308,8 +373,12 @@ class RestoreManager:
 
         outcome = InterventionOutcome(
             intervention_id=iid,
-            started_at=datetime.now(UTC),  # approximate
-            ended_at=datetime.now(UTC),
+            started_at=(
+                datetime.fromtimestamp(active.started_at_unix_ms / 1_000, tz=UTC)
+                if active.started_at_unix_ms > 0
+                else utc_datetime(self._clock)
+            ),
+            ended_at=utc_datetime(self._clock),
             duration_seconds=duration,
             user_action=user_action,
             recovery_detected=is_recovery,
@@ -321,7 +390,12 @@ class RestoreManager:
         )
 
         self._outcomes.append(outcome)
-        self._active.pop(iid, None)
+        # A failed restore remains active and retryable. The previous code
+        # discarded both ActiveIntervention and executor mutations after the
+        # first failure, making the Undo control lie and eliminating every
+        # recovery path except a process restart.
+        if workspace_restored:
+            self._active.pop(iid, None)
 
         logger.info(
             "Intervention %s ended: action=%s, duration=%.1fs, restored=%s",

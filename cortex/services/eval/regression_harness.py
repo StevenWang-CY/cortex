@@ -1,7 +1,7 @@
-"""Audit F41 — regression harness for the trigger-policy + LLM-eval cohort.
+"""Regression harness for trigger behavior and deterministic policy replay.
 
 Replays a small library of synthetic state traces against the
-``TriggerPolicy`` and the ``ContextualBandit`` policies, then computes
+``TriggerPolicy`` and the production ordered-rules policy, then computes
 the metrics CI tracks against a versioned ``baseline.json``:
 
 * ``oscillation_intervention_rate_per_hr`` — interventions/hour produced
@@ -13,18 +13,17 @@ the metrics CI tracks against a versioned ``baseline.json``:
   even with F25 hysteresis active.
 * ``flow_negative_trigger_rate`` — fraction of pure-FLOW traces that
   produced a trigger (should be 0).
-* ``bandit_regret_p95`` — 95th-percentile regret of the contextual
-  bandit replay over a 200-arm-pull synthetic stream. Bounded by the
-  Hoeffding inequality at the bandit's exploration rate.
+* ``deterministic_policy_replay_mismatch_rate`` — fraction of identical
+  decision inputs whose selected arm or immutable policy metadata differs
+  across independent production-policy instances (must be zero).
 
 Each metric has a "direction" (lower-is-better / higher-is-better) and
 a tolerance band; the CLI fails CI when any metric crosses its
 tolerance against the committed baseline. ``--update-baseline``
 re-records the metrics after a deliberate change.
 
-Determinism: all RNG paths are seeded via ``random.Random(seed)``;
-the harness fixes ``seed=20260519`` by default so reruns produce
-byte-identical metrics. Override with ``--seed`` for ad-hoc work.
+The seed varies only the generated context corpus. Production decisions never
+draw randomness and never emit behavior propensities.
 """
 
 from __future__ import annotations
@@ -34,12 +33,16 @@ import logging
 import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from uuid import UUID, uuid5
 
-import numpy as np
-
+from cortex.application.clock import FakeClock
 from cortex.libs.config.settings import InterventionConfig, StateConfig
+from cortex.libs.schemas.policy import PolicyArm, PolicyContextSnapshot
 from cortex.libs.schemas.state import SignalQuality, StateEstimate, StateScores
-from cortex.services.eval.bandit import ContextualBandit
+from cortex.services.eval.production_policy import (
+    DeterministicProductionPolicy,
+    PolicySelectionInput,
+)
 from cortex.services.state_engine.trigger_policy import TriggerPolicy
 
 logger = logging.getLogger(__name__)
@@ -48,6 +51,7 @@ DEFAULT_SEED = 20260519
 """Fixed RNG seed so eval runs reproduce byte-identical metrics. The
 date-stamp is the audit close-out day; bump on intentional baseline
 refreshes via ``--seed``."""
+BASELINE_VERSION = 2
 
 # Tolerance bands per metric. ``direction`` is how a regression looks:
 #   "lower"  — measured value going DOWN is a regression
@@ -59,10 +63,12 @@ refreshes via ``--seed``."""
 # baseline can be near zero (where a relative band degenerates).
 _METRIC_DIRECTIONS: dict[str, tuple[str, float, float]] = {
     "oscillation_intervention_rate_per_hr": ("higher", 0.03, 0.5),
-    "sustained_overwhelm_pass_rate":        ("lower",  0.03, 0.05),
-    "flow_negative_trigger_rate":           ("higher", 0.03, 0.05),
-    "bandit_regret_p95":                    ("higher", 0.03, 0.05),
+    "sustained_overwhelm_pass_rate": ("lower", 0.03, 0.05),
+    "flow_negative_trigger_rate": ("higher", 0.03, 0.05),
+    "deterministic_policy_replay_mismatch_rate": ("higher", 0.0, 0.0),
 }
+
+_REPLAY_NAMESPACE = UUID("d5701c83-8f14-44bb-af8e-cef3730a112a")
 
 
 def default_baseline_path() -> Path:
@@ -207,27 +213,87 @@ def compute_flow_negative_trigger_rate(n_traces: int = 10) -> float:
     return fp / n_traces
 
 
-def compute_bandit_regret_p95(n_steps: int = 200, *, seed: int = DEFAULT_SEED) -> float:
-    """95th-percentile regret of the contextual bandit over a
-    synthetic stream. The "true" optimal arm is fixed (arm 0); the
-    bandit's regret is 1 if it picks anything else."""
-    from cortex.services.eval.bandit import N_FEATURES
+def compute_deterministic_policy_replay_mismatch_rate(
+    n_steps: int = 200,
+    *,
+    seed: int = DEFAULT_SEED,
+) -> float:
+    """Return the fraction of exact inputs that fail deterministic replay.
 
+    Two fresh policy instances receive the same versioned requests. The
+    generated corpus spans availability, eligibility, safety suppression,
+    feasibility masks, and preferred-arm routing. A mismatch includes any
+    difference in arm, probability semantics, OPE declaration, or state
+    checksum.
+    """
+
+    if n_steps <= 0:
+        raise ValueError("n_steps must be positive")
     rng = random.Random(seed)
-    bandit = ContextualBandit(store=None)
-    regrets: list[float] = []
-    for _ in range(n_steps):
-        features = np.array(
-            [rng.random() for _ in range(N_FEATURES)], dtype=np.float64,
+    clock = FakeClock(
+        wall_unix_ms=1_700_000_000_000,
+        mono_ns=5_000_000_000,
+        _boot_id=UUID("270efc74-274a-42ed-84ea-6ecad7830f30"),
+    )
+    left = DeterministicProductionPolicy(clock=clock)
+    right = DeterministicProductionPolicy(clock=clock)
+    mismatches = 0
+    states = ("UNKNOWN", "FLOW", "RECOVERY", "HYPO", "HYPER")
+    for index in range(n_steps):
+        eligible = rng.random() >= 0.1
+        available = rng.random() >= 0.1
+        repeated_dismissal = rng.random() < 0.15
+        include_suggestion = rng.random() >= 0.15
+        include_simplify = rng.random() >= 0.5
+        feasible: tuple[PolicyArm, ...] = (
+            "no_action",
+            *(("suggest_only",) if include_suggestion else ()),
+            *(("workspace_simplify",) if include_simplify else ()),
         )
-        arm = bandit.select_arm(features)
-        # Reward: 1.0 for arm 0, 0.0 otherwise (so optimal-arm fraction
-        # is the inverse of regret).
-        reward = 1.0 if arm == 0 else 0.0
-        bandit.update(context=features, arm_idx=arm, reward=reward)
-        regrets.append(1.0 - reward)
-    arr = np.array(regrets)
-    return float(np.percentile(arr, 95))
+        preferred: PolicyArm | None = "workspace_simplify" if rng.random() >= 0.5 else None
+        request = PolicySelectionInput(
+            decision_point_id=uuid5(_REPLAY_NAMESPACE, f"{seed}:{index}"),
+            session_id=f"replay-{seed}",
+            context=PolicyContextSnapshot(
+                support_state=states[index % len(states)],
+                support_status="supported" if eligible else "insufficient_evidence",
+                support_confidence=rng.random(),
+                evidence_coverage=rng.random(),
+                complexity_score=rng.random(),
+                tab_count=rng.randrange(0, 80),
+                error_count=rng.randrange(0, 20),
+                thrashing_score=rng.random(),
+                hour_utc=index % 24,
+            ),
+            eligible=eligible,
+            available=available,
+            availability_reason="synthetic_regression_corpus",
+            feasible_arms=feasible,
+            recent_repeated_dismissal=repeated_dismissal,
+            preferred_low_friction_arm=preferred,
+        )
+        a = left.choose(request)
+        b = right.choose(request)
+        replay_fields_a = (
+            a.selected_arm,
+            a.selected_probability,
+            a.policy_name,
+            a.policy_version,
+            a.policy_state_sha256,
+            a.propensities,
+            a.supports_ope,
+        )
+        replay_fields_b = (
+            b.selected_arm,
+            b.selected_probability,
+            b.policy_name,
+            b.policy_version,
+            b.policy_state_sha256,
+            b.propensities,
+            b.supports_ope,
+        )
+        mismatches += int(replay_fields_a != replay_fields_b)
+    return mismatches / n_steps
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +308,7 @@ class EvalMetrics:
     oscillation_intervention_rate_per_hr: float
     sustained_overwhelm_pass_rate: float
     flow_negative_trigger_rate: float
-    bandit_regret_p95: float
+    deterministic_policy_replay_mismatch_rate: float
 
     def to_dict(self) -> dict[str, float]:
         return asdict(self)
@@ -263,7 +329,9 @@ def run_harness(*, seed: int = DEFAULT_SEED) -> EvalMetrics:
         oscillation_intervention_rate_per_hr=compute_oscillation_rate_per_hr(),
         sustained_overwhelm_pass_rate=compute_sustained_overwhelm_pass_rate(),
         flow_negative_trigger_rate=compute_flow_negative_trigger_rate(),
-        bandit_regret_p95=compute_bandit_regret_p95(seed=seed),
+        deterministic_policy_replay_mismatch_rate=(
+            compute_deterministic_policy_replay_mismatch_rate(seed=seed)
+        ),
     )
 
 
@@ -277,14 +345,16 @@ def load_baseline(path: Path | None = None) -> BaselineFile:
     )
 
 
-def save_baseline(metrics: EvalMetrics, *, path: Path | None = None, seed: int = DEFAULT_SEED) -> Path:
+def save_baseline(
+    metrics: EvalMetrics, *, path: Path | None = None, seed: int = DEFAULT_SEED
+) -> Path:
     """Write a fresh baseline file. Used by ``--update-baseline`` when
     a deliberate threshold change has been signed off."""
     from cortex.libs.utils.atomic_write import atomic_write_json
 
     target = path or default_baseline_path()
     payload = {
-        "version": 1,
+        "version": BASELINE_VERSION,
         "seed": seed,
         "metrics": metrics.to_dict(),
     }
@@ -314,11 +384,17 @@ def compare_to_baseline(metrics: EvalMetrics, baseline: BaselineFile) -> list[Me
         if base is None:
             # New metric — record as non-regressing; CI prompts the
             # operator to update the baseline.
-            out.append(MetricDelta(
-                name=name, measured=measured[name], baseline=float("nan"),
-                direction=direction, regressed=False,
-                rel_tol=rel_tol, abs_tol=abs_tol,
-            ))
+            out.append(
+                MetricDelta(
+                    name=name,
+                    measured=measured[name],
+                    baseline=float("nan"),
+                    direction=direction,
+                    regressed=False,
+                    rel_tol=rel_tol,
+                    abs_tol=abs_tol,
+                )
+            )
             continue
         m = measured[name]
         delta = m - base
@@ -329,11 +405,17 @@ def compare_to_baseline(metrics: EvalMetrics, baseline: BaselineFile) -> list[Me
             regressed = delta > tol_band
         else:  # lower
             regressed = -delta > tol_band
-        out.append(MetricDelta(
-            name=name, measured=m, baseline=base,
-            direction=direction, regressed=regressed,
-            rel_tol=rel_tol, abs_tol=abs_tol,
-        ))
+        out.append(
+            MetricDelta(
+                name=name,
+                measured=m,
+                baseline=base,
+                direction=direction,
+                regressed=regressed,
+                rel_tol=rel_tol,
+                abs_tol=abs_tol,
+            )
+        )
     return out
 
 
@@ -347,9 +429,7 @@ def format_report(deltas: list[MetricDelta]) -> str:
     for d in deltas:
         verdict = "REGRESS" if d.regressed else "ok"
         base_s = f"{d.baseline:.4f}" if d.baseline == d.baseline else "  N/A"
-        lines.append(
-            f"{d.name:40s} {d.measured:10.4f} {base_s:>10s} {verdict:>8s}"
-        )
+        lines.append(f"{d.name:40s} {d.measured:10.4f} {base_s:>10s} {verdict:>8s}")
     return "\n".join(lines)
 
 
@@ -365,20 +445,23 @@ def any_regression(deltas: list[MetricDelta]) -> bool:
 def _cli(argv: list[str] | None = None) -> int:
     import argparse
 
-    parser = argparse.ArgumentParser(
-        description="Cortex regression harness (audit F41)."
+    parser = argparse.ArgumentParser(description="Cortex regression harness (audit F41).")
+    parser.add_argument(
+        "--update-baseline",
+        action="store_true",
+        help="Re-record baseline.json after a deliberate, reviewed change.",
     )
     parser.add_argument(
-        "--update-baseline", action="store_true",
-        help="Re-record baseline.json after a deliberate, reviewed change."
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help="RNG seed (default: %(default)s — change only for ad-hoc work).",
     )
     parser.add_argument(
-        "--seed", type=int, default=DEFAULT_SEED,
-        help="RNG seed (default: %(default)s — change only for ad-hoc work)."
-    )
-    parser.add_argument(
-        "--baseline", type=Path, default=None,
-        help="Alternative baseline path (default: services/eval/baseline.json)."
+        "--baseline",
+        type=Path,
+        default=None,
+        help="Alternative baseline path (default: services/eval/baseline.json).",
     )
     args = parser.parse_args(argv)
 
@@ -392,8 +475,7 @@ def _cli(argv: list[str] | None = None) -> int:
     baseline = load_baseline(args.baseline)
     if baseline.seed != args.seed:
         logger.warning(
-            "Baseline seed %d differs from run seed %d; deltas may be noise "
-            "rather than signal.",
+            "Baseline seed %d differs from run seed %d; deltas may be noise rather than signal.",
             baseline.seed,
             args.seed,
         )
@@ -404,4 +486,5 @@ def _cli(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":  # pragma: no cover
     import sys
+
     sys.exit(_cli(sys.argv[1:]))

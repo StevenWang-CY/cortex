@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import logging
 import subprocess
-from datetime import UTC, datetime
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
+
+from cortex.application.clock import SYSTEM_CLOCK, Clock, utc_datetime
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +32,13 @@ class HandoverSnapshot:
     Writes a Markdown file to storage/handovers/{date}.md
     """
 
-    def __init__(self, storage_path: str = "./storage") -> None:
+    def __init__(
+        self,
+        storage_path: str = "./storage",
+        *,
+        clock: Clock | None = None,
+    ) -> None:
+        self._clock = clock or SYSTEM_CLOCK
         self._storage_path = Path(storage_path)
         self._handovers_dir = self._storage_path / "handovers"
         self._handovers_dir.mkdir(parents=True, exist_ok=True)
@@ -57,7 +65,7 @@ class HandoverSnapshot:
         Returns:
             Path to the written Markdown file.
         """
-        now = datetime.now(UTC)
+        now = utc_datetime(self._clock)
         date_str = now.strftime("%Y-%m-%d")
         time_str = now.strftime("%H:%M")
 
@@ -253,7 +261,8 @@ class HandoverSnapshot:
 
     def get_yesterday_handover(self) -> Path | None:
         """Get yesterday's handover file if it exists."""
-        from datetime import timedelta
-        yesterday = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
+        yesterday = (utc_datetime(self._clock) - timedelta(days=1)).strftime(
+            "%Y-%m-%d"
+        )
         path = self._handovers_dir / f"{yesterday}.md"
         return path if path.exists() else None

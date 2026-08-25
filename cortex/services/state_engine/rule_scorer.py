@@ -1,30 +1,75 @@
-"""
-State Engine — Rule-Based Scorer
+"""Evidence-aware deterministic support scorer.
 
-Computes per-state scores (HYPER, HYPO, FLOW, RECOVERY) from the unified
-FeatureVector using configurable weights and user baselines.
-
-Hyper-arousal score formula:
-    hyper_score = w1*pulse_elevation + w2*hrv_drop + w3*blink_suppression
-                + w4*posture_collapse + w5*mouse_thrash + w6*window_switch
-                + w7*workspace_complexity
-
-Default weights: w1=0.20, w2=0.15, w3=0.12, w4=0.08, w5=0.15, w6=0.15, w7=0.15
-
-All sub-scores are normalized to 0-1 range.
+The production path emits bounded heuristic scores, never probabilities or a
+diagnosis. Each score uses a fixed denominator, so removing or lowering the
+quality of evidence cannot increase its strength. Webcam-derived physiology,
+blink, and head/neck values are intentionally excluded pending the registered
+participant-held-out validation protocol.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 import numpy as np
 
 from cortex.libs.config.settings import StateConfig
-from cortex.libs.schemas.features import FeatureVector
-from cortex.libs.schemas.state import StateScores, UserBaselines
+from cortex.libs.schemas.features import FeatureName, FeatureValue, FeatureVector
+from cortex.libs.schemas.observations import MissingReason
+from cortex.libs.schemas.state import (
+    EstimateStatus,
+    FeatureContribution,
+    RuleEvaluation,
+    StateScores,
+    SupportScores,
+    SupportState,
+    UserBaselines,
+)
+from cortex.services.state_engine.feature_schema import ORDERED_FEATURES
+from cortex.services.state_engine.model_registry import deterministic_support_identity
 
 logger = logging.getLogger(__name__)
+
+
+_SUPPORT_WEIGHTS: dict[FeatureName, float] = {
+    FeatureName.MOUSE_VELOCITY_VARIANCE: 0.18,
+    FeatureName.CLICK_FREQUENCY: 0.06,
+    FeatureName.KEYSTROKE_INTERVAL_VARIANCE: 0.08,
+    FeatureName.CORRECTION_RATE_PER_100_KEYS: 0.16,
+    FeatureName.TAB_SWITCH_RATE_PER_MIN: 0.18,
+    FeatureName.SCROLL_BACK_RATE_PER_MIN: 0.12,
+    FeatureName.THRASHING_SCORE: 0.22,
+}
+_FLOW_WEIGHTS: dict[FeatureName, float] = {
+    FeatureName.MOUSE_VELOCITY_MEAN: 0.07,
+    FeatureName.MOUSE_VELOCITY_VARIANCE: 0.13,
+    FeatureName.CLICK_FREQUENCY: 0.05,
+    FeatureName.KEYPRESS_RATE_PER_MIN: 0.15,
+    FeatureName.KEYSTROKE_INTERVAL_VARIANCE: 0.09,
+    FeatureName.CORRECTION_RATE_PER_100_KEYS: 0.13,
+    FeatureName.TAB_SWITCH_RATE_PER_MIN: 0.14,
+    FeatureName.SCROLL_BACK_RATE_PER_MIN: 0.09,
+    FeatureName.THRASHING_SCORE: 0.15,
+}
+_UNDER_ENGAGED_WEIGHTS: dict[FeatureName, float] = {
+    FeatureName.INACTIVITY_SECONDS: 0.45,
+    FeatureName.MOUSE_VELOCITY_MEAN: 0.15,
+    FeatureName.CLICK_FREQUENCY: 0.10,
+    FeatureName.KEYPRESS_RATE_PER_MIN: 0.15,
+    FeatureName.TAB_SWITCH_RATE_PER_MIN: 0.15,
+}
+_PRODUCTION_FEATURE_NAMES = frozenset(
+    set(_SUPPORT_WEIGHTS) | set(_FLOW_WEIGHTS) | set(_UNDER_ENGAGED_WEIGHTS)
+)
+
+for _rule_name, _rule_weights in (
+    ("support_likely", _SUPPORT_WEIGHTS),
+    ("flow_like", _FLOW_WEIGHTS),
+    ("under_engaged", _UNDER_ENGAGED_WEIGHTS),
+):
+    if not np.isclose(sum(_rule_weights.values()), 1.0):
+        raise RuntimeError(f"{_rule_name} weights must sum to 1.0")
 
 
 class RuleScorer:
@@ -50,7 +95,6 @@ class RuleScorer:
         self._weights = self._config.weights
         # Optional tab category context for same-category discount
         self._tab_categories: list[str] | None = None
-        self._apnea_low_since: float | None = None
 
     @property
     def baselines(self) -> UserBaselines:
@@ -97,26 +141,348 @@ class RuleScorer:
         return most_common_count / len(cats)
 
     def compute_scores(self, fv: FeatureVector) -> StateScores:
-        """
-        Compute all state scores from a FeatureVector.
+        """Return the one-cycle uppercase projection of Level-A scores."""
 
-        Args:
-            fv: Unified 12-dimensional feature vector.
+        return self.evaluate(fv).scores.to_legacy()
 
-        Returns:
-            StateScores with flow, hypo, hyper, recovery scores.
-        """
-        hyper = self._compute_hyper_score(fv)
-        hypo = self._compute_hypo_score(fv)
-        flow = self._compute_flow_score(fv)
-        recovery = self._compute_recovery_score(fv, hyper, hypo, flow)
+    def evaluate(self, fv: FeatureVector) -> RuleEvaluation:
+        """Evaluate observed evidence under the registered Level-A rules."""
 
-        return StateScores(
-            flow=flow,
-            hypo=hypo,
-            hyper=hyper,
-            recovery=recovery,
+        features = self._canonical_features(fv)
+        contributions: list[FeatureContribution] = []
+        exclusions = [
+            f"{definition.name.value}: {definition.exclusion_reason}"
+            for definition in ORDERED_FEATURES
+            if definition.exclusion_reason is not None
+        ]
+
+        support, support_coverage, support_count = self._score_rule(
+            SupportState.SUPPORT_LIKELY,
+            _SUPPORT_WEIGHTS,
+            features,
+            self._support_transform,
+            contributions,
         )
+        flow, flow_coverage, flow_count = self._score_rule(
+            SupportState.FLOW_LIKE,
+            _FLOW_WEIGHTS,
+            features,
+            self._flow_transform,
+            contributions,
+        )
+        under, under_coverage, under_count = self._score_rule(
+            SupportState.UNDER_ENGAGED,
+            _UNDER_ENGAGED_WEIGHTS,
+            features,
+            self._under_engaged_transform,
+            contributions,
+        )
+
+        # Quiet input is ambiguous. Under-engaged requires an observed period
+        # of inactivity plus at least one corroborating behavior channel.
+        inactivity = features.get(FeatureName.INACTIVITY_SECONDS)
+        inactivity_strength = (
+            self._under_engaged_transform(
+                FeatureName.INACTIVITY_SECONDS, float(inactivity.value)
+            )
+            if inactivity is not None and inactivity.valid and inactivity.value is not None
+            else 0.0
+        )
+        if inactivity_strength <= 0.0 or under_count < 2:
+            under = 0.0
+
+        # Stable zero-valued streams do not establish steady activity.
+        # Require a recent-input observation and an affirmative interaction
+        # channel so telemetry availability cannot be mistaken for work.
+        recent_activity = bool(
+            inactivity is not None
+            and inactivity.valid
+            and inactivity.value is not None
+            and inactivity.value <= 30.0
+        )
+        affirmative_activity = any(
+            feature is not None
+            and feature.valid
+            and feature.value is not None
+            and float(feature.value) >= threshold
+            for feature, threshold in (
+                (features.get(FeatureName.MOUSE_VELOCITY_MEAN), 25.0),
+                (features.get(FeatureName.CLICK_FREQUENCY), 0.02),
+                (features.get(FeatureName.KEYPRESS_RATE_PER_MIN), 2.0),
+            )
+        )
+        if not recent_activity or not affirmative_activity:
+            flow = 0.0
+
+        minimum_coverage = 0.45
+        eligible = {
+            SupportState.SUPPORT_LIKELY: (
+                support if support_count >= 3 and support_coverage >= minimum_coverage else 0.0
+            ),
+            SupportState.FLOW_LIKE: (
+                flow if flow_count >= 3 and flow_coverage >= minimum_coverage else 0.0
+            ),
+            SupportState.UNDER_ENGAGED: (
+                under if under_count >= 2 and under_coverage >= minimum_coverage else 0.0
+            ),
+        }
+        coverage_by_state = {
+            SupportState.SUPPORT_LIKELY: support_coverage,
+            SupportState.UNDER_ENGAGED: under_coverage,
+            SupportState.FLOW_LIKE: flow_coverage,
+            SupportState.RECOVERING: 0.0,
+            SupportState.UNKNOWN: 0.0,
+        }
+        scores = SupportScores(
+            support_likely=eligible[SupportState.SUPPORT_LIKELY],
+            under_engaged=eligible[SupportState.UNDER_ENGAGED],
+            flow_like=eligible[SupportState.FLOW_LIKE],
+            # Recovery is a temporal relation and is owned by ScoreSmoother.
+            recovering=0.0,
+        )
+        dominant, strength = scores.dominant()
+        evidence_coverage = (
+            coverage_by_state[dominant] if dominant != SupportState.UNKNOWN else 0.0
+        )
+        valid_production_count = sum(
+            1
+            for name, feature in features.items()
+            if name in _PRODUCTION_FEATURE_NAMES and feature.valid
+        )
+        if fv.telemetry_seen_count < 5:
+            status = EstimateStatus.WARMING_UP
+            exclusions.append("Telemetry warm-up requires five observed snapshots.")
+        elif valid_production_count < 2 or not any(eligible.values()):
+            status = EstimateStatus.INSUFFICIENT_EVIDENCE
+        elif strength < 0.25:
+            status = EstimateStatus.INSUFFICIENT_EVIDENCE
+            exclusions.append("Observed patterns are too ambiguous for a support label.")
+        else:
+            status = EstimateStatus.ESTIMATED
+
+        return RuleEvaluation(
+            status=status,
+            scores=scores,
+            evidence_coverage=evidence_coverage,
+            state_coverage=coverage_by_state,
+            contributing_features=contributions,
+            exclusions=exclusions,
+            model=deterministic_support_identity(),
+        )
+
+    def _score_rule(
+        self,
+        state: SupportState,
+        weights: dict[FeatureName, float],
+        features: dict[FeatureName, FeatureValue],
+        transform: Callable[[FeatureName, float], float],
+        contributions: list[FeatureContribution],
+    ) -> tuple[float, float, int]:
+        score = 0.0
+        coverage = 0.0
+        observed_count = 0
+        for name, weight in weights.items():
+            feature = features.get(name)
+            if feature is None or not feature.valid or feature.value is None:
+                contributions.append(FeatureContribution(
+                    feature=name.value,
+                    support_state=state,
+                    direction="missing",
+                    contribution=0.0,
+                    quality=0.0,
+                    observed=False,
+                    note="Feature unavailable; it contributes neither evidence nor score.",
+                ))
+                continue
+            observed_count += 1
+            quality = float(feature.quality)
+            transformed = float(transform(name, float(feature.value)))
+            transformed = float(np.clip(transformed, 0.0, 1.0))
+            positive = weight * quality * transformed
+            counter = -weight * quality * (1.0 - transformed)
+            score += positive
+            coverage += weight * quality
+            contributions.append(FeatureContribution(
+                feature=name.value,
+                support_state=state,
+                direction="positive" if transformed >= 0.5 else "negative",
+                contribution=positive if transformed >= 0.5 else counter,
+                quality=quality,
+                observed=True,
+                note=(
+                    f"Fixed weight {weight:.2f}; transform={transformed:.3f}; "
+                    "score is quality-bounded and not renormalized."
+                ),
+            ))
+        return (
+            float(np.clip(score, 0.0, 1.0)),
+            float(np.clip(coverage, 0.0, 1.0)),
+            observed_count,
+        )
+
+    def _support_transform(self, name: FeatureName, value: float) -> float:
+        if name == FeatureName.MOUSE_VELOCITY_VARIANCE:
+            return self.score_mouse_thrash(value)
+        if name == FeatureName.CLICK_FREQUENCY:
+            return self._ramp(value, 0.5, 3.0)
+        if name == FeatureName.KEYSTROKE_INTERVAL_VARIANCE:
+            return self._ramp(value, 1_500.0, 8_000.0)
+        if name == FeatureName.CORRECTION_RATE_PER_100_KEYS:
+            return self._ramp(value, 8.0, 25.0)
+        if name == FeatureName.TAB_SWITCH_RATE_PER_MIN:
+            score = self.score_window_switch(value)
+            ratio = self._same_category_ratio()
+            return score * (1.0 - 0.5 * ratio) if ratio > 0.6 else score
+        if name == FeatureName.SCROLL_BACK_RATE_PER_MIN:
+            return self._ramp(value, 10.0, 40.0)
+        if name == FeatureName.THRASHING_SCORE:
+            return value
+        return 0.0
+
+    def _flow_transform(self, name: FeatureName, value: float) -> float:
+        if name == FeatureName.MOUSE_VELOCITY_MEAN:
+            return self._band(value, 100.0, 800.0, 1_500.0)
+        if name == FeatureName.MOUSE_VELOCITY_VARIANCE:
+            baseline = max(1.0, self._baselines.mouse_variance_baseline)
+            return 1.0 - self._ramp(value / baseline, 1.0, 2.5)
+        if name == FeatureName.CLICK_FREQUENCY:
+            return self._band(value, 0.05, 1.5, 3.0)
+        if name == FeatureName.KEYPRESS_RATE_PER_MIN:
+            return self._band(value, 2.0, 120.0, 300.0)
+        if name == FeatureName.KEYSTROKE_INTERVAL_VARIANCE:
+            return 1.0 - self._ramp(value, 1_500.0, 8_000.0)
+        if name == FeatureName.CORRECTION_RATE_PER_100_KEYS:
+            return 1.0 - self._ramp(value, 8.0, 25.0)
+        if name == FeatureName.TAB_SWITCH_RATE_PER_MIN:
+            return self._band(value, 0.5, 4.0, 10.0)
+        if name == FeatureName.SCROLL_BACK_RATE_PER_MIN:
+            return 1.0 - self._ramp(value, 10.0, 40.0)
+        if name == FeatureName.THRASHING_SCORE:
+            return 1.0 - value
+        return 0.0
+
+    @staticmethod
+    def _under_engaged_transform(name: FeatureName, value: float) -> float:
+        if name == FeatureName.INACTIVITY_SECONDS:
+            return RuleScorer._ramp(value, 30.0, 300.0)
+        if name == FeatureName.MOUSE_VELOCITY_MEAN:
+            return 1.0 - RuleScorer._ramp(value, 25.0, 250.0)
+        if name == FeatureName.CLICK_FREQUENCY:
+            return 1.0 - RuleScorer._ramp(value, 0.05, 0.75)
+        if name == FeatureName.KEYPRESS_RATE_PER_MIN:
+            return 1.0 - RuleScorer._ramp(value, 2.0, 60.0)
+        if name == FeatureName.TAB_SWITCH_RATE_PER_MIN:
+            return 1.0 - RuleScorer._ramp(value, 0.2, 4.0)
+        return 0.0
+
+    @staticmethod
+    def _ramp(value: float, low: float, high: float) -> float:
+        if high <= low:
+            raise ValueError("ramp high bound must exceed low bound")
+        return float(np.clip((value - low) / (high - low), 0.0, 1.0))
+
+    @staticmethod
+    def _band(value: float, low: float, high: float, outer_high: float) -> float:
+        if value < low:
+            return float(np.clip(value / max(low, 1e-6), 0.0, 1.0))
+        if value <= high:
+            return 1.0
+        return 1.0 - RuleScorer._ramp(value, high, outer_high)
+
+    def _canonical_features(self, fv: FeatureVector) -> dict[FeatureName, FeatureValue]:
+        if fv.features:
+            return dict(fv.features)
+
+        # Decode-only bridge for tests and one-release callers still sending
+        # the flat v1 shape. Presence is inferred only from an explicit sample
+        # count or a non-default telemetry value; zeros alone never fabricate
+        # an available source.
+        telemetry_present = fv.telemetry_seen_count > 0 or any((
+            fv.mouse_velocity_mean != 0.0,
+            fv.mouse_velocity_variance != 0.0,
+            fv.click_frequency != 0.0,
+            fv.keypress_rate_per_min != 0.0,
+            fv.keystroke_interval_variance != 0.0,
+            fv.correction_rate_per_100_keys is not None,
+            fv.tab_switch_frequency != 0.0,
+            fv.scroll_back_rate_per_min is not None,
+            fv.thrashing_score != 0.0,
+        ))
+
+        def legacy(value: float | None, *, present: bool, version: str) -> FeatureValue:
+            if present and value is not None:
+                return FeatureValue(
+                    value=float(value), valid=True, quality=1.0, age_ms=0,
+                    source_window_ms=15_000, algorithm_version=version,
+                )
+            return FeatureValue(
+                valid=False, quality=0.0, age_ms=0, source_window_ms=15_000,
+                algorithm_version=version,
+                missing_reason=MissingReason.SOURCE_DISCONNECTED,
+            )
+
+        values = {
+            FeatureName.HEART_RATE_BPM: legacy(
+                fv.hr, present=fv.hr is not None, version="legacy-flat-v1"
+            ),
+            FeatureName.BLINK_RATE_PER_MIN: legacy(
+                fv.blink_rate,
+                present=fv.blink_rate is not None,
+                version="legacy-flat-v1",
+            ),
+            FeatureName.HEAD_NECK_FLEXION_SCORE: legacy(
+                fv.head_neck_flexion_score,
+                present=fv.head_neck_proxy_available,
+                version="legacy-flat-v1",
+            ),
+            FeatureName.MOUSE_VELOCITY_MEAN: legacy(
+                fv.mouse_velocity_mean, present=telemetry_present, version="legacy-flat-v1"
+            ),
+            FeatureName.MOUSE_VELOCITY_VARIANCE: legacy(
+                fv.mouse_velocity_variance,
+                present=telemetry_present,
+                version="legacy-flat-v1",
+            ),
+            FeatureName.CLICK_FREQUENCY: legacy(
+                fv.click_frequency, present=telemetry_present, version="legacy-flat-v1"
+            ),
+            FeatureName.KEYPRESS_RATE_PER_MIN: legacy(
+                fv.keypress_rate_per_min,
+                present=telemetry_present,
+                version="legacy-flat-v1",
+            ),
+            FeatureName.KEYSTROKE_INTERVAL_VARIANCE: legacy(
+                fv.keystroke_interval_variance,
+                present=telemetry_present,
+                version="legacy-flat-v1",
+            ),
+            FeatureName.CORRECTION_RATE_PER_100_KEYS: legacy(
+                fv.correction_rate_per_100_keys,
+                present=telemetry_present,
+                version="legacy-flat-v1",
+            ),
+            FeatureName.INACTIVITY_SECONDS: legacy(
+                fv.inactivity_seconds,
+                present=telemetry_present,
+                version="legacy-flat-v1",
+            ),
+            FeatureName.TAB_SWITCH_RATE_PER_MIN: legacy(
+                fv.tab_switch_frequency,
+                present=telemetry_present,
+                version="legacy-flat-v1",
+            ),
+            FeatureName.SCROLL_BACK_RATE_PER_MIN: legacy(
+                fv.scroll_back_rate_per_min,
+                present=telemetry_present,
+                version="legacy-flat-v1",
+            ),
+            FeatureName.THRASHING_SCORE: legacy(
+                fv.thrashing_score,
+                present=telemetry_present and fv.thrashing_score != 0.0,
+                version="legacy-flat-v1",
+            ),
+        }
+        return values
 
     def _compute_hyper_score(self, fv: FeatureVector) -> float:
         """
@@ -218,15 +584,6 @@ class RuleScorer:
             scores.append(0.3)
         elif fv.telemetry_seen_count >= 5:
             scores.append(0.0)
-
-        # Screen apnea indicator (low respiration + fixation)
-        apnea = self.score_screen_apnea(
-            fv.respiration_rate,
-            fv.blink_rate,
-            timestamp=fv.timestamp,
-        )
-        if apnea > 0.3:
-            scores.append(apnea)
 
         if not scores:
             return 0.0
@@ -403,40 +760,6 @@ class RuleScorer:
             score *= 0.3
 
         return score
-
-    def score_screen_apnea(
-        self,
-        respiration_rate: float | None,
-        blink_rate: float | None,
-        *,
-        timestamp: float | None = None,
-    ) -> float:
-        """
-        Score screen apnea: respiration_rate < 8 AND blink suppression.
-        Returns 0-1 indicating screen apnea severity.
-        """
-        if respiration_rate is None:
-            return 0.0
-
-        resp_score = 0.0
-        if respiration_rate < self._baselines.resp_baseline * 0.5:  # < half baseline
-            resp_score = 1.0
-        elif respiration_rate < self._baselines.resp_baseline * 0.7:
-            resp_score = (self._baselines.resp_baseline * 0.7 - respiration_rate) / (self._baselines.resp_baseline * 0.2)
-
-        # Combine with blink suppression (low blink = fixating = apnea risk)
-        blink_score = self.score_blink_suppression(blink_rate)
-
-        # Both must be present for screen apnea
-        if resp_score > 0.3 and blink_score > 0.3:
-            now = float(timestamp or 0.0)
-            if self._apnea_low_since is None:
-                self._apnea_low_since = now
-            elapsed = max(0.0, now - self._apnea_low_since)
-            sustain = min(1.0, elapsed / 30.0)  # HEURISTIC: sustained >=30s.
-            return float(np.clip((0.6 * resp_score + 0.4 * blink_score) * sustain, 0.0, 1.0))
-        self._apnea_low_since = None
-        return 0.0
 
     def score_posture_collapse(
         self, forward_lean: float | None, shoulder_drop: float | None,

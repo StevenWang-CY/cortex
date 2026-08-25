@@ -100,7 +100,7 @@ def test_why_copy_is_substantive(wizard):
     keyword guards against future copy edits that silently drop the
     rationale (e.g. an accidental empty-string default)."""
     pinned = {
-        wizard._camera_step: "facial cues",
+        wizard._camera_step: "camera-relative",
         wizard._accessibility_step: "system-wide events",
         wizard._llm_step: "macOS Keychain",
         wizard._extensions_step: "browser",

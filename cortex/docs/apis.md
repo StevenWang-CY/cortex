@@ -6,7 +6,10 @@ Cortex exposes a REST API on `http://127.0.0.1:9472` and a WebSocket server on `
 
 Base URL: `http://127.0.0.1:9472`
 
-All request and response bodies are JSON. Timestamps use monotonic seconds (`time.monotonic()`).
+All request and response bodies are JSON. Legacy v1 payloads contain a bare
+`timestamp` whose clock varies by endpoint and must not be compared across
+processes. New v2 payloads use explicit `observed_at_unix_ms`,
+`observed_at_mono_ns`, and `boot_id`; see the compatibility notes below.
 
 ### Authentication
 
@@ -38,13 +41,19 @@ Health check for all registered services. Capability token is optional.
 
 #### `GET /status/current`
 
-Current cognitive state, confidence, and signal quality.
+Current legacy support label, heuristic score, and signal quality. The
+`confidence` name is retained for wire compatibility; it is not a calibrated
+probability.
 
 **Response:**
 ```json
 {
   "state": "FLOW",
+  "support_state": "flow_like",
+  "estimate_status": "estimated",
   "confidence": 0.87,
+  "evidence_strength": 0.87,
+  "evidence_coverage": 0.82,
   "signal_quality": {
     "physio": 0.92,
     "kinematics": 0.88,
@@ -149,25 +158,27 @@ All feature endpoints return `{ "status": "ok", "timestamp": <float> }`.
 
 #### `POST /state/infer`
 
-Compute cognitive state from a fused feature vector.
+Compute an evidence-aware deterministic support estimate. Named
+`FeatureValue` entries are canonical; flat fields are decode-only. Every named
+entry carries validity, quality, age, source-window exposure, algorithm
+version, and a missing reason when invalid.
 
 **Request body:**
 ```json
 {
   "feature_vector": {
-    "pulse_norm": 0.3,
-    "hrv_norm": 0.6,
-    "blink_norm": 0.5,
-    "posture_norm": 0.2,
-    "mouse_velocity_norm": 0.4,
-    "mouse_jerk_norm": 0.1,
-    "click_burst_norm": 0.1,
-    "keyboard_burst_norm": 0.2,
-    "inactivity_norm": 0.05,
-    "window_switch_norm": 0.3,
-    "backspace_norm": 0.05,
-    "complexity_norm": 0.4,
-    "timestamp": 1000.5
+    "timestamp": 1000.5,
+    "telemetry_seen_count": 5,
+    "features": {
+      "keypress_rate_per_min": {
+        "value": 60.0,
+        "valid": true,
+        "quality": 1.0,
+        "age_ms": 0,
+        "source_window_ms": 15000,
+        "algorithm_version": "input-aggregation-v2"
+      }
+    }
   },
   "signal_quality": {
     "physio": 0.9,
@@ -182,19 +193,31 @@ Compute cognitive state from a fused feature vector.
 ```json
 {
   "estimate": {
-    "state": "FLOW",
-    "confidence": 0.87,
+    "state": "UNKNOWN",
+    "support_state": "unknown",
+    "status": "insufficient_evidence",
+    "confidence": 0.0,
     "scores": {
-      "flow": 0.87,
-      "hypo": 0.05,
-      "hyper": 0.08,
+      "flow": 0.0,
+      "hypo": 0.0,
+      "hyper": 0.0,
       "recovery": 0.0
     },
-    "reasons": ["Good HRV", "Normal blink rate", "Steady input"],
+    "support_scores": {
+      "support_likely": 0.0,
+      "under_engaged": 0.0,
+      "flow_like": 0.0,
+      "recovering": 0.0
+    },
+    "evidence_coverage": 0.0,
+    "probabilities": null,
+    "reasons": ["Not enough current evidence for a support estimate"],
     "signal_quality": { "physio": 0.9, "kinematics": 0.85, "telemetry": 0.95, "overall": 0.9 },
     "timestamp": 1000.5,
-    "dwell_seconds": 45.2
+    "dwell_seconds": 0.0
   },
+  "source": "rules",
+  "degraded": true,
   "timestamp": 1000.52
 }
 ```
@@ -253,9 +276,80 @@ Build task context from workspace adapters.
 
 ### LLM Planning
 
+External planning is network-off by default. The privacy routes below require
+the same local bearer capability as other sensitive routes. Preview creation
+does not call a provider; confirmation burns the handle before the external
+await. See [`privacy.md`](privacy.md) for the field catalog and retention
+contract.
+
+#### `GET /privacy/context/status`
+
+Returns `planner_mode`, whether configuration permits an external transport,
+the number of live prepared previews, provider, and conservative retention
+disclosure. It never probes the provider.
+
+#### `POST /privacy/context/preview/current`
+
+Creates an exact redacted preview from the daemon's current in-memory
+`TaskContext` and `StateEstimate`. The caller supplies only `selection`, an
+optional template/constraints object, and an optional user-authored note.
+
+```json
+{
+  "selection": {
+    "workspace_aggregates": true,
+    "support_estimate": false,
+    "user_goal": true,
+    "editor_metadata": true,
+    "editor_content": false,
+    "terminal_content": false,
+    "browser_metadata": true,
+    "browser_content": false,
+    "learned_preferences": false,
+    "extra_context": false
+  },
+  "extra_context": ""
+}
+```
+
+The response includes the exact outbound context/prompt, field disclosures,
+redaction/omission counts, encoded size, destination/model, provider caveat,
+expiry, and one-time `preview_id`. `raw_context_retained` is false; the exact
+prepared redacted payload is retained in memory until confirmation,
+cancellation, eviction, or expiry (maximum 60 seconds).
+
+#### `POST /privacy/context/preview`
+
+Developer equivalent of `/current` that accepts a caller-supplied local
+`state_estimate` and `task_context`. It has the same no-network semantics and
+is useful for contract tests or an explicitly constructed local client.
+
+#### `POST /privacy/context/confirm`
+
+```json
+{
+  "preview_id": "ctx_<opaque-random-handle>",
+  "confirmation_phrase": "SEND PREVIEWED CONTEXT ONCE"
+}
+```
+
+Both fields are required. The handle is consumed on every attempt. Missing,
+expired, cancelled, replayed, or wrongly confirmed handles return `409` and do
+not send. A successful response contains a schema-validated proposal and
+`authority_granted: false`; workspace actions require a separate transaction.
+
+#### `DELETE /privacy/context/preview/{preview_id}`
+
+Idempotently burns a prepared handle without contacting the provider. The
+response reports whether the handle was still live, always reports
+`sent: false`, and grants no authority.
+
 #### `POST /llm/plan`
 
-Request an intervention plan from the LLM engine.
+Request an intervention plan from the configured engine. In `no_llm` this is a
+local deterministic plan. In external mode, omitting a valid preview handle
+and confirmation yields a deterministic no-content fallback rather than an
+implicit model request.
 
 **Request body:**
 ```json
@@ -299,7 +393,11 @@ Request an intervention plan from the LLM engine.
 
 #### `POST /intervention/apply`
 
-Apply an intervention plan to the workspace.
+Submit an intervention plan to the authority boundary. In the shipping
+`suggest_only` mode the route validates and sanitizes the plan, broadcasts a
+presentation-only proposal, performs no adapter call or snapshot, and returns
+`applied: false`. Legacy `authorized` behavior remains experimental until
+manifest-bound authorization and durable action receipts are complete.
 
 **Request body:**
 ```json
@@ -308,21 +406,13 @@ Apply an intervention plan to the workspace.
 }
 ```
 
-**Response:**
+**Safe-default response:**
 ```json
 {
-  "applied": true,
-  "snapshot": {
-    "intervention_id": "int_a1b2c3d4e5f6",
-    "timestamp": 1002.2,
-    "fold_states": [],
-    "editor_visible_range": [45, 95],
-    "tab_visibility": [],
-    "active_tab_id": null,
-    "overlay_present": false,
-    "terminal_scroll_position": null
-  },
-  "timestamp": 1002.3
+  "applied": false,
+  "snapshot": null,
+  "confirmation": null,
+  "correlation_id": "..."
 }
 ```
 
@@ -365,25 +455,26 @@ Valid `user_action` values: `dismissed`, `engaged`, `snoozed`, `timed_out`, `nat
 
 #### `GET /api/stress-integral`
 
-Current cumulative standardized HRV-deficit integral (the "biological
-pomodoro"). When ``current_value / threshold ≥ 1`` the daemon recommends
-a break.
+Compatibility endpoint for the removed physiology-triggered break feature.
+It is side-effect free and always reports unavailable.
 
 **Response:**
 ```json
 {
-  "current_value": 12.5,
-  "threshold": 30.0,
+  "status": "unavailable",
+  "unavailable_reason": "validation_required",
+  "current_value": 0.0,
+  "threshold": 0.0,
   "should_break": false,
   "sensitivity_multiplier": 1.0,
-  "timestamp": 1000.5
+  "timestamp": 1787592000.5
 }
 ```
 
 #### `GET /api/helpfulness/summary`
 
-Summary of intervention helpfulness from the contextual-bandit feedback
-loop.
+Legacy descriptive engagement/dismissal summary. It does not update the
+production policy and is not causal evidence.
 
 **Response:**
 ```json
@@ -505,9 +596,16 @@ The full list below is the canonical message-type catalog (Python source of trut
 
 **Inbound (client → daemon):** `AUTH`, `IDENTIFY`, `USER_ACTION`, `ACTION_EXECUTE`, `USER_RATING`, `CONTEXT_RESPONSE`, `SETTINGS_SYNC`, `ACTIVITY_SYNC`, `TAB_RELEVANCE_FEEDBACK`, `LEETCODE_CONTEXT_UPDATE`, `INTERVENTION_APPLIED`, `SHUTDOWN`.
 
-**Outbound (daemon → client):** `AUTH_OK`, `STATE_UPDATE`, `INTERVENTION_TRIGGER`, `INTERVENTION_RESTORE`, `CONTEXT_REQUEST`, `ACTIVE_RECALL`, `BREATHING_OVERLAY`, `PRE_BREAK_WARNING`, `MORNING_BRIEFING`, `COPILOT_THROTTLE`, `AMBIENT_STATE_UPDATE`.
+**Outbound (daemon → client):** the generated catalog includes
+`AUTH_OK`, `STATE_UPDATE`, `INTERVENTION_TRIGGER`,
+`INTERVENTION_RESTORE`, `CONTEXT_REQUEST`, `ACTIVE_RECALL`,
+`BREATHING_OVERLAY`, `PRE_BREAK_WARNING`, `BREAK_RECOMMENDATION`,
+`MORNING_BRIEFING`, `COPILOT_THROTTLE`, and
+`AMBIENT_STATE_UPDATE`. The three break/respiration messages are
+decode-only compatibility entries and product clients intentionally ignore
+them.
 
-**LeetCode cues (daemon → chrome, `target_client_types=["chrome"]`):** `LEETCODE_SHOW_SCRATCHPAD`, `LEETCODE_SHOW_PATTERN_LADDER`, `LEETCODE_SHOW_LOCKOUT`, `LEETCODE_SHOW_CONSOLIDATION`, `LEETCODE_SHOW_SUBMISSION_GATE`, `LEETCODE_SHOW_SOLUTION_FRICTION`, `LEETCODE_SHOW_SESSION_BRIEFING`, `LEETCODE_LOCK_EDITOR`, `LEETCODE_INTERCEPT_SUBMIT`, `LEETCODE_GATE_SOLUTIONS`, `LEETCODE_AI_RESTATEMENT_CHECK`, `LEETCODE_AI_COMPREHENSION_CHECK`, `LEETCODE_AI_HYPOTHESIS_CHECK`, `LEETCODE_AI_STUCK_ANALYSIS`, `LEETCODE_AI_SESSION_BRIEFING`.
+**LeetCode cues (daemon → chrome, `target_client_types=["chrome"]`):** `LEETCODE_SHOW_SCRATCHPAD`, `LEETCODE_SHOW_PATTERN_LADDER`, `LEETCODE_SHOW_LOCKOUT`, `LEETCODE_SHOW_CONSOLIDATION`, `LEETCODE_SHOW_SUBMISSION_GATE`, and `LEETCODE_SHOW_SOLUTION_FRICTION`. The catalogue contains only messages with a production producer or consumer; proposed capabilities do not reserve wire literals.
 
 Selected payload shapes follow.
 
@@ -534,7 +632,7 @@ Broadcast every 500ms to all connected clients.
       "overall": 0.9
     },
     "dwell_seconds": 45.2,
-    "reasons": ["Good HRV", "Normal blink rate"]
+    "reasons": ["Stable visible-eye activity", "Steady input"]
   },
   "timestamp": 12345.6,
   "sequence": 42
@@ -543,7 +641,8 @@ Broadcast every 500ms to all connected clients.
 
 #### `INTERVENTION_TRIGGER` (server → client)
 
-Sent when the intervention engine triggers an intervention.
+Legacy name for a presentation-only proposal in `suggest_only` mode.
+Receiving this message is never authorization to mutate a workspace.
 
 ```json
 {
@@ -559,12 +658,12 @@ Sent when the intervention engine triggers an intervention.
       "Check the expected type",
       "Update the value"
     ],
-    "hide_targets": ["sidebar", "terminal"],
+    "hide_targets": [],
     "ui_plan": {
-      "dim_background": true,
+      "dim_background": false,
       "show_overlay": true,
-      "fold_unrelated_code": true,
-      "intervention_type": "simplified_workspace"
+      "fold_unrelated_code": false,
+      "intervention_type": "overlay_only"
     },
     "tone": "direct"
   },
@@ -618,7 +717,8 @@ Sent by clients to update settings, or by the server to broadcast settings chang
   "payload": {
     "consent_levels": { "close_tabs": 3, "fold_code": 4 },
     "quiet_mode": false,
-    "max_autonomy": "REVERSIBLE_ACT"
+    "max_autonomy": "SUGGEST",
+    "execution_mode": "suggest_only"
   },
   "timestamp": 12350.0,
   "sequence": 2

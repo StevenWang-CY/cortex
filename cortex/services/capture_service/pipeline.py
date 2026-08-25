@@ -7,7 +7,7 @@ quality-gated FrameMeta + landmarks to an async output queue.
 Features:
 - Full webcam → face → quality pipeline
 - Adaptive frame skip when processing falls behind
-- Quality-gated output (only high-quality frames are forwarded)
+- Scheduled observation output (valid, missing, rejected, and stale)
 - Structured output for downstream consumers (physio, kinematics)
 - Graceful lifecycle management
 
@@ -18,21 +18,35 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from typing import cast
+from uuid import UUID, uuid4
 
 import cv2
 import numpy as np
+from numpy.typing import NDArray
 
+from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 from cortex.libs.config.settings import CaptureConfig, get_config
 from cortex.libs.schemas.features import FrameMeta
+from cortex.libs.schemas.observations import (
+    CameraFrameObservation,
+    CameraIdentity,
+    CameraObservationEnvelope,
+    MissingReason,
+    ObservationSource,
+    ObservationValidity,
+)
 from cortex.services.capture_service.face_tracker import FaceTracker, FaceTrackingResult
+from cortex.services.capture_service.observation_buffer import ObservationBuffer
 from cortex.services.capture_service.quality import FrameQuality, FrameQualityScorer
 from cortex.services.capture_service.webcam import CapturedFrame, WebcamCapture
 
 logger = logging.getLogger(__name__)
+
+_CAPTURE_ALGORITHM_VERSION = "capture-integrity/2.0.0"
 
 
 @dataclass(frozen=True)
@@ -40,11 +54,13 @@ class PipelineOutput:
     """Output of the capture pipeline for downstream consumers."""
 
     frame_meta: FrameMeta
-    landmarks: np.ndarray | None  # (468, 3) normalized, or None
-    landmarks_px: np.ndarray | None  # (468, 2) pixel coords, or None
-    frame: np.ndarray  # BGR image (kept in memory only, never saved)
+    landmarks: NDArray[np.float32] | None  # (468, 3) normalized, or None
+    landmarks_px: NDArray[np.float32] | None  # (468, 2) pixel coords, or None
+    frame: NDArray[np.uint8] | None  # BGR image (kept in memory only, never saved)
     quality: FrameQuality
     tracking: FaceTrackingResult
+    observation: CameraObservationEnvelope
+    camera_identity: CameraIdentity
 
 
 class AdaptiveFrameSkipper:
@@ -136,12 +152,15 @@ class CapturePipeline:
         self,
         config: CaptureConfig | None = None,
         output_queue_size: int = 30,
+        *,
+        clock: Clock | None = None,
     ) -> None:
         self._config = config or get_config().capture
+        self._clock = clock or SYSTEM_CLOCK
         self._output_queue_size = output_queue_size
 
         # Components
-        self._webcam = WebcamCapture(self._config)
+        self._webcam = WebcamCapture(self._config, clock=self._clock)
         self._face_tracker = FaceTracker(self._config)
         self._quality_scorer = FrameQualityScorer(self._config)
         self._frame_skipper = AdaptiveFrameSkipper(self._config.fps)
@@ -175,6 +194,14 @@ class CapturePipeline:
         # rate-limit the warning to one per drop-window so a sustained
         # backpressure spike doesn't spam the log.
         self._last_frame_drop_warning_at: float = 0.0
+        self._observation_buffer: ObservationBuffer[CameraObservationEnvelope] = ObservationBuffer(
+            max_age_seconds=self._config.observation_buffer_seconds,
+            max_items=self._config.observation_buffer_max_items,
+        )
+        self._legacy_source_instance_id = uuid4()
+        self._last_captured: CapturedFrame | None = None
+        self._observations_missing = 0
+        self._observations_rejected = 0
 
     @property
     def is_running(self) -> bool:
@@ -220,6 +247,12 @@ class CapturePipeline:
         """
         return int(getattr(self._webcam, "frames_dropped", 0) or 0)
 
+    @property
+    def observations(self) -> tuple[CameraObservationEnvelope, ...]:
+        """Bounded acquisition-order observation snapshot for diagnostics/replay."""
+
+        return self._observation_buffer.snapshot()
+
     def get_diagnostics(self) -> dict[str, int | float]:
         """B3 (Phase 4.1): operator-facing diagnostics snapshot.
 
@@ -239,6 +272,9 @@ class CapturePipeline:
             "frames_skipped": self._frame_skipper.total_skipped,
             "frames_dropped_total": self._frames_dropped_total,
             "frames_dropped_input": self.frames_dropped_input,
+            "observations_buffered": len(self._observation_buffer),
+            "observations_missing": self._observations_missing,
+            "observations_rejected": self._observations_rejected,
         }
 
     def _record_frame_drop(self) -> None:
@@ -250,7 +286,7 @@ class CapturePipeline:
         exceeded.
         """
         self._frames_dropped_total += 1
-        now = time.monotonic()
+        now = monotonic_seconds(self._clock)
         window = self._frame_drop_window_seconds
         self._frame_drop_timestamps.append(now)
         cutoff = now - window
@@ -284,6 +320,7 @@ class CapturePipeline:
         # Initialize components
         self._face_tracker.initialize()
         await self._webcam.start()
+        self._last_captured = None
 
         # Start pipeline processing loop
         self._running = True
@@ -352,54 +389,39 @@ class CapturePipeline:
                 if captured is None:
                     continue
 
+                for missing in self._synthesize_input_queue_gaps(captured):
+                    await self._publish_output(self._process_frame(missing))
+
                 # Adaptive frame skip
                 if self._frame_skipper.should_skip(captured.sequence):
+                    await self._publish_output(
+                        self._missing_output(
+                            captured,
+                            validity=ObservationValidity.REJECTED,
+                            reason=MissingReason.FRAME_DROPPED,
+                        )
+                    )
                     continue
 
                 # Process frame
-                t_start = time.monotonic()
+                t_start = self._clock.monotonic_ns()
                 output = self._process_frame(captured)
-                processing_time = time.monotonic() - t_start
+                processing_time = max(
+                    0.0,
+                    (self._clock.monotonic_ns() - t_start) / 1_000_000_000.0,
+                )
 
                 # Update adaptive skip with processing latency
                 self._frame_skipper.update_latency(processing_time)
 
-                if output is None:
-                    continue
-
-                # Publish to output queue
-                if self._output_queue.full():
-                    # Drop oldest to maintain real-time
-                    try:
-                        self._output_queue.get_nowait()
-                        # B3 (Phase 4.1): record the eviction.
-                        self._record_frame_drop()
-                    except asyncio.QueueEmpty:
-                        # Race: another consumer drained the queue between
-                        # the ``full()`` check and ``get_nowait`` call.
-                        # Benign — fall through to the put_nowait below.
-                        logger.debug(
-                            "frame drop race: queue drained between full() and get_nowait",
-                        )
-
-                try:
-                    self._output_queue.put_nowait(output)
-                except asyncio.QueueFull:
-                    # B3 (Phase 4.1): even after dropping the oldest the
-                    # queue is still full (consumer added another
-                    # producer concurrently?). Record this as a drop too
-                    # so the counter reflects ALL frames lost.
-                    self._record_frame_drop()
-                    logger.debug(
-                        "frame drop: put_nowait racing with refill",
-                    )
+                await self._publish_output(output)
 
         except asyncio.CancelledError:
             pass
         except Exception:
             logger.exception("Error in capture pipeline loop")
 
-    def _process_frame(self, captured: CapturedFrame) -> PipelineOutput | None:
+    def _process_frame(self, captured: CapturedFrame) -> PipelineOutput:
         """
         Process a single captured frame through face tracking and quality scoring.
 
@@ -409,7 +431,15 @@ class CapturePipeline:
         Returns:
             PipelineOutput if frame passes quality gate, None otherwise.
         """
+        if captured.frame is None:
+            return self._missing_output(
+                captured,
+                validity=ObservationValidity.MISSING,
+                reason=captured.missing_reason or MissingReason.UNKNOWN,
+            )
         frame = captured.frame
+        event = self._event_fields(captured)
+        camera_identity = self._camera_identity(captured)
 
         # audit Phase-I: convert BGR→RGB and BGR→GRAY exactly once per
         # frame and share the cached views between detectors. The
@@ -418,33 +448,36 @@ class CapturePipeline:
         # would otherwise convert twice — once per metric). On an
         # M-series Mac at 30 Hz / 640×480 this halves the per-frame
         # cvtColor cost.
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        rgb_frame = cast(
+            NDArray[np.uint8], cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        )
+        gray_frame = cast(
+            NDArray[np.uint8], cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        )
 
         # Step 1: Face tracking
-        tracking = self._face_tracker.process_frame(frame, rgb_frame=rgb_frame)
-
-        # Step 2: Compute motion displacement
-        nose_displacement = 0.0
-        if tracking.face_detected and tracking.landmarks_px is not None:
-            nose_displacement = self._face_tracker.compute_nose_tip_displacement(
-                tracking.landmarks_px
-            )
+        tracking = self._face_tracker.process_frame(
+            frame,
+            rgb_frame=rgb_frame,
+            capture_mono_ns=event[1],
+        )
 
         # Step 3: Quality scoring
         quality = self._quality_scorer.score(
-            frame, nose_displacement, gray_frame=gray_frame,
+            frame,
+            tracking.nose_displacement_px,
+            gray_frame=gray_frame,
+            motion_face_widths_per_second=tracking.motion_face_widths_per_second,
         )
 
         # Step 4: Build FrameMeta.
-        # P1 Pipeline A: stamp ``low_quality`` directly on the meta so
-        # downstream consumers do not have to read the full QualityScore
-        # struct. The rPPG window in ``runtime_daemon._rgb_history`` now
-        # skips the RGB append (or substitutes a NaN sentinel) when this
-        # flag is True instead of polluting the bvp signal with frames
-        # the quality scorer already rejected.
+        # Keep the deprecated low_quality mirror while the canonical
+        # ObservationEnvelope carries validity, reason, and components.
         frame_meta = FrameMeta(
             timestamp=captured.timestamp,
+            observed_at_unix_ms=event[0],
+            observed_at_mono_ns=event[1],
+            boot_id=event[2],
             face_detected=tracking.face_detected,
             face_confidence=tracking.confidence,
             brightness_score=quality.brightness_score,
@@ -471,6 +504,55 @@ class CapturePipeline:
         if not tracking.face_detected and not tracking.face_stable:
             self._frames_no_face += 1
 
+        validity = ObservationValidity.VALID
+        reason: MissingReason | None = None
+        if tracking.is_replayed:
+            validity = ObservationValidity.STALE
+            reason = MissingReason.FRAME_DROPPED
+        elif tracking.detector_timestamp_adjusted:
+            validity = ObservationValidity.REJECTED
+            reason = MissingReason.ARTIFACT
+        elif not tracking.face_detected or tracking.landmarks_px is None:
+            validity = ObservationValidity.MISSING
+            reason = MissingReason.NO_FACE
+        elif not quality.passed:
+            validity = ObservationValidity.REJECTED
+            reason = self._quality_scorer.rejection_reason(quality)
+
+        components = self._quality_components(quality, tracking)
+        observation_quality = min(components.values()) if components else 0.0
+        value = (
+            CameraFrameObservation(
+                width=int(frame.shape[1]),
+                height=int(frame.shape[0]),
+                face_detected=tracking.face_detected,
+                face_stable=tracking.face_stable,
+                face_confidence=tracking.confidence,
+                detector_replayed=tracking.is_replayed,
+                detector_timestamp_adjusted=tracking.detector_timestamp_adjusted,
+                motion_face_widths_per_second=(
+                    tracking.motion_face_widths_per_second
+                ),
+                camera_identity=camera_identity,
+            )
+            if validity == ObservationValidity.VALID
+            else None
+        )
+        observation = CameraObservationEnvelope(
+            source=ObservationSource.CAMERA,
+            source_instance_id=self._source_instance_id(captured),
+            sequence=captured.sequence,
+            observed_at_unix_ms=event[0],
+            observed_at_mono_ns=event[1],
+            boot_id=event[2],
+            value=value,
+            validity=validity,
+            missing_reason=reason,
+            quality=observation_quality,
+            quality_components=components,
+            algorithm_version=_CAPTURE_ALGORITHM_VERSION,
+        )
+
         return PipelineOutput(
             frame_meta=frame_meta,
             landmarks=tracking.landmarks,
@@ -478,4 +560,190 @@ class CapturePipeline:
             frame=frame,
             quality=quality,
             tracking=tracking,
+            observation=observation,
+            camera_identity=camera_identity,
         )
+
+    async def _publish_output(self, output: PipelineOutput) -> None:
+        """Retain every observation, then publish with bounded backpressure."""
+
+        self._observation_buffer.append(output.observation)
+        if output.observation.validity == ObservationValidity.MISSING.value:
+            self._observations_missing += 1
+        elif output.observation.validity != ObservationValidity.VALID.value:
+            self._observations_rejected += 1
+
+        if self._output_queue.full():
+            try:
+                self._output_queue.get_nowait()
+                self._record_frame_drop()
+            except asyncio.QueueEmpty:
+                logger.debug(
+                    "frame drop race: queue drained between full() and get_nowait",
+                )
+        try:
+            self._output_queue.put_nowait(output)
+        except asyncio.QueueFull:
+            self._record_frame_drop()
+            logger.debug("frame drop: put_nowait racing with refill")
+
+    def _missing_output(
+        self,
+        captured: CapturedFrame,
+        *,
+        validity: ObservationValidity,
+        reason: MissingReason,
+    ) -> PipelineOutput:
+        event = self._event_fields(captured)
+        camera_identity = self._camera_identity(captured)
+        quality = FrameQuality(
+            brightness_score=0.0,
+            blur_score=0.0,
+            motion_score=0.0,
+            passed=False,
+        )
+        if reason in {
+            MissingReason.CAMERA_WARMUP,
+            MissingReason.SOURCE_DISCONNECTED,
+        }:
+            tracking = self._face_tracker.process_missing(capture_mono_ns=event[1])
+        else:
+            tracking = FaceTrackingResult(
+                face_detected=False,
+                confidence=0.0,
+                landmarks=None,
+                landmarks_px=None,
+                bounding_box=None,
+                face_stable=self._face_tracker.face_stable,
+                observed_at_mono_ns=event[1],
+            )
+        frame_meta = FrameMeta(
+            timestamp=event[0] / 1000.0,
+            observed_at_unix_ms=event[0],
+            observed_at_mono_ns=event[1],
+            boot_id=event[2],
+            face_detected=False,
+            face_confidence=0.0,
+            brightness_score=0.0,
+            blur_score=0.0,
+            motion_score=0.0,
+            low_quality=True,
+        )
+        observation = CameraObservationEnvelope(
+            source=ObservationSource.CAMERA,
+            source_instance_id=self._source_instance_id(captured),
+            sequence=captured.sequence,
+            observed_at_unix_ms=event[0],
+            observed_at_mono_ns=event[1],
+            boot_id=event[2],
+            value=None,
+            validity=validity,
+            missing_reason=reason,
+            quality=0.0,
+            quality_components={
+                "brightness": 0.0,
+                "blur": 0.0,
+                "motion": 0.0,
+                "face_confidence": 0.0,
+            },
+            algorithm_version=_CAPTURE_ALGORITHM_VERSION,
+        )
+        return PipelineOutput(
+            frame_meta=frame_meta,
+            landmarks=None,
+            landmarks_px=None,
+            frame=captured.frame,
+            quality=quality,
+            tracking=tracking,
+            observation=observation,
+            camera_identity=camera_identity,
+        )
+
+    def _event_fields(self, captured: CapturedFrame) -> tuple[int, int, UUID]:
+        if (
+            captured.observed_at_unix_ms is not None
+            and captured.observed_at_mono_ns is not None
+            and captured.boot_id is not None
+        ):
+            return (
+                captured.observed_at_unix_ms,
+                captured.observed_at_mono_ns,
+                captured.boot_id,
+            )
+        # Internal compatibility for legacy tests/callers. Do not invent a
+        # monotonic value from the epoch timestamp; capture it independently.
+        return (
+            max(0, int(captured.timestamp * 1000)),
+            self._clock.monotonic_ns(),
+            self._clock.boot_id,
+        )
+
+    def _source_instance_id(self, captured: CapturedFrame) -> UUID:
+        return captured.source_instance_id or self._legacy_source_instance_id
+
+    def _camera_identity(self, captured: CapturedFrame) -> CameraIdentity:
+        if captured.camera_identity is not None:
+            return captured.camera_identity
+        return CameraIdentity(
+            identity_key="legacy-camera",
+            device_id=max(0, int(self._config.device_id or 0)),
+            device_name=None,
+            source="legacy",
+            backend=None,
+            width=self._config.width,
+            height=self._config.height,
+        )
+
+    @staticmethod
+    def _quality_components(
+        quality: FrameQuality,
+        tracking: FaceTrackingResult,
+    ) -> dict[str, float]:
+        return {
+            "brightness": float(np.clip(quality.brightness_score, 0.0, 1.0)),
+            "blur": float(np.clip(quality.blur_score, 0.0, 1.0)),
+            "motion": float(np.clip(quality.motion_score, 0.0, 1.0)),
+            "face_confidence": float(np.clip(tracking.confidence, 0.0, 1.0)),
+        }
+
+    def _synthesize_input_queue_gaps(
+        self, captured: CapturedFrame
+    ) -> tuple[CapturedFrame, ...]:
+        """Materialize webcam-queue evictions as FRAME_DROPPED observations."""
+
+        previous = self._last_captured
+        self._last_captured = captured
+        if previous is None:
+            return ()
+        same_source = self._source_instance_id(previous) == self._source_instance_id(captured)
+        gap = captured.sequence - previous.sequence - 1
+        if not same_source or gap <= 0:
+            return ()
+        prev_event = self._event_fields(previous)
+        current_event = self._event_fields(captured)
+        if current_event[2] != prev_event[2]:
+            return ()
+        # A pathological consumer stall can span more observations than the
+        # bounded buffer can retain. Materialize only the newest bounded tail;
+        # the sequence gap still exposes the complete loss count.
+        first_offset = max(1, gap - self._config.observation_buffer_max_items + 1)
+        missing: list[CapturedFrame] = []
+        denominator = gap + 1
+        for offset in range(first_offset, gap + 1):
+            fraction = offset / denominator
+            unix_ms = round(prev_event[0] + fraction * (current_event[0] - prev_event[0]))
+            mono_ns = round(prev_event[1] + fraction * (current_event[1] - prev_event[1]))
+            missing.append(
+                CapturedFrame(
+                    frame=None,
+                    timestamp=unix_ms / 1000.0,
+                    sequence=previous.sequence + offset,
+                    observed_at_unix_ms=unix_ms,
+                    observed_at_mono_ns=mono_ns,
+                    boot_id=current_event[2],
+                    source_instance_id=self._source_instance_id(captured),
+                    camera_identity=captured.camera_identity,
+                    missing_reason=MissingReason.FRAME_DROPPED,
+                )
+            )
+        return tuple(missing)

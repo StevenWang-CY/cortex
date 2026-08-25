@@ -51,6 +51,10 @@ datas = [
     # Configuration
     (str(CORTEX / "libs" / "config" / "defaults.yaml"), "cortex/libs/config"),
 
+    # WP7 SQLite schema migrations are loaded through importlib.resources at
+    # first launch and checksum-verified on every subsequent launch.
+    (str(CORTEX / "storage" / "migrations"), "cortex/storage/migrations"),
+
     # Browser extensions (pre-built) — loaded via "Load unpacked" from the
     # ConnectionsPanel, which expects Contents/Resources/<ext_subdir>.
     (str(CORTEX / "apps" / "browser_extension" / "build" / "chrome-mv3-prod"),
@@ -84,10 +88,6 @@ datas = [
     # locate ``box_4s.wav`` etc. inside MEIPASS).
     (str(CORTEX / "assets" / "audio"),
      "cortex/assets/audio"),
-
-    # Fonts
-    (str(CORTEX / "apps" / "browser_extension" / "assets" / "fonts"),
-     "fonts"),
 
     # App icon (used by build script, not runtime)
     (str(CORTEX / "assets" / "logo.svg"), "."),
@@ -211,7 +211,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,
-    target_arch=None,
+    target_arch=os.environ.get("CORTEX_ARTIFACT_ARCH") or None,
     codesign_identity=None,
     entitlements_file=None,  # Signing handled by build_macos_app.sh
 )

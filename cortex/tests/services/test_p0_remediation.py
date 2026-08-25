@@ -67,18 +67,19 @@ class _FakeWSServer:
 
 
 class _FakeConfigIntervention:
+    execution_mode: str = "authorized"
     quiet_mode_minutes: int = 30
     enable_auto_distraction_block: bool = True
     auto_distraction_block_confidence: float = 0.85
     auto_distraction_block_dwell_seconds: float = 30.0
     auto_distraction_block_exit_seconds: float = 300.0
     auto_distraction_block_preset: str = "developer"
-    auto_distraction_block_session_minutes: int = 20
     auto_distraction_block_custom_domains: list[str] = []
 
 
 class _FakeConfig:
-    intervention = _FakeConfigIntervention()
+    def __init__(self) -> None:
+        self.intervention = _FakeConfigIntervention()
 
 
 class _MinimalDaemon:
@@ -135,13 +136,29 @@ class _MinimalDaemon:
         task.cancel()
         return task
 
+    @property
+    def workspace_mutation_allowed(self) -> bool:
+        return self.config.intervention.execution_mode != "suggest_only"
+
 
 def _hyper(confidence: float = 0.9) -> SimpleNamespace:
-    return SimpleNamespace(state="HYPER", confidence=confidence)
+    return SimpleNamespace(
+        state="HYPER",
+        support_state="support_likely",
+        status="estimated",
+        confidence=confidence,
+        evidence_coverage=1.0,
+    )
 
 
 def _flow() -> SimpleNamespace:
-    return SimpleNamespace(state="FLOW", confidence=0.95)
+    return SimpleNamespace(
+        state="FLOW",
+        support_state="flow_like",
+        status="estimated",
+        confidence=0.95,
+        evidence_coverage=1.0,
+    )
 
 
 # ======================================================================
@@ -158,10 +175,10 @@ async def test_opt_out_while_armed_disarms_focus_session() -> None:
     d = _MinimalDaemon()
     d.config.intervention.enable_auto_distraction_block = True
     d._consent_policy.set_level("distraction_block", AUTONOMOUS_ACT)
-    # Arm.
-    await d._evaluate_auto_distraction_block(_hyper(), timestamp=0.0)
-    await d._evaluate_auto_distraction_block(_hyper(), timestamp=40.0)
-    assert d._auto_focus_armed is True
+    # Simulate legacy ownership restored from an older release. New WP6 code
+    # never enters this state through START_FOCUS_AUTO, but must still clean
+    # it up when the user opts out.
+    d._auto_focus_armed = True
 
     # User toggles off mid-session.
     d.config.intervention.enable_auto_distraction_block = False
@@ -182,9 +199,8 @@ async def test_consent_downgrade_while_armed_disarms_focus_session() -> None:
     d = _MinimalDaemon()
     d.config.intervention.enable_auto_distraction_block = True
     d._consent_policy.set_level("distraction_block", AUTONOMOUS_ACT)
-    await d._evaluate_auto_distraction_block(_hyper(), timestamp=0.0)
-    await d._evaluate_auto_distraction_block(_hyper(), timestamp=40.0)
-    assert d._auto_focus_armed
+    # Migration cleanup for an already-armed legacy session.
+    d._auto_focus_armed = True
 
     # Downgrade consent.
     d._consent_policy.set_level("distraction_block", REVERSIBLE_ACT)

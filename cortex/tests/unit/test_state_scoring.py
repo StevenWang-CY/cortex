@@ -55,8 +55,12 @@ def make_flow_features() -> FeatureVector:
         mouse_velocity_mean=400.0,
         mouse_velocity_variance=5000.0,
         click_frequency=0.5,
+        keypress_rate_per_min=60.0,
         keystroke_interval_variance=500.0,
+        correction_rate_per_100_keys=5.0,
+        inactivity_seconds=2.0,
         tab_switch_frequency=5.0,
+        scroll_back_rate_per_min=1.0,
         telemetry_seen_count=10,
     )
 
@@ -75,8 +79,14 @@ def make_hyper_features() -> FeatureVector:
         mouse_velocity_mean=1500.0,
         mouse_velocity_variance=80000.0,  # Very high variance (>3x baseline)
         click_frequency=3.0,
+        keypress_rate_per_min=90.0,
         keystroke_interval_variance=8000.0,
+        correction_rate_per_100_keys=25.0,
+        inactivity_seconds=0.5,
         tab_switch_frequency=25.0,  # Rapid switching >20/min
+        scroll_back_rate_per_min=40.0,
+        thrashing_score=1.0,
+        telemetry_seen_count=10,
     )
 
 
@@ -94,8 +104,13 @@ def make_hypo_features() -> FeatureVector:
         mouse_velocity_mean=30.0,  # Very low activity
         mouse_velocity_variance=1000.0,
         click_frequency=0.1,
+        keypress_rate_per_min=0.0,
         keystroke_interval_variance=200.0,
+        correction_rate_per_100_keys=0.0,
+        inactivity_seconds=300.0,
         tab_switch_frequency=0.5,
+        scroll_back_rate_per_min=0.0,
+        telemetry_seen_count=10,
     )
 
 
@@ -308,17 +323,14 @@ class TestRuleScorer:
         )
         cold_flow = scorer.compute_scores(cold).flow
 
-        # Same fixture, but warmed up — the fabricated 0.0 variance now
-        # legitimately counts because telemetry is genuinely flowing.
+        # Same zero-valued fixture, but with a connected/warm stream.
         warm = cold.model_copy(update={"telemetry_seen_count": 10})
         warm_flow = scorer.compute_scores(warm).flow
 
-        # The cold-start session must not be credited the telemetry FLOW
-        # contribution that the fabricated 0.0 variance would have added.
-        assert cold_flow < warm_flow, (
-            f"cold_flow={cold_flow:.3f} should be < warm_flow={warm_flow:.3f}; "
-            "telemetry-off FLOW must not accrue from fabricated 0.0 variance"
-        )
+        # Neither missing telemetry nor an observed all-zero stream is
+        # affirmative activity evidence.
+        assert cold_flow == 0.0
+        assert warm_flow == 0.0
 
 
 class TestSubScores:
@@ -440,13 +452,15 @@ class TestScoreSmoother:
     def _make_smoother(self) -> ScoreSmoother:
         return ScoreSmoother(config=StateConfig())
 
-    def test_initial_state_is_flow(self):
+    def test_initial_state_is_unknown(self):
         smoother = self._make_smoother()
-        assert smoother.current_state == UserState.FLOW
+        assert smoother.current_state == UserState.UNKNOWN
 
     def test_ema_smoothing_effect(self):
         """EMA should smooth out spiky scores."""
-        smoother = self._make_smoother()
+        smoother = ScoreSmoother(
+            config=StateConfig(flow_dwell_seconds=2, ema_alpha=0.5)
+        )
         quality = make_good_quality()
 
         # Feed high hyper score
@@ -471,7 +485,9 @@ class TestScoreSmoother:
 
     def test_hysteresis_prevents_flicker(self):
         """State should not change on brief score fluctuations."""
-        smoother = self._make_smoother()
+        smoother = ScoreSmoother(
+            config=StateConfig(flow_dwell_seconds=2, ema_alpha=0.5)
+        )
         quality = make_good_quality()
 
         # Start with flow
@@ -533,7 +549,7 @@ class TestScoreSmoother:
         scores = StateScores(flow=0.1, hypo=0.0, hyper=0.9, recovery=0.0)
         smoother.update(scores, quality, timestamp=1.0)
         smoother.reset()
-        assert smoother.current_state == UserState.FLOW
+        assert smoother.current_state == UserState.UNKNOWN
         assert smoother.latest_estimate is None
 
 

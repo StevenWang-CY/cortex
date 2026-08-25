@@ -25,12 +25,9 @@ from __future__ import annotations
 import collections
 import logging
 import time
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from PySide6.QtCore import Qt, QTimer, Signal
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 try:
     from PySide6.QtCore import QRectF
@@ -227,9 +224,9 @@ from cortex.apps.desktop_shell import mac_native
 from cortex.apps.desktop_shell.tokens import (
     BIO_BLINK,
     BIO_HR,
-    BIO_HRV,
     BRAND_ACCENT,
     BRAND_ACCENT_DARK,
+    BRAND_ACCENT_TEXT,
     BRAND_DISPLAY_FONT,
     CX_TEXT_SECONDARY,
     CX_TEXT_TERTIARY,
@@ -251,7 +248,11 @@ from cortex.apps.desktop_shell.tokens import (
     SP5,
     SP6,
     STATE_COLORS,
-    STATE_LABELS,
+    STATE_TEXT_COLORS,
+)
+from cortex.apps.desktop_shell.view_models import (
+    advanced_state_view,
+    consumer_state_view,
 )
 
 logger = logging.getLogger(__name__)
@@ -267,35 +268,47 @@ logger = logging.getLogger(__name__)
 # calls reach in by key.
 _CONCEPTS_GLOSSARY: dict[str, str] = {
     "state": (
-        "Cognitive state: Cortex infers FLOW (deep focus), HYPER (overwhelmed), "
-        "HYPO (idle), or RECOVERY (winding back to focus) from biometrics + "
-        "activity. The pill turns warmer when sustained HYPER is detected."
+        "Support estimate: Cortex combines available local activity and sensor "
+        "signals into a heuristic workspace-support label. It is not a medical "
+        "or psychological assessment."
     ),
-    "flow": "FLOW: sustained deep focus — your nervous system is regulated and engaged.",
-    "hyper": "HYPER: elevated arousal — heart rate up, attention scattered. Cortex offers a calming intervention.",
-    "hypo": "HYPO: low arousal — long pauses, low engagement. Cortex offers a re-engagement nudge.",
-    "recovery": "RECOVERY: post-HYPER cool-down — Cortex eases interventions while your nervous system settles.",
-    "hr": "BPM (Heart rate): beats per minute, inferred from your face using rPPG. Not medical-grade.",
-    "hrv": (
-        "HRV (Heart Rate Variability): variation between heartbeats. Higher HRV "
-        "correlates with a calmer, more adaptive nervous system."
+    "flow": (
+        "Steady activity: a heuristic label for sustained interaction "
+        "patterns. It does not measure a nervous-system state."
+    ),
+    "hyper": (
+        "Support may help: a heuristic label for behavior patterns that may "
+        "benefit from a workspace suggestion. It is not an arousal diagnosis."
+    ),
+    "hypo": (
+        "Quiet activity: a heuristic label for quieter interaction patterns. "
+        "It does not establish disengagement or low arousal."
+    ),
+    "recovery": (
+        "Settling: a temporal transition label after support was indicated; "
+        "it is not a physiological recovery measurement."
+    ),
+    "hr": (
+        "BPM: an experimental camera-derived pulse estimate. Accuracy varies "
+        "with lighting, motion, camera, and individual conditions; it is not "
+        "medical-grade."
     ),
     "perclos": (
-        "PERCLOS: percentage of eyelid closure, averaged over a minute. "
-        "A proxy for drowsiness / cognitive fatigue."
+        "PERCLOS: estimated eyelid-closure exposure over a recent window. "
+        "Cortex has not validated it as a drowsiness or fatigue measure."
     ),
-    "blink": "Blink rate: blinks per minute. Elevated rates can flag screen fatigue.",
+    "blink": (
+        "Blink rate: an estimated local count per minute. It is contextual "
+        "telemetry, not a fatigue diagnosis."
+    ),
     "sqi": (
-        "SQI (Signal Quality Index): how confident Cortex is in its biometric "
-        "readout. Drops when lighting, motion, or face position degrade the signal."
-    ),
-    "stress_integral": (
-        "Stress integral: a running area-under-curve of elevated arousal. When it "
-        "crosses a threshold, Cortex suggests a paced break."
+        "SQI (Signal Quality Index): an algorithmic camera-signal quality "
+        "score. It is not measurement confidence or an accuracy guarantee."
     ),
     "calibration": (
-        "Calibration: a 2-minute capture that locks in your resting baselines so "
-        "Cortex can detect *your* shift, not the population average."
+        "Calibration: a versioned, quality-gated measured profile with explicit "
+        "provenance. It personalizes supported baselines but does not validate a "
+        "metric or create calibrated state probabilities."
     ),
 }
 
@@ -305,29 +318,31 @@ _CONCEPTS_GLOSSARY: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 
-def _baseline_default_path() -> Path:
-    """Resolve `storage/baselines/default.json` via the active config.
-    Lazy-imported so the dashboard stays importable under test stubs."""
-    from pathlib import Path
-
+def _active_calibration_measured_at() -> float | None:
+    """Measurement time from the canonical active immutable profile."""
     try:
         from cortex.libs.config.settings import get_config
+        from cortex.services.capture_service.calibration_store import (
+            CalibrationProfileStore,
+        )
 
-        return Path(get_config().storage.path) / "baselines" / "default.json"
+        config = get_config()
+        profile = CalibrationProfileStore(config.storage.path).load_active()
+        if profile is None:
+            return None
+        return profile.created_at_unix_ms / 1000.0
     except Exception:
-        return Path("storage") / "baselines" / "default.json"
+        logger.debug("active calibration metadata unavailable", exc_info=True)
+        return None
 
 
 def _baseline_age_days(now: float | None = None) -> float | None:
-    """Age of the default baseline file in days, or None if missing."""
-    target = _baseline_default_path()
-    try:
-        if not target.exists():
-            return None
-        current = now if now is not None else time.time()
-        return max(0.0, (current - target.stat().st_mtime) / 86400.0)
-    except OSError:
+    """Age of the active measured profile, or ``None`` when unavailable."""
+    measured_at = _active_calibration_measured_at()
+    if measured_at is None:
         return None
+    current = now if now is not None else time.time()
+    return max(0.0, (current - measured_at) / 86400.0)
 
 
 _MAX_HR_HISTORY = 120
@@ -473,7 +488,7 @@ QMenu::item {{
 }}
 QMenu::item:selected {{
     background-color: {BRAND_ACCENT};
-    color: #FFFFFF;
+    color: {_LABEL};
 }}
 QMenu::separator {{
     height: 1px;
@@ -846,7 +861,7 @@ class _ConsumerTab(QWidget):
         self._focus_protection_pill.setStyleSheet(
             "QPushButton {"
             f"  background: {BRAND_ACCENT}1A;"
-            f"  color: {BRAND_ACCENT};"
+            f"  color: {BRAND_ACCENT_TEXT};"
             f"  border-radius: {RADIUS_PILL}px;"
             "  padding: 3px 10px;"
             "  margin-left: 8px;"
@@ -895,13 +910,9 @@ class _ConsumerTab(QWidget):
         self._cost_last_value: float = -1.0
         self._cost_budget_warned: bool = False
 
-        # P0 §3.7 desktop dispatch: "Take a break?" soft pill. Hidden by
-        # default; surfaced via :meth:`apply_break_recommendation` when
-        # the daemon emits BREAK_RECOMMENDATION (stress integral
-        # threshold reached). Click → emits ``break_pill_clicked`` which
-        # the controller routes to the BiologyBreakOverlay; right-click
-        # snoozes the pill for 5 minutes. The pill auto-clears after a
-        # break completes or 10 minutes of no engagement.
+        # Opt-in elapsed-focus reminder. Hidden unless the user's preferred
+        # interval is reached; no biometric or inferred-stress input can
+        # surface this control.
         self._break_pill = QPushButton("Take a break?")
         try:
             self._break_pill.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -913,7 +924,7 @@ class _ConsumerTab(QWidget):
         self._break_pill.setStyleSheet(
             "QPushButton {"
             f"  background: rgba(217, 119, 87, 0.18);"
-            f"  color: {BRAND_ACCENT};"
+            f"  color: {BRAND_ACCENT_TEXT};"
             f"  border-radius: {RADIUS_PILL}px;"
             "  padding: 3px 10px;"
             "  margin-left: 8px;"
@@ -1147,7 +1158,7 @@ class _ConsumerTab(QWidget):
         bio_inner.addWidget(bio_heading)
 
         # Phase J-3: empty-state placeholder. Pre-first-frame the BPM /
-        # HRV / BLK numerics carry placeholder "--" glyphs but that
+        # pulse / blink numerics carry placeholder "--" glyphs but that
         # reads as "stuck at zero" rather than "we haven't started yet".
         # The placeholder paragraph below sets the expectation: nothing
         # is broken; the daemon simply hasn't captured a frame. Hidden
@@ -1184,7 +1195,6 @@ class _ConsumerTab(QWidget):
         # the inline tooltips share a single source of truth.
         bio_specs = [
             (self._bpm_label, "BPM", BIO_HR, "hr"),
-            (self._hrv_label, "HRV", BIO_HRV, "hrv"),
             (self._blk_label, "BLK", BIO_BLINK, "blink"),
         ]
         for val_widget, title, color, glossary_key in bio_specs:
@@ -1311,7 +1321,7 @@ class _ConsumerTab(QWidget):
         self._connect_btn.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
         self._connect_btn.setStyleSheet(
             "QPushButton {"
-            f"  color: {BRAND_ACCENT};"
+            f"  color: {BRAND_ACCENT_TEXT};"
             f"  background: transparent;"
             f"  border: none;"
             f"  padding: 4px 0;"
@@ -1347,7 +1357,7 @@ class _ConsumerTab(QWidget):
         self._today_blocked = QLabel("--")
 
         for val_widget, title in [
-            (self._today_focus, "Focus"),
+            (self._today_focus, "Steady"),
             (self._today_sessions, "Sessions"),
             (self._today_best, "Best"),
             (self._today_blocked, "Blocked"),
@@ -1468,9 +1478,9 @@ class _ConsumerTab(QWidget):
             pill.setVisible(False)
             return
         if age > 30.0:
-            pill.setText("Stale baseline · Recalibrate?")
+            pill.setText("Measured profile is old · Recalibrate?")
             pill.setStyleSheet(
-                f"color: {BRAND_ACCENT}; background: {_GROUPED_BG};"
+                f"color: {BRAND_ACCENT_TEXT}; background: {_GROUPED_BG};"
                 f" border-radius: {RADIUS_PILL}px; padding: 3px 10px;"
                 " margin-left: 8px;"
             )
@@ -1515,7 +1525,7 @@ class _ConsumerTab(QWidget):
         try:
             self._cost_pill.setText(text)
             if ratio >= 0.80:
-                color = BRAND_ACCENT
+                color = BRAND_ACCENT_TEXT
             elif ratio >= 0.50:
                 color = _LABEL_SECONDARY
             else:
@@ -1610,7 +1620,7 @@ class _ConsumerTab(QWidget):
                 f"QMenu#RecentGoalsMenu::item {{"
                 f" padding: 6px 12px; border-radius: 5px; }}"
                 f"QMenu#RecentGoalsMenu::item:selected {{"
-                f" background-color: {BRAND_ACCENT}; color: #FFFFFF; }}"
+                f" background-color: {BRAND_ACCENT}; color: {_LABEL}; }}"
             )
             menu.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
             for g in goals:
@@ -1729,7 +1739,7 @@ class _ConsumerTab(QWidget):
                 self._quiet_capsule.setStyleSheet(
                     "QPushButton {"
                     f"  background: {BRAND_ACCENT}22;"
-                    f"  color: {BRAND_ACCENT};"
+                    f"  color: {BRAND_ACCENT_TEXT};"
                     f"  border-radius: {RADIUS_PILL}px;"
                     "  padding: 3px 12px;"
                     "  margin-left: 8px;"
@@ -1770,26 +1780,19 @@ class _ConsumerTab(QWidget):
             logger.debug("focus protection pill update failed", exc_info=True)
 
     def apply_break_recommendation(self, payload: dict) -> None:
-        """P0 §3.7 desktop dispatch: surface the "Take a break?" pill.
+        """Render only the opt-in elapsed-focus reminder contract."""
 
-        Idempotent: if the pill is already visible, the payload is
-        refreshed (so a higher-urgency recommendation can over-write a
-        prior low one) but no flicker is introduced.
-        """
-        if not isinstance(payload, dict):
+        if payload.get("basis") != "elapsed_focus":
+            self._clear_break_pill()
             return
         self._break_recommendation_payload = dict(payload)
-        urgency = str(payload.get("urgency") or "low").lower()
-        label_by_urgency = {
-            "low": "Take a break?",
-            "medium": "Time for a break",
-            "high": "Break recommended now",
-        }
         try:
-            self._break_pill.setText(label_by_urgency.get(urgency, "Take a break?"))
+            elapsed = float(payload.get("elapsed_focus_seconds", 0.0))
+            minutes = max(1, round(elapsed / 60.0))
+            self._break_pill.setText(f"Take a break? · {minutes} min")
             self._break_pill.setToolTip(
-                str(payload.get("reason") or "")
-                or "Stress integral threshold reached. Click for a paced break."
+                "Your preferred active-work interval was reached. "
+                "This reminder does not use camera or biometric estimates."
             )
             self._break_pill.setVisible(True)
         except Exception:
@@ -1820,30 +1823,17 @@ class _ConsumerTab(QWidget):
 
     # ── P0 §3.16: undo toast + restore pill ─────────────────────────
 
-    # Mirror of cortex/services/intervention_engine/executor.py::_REVERSE_ACTIONS.
-    # Membership controls when the Undo toast + Restore pill surface.
-    # We could ship the daemon-side `is_reversible: bool` on every
-    # INTERVENTION_APPLIED payload (Phase 4b), but pre-empting that with
-    # a local mirror keeps the desktop UX functional in isolation.
-    _DESKTOP_REVERSIBLE_ACTIONS: frozenset[str] = frozenset({
-        "hide_tabs_except_active",
-        "collapse_before_error",
-        "fold_except_current",
-        "dim_background",
-        "show_overlay",
-        "close_tab",
-        "group_tabs",
-        "bookmark_and_close",
-    })
+    # Compatibility symbol retained for downstream imports. It is deliberately
+    # empty: an action name is not restoration evidence. Only a verified exact
+    # transaction receipt may surface Undo/Restore.
+    _DESKTOP_REVERSIBLE_ACTIONS: frozenset[str] = frozenset()
 
     def apply_intervention_applied(self, payload: dict) -> None:
         """Render the Undo toast on a reversible INTERVENTION_APPLIED.
 
-        Payload keys (matches the daemon's contract):
-        ``intervention_id``, ``action_type``, ``mutations_applied_count``,
-        and optional ``is_reversible`` (Phase 4b will start stamping
-        this; until then we fall back to ``action_type`` membership in
-        :data:`_DESKTOP_REVERSIBLE_ACTIONS`).
+        This compatibility entry point requires ``transaction_verified=True``
+        plus ``is_reversible=True``. Callers may not infer reversibility from
+        action names or optimistic adapter acknowledgements.
         """
         if not isinstance(payload, dict):
             return
@@ -1854,12 +1844,20 @@ class _ConsumerTab(QWidget):
         except (TypeError, ValueError):
             applied = 0
         is_reversible = payload.get("is_reversible")
-        if not isinstance(is_reversible, bool):
-            is_reversible = action_type in self._DESKTOP_REVERSIBLE_ACTIONS
-        if not is_reversible or applied <= 0 or not intervention_id:
+        if (
+            payload.get("transaction_verified") is not True
+            or is_reversible is not True
+            or applied <= 0
+            or not intervention_id
+        ):
             return
         import time as _time
         now = _time.monotonic()
+        if any(
+            entry[1] == intervention_id
+            for entry in self._reversible_actions
+        ):
+            return
         self._reversible_actions.append(
             (now, intervention_id, action_type, applied)
         )
@@ -1872,6 +1870,54 @@ class _ConsumerTab(QWidget):
         ]
         self._show_undo_toast(intervention_id, action_type, applied)
         self._refresh_restore_pill()
+
+    def apply_intervention_transaction_state(self, payload: dict) -> None:
+        """Project verified transaction outcomes into the Undo affordance."""
+
+        if not isinstance(payload, dict):
+            return
+        intervention_id = str(payload.get("intervention_id") or "")
+        state = str(payload.get("state") or "")
+        if not intervention_id:
+            return
+        if state in {"restored", "failed", "restore_failed"}:
+            self._reversible_actions = [
+                entry for entry in self._reversible_actions
+                if entry[1] != intervention_id
+            ]
+            if self._undo_toast_timer is not None:
+                try:
+                    self._undo_toast_timer.stop()
+                except Exception:
+                    pass
+                self._undo_toast_timer = None
+            if self._undo_toast is not None:
+                try:
+                    self._undo_toast.deleteLater()
+                except Exception:
+                    pass
+                self._undo_toast = None
+            self._refresh_restore_pill()
+            return
+        if state != "applied":
+            return
+        raw_results = payload.get("receipt_results")
+        results = raw_results if isinstance(raw_results, list) else []
+        restorable = [
+            item for item in results
+            if isinstance(item, dict)
+            and item.get("reversible") is True
+            and item.get("status") in {"succeeded", "already_complete"}
+        ]
+        if not restorable:
+            return
+        self.apply_intervention_applied({
+            "intervention_id": intervention_id,
+            "action_type": "workspace_change",
+            "mutations_applied_count": len(restorable),
+            "is_reversible": True,
+            "transaction_verified": True,
+        })
 
     def _show_undo_toast(
         self,
@@ -2055,6 +2101,7 @@ class _ConsumerTab(QWidget):
         self._refresh_restore_pill()
 
     def update_state(self, payload: dict) -> None:
+        view = consumer_state_view(payload)
         # Phase J-3: first frame retires the empty state. The flag is
         # sticky so a transient WS disconnect doesn't collapse the UI
         # back to "no data yet" — the rendered numerics carry the last
@@ -2074,21 +2121,8 @@ class _ConsumerTab(QWidget):
         # because a dead camera is more user-actionable than a
         # degraded SQLite store.
         try:
-            capture_envelope = payload.get("capture") or {}
-            store_envelope = payload.get("store") or {}
-            capture_stale = bool(capture_envelope.get("stale", False))
-            store_degraded = bool(store_envelope.get("degraded", False))
-            if capture_stale:
-                self._set_text_if_changed(
-                    self._health_banner,
-                    "Camera offline — frames are not flowing",
-                )
-                self._health_banner.setVisible(True)
-            elif store_degraded:
-                self._set_text_if_changed(
-                    self._health_banner,
-                    "Storage degraded — sessions may not persist",
-                )
+            if view.health_message is not None:
+                self._set_text_if_changed(self._health_banner, view.health_message)
                 self._health_banner.setVisible(True)
             else:
                 self._health_banner.setVisible(False)
@@ -2097,21 +2131,20 @@ class _ConsumerTab(QWidget):
             # setText; the visibility flag isn't load-bearing.
             pass
 
-        state = payload.get("state", "FLOW")
-        color = STATE_COLORS.get(state, _LABEL_TERTIARY)
-        label = STATE_LABELS.get(state, state)
+        state = view.state
+        dot_color = STATE_COLORS.get(state, _LABEL_TERTIARY)
+        text_color = STATE_TEXT_COLORS.get(state, _LABEL_TERTIARY)
         self._set_style_if_changed(
-            self._state_dot, f"background: {color}; border-radius: 3px;"
+            self._state_dot, f"background: {dot_color}; border-radius: 3px;"
         )
-        self._set_text_if_changed(self._state_label, label)
+        self._set_text_if_changed(self._state_label, view.label)
         self._set_style_if_changed(
-            self._state_label, f"color: {color}; background: transparent;"
+            self._state_label, f"color: {text_color}; background: transparent;"
         )
 
-        bio = payload.get("biometrics", {})
-        hr = bio.get("heart_rate")
-        hrv = bio.get("hrv_rmssd")
-        blink = bio.get("blink_rate")
+        hr = view.heart_rate
+        hrv = view.hrv_rmssd
+        blink = view.blink_rate
 
         # When no heart-rate has landed yet, swap the BPM/HRV/BLK row for
         # a contextual status line so the user can tell apart "camera off"
@@ -2120,21 +2153,10 @@ class _ConsumerTab(QWidget):
         # that lack the field fall through to the "Reading your pulse…"
         # default, which is the most benign of the three states.
         if hr is None:
-            capture = payload.get("capture") or {}
-            frames_flowing = bool(capture.get("frames_flowing", True))
-            face_detected = bool(capture.get("face_detected", True))
-            if not frames_flowing:
-                status_text = (
-                    "Camera offline — check System Settings → Privacy "
-                    "& Security → Camera"
-                )
-            elif not face_detected:
-                status_text = "Looking for your face…"
-            else:
-                # Camera + face are both healthy; the rPPG sliding window
-                # is filling. First HR usually lands inside ~25 s.
-                status_text = "Reading your pulse…"
-            self._set_text_if_changed(self._bio_status_label, status_text)
+            self._set_text_if_changed(
+                self._bio_status_label,
+                view.biometrics_status or "Reading your pulse…",
+            )
             try:
                 self._bio_status_label.setVisible(True)
                 self._bio_numerics.setVisible(False)
@@ -2156,8 +2178,8 @@ class _ConsumerTab(QWidget):
 
         # Audit-2 fix: drive the Today panel from accumulated session
         # stats instead of leaving the placeholder "--" labels. We
-        # accumulate FLOW seconds, count interventions seen, and track
-        # the longest contiguous FLOW streak. Approximation is
+        # accumulate steady-activity seconds, count interventions seen, and
+        # track the longest contiguous steady streak. Approximation is
         # acceptable here — these are at-a-glance numerics, not
         # research data — and is better than dead UI.
         try:
@@ -2173,16 +2195,16 @@ class _ConsumerTab(QWidget):
         # is deliberately one-way; a daemon-side type that the dashboard
         # doesn't render is silently dropped.
         try:
-            connected = payload.get("connected_clients")
-            if isinstance(connected, list):
-                _CLIENT_TYPE_TO_DOT = {
-                    "chrome": "Chrome",
-                    "edge": "Edge",
-                    "vscode": "Editor",
-                }
-                connected_set = {str(c).lower() for c in connected}
-                for ct, dot_name in _CLIENT_TYPE_TO_DOT.items():
-                    self.set_extension_connected(dot_name, ct in connected_set)
+            _CLIENT_TYPE_TO_DOT = {
+                "chrome": "Chrome",
+                "edge": "Edge",
+                "vscode": "Editor",
+            }
+            for client_type, dot_name in _CLIENT_TYPE_TO_DOT.items():
+                self.set_extension_connected(
+                    dot_name,
+                    client_type in view.connected_surfaces,
+                )
         except Exception:
             pass
 
@@ -2243,7 +2265,7 @@ class _ConsumerTab(QWidget):
                 self._today_best_streak = self._today_current_streak
         else:
             self._today_current_streak = 0.0
-        # Format Focus (h:mm) and Best (m:ss / h:mm) compactly.
+        # Format steady activity (h:mm) and Best (m:ss / h:mm) compactly.
         focus_m = int(self._today_flow_seconds // 60)
         focus_h, focus_m = divmod(focus_m, 60)
         focus_text = f"{focus_h}h{focus_m:02d}" if focus_h else f"{focus_m}m"
@@ -2648,7 +2670,7 @@ class _AdvancedTab(QWidget):
         # as "Cortex is broken". Hidden once update_state arrives.
         self._empty_state = QLabel(
             "Start a session to populate signal quality, heart-rate "
-            "trace, and state scores."
+            "trace, and support scores."
         )
         self._empty_state.setObjectName("CortexAdvancedEmptyState")
         self._empty_state.setWordWrap(True)
@@ -2666,12 +2688,8 @@ class _AdvancedTab(QWidget):
         _set_accessible_name(self._empty_state, "Advanced tab empty state")
         layout.addWidget(self._empty_state)
 
-        # F18 (audit): a small badge that surfaces when the daemon falls
-        # back to synthetic state inference. Hidden by default so the
-        # happy path remains visually unchanged.
-        self._degraded_badge = QLabel(
-            "Cortex degraded — classifier unavailable"
-        )
+        # Explicitly describe unavailable evidence or a safety fallback.
+        self._degraded_badge = QLabel("No actionable estimate yet")
         self._degraded_badge.setObjectName("CortexDegradedBadge")
         self._degraded_badge.setFont(
             mac_native.system_font(FS_FOOTNOTE, "semibold")
@@ -2713,7 +2731,7 @@ class _AdvancedTab(QWidget):
         self._hr_plot = HRTracePlot()
         layout.addWidget(self._hr_plot)
 
-        scores_label = QLabel("State scores")
+        scores_label = QLabel("Support scores")
         scores_label.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
         scores_label.setStyleSheet(
             f"color: {_LABEL_SECONDARY}; background: transparent;"
@@ -2724,13 +2742,13 @@ class _AdvancedTab(QWidget):
         scores_grid.setVerticalSpacing(6)
         self._score_bars: dict[str, QProgressBar] = {}
         self._score_labels: dict[str, QLabel] = {}
-        for i, (name, color) in enumerate([
-            ("flow", STATE_COLORS["FLOW"]),
-            ("hyper", STATE_COLORS["HYPER"]),
-            ("hypo", STATE_COLORS["HYPO"]),
-            ("recovery", STATE_COLORS["RECOVERY"]),
+        for i, (name, display_name, color) in enumerate([
+            ("flow", "Steady", STATE_COLORS["FLOW"]),
+            ("hyper", "Support", STATE_COLORS["HYPER"]),
+            ("hypo", "Quiet", STATE_COLORS["HYPO"]),
+            ("recovery", "Settling", STATE_COLORS["RECOVERY"]),
         ]):
-            lbl = QLabel(name.capitalize())
+            lbl = QLabel(display_name)
             lbl.setFixedWidth(72)
             lbl.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
             lbl.setStyleSheet(
@@ -2762,7 +2780,7 @@ class _AdvancedTab(QWidget):
         layout.addLayout(scores_grid)
 
         meta_row = QHBoxLayout()
-        self._confidence_lbl = QLabel("Confidence: --")
+        self._confidence_lbl = QLabel("Evidence strength: --")
         self._confidence_lbl.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         self._confidence_lbl.setStyleSheet(
             f"color: {_LABEL_TERTIARY}; background: transparent;"
@@ -2819,27 +2837,16 @@ class _AdvancedTab(QWidget):
             except Exception:
                 pass
 
-        scores = payload.get("scores", {})
-        sig_q = payload.get("signal_quality", {})
-        confidence = payload.get("confidence", 0.0)
-        dwell = payload.get("dwell_seconds", 0.0)
-        state = payload.get("state", "FLOW")
-        bio = payload.get("biometrics", {})
-
-        # F18 (audit): surface the daemon's degraded state. ``degraded``
-        # and ``source`` are mirrored from the ``StateInferResponse``
-        # envelope onto every WS STATE_UPDATE payload by
-        # ``WebSocketServer._make_state_update`` (audit Wave-2 fix), so
-        # the same reader works for both the /state/infer round-trip and
-        # the live WS stream. The literal ``fallback`` is the only value
-        # ``source`` takes when the classifier is unavailable; treating
-        # it as the trigger keeps the badge from flipping on a healthy
-        # ``classifier_source="rule"`` debug field (which lives on the
-        # same payload but is unrelated to envelope-level degradation).
-        is_degraded = bool(payload.get("degraded", False)) or (
-            payload.get("source") == "fallback"
-        )
-        self._degraded_badge.setVisible(is_degraded)
+        view = advanced_state_view(payload)
+        scores = view.scores
+        sig_q = view.signal_quality
+        evidence_strength = view.evidence_strength
+        coverage = view.evidence_coverage
+        dwell = view.dwell_seconds
+        state = view.state
+        badge_text = view.degraded_message or ""
+        self._set_text_if_changed(self._degraded_badge, badge_text)
+        self._degraded_badge.setVisible(bool(badge_text))
 
         self._physio_q.set_value(sig_q.get("physio", 0.0))
         self._kine_q.set_value(sig_q.get("kinematics", 0.0))
@@ -2860,7 +2867,7 @@ class _AdvancedTab(QWidget):
         except Exception:
             logger.debug("physio SQI subcomponent update failed", exc_info=True)
 
-        hr = bio.get("heart_rate")
+        hr = view.heart_rate
         if hr is not None:
             self._hr_plot.add_value(hr)
 
@@ -2872,13 +2879,21 @@ class _AdvancedTab(QWidget):
                 self._set_value_if_changed(self._score_bars[name], int(val * 100))
                 self._set_text_if_changed(self._score_labels[name], f"{val:.2f}")
 
-        self._set_text_if_changed(self._confidence_lbl, f"Confidence: {confidence:.0%}")
-        self._set_text_if_changed(self._dwell_lbl, f"Dwell: {dwell:.1f}s")
+        self._set_text_if_changed(
+            self._confidence_lbl,
+            f"Evidence strength: {evidence_strength:.0%}",
+        )
+        self._set_text_if_changed(
+            self._dwell_lbl,
+            f"Coverage: {coverage:.0%} · Dwell: {dwell:.1f}s",
+        )
 
         if not self._timeline_events or self._timeline_events[-1]["state"] != state:
             elapsed = time.monotonic() - self._session_start
             self._timeline_events.append({
-                "time": elapsed, "state": state, "confidence": confidence,
+                "time": elapsed,
+                "state": state,
+                "evidence_strength": evidence_strength,
             })
             if len(self._timeline_events) > _MAX_TIMELINE_EVENTS:
                 self._timeline_events = self._timeline_events[-_MAX_TIMELINE_EVENTS:]
@@ -2886,7 +2901,10 @@ class _AdvancedTab(QWidget):
             for ev in reversed(self._timeline_events[-8:]):
                 t = ev["time"]
                 m, s = int(t // 60), t % 60
-                lines.append(f"{m:02d}:{s:04.1f}  {ev['state']:<10} {ev['confidence']:.0%}")
+                lines.append(
+                    f"{m:02d}:{s:04.1f}  {ev['state']:<10} "
+                    f"{ev['evidence_strength']:.0%} evidence"
+                )
             self._timeline_text.setText("\n".join(lines) if lines else "No events yet")
 
 
@@ -2934,7 +2952,7 @@ class ConceptsDialog(QDialog):
                 term = QLabel(key.upper())
                 term.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
                 term.setStyleSheet(
-                    f"color: {BRAND_ACCENT}; background: transparent;"
+                    f"color: {BRAND_ACCENT_TEXT}; background: transparent;"
                 )
                 layout.addWidget(term)
                 desc = QLabel(body)
@@ -3390,7 +3408,7 @@ class DashboardWindow(QWidget):
                 )
 
     def apply_intervention_applied(self, payload: dict) -> None:
-        """P0 §3.16: forward INTERVENTION_APPLIED to consumer tab's undo toast."""
+        """Forward a verified compatibility projection to the consumer tab."""
         if self._consumer is not None and hasattr(
             self._consumer, "apply_intervention_applied",
         ):
@@ -3399,6 +3417,20 @@ class DashboardWindow(QWidget):
             except Exception:
                 logger.debug(
                     "consumer apply_intervention_applied failed",
+                    exc_info=True,
+                )
+
+    def apply_intervention_transaction_state(self, payload: dict) -> None:
+        """Forward exact transaction outcomes to the Undo/Restore surface."""
+
+        if self._consumer is not None and hasattr(
+            self._consumer, "apply_intervention_transaction_state",
+        ):
+            try:
+                self._consumer.apply_intervention_transaction_state(payload)
+            except Exception:
+                logger.debug(
+                    "consumer transaction-state projection failed",
                     exc_info=True,
                 )
 

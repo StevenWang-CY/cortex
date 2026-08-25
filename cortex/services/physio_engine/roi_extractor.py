@@ -13,7 +13,7 @@ ROI regions (from spec):
 Design:
 - Convex hull from landmark pixel coordinates defines the ROI polygon
 - Spatial averaging of pixels within the polygon produces one (R, G, B) per ROI
-- Dynamic ROI selection picks the region with highest SNR
+- At least two usable regions are fused with fixed equal weights
 - No frame storage — ephemeral processing only
 """
 
@@ -79,44 +79,35 @@ class RoiTraceFrame:
 
     def combined_rgb(self) -> NDArray[np.float64] | None:
         """
-        Adaptive weighted average of all available ROIs.
+        Fixed-weight average of quality-qualified ROIs.
 
-        Weights combine ROI area with luminance/chrominance quality and
-        apply a global head-jitter penalty. This is a robust replacement
-        for static equal/pixel-only fusion.
+        Per-frame area/texture weights can fluctuate with tracking geometry
+        and manufacture a color oscillation. Cortex therefore uses equal
+        anatomical-region weights and fails closed unless at least two
+        regions survive the fixed illumination gate. Motion is gated on the
+        observation stream, not folded into a time-varying color weight.
 
         Returns:
             Array of shape (3,) with [R, G, B] means, or None if no ROIs.
         """
         rois = [
             roi for roi in [self.forehead, self.left_cheek, self.right_cheek]
-            if roi is not None and roi.pixel_count > 0
-        ]
-        if not rois:
-            return None
-
-        raw_weights: list[float] = []
-        for roi in rois:
-            # HEURISTIC: prefer well-lit but non-saturated, chroma-stable ROIs.
-            luma_gate = 1.0 if 35.0 <= roi.luma_mean <= 220.0 else 0.45
-            chroma_gate = 1.0 / (1.0 + roi.chroma_std / 60.0)
-            texture_gate = 1.0 / (1.0 + roi.luma_std / 50.0)
-            jitter_gate = 1.0 / (1.0 + self.head_jitter_px / 12.0)
-            raw_weights.append(
-                max(1.0, float(roi.pixel_count))
-                * luma_gate
-                * chroma_gate
-                * texture_gate
-                * jitter_gate
+            if (
+                roi is not None
+                and roi.pixel_count > 0
+                and (roi.luma_mean == 0.0 or 35.0 <= roi.luma_mean <= 220.0)
             )
-
-        total_pixels = sum(raw_weights)
-        if total_pixels <= 1e-9:
+        ]
+        if len(rois) < 2:
             return None
-        weighted_sum = np.zeros(3, dtype=np.float64)
-        for roi, weight in zip(rois, raw_weights, strict=False):
-            weighted_sum += roi.to_array() * weight
-        return weighted_sum / total_pixels
+        return np.asarray(
+            np.mean(
+                np.stack([roi.to_array() for roi in rois]),
+                axis=0,
+                dtype=np.float64,
+            ),
+            dtype=np.float64,
+        )
 
 
 class RoiExtractor:
@@ -235,7 +226,7 @@ class RoiExtractor:
 
         # Create binary mask from convex hull
         mask = np.zeros((height, width), dtype=np.uint8)
-        cv2.fillConvexPoly(mask, hull, 1)
+        cv2.fillConvexPoly(mask, hull, (1,))
 
         # Count pixels in ROI
         pixel_count = int(np.sum(mask))

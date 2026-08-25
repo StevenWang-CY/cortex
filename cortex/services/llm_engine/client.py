@@ -19,6 +19,7 @@ from cortex.libs.schemas.intervention import (
     TabRecommendations,
     UIPlan,
 )
+from cortex.libs.schemas.privacy import ContextFieldDisclosure
 from cortex.libs.schemas.state import StateEstimate
 
 
@@ -34,6 +35,9 @@ class LLMClient(Protocol):
         *,
         template_name: str | None = None,
         extra_context: str = "",
+        disclosure_manifest: tuple[ContextFieldDisclosure, ...] | None = None,
+        privacy_preview_id: str | None = None,
+        privacy_confirmation: str | None = None,
     ) -> InterventionPlan:
         """
         Generate a structured intervention plan from workspace context and user state.
@@ -101,42 +105,64 @@ def build_fallback_plan(context: TaskContext | None = None) -> InterventionPlan:
             active_title = context.browser_context.active_tab_title
             distraction_types = {"distraction", "social"}
             safe_types = {
-                "ai_assistant", "documentation", "learning_platform",
-                "reference", "code_host", "stackoverflow",
+                "ai_assistant",
+                "documentation",
+                "learning_platform",
+                "reference",
+                "code_host",
+                "stackoverflow",
             }
 
             rec_tabs: list[TabRecommendation] = []
             for i, tab in enumerate(tabs):
                 if tab.is_active:
-                    rec_tabs.append(TabRecommendation(
-                        tab_index=i, tab_title=tab.title,
-                        action="keep", reason="Active tab",
-                        relevance_score=1.0,
-                    ))
+                    rec_tabs.append(
+                        TabRecommendation(
+                            tab_index=i,
+                            tab_title=tab.title,
+                            action="keep",
+                            reason="Active tab",
+                            relevance_score=1.0,
+                        )
+                    )
                 elif tab.tab_type in safe_types:
-                    rec_tabs.append(TabRecommendation(
-                        tab_index=i, tab_title=tab.title,
-                        action="keep", reason=f"{tab.tab_type} tab",
-                        relevance_score=0.8,
-                    ))
+                    rec_tabs.append(
+                        TabRecommendation(
+                            tab_index=i,
+                            tab_title=tab.title,
+                            action="keep",
+                            reason=f"{tab.tab_type} tab",
+                            relevance_score=0.8,
+                        )
+                    )
                 elif tab.tab_type in distraction_types:
-                    rec_tabs.append(TabRecommendation(
-                        tab_index=i, tab_title=tab.title,
-                        action="close", reason="Likely distracting",
-                        relevance_score=0.1,
-                    ))
-                    actions.append(SuggestedAction(
-                        action_type="close_tab",
-                        tab_index=i,
-                        label=f"Close {tab.title}",
-                        reason="Likely distracting",
-                    ))
+                    rec_tabs.append(
+                        TabRecommendation(
+                            tab_index=i,
+                            tab_title=tab.title,
+                            action="close",
+                            reason="Likely distracting",
+                            relevance_score=0.1,
+                        )
+                    )
+                    actions.append(
+                        SuggestedAction(
+                            action_type="close_tab",
+                            tab_index=i,
+                            label=f"Close {tab.title}",
+                            reason="Likely distracting",
+                        )
+                    )
                 else:
-                    rec_tabs.append(TabRecommendation(
-                        tab_index=i, tab_title=tab.title,
-                        action="keep", reason="May be relevant",
-                        relevance_score=0.5,
-                    ))
+                    rec_tabs.append(
+                        TabRecommendation(
+                            tab_index=i,
+                            tab_title=tab.title,
+                            action="keep",
+                            reason="May be relevant",
+                            relevance_score=0.5,
+                        )
+                    )
 
             close_count = sum(1 for r in rec_tabs if r.action == "close")
             tab_recs = TabRecommendations(
@@ -190,7 +216,12 @@ class RuleBasedLLMClient:
         *,
         template_name: str | None = None,
         extra_context: str = "",
+        disclosure_manifest: tuple[ContextFieldDisclosure, ...] | None = None,
+        privacy_preview_id: str | None = None,
+        privacy_confirmation: str | None = None,
     ) -> InterventionPlan:
+        del state, constraints, template_name, extra_context
+        del disclosure_manifest, privacy_preview_id, privacy_confirmation
         return build_fallback_plan(context)
 
     async def health_check(self) -> bool:

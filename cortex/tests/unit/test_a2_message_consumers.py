@@ -123,20 +123,25 @@ def test_intervention_failed_is_in_controller_dispatch_map(qapp) -> None:
     bridge = DaemonBridge()
     ctrl._bridge = bridge
 
-    # Stand-in ws_server whose send_message we can wrap. The observer
-    # installs a wrapper around it and builds the type→handler map.
+    # Stand-in WS server exposing the transport-neutral subscription API.
     captured: dict[str, Any] = {}
 
-    async def _send(message_type: str, payload: dict, **kwargs: Any) -> int:
-        return 0
+    class _Subscription:
+        def cancel(self) -> None:
+            return None
 
     class _WS:
-        send_message = staticmethod(_send)
+        listener: Any = None
+
+        def subscribe_outbound(self, listener: Any) -> _Subscription:
+            self.listener = listener
+            return _Subscription()
 
     class _Daemon:
         _ws_server = _WS()
 
     ctrl._daemon = _Daemon()
+    ctrl._outbound_subscription = None
     ctrl._install_ws_broadcast_observer()
 
     # After install, the wrapped send_message must, for INTERVENTION_FAILED,
@@ -146,13 +151,13 @@ def test_intervention_failed_is_in_controller_dispatch_map(qapp) -> None:
         lambda t, b, c: received.append((t, b, c))
     )
 
-    wrapped = ctrl._daemon._ws_server.send_message
-    assert getattr(wrapped, "_cortex_broadcast_wrapped", False) is True
+    from cortex.application.events import OutboundTransportEvent
 
-    asyncio.run(
-        wrapped(
-            MessageType.INTERVENTION_FAILED.value,
-            {"intervention_id": "iv-x", "error_reason": "boom"},
+    assert ctrl._daemon._ws_server.listener is not None
+    ctrl._daemon._ws_server.listener(
+        OutboundTransportEvent(
+            message_type=MessageType.INTERVENTION_FAILED.value,
+            payload={"intervention_id": "iv-x", "error_reason": "boom"},
         )
     )
     captured["after"] = list(received)
@@ -270,8 +275,10 @@ def test_trends_schedule_failure_emits_internal(
 
 class _BreakRecordingDaemon:
     def __init__(self) -> None:
+        self.workspace_mutation_allowed = True
         self.break_calls: list[dict[str, Any]] = []
         self.user_actions: list[dict[str, Any]] = []
+        self.exact_actions: list[tuple[str, dict[str, Any]]] = []
 
     async def start_biology_break(self, **kwargs: Any) -> dict[str, Any]:
         self.break_calls.append(dict(kwargs))
@@ -280,11 +287,17 @@ class _BreakRecordingDaemon:
     async def _handle_user_action(self, payload: dict) -> None:
         self.user_actions.append(payload)
 
+    async def dispatch_intervention_action(
+        self,
+        intervention_id: str,
+        action: dict[str, Any],
+    ) -> int:
+        self.exact_actions.append((intervention_id, dict(action)))
+        return 0
 
-def test_start_timer_invokes_break_countdown(qapp) -> None:
-    """P2-FE-START-TIMER: clicking 'start timer' must invoke the
-    daemon's break/countdown overlay with the metadata duration and a
-    plain (no-pattern, no-audio) countdown — not a silent no-op."""
+
+def test_start_timer_cannot_bypass_exact_action_boundary(qapp) -> None:
+    """An irreversible timer suggestion is requested, never run in Qt."""
     from cortex.apps.desktop_shell.controller import CortexAppController
 
     ctrl = CortexAppController.__new__(CortexAppController)
@@ -308,19 +321,26 @@ def test_start_timer_invokes_break_countdown(qapp) -> None:
         )
 
         deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline and not daemon.break_calls:
+        while time.monotonic() < deadline and not daemon.exact_actions:
             time.sleep(0.01)
     finally:
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=2.0)
         loop.close()
 
-    assert daemon.break_calls, "start_timer did not start a break/countdown"
-    call = daemon.break_calls[0]
-    assert call["duration_seconds"] == 600
-    assert call["breathing_pattern"] is None
-    assert call["audio_cue"] is False
-    assert call["intervention_id"] == "iv-timer"
+    assert daemon.break_calls == []
+    assert daemon.user_actions == []
+    assert daemon.exact_actions == [
+        (
+            "iv-timer",
+            {
+                "action_id": "act-timer",
+                "action_type": "start_timer",
+                "label": "Start a 10-minute timer",
+                "metadata": {"duration_seconds": 600},
+            },
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------

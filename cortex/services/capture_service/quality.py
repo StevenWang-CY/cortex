@@ -19,11 +19,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import cast
 
 import cv2
 import numpy as np
+from numpy.typing import NDArray
 
 from cortex.libs.config.settings import CaptureConfig
+from cortex.libs.schemas.observations import MissingReason
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +45,8 @@ class FrameQuality:
     blur_score: float  # 0.0 (very blurry) to 1.0 (sharp)
     motion_score: float  # 0.0 (excessive jitter) to 1.0 (stable)
     passed: bool  # Whether frame passes the composite quality gate
+    mean_intensity: float = 0.0
+    motion_face_widths_per_second: float | None = None
 
 
 class FrameQualityScorer:
@@ -63,9 +68,11 @@ class FrameQualityScorer:
 
     def score(
         self,
-        frame: np.ndarray,
+        frame: NDArray[np.uint8],
         nose_displacement: float = 0.0,
-        gray_frame: np.ndarray | None = None,
+        gray_frame: NDArray[np.uint8] | None = None,
+        *,
+        motion_face_widths_per_second: float | None = None,
     ) -> FrameQuality:
         """
         Score a frame's quality.
@@ -88,10 +95,16 @@ class FrameQualityScorer:
         # ran cvtColor independently, doubling the conversion cost on
         # every frame.
         if gray_frame is None:
-            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray_frame = cast(
+                NDArray[np.uint8], cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            )
         brightness = self._score_brightness(gray_frame)
         blur = self._score_blur(gray_frame)
-        motion = self._score_motion(nose_displacement)
+        motion = (
+            self._score_motion_rate(motion_face_widths_per_second)
+            if motion_face_widths_per_second is not None
+            else self._score_motion(nose_displacement)
+        )
 
         passed = (
             brightness >= self._brightness_threshold
@@ -104,9 +117,26 @@ class FrameQualityScorer:
             blur_score=blur,
             motion_score=motion,
             passed=passed,
+            mean_intensity=float(np.mean(gray_frame)),
+            motion_face_widths_per_second=motion_face_widths_per_second,
         )
 
-    def _score_brightness(self, gray: np.ndarray) -> float:
+    def rejection_reason(self, quality: FrameQuality) -> MissingReason:
+        """Return the dominant closed-catalog reason for a rejected frame."""
+
+        if quality.motion_score < self._motion_threshold:
+            return MissingReason.MOTION
+        if quality.brightness_score < self._brightness_threshold:
+            return (
+                MissingReason.LOW_LIGHT
+                if quality.mean_intensity < _BRIGHTNESS_LOW
+                else MissingReason.SATURATED
+            )
+        if quality.blur_score < self._blur_threshold:
+            return MissingReason.ARTIFACT
+        return MissingReason.UNKNOWN
+
+    def _score_brightness(self, gray: NDArray[np.uint8]) -> float:
         """
         Score frame brightness.
 
@@ -133,7 +163,7 @@ class FrameQualityScorer:
             distance_from_ideal = abs(mean_intensity - 128) / 128
             return 1.0 - 0.3 * distance_from_ideal
 
-    def _score_blur(self, gray: np.ndarray) -> float:
+    def _score_blur(self, gray: NDArray[np.uint8]) -> float:
         """
         Score frame sharpness using Laplacian variance.
 
@@ -191,3 +221,19 @@ class FrameQualityScorer:
             range_start = max_jitter * 0.5
             range_end = max_jitter * 2.0
             return 1.0 - (nose_displacement - range_start) / (range_end - range_start)
+
+    def _score_motion_rate(self, motion_face_widths_per_second: float) -> float:
+        """Score resolution/FPS-independent facial translation speed."""
+
+        if motion_face_widths_per_second <= 0.0:
+            return 1.0
+        threshold = self._config.max_motion_face_widths_per_second
+        if motion_face_widths_per_second <= threshold * 0.5:
+            return 1.0
+        if motion_face_widths_per_second >= threshold * 2.0:
+            return 0.0
+        return float(
+            1.0
+            - (motion_face_widths_per_second - threshold * 0.5)
+            / (threshold * 1.5)
+        )

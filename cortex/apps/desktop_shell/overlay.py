@@ -54,8 +54,8 @@ except ImportError:  # pragma: no cover - lightweight stub fallback
     # "Show more" toggle, so it stands in faithfully.
     QToolButton = QPushButton
 
-# Phase J-4: subtle scale-in (headline) + fade-in (causal row) micro-
-# interactions. QPropertyAnimation / QEasingCurve / QGraphicsOpacityEffect
+# Phase J-4: subtle concurrent opacity feedback for newly presented text.
+# QPropertyAnimation / QEasingCurve / QGraphicsOpacityEffect
 # are real-PySide6 only — the lightweight stubs don't expose them. The
 # import-time guard keeps this file importable from the legacy mock
 # harness; the runtime guard inside ``_play_show_animations`` short-
@@ -94,15 +94,16 @@ from cortex.apps.desktop_shell.tokens import (
     TEXT_HUD_SECONDARY,
     TEXT_HUD_TERTIARY,
 )
+from cortex.libs.schemas.intervention_transaction import (
+    ActionManifest,
+    manifest_suggestion_matches,
+)
 
-# Phase J-4: tween constants. Chosen to be "perceptible but never
-# distracting" — the headline scale-in is fast enough to feel
-# responsive (under 300 ms is below the typical user attention
-# threshold) and the causal fade lags by exactly the headline duration
-# so the two animations read as one continuous motion rather than two
-# competing tweens. The Reduce Motion path forces both to 0 ms.
-HEADLINE_SCALE_DURATION_MS: int = 250
-CAUSAL_FADE_DURATION_MS: int = 180
+# Support text must be readable on the first frame.  Both labels therefore
+# begin at 72% opacity and settle together; no geometry or delayed phase is
+# involved.  The Reduce Motion path forces both to their final state.
+HEADLINE_FADE_DURATION_MS: int = 160
+CAUSAL_FADE_DURATION_MS: int = 160
 
 logger = logging.getLogger(__name__)
 
@@ -332,9 +333,8 @@ class OverlayWindow(QWidget):
     dismissed = Signal(str)
     # G4 (audit-prod): emitted when the user clicks a suggested-action
     # button. Payload is ``(intervention_id, action_dict)`` matching the
-    # ``SuggestedAction`` schema; the controller / main routes it to
-    # either a native handler (clipboard, timer) or the WS
-    # ``ACTION_EXECUTE`` channel for browser-bound actions.
+    # ``SuggestedAction`` schema; the controller submits it to the daemon's
+    # manifest-bound authorization path.
     action_invoked = Signal(str, dict)
     # P0 §3.6: emitted when the user toggles a micro-step checkbox.
     # Payload is ``(intervention_id, step_index, new_status)`` where
@@ -364,6 +364,7 @@ class OverlayWindow(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._intervention_id = ""
+        self._execution_mode = "suggest_only"
         # P0 §3.6: per-intervention checkbox cache. Keyed by
         # ``intervention_id``; value is the list of ``QCheckBox``
         # widgets currently in the steps_container. When a re-render
@@ -406,6 +407,7 @@ class OverlayWindow(QWidget):
         # back-to-back interventions reuse the same animation objects.
         self._headline_anim: object | None = None
         self._causal_fade_anim: object | None = None
+        self._headline_opacity_effect: QGraphicsOpacityEffect | None = None
         self._causal_opacity_effect: QGraphicsOpacityEffect | None = None
         # Test affordance: when True, ``_play_show_animations`` records
         # the durations it would use without actually starting the
@@ -425,6 +427,11 @@ class OverlayWindow(QWidget):
             mac_native.apply_vibrancy(self, material="hudWindow")
         except Exception:
             pass
+
+    @property
+    def workspace_actions_enabled(self) -> bool:
+        """Whether the current proposal permits action-button dispatch."""
+        return self._execution_mode in ("authorized", "research_autonomous")
 
     def _build_ui(self) -> None:
         self._main_layout = QVBoxLayout(self)
@@ -543,10 +550,8 @@ class OverlayWindow(QWidget):
 
         # G4 (audit-prod): suggested-action buttons. Rendered in
         # ``show_intervention`` whenever the plan carries a non-empty
-        # ``suggested_actions`` list. Each click emits ``action_invoked``;
-        # the controller routes browser-bound actions through the WS
-        # ACTION_EXECUTE channel and handles ``copy_to_clipboard`` /
-        # ``start_timer`` natively in the desktop shell.
+        # ``suggested_actions`` list. Each click emits ``action_invoked`` and
+        # only a manifest-listed, reversible remote executor may act on it.
         self._actions_container = QVBoxLayout()
         self._actions_container.setSpacing(SP2)
         self._action_buttons: list[QPushButton] = []
@@ -894,6 +899,12 @@ class OverlayWindow(QWidget):
 
     def show_intervention(self, payload: dict) -> None:
         self._intervention_id = payload.get("intervention_id", "")
+        raw_execution_mode = payload.get("execution_mode", "suggest_only")
+        self._execution_mode = (
+            str(raw_execution_mode)
+            if raw_execution_mode in ("authorized", "research_autonomous")
+            else "suggest_only"
+        )
         # Fresh intervention — clear dismissed flag so this one can dismiss.
         self._dismissed = False
 
@@ -993,6 +1004,8 @@ class OverlayWindow(QWidget):
             self._render_actions(
                 payload.get("suggested_actions") or [],
                 connected_clients=payload.get("connected_clients") or [],
+                execution_mode=self._execution_mode,
+                action_manifest=payload.get("action_manifest"),
             )
         except Exception:
             logger.debug("Action rendering failed", exc_info=True)
@@ -1068,12 +1081,9 @@ class OverlayWindow(QWidget):
         self.raise_()
         self.activateWindow()
 
-        # Phase J-4: subtle scale-in (headline) + fade-in (causal row)
-        # micro-interactions. Skipped entirely under Reduce Motion or
-        # when the Qt build lacks QPropertyAnimation. The animations
-        # are visually subordinate to the breathing pacer (which keeps
-        # its existing rhythm); the dismiss button and checkboxes are
-        # NOT animated per the audit's "strictly purposeful" rule.
+        # Phase J-4: concurrent opacity feedback for newly presented text.
+        # Skipped under Reduce Motion or when Qt lacks QPropertyAnimation.
+        # The breathing pacer remains independent; controls do not move.
         self._play_show_animations()
 
         logger.info(f"Overlay shown for intervention {self._intervention_id}")
@@ -1125,12 +1135,12 @@ class OverlayWindow(QWidget):
     # ------------------------------------------------------------------
 
     def _play_show_animations(self) -> None:
-        """Animate the headline (scale-in 250 ms) and the causal row
-        (fade-in 180 ms, starts after the headline animation completes).
+        """Settle readable support text together with a 160 ms opacity cue.
 
         Honours the macOS "Reduce Motion" accessibility preference: when
-        enabled, both end states are applied directly and the animations
-        skip entirely.
+        enabled, both labels render at full opacity immediately.  Geometry is
+        never animated: the card is actionable on its first frame and rapid
+        replacement cannot reflow or squash text.
 
         Defensive: short-circuits when the Qt build lacks the animation
         classes (the lightweight test stubs) or when the headline /
@@ -1145,7 +1155,7 @@ class OverlayWindow(QWidget):
             headline_ms = 0
             causal_ms = 0
         else:
-            headline_ms = HEADLINE_SCALE_DURATION_MS
+            headline_ms = HEADLINE_FADE_DURATION_MS
             causal_ms = CAUSAL_FADE_DURATION_MS
         self._last_animation_log = {
             "headline_ms": headline_ms,
@@ -1159,61 +1169,51 @@ class OverlayWindow(QWidget):
             return
 
         if reduced or not _ANIMATION_AVAILABLE:
-            # Reduce-motion / mocked-out path: apply the end state directly.
-            # The causal label is whatever ``_show_causal_explanation``
-            # set; ensure its opacity effect (if any) is at full.
-            self._reset_causal_opacity_to_full()
+            self._reset_text_opacity_to_full()
             return
 
-        # Headline scale-in: animate ``geometry`` from a slightly
-        # squashed rect to the natural rect. The squash is 90 % height
-        # so the eye reads it as growing into place; lateral position
-        # is preserved so the text doesn't appear to drift.
-        try:
-            target_rect = self._headline.geometry()
-            squashed = QRect(
-                target_rect.x(),
-                target_rect.y() + target_rect.height() // 20,
-                target_rect.width(),
-                max(1, int(target_rect.height() * 0.9)),
-            )
-            self._headline.setGeometry(squashed)
-            anim = QPropertyAnimation(self._headline, b"geometry")
-            anim.setDuration(HEADLINE_SCALE_DURATION_MS)
-            anim.setStartValue(squashed)
-            anim.setEndValue(target_rect)
-            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-            self._headline_anim = anim
-            anim.start()
-        except Exception:
-            logger.debug("Headline scale-in animation failed", exc_info=True)
+        # Stop a prior run before retargeting. QPropertyAnimation otherwise
+        # keeps the old opacity writer alive during a back-to-back update.
+        for prior in (self._headline_anim, self._causal_fade_anim):
+            stop = getattr(prior, "stop", None)
+            if callable(stop):
+                try:
+                    stop()
+                except Exception:
+                    logger.debug("Prior text animation stop failed", exc_info=True)
 
-        # Causal fade-in: opacity 0 → 1 over 180 ms, started after the
-        # headline animation completes so the two reads as one
-        # continuous motion. We arm a singleShot timer for the start
-        # rather than chaining via ``finished`` because the headline
-        # animation may be replaced (back-to-back interventions) and a
-        # finished signal carries no context about which run it
-        # belongs to.
-        if not getattr(self, "_causal_label", None):
-            return
         try:
-            effect = self._causal_opacity_effect
-            if effect is None:
-                effect = QGraphicsOpacityEffect(self._causal_label)
-                self._causal_label.setGraphicsEffect(effect)
-                self._causal_opacity_effect = effect
-            effect.setOpacity(0.0)
-            fade = QPropertyAnimation(effect, b"opacity")
-            fade.setDuration(CAUSAL_FADE_DURATION_MS)
-            fade.setStartValue(0.0)
-            fade.setEndValue(1.0)
-            fade.setEasingCurve(QEasingCurve.Type.InOutSine)
-            self._causal_fade_anim = fade
-            QTimer.singleShot(HEADLINE_SCALE_DURATION_MS, fade.start)
+            headline_effect = self._headline_opacity_effect
+            if headline_effect is None:
+                headline_effect = QGraphicsOpacityEffect(self._headline)
+                self._headline.setGraphicsEffect(headline_effect)
+                self._headline_opacity_effect = headline_effect
+            headline_effect.setOpacity(0.72)
+            headline_fade = QPropertyAnimation(headline_effect, b"opacity")
+            headline_fade.setDuration(HEADLINE_FADE_DURATION_MS)
+            headline_fade.setStartValue(0.72)
+            headline_fade.setEndValue(1.0)
+            headline_fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._headline_anim = headline_fade
+            headline_fade.start()
+
+            if getattr(self, "_causal_label", None):
+                causal_effect = self._causal_opacity_effect
+                if causal_effect is None:
+                    causal_effect = QGraphicsOpacityEffect(self._causal_label)
+                    self._causal_label.setGraphicsEffect(causal_effect)
+                    self._causal_opacity_effect = causal_effect
+                causal_effect.setOpacity(0.72)
+                causal_fade = QPropertyAnimation(causal_effect, b"opacity")
+                causal_fade.setDuration(CAUSAL_FADE_DURATION_MS)
+                causal_fade.setStartValue(0.72)
+                causal_fade.setEndValue(1.0)
+                causal_fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+                self._causal_fade_anim = causal_fade
+                causal_fade.start()
         except Exception:
-            logger.debug("Causal fade-in animation failed", exc_info=True)
-            self._reset_causal_opacity_to_full()
+            logger.debug("Text opacity animation failed", exc_info=True)
+            self._reset_text_opacity_to_full()
 
     def _reduce_motion_enabled(self) -> bool:
         """Wrapper around :func:`mac_native.prefers_reduced_motion` so a
@@ -1224,12 +1224,15 @@ class OverlayWindow(QWidget):
         except Exception:
             return False
 
-    def _reset_causal_opacity_to_full(self) -> None:
-        """Restore the causal row's opacity effect (if any) to full so
-        a Reduce-Motion path doesn't leave the label hidden behind a
-        stale 0-opacity effect from a prior intervention."""
-        effect = self._causal_opacity_effect
-        if effect is not None:
+    def _reset_text_opacity_to_full(self) -> None:
+        """Restore both text effects after reduce-motion or animation failure."""
+
+        for effect in (
+            self._headline_opacity_effect,
+            self._causal_opacity_effect,
+        ):
+            if effect is None:
+                continue
             try:
                 effect.setOpacity(1.0)
             except Exception:
@@ -1312,23 +1315,10 @@ class OverlayWindow(QWidget):
     # G4 (audit-prod): suggested-action rendering + dispatch
     # ------------------------------------------------------------------
 
-    # Action types that the desktop shell can execute natively without
-    # routing through the browser extension. Everything else needs an
-    # IDENTIFY-ed Chrome / Edge / VS Code client to receive the
-    # ACTION_EXECUTE frame.
-    _NATIVE_ACTION_TYPES = frozenset({
-        "copy_to_clipboard",
-        "start_timer",
-        # P0 §3.5 extensions — native actions for HYPO / RECOVERY plans.
-        # ``resume_last_active_file`` is forwarded to the editor adapter
-        # via the controller; ``prompt_micro_commit`` and
-        # ``suggest_movement_break`` render inline widgets (text input +
-        # countdown card respectively) below the action buttons.
-        "resume_last_active_file",
-        "prompt_micro_commit",
-        "suggest_movement_break",
-        "take_biology_break",
-    })
+    # The desktop is a proposal/authorization surface, never a capability
+    # executor. These catalogs describe the remote owner used only for
+    # availability copy; the immutable manifest remains authoritative.
+    _NATIVE_ACTION_TYPES: frozenset[str] = frozenset()
     _BROWSER_ACTION_TYPES = frozenset({
         "close_tab",
         "bookmark_and_close",
@@ -1336,8 +1326,8 @@ class OverlayWindow(QWidget):
         "open_url",
         "search_error",
         "highlight_tab",
-        "save_session",
     })
+    _EDITOR_ACTION_TYPES = frozenset({"resume_last_active_file"})
 
     # Action types that render an inline widget below the button row
     # rather than executing on click (the click reveals the widget; a
@@ -1523,6 +1513,8 @@ class OverlayWindow(QWidget):
         self,
         actions: list[dict],
         connected_clients: list[str] | None = None,
+        execution_mode: str = "suggest_only",
+        action_manifest: object | None = None,
     ) -> None:
         """Re-render the suggested_action button list.
 
@@ -1545,22 +1537,37 @@ class OverlayWindow(QWidget):
             return
 
         connected = {str(c).lower() for c in (connected_clients or [])}
-        # The desktop shell can drive any browser-side action if either
-        # Chrome OR Edge is identified; VS Code is the executor for
-        # editor-bound actions but none of the 7 browser-bound types
-        # require it. The map of "which client_type executes which
-        # action_type" lives implicitly here.
         has_browser_executor = bool(connected & {"chrome", "edge"})
-        any_browser_bound = False
+        has_editor_executor = "vscode" in connected
+        executable_by_id: dict[str, str] = {}
+        manifest: ActionManifest | None = None
+        try:
+            manifest = ActionManifest.model_validate(action_manifest)
+            executable_by_id = {
+                manifest_action.action_id: str(manifest_action.executor)
+                for manifest_action in manifest.body.actions
+            }
+        except Exception:
+            # Missing/corrupt authority disables every button. Presentation
+            # remains readable and the daemon can issue a fresh proposal.
+            executable_by_id = {}
+        unavailable_reasons: set[str] = set()
+        suggestion_only = execution_mode not in (
+            "authorized", "research_autonomous",
+        )
 
         for action in actions:
             if not isinstance(action, dict):
                 continue
             action_type = str(action.get("action_type") or "")
+            action_id = str(action.get("action_id") or "")
             label = str(action.get("label") or action_type or "Action")
             reason = str(action.get("reason") or "")
-            is_browser = action_type in self._BROWSER_ACTION_TYPES
-            is_native = action_type in self._NATIVE_ACTION_TYPES
+            executor = executable_by_id.get(action_id)
+            presentation_matches = bool(
+                manifest is not None
+                and manifest_suggestion_matches(manifest, action)
+            )
 
             btn = QPushButton(label)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1587,13 +1594,26 @@ class OverlayWindow(QWidget):
             )
             _set_accessible_name(btn, label)
 
-            if is_browser and not has_browser_executor:
+            if suggestion_only:
                 btn.setEnabled(False)
-                any_browser_bound = True
-            elif not is_browser and not is_native:
-                # Unknown action_type: disable rather than silently fail.
+                btn.setToolTip(
+                    "Suggestion only — switch to an authorized mode to apply actions."
+                )
+            elif executor is None or not presentation_matches:
                 btn.setEnabled(False)
-                btn.setToolTip(f"Unsupported action type: {action_type}")
+                btn.setToolTip(
+                    "This suggestion is unavailable because its displayed "
+                    "details do not match Cortex's exact reversible manifest."
+                )
+                unavailable_reasons.add("unsupported")
+            elif executor == "browser" and not has_browser_executor:
+                btn.setEnabled(False)
+                btn.setToolTip("Connect Chrome or Edge to apply this action.")
+                unavailable_reasons.add("browser")
+            elif executor == "editor" and not has_editor_executor:
+                btn.setEnabled(False)
+                btn.setToolTip("Connect VS Code to apply this action.")
+                unavailable_reasons.add("editor")
 
             # Capture-by-default to bind the action dict to this button.
             action_snapshot = dict(action)
@@ -1613,9 +1633,25 @@ class OverlayWindow(QWidget):
             self._actions_container.addWidget(btn)
             self._action_buttons.append(btn)
 
-        if any_browser_bound and not has_browser_executor:
+        if suggestion_only:
+            self._actions_caption.setText(
+                "Suggestions only — Cortex will not change your workspace."
+            )
+            self._actions_caption.show()
+        elif unavailable_reasons == {"browser"}:
             self._actions_caption.setText(
                 "Open Cortex in Chrome or Edge to enable these actions."
+            )
+            self._actions_caption.show()
+        elif unavailable_reasons == {"editor"}:
+            self._actions_caption.setText(
+                "Connect the Cortex VS Code extension to enable this action."
+            )
+            self._actions_caption.show()
+        elif unavailable_reasons:
+            self._actions_caption.setText(
+                "Some suggestions are unavailable until their reversible "
+                "executor is connected and verified."
             )
             self._actions_caption.show()
         else:
@@ -1627,7 +1663,10 @@ class OverlayWindow(QWidget):
         the action dict. The host (controller / main) decides how to
         dispatch.
         """
-        if not self._intervention_id:
+        if (
+            not self._intervention_id
+            or self._execution_mode == "suggest_only"
+        ):
             return
         try:
             self.action_invoked.emit(self._intervention_id, dict(action))

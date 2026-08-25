@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import timedelta
 from typing import Any
 
 import numpy as np
+
+from cortex.application.clock import SYSTEM_CLOCK, Clock, utc_datetime
 
 logger = logging.getLogger(__name__)
 
@@ -43,13 +45,16 @@ class LongitudinalTracker:
         self,
         store: Any = None,
         window_days: int = _DEFAULT_WINDOW_DAYS,
+        *,
+        clock: Clock | None = None,
     ) -> None:
+        self._clock = clock or SYSTEM_CLOCK
         self._store = store
         self._window_days = window_days
         self._sensitivity_multiplier: float = 1.0
 
         # In-memory accumulators for current day
-        self._today = date.today()
+        self._today = utc_datetime(self._clock).astimezone().date()
         self._hr_samples: list[float] = []
         self._hrv_samples: list[float] = []
         self._resp_samples: list[float] = []
@@ -91,7 +96,7 @@ class LongitudinalTracker:
 
         Called from the state loop (~2Hz).
         """
-        current = date.today()
+        current = utc_datetime(self._clock).astimezone().date()
         if current != self._today:
             self._today = current
             self._hr_samples.clear()
@@ -110,7 +115,7 @@ class LongitudinalTracker:
         if resp is not None:
             self._resp_samples.append(resp)
 
-        hour = datetime.now().hour
+        hour = utc_datetime(self._clock).astimezone().hour
         bucket = self._hourly_overload[hour]
         bucket.append(state == "HYPER")
         # B16 (Phase 4.1): bound the bucket length to avoid unbounded
@@ -234,8 +239,7 @@ class LongitudinalTracker:
         # Load recent daily baselines from store
         baselines = []
         for i in range(self._window_days):
-            from datetime import timedelta
-            d = date.today() - timedelta(days=i)
+            d = utc_datetime(self._clock).astimezone().date() - timedelta(days=i)
             key = f"daily_baseline:{d.isoformat()}"
             try:
                 data = await self._store.get_json(key)

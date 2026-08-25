@@ -2,8 +2,8 @@
 
 Covers:
 * TASK B — FeatureFusion physio_missing + telemetry_seen_count
-* TASK C — RuleScorer forward_lean None handling + cold-start gate
-* TASK D — TriggerPolicy HYPER physio/kinematics signal-quality floor
+* TASK C — camera posture is excluded from production support inference
+* TASK D — TriggerPolicy accepts eligible behavior-only evidence
 * TASK E — SessionReportGenerator NTP back-jump clamp
 * TASK F — Real interventions_triggered / interventions_accepted plumbing
 """
@@ -83,7 +83,7 @@ class TestFeatureFusionPhysioGating:
             fusion.update_telemetry(tel, timestamp=float(i))
         assert fusion.fuse(timestamp=7.0)[0].telemetry_seen_count == 7
 
-    def test_forward_lean_angle_none_when_kinematics_score_none(self):
+    def test_deprecated_posture_fields_do_not_fabricate_shoulder_data(self):
         fusion = FeatureFusion()
         kin = KinematicFeatures(
             blink_rate=15.0,
@@ -94,7 +94,7 @@ class TestFeatureFusionPhysioGating:
         fusion.update_kinematics(kin, timestamp=0.0)
         vec, _ = fusion.fuse(timestamp=0.0)
         assert vec.forward_lean_angle is None
-        assert vec.shoulder_drop_ratio == 0.2
+        assert vec.shoulder_drop_ratio is None
 
 
 # ---------------------------------------------------------------------------
@@ -132,12 +132,13 @@ class TestRuleScorerPostureColdStart:
         # these neutral values, so HYPO should be close to zero.
         assert scores.hypo < 0.3
 
-    def test_posture_hypo_fires_when_forward_lean_present(self):
+    def test_posture_hypo_is_excluded_when_forward_lean_present(self):
         scorer = RuleScorer(baselines=UserBaselines())
         fv = _hypo_fv(telemetry_seen=10, forward_lean=5.0, shoulder_drop=0.3)
         scores = scorer.compute_scores(fv)
-        # Slump (lean<15 + drop>0.1) should contribute a HYPO score.
-        assert scores.hypo > 0.0
+        # Camera-derived posture is diagnostic-only until it passes the
+        # registered participant-held-out validation protocol.
+        assert scores.hypo == 0.0
 
     def test_hypo_telemetry_skipped_during_cold_start(self):
         scorer = RuleScorer(baselines=UserBaselines())
@@ -149,12 +150,13 @@ class TestRuleScorerPostureColdStart:
         # so the score should be close to zero.
         assert scores.hypo == 0.0
 
-    def test_hypo_telemetry_fires_after_warmup(self):
+    def test_zero_telemetry_does_not_fabricate_under_engagement_after_warmup(self):
         scorer = RuleScorer(baselines=UserBaselines())
         fv = _hypo_fv(telemetry_seen=5, forward_lean=None, shoulder_drop=None)
         scores = scorer.compute_scores(fv)
-        # Mouse drift + low switch rate now contribute → non-zero HYPO.
-        assert scores.hypo > 0.0
+        # An available but all-zero stream is ambiguous. Under-engagement
+        # requires observed inactivity plus corroborating behavior evidence.
+        assert scores.hypo == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -179,18 +181,15 @@ def _hyper_estimate(*, physio: float, kinematics: float, telemetry: float,
 
 
 class TestHyperSignalQualityFloor:
-    def test_telemetry_only_blocks_hyper(self):
-        """Physio + kinematics near zero must defer the HYPER trigger
-        even when telemetry is strong enough that the overall quality
-        is ``acceptable``."""
+    def test_eligible_behavior_evidence_does_not_require_camera(self):
+        """Camera absence cannot veto an eligible behavior-only estimate."""
         policy = TriggerPolicy(
             config=InterventionConfig(adaptive_threshold_enabled=False),
             state_config=StateConfig(),
         )
         est = _hyper_estimate(physio=0.1, kinematics=0.1, telemetry=0.9)
         decision = policy.evaluate(est, current_time=200.0)
-        assert decision.should_trigger is False
-        assert "physio" in decision.reason.lower()
+        assert decision.should_trigger is True
 
     def test_physio_floor_alone_passes(self):
         """Physio >= 0.3 passes the SQ floor even with weak kinematics."""

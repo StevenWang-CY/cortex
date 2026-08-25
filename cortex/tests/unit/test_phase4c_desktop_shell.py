@@ -217,34 +217,23 @@ def test_concepts_glossary_has_core_terms() -> None:
     from cortex.apps.desktop_shell import dashboard
 
     glossary = dashboard._CONCEPTS_GLOSSARY
-    for required in ("state", "hr", "hrv", "perclos", "sqi"):
+    for required in ("state", "hr", "perclos", "sqi"):
         assert required in glossary, f"glossary missing {required!r}"
         # Every entry is a non-empty string so the tooltip is not blank.
         assert isinstance(glossary[required], str)
         assert len(glossary[required]) > 10
+    assert "hrv" not in glossary
 
 
 # ---------------------------------------------------------------------------
-# P0 §3.16 — Reversible action set mirrors executor map.
+# P0 §3.16 — action names never imply exact reversibility.
 # ---------------------------------------------------------------------------
 
 
-def test_reversible_set_mirrors_executor_keys() -> None:
+def test_desktop_does_not_infer_reversibility_from_legacy_action_names() -> None:
     from cortex.apps.desktop_shell.dashboard import _ConsumerTab
-    from cortex.services.intervention_engine.executor import (
-        _REVERSE_ACTIONS,
-    )
 
-    mirror = _ConsumerTab._DESKTOP_REVERSIBLE_ACTIONS
-    # The mirror is allowed to drop a few entries (e.g. ``show_overlay``
-    # is rarely reversed from the desktop side) but everything in the
-    # mirror must exist in the executor map. This catches a typo in
-    # the mirror — the dashboard would otherwise show an Undo toast
-    # for an action the daemon cannot actually undo.
-    for action in mirror:
-        assert action in _REVERSE_ACTIONS, (
-            f"{action} in desktop mirror but not in executor _REVERSE_ACTIONS"
-        )
+    assert _ConsumerTab._DESKTOP_REVERSIBLE_ACTIONS == frozenset()
 
 
 # ---------------------------------------------------------------------------
@@ -252,16 +241,10 @@ def test_reversible_set_mirrors_executor_keys() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_overlay_native_action_types_extended() -> None:
+def test_overlay_has_no_direct_native_capability_bypass() -> None:
     from cortex.apps.desktop_shell.overlay import OverlayWindow
 
-    native = OverlayWindow._NATIVE_ACTION_TYPES
-    for required in (
-        "resume_last_active_file",
-        "prompt_micro_commit",
-        "suggest_movement_break",
-        "take_biology_break",
-    ):
-        assert required in native, (
-            f"new action type {required!r} missing from _NATIVE_ACTION_TYPES"
-        )
+    assert OverlayWindow._NATIVE_ACTION_TYPES == frozenset()
+    assert OverlayWindow._EDITOR_ACTION_TYPES == frozenset(
+        {"resume_last_active_file"}
+    )

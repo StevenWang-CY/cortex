@@ -8,13 +8,11 @@ maps hide_targets to concrete adapter commands.
 from __future__ import annotations
 
 import logging
-from typing import Literal
 
 from cortex.libs.schemas.intervention import (
     AdapterCommand,
     InterventionPlan,
     SuggestedAction,
-    UIPlan,
     ValidationResult,
 )
 
@@ -27,7 +25,7 @@ __all__ = [
     "validate_plan",
     "sanitize_plan_actions",
     "map_hide_targets",
-    "promote_biology_break",
+    "materialize_suggestion_only",
     "prepare_plan",
 ]
 
@@ -51,6 +49,43 @@ _HIDE_TARGET_MAP: dict[str, AdapterCommand] = {
         action="fold_except_current",
     ),
 }
+
+
+def materialize_suggestion_only(plan: InterventionPlan) -> InterventionPlan:
+    """Return a presentation-only copy of a validated intervention plan.
+
+    The original plan is retained only as descriptive context. Every field
+    that can cause an automatic workspace effect is removed, and suggested
+    actions are marked non-executable for clients that render the legacy
+    action shape. This conversion happens after validation so it cannot hide
+    an invalid LLM response from observability.
+    """
+    proposal = plan.model_copy(deep=True)
+    original_level = proposal.level
+    original_consent = proposal.consent_level
+
+    proposal.hide_targets = []
+    proposal.ui_plan = proposal.ui_plan.model_copy(
+        update={
+            "show_overlay": True,
+            "fold_unrelated_code": False,
+            "intervention_type": "overlay_only",
+        },
+        deep=True,
+    )
+    proposal.level = "overlay_only"
+    proposal.consent_level = "suggest"
+    proposal.metadata = dict(proposal.metadata or {})
+    proposal.metadata.update({
+        "execution_mode": "suggest_only",
+        "original_intervention_level": original_level,
+        "original_consent_level": original_consent,
+        "workspace_mutation_allowed": False,
+    })
+    for action in proposal.suggested_actions:
+        action.metadata = dict(action.metadata or {})
+        action.metadata["execution_available"] = False
+    return proposal
 
 
 # ---------------------------------------------------------------------------
@@ -87,9 +122,10 @@ def validate_plan(plan: InterventionPlan) -> ValidationResult:
     elif step_count > 3:
         errors.append(f"has {step_count} micro_steps (max 3)")
 
-    # Check for destructive actions (keep as warning; dropped during sanitization).
+    # Destructive-looking suggestions remain inert presentation copy unless
+    # the transaction catalog can mint an exact reversible capability.
     if plan.is_destructive:
-        warnings.append("plan contains destructive actions (dropped)")
+        warnings.append("plan contains destructive actions (presentation-only)")
 
     # Check required fields are non-empty
     if not plan.situation_summary.strip():
@@ -102,13 +138,11 @@ def validate_plan(plan: InterventionPlan) -> ValidationResult:
     if plan.level not in valid_levels:
         errors.append(f"invalid level '{plan.level}'")
 
-    # Validate suggested_actions
+    # SuggestedAction.reversible is a catalog-derived presentation hint, not
+    # authority and not a prerequisite for showing a proposal. Unsupported
+    # close/group actions are intentionally visible but omitted from the exact
+    # action manifest by build_action_manifest().
     for action in plan.suggested_actions:
-        if action.action_type in ("close_tab", "group_tabs", "bookmark_and_close"):
-            if not action.reversible:
-                errors.append(
-                    f"action {action.action_id} ({action.action_type}) must be reversible"
-                )
         if not action.label:
             warnings.append(f"action {action.action_id} has empty label")
     if len(plan.suggested_actions) > 10:
@@ -172,11 +206,6 @@ def sanitize_plan_actions(
                     f"dropped action {action.action_id}: tab_index {action.tab_index} out of range"
                 )
                 continue
-        if action.action_type in {"close_tab", "bookmark_and_close"} and not action.reversible:
-            warnings.append(
-                f"dropped action {action.action_id}: close action must be reversible"
-            )
-            continue
         if any(tok in action.label.lower() for tok in ("discard", "delete project", "delete file")):
             warnings.append(
                 f"dropped action {action.action_id}: destructive label content"
@@ -239,76 +268,6 @@ def map_hide_targets(plan: InterventionPlan) -> list[AdapterCommand]:
             )
 
     return commands
-
-
-def promote_biology_break(
-    plan: InterventionPlan,
-    *,
-    duration_seconds: int = 240,
-    breathing_pattern: Literal["box", "4-7-8", "coherent"] | None = None,
-    audio_cue: bool = True,
-    reason: str = "stress_integral_crossed_threshold",
-) -> InterventionPlan:
-    """Mutate ``plan`` so ``take_biology_break`` is the primary action.
-
-    Called by the daemon when :meth:`StressIntegralTracker.should_break`
-    is True. The function:
-
-    * prepends a ``take_biology_break`` :class:`SuggestedAction` with
-      the configured metadata (the desktop shell reads
-      ``metadata.duration_seconds`` etc. to drive the overlay),
-    * downgrades any peer ``recommended`` actions to ``optional`` so
-      the UI's single-CTA preview→confirm→execute path elevates the
-      break,
-    * forces ``ui_plan.intervention_type = "overlay_only"`` so the
-      desktop shell renders the break overlay rather than the
-      simplified workspace,
-    * rewrites the headline / primary_focus to a deterministic
-      copy (the LLM is free to keep its own text in the situation
-      summary).
-
-    The plan object is mutated in place and also returned for
-    composability with planner pipelines.
-    """
-    metadata: dict[str, object] = {
-        "duration_seconds": int(duration_seconds),
-        "breathing_pattern": breathing_pattern or "auto",
-        "audio_cue": bool(audio_cue),
-        "reason": str(reason)[:120],
-    }
-    break_action = SuggestedAction(
-        action_type="take_biology_break",
-        target="",
-        label=f"Take a {max(1, duration_seconds // 60)}-minute break",
-        reason="Your HRV has been suppressed long enough that the daemon "
-               "recommends a guided breathing reset.",
-        category="recommended",
-        reversible=True,
-        metadata=metadata,
-    )
-
-    # Demote peer recommended actions so the single-CTA UI surfaces the
-    # break, not e.g. a tab-close as the primary action.
-    for action in plan.suggested_actions:
-        if action.category == "recommended":
-            action.category = "optional"
-    plan.suggested_actions = [break_action, *plan.suggested_actions]
-
-    # Force overlay-only — the simplified_workspace path would hide tabs
-    # while the breathing overlay runs, which is jarring.
-    plan.ui_plan = UIPlan(
-        dim_background=True,
-        show_overlay=True,
-        fold_unrelated_code=False,
-        intervention_type="overlay_only",
-        max_visible_lines=plan.ui_plan.max_visible_lines,
-    )
-    plan.level = "overlay_only"
-    plan.headline = f"Take a {max(1, duration_seconds // 60)}-minute break."
-    plan.primary_focus = "Your breath"
-    plan.tone = "supportive"
-    plan.consent_level = "suggest"
-    return plan
 
 
 def prepare_plan(

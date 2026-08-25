@@ -64,7 +64,7 @@ class _MockAdapter:
 
 
 def test_state_transition_increments_counter() -> None:
-    """A confirmed FLOW→HYPER transition bumps the transition counter."""
+    """A confirmed UNKNOWN→HYPER transition bumps the transition counter."""
     config = StateConfig(
         entry_threshold=0.85,
         exit_threshold=0.70,
@@ -76,7 +76,7 @@ def test_state_transition_increments_counter() -> None:
     hyper_scores = StateScores(flow=0.05, hypo=0.0, hyper=0.99, recovery=0.0)
 
     before = _labeled_value(
-        STATE_TRANSITIONS_TOTAL, from_state="FLOW", to_state="HYPER",
+        STATE_TRANSITIONS_TOTAL, from_state="UNKNOWN", to_state="HYPER",
     )
 
     for i in range(30):
@@ -86,17 +86,17 @@ def test_state_transition_increments_counter() -> None:
     assert smoother.current_state == UserState.HYPER
 
     after = _labeled_value(
-        STATE_TRANSITIONS_TOTAL, from_state="FLOW", to_state="HYPER",
+        STATE_TRANSITIONS_TOTAL, from_state="UNKNOWN", to_state="HYPER",
     )
     assert after == before + 1.0, (
-        f"expected exactly one flow→hyper increment; before={before} after={after}"
+        f"expected exactly one unknown→hyper increment; before={before} after={after}"
     )
 
 
 @pytest.mark.asyncio
 async def test_intervention_applied_increments_counter_on_success() -> None:
     """A successful adapter dispatch bumps the applied counter once."""
-    executor = InterventionExecutor()
+    executor = InterventionExecutor(execution_mode="authorized")
     executor._allow_unwired_consent = True  # noqa: SLF001  # test escape hatch
     executor.register_adapter("editor", _MockAdapter())
 
@@ -121,7 +121,7 @@ async def test_intervention_applied_increments_counter_on_success() -> None:
 @pytest.mark.asyncio
 async def test_intervention_applied_not_incremented_on_failure() -> None:
     """A failed adapter dispatch must NOT bump the applied counter."""
-    executor = InterventionExecutor()
+    executor = InterventionExecutor(execution_mode="authorized")
     executor._allow_unwired_consent = True  # noqa: SLF001
     executor.register_adapter("editor", _MockAdapter(fail=True))
 

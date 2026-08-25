@@ -1,11 +1,10 @@
-"""P0-2 / audit P1: low-quality frames must be NaN-filled (not dropped)
-in the rPPG RGB window so the window stays time-uniform.
+"""WP-2: missing/low-quality camera observations retain window exposure.
 
 The behaviour lives inside ``CortexDaemon._process_capture_output``: a
 low-quality frame is NOT contributed as a real RGB sample, but a NaN
-sentinel row IS appended so the fixed-maxlen deque still advances by one
-slot. ``_frames_low_quality_rejected`` is incremented. The NaN gaps are
-interpolated away just before ``extract_bvp``.
+observation IS appended so the bounded time-series still advances by one
+slot. ``_frames_low_quality_rejected`` is incremented. Interpolation is
+permitted only after the coverage/gap gate accepts the window.
 """
 
 from __future__ import annotations
@@ -52,12 +51,21 @@ def _stub_kinematics() -> tuple[object, object, object]:
         perclos_60s=None,
         mean_blink_duration_ms=None,
         ear_variance=None,
+        valid_exposure_seconds=0.0,
     )
-    fake_pose = SimpleNamespace(pitch=None, yaw=None, roll=None)
+    fake_pose = SimpleNamespace(
+        pitch=0.0,
+        yaw=0.0,
+        roll=0.0,
+        angular_velocity_deg_per_s=0.0,
+        is_jittery=False,
+        is_frozen=False,
+    )
     fake_posture = SimpleNamespace(
-        slump_score=None,
-        forward_lean_score=None,
-        shoulder_drop_ratio=None,
+        head_neck_flexion_angle=None,
+        head_neck_flexion_score=None,
+        sustained_flexion_seconds=0.0,
+        proxy_available=False,
     )
     return fake_blink, fake_pose, fake_posture
 
@@ -78,10 +86,11 @@ async def _run_outputs(daemon: object, outputs: list[object]) -> None:
         mock_roi_extractor.extract.return_value = fake_roi
         mock_blink.update.return_value = fake_blink
         mock_pose.update.return_value = fake_pose
-        mock_posture.update_with_face.return_value = fake_posture
+        mock_posture.face_scale.return_value = 100.0
+        mock_posture.update.return_value = fake_posture
         mock_fusion.update_kinematics.return_value = None
         mock_fusion.update_physio.return_value = None
-        with patch("cortex.services.runtime_daemon.registry") as mock_reg:
+        with patch.object(daemon, "_services") as mock_reg:
             mock_reg.register.return_value = None
             for out in outputs:
                 await daemon._process_capture_output(out)  # type: ignore[attr-defined]
@@ -145,12 +154,10 @@ def test_interpolate_nan_window_fills_gaps_finite() -> None:
     np.testing.assert_allclose(out[2], [3.0, 4.0, 5.0])
 
 
-def test_interpolate_nan_window_all_nan_channel_falls_back_to_zero() -> None:
-    """A channel with no finite sample anywhere falls back to zeros (which
-    extract_bvp tolerates) rather than propagating NaN."""
+def test_interpolate_nan_window_all_nan_channel_stays_unavailable() -> None:
+    """An all-missing channel must never be fabricated into a zero signal."""
     from cortex.services.runtime_daemon import _interpolate_nan_window
 
     window = np.full((4, 3), np.nan, dtype=np.float64)
     out = _interpolate_nan_window(window)
-    assert not np.isnan(out).any()
-    np.testing.assert_allclose(out, np.zeros((4, 3)))
+    assert np.isnan(out).all()

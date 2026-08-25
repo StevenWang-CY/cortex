@@ -16,12 +16,8 @@ from __future__ import annotations
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.integrate import trapezoid
 from scipy.signal import find_peaks, lombscargle, welch
-
-# np.trapz was removed in NumPy 2.0 in favor of np.trapezoid.
-# This shim lets the module work on both NumPy 1.x (deployed in CI) and 2.x.
-if not hasattr(np, "trapezoid"):
-    np.trapezoid = np.trapz  # type: ignore[attr-defined]
 
 
 def estimate_hr_welch(
@@ -281,12 +277,12 @@ def compute_lf_hf_ratio_lomb_scargle(
     rr_centered = rr - np.mean(rr)
     freqs = np.linspace(0.04, 0.40, 256)
     ang = 2.0 * np.pi * freqs
-    pgram = lombscargle(beat_t, rr_centered, ang, precenter=False, normalize=True)
+    pgram = lombscargle(beat_t, rr_centered, ang, normalize=True)
 
     lf_mask = (freqs >= 0.04) & (freqs < 0.15)
     hf_mask = (freqs >= 0.15) & (freqs <= 0.40)
-    lf = float(np.trapezoid(pgram[lf_mask], freqs[lf_mask])) if np.any(lf_mask) else 0.0
-    hf = float(np.trapezoid(pgram[hf_mask], freqs[hf_mask])) if np.any(hf_mask) else 0.0
+    lf = float(trapezoid(pgram[lf_mask], freqs[lf_mask])) if np.any(lf_mask) else 0.0
+    hf = float(trapezoid(pgram[hf_mask], freqs[hf_mask])) if np.any(hf_mask) else 0.0
     if hf <= 1e-9:
         return None
     return float(lf / hf)

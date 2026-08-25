@@ -1,0 +1,84 @@
+name: Publish validated macOS release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing draft release tag (for example v0.3.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cortex-release-${{ github.event.inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  UV_VERSION: "0.10.12"
+  PYTHON_PRIMARY: "3.11.15"
+  NODE_VERSION: "22.23.2"
+  PNPM_VERSION: "9.15.9"
+  RELEASE_TAG: ${{ github.event.inputs.tag }}
+
+jobs:
+  validate-and-publish:
+    name: Validate independent evidence and publish draft
+    runs-on: ubuntu-latest
+    environment: production-publish
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      attestations: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_PRIMARY }}
+          enable-cache: true
+      - name: Require an existing draft and download its immutable candidate assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft)" = "true"
+          mkdir -p release-assets
+          gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --dir release-assets --clobber
+      - name: Validate tag, two architecture records, hashes, cases, and reviewer independence
+        run: |
+          uv sync --project cortex --locked --extra dev
+          uv run --project cortex --locked --extra dev python -m cortex.scripts.sync_versions --check --tag "${RELEASE_TAG}"
+          VERSION="$(uv run --project cortex --locked python -m cortex.scripts.sync_versions --print)"
+          COMMIT="$(git rev-parse HEAD)"
+          uv run --project cortex --locked --extra dev python -m cortex.scripts.validate_release_records \
+            --records-dir release-assets \
+            --asset-dir release-assets \
+            --expected-version "${VERSION}" \
+            --expected-commit "${COMMIT}" \
+            --output release-assets/release-promotion-validation.json
+      - name: Verify GitHub provenance attestations for both reviewed DMGs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          COMMIT="$(git rev-parse HEAD)"
+          gh attestation verify release-assets/Cortex-*-macos-arm64.dmg \
+            --repo "${GITHUB_REPOSITORY}" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
+            --source-ref "refs/tags/${RELEASE_TAG}" \
+            --source-digest "${COMMIT}"
+          gh attestation verify release-assets/Cortex-*-macos-x86_64.dmg \
+            --repo "${GITHUB_REPOSITORY}" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
+            --source-ref "refs/tags/${RELEASE_TAG}" \
+            --source-digest "${COMMIT}"
+      - name: Attach promotion decision and publish the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${RELEASE_TAG}" release-assets/release-promotion-validation.json --repo "${GITHUB_REPOSITORY}" --clobber
+          gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false --verify-tag

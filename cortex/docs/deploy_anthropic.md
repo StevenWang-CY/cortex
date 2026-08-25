@@ -6,15 +6,27 @@ Use this flow to experience Cortex as a real product on macOS. Cortex talks to C
 
 ```bash
 cd /path/to/cortex-repo
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install -e "./cortex[dev]"
-export PYTHONPATH="$PWD"
+uv sync --project cortex --locked --extra dev --extra codegen
 cp cortex/.env.example .env
-python -m cortex.scripts.seed_config --root .
+uv run --project cortex --locked python -m cortex.scripts.seed_config --root .
 ```
 
 Set the provider in `.env`. Pick one option below.
+
+Provider credentials alone do not enable network calls. Cortex defaults to the
+local deterministic planner. After reading [`privacy.md`](privacy.md), enable
+the external preview path explicitly:
+
+```bash
+CORTEX_LLM__PRIVACY__PLANNER_MODE=external_redacted
+CORTEX_LLM__PRIVACY__EXTERNAL_CONTEXT_ENABLED=true
+CORTEX_LLM__PRIVACY__CONSENT_REVISION=context-disclosure-v1
+CORTEX_LLM__PRIVACY__PROVIDER_RETENTION_MODE=unverified
+```
+
+Every provider request still needs a fresh source selection, exact redacted
+preview, and one-time confirmation. Cortex does not verify provider retention
+configuration or contractual terms.
 
 #### Option A — AWS Bedrock (default)
 
@@ -59,10 +71,10 @@ CORTEX_LLM__FALLBACK_MODE=rule_based   # default — deterministic plan if all e
 
 `cortex/libs/llm/anthropic_client.resolve_anthropic_model_id` maps each logical id to the provider-specific identifier (Bedrock inference profile, Vertex revision, or direct API name).
 
-### 2. Calibrate
+### 2. Optional research calibration
 
 ```bash
-cortex-calibrate --duration 120
+uv run --project cortex --locked cortex-calibrate --duration 120
 ```
 
 This writes the active baseline to `storage/baselines/default.json`.
@@ -73,7 +85,7 @@ VS Code:
 
 ```bash
 cd cortex/apps/vscode_extension
-npm install
+npm ci
 npm run compile
 ```
 
@@ -81,8 +93,8 @@ Chrome:
 
 ```bash
 cd cortex/apps/browser_extension
-pnpm install
-pnpm build
+pnpm install --frozen-lockfile
+pnpm exec plasmo build
 ```
 
 Load the browser extension from `chrome://extensions`.
@@ -97,13 +109,13 @@ Open **Cortex.app** from `/Applications` (installed via DMG). The app starts the
 Terminal 1:
 
 ```bash
-cortex-dev
+uv run --project cortex --locked cortex-dev
 ```
 
 Terminal 2:
 
 ```bash
-python -m cortex.apps.desktop_shell.main
+uv run --project cortex --locked python -m cortex.apps.desktop_shell.main
 ```
 
 ### 5. Experience the product
@@ -117,17 +129,15 @@ For research recovery:
 - keep Chrome open with docs, PDFs, and paper tabs
 - let the browser extension classify the active research context
 
-When overwhelm is detected, Cortex can:
-- fold unrelated code
-- hide non-active research tabs
-- show a focused overlay with 1-3 next steps
-- restore the workspace when you dismiss, snooze, or recover
+When the legacy heuristic support gate is reached, Cortex can show a focused
+proposal with 1–3 next steps. The shipping `suggest_only` mode does not fold
+code, hide tabs, or otherwise restructure the workspace. Do not interpret the
+gate as a diagnosis of overwhelm.
 
 ### 6. Package a macOS app
 
 ```bash
-cd cortex
-./scripts/build_macos_app.sh
+./cortex/scripts/build_macos_app.sh
 ```
 
 Use code signing and DMG packaging for distribution after local verification. Bedrock bearer tokens, Anthropic API keys, and Vertex ADC files are NOT bundled — every user supplies their own credentials during onboarding (BYOK).

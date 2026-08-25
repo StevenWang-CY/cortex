@@ -2,161 +2,324 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to release (e.g. v0.2.1). The tag must already exist."
+        description: "Existing tag to release (for example v0.3.0)"
         required: true
         type: string
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: cortex-release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  UV_VERSION: "0.10.12"
+  PYTHON_PRIMARY: "3.11.15"
+  NODE_VERSION: "22.23.2"
+  PNPM_VERSION: "9.15.9"
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
   ci-gate:
-    name: Pre-release CI gate
-    runs-on: macos-14
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-
-      - name: Install Cortex (dev + codegen)
-        run: pip install -e "./cortex[dev,codegen]"
-
-      - name: Install json2ts
-        run: npm install -g json-schema-to-typescript
-
-      - name: Lint
-        run: ruff check cortex/
-
-      - name: Typecheck (mypy --strict — blocking, full project)
-        # Audit fix: previously the blocking scope was a curated subset
-        # (libs/design + libs/llm) and the full tree ran with
-        # ``|| true``. Tag release builds (release.yml) ran the full
-        # ``mypy cortex/ --strict`` gate, so a PR could land green and
-        # break the next release. Promote the strict full-project gate
-        # to block PR merges as well so the two CI surfaces stay
-        # aligned and tag-time surprises stop happening.
-        #
-        # ``--config-file cortex/pyproject.toml`` is REQUIRED: the job
-        # runs from the repo root where mypy would otherwise never
-        # discover ``[tool.mypy]`` (it lives under ``cortex/``). Without
-        # it the pydantic plugin + per-module overrides are silently
-        # dropped and the gate reports false errors. Kept byte-identical
-        # with release.yml's pre-release gate.
-        run: mypy --config-file cortex/pyproject.toml cortex/ --strict
-
-      - name: Schema codegen drift
-        run: python -m cortex.scripts.generate_ts_schemas --check
-
-      - name: Test (pytest)
-        # ci-pytest-split (audit): a single ``pytest cortex/tests/``
-        # SEGFAULTs during collection because PySide6/shiboken loads
-        # after scipy/pyobjc have already initialised their own copies of
-        # the same native libs. Split into TWO invocations: the whole suite
-        # EXCEPT the PySide6 desktop_shell test (covers unit, integration,
-        # services, state_engine, eval, physio, performance), then the
-        # desktop_shell test isolated in its own interpreter. The earlier
-        # three-way split silently dropped integration/state_engine/eval/
-        # physio/performance coverage. ``QT_QPA_PLATFORM`` stays offscreen
-        # for both. Kept byte-identical with the other workflow's gate
-        # (enforced by the ci-release-parity job).
-        env:
-          QT_QPA_PLATFORM: offscreen
-        run: |
-          pytest cortex/tests/ --ignore=cortex/tests/unit/test_desktop_shell.py
-          pytest cortex/tests/unit/test_desktop_shell.py
-
-  build-dmg:
-    name: Build macOS .dmg
-    needs: ci-gate
+    name: Pre-release locked CI gate
     runs-on: macos-14
     timeout-minutes: 45
-    outputs:
-      dmg-path: ${{ steps.locate.outputs.dmg-path }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          python-version: "3.11"
-
-      - name: Set up Node
-        uses: actions/setup-node@v6
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_PRIMARY }}
+          enable-cache: true
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
         with:
-          node-version: "20"
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Activate exact pnpm without the action-setup version shim
+        run: |
+          corepack enable
+          corepack prepare "pnpm@${PNPM_VERSION}" --activate
+          test "$(pnpm --version)" = "${PNPM_VERSION}"
+      - name: Frozen install
+        run: |
+          uv sync --project cortex --locked --extra dev --extra codegen
+          pnpm --dir cortex/apps/browser_extension install --frozen-lockfile
+      - name: Tag, schema, config, docs, and version contracts
+        run: |
+          uv run --project cortex --locked --extra dev --extra codegen python -m cortex.scripts.sync_versions --check --tag "${RELEASE_TAG}"
+          uv run --project cortex --locked --extra dev --extra codegen python -m cortex.scripts.generate_ts_schemas --check
+          uv run --project cortex --locked --extra dev --extra codegen python -m cortex.scripts.verify_repository_contracts
+      - name: Canonical Python gate
+        run: ./cortex/scripts/run_python_gate.sh
 
-      - name: Install pnpm
-        # Audit fix: ``npm install -g pnpm`` pulled "whatever pnpm
-        # tagged latest" at release time — silent version drift across
-        # tag builds. ``pnpm/action-setup`` pins to the same version as
-        # ci.yml so the lockfile that passed PR CI is the lockfile the
-        # release build consumes.
-        uses: pnpm/action-setup@v6
+  build-dmg:
+    name: Signed notarized DMG (${{ matrix.arch }})
+    needs: ci-gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+            python: "3.11.15"
+          - runner: macos-15-intel
+            arch: x86_64
+            python: "3.12.13"
+    runs-on: ${{ matrix.runner }}
+    environment: production-release
+    timeout-minutes: 90
+    env:
+      # The x86_64 builder must not fall back to the primary .python-version.
+      UV_PYTHON: ${{ matrix.python }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          version: 9
-
-      - name: Install Cortex (dev)
-        run: pip install -e "./cortex[dev]"
-
-      - name: Install browser-extension deps
-        # ``--frozen-lockfile`` aborts if pnpm-lock.yaml is out of
-        # sync — prevents a stale lockfile from quietly resolving
-        # different versions in CI than in dev.
-        run: cd cortex/apps/browser_extension && pnpm install --frozen-lockfile
-
-      - name: Build DMG (ad-hoc signed)
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Activate exact pnpm without the action-setup version shim
+        run: |
+          corepack enable
+          corepack prepare "pnpm@${PNPM_VERSION}" --activate
+          test "$(pnpm --version)" = "${PNPM_VERSION}"
+      - name: Frozen install
+        run: |
+          uv sync --project cortex --locked --extra dev --extra codegen
+          pnpm --dir cortex/apps/browser_extension install --frozen-lockfile
+          npm --prefix cortex/apps/vscode_extension ci
+          echo "${GITHUB_WORKSPACE}/cortex/.venv/bin" >> "${GITHUB_PATH}"
+      - name: Verify exact build interpreter and architecture
         env:
-          # Production releases should set CORTEX_SIGN_IDENTITY +
-          # CORTEX_NOTARIZE_PROFILE as repo secrets. Without them the
-          # script falls back to ad-hoc signing for portfolio builds.
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          EXPECTED_PYTHON: ${{ matrix.python }}
+        run: uv run --project cortex --locked python -c 'import platform, os; actual=(platform.python_version(), platform.machine()); expected=(os.environ["EXPECTED_PYTHON"], os.environ["EXPECTED_ARCH"]); assert actual == expected, (actual, expected)'
+      - name: Audit the resolved architecture-specific Python graph
+        run: |
+          uv run --project cortex --locked --extra dev pip-audit \
+            --format json \
+            --output "${RUNNER_TEMP}/python-${{ matrix.arch }}-audit.json" || true
+          audit_exception_args=()
+          if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
+            audit_exception_args=(--exceptions cortex/security/python-intel-audit-exceptions.json)
+          fi
+          uv run --project cortex --locked --extra dev python \
+            cortex/scripts/verify_dependency_audit.py \
+            --ecosystem pip \
+            --report "${RUNNER_TEMP}/python-${{ matrix.arch }}-audit.json" \
+            --summary-out "${RUNNER_TEMP}/python-${{ matrix.arch }}-audit-summary.json" \
+            "${audit_exception_args[@]}"
+
+      - name: Import Developer ID certificate and notary credentials
+        env:
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_ID_USERNAME: ${{ secrets.APPLE_ID_USERNAME }}
+          APPLE_ID_APP_PASSWORD: ${{ secrets.APPLE_ID_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TEMP_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_TEMP_KEYCHAIN_PASSWORD }}
+        run: |
+          : "${APPLE_DEVELOPER_ID_P12_BASE64:?missing certificate secret}"
+          : "${APPLE_DEVELOPER_ID_P12_PASSWORD:?missing certificate password}"
+          : "${TEMP_KEYCHAIN_PASSWORD:?missing temporary keychain password}"
+          NOTARY_AUTH_MODE="$(
+            uv run --project cortex --locked python \
+              -m cortex.scripts.select_notary_auth
+          )"
+          CERTIFICATE_PATH="${RUNNER_TEMP}/developer-id.p12"
+          KEYCHAIN_PATH="${RUNNER_TEMP}/cortex-signing.keychain-db"
+          CREDENTIAL_FILES=("${CERTIFICATE_PATH}")
+          cleanup_decoded_credentials() {
+            rm -f "${CREDENTIAL_FILES[@]}"
+          }
+          trap cleanup_decoded_credentials EXIT
+          printf '%s' "${APPLE_DEVELOPER_ID_P12_BASE64}" | base64 --decode > "${CERTIFICATE_PATH}"
+          if [[ "${NOTARY_AUTH_MODE}" == "api-key" ]]; then
+            NOTARY_KEY_PATH="${RUNNER_TEMP}/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
+            CREDENTIAL_FILES+=("${NOTARY_KEY_PATH}")
+            printf '%s' "${APPLE_NOTARY_KEY_P8_BASE64}" | base64 --decode > "${NOTARY_KEY_PATH}"
+          fi
+          security create-keychain -p "${TEMP_KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${TEMP_KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security import "${CERTIFICATE_PATH}" -P "${APPLE_DEVELOPER_ID_P12_PASSWORD}" -A -t cert -f pkcs12 -k "${KEYCHAIN_PATH}"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${TEMP_KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security list-keychains -d user -s "${KEYCHAIN_PATH}" login.keychain-db
+          if [[ "${NOTARY_AUTH_MODE}" == "api-key" ]]; then
+            xcrun notarytool store-credentials cortex-ci-notary \
+              --key "${NOTARY_KEY_PATH}" \
+              --key-id "${APPLE_NOTARY_KEY_ID}" \
+              --issuer "${APPLE_NOTARY_ISSUER_ID}" \
+              --keychain "${KEYCHAIN_PATH}"
+          else
+            xcrun notarytool store-credentials cortex-ci-notary \
+              --apple-id "${APPLE_ID_USERNAME}" \
+              --password "${APPLE_ID_APP_PASSWORD}" \
+              --team-id "${APPLE_TEAM_ID}" \
+              --keychain "${KEYCHAIN_PATH}"
+          fi
+          cleanup_decoded_credentials
+          trap - EXIT
+          echo "CORTEX_CI_KEYCHAIN=${KEYCHAIN_PATH}" >> "${GITHUB_ENV}"
+          echo "CORTEX_NOTARIZE_KEYCHAIN=${KEYCHAIN_PATH}" >> "${GITHUB_ENV}"
+
+      - name: Build, sign, notarize, staple, mount, and verify DMG
+        env:
           CORTEX_SIGN_IDENTITY: ${{ secrets.CORTEX_SIGN_IDENTITY }}
-          CORTEX_NOTARIZE_PROFILE: ${{ secrets.CORTEX_NOTARIZE_PROFILE }}
+          CORTEX_NOTARIZE_PROFILE: cortex-ci-notary
+          CORTEX_REQUIRE_NOTARIZATION: "1"
+          CORTEX_ARTIFACT_ARCH: ${{ matrix.arch }}
+          CORTEX_RELEASE_EVIDENCE_DIR: dist/evidence-${{ matrix.arch }}
+          CORTEX_RELEASE_TAG: ${{ env.RELEASE_TAG }}
         run: ./cortex/scripts/build_macos_app.sh
 
-      - name: Locate DMG
-        id: locate
+      - name: Bind architecture audit to release evidence
         run: |
-          DMG=$(ls dist/Cortex*.dmg | head -1)
-          echo "dmg-path=$DMG" >> "$GITHUB_OUTPUT"
-          echo "Built: $DMG ($(du -h "$DMG" | awk '{print $1}'))"
+          cp "${RUNNER_TEMP}/python-${{ matrix.arch }}-audit.json" \
+            "dist/evidence-${{ matrix.arch }}/"
+          cp "${RUNNER_TEMP}/python-${{ matrix.arch }}-audit-summary.json" \
+            "dist/evidence-${{ matrix.arch }}/"
 
-      - name: Upload DMG artifact
-        uses: actions/upload-artifact@v7
+      - name: Generate application and Python dependency SBOMs
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
-          name: cortex-dmg
-          path: ${{ steps.locate.outputs.dmg-path }}
-          retention-days: 14
+          path: dist/Cortex.app
+          format: spdx-json
+          output-file: dist/evidence-${{ matrix.arch }}/cortex-app.spdx.json
+          upload-artifact: false
+      - name: Generate locked Python CycloneDX graph and refresh checksums
+        run: |
+          uv export --project cortex --locked --all-extras --format cyclonedx1.5 --output-file "dist/evidence-${{ matrix.arch }}/python-lock.cdx.json"
+          uv run --project cortex --locked python -m cortex.scripts.generate_release_evidence \
+            --artifact "dist/Cortex-$(uv run --project cortex --locked python -m cortex.scripts.sync_versions --print)-macos-${{ matrix.arch }}.dmg" \
+            --sbom "dist/evidence-${{ matrix.arch }}/cortex-app.spdx.json" \
+            --sbom "dist/evidence-${{ matrix.arch }}/python-lock.cdx.json" \
+            --verification "dist/evidence-${{ matrix.arch }}/release-verification.json" \
+            --output-dir "dist/evidence-${{ matrix.arch }}" \
+            --checksum-name "SHA256SUMS-${{ matrix.arch }}" \
+            --expected-tag "${RELEASE_TAG}" \
+            --require-clean
+
+      - name: Package architecture-specific evidence
+        run: |
+          VERSION="$(uv run --project cortex --locked python -m cortex.scripts.sync_versions --print)"
+          ditto -c -k --sequesterRsrc \
+            "dist/evidence-${{ matrix.arch }}" \
+            "dist/Cortex-${VERSION}-macos-${{ matrix.arch }}-evidence.zip"
+
+      - name: Attest build provenance
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: dist/Cortex-*-macos-${{ matrix.arch }}.dmg
+      - name: Attest application SBOM
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: dist/Cortex-*-macos-${{ matrix.arch }}.dmg
+          sbom-path: dist/evidence-${{ matrix.arch }}/cortex-app.spdx.json
+      - name: Attest Python lock SBOM
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: dist/Cortex-*-macos-${{ matrix.arch }}.dmg
+          sbom-path: dist/evidence-${{ matrix.arch }}/python-lock.cdx.json
+      - name: Attest evidence bundle provenance
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: dist/Cortex-*-macos-${{ matrix.arch }}-evidence.zip
+
+      - name: Upload architecture artifact and evidence
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: cortex-release-${{ matrix.arch }}
+          path: |
+            dist/Cortex-*-macos-${{ matrix.arch }}.dmg
+            dist/Cortex-*-macos-${{ matrix.arch }}-evidence.zip
+            dist/evidence-${{ matrix.arch }}/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove temporary signing Keychain
+        if: always()
+        run: |
+          if [ -n "${CORTEX_CI_KEYCHAIN:-}" ] && [ -f "${CORTEX_CI_KEYCHAIN}" ]; then
+            security delete-keychain "${CORTEX_CI_KEYCHAIN}"
+          fi
 
   attach-to-release:
-    name: Attach DMG to GitHub release
+    name: Stage traceable draft release
     needs: build-dmg
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - name: Download DMG artifact
-        uses: actions/download-artifact@v8
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          name: cortex-dmg
-          path: ./artifact
-
-      - name: Attach to release
-        uses: softprops/action-gh-release@v3
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          files: ./artifact/*.dmg
+          pattern: cortex-release-*
+          path: artifact
+          merge-multiple: true
+      - name: Require both architectures and evidence
+        run: |
+          test "$(find artifact -name 'Cortex-*-macos-arm64.dmg' -type f | wc -l)" -eq 1
+          test "$(find artifact -name 'Cortex-*-macos-x86_64.dmg' -type f | wc -l)" -eq 1
+          test "$(find artifact -name 'SHA256SUMS-arm64' -type f | wc -l)" -eq 1
+          test "$(find artifact -name 'SHA256SUMS-x86_64' -type f | wc -l)" -eq 1
+          test "$(find artifact -name 'Cortex-*-macos-arm64-evidence.zip' -type f | wc -l)" -eq 1
+          test "$(find artifact -name 'Cortex-*-macos-x86_64-evidence.zip' -type f | wc -l)" -eq 1
+          test "$(find artifact -name 'release-verification.json' -type f | wc -l)" -eq 2
+      - name: Refuse to replace an already-public release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if EXISTING_DRAFT="$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            test "${EXISTING_DRAFT}" = "true"
+          fi
+      - name: Render this version's release notes from the changelog
+        run: |
+          NOTES_PATH="${RUNNER_TEMP}/release-notes.md"
+          HEADING="## [${RELEASE_TAG}]"
+          awk -v heading="${HEADING}" '
+            index($0, heading) == 1 { capture = 1 }
+            capture && /^## \[/ && index($0, heading) != 1 { exit }
+            capture { print }
+          ' CHANGELOG.md > "${NOTES_PATH}"
+          test -s "${NOTES_PATH}"
+          grep -Fq "${HEADING}" "${NOTES_PATH}"
+          echo "CORTEX_RELEASE_NOTES=${NOTES_PATH}" >> "${GITHUB_ENV}"
+      - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Cortex ${{ env.RELEASE_TAG }}
+          draft: true
+          body_path: ${{ env.CORTEX_RELEASE_NOTES }}
+          files: |
+            artifact/**/*.dmg
+            artifact/**/*-evidence.zip
+            artifact/**/SHA256SUMS-*
           fail_on_unmatched_files: true
           generate_release_notes: false

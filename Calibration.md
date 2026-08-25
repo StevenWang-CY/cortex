@@ -1,55 +1,43 @@
 # Calibration
 
-## Purpose
+Calibration establishes local acquisition and behavior baselines. It does not
+train a cognitive-state model, diagnose a condition, or validate camera-derived
+HRV/respiration.
 
-Calibration establishes personal baseline distributions used by state scoring and trigger personalization. Cortex 0.2.0 keeps the original seed capture and adds richer baseline statistics for robust z-score/percentile logic.
+## What is measured
 
-## What Changed in 0.2.0
+- camera timing/availability, face/ROI quality, motion and lighting quality;
+- experimental pulse baseline when a quality-valid window exists;
+- local blink and camera-relative head/neck proxy baselines;
+- user interaction baselines used by deterministic telemetry rules.
 
-- Baseline artifacts now include per-metric distribution stats:
-  - `mu`, `sigma`, `p10`, `p90`
-- Baseline loader includes migration logic so legacy baseline JSON files still load.
-- Blink threshold personalization support is available from EAR sample percentiles.
-- Config includes rolling re-baseline and decay knobs for longitudinal adaptation.
+Unsupported HRV, LF/HF, respiration, breath-pause, stress-integral, and
+physiology-triggered-break fields remain unavailable regardless of calibration.
+Camera features remain excluded from the production support score.
 
-## Running Baseline Capture
+## Validity contract
 
-```bash
-cortex-calibrate --duration 120
-```
+A profile records schema/algorithm version, source device identity, measured
+duration, missing fraction, quality summaries, clock provenance, and creation
+time. Synthetic/simulated fallback cannot be saved as a measured profile. A
+new profile is committed atomically only after review; cancel/failure preserves
+the previous profile. Reload verifies the exact committed profile ID.
 
-Optional simulation mode:
+Camera opening follows macOS-specific safeguards: automatic selection unless a
+device override is explicit, live re-enumeration after open to reject a
+Continuity Camera whose index changed, and warm-up retries for the Mac camera.
+Do not use `system_profiler` order as an AVFoundation index and do not globally
+reset camera permissions.
 
-```bash
-cortex-calibrate --simulate
-```
+## When to recalibrate
 
-## Output Schema (Key Fields)
+Recalibrate after changing camera, normal camera position/distance, lighting,
+input device, or primary work setup, or when the UI reports a stale/incompatible
+profile. Do not recalibrate merely to force an expected state label.
 
-`UserBaselines` now persists both legacy scalar baselines and additive distribution metadata:
+If calibration falls back to simulation, reports insufficient valid exposure,
+or loses the face/camera, resolve the visible cause and retry. Cortex should
+degrade to telemetry-only/unknown rather than save fabricated evidence.
 
-```json
-{
-  "hr_baseline": 72.0,
-  "hrv_baseline": 50.0,
-  "blink_rate_baseline": 17.0,
-  "mouse_velocity_baseline": 500.0,
-  "metric_distributions": {
-    "hr": {"mu": 72.0, "sigma": 4.2, "p10": 66.0, "p90": 78.0},
-    "hrv": {"mu": 50.0, "sigma": 9.5, "p10": 38.0, "p90": 63.0}
-  }
-}
-```
-
-The full `UserBaselines` schema (including `hr_std`, `mouse_variance_baseline`, `shoulder_neutral_y`, `resp_baseline`, `circadian_hr_cosinor`, and rolling/decay knobs) lives in `cortex/libs/schemas/state.py`.
-
-## How Baselines Are Used
-
-- Pulse/HRV sub-scores use personalized z-score style logic when distribution stats exist.
-- FLOW/HYPER rules reference personalized baseline bands before fallback heuristics.
-- Stress integral normalization can use baseline variance (`sigma`) rather than absolute ms deficit.
-- Trigger threshold adaptation and dismissal modeling use feedback tied to personal history.
-
-## Compatibility
-
-Legacy files without `metric_distributions` are auto-migrated in runtime load paths. No manual data migration is required.
+Implementation details: [calibration documentation](cortex/docs/calibration.md)
+and [limitations](docs/limitations.md).

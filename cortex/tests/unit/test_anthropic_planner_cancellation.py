@@ -111,7 +111,12 @@ def _make_planner(tracker: CostTracker, sdk: MagicMock) -> AnthropicPlanner:
         timeout_seconds=2.0,
         max_concurrent_requests=2,
     )
-    return AnthropicPlanner(cfg, sdk=sdk, cost_tracker=tracker)
+    return AnthropicPlanner(
+        cfg,
+        sdk=sdk,
+        cost_tracker=tracker,
+        _allow_unbrokered_test_requests=True,
+    )
 
 
 # ---------------------------------------------------------------------------

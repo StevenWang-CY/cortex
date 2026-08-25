@@ -1,105 +1,99 @@
-"""
-State Engine — Score Smoother
+"""Temporal smoothing, hysteresis, and evidence-status handling.
 
-Applies Exponential Moving Average (EMA) smoothing over score history,
-hysteresis thresholds for state transitions, and dwell time enforcement
-before confirming state changes.
-
-Produces StateEstimate output every 500ms.
-
-Parameters (from StateConfig):
-- EMA alpha: 0.3 (higher = more responsive, less smooth)
-- Entry threshold: 0.85 (score must exceed to enter state)
-- Exit threshold: 0.70 (score must drop below to exit state)
-- Dwell times: HYPER=8s, HYPO=15s, FLOW=15s
+The smoother starts UNKNOWN, consumes monotonic time, and never converts rule
+scores to probabilities. Recovery is represented only after a confirmed
+support-likely episode begins to subside; it is not inferred from a mixed
+single-frame feature vector.
 """
 
 from __future__ import annotations
 
 import logging
-import time
 from collections import deque
 from dataclasses import dataclass
 
-import numpy as np
-
+from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 from cortex.libs.config.settings import StateConfig
 from cortex.libs.logging.correlation import get_correlation_id
 from cortex.libs.logging.structured import log_state_transition
 from cortex.libs.observability.metrics import STATE_TRANSITIONS_TOTAL
 from cortex.libs.schemas.state import (
+    EstimateStatus,
+    FeatureContribution,
+    RuleEvaluation,
     SignalQuality,
     StateEstimate,
     StateScores,
     StateTransition,
+    SupportScores,
+    SupportState,
     UserState,
+    legacy_inference_identity,
 )
+from cortex.libs.schemas.temporal import EventTime
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class SmoothedScores:
-    """EMA-smoothed state scores."""
+    """EMA-smoothed heuristic scores. All channels start with no evidence."""
 
-    flow: float = 0.3  # Start with slight flow assumption
+    flow: float = 0.0
     hypo: float = 0.0
     hyper: float = 0.0
     recovery: float = 0.0
 
     def to_state_scores(self) -> StateScores:
         return StateScores(
-            flow=self.flow, hypo=self.hypo,
-            hyper=self.hyper, recovery=self.recovery,
+            flow=self.flow,
+            hypo=self.hypo,
+            hyper=self.hyper,
+            recovery=self.recovery,
+        )
+
+    def to_support_scores(self) -> SupportScores:
+        return SupportScores(
+            support_likely=self.hyper,
+            under_engaged=self.hypo,
+            flow_like=self.flow,
+            recovering=self.recovery,
         )
 
     def dominant(self) -> tuple[UserState, float]:
-        scores = {
-            UserState.FLOW: self.flow,
-            UserState.HYPO: self.hypo,
-            UserState.HYPER: self.hyper,
-            UserState.RECOVERY: self.recovery,
-        }
-        state = max(scores, key=lambda k: scores[k])
-        return state, scores[state]
+        return self.to_state_scores().dominant_state()
+
+
+_SUPPORT_TO_LEGACY = {
+    SupportState.SUPPORT_LIKELY: UserState.HYPER,
+    SupportState.UNDER_ENGAGED: UserState.HYPO,
+    SupportState.FLOW_LIKE: UserState.FLOW,
+    SupportState.RECOVERING: UserState.RECOVERY,
+    SupportState.UNKNOWN: UserState.UNKNOWN,
+}
+_LEGACY_TO_SUPPORT = {value: key for key, value in _SUPPORT_TO_LEGACY.items()}
 
 
 class ScoreSmoother:
-    """
-    Smooths state scores and applies hysteresis for state transitions.
+    """Apply EMA, Schmitt hysteresis, and elapsed-time dwell confirmation."""
 
-    Maintains:
-    - EMA-smoothed scores for all four states
-    - Current confirmed state with dwell time
-    - State transition history
-    - Hysteresis to prevent flickering between states
-
-    Usage:
-        smoother = ScoreSmoother()
-        estimate = smoother.update(raw_scores, signal_quality, timestamp)
-    """
-
-    def __init__(self, config: StateConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: StateConfig | None = None,
+        *,
+        clock: Clock | None = None,
+    ) -> None:
         self._config = config or StateConfig()
+        self._clock = clock or SYSTEM_CLOCK
         self._alpha = self._config.ema_alpha
-        self._probability_temperature = 1.0
-
-        # Smoothed scores
         self._smoothed = SmoothedScores()
-
-        # Current state
-        self._current_state = UserState.FLOW
+        self._current_state = UserState.UNKNOWN
         self._state_entered_at: float | None = None
-        self._dwell_seconds: float = 0.0
-
-        # Candidate state (being evaluated for transition)
+        self._dwell_seconds = 0.0
         self._candidate_state: UserState | None = None
-        self._candidate_since: float = 0.0
-
-        # Transition history
+        self._candidate_since = 0.0
+        self._last_update_at: float | None = None
         self._transitions: deque[StateTransition] = deque(maxlen=100)
-
-        # Latest estimate
         self._latest: StateEstimate | None = None
 
     @property
@@ -116,269 +110,313 @@ class ScoreSmoother:
 
     def update(
         self,
-        raw_scores: StateScores,
+        raw_scores: StateScores | RuleEvaluation,
         signal_quality: SignalQuality,
         timestamp: float | None = None,
         *,
-        ml_p_hyper: float | None = None,
-        ml_alpha: float = 0.0,
+        event_time: EventTime | None = None,
     ) -> StateEstimate:
-        """
-        Update smoothed scores and produce a StateEstimate.
-
-        Args:
-            raw_scores: Raw state scores from the rule scorer.
-            signal_quality: Per-channel signal quality.
-            timestamp: Current time. Defaults to now.
-            ml_p_hyper: Optional probability of HYPER from the per-user
-                logistic classifier (C.2). Blended into the smoothed
-                hyper score using ``ml_alpha``.
-            ml_alpha: Blend weight in ``[0, 1]``. ``0`` keeps the rule
-                output; ``1`` replaces it entirely. The daemon ramps this
-                with training-data volume (see ``StateConfig.ml_alpha_max``
-                and ``ml_alpha_full_at_episodes``).
-
-        Returns:
-            StateEstimate with smoothed state, confidence, and reasons.
-        """
-        now = timestamp if timestamp is not None else time.monotonic()
-
-        # Initialize state_entered_at on first update
+        """Consume a rule evaluation and publish a support estimate."""
+        if event_time is not None:
+            supplied_now = event_time.observed_at_mono_ns / 1_000_000_000.0
+        else:
+            supplied_now = (
+                timestamp if timestamp is not None else monotonic_seconds(self._clock)
+            )
+        # A replayed/regressed timestamp must not create negative dwell or move
+        # a candidate timer backward. The event ordering layer handles drops;
+        # this clamp is the final domain invariant.
+        now = (
+            max(supplied_now, self._last_update_at)
+            if self._last_update_at is not None
+            else supplied_now
+        )
+        self._last_update_at = now
         if self._state_entered_at is None:
             self._state_entered_at = now
 
-        # Apply EMA smoothing
-        self._smoothed.flow = self._ema(self._smoothed.flow, raw_scores.flow)
-        self._smoothed.hypo = self._ema(self._smoothed.hypo, raw_scores.hypo)
-        self._smoothed.hyper = self._ema(self._smoothed.hyper, raw_scores.hyper)
-        self._smoothed.recovery = self._ema(self._smoothed.recovery, raw_scores.recovery)
-
-        # C.2: blend per-user ML classifier into the HYPER channel.
-        blended_classifier_source = "rule"
-        blended_alpha = 0.0
-        if ml_p_hyper is not None and 0.0 < ml_alpha <= 1.0:
-            blended_alpha = float(max(0.0, min(1.0, ml_alpha)))
-            self._smoothed.hyper = (
-                self._smoothed.hyper * (1.0 - blended_alpha)
-                + float(ml_p_hyper) * blended_alpha
+        evaluation = self._coerce_evaluation(raw_scores, signal_quality)
+        if evaluation.status != EstimateStatus.ESTIMATED:
+            self._decay_scores()
+            self._candidate_state = None
+            self._force_unknown(now, event_time)
+            estimate = self._build_estimate(
+                evaluation=evaluation,
+                signal_quality=signal_quality,
+                now=now,
+                event_time=event_time,
+                status=EstimateStatus(str(evaluation.status)),
             )
-            blended_classifier_source = "ensemble"
+            self._latest = estimate
+            return estimate
 
-        # Determine dominant state from raw smoothed scores for hysteresis.
-        # Probabilities are used for confidence reporting, not entry gating.
-        probs = self._compute_probabilities()
+        support_scores = evaluation.scores
+        self._smoothed.flow = self._ema(self._smoothed.flow, support_scores.flow_like)
+        self._smoothed.hypo = self._ema(
+            self._smoothed.hypo, support_scores.under_engaged
+        )
+        self._smoothed.hyper = self._ema(
+            self._smoothed.hyper, support_scores.support_likely
+        )
+        self._smoothed.recovery = self._ema(self._smoothed.recovery, 0.0)
+
         dominant_state, dominant_score = self._smoothed.dominant()
+        # Recovery is temporal: it exists only while leaving a confirmed
+        # support-likely episode toward a sufficiently supported alternative.
+        if (
+            self._current_state == UserState.HYPER
+            and self._smoothed.hyper < self._config.estimate_exit_threshold
+            and dominant_state not in (UserState.HYPER, UserState.UNKNOWN)
+        ):
+            recovery_score = max(self._smoothed.flow, self._smoothed.hypo) * (
+                1.0 - self._smoothed.hyper
+            )
+            self._smoothed.recovery = max(self._smoothed.recovery, recovery_score)
+            dominant_state = UserState.RECOVERY
+            dominant_score = self._smoothed.recovery
 
-        # Apply hysteresis and dwell time
-        confirmed_state = self._apply_hysteresis(dominant_state, dominant_score, now)
-
-        # Update dwell time
-        if confirmed_state == self._current_state:
-            self._dwell_seconds = now - self._state_entered_at
+        confirmed = self._apply_hysteresis(dominant_state, dominant_score, now)
+        if confirmed != self._current_state:
+            self._commit_transition(confirmed, dominant_score, now, event_time)
         else:
-            # State changed — record transition
-            transition = StateTransition(
-                timestamp=now,
-                from_state=self._current_state.value,
-                to_state=confirmed_state.value,
-                from_confidence=self._get_state_score(self._current_state),
-                to_confidence=self._get_state_score(confirmed_state),
-                dwell_seconds=self._dwell_seconds,
-                trigger_reasons=self._generate_reasons(),
-            )
-            self._transitions.append(transition)
-            # C6: increment the Prometheus state-transition counter at the
-            # real commit site (this is the single place ``_current_state``
-            # actually changes after hysteresis + dwell confirmation), so
-            # ``cortex_state_transitions_total{from_state,to_state}``
-            # reflects confirmed transitions only — never the raw
-            # per-frame dominant flicker.
-            STATE_TRANSITIONS_TOTAL.labels(
-                from_state=self._current_state.value,
-                to_state=confirmed_state.value,
-            ).inc()
-            # P2-16: emit structured STATE_TRANSITION event via structlog so
-            # the event stream carries from_state, to_state, dwell_seconds,
-            # confidence, and correlation_id for observability dashboards.
-            log_state_transition(
-                from_state=self._current_state.value,
-                to_state=confirmed_state.value,
-                confidence=dominant_score,
-                reasons=self._generate_reasons(),
-                dwell_seconds=self._dwell_seconds,
-                correlation_id=get_correlation_id(),
-            )
+            self._dwell_seconds = max(0.0, now - self._state_entered_at)
 
-            self._current_state = confirmed_state
-            self._state_entered_at = now
-            self._dwell_seconds = 0.0
-
-        # C.1: confidence is the raw smoothed dominant score, not a
-        # softmax probability. Softmax over 4 saturated [0,1] scores caps
-        # at ~0.475, making the spec's 0.85 gate mathematically unreachable
-        # and silently suppressing triggers.
-        #
-        # ``calibrated_probabilities`` is still populated so the dashboard
-        # transparency UI can render proportional bars — but the trigger
-        # policy and any UI threshold compare against the raw confidence.
-        smoothed_state_scores = self._smoothed.to_state_scores()
-        confidence_raw = float(
-            getattr(smoothed_state_scores, self._current_state.value.lower())
+        # An eligible rule frame may still be waiting out its entry dwell. The
+        # UI must render that as warming, not as a confident UNKNOWN label.
+        output_status = (
+            EstimateStatus.WARMING_UP
+            if self._current_state == UserState.UNKNOWN
+            else EstimateStatus.ESTIMATED
         )
-        estimate = StateEstimate(
-            state=self._current_state.value,
-            confidence=confidence_raw,
-            scores=smoothed_state_scores,
-            calibrated_probabilities=StateScores(
-                flow=probs[UserState.FLOW],
-                hypo=probs[UserState.HYPO],
-                hyper=probs[UserState.HYPER],
-                recovery=probs[UserState.RECOVERY],
-            ),
-            classifier_source=blended_classifier_source,
-            classifier_alpha=blended_alpha,
-            reasons=self._generate_reasons(),
+        estimate = self._build_estimate(
+            evaluation=evaluation,
             signal_quality=signal_quality,
-            timestamp=now,
-            dwell_seconds=self._dwell_seconds,
+            now=now,
+            event_time=event_time,
+            status=output_status,
         )
-
         self._latest = estimate
         return estimate
 
-    def _ema(self, prev: float, new: float) -> float:
-        """Apply exponential moving average."""
-        return self._alpha * new + (1.0 - self._alpha) * prev
+    def _coerce_evaluation(
+        self,
+        raw: StateScores | RuleEvaluation,
+        quality: SignalQuality,
+    ) -> RuleEvaluation:
+        if isinstance(raw, RuleEvaluation):
+            return raw
+        status = (
+            EstimateStatus.ESTIMATED
+            if quality.acceptable
+            else EstimateStatus.INSUFFICIENT_EVIDENCE
+        )
+        return RuleEvaluation(
+            status=status,
+            scores=SupportScores(
+                support_likely=raw.hyper,
+                under_engaged=raw.hypo,
+                flow_like=raw.flow,
+                recovering=0.0,
+            ),
+            evidence_coverage=quality.overall,
+            state_coverage={
+                SupportState.SUPPORT_LIKELY: quality.overall,
+                SupportState.UNDER_ENGAGED: quality.overall,
+                SupportState.FLOW_LIKE: quality.overall,
+                SupportState.RECOVERING: 0.0,
+                SupportState.UNKNOWN: 0.0,
+            },
+            exclusions=["Legacy score-only input omitted per-feature provenance."],
+            model=legacy_inference_identity(),
+        )
+
+    def _build_estimate(
+        self,
+        *,
+        evaluation: RuleEvaluation,
+        signal_quality: SignalQuality,
+        now: float,
+        event_time: EventTime | None,
+        status: EstimateStatus,
+    ) -> StateEstimate:
+        state = self._current_state if status == EstimateStatus.ESTIMATED else UserState.UNKNOWN
+        support_state = _LEGACY_TO_SUPPORT[state]
+        state_scores = self._smoothed.to_state_scores()
+        support_scores = self._smoothed.to_support_scores()
+        confidence = self._get_state_score(state) if state != UserState.UNKNOWN else 0.0
+        return StateEstimate(
+            state=state,
+            support_state=support_state,
+            status=status,
+            confidence=confidence,
+            scores=state_scores,
+            support_scores=support_scores,
+            evidence_coverage=evaluation.evidence_coverage,
+            contributing_features=evaluation.contributing_features,
+            exclusions=evaluation.exclusions,
+            model=evaluation.model,
+            probabilities=None,
+            calibrated_probabilities=None,
+            classifier_source="rule",
+            classifier_alpha=0.0,
+            reasons=self._generate_reasons(status, evaluation.contributing_features),
+            signal_quality=signal_quality,
+            timestamp=now,
+            observed_at_unix_ms=(
+                event_time.observed_at_unix_ms if event_time is not None else None
+            ),
+            observed_at_mono_ns=(
+                event_time.observed_at_mono_ns if event_time is not None else None
+            ),
+            boot_id=event_time.boot_id if event_time is not None else None,
+            dwell_seconds=self._dwell_seconds if state != UserState.UNKNOWN else 0.0,
+        )
+
+    def _ema(self, previous: float, current: float) -> float:
+        return self._alpha * current + (1.0 - self._alpha) * previous
+
+    def _decay_scores(self) -> None:
+        self._smoothed.flow = self._ema(self._smoothed.flow, 0.0)
+        self._smoothed.hypo = self._ema(self._smoothed.hypo, 0.0)
+        self._smoothed.hyper = self._ema(self._smoothed.hyper, 0.0)
+        self._smoothed.recovery = self._ema(self._smoothed.recovery, 0.0)
+
+    def _force_unknown(self, now: float, event_time: EventTime | None) -> None:
+        if self._current_state != UserState.UNKNOWN:
+            self._commit_transition(UserState.UNKNOWN, 0.0, now, event_time)
+        else:
+            self._dwell_seconds = 0.0
+            self._state_entered_at = now
 
     def _apply_hysteresis(
-        self, dominant: UserState, score: float, now: float,
+        self,
+        dominant: UserState,
+        score: float,
+        now: float,
     ) -> UserState:
-        """
-        Apply hysteresis thresholds and dwell time enforcement.
-
-        A state transition requires:
-        1. Dominant score exceeds entry threshold (0.85)
-        2. Current state score drops below exit threshold (0.70)
-        3. Candidate state maintained for required dwell time
-        """
-        current_score = self._get_state_score(self._current_state)
-
-        # Check if we should even consider a transition
+        if dominant == UserState.UNKNOWN:
+            self._candidate_state = None
+            return self._current_state
         if dominant == self._current_state:
-            # Same state — no transition needed
             self._candidate_state = None
             return self._current_state
 
-        # Check exit condition: current state must have weakened below exit_threshold
-        # (proper Schmitt trigger — separate entry and exit thresholds)
-        if current_score > self._config.exit_threshold:
-            # Current state still strong — no transition
+        current_score = self._get_state_score(self._current_state)
+        if (
+            self._current_state != UserState.UNKNOWN
+            and current_score > self._config.estimate_exit_threshold
+        ):
             self._candidate_state = None
             return self._current_state
 
-        # Check entry condition: new state must exceed entry threshold
-        if score < self._config.entry_threshold:
-            # New state not strong enough — no transition
-            # But allow FLOW and RECOVERY to transition more easily
-            if dominant in (UserState.FLOW, UserState.RECOVERY) and score >= 0.5:
-                pass  # Allow weaker transitions to flow/recovery
-            else:
-                self._candidate_state = None
-                return self._current_state
+        entry_threshold = self._config.estimate_entry_threshold
+        if dominant == UserState.RECOVERY:
+            entry_threshold = min(entry_threshold, 0.5)
+        if score < entry_threshold:
+            self._candidate_state = None
+            return self._current_state
 
-        # Check dwell time
         if self._candidate_state != dominant:
-            # New candidate — start dwell timer
             self._candidate_state = dominant
             self._candidate_since = now
             return self._current_state
+        if now - self._candidate_since < self._get_dwell_time(dominant):
+            return self._current_state
+        self._candidate_state = None
+        return dominant
 
-        # Same candidate — check if dwell time is met
-        dwell_required = self._get_dwell_time(dominant)
-        elapsed = now - self._candidate_since
-
-        if elapsed >= dwell_required:
-            # Dwell time met — confirm transition
-            self._candidate_state = None
-            return dominant
-
-        return self._current_state
+    def _commit_transition(
+        self,
+        new_state: UserState,
+        score: float,
+        now: float,
+        event_time: EventTime | None,
+    ) -> None:
+        old_state = self._current_state
+        transition = StateTransition(
+            timestamp=now,
+            observed_at_unix_ms=(
+                event_time.observed_at_unix_ms if event_time is not None else None
+            ),
+            observed_at_mono_ns=(
+                event_time.observed_at_mono_ns if event_time is not None else None
+            ),
+            boot_id=event_time.boot_id if event_time is not None else None,
+            from_state=old_state,
+            to_state=new_state,
+            from_confidence=self._get_state_score(old_state),
+            to_confidence=max(0.0, min(1.0, score)),
+            dwell_seconds=self._dwell_seconds,
+            trigger_reasons=self._generate_reasons(EstimateStatus.ESTIMATED, []),
+        )
+        self._transitions.append(transition)
+        STATE_TRANSITIONS_TOTAL.labels(
+            from_state=old_state.value,
+            to_state=new_state.value,
+        ).inc()
+        log_state_transition(
+            from_state=old_state.value,
+            to_state=new_state.value,
+            confidence=max(0.0, min(1.0, score)),
+            reasons=transition.trigger_reasons,
+            dwell_seconds=self._dwell_seconds,
+            correlation_id=get_correlation_id(),
+        )
+        self._current_state = new_state
+        self._state_entered_at = now
+        self._dwell_seconds = 0.0
 
     def _get_state_score(self, state: UserState) -> float:
-        """Get smoothed score for a specific state."""
-        scores = {
+        return {
+            UserState.UNKNOWN: 0.0,
             UserState.FLOW: self._smoothed.flow,
             UserState.HYPO: self._smoothed.hypo,
             UserState.HYPER: self._smoothed.hyper,
             UserState.RECOVERY: self._smoothed.recovery,
-        }
-        return scores[state]
-
-    def _compute_probabilities(self) -> dict[UserState, float]:
-        """Convert smoothed scores into calibrated probabilities via softmax."""
-        logits = np.array(
-            [
-                self._smoothed.flow,
-                self._smoothed.hypo,
-                self._smoothed.hyper,
-                self._smoothed.recovery,
-            ],
-            dtype=np.float64,
-        )
-        temp = max(1e-3, float(self._probability_temperature))
-        logits = logits / temp
-        logits = logits - np.max(logits)
-        exp = np.exp(logits)
-        denom = float(np.sum(exp)) if np.sum(exp) > 1e-12 else 1.0
-        probs = exp / denom
-        return {
-            UserState.FLOW: float(probs[0]),
-            UserState.HYPO: float(probs[1]),
-            UserState.HYPER: float(probs[2]),
-            UserState.RECOVERY: float(probs[3]),
-        }
+        }[state]
 
     def _get_dwell_time(self, state: UserState) -> float:
-        """Get required dwell time for a state transition."""
-        dwell_map = {
+        return float({
+            UserState.UNKNOWN: 0.0,
             UserState.HYPER: self._config.hyper_dwell_seconds,
             UserState.HYPO: self._config.hypo_dwell_seconds,
             UserState.FLOW: self._config.flow_dwell_seconds,
-            UserState.RECOVERY: 5.0,  # Faster recovery transitions
-        }
-        return float(dwell_map.get(state, 8.0))
+            UserState.RECOVERY: 5.0,
+        }[state])
 
-    def _generate_reasons(self) -> list[str]:
-        """Generate human-readable reasons for the current state."""
-        reasons = []
-        state = self._current_state
-
-        if state == UserState.HYPER:
-            if self._smoothed.hyper > 0.7:
-                reasons.append("Elevated overwhelm indicators detected")
-            if self._smoothed.hyper > 0.85:
-                reasons.append("Multiple stress signals converging")
-
-        elif state == UserState.HYPO:
-            if self._smoothed.hypo > 0.6:
-                reasons.append("Low engagement indicators detected")
-
-        elif state == UserState.FLOW:
-            if self._smoothed.flow > 0.7:
-                reasons.append("Stable, focused engagement pattern")
-
-        elif state == UserState.RECOVERY:
-            reasons.append("Transitioning from elevated state")
-
-        return reasons
+    def _generate_reasons(
+        self,
+        status: EstimateStatus,
+        contributions: list[FeatureContribution],
+    ) -> list[str]:
+        if status == EstimateStatus.WARMING_UP:
+            return ["Still gathering enough input-pattern evidence"]
+        if status == EstimateStatus.INSUFFICIENT_EVIDENCE:
+            return ["Not enough current evidence for a support estimate"]
+        positive = sorted(
+            (
+                item
+                for item in contributions
+                if item.observed and item.direction == "positive"
+            ),
+            key=lambda item: abs(item.contribution),
+            reverse=True,
+        )
+        reasons = [
+            f"Observed {item.feature.replace('_', ' ')} contributed to the estimate"
+            for item in positive[:2]
+        ]
+        if reasons:
+            return reasons
+        return ["Observed input patterns were stable but not diagnostic"]
 
     def reset(self) -> None:
-        """Reset smoother state."""
         self._smoothed = SmoothedScores()
-        self._current_state = UserState.FLOW
+        self._current_state = UserState.UNKNOWN
         self._state_entered_at = None
         self._dwell_seconds = 0.0
         self._candidate_state = None
         self._candidate_since = 0.0
+        self._last_update_at = None
         self._transitions.clear()
         self._latest = None

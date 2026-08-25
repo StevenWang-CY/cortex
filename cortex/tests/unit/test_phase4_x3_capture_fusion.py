@@ -13,6 +13,7 @@ Covers:
 * Fix #6 — :class:`LongitudinalTracker.accumulate` filters None HR/HRV
   out of the rolling baseline instead of imputing zero.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -31,6 +32,7 @@ from cortex.libs.schemas.features import (
 )
 from cortex.services.capture_service.webcam import (
     _CAPTURE_STALE_THRESHOLD,
+    CameraSelection,
     CapturedFrame,
     WebcamCapture,
 )
@@ -44,7 +46,9 @@ def _synthetic_bgr_frame(width: int = 64, height: int = 48) -> np.ndarray:
 
 
 def _read_side_effect_factory(
-    *, validation_passes: int, post_validation: Iterable[tuple[bool, object]],
+    *,
+    validation_passes: int,
+    post_validation: Iterable[tuple[bool, object]],
 ) -> object:
     """Factory: returns a ``side_effect`` callable that yields successful
     frames for the first ``validation_passes`` calls (so
@@ -79,16 +83,22 @@ class TestCapturedFrameTimestampIsWallClock:
     @pytest.mark.asyncio
     async def test_capture_loop_uses_time_time_for_frame_timestamp(self) -> None:
         capture = WebcamCapture(
-            CaptureConfig(device_id=0, fps=30), queue_maxsize=4,
+            CaptureConfig(device_id=0, fps=30),
+            queue_maxsize=4,
+        )
+        mock_cap = MagicMock()
+        mock_cap.isOpened.return_value = True
+        mock_cap.read.return_value = (True, _synthetic_bgr_frame())
+        selection = CameraSelection(
+            device_id=0,
+            backend=None,
+            source="test_fixture",
+            device_name="Synthetic Camera",
         )
         with patch(
-            "cortex.services.capture_service.webcam.cv2.VideoCapture",
-        ) as mock_videocap:
-            mock_cap = MagicMock()
-            mock_cap.isOpened.return_value = True
-            mock_cap.read.return_value = (True, _synthetic_bgr_frame())
-            mock_videocap.return_value = mock_cap
-
+            "cortex.services.capture_service.webcam.open_video_capture",
+            return_value=(mock_cap, selection),
+        ):
             t0_wall = time.time()
             await capture.start()
             try:
@@ -107,7 +117,10 @@ class TestCapturedFrameTimestampIsWallClock:
         # because monotonic clocks on Linux/macOS start near system uptime
         # while time.time() is current epoch seconds — orders of magnitude
         # larger). A simple lower-bound check on wall clock is enough.
-        assert frame.timestamp >= t0_wall, (
+        # Production derives the compatibility field from the canonical
+        # integer ``observed_at_unix_ms`` value, so compare at that declared
+        # precision instead of requiring the discarded sub-millisecond part.
+        assert int(frame.timestamp * 1000) >= int(t0_wall * 1000), (
             "frame.timestamp predates capture start — not wall-clock"
         )
         # Wall-clock values on modern systems are > 1.7e9 (seconds since
@@ -134,7 +147,8 @@ class TestCaptureStaleTracking:
     @pytest.mark.asyncio
     async def test_capture_stale_set_after_threshold_failures(self) -> None:
         capture = WebcamCapture(
-            CaptureConfig(device_id=0, fps=30), queue_maxsize=4,
+            CaptureConfig(device_id=0, fps=30),
+            queue_maxsize=4,
         )
         mock_cap = MagicMock()
         mock_cap.isOpened.return_value = True
@@ -172,7 +186,8 @@ class TestCaptureStaleTracking:
     @pytest.mark.asyncio
     async def test_capture_stale_cleared_on_successful_frame(self) -> None:
         capture = WebcamCapture(
-            CaptureConfig(device_id=0, fps=30), queue_maxsize=4,
+            CaptureConfig(device_id=0, fps=30),
+            queue_maxsize=4,
         )
         mock_cap = MagicMock()
         mock_cap.isOpened.return_value = True
@@ -182,10 +197,9 @@ class TestCaptureStaleTracking:
         # MagicMock side_effect with a list raises StopIteration after
         # exhaustion which crashes the capture thread. Use a long tail of
         # success frames so the test never runs out.
-        mock_cap.read.side_effect = (
-            [(False, None)] * fail_count
-            + [(True, _synthetic_bgr_frame())] * 200
-        )
+        mock_cap.read.side_effect = [(False, None)] * fail_count + [
+            (True, _synthetic_bgr_frame())
+        ] * 200
 
         with patch(
             "cortex.services.capture_service.webcam.open_video_capture",
@@ -206,9 +220,7 @@ class TestCaptureStaleTracking:
             finally:
                 await capture.stop()
 
-        assert capture.capture_stale is False, (
-            "capture_stale should clear after a successful frame"
-        )
+        assert capture.capture_stale is False, "capture_stale should clear after a successful frame"
 
     def test_capture_stale_property_exists_and_default_false(self) -> None:
         """Daemon polling path requires the property to be available
@@ -240,7 +252,9 @@ class TestFeatureFusionTimestampOrdering:
         assert fusion._physio_timestamp == 0.0
 
         physio = PhysioFeatures(
-            pulse_bpm=72.0, pulse_quality=0.9, valid=True,
+            pulse_bpm=72.0,
+            pulse_quality=0.9,
+            valid=True,
         )
         fusion.update_physio(physio, timestamp=123.456)
 

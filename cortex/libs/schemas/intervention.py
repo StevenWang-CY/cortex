@@ -19,9 +19,11 @@ from dataclasses import field as dc_field
 from datetime import datetime
 from typing import Any, Literal
 from urllib.parse import urlparse
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from cortex.application.clock import SYSTEM_CLOCK, utc_datetime
 
 # ---------------------------------------------------------------------------
 # Planner-side dataclasses (intentionally NOT pydantic models).
@@ -58,6 +60,18 @@ class ValidationResult:
 # when the extension hands the URL to ``chrome.tabs.create``.
 _ALLOWED_URL_SCHEMES: frozenset[str] = frozenset({"http", "https"})
 
+# These proposal actions currently have an exact apply verifier plus an
+# ownership-safe inverse in the WP-6 transaction adapters. This presentation
+# hint is normalised from the catalog; it is never used as execution authority.
+_EXACTLY_REVERSIBLE_ACTION_TYPES: frozenset[str] = frozenset(
+    {
+        "open_url",
+        "search_error",
+        "highlight_tab",
+        "resume_last_active_file",
+    }
+)
+
 # F10: per-action_type maximum length of the ``target`` string. The
 # overall ``max_length=500`` on the field remains as an outer bound;
 # these tighter caps catch obvious shape misuse (e.g. a search query
@@ -85,7 +99,7 @@ def _generate_action_id() -> str:
 
 
 class SuggestedAction(BaseModel):
-    """A single executable action the user can approve with one click."""
+    """A proposed action; only the transaction manifest can make it executable."""
 
     action_id: str = Field(
         default_factory=_generate_action_id,
@@ -129,7 +143,13 @@ class SuggestedAction(BaseModel):
         "recommended",
         description="How strongly recommended",
     )
-    reversible: bool = Field(True, description="Whether this action can be undone")
+    reversible: bool = Field(
+        False,
+        description=(
+            "Presentation hint normalised from the transactional capability "
+            "catalog; never execution authority"
+        ),
+    )
     group_id: str | None = Field(
         None, description="Groups related actions together"
     )
@@ -202,6 +222,7 @@ class SuggestedAction(BaseModel):
                 raise ValueError(
                     "open_url target must include a hostname"
                 )
+        self.reversible = self.action_type in _EXACTLY_REVERSIBLE_ACTION_TYPES
         return self
 
 
@@ -518,19 +539,26 @@ class InterventionPlan(BaseModel):
 
     @property
     def is_destructive(self) -> bool:
-        """Check if plan contains destructive workspace actions (should always be False).
+        """Check whether a proposal can discard unreconstructable user state.
 
         Uses action_type checking instead of substring matching on labels,
         which avoids false positives on benign labels like 'Close New Tab'.
-        close_tab is NOT inherently destructive (it's reversible via undo).
+        Closing a browser tab is destructive for Cortex: reopening its URL does
+        not reconstruct browser-owned session identity, history, form state,
+        scroll position, or live media state. Bookmarking the URL first does
+        not change that classification.
         """
         destructive_action_types = {
-            "delete_file", "delete_project", "close_application", "discard_changes",
+            "delete_file",
+            "delete_project",
+            "close_application",
+            "discard_changes",
+            "close_tab",
+            "bookmark_and_close",
         }
         for action in self.suggested_actions:
             if action.action_type in destructive_action_types:
                 return True
-        # close_tab is NOT inherently destructive (it's reversible via undo)
         return False
 
 
@@ -560,7 +588,18 @@ class WorkspaceSnapshot(BaseModel):
     """
 
     intervention_id: str = Field(..., description="Associated intervention ID")
-    timestamp: float = Field(..., description="When snapshot was taken")
+    timestamp: float = Field(
+        ...,
+        deprecated=True,
+        description=(
+            "Deprecated v1 process-local monotonic seconds. Compare only "
+            "inside the producing boot; prefer observed_at_mono_ns."
+        ),
+    )
+    schema_version: Literal["2.0"] = "2.0"
+    observed_at_unix_ms: int | None = Field(None, ge=0)
+    observed_at_mono_ns: int | None = Field(None, ge=0)
+    boot_id: UUID | None = None
 
     # Editor state
     fold_states: list[FoldState] = Field(
@@ -587,6 +626,17 @@ class WorkspaceSnapshot(BaseModel):
     terminal_scroll_position: int | None = Field(
         None, description="Terminal scroll position"
     )
+
+    @model_validator(mode="after")
+    def _validate_v2_time_tuple(self) -> WorkspaceSnapshot:
+        supplied = (
+            self.observed_at_unix_ms is not None,
+            self.observed_at_mono_ns is not None,
+            self.boot_id is not None,
+        )
+        if any(supplied) and not all(supplied):
+            raise ValueError("workspace snapshot v2 time fields must be supplied together")
+        return self
 
     @property
     def has_editor_state(self) -> bool:
@@ -679,10 +729,13 @@ class DismissalRecord(BaseModel):
         stored timestamp so the subtraction is always valid.
         """
         if self.timestamp.tzinfo is not None:
-            now = datetime.now(self.timestamp.tzinfo)
+            now = utc_datetime(SYSTEM_CLOCK).astimezone(self.timestamp.tzinfo)
         else:
-            now = datetime.now()
-        return (now - self.timestamp).total_seconds()
+            now = utc_datetime(SYSTEM_CLOCK).astimezone().replace(tzinfo=None)
+        # Construction and access can straddle adjacent clock reads; a caller
+        # may also provide a timestamp a few microseconds in the future due to
+        # serialization precision. Age is a duration and cannot be negative.
+        return max(0.0, (now - self.timestamp).total_seconds())
 
 
 class InterventionApplied(BaseModel):

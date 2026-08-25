@@ -1,61 +1,59 @@
 # Calibration
 
-## Purpose
+## Current status
 
-Calibration establishes personal baseline distributions used by state scoring and trigger personalization. Cortex 0.2.0 keeps the original seed capture and adds richer baseline statistics for robust z-score/percentile logic.
-
-## What Changed in 0.2.0
-
-- Baseline artifacts now include per-metric distribution stats:
-  - `mu`, `sigma`, `p10`, `p90`
-- Baseline loader includes migration logic so legacy baseline JSON files still load.
-- Blink threshold personalization support is available from EAR sample percentiles.
-- Config includes rolling re-baseline and decay knobs for longitudinal adaptation.
-
-## Running Baseline Capture
+The existing calibration command is a legacy research utility. It does not yet
+consume exactly the same versioned observation/feature pipeline as the runtime,
+does not establish independent reference-sensor truth, and may overstate the
+effective sample size of overlapping windows. It must not be described as
+making state scores accurate, probabilistic, or diagnostic.
 
 ```bash
 cortex-calibrate --duration 120
 ```
 
-Optional simulation mode:
+The `--simulate` option is for UI/developer demonstrations only. Synthetic
+values are not user measurements and must not be promoted or persisted as a
+measured calibration profile.
 
-```bash
-cortex-calibrate --simulate
-```
+## Product use
 
-## Output Schema (Key Fields)
+Until Calibration v2 is complete:
 
-`UserBaselines` (in `cortex/libs/schemas/state.py`) persists both scalar baselines and additive distribution metadata. The schema's actual field names:
+- resting heart-rate and basic blink/head-neutral values are advisory legacy
+  baselines;
+- HRV and respiration baselines cannot enable product metrics or
+  physiology-triggered actions;
+- a profile cannot turn a heuristic support score into a calibrated
+  probability;
+- camera or configuration changes can invalidate prior values;
+- stale or simulated profiles must not silently drive decisions.
 
-```json
-{
-  "hr_baseline": 72.0,
-  "hr_std": 5.0,
-  "hrv_baseline": 50.0,
-  "blink_rate_baseline": 17.0,
-  "mouse_velocity_baseline": 500.0,
-  "mouse_variance_baseline": 10000.0,
-  "shoulder_neutral_y": 0.5,
-  "resp_baseline": 15.0,
-  "calibrated_at": "2026-05-19T08:00:00",
-  "metric_distributions": {
-    "hr": {"mu": 72.0, "sigma": 4.2, "p10": 66.0, "p90": 78.0},
-    "hrv": {"mu": 50.0, "sigma": 9.5, "p10": 38.0, "p90": 63.0}
-  },
-  "circadian_hr_cosinor": {},
-  "rolling_rebaseline_seconds": 60.0,
-  "ew_decay_half_life_days": 7.0
-}
-```
+## Calibration v2 contract
 
-## How Baselines Are Used
+WP-4 in [`../../IMPLEMENTATION.md`](../../IMPLEMENTATION.md) replaces the
+parallel runner with a profile produced by the same observation and feature
+pipeline as normal operation. A valid profile records:
 
-- Pulse/HRV sub-scores use personalized z-score style logic when distribution stats exist.
-- FLOW/HYPER rules reference personalized baseline bands before fallback heuristics.
-- Stress integral normalization can use baseline variance (`sigma`) rather than absolute ms deficit.
-- Trigger threshold adaptation and dismissal modeling use feedback tied to personal history.
+- schema and algorithm versions;
+- camera identity class and relevant configuration;
+- start/end wall time and valid monotonic exposure;
+- per-channel quality and missingness;
+- accepted observation/beat counts and effective sample size;
+- reference task and collection conditions;
+- explicit `measured` provenance;
+- metric-specific readiness and rejection reasons.
 
-## Compatibility
+Publishing a new profile emits a `CalibrationUpdated` event and atomically
+rebuilds every dependent estimator. Values derived under another feature
+version are compatibility data, not silently reusable evidence.
 
-Legacy files without `metric_distributions` are auto-migrated in runtime load paths. No manual data migration is required.
+## Validation
+
+Calibration UX is not validation. Pulse and any future derived physiology need
+a consented, subject-disjoint reference-sensor protocol with condition and
+subgroup reporting. Support estimates need a declared target such as
+self-reported near-term support need, with participant-held-out evaluation.
+
+The release gates and reference protocol are defined in Sections 13 and 18 of
+the implementation plan.

@@ -18,16 +18,58 @@ echo "Root: ${ROOT_DIR}"
 
 cd "${ROOT_DIR}"
 
-# Activate venv if present
-if [ -f "${ROOT_DIR}/.venv/bin/activate" ]; then
-    source "${ROOT_DIR}/.venv/bin/activate"
+# A release build must use the environment created from cortex/uv.lock. Do not
+# fall back to a shell/system interpreter whose dependency graph is unknown.
+PYTHON_BIN="${CORTEX_DIR}/.venv/bin/python"
+if [ ! -x "${PYTHON_BIN}" ]; then
+    echo "[FATAL] Locked project interpreter is missing at ${PYTHON_BIN}. Run uv sync --project cortex --locked --all-extras." >&2
+    exit 1
 fi
+
+check_node_version() {
+    if ! command -v node &>/dev/null; then
+        echo "[FATAL] Node is required to build bundled integrations" >&2
+        return 1
+    fi
+    local expected actual
+    expected=$(<"${ROOT_DIR}/.node-version")
+    actual=$(node -p 'process.versions.node')
+    if [ "${actual}" != "${expected}" ]; then
+        echo "[FATAL] Node ${actual} does not match repository pin ${expected}" >&2
+        return 1
+    fi
+}
+
+# pyproject.toml is the sole version source. Refuse to package stale generated
+# Python/extension surfaces before spending minutes on native builds.
+"${PYTHON_BIN}" -m cortex.scripts.sync_versions --check
+CORTEX_VERSION=$("${PYTHON_BIN}" -m cortex.scripts.sync_versions --print)
+ARTIFACT_ARCH="${CORTEX_ARTIFACT_ARCH:-$(uname -m)}"
+REQUIRE_NOTARIZATION="${CORTEX_REQUIRE_NOTARIZATION:-0}"
+SIGN_IDENTITY="${CORTEX_SIGN_IDENTITY:--}"
+EVIDENCE_DIR="${CORTEX_RELEASE_EVIDENCE_DIR:-${DIST_DIR}/evidence-${ARTIFACT_ARCH}}"
+
+case "${ARTIFACT_ARCH}" in
+    arm64|x86_64) ;;
+    *)
+        echo "[FATAL] Unsupported CORTEX_ARTIFACT_ARCH=${ARTIFACT_ARCH}; expected arm64 or x86_64" >&2
+        exit 1
+        ;;
+esac
+if [ "${REQUIRE_NOTARIZATION}" = "1" ]; then
+    if [ "${SIGN_IDENTITY}" = "-" ] || [ -z "${CORTEX_NOTARIZE_PROFILE:-}" ]; then
+        echo "[FATAL] Production release requires CORTEX_SIGN_IDENTITY and CORTEX_NOTARIZE_PROFILE" >&2
+        exit 1
+    fi
+fi
+mkdir -p "${EVIDENCE_DIR}"
+export CORTEX_ARTIFACT_ARCH="${ARTIFACT_ARCH}"
 
 # Non-interactive bash launched from GUI tools often lacks Homebrew/NVM paths.
 # Add the common macOS Node locations before building bundled extensions.
 export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
 if ! command -v npm &>/dev/null && [ -s "${HOME}/.nvm/nvm.sh" ]; then
-    # shellcheck disable=SC1090
+    # shellcheck disable=SC1090,SC1091
     source "${HOME}/.nvm/nvm.sh"
     nvm use --silent default >/dev/null 2>&1 || true
 fi
@@ -64,30 +106,32 @@ else
     echo "→ Building Chrome and Edge extensions..."
     (
         cd "${EXT_DIR}"
-        if command -v pnpm &>/dev/null; then
-            pnpm install
-            pnpm exec plasmo build
-            pnpm exec plasmo build --target=edge-mv3
-        elif command -v corepack &>/dev/null; then
-            corepack pnpm install
-            corepack pnpm exec plasmo build
-            corepack pnpm exec plasmo build --target=edge-mv3
-        elif command -v npm &>/dev/null; then
-            npm install
-            npx plasmo build
-            npx plasmo build --target=edge-mv3
+        check_node_version
+        EXPECTED_PNPM=$(node -p 'require("./package.json").packageManager.replace(/^pnpm@/, "")')
+        if command -v corepack &>/dev/null; then
+            PNPM_CMD=(corepack pnpm)
+        elif command -v pnpm &>/dev/null; then
+            PNPM_CMD=(pnpm)
         else
-            echo "ERROR: pnpm/corepack/npm not installed; cannot build browser extension" >&2
+            echo "ERROR: pnpm/corepack not installed; cannot consume pnpm-lock.yaml" >&2
             exit 1
         fi
+        ACTUAL_PNPM=$("${PNPM_CMD[@]}" --version)
+        if [ "${ACTUAL_PNPM}" != "${EXPECTED_PNPM}" ]; then
+            echo "[FATAL] pnpm ${ACTUAL_PNPM} does not match packageManager pin ${EXPECTED_PNPM}" >&2
+            exit 1
+        fi
+        "${PNPM_CMD[@]}" install --frozen-lockfile
+        "${PNPM_CMD[@]}" exec plasmo build
+        "${PNPM_CMD[@]}" exec plasmo build --target=edge-mv3
     )
 fi
 
 # ── Step 2: Build VS Code extension ────────────────────────────────────────
-# P2-12: Read version from package.json so the VSIX path is always
-# consistent with the manifest; never hardcode the version string here.
-VSIX_VERSION=$(jq -r .version "${CORTEX_DIR}/apps/vscode_extension/package.json")
-VSIX="${CORTEX_DIR}/apps/vscode_extension/cortex-somatic-${VSIX_VERSION}.vsix"
+# The version-consistency gate above proves the VS Code manifest agrees with
+# the canonical project version, so both the expected VSIX and bundled spec
+# resolve the same immutable artifact name.
+VSIX="${CORTEX_DIR}/apps/vscode_extension/cortex-somatic-${CORTEX_VERSION}.vsix"
 VSCODE_EXT_DIR="${CORTEX_DIR}/apps/vscode_extension"
 if [ "${CORTEX_SKIP_VSCODE_EXT_BUILD:-0}" = "1" ]; then
     echo "→ Skipping VS Code extension build (CORTEX_SKIP_VSCODE_EXT_BUILD=1)"
@@ -95,10 +139,11 @@ else
     echo "→ Building VS Code extension..."
     (
         cd "${VSCODE_EXT_DIR}"
+        check_node_version
         if command -v npm &>/dev/null; then
-            npm install
+            npm ci
             npm run compile
-            npx --yes @vscode/vsce package --out "${VSIX}"
+            npm exec -- vsce package --out "${VSIX}"
         else
             echo "ERROR: npm not installed; cannot build VS Code extension" >&2
             exit 1
@@ -109,7 +154,7 @@ fi
 # ── Step 3: Verify VSIX ────────────────────────────────────────────────────
 if [ ! -f "${VSIX}" ]; then
     echo "ERROR: VSIX not found at ${VSIX}" >&2
-    echo "Build it with: cd cortex/apps/vscode_extension && npx @vscode/vsce package --out cortex-somatic-${VSIX_VERSION}.vsix" >&2
+    echo "Build it with: cd cortex/apps/vscode_extension && npm ci && npm exec -- vsce package --out cortex-somatic-${CORTEX_VERSION}.vsix" >&2
     exit 1
 fi
 echo "→ VSIX found"
@@ -146,10 +191,9 @@ fi
     echo "CORTEX_API__PORT=9472"
     echo "CORTEX_API__WS_PORT=9473"
 } >> "${ROOT_DIR}/.env.bundled"
-# Defence-in-depth: blow up the build if a secret slipped through.
-if grep -qiE "AWS_BEARER_TOKEN_BEDROCK|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|api_key=|sk-ant-|openai\.com|franklink|gwhiz|cis\.upenn" "${ROOT_DIR}/.env.bundled"; then
+# Defence-in-depth: fail without echoing the suspect file into CI logs.
+if grep -qiE "AWS_BEARER_TOKEN_BEDROCK|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|api_key=|sk-ant-|openai\.com|/Users/|/home/" "${ROOT_DIR}/.env.bundled"; then
     echo "ERROR: bundled .env contains a forbidden pattern; aborting build." >&2
-    head -50 "${ROOT_DIR}/.env.bundled" >&2
     exit 1
 fi
 
@@ -244,7 +288,7 @@ fi
 # ── Step 6: Run PyInstaller ────────────────────────────────────────────────
 echo "→ Running PyInstaller..."
 export CORTEX_ROOT="${ROOT_DIR}"
-pyinstaller "${SPEC_FILE}" --noconfirm --clean --distpath "${DIST_DIR}" --workpath "${ROOT_DIR}/build/pyinstaller"
+"${PYTHON_BIN}" -m PyInstaller "${SPEC_FILE}" --noconfirm --clean --distpath "${DIST_DIR}" --workpath "${ROOT_DIR}/build/pyinstaller"
 
 APP_PATH="${DIST_DIR}/Cortex.app"
 if [ ! -d "${APP_PATH}" ]; then
@@ -261,9 +305,6 @@ if [ -f "${ICON_ICNS}" ]; then
 fi
 
 # ── Step 7: Code sign ──────────────────────────────────────────────────────
-# Check for Developer ID certificate
-SIGN_IDENTITY="${CORTEX_SIGN_IDENTITY:--}"  # Default to ad-hoc ("-")
-
 echo "→ Code signing with: ${SIGN_IDENTITY}"
 
 # For ad-hoc signing, we must NOT use --options runtime (hardened runtime).
@@ -295,14 +336,23 @@ fi
 # sees a Gatekeeper bounce. ``codesign --verify`` is authoritative for
 # both ad-hoc and Developer ID bundles; ``spctl`` is warn-only for
 # ad-hoc because Gatekeeper rejects unsigned binaries by design.
-if ! codesign --verify --deep --strict --verbose=2 "${APP_PATH}"; then
+if ! codesign --verify --deep --strict --verbose=2 "${APP_PATH}" \
+    2>&1 | tee "${EVIDENCE_DIR}/codesign-verify-app.txt"; then
     echo "[FATAL] codesign --verify failed for ${APP_PATH}" >&2
     exit 1
 fi
-spctl -a -v --type execute "${APP_PATH}" 2>&1 || true
+spctl -a -vv --type execute "${APP_PATH}" \
+    > "${EVIDENCE_DIR}/spctl-app.txt" 2>&1 || true
+
+BUILT_ARCHS=$(lipo -archs "${APP_PATH}/Contents/MacOS/Cortex")
+if [ "${BUILT_ARCHS}" != "${ARTIFACT_ARCH}" ]; then
+    echo "[FATAL] Built architecture ${BUILT_ARCHS} does not equal ${ARTIFACT_ARCH}" >&2
+    exit 1
+fi
+echo "${BUILT_ARCHS}" > "${EVIDENCE_DIR}/architectures.txt"
 
 # ── Step 8: Create DMG ────────────────────────────────────────────────────
-DMG_PATH="${DIST_DIR}/Cortex.dmg"
+DMG_PATH="${DIST_DIR}/Cortex-${CORTEX_VERSION}-macos-${ARTIFACT_ARCH}.dmg"
 echo "→ Creating DMG..."
 DMG_STAGE_DIR="$(mktemp -d /tmp/cortex_dmg_stage.XXXXXX)"
 cp -R "${APP_PATH}" "${DMG_STAGE_DIR}/Cortex.app"
@@ -352,20 +402,79 @@ fi
 # ── Step 9: Notarize (if credentials available) ───────────────────────────
 if [ "${SIGN_IDENTITY}" != "-" ] && [ -n "${CORTEX_NOTARIZE_PROFILE:-}" ]; then
     echo "→ Notarizing DMG..."
-    xcrun notarytool submit "${DMG_PATH}" \
-        --keychain-profile "${CORTEX_NOTARIZE_PROFILE}" \
+    NOTARY_ARGS=(
+        submit "${DMG_PATH}"
+        --keychain-profile "${CORTEX_NOTARIZE_PROFILE}"
         --wait
+        --output-format json
+    )
+    if [ -n "${CORTEX_NOTARIZE_KEYCHAIN:-}" ]; then
+        NOTARY_ARGS+=(--keychain "${CORTEX_NOTARIZE_KEYCHAIN}")
+    fi
+    xcrun notarytool "${NOTARY_ARGS[@]}" \
+        | tee "${EVIDENCE_DIR}/notarytool-submit.json"
+    "${PYTHON_BIN}" - "${EVIDENCE_DIR}/notarytool-submit.json" "${EVIDENCE_DIR}/notary-request-id.txt" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if payload.get("status") != "Accepted":
+    raise SystemExit(f"notarization was not accepted: {payload.get('status')!r}")
+request_id = str(payload.get("id") or "").strip()
+if not request_id:
+    raise SystemExit("accepted notarization response omitted its request id")
+Path(sys.argv[2]).write_text(request_id + "\n", encoding="utf-8")
+PY
+    IFS= read -r NOTARY_REQUEST_ID < "${EVIDENCE_DIR}/notary-request-id.txt"
+    NOTARY_LOG_ARGS=(
+        log "${NOTARY_REQUEST_ID}"
+        --keychain-profile "${CORTEX_NOTARIZE_PROFILE}"
+    )
+    if [ -n "${CORTEX_NOTARIZE_KEYCHAIN:-}" ]; then
+        NOTARY_LOG_ARGS+=(--keychain "${CORTEX_NOTARIZE_KEYCHAIN}")
+    fi
+    xcrun notarytool "${NOTARY_LOG_ARGS[@]}" \
+        > "${EVIDENCE_DIR}/notarytool-log.json"
     xcrun stapler staple "${DMG_PATH}"
+    xcrun stapler validate "${DMG_PATH}" \
+        2>&1 | tee "${EVIDENCE_DIR}/stapler-validate-dmg.txt"
     echo "→ Notarization complete"
 else
     echo "→ Skipping notarization (no Developer ID or CORTEX_NOTARIZE_PROFILE not set)"
     echo "  For production: set CORTEX_SIGN_IDENTITY and CORTEX_NOTARIZE_PROFILE"
 fi
 
-# ── Step 10: Verify ───────────────────────────────────────────────────────
+# ── Step 10: Verify the mounted artifact and emit local provenance ─────────
+VERIFY_ARGS=(
+    "${DMG_PATH}"
+    --expected-arch "${ARTIFACT_ARCH}"
+    --output "${EVIDENCE_DIR}/release-verification.json"
+)
+if [ "${REQUIRE_NOTARIZATION}" = "1" ]; then
+    VERIFY_ARGS+=(--require-notarized)
+fi
+"${PYTHON_BIN}" -m cortex.scripts.verify_macos_release "${VERIFY_ARGS[@]}"
+
+EVIDENCE_ARGS=(
+    --artifact "${DMG_PATH}"
+    --verification "${EVIDENCE_DIR}/release-verification.json"
+    --output-dir "${EVIDENCE_DIR}"
+    --checksum-name "SHA256SUMS-${ARTIFACT_ARCH}"
+)
+if [ "${REQUIRE_NOTARIZATION}" = "1" ]; then
+    EVIDENCE_ARGS+=(--require-clean)
+fi
+if [ -n "${CORTEX_RELEASE_TAG:-}" ]; then
+    EVIDENCE_ARGS+=(--expected-tag "${CORTEX_RELEASE_TAG}")
+fi
+"${PYTHON_BIN}" -m cortex.scripts.generate_release_evidence "${EVIDENCE_ARGS[@]}"
+
+# ── Step 11: Summary ──────────────────────────────────────────────────────
 echo ""
 echo "=== Build Complete ==="
 echo "  App:  ${APP_PATH}"
 echo "  DMG:  ${DMG_PATH}"
+echo "  Evidence: ${EVIDENCE_DIR}"
 echo ""
 echo "To test: open ${DMG_PATH}"

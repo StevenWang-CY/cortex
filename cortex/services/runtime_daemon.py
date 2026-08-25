@@ -14,45 +14,135 @@ import json
 import logging
 import queue
 import threading
-import time
 from collections import deque
 from collections.abc import Callable
-from datetime import UTC, datetime
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
+from uuid import uuid4
 
 import numpy as np
 import uvicorn
+from numpy.typing import NDArray
 
+from cortex.application.clock import (
+    SYSTEM_CLOCK,
+    BoundedDeadline,
+    Clock,
+    clock_or_system,
+    monotonic_seconds,
+    unix_seconds,
+    utc_datetime,
+)
+from cortex.application.coordinators import (
+    ExperimentCoordinator,
+    ExperimentOperations,
+    InferenceCoordinator,
+    InferenceOperations,
+    InterventionCoordinator,
+    LoopSpec,
+    OperationsCoordinator,
+    RuntimeCoordinatorSet,
+    SensingCoordinator,
+    SensingOperations,
+)
+from cortex.application.events import Subscription
+from cortex.application.gateway import WebSocketCommandHandlers
+from cortex.application.kernel import ApplicationKernel
+from cortex.application.task_supervisor import TaskFailure, TaskGroupName
 from cortex.libs.adapters.leetcode_adapter import LeetCodeAdapter
 from cortex.libs.config.settings import CortexConfig, get_config
-from cortex.libs.logging.correlation import get_correlation_id
 from cortex.libs.logging.structured import (
     EventType,
     configure_logging,
     get_logger,
 )
-from cortex.libs.schemas.features import KinematicFeatures, PhysioFeatures
+from cortex.libs.schemas.calibration import (
+    CALIBRATION_FEATURE_SCHEMA_VERSION,
+    CALIBRATION_PROTOCOL_VERSION,
+    ActiveCalibrationPointer,
+    CalibrationMetricMaturity,
+    CalibrationMetricName,
+    CalibrationProfile,
+    CalibrationProvenance,
+    CalibrationUpdated,
+)
+from cortex.libs.schemas.features import (
+    FeatureName,
+    FeatureValue,
+    KinematicFeatures,
+    PhysioFeatures,
+)
 from cortex.libs.schemas.intervention import (
     InterventionApplyResult,
     InterventionPlan,
 )
+from cortex.libs.schemas.intervention_transaction import (
+    ActionReceipt,
+    AuthorizationDenied,
+    InterventionApplyCommand,
+    InterventionAuthorizationRequest,
+    InterventionLifecycleState,
+    InterventionReceiptBatch,
+    InterventionRestoreCommand,
+    ReceiptPhase,
+    ReceiptStatus,
+    VerificationStatus,
+    manifest_suggestion_matches,
+)
 from cortex.libs.schemas.leetcode import LeetCodeContext
+from cortex.libs.schemas.observations import (
+    CameraFrameObservation,
+    CameraIdentity,
+    MissingReason,
+    ObservationEnvelope,
+    ObservationSource,
+    ObservationValidity,
+)
+from cortex.libs.schemas.physiology import SignalAlgorithmIdentity, SignalEstimate
+from cortex.libs.schemas.policy import (
+    PolicyArm,
+    PolicyContextSnapshot,
+    PolicyDecisionRecord,
+    policy_payload_sha256,
+)
 from cortex.libs.schemas.session_history import (
     SessionDetailResponse,
     SessionListResponse,
     TrendsResponse,
 )
 from cortex.libs.schemas.state import UserBaselines
+from cortex.libs.schemas.temporal import EventTime
 from cortex.libs.schemas.ws_message_types import MessageType
 
 # v2.0 imports
-from cortex.libs.store import InMemoryStore, RedisStore, make_default_store
+from cortex.libs.store import (
+    InMemoryStore,
+    RedisStore,
+    SQLiteKeyValueStore,
+    default_legacy_store_path,
+    make_default_store,
+)
 from cortex.libs.utils import receptivity
 from cortex.services.activity_tracker.aggregator import ActivityAggregator
-from cortex.services.api_gateway.app import create_app, registry
+from cortex.services.api_gateway.app import create_app
 from cortex.services.api_gateway.websocket_server import WebSocketServer
+from cortex.services.capture_service.calibration_store import (
+    CalibrationProfileStore,
+    calibration_profile_sha256,
+)
+from cortex.services.capture_service.feature_factory import (
+    ProductionCameraFeatureComponents,
+    build_production_camera_feature_components,
+    production_calibration_algorithm_identities,
+)
+from cortex.services.capture_service.observation_buffer import (
+    NumericObservation,
+    ObservationBuffer,
+    PreparedObservationWindow,
+    prepare_observation_window,
+)
 from cortex.services.capture_service.pipeline import CapturePipeline, PipelineOutput
 from cortex.services.consent.ladder import ConsentLadder
 from cortex.services.consent.policy import (
@@ -68,41 +158,52 @@ from cortex.services.context_engine import (
     TerminalAdapter,
     classify_tab_type,
 )
-from cortex.services.eval.amip import AMIPPolicy
-from cortex.services.eval.bandit import ContextualBandit
-from cortex.services.eval.causal_report import generate_daily_causal_report
 from cortex.services.eval.helpfulness import HelpfulnessTracker
+from cortex.services.eval.policy_diagnostics import (
+    generate_daily_policy_diagnostics,
+    migrate_legacy_causal_report_names,
+)
+from cortex.services.eval.policy_lifecycle import PolicyLifecycleService
+from cortex.services.eval.policy_repository import PolicyRepository
+from cortex.services.eval.production_policy import PolicySelectionInput
+from cortex.services.eval.research_policy import (
+    RESEARCH_POLICY_NAME,
+    RESEARCH_POLICY_VERSION,
+    ResearchPolicySettings,
+)
 from cortex.services.eval.tab_relevance import TabRelevanceTracker
 from cortex.services.handover.briefing import MorningBriefing
 from cortex.services.handover.detector import ShutdownDetector
 from cortex.services.handover.snapshot import HandoverSnapshot
 from cortex.services.intervention_engine.break_overlay import (
-    BiologyBreakController,
     BreakUIHandler,
+    GuidedBreakController,
 )
 from cortex.services.intervention_engine.executor import InterventionExecutor
 from cortex.services.intervention_engine.leetcode_interventions import InterventionMatrix
 from cortex.services.intervention_engine.planner import (
+    materialize_suggestion_only,
     prepare_plan,
-    promote_biology_break,
 )
 from cortex.services.intervention_engine.restore import RestoreManager
 from cortex.services.intervention_engine.snapshot import capture_snapshot
+from cortex.services.intervention_engine.transaction import (
+    InterventionTransactionCoordinator,
+    build_action_manifest,
+)
+from cortex.services.intervention_engine.transaction_store import (
+    SQLiteInterventionTransactionStore,
+)
 from cortex.services.janitor.retention import (
     enforce_chronotype_retention,
 )
 from cortex.services.janitor.retention import (
     sweep_once_async as run_retention_sweep_async,
 )
-from cortex.services.kinematics_engine.blink_detector import BlinkDetector
-from cortex.services.kinematics_engine.head_pose import HeadPoseEstimator
-from cortex.services.kinematics_engine.posture import PostureAnalyzer
 from cortex.services.launcher.launcher import ProjectLauncher
 from cortex.services.llm_engine import create_llm_client
 from cortex.services.llm_engine.parser import enrich_plan_with_context
 from cortex.services.physio_engine.pulse_estimator import PulseEstimator, PulseStabilizer
-from cortex.services.physio_engine.roi_extractor import RoiExtractor
-from cortex.services.physio_engine.rppg import extract_bvp
 from cortex.services.session_report.generator import SessionReportGenerator
 from cortex.services.session_report.longitudinal import LongitudinalAggregator
 from cortex.services.session_report.reader import SessionReader
@@ -111,20 +212,126 @@ from cortex.services.state_engine import FeatureFusion, RuleScorer, ScoreSmoothe
 from cortex.services.state_engine.amygdala_hijack import AmygdalaHijackDetector
 from cortex.services.state_engine.causal_attribution import CausalAttributor
 from cortex.services.state_engine.destructive_struggle import DestructiveStruggleDetector
+from cortex.services.state_engine.focus_break_policy import FocusBreakPolicy
 from cortex.services.state_engine.leetcode_mode_resolver import LeetCodeModeResolver
 from cortex.services.state_engine.longitudinal import LongitudinalTracker
-from cortex.services.state_engine.ml_classifier import PerUserLogisticClassifier
+from cortex.services.state_engine.model_registry import SupportModelRegistry
 from cortex.services.state_engine.parasympathetic_rebound import ParasympatheticReboundDetector
 from cortex.services.state_engine.rabbit_hole import RabbitHoleDetector
-from cortex.services.state_engine.stress_integral import StressIntegralTracker
+from cortex.services.state_engine.support_inference import SupportInferenceEngine
 from cortex.services.state_engine.trigger_policy import TriggerPolicy
 from cortex.services.state_engine.zombie_detector import ZombieReadingDetector
 from cortex.services.telemetry_engine.feature_aggregator import FeatureAggregator
 from cortex.services.telemetry_engine.input_hooks import InputHooks
 from cortex.services.telemetry_engine.window_tracker import WindowTracker
 from cortex.services.throttle.copilot_throttle import CopilotThrottle
+from cortex.storage import SQLiteDatabase
+from cortex.storage.event_writer import BoundedAnalyticsWriter
+from cortex.storage.legacy_migrator import LegacyDataMigrator
+from cortex.storage.maintenance import StorageMaintenance
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _PreparedCalibrationGraph:
+    """Fully validated replacement graph built before the commit boundary."""
+
+    profile: CalibrationProfile
+    baselines: UserBaselines
+    camera_features: ProductionCameraFeatureComponents
+    pulse_estimator: PulseEstimator
+    rgb_observations: ObservationBuffer[NumericObservation]
+    feature_fusion: FeatureFusion
+    scorer: RuleScorer
+    smoother: ScoreSmoother
+    zombie_detector: ZombieReadingDetector
+    shutdown_detector: ShutdownDetector
+    causal_attributor: CausalAttributor
+    camera_calibration_valid: bool
+
+
+def _build_legacy_pulse_estimator(config: CortexConfig) -> PulseEstimator:
+    """Construct the compatibility pulse path from the canonical config."""
+
+    rppg = config.signal.rppg
+    stabilizer = (
+        PulseStabilizer(
+            enter_windows=rppg.lock_enter_windows,
+            grace_seconds=rppg.lock_grace_seconds,
+            snr_release_db=rppg.snr_release_db,
+            sqi_release=rppg.sqi_release,
+            smoothing_seconds=rppg.bpm_smoothing_seconds,
+            max_slew_bpm_per_s=rppg.bpm_max_slew_bpm_per_s,
+        )
+        if rppg.stabilize
+        else None
+    )
+    return PulseEstimator(
+        fs=float(config.capture.fps),
+        nsqi_threshold=rppg.nsqi_threshold,
+        min_cardiac_snr_db=rppg.min_cardiac_snr_db,
+        hrv_min_window_seconds=float(rppg.hrv_min_window_seconds),
+        hrv_min_valid_ibi=rppg.hrv_min_valid_ibi,
+        stabilizer=stabilizer,
+    )
+
+
+def _build_rgb_observation_buffer(
+    config: CortexConfig,
+) -> ObservationBuffer[NumericObservation]:
+    """Build the bounded camera-signal history used by runtime inference."""
+
+    window_seconds = max(
+        float(config.signal.rppg.window_seconds),
+        float(config.signal.rppg.respiration_window_seconds),
+    )
+    max_age_seconds = window_seconds + config.signal.rppg.max_interpolation_gap_ms / 1000.0 + 1.0
+    return ObservationBuffer(
+        max_age_seconds=max_age_seconds,
+        max_items=max(
+            config.capture.observation_buffer_max_items,
+            int(max_age_seconds * config.signal.rppg.fps_clamp_max) + 2,
+        ),
+    )
+
+
+def _validate_runtime_calibration_profile(
+    profile: CalibrationProfile,
+    *,
+    expected_algorithms: dict[str, SignalAlgorithmIdentity],
+) -> None:
+    """Fail closed before any persisted calibration can influence runtime."""
+
+    if profile.provenance != CalibrationProvenance.MEASURED.value:
+        raise ValueError("only measured calibration profiles may be applied")
+    if not profile.is_approved:
+        raise ValueError("calibration profile must be approved before application")
+    if profile.feature_schema_version != CALIBRATION_FEATURE_SCHEMA_VERSION:
+        raise ValueError("calibration feature schema is incompatible")
+    if profile.protocol_version != CALIBRATION_PROTOCOL_VERSION:
+        raise ValueError("calibration protocol version is incompatible")
+
+    algorithm_key_by_metric = {
+        CalibrationMetricName.BLINK_RATE_PER_MIN.value: "blink",
+        CalibrationMetricName.MOUSE_VELOCITY_PX_PER_S.value: "telemetry",
+        CalibrationMetricName.MOUSE_VELOCITY_VARIANCE.value: "telemetry",
+        CalibrationMetricName.NEUTRAL_HEAD_PITCH_DEG.value: "head_pose",
+        CalibrationMetricName.NEUTRAL_FACE_SCALE_PX.value: "head_pose",
+    }
+    for summary in profile.metrics:
+        algorithm_key = algorithm_key_by_metric.get(str(summary.metric))
+        if algorithm_key is None or summary.value is None:
+            continue
+        if summary.algorithm != expected_algorithms[algorithm_key]:
+            raise ValueError(f"calibration algorithm identity is incompatible for {summary.metric}")
+
+
+def _daemon_clock(owner: object) -> Clock:
+    """Resolve the daemon clock at legacy unbound-method boundaries."""
+
+    return clock_or_system(getattr(owner, "_clock", None))
+
 
 # C6 (audit): structured event sink. ``configure_logging`` (invoked once at
 # daemon startup, see ``start()``) wires the structlog processor chain; this
@@ -147,18 +354,16 @@ def _emit_event(event: EventType, **fields: Any) -> None:
         logger.debug("structured event %s emit failed", event.value, exc_info=True)
 
 
-def _interpolate_nan_window(window: np.ndarray) -> np.ndarray:
-    """Linear-interpolate over NaN-sentinel rows in an rPPG RGB window.
+def _interpolate_nan_window(window: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Legacy bounded-input helper for a prevalidated rPPG RGB window.
 
-    ``window`` is shape ``(N, C)`` (N frames, C colour channels). Low-quality
-    frames are appended to ``_rgb_history`` as all-NaN rows so the window
-    stays time-uniform (audit P1); this fills those gaps per-channel via
-    ``np.interp`` so the downstream non-NaN-aware bandpass filter + Welch PSD
-    never see a NaN. A channel that is entirely NaN (no good frame in the
-    window) falls back to zeros, which ``extract_bvp`` already tolerates.
+    ``window`` is shape ``(N, C)``. The production path first applies the
+    explicit time/coverage/gap gate in ``prepare_observation_window`` and no
+    longer calls this helper. It remains for compatibility callers that have
+    already bounded their gaps. An entirely missing channel remains NaN:
+    fabricating a zero trace would make an unavailable window look ready.
 
-    Returns a finite array of the same shape. A window with no NaNs is
-    returned (a copy is acceptable) unchanged.
+    A window with no NaNs is returned (a copy is acceptable) unchanged.
     """
     if window.size == 0:
         return window
@@ -174,12 +379,38 @@ def _interpolate_nan_window(window: np.ndarray) -> np.ndarray:
         col = view[:, c]
         good = ~np.isnan(col)
         if not good.any():
-            col[:] = 0.0
             continue
         if good.all():
             continue
         col[~good] = np.interp(x[~good], x[good], col[good])
     return out
+
+
+def _face_normalized_vertical_position(landmarks_px: Any) -> float | None:
+    """Return face-centre vertical position in units of observed face height.
+
+    Pixel displacement is camera-resolution and distance dependent. Dividing
+    by the current face height yields a dimensionless motion channel suitable
+    for detrending; invalid/degenerate landmark sets abstain explicitly.
+    """
+
+    try:
+        landmarks = np.asarray(landmarks_px, dtype=np.float64)
+    except (TypeError, ValueError):
+        return None
+    if (
+        landmarks.ndim != 2
+        or landmarks.shape[0] < 3
+        or landmarks.shape[1] < 2
+        or not bool(np.isfinite(landmarks[:, :2]).all())
+    ):
+        return None
+    vertical = landmarks[:, 1]
+    lower, upper = np.percentile(vertical, [5.0, 95.0])
+    face_height = float(upper - lower)
+    if face_height < 1.0:
+        return None
+    return float(np.median(vertical) / face_height)
 
 
 def _supervise_background_task(task: asyncio.Task[Any]) -> None:
@@ -202,6 +433,7 @@ def _supervise_background_task(task: asyncio.Task[Any]) -> None:
         exc_info=exc,
     )
 
+
 # P0 §3.3: bound on the SESSION_RECAP broadcast inside ``stop()`` so a
 # stuck WS client (e.g. a dead browser tab that never reads its frame)
 # cannot deadlock the daemon shutdown.
@@ -222,6 +454,14 @@ _AUTO_FOCUS_DEBOUNCE_S: float = 30.0
 # nightly tick. Daily baselines older than this are pruned from
 # ``storage/chronotype/daily/*.json``.
 _CHRONOTYPE_WINDOW_DAYS: int = 90
+
+_EXECUTION_MODES = frozenset(
+    {
+        "suggest_only",
+        "authorized",
+        "research_autonomous",
+    }
+)
 
 
 def enforce_session_storage_budget(
@@ -275,14 +515,13 @@ def enforce_session_storage_budget(
             total -= size
             evicted += 1
         except OSError:
-            logger.warning(
-                "F36 storage budget: could not evict %s", path, exc_info=True
-            )
+            logger.warning("F36 storage budget: could not evict %s", path, exc_info=True)
     if evicted > 0:
         logger.info(
-            "F36 storage budget: evicted %d session(s) to make room for "
-            "%d-byte write (cap=%d MB)",
-            evicted, incoming_bytes, max_total_size_mb,
+            "F36 storage budget: evicted %d session(s) to make room for %d-byte write (cap=%d MB)",
+            evicted,
+            incoming_bytes,
+            max_total_size_mb,
         )
     return evicted
 
@@ -347,17 +586,18 @@ class SessionRecorder:
     shutdown.
     """
 
-    def __init__(self, storage_root: str) -> None:
+    def __init__(self, storage_root: str, *, clock: Clock | None = None) -> None:
+        self._clock = clock or SYSTEM_CLOCK
         root = Path(storage_root)
         root.mkdir(parents=True, exist_ok=True)
         session_dir = root / "sessions"
         session_dir.mkdir(parents=True, exist_ok=True)
-        self._path = session_dir / f"session_{int(time.time())}.jsonl"
+        self._path = session_dir / f"session_{self._clock.unix_ms() // 1000}.jsonl"
         # Bounded queue so a runaway producer can't exhaust memory; if
         # the writer thread falls behind by more than 4096 records we
         # drop the oldest and log so the data loss is observable.
-        self._queue: queue.Queue[tuple[str, dict[str, Any], float] | None] = (
-            queue.Queue(maxsize=4096)
+        self._queue: queue.Queue[tuple[str, dict[str, Any], float] | None] = queue.Queue(
+            maxsize=4096
         )
         self._stop_event = threading.Event()
         # B19 (Phase 4.1): consecutive-overflow tracker for the
@@ -375,7 +615,7 @@ class SessionRecorder:
         self._writer_thread.start()
 
     def append(self, event_type: str, payload: dict[str, Any]) -> None:
-        record = (event_type, payload, time.time())
+        record = (event_type, payload, unix_seconds(self._clock))
         try:
             self._queue.put_nowait(record)
             # B19 (Phase 4.1): clear the overflow streak counter on every
@@ -488,9 +728,68 @@ class SessionRecorder:
 class CortexDaemon:
     """In-process supervisor for the full Cortex runtime."""
 
-    def __init__(self, config: CortexConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: CortexConfig | None = None,
+        *,
+        clock: Clock | None = None,
+        kernel: ApplicationKernel | None = None,
+    ) -> None:
         self.config = config or get_config()
+        self._clock = clock or SYSTEM_CLOCK
+        storage_root = Path(self.config.storage.path).expanduser()
+        self._database = SQLiteDatabase(
+            storage_root / self.config.storage.sqlite_filename,
+            clock=self._clock,
+            busy_timeout_ms=int(getattr(self.config.storage, "sqlite_busy_timeout_ms", 5_000)),
+            backup_retention_count=int(getattr(self.config.storage, "backup_retention_count", 3)),
+        )
+        self._analytics_writer = BoundedAnalyticsWriter(
+            self._database,
+            capacity=self.config.storage.analytics_queue_capacity,
+        )
+        self._storage_maintenance = StorageMaintenance(
+            self._database,
+            storage_root=storage_root,
+            analytics_writer=self._analytics_writer,
+            clock=self._clock,
+            retention_days={
+                "sessions": self.config.storage.session_retention_days,
+                "policy": self.config.storage.error_retention_days,
+                "interventions": self.config.storage.error_retention_days,
+            },
+            namespace=self.config.redis.key_prefix,
+            legacy_store_path=default_legacy_store_path(),
+        )
+        self._legacy_data_migrator = LegacyDataMigrator(
+            self._database,
+            storage_root=storage_root,
+            clock=self._clock,
+            session_retention_days=self.config.storage.session_retention_days,
+        )
+        self._calibration_store = CalibrationProfileStore(
+            self.config.storage.path,
+            clock=self._clock,
+        )
+        loaded_calibration_profile: CalibrationProfile | None = None
+        self._active_calibration_profile: CalibrationProfile | None = None
+        try:
+            loaded_calibration_profile = self._calibration_store.load_active()
+        except Exception:
+            logger.exception("Active calibration profile failed validation; starting uncalibrated")
+        self._baseline_snapshot = UserBaselines()
+        self._inference_publication_paused = False
         self._shutdown = asyncio.Event()
+        self._kernel = kernel or ApplicationKernel.create(
+            on_task_failure=self._on_supervised_task_failure,
+        )
+        self._services = self._kernel.services
+        self._events = self._kernel.events
+        self._task_supervisor = self._kernel.tasks
+        self._runtime_status = self._kernel.runtime_status
+        self._runtime_data = self._kernel.runtime_data
+        self._runtime_status.bind_daemon(self)
+        self._stop_started = False
         self._tasks: list[asyncio.Task[Any]] = []
         # F03: every dynamically-spawned background task (intervention
         # dispatch, in-flight LLM call, etc.) is tracked here so stop()
@@ -506,6 +805,8 @@ class CortexDaemon:
         # must handle thread-safety, e.g. via Qt signal emission).
         self._state_callback: Callable[[dict[str, Any]], None] | None = None
         self._intervention_callback: Callable[[dict[str, Any]], None] | None = None
+        self._legacy_state_subscription: Subscription | None = None
+        self._legacy_intervention_subscription: Subscription | None = None
         # F17 (audit): per-callback monotonic sequence numbers. The
         # in-process bridge (``DaemonBridge``) reads ``_seq`` from the
         # payload and drops frames whose ``_seq`` is not strictly
@@ -515,9 +816,9 @@ class CortexDaemon:
         self._state_callback_seq: int = 0
         self._intervention_callback_seq: int = 0
 
-        self._recorder = SessionRecorder(self.config.storage.path)
-        self._input_hooks = InputHooks(self.config.telemetry)
-        self._window_tracker = WindowTracker()
+        self._recorder = SessionRecorder(self.config.storage.path, clock=self._clock)
+        self._input_hooks = InputHooks(self.config.telemetry, clock=self._clock)
+        self._window_tracker = WindowTracker(clock=self._clock)
         self._terminal_adapter = TerminalAdapter()
         self._editor_adapter = EditorAdapter(request_context_fn=self._request_context)
         self._browser_adapter = BrowserAdapter(request_context_fn=self._request_context)
@@ -528,86 +829,69 @@ class CortexDaemon:
             active_app_provider=self._current_app_name,
         )
 
-        self._capture_pipeline = CapturePipeline(self.config.capture)
-        self._roi_extractor = RoiExtractor(self.config.landmarks)
-        _rppg_cfg = self.config.signal.rppg
-        # B2: the temporal stabilizer removes the ~1 Hz "Reading your
-        # pulse…" flicker (Schmitt-trigger lock + last-valid hold + BPM
-        # median/slew smoothing). Disabled → estimator keeps its old
-        # stateless per-window behavior.
-        _stabilizer = (
-            PulseStabilizer(
-                enter_windows=_rppg_cfg.lock_enter_windows,
-                grace_seconds=_rppg_cfg.lock_grace_seconds,
-                snr_release_db=_rppg_cfg.snr_release_db,
-                sqi_release=_rppg_cfg.sqi_release,
-                smoothing_seconds=_rppg_cfg.bpm_smoothing_seconds,
-                max_slew_bpm_per_s=_rppg_cfg.bpm_max_slew_bpm_per_s,
-            )
-            if _rppg_cfg.stabilize
-            else None
+        self._capture_pipeline = CapturePipeline(
+            self.config.capture,
+            clock=self._clock,
         )
-        self._pulse_estimator = PulseEstimator(
-            fs=float(self.config.capture.fps),
-            nsqi_threshold=_rppg_cfg.nsqi_threshold,
-            min_cardiac_snr_db=_rppg_cfg.min_cardiac_snr_db,
-            hrv_min_window_seconds=float(_rppg_cfg.hrv_min_window_seconds),
-            hrv_min_valid_ibi=_rppg_cfg.hrv_min_valid_ibi,
-            stabilizer=_stabilizer,
-        )
-        self._blink_detector = BlinkDetector(
-            blink_config=self.config.signal.blink,
-            landmarks_config=self.config.landmarks,
-        )
-        self._blink_detector.baseline_blink_rate = self._load_baselines().blink_rate_baseline
-        self._head_pose = HeadPoseEstimator(
-            frame_width=self.config.capture.width,
-            frame_height=self.config.capture.height,
-        )
-        self._posture = PostureAnalyzer(self.config.signal.posture)
-        self._feature_fusion = FeatureFusion()
-        self._scorer = RuleScorer(config=self.config.state, baselines=self._load_baselines())
-        self._smoother = ScoreSmoother(self.config.state)
-
-        # C.2: optional per-user ML classifier. If a previously-trained
-        # model file exists in storage/baselines/classifier.json AND
-        # ml_enabled is set, load it and blend its HYPER probability into
-        # the smoothed score (see ScoreSmoother.update + state_loop below).
-        self._ml_classifier: PerUserLogisticClassifier | None = None
-        if self.config.state.ml_enabled:
-            classifier_path = (
-                Path(self.config.storage.path).expanduser()
-                / "baselines"
-                / "classifier.json"
-            )
+        camera_features = build_production_camera_feature_components(self.config)
+        if loaded_calibration_profile is not None:
             try:
-                if classifier_path.exists():
-                    self._ml_classifier = PerUserLogisticClassifier.load(classifier_path)
-                    logger.info(
-                        "Loaded per-user ML classifier from %s (fitted=%s)",
-                        classifier_path,
-                        self._ml_classifier.is_fitted,
-                    )
-            except Exception:
-                logger.warning(
-                    "Failed to load ML classifier; falling back to rule-only",
-                    exc_info=True,
+                _validate_runtime_calibration_profile(
+                    loaded_calibration_profile,
+                    expected_algorithms=(
+                        production_calibration_algorithm_identities(
+                            self.config,
+                            components=camera_features,
+                        )
+                    ),
                 )
-                self._ml_classifier = None
-        self._ml_labeled_episodes: int = 0  # incremented by feedback ingest
+            except Exception:
+                logger.exception(
+                    "Active calibration profile is incompatible; starting uncalibrated"
+                )
+            else:
+                self._active_calibration_profile = loaded_calibration_profile
+                self._baseline_snapshot = loaded_calibration_profile.to_user_baselines()
+        self._roi_extractor = camera_features.roi_extractor
+        self._pulse_estimator = _build_legacy_pulse_estimator(self.config)
+        self._physiology_v2 = camera_features.physiology
+        self._blink_detector = camera_features.blink
+        self._blink_detector.baseline_blink_rate = self._baseline_snapshot.blink_rate_baseline
+        self._head_pose = camera_features.head_pose
+        self._posture = camera_features.head_neck_proxy
+        self._feature_fusion = FeatureFusion(clock=self._clock)
+        self._scorer = RuleScorer(
+            config=self.config.state,
+            baselines=self._baseline_snapshot,
+        )
+        self._support_model_registry = SupportModelRegistry()
+        if self.config.state.inference_mode == "safety_null":
+            self._support_model_registry.rollback_to_safe_null()
+        self._support_inference = SupportInferenceEngine(
+            self._scorer,
+            self._support_model_registry,
+        )
+        self._smoother = ScoreSmoother(self.config.state, clock=self._clock)
+
+        # The former per-user logistic branch used intervention feedback as a
+        # pseudo-label for cognitive state and had no participant-held-out
+        # validation lifecycle. It remains a research utility module only;
+        # production always runs the registered deterministic support rules.
         self._trigger_policy = TriggerPolicy(
             self.config.intervention,
             state_config=self.config.state,
+            clock=self._clock,
         )
-        self._llm_client = create_llm_client(self.config.llm)
-        self._executor = InterventionExecutor()
+        self._llm_client = create_llm_client(self.config.llm, clock=self._clock)
+        self._executor = InterventionExecutor(
+            execution_mode=self.intervention_execution_mode,
+        )
         self._project_launcher = ProjectLauncher(storage_path=self.config.storage.path)
         self._restore_manager = RestoreManager(
             self._executor,
             timeout_seconds=float(self.config.intervention.timeout_minutes * 60),
+            clock=self._clock,
         )
-        for adapter_name in ("browser", "editor", "overlay", "terminal"):
-            self._executor.register_adapter(adapter_name, _PassiveWorkspaceAdapter())
 
         # Phase-4b TASK M: bind the per-action consent gate + the two
         # special-action hooks on the executor. The hooks run inside
@@ -618,21 +902,20 @@ class CortexDaemon:
         self._executor.set_editor_focus_hook(self._resume_last_active_file)
         self._executor.set_prompt_broadcast_hook(self._broadcast_prompt)
 
-        self._ws_server = WebSocketServer(self.config.api)
-        self._ws_server.set_user_action_callback(self._handle_user_action)
-        self._ws_server.set_settings_callback(self.apply_settings)
-        self._ws_server.set_shutdown_callback(self._request_shutdown)
-        self._ws_server.set_leetcode_context_callback(self._handle_leetcode_context_update)
-        self._ws_server.set_intervention_applied_callback(self._handle_intervention_applied)
+        self._ws_server = WebSocketServer(
+            self.config.api,
+            clock=self._clock,
+            services=self._services,
+            events=self._events,
+            runtime_status=self._runtime_status,
+        )
         # P0 §3.6: route MICRO_STEP_TOGGLED frames into ``toggle_micro_step``
         # so peer surfaces (popup, VS Code panel, WS-mode overlay) can
         # toggle steps without the in-process Qt overlay path.
-        self._ws_server.set_micro_step_toggled_callback(self.toggle_micro_step)
         # G1 (audit-prod): caller registers via set_client_identified_callback
         # to bridge connection events to the desktop shell. Default is a
         # noop list so the daemon can still run headless.
         self._client_identified_listeners: list[Callable[[str, bool], None]] = []
-        self._ws_server.set_client_identified_callback(self._on_client_identified)
 
         self._leetcode_adapter = LeetCodeAdapter()
         self._leetcode_adapter.set_ws_sender(self._send_leetcode_ws_message)
@@ -646,26 +929,21 @@ class CortexDaemon:
         self._last_leetcode_hrv_rmssd: float | None = None
         self._leetcode_action_signatures: dict[str, float] = {}
 
-        _rgb_maxlen = max(
-            1, self.config.signal.rppg.window_seconds * self.config.capture.fps
+        self._rgb_observations: ObservationBuffer[NumericObservation] = (
+            _build_rgb_observation_buffer(self.config)
         )
-        self._rgb_history: deque[np.ndarray] = deque(maxlen=_rgb_maxlen)
-        # B1 (sampling-rate correctness): real frame timestamps kept in
-        # lock-step with ``_rgb_history`` so the rPPG window's *effective*
-        # fps is derived from wall-clock spacing, not the configured 30. A
-        # MacBook/Continuity camera commonly delivers ~24-28 fps; feeding a
-        # wrong fs into the Welch PSD scales BPM by the same factor and
-        # drifts the spectral peak across the SQI gate.
-        self._rgb_ts_history: deque[float] = deque(maxlen=_rgb_maxlen)
+        self._legacy_capture_sequence = 0
+        self._legacy_capture_source_instance_id = self._clock.boot_id
+        self._legacy_capture_mono_origin_ns = self._clock.monotonic_ns()
+        self._active_camera_identity_key: str | None = None
+        self._active_camera_geometry: tuple[int, int] | None = None
+        self._active_camera_source_instance_id: str | None = None
+        self._latest_respiration_evidence: SignalEstimate | None = None
+        # A profile is camera-bound. Readiness remains false until the first
+        # live, post-open identity confirms that binding.
+        self._camera_calibration_valid = False
         # P0-2: count of low-quality frames rejected from the rPPG window.
         self._frames_low_quality_rejected: int = 0
-        # C5 (audit): cache the previous frame's blink-suppression score so
-        # the apnea path in ``PulseEstimator.process_window`` can see it
-        # with a 1-frame lag (kinematics for the current frame are computed
-        # AFTER the rPPG window is processed, so the freshest value
-        # available at window-build time is the prior frame's). 0.0 until
-        # the first kinematics update lands.
-        self._last_blink_suppression_score: float = 0.0
         # C6 (audit): edge-trigger latch for FACE_LOST / FACE_REACQUIRED
         # structured events. Starts True so the first lost-face frame emits
         # FACE_LOST exactly once (we assume the user is present at startup).
@@ -693,9 +971,10 @@ class CortexDaemon:
             confidence=0.0,
         )
         self._last_physio_update = 0.0
+        self._last_physio_update_mono_ns = 0
         # B22 (Phase 4.1): monotonic timestamp of the most recent
         # kinematics feature delivery. State loop marks the kinematics
-        # channel stale when ``time.monotonic() - _last_kinematics_ts > 2.0``.
+        # channel stale when monotonic age exceeds 2 seconds.
         self._last_kinematics_ts: float = 0.0
         self._active_intervention_id: str | None = None
         # P0 §3.6: cache the most recently broadcast InterventionPlan
@@ -740,9 +1019,7 @@ class CortexDaemon:
         # ``_handle_intervention_applied`` callback resolves it; the 30 s
         # timeout watcher resolves it to ``confirmed=False`` if no ack
         # arrives.
-        self._pending_apply_results: dict[
-            str, asyncio.Future[Any]
-        ] = {}
+        self._pending_apply_results: dict[str, asyncio.Future[Any]] = {}
         # F05: ``_background_tasks`` (declared above at __init__ top) tracks
         # timeout watchers etc. Mirrors the F03 pattern from the audit
         # Ledger: any new task spawn must use ``_spawn_background_task`` so
@@ -757,6 +1034,7 @@ class CortexDaemon:
                 if self._browser_adapter.last_context is not None
                 else 0
             ),
+            clock=self._clock,
         )
         self._capture_available = False
         self._capture_processing_enabled = True
@@ -786,8 +1064,12 @@ class CortexDaemon:
         # inside the recorder).
 
         # --- v2.0 services ---
-        # Store (Redis with in-memory fallback)
-        self._store: RedisStore | InMemoryStore
+        # WP7: one embedded SQLite database is authoritative for durable
+        # consent, small state, policy records, and intervention authority.
+        # Redis/InMemory remain import-compatible adapters for external test
+        # composition, but the shipped runtime never splits authority across
+        # them.
+        self._store: RedisStore | InMemoryStore | SQLiteKeyValueStore
         # B4 (Phase 4.1): flips True the moment the daemon falls back
         # to ``InMemoryStore`` from Redis. Surfaced on every subsequent
         # STATE_UPDATE under ``store.degraded`` so the dashboard's
@@ -799,33 +1081,26 @@ class CortexDaemon:
         # react to the degradation.
         self._store_degraded: bool = False
         if self.config.redis.enabled:
+            # Compatibility diagnostic for operators who still carry the
+            # pre-WP7 Redis setting. SQLite remains authoritative; constructing
+            # the lazy adapter performs no network I/O, but preserves the
+            # established degraded signal exposed by custom/test adapters.
             try:
-                self._store = RedisStore(
+                requested_redis = RedisStore(
                     host=self.config.redis.host,
                     port=self.config.redis.port,
                     db=self.config.redis.db,
                     key_prefix=self.config.redis.key_prefix,
                 )
+                self._store_degraded = bool(getattr(requested_redis, "degraded", False))
             except Exception:
-                logger.warning(
-                    "Redis unavailable, falling back to in-memory store",
-                    exc_info=True,
-                )
-                # P0 durability fix: use make_default_store so the
-                # fallback InMemoryStore writes JSON to ~/Library/...
-                # — without this, ConsentLadder._persist + earned
-                # escalation state are lost on every daemon restart in
-                # the DMG-default no-Redis deployment.
-                self._store = make_default_store(self.config)
-                # B4: mark store as degraded so the next broadcast cycle
-                # stamps the indicator on STATE_UPDATE and the one-time
-                # announcement task fires from ``start()``.
                 self._store_degraded = True
-        else:
-            # DMG default: no Redis. The persisted file-backed
-            # InMemoryStore preserves consent / helpfulness across
-            # restarts.
-            self._store = make_default_store(self.config)
+        self._consent_overrides_path = storage_root / "consent_overrides.json"
+        self._store = make_default_store(
+            self.config,
+            database=self._database,
+            consent_overrides_path=self._consent_overrides_path,
+        )
 
         # C7 (audit): mirror the store's own ``degraded`` flag onto the
         # daemon flag after construction. ``RedisStore`` exposes a public
@@ -835,27 +1110,18 @@ class CortexDaemon:
         # DMG-default backend), so ``getattr(..., False)`` keeps the flag
         # False there. We OR with the existing value so the explicit
         # except-branch above (construction failure) is never un-set.
-        self._store_degraded = self._store_degraded or bool(
-            getattr(self._store, "degraded", False)
+        self._store_degraded = self._store_degraded or bool(getattr(self._store, "degraded", False))
+        self._runtime_status.publish_storage(
+            degraded=self._store_degraded,
+            backend="sqlite",
+            healthy=not self._store_degraded,
         )
 
-        # Stress integral tracker (biological pomodoros). The standardized
-        # deficit math requires the user-specific HRV sigma so the integral
-        # is in z-score units, not raw ms·s. Without sigma the AMIP safety
-        # floor (keyed off stress_ratio ≥ 1.0) effectively never tripped.
-        _baselines_for_stress = self._load_baselines()
-        _hrv_sigma = 1.0
-        try:
-            _hrv_sigma = float(
-                _baselines_for_stress.metric_distributions.get(
-                    "hrv_rmssd", {}
-                ).get("std", 1.0)
-            )
-        except Exception:
-            _hrv_sigma = 1.0
-        self._stress_tracker = StressIntegralTracker(
-            hrv_baseline=_baselines_for_stress.hrv_baseline,
-            hrv_sigma=max(1.0, _hrv_sigma),
+        self._focus_break_policy = FocusBreakPolicy(
+            enabled=self.config.intervention.enable_focus_break_reminders,
+            interval_minutes=self.config.intervention.focus_break_interval_minutes,
+            suggested_duration_seconds=(self.config.intervention.focus_break_duration_seconds),
+            clock=self._clock,
         )
 
         # Cache the most recent state estimate + biometric payload for the
@@ -871,32 +1137,54 @@ class CortexDaemon:
         self._broadcast_interval_seconds: float = 0.5
 
         # Longitudinal tracker (baseline drift)
-        self._longitudinal = LongitudinalTracker(store=self._store)
+        self._longitudinal = LongitudinalTracker(
+            store=self._store,
+            clock=self._clock,
+        )
 
         # Zombie reading detector
-        self._zombie_detector = ZombieReadingDetector()
+        self._zombie_detector = ZombieReadingDetector(
+            blink_baseline=self._baseline_snapshot.blink_rate_baseline
+        )
 
         # Rabbit hole detector
         self._rabbit_hole = RabbitHoleDetector()
 
         # Shutdown detector (morning handover)
-        self._shutdown_detector = ShutdownDetector()
+        self._shutdown_detector = ShutdownDetector(
+            hrv_baseline=self._baseline_snapshot.hrv_baseline,
+            config=self.config.handover,
+        )
 
         # Consent ladder
         self._consent_policy = ConsentPolicy()
-        self._consent_ladder = ConsentLadder(store=self._store, policy=self._consent_policy)
+        self._consent_ladder = ConsentLadder(
+            store=self._store,
+            policy=self._consent_policy,
+            clock=self._clock,
+        )
         # Phase-3 P0 + Audit-1.1 P0-1: consent policy overrides must
         # survive a daemon restart. Without persistence, the user's
         # opt-in to ``distraction_block`` at AUTONOMOUS_ACT silently
         # reverts to REVERSIBLE_ACT on reboot — the toggle in Settings
         # stays "on" but the HYPER auto-arm gate never opens.
-        self._consent_overrides_path: Path = (
-            Path(self.config.storage.path).expanduser() / "consent_overrides.json"
+        self._transaction_coordinator = InterventionTransactionCoordinator(
+            self._consent_ladder,
+            store=SQLiteInterventionTransactionStore(
+                self._database,
+                legacy_json_path=storage_root / "intervention_transactions.json",
+                clock=self._clock,
+            ),
+            clock=self._clock,
+            execution_mode=self.intervention_execution_mode,
         )
-        self._load_consent_overrides()
+        self._executor.set_authorization_verifier(self._transaction_coordinator.validate_consumed)
+        self._restore_manager.set_restore_callback(self._restore_transaction_and_wait)
+        self._pending_restore_results: dict[str, asyncio.Future[bool]] = {}
+        self._pending_startup_restores: dict[str, InterventionRestoreCommand] = {}
 
         # Helpfulness tracker
-        self._helpfulness = HelpfulnessTracker(store=self._store)
+        self._helpfulness = HelpfulnessTracker(store=self._store, clock=self._clock)
 
         # P0 §3.9: per-signal causal attributor — fed by ``_state_loop``
         # at the same cadence the state estimate runs and queried when
@@ -907,29 +1195,19 @@ class CortexDaemon:
         # resolve without re-running attribution against stale features.
         self._causal_signals_by_intervention: dict[str, list[dict[str, Any]]] = {}
 
-        # P0 §3.7: latched so each ``should_break`` False→True
-        # transition broadcasts exactly one BREAK_RECOMMENDATION pulse.
-        # Reset to False on every ``StressIntegralTracker.reset``.
-        self._break_recommendation_sent: bool = False
-        # B21 (Phase 4.1): timestamp of the most recent HRV reading
-        # used by the recommendation-latch re-arm gate. When HRV has
-        # been None for > 30 s the latch can re-arm even without a
-        # fresh HRV sample so the user is not permanently silenced if
-        # the camera ROI degrades after a recommendation fires.
-        self._last_hrv_seen_at: float = 0.0
         # Flipped by ``_set_break_suppression`` for the duration of a
         # break overlay so the state loop skips trigger evaluation.
         self._break_active: bool = False
-        # The biology break controller is instantiated after
+        # The guided-break controller is instantiated after
         # ``_session_report`` is created (a few lines below); keep a
         # forward-declared attribute so type checkers don't trip.
-        self._break_controller: BiologyBreakController | None = None
-        # P0 §3.7 audit fix (mic_active audio gate, spec line 643):
+        self._break_controller: GuidedBreakController | None = None
+        # Audio gate: ``last_mic_active_at`` is the monotonic timestamp of the
         # ``last_mic_active_at`` is the monotonic timestamp of the
         # most-recent positive ``receptivity.is_microphone_in_use``
         # reading. The break controller flips ``audio_cue=False`` for
         # any break whose start falls within
-        # ``InterventionConfig.biology_break_audio_mute_after_mic_seconds``
+        # ``InterventionConfig.guided_break_audio_mute_after_mic_seconds``
         # of this timestamp so users on a call don't get blindsided
         # by a chime.
         self._last_mic_active_at: float = 0.0
@@ -941,24 +1219,42 @@ class CortexDaemon:
 
         # Tab relevance learning
         self._tab_relevance = TabRelevanceTracker(store=self._store)
-        self._per_tab_feedback_ids: deque[str] = deque(maxlen=50)  # intervention IDs with per-tab feedback
+        self._per_tab_feedback_ids: deque[str] = deque(
+            maxlen=50
+        )  # intervention IDs with per-tab feedback
 
-        # Contextual bandit
-        self._bandit = ContextualBandit(store=self._store)
-        self._amip = AMIPPolicy(
-            storage_root=self.config.storage.path,
-            n_features=8,
-            tau0=self.config.eval.amip.tau0,
-            tau_min=self.config.eval.amip.tau_min,
-            epsilon_explore=self.config.eval.amip.epsilon_explore,
-            epsilon_explore_after_500=self.config.eval.amip.epsilon_explore_after_500,
-            stress_ratio_threshold=self.config.eval.amip.safety_floor_stress_ratio,
+        # WP8: production is a deterministic, non-learning policy. The only
+        # randomized path requires an explicit fixed research epoch and
+        # separate consent configuration; deterministic records never expose
+        # propensities suitable for causal/off-policy analysis.
+        self._policy_repository = PolicyRepository(self._database, clock=self._clock)
+        research_settings: ResearchPolicySettings | None = None
+        if self.config.eval.policy == "research_randomized":
+            research = self.config.eval.research
+            specification = research.mrt_specification(
+                policy_name=RESEARCH_POLICY_NAME,
+                policy_version=RESEARCH_POLICY_VERSION,
+                reward_version=self.config.eval.outcome.reward_version,
+                proximal_window_seconds=self.config.eval.outcome.reward_window_seconds,
+            )
+            research_settings = ResearchPolicySettings(
+                study_id=research.study_id,
+                study_epoch=research.study_epoch,
+                consent_version=research.consent_version,
+                seed_hex=research.seed_hex,
+                specification_sha256=policy_payload_sha256(specification.model_dump(mode="json")),
+                action_catalog=research.action_catalog,
+                minimum_probability=research.minimum_probability,
+                online_learning=research.online_learning,
+            )
+        self._policy_lifecycle = PolicyLifecycleService(
+            self._policy_repository,
+            clock=self._clock,
+            mode=self.config.eval.policy,
+            reward_window_seconds=self.config.eval.outcome.reward_window_seconds,
+            research_settings=research_settings,
         )
-        self._last_policy_decision_id: str | None = None
-        self._last_policy_arm: str | None = None
-        self._last_policy_propensity: dict[str, float] | None = None
-        self._amip_decision_ids_by_intervention: dict[str, str] = {}
-        self._bandit_decisions_by_intervention: dict[str, tuple[list[float], int]] = {}
+        self._next_policy_decision_mono_ns = 0
         # P1: canonical consent action-types for each applied intervention,
         # captured at apply time keyed by intervention_id. On engage/dismiss
         # the daemon records the approval/rejection under THESE keys (the
@@ -975,17 +1271,13 @@ class CortexDaemon:
         # quantities (recovery confidence is a FLOW-recovery score, not the
         # trigger confidence) and so the dismissal model learned from
         # mislabelled features. ``(confidence, context_complexity)``.
-        self._dismissal_features_by_intervention: dict[
-            str, tuple[float, float]
-        ] = {}
+        self._dismissal_features_by_intervention: dict[str, tuple[float, float]] = {}
 
         # Copilot throttle
         self._copilot_throttle = CopilotThrottle(ws_server=self._ws_server)
 
         # Activity tracker aggregator
         self._activity_aggregator = ActivityAggregator(store=self._store)
-        self._ws_server.set_activity_sync_callback(self._handle_activity_sync)
-        self._ws_server.set_tab_relevance_feedback_callback(self._handle_tab_relevance_feedback)
 
         # Track previous state for copilot throttle transitions
         self._prev_state: str = "FLOW"
@@ -1023,41 +1315,28 @@ class CortexDaemon:
         self._recap_dismissed_event: asyncio.Event = asyncio.Event()
 
         # P0 §3.1: serve REQUEST_SESSION_LIST / REQUEST_SESSION_DETAIL
-        self._ws_server.set_session_list_callback(self.list_sessions)
-        self._ws_server.set_session_detail_callback(self.get_session)
         # P0 §3.2: serve REQUEST_TRENDS
-        self._ws_server.set_trends_callback(self.get_trends)
         # P0 §3.3: serve REQUEST_SESSION_RECAP from the cached payload
-        self._ws_server.set_session_recap_cache_callback(
-            self.latest_session_recap,
-        )
         # P0 §3.3 (Wave-2 P1): consume SESSION_RECAP_ACKNOWLEDGED
         # frames; flips ``_recap_dismissed_event`` to release ``stop()``.
-        self._ws_server.set_session_recap_acknowledged_callback(
-            self.acknowledge_session_recap,
-        )
 
-        # P0 §3.7: biology-driven break controller. Built after
-        # ``_session_report`` and ``_stress_tracker`` so we can pass
-        # them directly. The desktop shell binds its full-screen
+        # Compatibility break-overlay controller. The policy feeding it is
+        # the opt-in elapsed-focus reminder above; no HRV tracker is bound.
+        # The desktop shell binds its full-screen
         # overlay handler via :meth:`set_break_overlay_ui_handler`.
-        self._break_controller = BiologyBreakController(
-            hrv_sampler=self._sample_hrv_for_break,
+        self._break_controller = GuidedBreakController(
             session_report=self._session_report,
             suppress_interventions=self._set_break_suppression,
-            stress_tracker=self._stress_tracker,
         )
 
         # P0 §3.9: serve WHY_DETAIL_REQUEST from the per-intervention
         # causal-signal cache. Returns a list[dict] or None.
-        self._ws_server.set_why_detail_callback(self.get_causal_signals)
 
         # P0 §3.11: serve QUIET_MODE_TOGGLE / SNOOZE_REQUEST. Routed
         # through :meth:`set_quiet_mode` which centralises the
         # quiet/pause primitives and broadcasts QUIET_MODE_STATE so
         # every surface (dashboard, overlay, tray, browser popup, VS
         # Code) reflects the same truth.
-        self._ws_server.set_quiet_mode_toggle_callback(self.set_quiet_mode)
 
         # P0 §3.10: auto-armed focus session bookkeeping. ``_auto_focus_armed``
         # is True only when the daemon (not the user) opened the focus
@@ -1091,6 +1370,7 @@ class CortexDaemon:
         # ``pause`` lasts until the user resumes).
         self._quiet_mode_kind: str = "off"
         self._quiet_mode_ends_at: float | None = None
+        self._quiet_mode_deadline: BoundedDeadline | None = None
         self._quiet_mode_source: str = "daemon"
         # Phase-3 P0: serialise concurrent ``set_quiet_mode`` calls
         # (dashboard menu, tray, overlay footer, WS dispatch, F26
@@ -1128,6 +1408,201 @@ class CortexDaemon:
         # dashboard.
         self._desktop_focused_probe: Callable[[], bool] | None = None
 
+        self._coordinators = self._compose_runtime_coordinators()
+        self._bind_gateway_handlers()
+
+    def _on_supervised_task_failure(self, failure: TaskFailure) -> None:
+        """Fail the application closed when a critical owner exits."""
+
+        if failure.critical:
+            logger.error(
+                "Critical application task failed; requesting shutdown: %s/%s",
+                failure.group,
+                failure.name,
+            )
+            self._shutdown.set()
+
+    def _bind_gateway_handlers(self) -> None:
+        """Compose the transport command boundary exactly once."""
+
+        self._intervention_coordinator.bind(self._ws_server)
+
+    def _gateway_command_handlers(self) -> WebSocketCommandHandlers:
+        """Return the immutable command port implemented by this runtime."""
+
+        return WebSocketCommandHandlers(
+            user_action=self._handle_user_action,
+            settings=self.apply_settings,
+            calibration_reload=self.activate_calibration_profile,
+            shutdown=self._request_shutdown,
+            activity_sync=self._handle_activity_sync,
+            tab_relevance_feedback=self._handle_tab_relevance_feedback,
+            leetcode_context=self._handle_leetcode_context_update,
+            intervention_applied=self._handle_intervention_applied,
+            intervention_authorize=self._authorize_intervention,
+            intervention_receipt=self._record_intervention_receipts,
+            intervention_dispatch_failure=self._record_intervention_dispatch_failure,
+            intervention_partial_dispatch=self._compensate_partial_intervention_dispatch,
+            intervention_dispatch_binding=(
+                self._transaction_coordinator.bind_dispatch_targets
+            ),
+            client_identified=self._on_client_identified,
+            session_list=self.list_sessions,
+            session_detail=self.get_session,
+            trends=self.get_trends,
+            micro_step_toggled=self.toggle_micro_step,
+            why_detail=self.get_causal_signals,
+            session_recap_cache=self.latest_session_recap,
+            session_recap_acknowledged=self.acknowledge_session_recap,
+            quiet_mode_toggle=self.set_quiet_mode,
+        )
+
+    def _compose_runtime_coordinators(self) -> RuntimeCoordinatorSet:
+        """Declare every long-lived application loop and its owner."""
+
+        self._intervention_coordinator = InterventionCoordinator(
+            self._task_supervisor,
+            handlers=self._gateway_command_handlers(),
+        )
+        return RuntimeCoordinatorSet(
+            SensingCoordinator(
+                self._task_supervisor,
+                operations=SensingOperations(
+                    capture_enabled=lambda: (
+                        self._capture_available
+                        and self._capture_processing_enabled
+                    ),
+                    next_capture=self._next_capture_output,
+                    process_capture=self._process_capture_output,
+                    telemetry_enabled=lambda: self._telemetry_enabled,
+                    sample_telemetry=self._sample_telemetry,
+                    refresh_context=self._refresh_context,
+                ),
+            ),
+            InferenceCoordinator(
+                self._task_supervisor,
+                operations=InferenceOperations(
+                    state_loop=self._state_loop,
+                    current_publication=lambda: self._latest_broadcast_snapshot,
+                    publish_state=self._ws_server.broadcast_state,
+                    broadcast_interval_seconds=self._broadcast_interval_seconds,
+                ),
+            ),
+            # Intervention commands are event-driven through the immutable
+            # WebSocket handler bundle; this coordinator deliberately owns no
+            # polling loop.
+            self._intervention_coordinator,
+            ExperimentCoordinator(
+                self._task_supervisor,
+                operations=ExperimentOperations(
+                    finalize_outcomes=self._finalize_policy_outcomes,
+                    outcome_interval_seconds=(
+                        self.config.eval.outcome.collector_interval_seconds
+                    ),
+                    generate_diagnostics_if_due=(
+                        self._generate_policy_diagnostics_if_due
+                        if self.config.eval.policy_diagnostics.enabled
+                        else None
+                    ),
+                ),
+            ),
+            OperationsCoordinator(
+                self._task_supervisor,
+                (
+                    LoopSpec(
+                        "cortex-longitudinal-loop",
+                        self._longitudinal_loop,
+                        critical=False,
+                    ),
+                    LoopSpec(
+                        "cortex-retention-loop",
+                        self._retention_sweep_loop,
+                        critical=False,
+                    ),
+                    LoopSpec(
+                        "cortex-session-checkpoint-loop",
+                        self._session_checkpoint_loop,
+                        critical=False,
+                    ),
+                    LoopSpec(
+                        "cortex-chronotype-backfill",
+                        lambda: asyncio.to_thread(
+                            self._session_aggregator.backfill_if_needed
+                        ),
+                        critical=False,
+                    ),
+                ),
+            ),
+        )
+
+    @property
+    def task_tree(self) -> dict[str, Any]:
+        """Return an operator-safe snapshot of application task ownership."""
+
+        return self._task_supervisor.snapshot()
+
+    @property
+    def services(self) -> Any:
+        """Expose the instance composition container for diagnostic adapters."""
+
+        return self._services
+
+    def _current_state_estimate(self) -> Any | None:
+        value = self._runtime_data.snapshot().state_estimate
+        return value if value is not None else self._services.get("latest_state_estimate")
+
+    def _current_telemetry(self) -> Any | None:
+        value = self._runtime_data.snapshot().telemetry
+        return value if value is not None else self._services.get("latest_telemetry")
+
+    def _current_feature_vector(self) -> Any | None:
+        value = self._runtime_data.snapshot().feature_vector
+        return value if value is not None else self._services.get("latest_feature_vector")
+
+    def _workspace_snapshot(self, intervention_id: str) -> Any | None:
+        present, value = self._runtime_data.workspace_snapshot(intervention_id)
+        if present:
+            return value
+        return self._services.get(f"workspace_snapshot:{intervention_id}")
+
+    def subscribe_state(
+        self,
+        listener: Callable[[dict[str, Any]], None],
+    ) -> Subscription:
+        return self._events.state.subscribe(listener)
+
+    def subscribe_intervention(
+        self,
+        listener: Callable[[dict[str, Any]], None],
+    ) -> Subscription:
+        return self._events.intervention.subscribe(listener)
+
+    @property
+    def intervention_execution_mode(
+        self,
+    ) -> Literal["suggest_only", "authorized", "research_autonomous"]:
+        """Return the configured workspace-authority mode, fail closed.
+
+        Configuration is Pydantic-validated in normal operation, but this
+        boundary also protects tests, legacy deserializers, and partially
+        constructed configs from increasing authority with an unknown value.
+        """
+        config = getattr(self, "config", None)
+        intervention = getattr(config, "intervention", None)
+        raw = str(getattr(intervention, "execution_mode", "suggest_only"))
+        if raw not in _EXECUTION_MODES:
+            logger.error(
+                "Unknown intervention execution_mode=%r; using suggest_only",
+                raw,
+            )
+            return "suggest_only"
+        return raw  # type: ignore[return-value]
+
+    @property
+    def workspace_mutation_allowed(self) -> bool:
+        """Whether this runtime may enter a workspace-apply path at all."""
+        return self.intervention_execution_mode != "suggest_only"
+
     def set_state_callback(self, fn: Callable[[dict[str, Any]], None]) -> None:
         """Register a callback invoked on every state update.
 
@@ -1136,7 +1611,10 @@ class CortexDaemon:
         the recipient is responsible for thread-safe dispatching (e.g.
         emit a Qt signal).
         """
+        if self._legacy_state_subscription is not None:
+            self._legacy_state_subscription.cancel()
         self._state_callback = fn
+        self._legacy_state_subscription = self.subscribe_state(fn)
 
     def set_intervention_callback(self, fn: Callable[[dict[str, Any]], None]) -> None:
         """Register a callback invoked when an intervention is sent.
@@ -1144,7 +1622,10 @@ class CortexDaemon:
         The callback receives a deep-copied dict of the intervention plan
         payload.  Same threading caveat as :meth:`set_state_callback`.
         """
+        if self._legacy_intervention_subscription is not None:
+            self._legacy_intervention_subscription.cancel()
         self._intervention_callback = fn
+        self._legacy_intervention_subscription = self.subscribe_intervention(fn)
 
     # ------------------------------------------------------------------
     # F05: background task helper + apply-confirmation primitives
@@ -1169,10 +1650,27 @@ class CortexDaemon:
         instead of disappearing into asyncio's "Task exception was
         never retrieved" garbage-collection warning at process exit.
         """
-        task = asyncio.create_task(coro, name=name)
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
-        task.add_done_callback(_supervise_background_task)
+        supervisor = getattr(self, "_task_supervisor", None)
+        if supervisor is None:
+            # Compatibility for narrow mixin-style adapters that bind this
+            # method without constructing the full kernel. The task is still
+            # supervised; production always supplies the kernel-owned one.
+            from cortex.application.task_supervisor import TaskSupervisor
+
+            supervisor = TaskSupervisor()
+            self._task_supervisor = supervisor
+        background_tasks = getattr(self, "_background_tasks", None)
+        if background_tasks is None:
+            background_tasks = set()
+            self._background_tasks = background_tasks
+        task = supervisor.spawn(
+            coro,
+            name=name or "cortex-background-task",
+            group=TaskGroupName.BACKGROUND,
+            critical=False,
+        )
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
         return task
 
     @staticmethod
@@ -1221,12 +1719,19 @@ class CortexDaemon:
                 StateScores as _StateScores,
             )
 
+            event_time = EventTime.from_clock(self._clock)
             estimate = _StateEstimate(
-                state="FLOW",
+                state="UNKNOWN",
+                support_state="unknown",
+                status="insufficient_evidence",
                 confidence=0.0,
                 scores=_StateScores(flow=0.0, hypo=0.0, hyper=0.0, recovery=0.0),
+                evidence_coverage=0.0,
                 signal_quality=_SQ(physio=0.0, kinematics=0.0, telemetry=0.0),
-                timestamp=time.monotonic(),
+                timestamp=event_time.observed_at_mono_ns / 1_000_000_000.0,
+                observed_at_unix_ms=event_time.observed_at_unix_ms,
+                observed_at_mono_ns=event_time.observed_at_mono_ns,
+                boot_id=event_time.boot_id,
                 dwell_seconds=0.0,
                 reasons=["capture_unavailable"],
             )
@@ -1236,7 +1741,8 @@ class CortexDaemon:
             # surface ``capture.frames_flowing`` and ``face_detected``;
             # adding the ``stale`` field there keeps the wire path
             # unchanged.
-            registry.register("capture_stale", True)
+            self._services.register("capture_stale", True)
+            self._runtime_status.mark_capture_stale()
             await self._ws_server.broadcast_state(estimate, None)
         except Exception:
             logger.warning(
@@ -1348,6 +1854,29 @@ class CortexDaemon:
             )
         except Exception:
             logger.debug("configure_logging failed; continuing", exc_info=True)
+        # Open and fully verify durable authority before capture, transports,
+        # or proposal producers start. A corrupt/future/read-only database is
+        # a startup failure: continuing would be unable to prove whether a
+        # prior workspace effect still needs restoration.
+        await self._database.start()
+        await self._legacy_data_migrator.migrate_all()
+        await self._policy_lifecycle.start()
+        await asyncio.to_thread(
+            migrate_legacy_causal_report_names,
+            self.config.storage.path,
+        )
+        sqlite_calibration = await self._legacy_data_migrator.load_active_calibration()
+        if sqlite_calibration is not None and (
+            self._active_calibration_profile is None
+            or self._active_calibration_profile.profile_id != sqlite_calibration.profile_id
+            or calibration_profile_sha256(self._active_calibration_profile)
+            != calibration_profile_sha256(sqlite_calibration)
+        ):
+            # Reconcile the composition graph to SQLite, which is now the
+            # authority. The file pointer remains a compatibility projection
+            # for synchronous desktop readers.
+            self.apply_calibration_profile(sqlite_calibration)
+        await self._analytics_writer.start()
         # F07: ensure the local capability token exists before any service
         # that gates on it (WebSocket SHUTDOWN, launcher /stop) comes up.
         # Generated lazily, persists across restarts.
@@ -1361,6 +1890,7 @@ class CortexDaemon:
         # came up cleanly.
         try:
             from cortex.libs.auth import load_or_create_token
+
             load_or_create_token()
         except (OSError, ImportError, RuntimeError) as exc:
             logger.warning(
@@ -1395,6 +1925,16 @@ class CortexDaemon:
             raise RuntimeError(
                 f"WebSocket server failed to bind {self.config.api.host}:{self.config.api.ws_port}"
             )
+        # Recover crash-interrupted transactions before accepting new
+        # intervention work. With no extension connected yet, exact restore
+        # commands remain queued and are retried when their executor identifies.
+        startup_restores = await self._transaction_coordinator.recover_unfinished()
+        for restore_command in startup_restores:
+            # Retain until the coordinator observes every inverse receipt.
+            # A partial restore send is expected when only one owning surface
+            # has reconnected during startup.
+            self._pending_startup_restores[restore_command.restore_id] = restore_command
+            await self._ws_server.send_restore_command(restore_command)
         self._start_api_server()
 
         # B1 (Phase 4.1): if the capture pipeline never came up, broadcast
@@ -1411,49 +1951,19 @@ class CortexDaemon:
         # rather than adding a new MessageType.
         if self._store_degraded:
             try:
-                registry.register("store_degraded", True)
+                self._services.register("store_degraded", True)
+                self._runtime_status.publish_storage(
+                    degraded=True,
+                    backend="sqlite",
+                    healthy=False,
+                )
             except Exception:
                 logger.debug("registry.register(store_degraded) failed", exc_info=True)
 
-        self._tasks = [
-            asyncio.create_task(self._capture_loop(), name="cortex-capture-loop"),
-            asyncio.create_task(self._telemetry_loop(), name="cortex-telemetry-loop"),
-            asyncio.create_task(self._state_loop(), name="cortex-state-loop"),
-            asyncio.create_task(self._broadcast_loop(), name="cortex-broadcast-loop"),
-            asyncio.create_task(self._context_loop(), name="cortex-context-loop"),
-            asyncio.create_task(self._longitudinal_loop(), name="cortex-longitudinal-loop"),
-        ]
-        if self.config.eval.causal_report.enabled:
-            self._tasks.append(
-                asyncio.create_task(self._causal_report_loop(), name="cortex-causal-report-loop")
-            )
-        # G.2: daily retention sweep so storage doesn't grow forever.
-        self._tasks.append(
-            asyncio.create_task(self._retention_sweep_loop(), name="cortex-retention-loop")
-        )
-        # Task C: periodic checkpoint so the in-progress session is visible
-        # in the History tab (which reads the on-disk store) while running.
-        self._tasks.append(
-            asyncio.create_task(
-                self._session_checkpoint_loop(), name="cortex-session-checkpoint-loop"
-            )
-        )
-
-        # P0 §3.2: kick off chronotype backfill on a worker thread so
-        # cold-start doesn't block the daemon loop. The aggregator is
-        # idempotent — repeated calls are no-ops if the model is fresh.
-        # B7 (Phase 4.1): the previously-orphaned task is now tracked on
-        # ``self._tasks`` AND wrapped with the supervision callback so
-        # any unexpected exception lands in the daemon log instead of
-        # being silently swallowed by asyncio's garbage collector.
-        _chronotype_backfill_task = asyncio.create_task(
-            asyncio.to_thread(self._session_aggregator.backfill_if_needed),
-            name="cortex-chronotype-backfill",
-        )
-        _chronotype_backfill_task.add_done_callback(
-            _supervise_background_task,
-        )
-        self._tasks.append(_chronotype_backfill_task)
+        # The composition root, rather than this method, declares ownership
+        # of every long-running loop. Critical child failures request a
+        # fail-closed daemon shutdown through ``TaskSupervisor``.
+        self._tasks = list(await self._coordinators.start())
         # P0 §3.2: start the nightly aggregation scheduler. The state
         # dir is the chronotype storage path so ``scheduler_state.json``
         # lives alongside ``model.json`` / ``daily/`` — persisting the
@@ -1506,8 +2016,7 @@ class CortexDaemon:
                 # ValueError: nested asyncio.run reusing a loop without
                 # privileges to install handlers.
                 logger.debug(
-                    "loop.add_signal_handler unsupported for %s; "
-                    "falling back to outer harness",
+                    "loop.add_signal_handler unsupported for %s; falling back to outer harness",
                     sig,
                 )
 
@@ -1522,6 +2031,7 @@ class CortexDaemon:
         """Request process shutdown via SIGTERM (triggers full graceful stop chain)."""
         import os
         import signal as _signal
+
         logger.info("Shutdown requested via WebSocket")
         try:
             loop = asyncio.get_running_loop()
@@ -1533,7 +2043,15 @@ class CortexDaemon:
 
     async def stop(self) -> None:
         """Gracefully stop all runtime services."""
+        if self._stop_started:
+            return
+        self._stop_started = True
         self._shutdown.set()
+        # Revoke the production path before cancelling proposal producers.
+        # Already-consumed effects are handled by the exact restore barrier
+        # below; no new authorization may be minted during teardown.
+        self._interventions_enabled = False
+        self._transaction_coordinator.set_execution_mode("suggest_only")
         # Audit P1: tell the macOS notification delegate to refuse new
         # callback dispatches BEFORE we cancel asyncio tasks. A user
         # click arriving mid-shutdown would otherwise reach a half-
@@ -1542,10 +2060,12 @@ class CortexDaemon:
         # non-mac / when PyObjC isn't installed.
         try:
             from cortex.libs.utils import macos_notifications as _mn
+
             _mn.mark_shutting_down()
         except Exception:
             logger.debug(
-                "macos_notifications.mark_shutting_down failed", exc_info=True,
+                "macos_notifications.mark_shutting_down failed",
+                exc_info=True,
             )
         # Phase-3 P0-N5: a daemon stop while an auto-armed focus
         # session is live would leave the browser blocking sites
@@ -1558,25 +2078,35 @@ class CortexDaemon:
                 await self.disarm_auto_focus()
             except Exception:
                 logger.debug(
-                    "disarm_auto_focus during stop failed", exc_info=True,
+                    "disarm_auto_focus during stop failed",
+                    exc_info=True,
                 )
         if self._uvicorn_server is not None:
+            self._task_supervisor.expect_completion(self._api_task)
             self._uvicorn_server.should_exit = True
-        for task in self._tasks:
-            task.cancel()
-        if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
+        await self._coordinators.stop(timeout=5.0)
         self._tasks.clear()
         # F03 + F05: cancel + drain dynamically-spawned background tasks
         # so they cannot outlive the daemon and corrupt persisted state.
         # Apply-confirmation timeout watchers (F05) are part of this set.
-        if self._background_tasks:
-            for task in list(self._background_tasks):
-                task.cancel()
-            await asyncio.gather(
-                *list(self._background_tasks), return_exceptions=True
+        await self._task_supervisor.cancel(TaskGroupName.BACKGROUND, timeout=5.0)
+        self._background_tasks.clear()
+        # WP6: while authenticated clients and receipt handlers are still
+        # alive, request every exact inverse and wait a bounded interval for
+        # verified completion. Offline/unresponsive owners remain durable and
+        # are retried on next startup rather than being reported restored.
+        try:
+            restore_summary = await self.restore_all_transactional_effects(
+                reason="system_cancelled",
+                timeout_seconds=3.0,
             )
-            self._background_tasks.clear()
+            if restore_summary["pending"] or restore_summary["failed"]:
+                logger.warning(
+                    "Shutdown retained unresolved exact restores: %s",
+                    restore_summary,
+                )
+        except Exception:
+            logger.exception("Shutdown exact-restore barrier failed; journal retained for startup")
         # F05 / B18 (Phase 4.1): any apply-confirmation future still
         # pending at shutdown is treated as a missed ack — resolve to
         # confirmed=False so awaiters don't hang.
@@ -1590,8 +2120,7 @@ class CortexDaemon:
         # set instead of inferring it from absent ack frames.
         if self._pending_apply_results:
             logger.warning(
-                "B18: aborting %d in-flight apply-confirmation futures "
-                "on daemon shutdown",
+                "B18: aborting %d in-flight apply-confirmation futures on daemon shutdown",
                 len(self._pending_apply_results),
             )
         for intervention_id, future in list(self._pending_apply_results.items()):
@@ -1627,9 +2156,7 @@ class CortexDaemon:
         # AVFoundation handle is reclaimed by the kernel on process exit
         # regardless, but only if we actually exit.
         try:
-            await asyncio.wait_for(
-                self._capture_pipeline.stop(), timeout=5.0
-            )
+            await asyncio.wait_for(self._capture_pipeline.stop(), timeout=5.0)
         except TimeoutError:
             logger.error(
                 "Capture pipeline stop() exceeded 5s; abandoning graceful "
@@ -1672,9 +2199,8 @@ class CortexDaemon:
                 if duration_seconds >= 90.0:
                     try:
                         from cortex.libs.utils.atomic_write import atomic_write_json
-                        sessions_dir = (
-                            Path(self.config.storage.path).expanduser() / "sessions"
-                        )
+
+                        sessions_dir = Path(self.config.storage.path).expanduser() / "sessions"
                         sessions_dir.mkdir(parents=True, exist_ok=True)
                         session_path = sessions_dir / f"session_{report.session_id}.json"
                         payload = report.model_dump(mode="json")
@@ -1687,6 +2213,7 @@ class CortexDaemon:
                             ),
                         )
                         atomic_write_json(session_path, payload)
+                        await self._legacy_data_migrator.upsert_session(report)
                         logger.info("Wrote session report to %s", session_path)
                         self._session_reader.invalidate(report.session_id)
                         persisted_ok = True
@@ -1705,9 +2232,10 @@ class CortexDaemon:
                     # ``report.end_time``). Building via the Pydantic model
                     # guarantees the shape matches the generated TS type.
                     from cortex.libs.schemas.realtime import SessionRecap
+
                     recap_payload = SessionRecap(
                         report=report,
-                        generated_at=datetime.now(UTC).isoformat(),
+                        generated_at=utc_datetime(self._clock).isoformat(),
                         persisted=persisted_ok,
                     ).model_dump(mode="json")
                     self._latest_session_recap = recap_payload
@@ -1743,9 +2271,7 @@ class CortexDaemon:
                             self._recap_dismissed_event.wait(),
                             timeout=_SESSION_RECAP_DISMISSAL_TIMEOUT_S,
                         )
-                        logger.info(
-                            "SESSION_RECAP acknowledged by UI; proceeding with shutdown"
-                        )
+                        logger.info("SESSION_RECAP acknowledged by UI; proceeding with shutdown")
                     except TimeoutError:
                         logger.warning(
                             "SESSION_RECAP dismissal ACK not received within %.1fs; "
@@ -1759,13 +2285,10 @@ class CortexDaemon:
                     # instead of waiting the full 6s.
                     try:
                         from cortex.libs.utils.atomic_write import atomic_write_json
-                        sessions_dir = (
-                            Path(self.config.storage.path).expanduser() / "sessions"
-                        )
+
+                        sessions_dir = Path(self.config.storage.path).expanduser() / "sessions"
                         sessions_dir.mkdir(parents=True, exist_ok=True)
-                        session_path_short = (
-                            sessions_dir / f"session_{report.session_id}.json"
-                        )
+                        session_path_short = sessions_dir / f"session_{report.session_id}.json"
                         payload_short = report.model_dump(mode="json")
                         encoded_short = json.dumps(payload_short, indent=2).encode("utf-8")
                         enforce_session_storage_budget(
@@ -1776,6 +2299,7 @@ class CortexDaemon:
                             ),
                         )
                         atomic_write_json(session_path_short, payload_short)
+                        await self._legacy_data_migrator.upsert_session(report)
                         self._session_reader.invalidate(report.session_id)
                     except Exception:
                         logger.debug(
@@ -1792,9 +2316,7 @@ class CortexDaemon:
                             timeout=1.0,
                         )
                     except (TimeoutError, Exception):
-                        logger.debug(
-                            "synthetic empty SESSION_RECAP broadcast failed (non-fatal)"
-                        )
+                        logger.debug("synthetic empty SESSION_RECAP broadcast failed (non-fatal)")
         # P0 §3.2: stop the midnight scheduler cleanly before the WS server
         # tears down so we don't await a callback that needs a WS broadcast.
         if self._midnight_scheduler is not None:
@@ -1822,8 +2344,17 @@ class CortexDaemon:
             self._recorder.flush(timeout=5.0)
         except Exception:
             logger.debug("Recorder flush failed (non-fatal)", exc_info=True)
+        try:
+            await self._analytics_writer.stop()
+            await self._store.close()
+        finally:
+            await self._database.close()
         self._uvicorn_server = None
-        registry.reset()
+        self._task_supervisor.forget_finished()
+        self._services.reset()
+        self._events.clear()
+        self._runtime_status.reset()
+        self._runtime_data.reset()
         logger.info("Cortex daemon stopped")
 
     async def run(self) -> None:
@@ -1833,14 +2364,17 @@ class CortexDaemon:
             await self.stop()
 
     def _register_services(self) -> None:
-        registry.reset()
+        self._services.reset()
         for name, service in {
             "feature_fusion": self._feature_fusion,
             "rule_scorer": self._scorer,
+            "support_inference": self._support_inference,
+            "support_model_registry": self._support_model_registry,
             "score_smoother": self._smoother,
             "context_engine": self._context_engine,
             "llm_client": self._llm_client,
             "intervention_executor": self._executor,
+            "intervention_transactions": self._transaction_coordinator,
             "restore_manager": self._restore_manager,
             "ws_server": self._ws_server,
             "trigger_policy": self._trigger_policy,
@@ -1852,22 +2386,37 @@ class CortexDaemon:
             "daemon": self,
             # v2.0 services
             "store": self._store,
-            "stress_integral_tracker": self._stress_tracker,
+            "database": self._database,
+            "analytics_writer": self._analytics_writer,
+            "storage_maintenance": self._storage_maintenance,
+            "legacy_data_migrator": self._legacy_data_migrator,
             "longitudinal_tracker": self._longitudinal,
             "zombie_detector": self._zombie_detector,
             "rabbit_hole_detector": self._rabbit_hole,
             "shutdown_detector": self._shutdown_detector,
             "consent_ladder": self._consent_ladder,
             "helpfulness_tracker": self._helpfulness,
-            "contextual_bandit": self._bandit,
-            "amip_policy": self._amip,
+            "policy_repository": self._policy_repository,
+            "policy_lifecycle": self._policy_lifecycle,
             "copilot_throttle": self._copilot_throttle,
         }.items():
-            registry.register(name, service)
-        registry.healthy = True
+            self._services.register(name, service)
+        self._services.register("store_backend", "sqlite")
+        self._services.register("store_healthy", not self._store_degraded)
+        self._runtime_status.publish_storage(
+            degraded=self._store_degraded,
+            backend="sqlite",
+            healthy=not self._store_degraded,
+        )
+        self._services.healthy = True
 
     def _start_api_server(self) -> None:
-        app = create_app(config=self.config.api, cortex_config=self.config)
+        app = create_app(
+            config=self.config.api,
+            cortex_config=self.config,
+            clock=self._clock,
+            services=self._services,
+        )
         # Phase-4b TASK L: bind a concrete InterventionPort instance on
         # the app's state so routes that depend on the protocol
         # (cortex.libs.ports.intervention_port.InterventionPort) can
@@ -1895,6 +2444,8 @@ class CortexDaemon:
             capture_snapshot as _cap,
         )
 
+        daemon_clock = self._clock
+
         class _DefaultInterventionPort:
             def capture_snapshot(
                 self,
@@ -1907,6 +2458,7 @@ class CortexDaemon:
                     context,
                     intervention_id=intervention_id,
                     timestamp=timestamp,
+                    clock=daemon_clock,
                 )
 
             def prepare_plan(
@@ -1954,12 +2506,15 @@ class CortexDaemon:
                 # Normal shutdown path.
                 raise
             except Exception:
-                logger.exception(
-                    "API server crashed unexpectedly; triggering daemon shutdown"
-                )
+                logger.exception("API server crashed unexpectedly; triggering daemon shutdown")
                 self._shutdown.set()
 
-        self._api_task = asyncio.create_task(_supervised_serve(), name="cortex-api")
+        self._api_task = self._task_supervisor.spawn(
+            _supervised_serve(),
+            name="cortex-api",
+            group=TaskGroupName.TRANSPORT,
+            critical=True,
+        )
 
     def _current_app_name(self) -> str:
         events = self._window_tracker.get_events_in_window(window_seconds=60.0)
@@ -1968,186 +2523,850 @@ class CortexDaemon:
         return events[-1].app_name
 
     def _load_baselines(self) -> UserBaselines:
-        baseline_path = Path(self.config.storage.path) / "baselines" / "default.json"
-        if not baseline_path.exists():
-            return UserBaselines()
+        """Return the one startup/live-applied immutable profile view."""
+
+        return self._baseline_snapshot
+
+    def reload_active_calibration(
+        self,
+        expected_profile_id: str | None = None,
+    ) -> CalibrationUpdated:
+        """Reload the already-active pointer, primarily for startup recovery."""
+
+        profile = self._legacy_data_migrator.load_active_calibration_blocking()
+        if profile is None:
+            raise ValueError("no active calibration profile exists")
+        if expected_profile_id is not None and str(profile.profile_id) != str(expected_profile_id):
+            raise ValueError("active calibration profile does not match request")
+        return self.apply_calibration_profile(profile)
+
+    def activate_calibration_profile(
+        self,
+        profile_id: str,
+        *,
+        expected_sha256: str | None = None,
+    ) -> CalibrationUpdated:
+        """Validate, persistently activate, and live-apply one staged profile.
+
+        Replacement services are constructed before the active pointer changes.
+        ``CalibrationProfileStore.activate`` commits the pointer last, and the
+        following graph swap is synchronous and assignment-only.  Consequently
+        a validation/construction/persistence error leaves both the previous
+        pointer and previous live graph in place.
+        """
+
+        profile = self._calibration_store.load_profile(profile_id)
+        actual_sha256 = calibration_profile_sha256(profile)
+        if expected_sha256 is not None and actual_sha256 != expected_sha256:
+            raise ValueError("staged calibration profile checksum mismatch")
+        prepared = self._prepare_calibration_profile(profile)
+        pointer = ActiveCalibrationPointer(
+            profile_id=profile.profile_id,
+            profile_sha256=actual_sha256,
+            activated_at_unix_ms=self._clock.unix_ms(),
+        )
+        # SQLite commits first and is the authoritative pointer. The JSON
+        # pointer is a compatibility projection for synchronous desktop
+        # readers; a projection failure cannot roll back proven authority or
+        # the prepared live graph.
+        prior_sqlite_calibration = (
+            self._legacy_data_migrator.load_active_calibration_record_blocking()
+        )
+        self._legacy_data_migrator.upsert_calibration_blocking(
+            profile,
+            active=pointer,
+        )
         try:
-            loaded = UserBaselines.model_validate_json(baseline_path.read_text())
-            if not loaded.metric_distributions:
-                # Backward-compatible migration for legacy baseline files.
-                loaded.metric_distributions = {
-                    "hr": {"mu": loaded.hr_baseline, "sigma": loaded.hr_std, "p10": loaded.hr_baseline, "p90": loaded.hr_baseline},
-                    "hrv_rmssd": {"mu": loaded.hrv_baseline, "sigma": max(6.0, loaded.hrv_baseline * 0.2), "p10": loaded.hrv_baseline, "p90": loaded.hrv_baseline},
-                    "blink_rate": {"mu": loaded.blink_rate_baseline, "sigma": max(3.0, loaded.blink_rate_baseline * 0.2), "p10": loaded.blink_rate_baseline, "p90": loaded.blink_rate_baseline},
+            self._calibration_store.activate(profile, pointer=pointer)
+        except (OSError, ValueError):
+            # Cross-file atomicity is emulated by restoring the prior SQLite
+            # pointer if the compatibility projection cannot commit. The new
+            # immutable profile may remain staged, but neither authority nor
+            # the live graph changes.
+            self._legacy_data_migrator.restore_active_calibration_blocking(prior_sqlite_calibration)
+            raise
+        return self._commit_calibration_graph(prepared)
+
+    def apply_calibration_profile(
+        self,
+        profile: CalibrationProfile,
+    ) -> CalibrationUpdated:
+        """Apply an already-authoritative profile with no await/interleaving.
+
+        All validation and replacement-object construction happens before the
+        first live reference changes.  Because runtime domain work is owned by
+        one asyncio loop and this method contains no await, consumers observe
+        either the prior component graph or the complete replacement graph.
+        """
+
+        return self._commit_calibration_graph(self._prepare_calibration_profile(profile))
+
+    def _prepare_calibration_profile(
+        self,
+        profile: CalibrationProfile,
+    ) -> _PreparedCalibrationGraph:
+        """Validate and construct a complete replacement without mutating live state."""
+
+        new_components = build_production_camera_feature_components(self.config)
+        expected_algorithms = production_calibration_algorithm_identities(
+            self.config,
+            components=new_components,
+        )
+        _validate_runtime_calibration_profile(
+            profile,
+            expected_algorithms=expected_algorithms,
+        )
+        new_baselines = profile.to_user_baselines()
+        new_components.blink.baseline_blink_rate = new_baselines.blink_rate_baseline
+        values = profile.baselines
+        camera_valid = bool(
+            profile.camera is not None
+            and self._active_camera_identity_key is not None
+            and profile.camera.identity_key == self._active_camera_identity_key
+            and self._active_camera_geometry == (profile.camera.width, profile.camera.height)
+            and values.neutral_head_pitch_deg is not None
+            and values.neutral_face_scale_px is not None
+        )
+        if (
+            camera_valid
+            and profile.camera is not None
+            and values.neutral_head_pitch_deg is not None
+            and values.neutral_face_scale_px is not None
+        ):
+            new_components.head_neck_proxy.apply_calibration(
+                neutral_pitch_deg=values.neutral_head_pitch_deg,
+                neutral_face_scale=values.neutral_face_scale_px,
+                camera_identity_key=profile.camera.identity_key,
+            )
+        new_fusion = FeatureFusion(clock=self._clock)
+        new_scorer = RuleScorer(config=self.config.state, baselines=new_baselines)
+        new_smoother = ScoreSmoother(self.config.state, clock=self._clock)
+        new_zombie = ZombieReadingDetector(blink_baseline=new_baselines.blink_rate_baseline)
+        new_shutdown = ShutdownDetector(
+            hrv_baseline=new_baselines.hrv_baseline,
+            config=self.config.handover,
+        )
+
+        return _PreparedCalibrationGraph(
+            profile=profile,
+            baselines=new_baselines,
+            camera_features=new_components,
+            pulse_estimator=_build_legacy_pulse_estimator(self.config),
+            rgb_observations=_build_rgb_observation_buffer(self.config),
+            feature_fusion=new_fusion,
+            scorer=new_scorer,
+            smoother=new_smoother,
+            zombie_detector=new_zombie,
+            shutdown_detector=new_shutdown,
+            causal_attributor=CausalAttributor(),
+            camera_calibration_valid=camera_valid,
+        )
+
+    def _commit_calibration_graph(
+        self,
+        prepared: _PreparedCalibrationGraph,
+    ) -> CalibrationUpdated:
+        """Swap a prepared graph atomically and publish its domain event."""
+
+        profile = prepared.profile
+        previous_id = (
+            self._active_calibration_profile.profile_id
+            if self._active_calibration_profile is not None
+            else None
+        )
+        self._inference_publication_paused = True
+        try:
+            self._rgb_observations = prepared.rgb_observations
+            self._roi_extractor = prepared.camera_features.roi_extractor
+            self._pulse_estimator = prepared.pulse_estimator
+            self._physiology_v2 = prepared.camera_features.physiology
+            self._blink_detector = prepared.camera_features.blink
+            self._head_pose = prepared.camera_features.head_pose
+            self._posture = prepared.camera_features.head_neck_proxy
+            self._feature_fusion = prepared.feature_fusion
+            self._scorer = prepared.scorer
+            self._support_inference.replace_scorer(prepared.scorer)
+            self._smoother = prepared.smoother
+            self._zombie_detector = prepared.zombie_detector
+            self._shutdown_detector = prepared.shutdown_detector
+            self._causal_attributor = prepared.causal_attributor
+            self._active_calibration_profile = profile
+            self._baseline_snapshot = prepared.baselines
+            self._camera_calibration_valid = prepared.camera_calibration_valid
+            self._latest_respiration_evidence = None
+            self._latest_estimate = None
+            self._latest_biometrics = None
+            self._latest_broadcast_snapshot = None
+            self._last_physio_update = 0.0
+            self._last_physio_update_mono_ns = 0
+            self._last_kinematics_ts = 0.0
+        finally:
+            self._inference_publication_paused = False
+
+        applied_metrics = tuple(
+            str(summary.metric)
+            for summary in profile.metrics
+            if summary.maturity
+            in {
+                CalibrationMetricMaturity.OBSERVED.value,
+                CalibrationMetricMaturity.SUPPORTED.value,
+            }
+            and summary.metric
+            in {
+                CalibrationMetricName.BLINK_RATE_PER_MIN.value,
+                CalibrationMetricName.MOUSE_VELOCITY_PX_PER_S.value,
+                CalibrationMetricName.MOUSE_VELOCITY_VARIANCE.value,
+                CalibrationMetricName.NEUTRAL_HEAD_PITCH_DEG.value,
+                CalibrationMetricName.NEUTRAL_FACE_SCALE_PX.value,
+            }
+            and (
+                summary.metric
+                not in {
+                    CalibrationMetricName.NEUTRAL_HEAD_PITCH_DEG.value,
+                    CalibrationMetricName.NEUTRAL_FACE_SCALE_PX.value,
                 }
-            return loaded
-        except Exception:
-            logger.exception("Failed to load baselines from %s", baseline_path)
-            return UserBaselines()
+                or prepared.camera_calibration_valid
+            )
+        )
+        event = CalibrationUpdated(
+            event_id=uuid4(),
+            profile_id=profile.profile_id,
+            previous_profile_id=previous_id,
+            observed_at_unix_ms=self._clock.unix_ms(),
+            observed_at_mono_ns=self._clock.monotonic_ns(),
+            boot_id=self._clock.boot_id,
+            camera_calibration_valid=prepared.camera_calibration_valid,
+            applied_metrics=applied_metrics,
+            reset_components=(
+                "physiology",
+                "blink",
+                "head_pose",
+                "head_neck_proxy",
+                "feature_fusion",
+                "rule_scorer",
+                "score_smoother",
+                "stress_integral",
+                "zombie_detector",
+                "shutdown_detector",
+                "causal_attribution",
+            ),
+        )
+        self._services.register("active_calibration_profile", profile.model_dump(mode="json"))
+        self._services.register("calibration_updated", event.model_dump(mode="json"))
+        self._services.register(
+            "camera_calibration_valid",
+            prepared.camera_calibration_valid,
+        )
+        _emit_event(
+            EventType.CALIBRATION_UPDATED,
+            **event.model_dump(mode="json"),
+        )
+        return event
 
     async def _request_context(self, client_type: str) -> dict[str, Any]:
         return await self._ws_server.request_context(client_type)
 
-    async def _capture_loop(self) -> None:
-        try:
-            while True:
-                if not self._capture_available or not self._capture_processing_enabled:
-                    await asyncio.sleep(0.5)
-                    continue
-                try:
-                    output = await self._capture_pipeline.get_output(timeout=0.5)
-                except Exception:
-                    # Audit-2 fix: a NaN landmark or an rPPG numerical
-                    # blow-up used to propagate out of the loop and kill
-                    # the task silently. The user then saw zero physio
-                    # updates for the rest of the session with no log
-                    # trace. Log + continue keeps the pipeline alive.
-                    logger.exception("Capture pipeline get_output failed; continuing")
-                    await asyncio.sleep(0.5)
-                    continue
-                if output is not None:
-                    try:
-                        await self._process_capture_output(output)
-                    except Exception:
-                        # Mediapipe occasionally returns malformed
-                        # landmarks; treat as a transient bad frame and
-                        # keep the loop running.
-                        logger.exception("Capture frame processing failed; skipping frame")
-        except asyncio.CancelledError:
-            # B6 (Phase 4.1): graceful task shutdown; intentional.
-            logger.debug("capture loop cancelled")
+    async def _next_capture_output(self) -> PipelineOutput | None:
+        """Typed sensing port implemented by the capture pipeline."""
+
+        return await self._capture_pipeline.get_output(timeout=0.5)
+
+    @property
+    def _rgb_history(self) -> deque[NDArray[np.float64]]:
+        """Derived legacy view; the canonical store is one observation deque."""
+
+        maxlen = max(1, self.config.signal.rppg.window_seconds * self.config.capture.fps)
+        rows = (
+            item.value
+            if item.is_valid and item.value is not None
+            else np.full(3, np.nan, dtype=np.float64)
+            for item in self._rgb_observations.snapshot()
+        )
+        return deque(rows, maxlen=maxlen)
+
+    @property
+    def _rgb_ts_history(self) -> deque[float]:
+        """Derived legacy timestamp view; no parallel timestamp state exists."""
+
+        maxlen = max(1, self.config.signal.rppg.window_seconds * self.config.capture.fps)
+        return deque(
+            (
+                item.observed_at_mono_ns / 1_000_000_000.0
+                for item in self._rgb_observations.snapshot()
+            ),
+            maxlen=maxlen,
+        )
 
     def _effective_rppg_fps(self) -> float:
-        """Effective sampling rate of the current rPPG window (B1).
+        """Return measured cadence from the canonical observation stream."""
 
-        Computed from the real frame timestamps held in ``_rgb_ts_history``
-        as ``(n - 1) / (t_last - t_first)`` — the true mean frame rate over
-        the window, which is what the Welch PSD needs to map a spectral peak
-        to BPM. Clamped to ``[fps_clamp_min, fps_clamp_max]``; outside that
-        band (or with too few / degenerate timestamps, or when disabled) we
-        fall back to the configured capture fps. Refs: MDPI Sensors
-        25(2):588 (2025); rPPG-in-the-wild, Behavior Research Methods 2024.
-        """
         cfg = self.config.signal.rppg
         fallback = float(self.config.capture.fps)
-        if not cfg.use_measured_fps:
+        times = np.asarray(
+            [item.observed_at_mono_ns for item in self._rgb_observations.snapshot()],
+            dtype=np.int64,
+        )
+        if len(times) < 2:
             return fallback
-        ts = self._rgb_ts_history
-        if len(ts) < 2:
+        diffs = np.diff(times)
+        if bool((diffs <= 0).any()):
             return fallback
-        span = float(ts[-1]) - float(ts[0])
-        if span <= 1e-3:
-            return fallback
-        cand = (len(ts) - 1) / span
-        if cfg.fps_clamp_min <= cand <= cfg.fps_clamp_max:
-            return float(cand)
+        candidate = 1_000_000_000.0 / float(np.median(diffs))
+        if cfg.fps_clamp_min <= candidate <= cfg.fps_clamp_max:
+            return candidate
         return fallback
 
+    def _legacy_capture_observation(
+        self, output: PipelineOutput
+    ) -> ObservationEnvelope[CameraFrameObservation]:
+        """Adapt pre-v2 internal test/plugin outputs without mixing clocks."""
+
+        frame_meta = output.frame_meta
+        sequence = self._legacy_capture_sequence
+        self._legacy_capture_sequence += 1
+        interval_ns = max(1, int(1_000_000_000 / max(1, self.config.capture.fps)))
+        mono_ns = self._legacy_capture_mono_origin_ns + sequence * interval_ns
+        unix_ms = max(0, int(float(frame_meta.timestamp) * 1000))
+        identity = self._camera_identity_from_output(output)
+        face_detected = bool(getattr(frame_meta, "face_detected", False))
+        low_quality = bool(getattr(frame_meta, "low_quality", False))
+        frame = getattr(output, "frame", None)
+        landmarks_px = getattr(output, "landmarks_px", None)
+        valid = face_detected and not low_quality and frame is not None and landmarks_px is not None
+        validity = (
+            ObservationValidity.VALID
+            if valid
+            else (ObservationValidity.REJECTED if low_quality else ObservationValidity.MISSING)
+        )
+        reason = (
+            None if valid else (MissingReason.ARTIFACT if low_quality else MissingReason.NO_FACE)
+        )
+        components = {
+            "brightness": float(getattr(frame_meta, "brightness_score", 0.0)),
+            "blur": float(getattr(frame_meta, "blur_score", 0.0)),
+            "motion": float(getattr(frame_meta, "motion_score", 0.0)),
+            "face_confidence": float(getattr(frame_meta, "face_confidence", 0.0)),
+        }
+        quality = min(max(0.0, min(1.0, value)) for value in components.values())
+        if valid:
+            assert frame is not None
+            frame_shape = np.asarray(frame).shape
+            value = CameraFrameObservation(
+                width=int(frame_shape[1]),
+                height=int(frame_shape[0]),
+                face_detected=True,
+                face_stable=True,
+                face_confidence=components["face_confidence"],
+                camera_identity=identity,
+            )
+        else:
+            value = None
+        return ObservationEnvelope[CameraFrameObservation](
+            source=ObservationSource.CAMERA,
+            source_instance_id=self._legacy_capture_source_instance_id,
+            sequence=sequence,
+            observed_at_unix_ms=unix_ms,
+            observed_at_mono_ns=mono_ns,
+            boot_id=self._clock.boot_id,
+            value=value,
+            validity=validity,
+            missing_reason=reason,
+            quality=quality,
+            quality_components=components,
+            algorithm_version="capture-integrity/legacy-adapter",
+        )
+
+    def _observation_from_output(
+        self, output: PipelineOutput
+    ) -> ObservationEnvelope[CameraFrameObservation]:
+        observation = getattr(output, "observation", None)
+        if isinstance(observation, ObservationEnvelope):
+            return observation
+        return self._legacy_capture_observation(output)
+
+    def _camera_identity_from_output(self, output: PipelineOutput) -> CameraIdentity:
+        identity = getattr(output, "camera_identity", None)
+        if isinstance(identity, CameraIdentity):
+            return identity
+        observation = getattr(output, "observation", None)
+        value = getattr(observation, "value", None)
+        value_identity = getattr(value, "camera_identity", None)
+        if isinstance(value_identity, CameraIdentity):
+            return value_identity
+        return CameraIdentity(
+            identity_key="legacy-camera",
+            device_id=max(0, int(self.config.capture.device_id or 0)),
+            device_name=None,
+            source="legacy",
+            backend=None,
+            width=self.config.capture.width,
+            height=self.config.capture.height,
+        )
+
+    def _reset_camera_dependent_state(self, *, invalidate_calibration: bool) -> None:
+        self._rgb_observations.clear()
+        self._pulse_estimator.reset()
+        self._physiology_v2.reset()
+        self._latest_respiration_evidence = None
+        self._blink_detector.reset()
+        self._head_pose.reset()
+        if invalidate_calibration:
+            self._posture.reset_calibration()
+            self._camera_calibration_valid = False
+        else:
+            self._posture.reset()
+        self._feature_fusion.invalidate_camera_channels()
+        self._latest_physio = PhysioFeatures(
+            pulse_bpm=None,
+            pulse_quality=0.0,
+            pulse_variability_proxy=None,
+            hr_delta_5s=None,
+            valid=False,
+        )
+        self._latest_kinematics = KinematicFeatures(
+            blink_rate=None,
+            blink_rate_delta=None,
+            blink_suppression_score=None,
+            perclos_60s=None,
+            mean_blink_duration_ms=None,
+            ear_variance=None,
+            head_pitch=None,
+            head_yaw=None,
+            head_roll=None,
+            slump_score=None,
+            forward_lean_score=None,
+            shoulder_drop_ratio=None,
+            confidence=0.0,
+        )
+        self._last_physio_update = 0.0
+        self._last_physio_update_mono_ns = 0
+        self._last_kinematics_ts = 0.0
+        self._services.register("latest_physio", self._latest_physio)
+        self._services.register("latest_kinematics", self._latest_kinematics)
+        self._services.register("camera_calibration_valid", self._camera_calibration_valid)
+
+    def _handle_camera_identity(
+        self,
+        identity: CameraIdentity,
+        observation: ObservationEnvelope[CameraFrameObservation],
+    ) -> None:
+        old_key = self._active_camera_identity_key
+        old_geometry = self._active_camera_geometry
+        new_geometry = (identity.width, identity.height)
+        source_id = str(observation.source_instance_id)
+        profile_camera = (
+            self._active_calibration_profile.camera
+            if self._active_calibration_profile is not None
+            and self._active_calibration_profile.camera is not None
+            else None
+        )
+        profile_camera_key = profile_camera.identity_key if profile_camera is not None else None
+        profile_geometry = (
+            (profile_camera.width, profile_camera.height) if profile_camera is not None else None
+        )
+        physical_changed = old_key is not None and (
+            old_key != identity.identity_key or old_geometry != new_geometry
+        )
+        initial_profile_mismatch = (
+            old_key is None
+            and profile_camera is not None
+            and (profile_camera_key != identity.identity_key or profile_geometry != new_geometry)
+        )
+        source_changed = (
+            self._active_camera_source_instance_id is not None
+            and self._active_camera_source_instance_id != source_id
+        )
+        if physical_changed or initial_profile_mismatch:
+            self._reset_camera_dependent_state(invalidate_calibration=True)
+            self._camera_calibration_valid = self._apply_camera_bound_posture_calibration(identity)
+            _emit_event(
+                EventType.CAMERA_IDENTITY_CHANGED,
+                previous_identity_key=old_key or profile_camera_key,
+                camera_identity_key=identity.identity_key,
+                observed_at_unix_ms=observation.observed_at_unix_ms,
+            )
+        elif (
+            old_key is None
+            and profile_camera_key == identity.identity_key
+            and profile_geometry == new_geometry
+        ):
+            self._camera_calibration_valid = self._apply_camera_bound_posture_calibration(identity)
+        elif source_changed:
+            # Same camera reopened: preserve its calibration, but never bridge
+            # signal windows or temporal detector state across acquisitions.
+            self._reset_camera_dependent_state(invalidate_calibration=False)
+        self._active_camera_identity_key = identity.identity_key
+        self._active_camera_geometry = new_geometry
+        self._active_camera_source_instance_id = source_id
+        self._services.register("camera_identity", identity.model_dump(mode="json"))
+        self._services.register("camera_calibration_valid", self._camera_calibration_valid)
+
+    def _apply_camera_bound_posture_calibration(
+        self,
+        identity: CameraIdentity,
+    ) -> bool:
+        """Apply the active neutral-pose values only to their measured camera."""
+
+        profile = self._active_calibration_profile
+        if profile is None or profile.camera is None:
+            return False
+        values = profile.baselines
+        if (
+            profile.camera.identity_key != identity.identity_key
+            or profile.camera.width != identity.width
+            or profile.camera.height != identity.height
+            or values.neutral_head_pitch_deg is None
+            or values.neutral_face_scale_px is None
+        ):
+            return False
+        self._posture.apply_calibration(
+            neutral_pitch_deg=values.neutral_head_pitch_deg,
+            neutral_face_scale=values.neutral_face_scale_px,
+            camera_identity_key=identity.identity_key,
+        )
+        return self._posture.is_calibrated
+
+    def _handle_face_transition(
+        self,
+        output: PipelineOutput,
+        observation: ObservationEnvelope[CameraFrameObservation],
+    ) -> None:
+        tracking = getattr(output, "tracking", None)
+        face_now = bool(
+            getattr(
+                tracking,
+                "face_stable",
+                getattr(output.frame_meta, "face_detected", False),
+            )
+        )
+        if face_now == self._face_present_prev:
+            return
+        if face_now:
+            _emit_event(
+                EventType.FACE_REACQUIRED,
+                observed_at_unix_ms=observation.observed_at_unix_ms,
+                face_confidence=float(output.frame_meta.face_confidence),
+            )
+        else:
+            _emit_event(
+                EventType.FACE_LOST,
+                observed_at_unix_ms=observation.observed_at_unix_ms,
+            )
+            self._reset_camera_dependent_state(invalidate_calibration=False)
+        self._face_present_prev = face_now
+
+    def _prepare_rppg_window(self) -> PreparedObservationWindow:
+        cfg = self.config.signal.rppg
+        return prepare_observation_window(
+            self._rgb_observations.snapshot(),
+            window_seconds=float(cfg.window_seconds),
+            nominal_fps=float(self.config.capture.fps),
+            min_valid_fraction=cfg.min_valid_coverage,
+            max_interpolation_gap_ms=cfg.max_interpolation_gap_ms,
+            max_motion_fraction=cfg.max_motion_rejected_fraction,
+            fps_clamp_min=cfg.fps_clamp_min,
+            fps_clamp_max=cfg.fps_clamp_max,
+        )
+
+    def _prepare_respiration_window(self) -> PreparedObservationWindow:
+        cfg = self.config.signal.rppg
+        return prepare_observation_window(
+            self._rgb_observations.snapshot(),
+            window_seconds=float(cfg.respiration_window_seconds),
+            nominal_fps=float(self.config.capture.fps),
+            min_valid_fraction=cfg.min_valid_coverage,
+            max_interpolation_gap_ms=cfg.max_interpolation_gap_ms,
+            max_motion_fraction=cfg.max_motion_rejected_fraction,
+            fps_clamp_min=cfg.fps_clamp_min,
+            fps_clamp_max=cfg.fps_clamp_max,
+        )
+
+    def _publish_unavailable_physio(
+        self,
+        prepared: PreparedObservationWindow,
+        *,
+        mono_seconds: float,
+    ) -> None:
+        self._latest_physio = PhysioFeatures(
+            pulse_bpm=None,
+            pulse_quality=prepared.quality,
+            pulse_variability_proxy=None,
+            physio_sqi=prepared.quality,
+            physio_sqi_components={
+                "valid_fraction": prepared.valid_fraction,
+                "temporal_coverage": prepared.temporal_coverage,
+                "artifact_fraction": prepared.artifact_fraction,
+            },
+            hr_delta_5s=None,
+            valid=False,
+        )
+        self._services.register("latest_physio", self._latest_physio)
+        self._services.register(
+            "physio_window_readiness",
+            {
+                "ready": False,
+                "quality": prepared.quality,
+                "valid_fraction": prepared.valid_fraction,
+                "temporal_coverage": prepared.temporal_coverage,
+                "artifact_fraction": prepared.artifact_fraction,
+                "reasons": [reason.value for reason in prepared.unavailable_reasons],
+            },
+        )
+        self._feature_fusion.update_physio(
+            self._latest_physio,
+            timestamp=mono_seconds,
+        )
+
     async def _process_capture_output(self, output: PipelineOutput) -> None:
-        registry.register("latest_frame_meta", output.frame_meta)
-        if output.landmarks_px is None:
+        self._services.register("latest_frame_meta", output.frame_meta)
+        self._runtime_status.publish_frame(output.frame_meta)
+        observation = self._observation_from_output(output)
+        identity = self._camera_identity_from_output(output)
+        self._handle_camera_identity(identity, observation)
+        self._handle_face_transition(output, observation)
+        self._services.register(
+            "latest_camera_observation",
+            observation.model_dump(mode="json"),
+        )
+
+        validity = str(observation.validity)
+        missing_reason = observation.missing_reason
+        rgb_value: NDArray[np.float64] | None = None
+        head_jitter_deg = 0.0
+        frame = getattr(output, "frame", None)
+        landmarks_px = getattr(output, "landmarks_px", None)
+        roi_frame: Any | None = None
+        if (
+            validity == ObservationValidity.VALID.value
+            and frame is not None
+            and landmarks_px is not None
+        ):
+            roi_frame = self._roi_extractor.extract(
+                frame,
+                landmarks_px,
+                observation.observed_at_unix_ms / 1000.0,
+            )
+            combined_rgb = roi_frame.combined_rgb()
+            if combined_rgb is not None and bool(np.isfinite(combined_rgb).all()):
+                rgb_value = np.asarray(combined_rgb, dtype=np.float64)
+                head_jitter_deg = float(roi_frame.head_jitter_px) * (
+                    45.0 / max(1.0, float(self.config.capture.width))
+                )
+            else:
+                validity = ObservationValidity.REJECTED.value
+                missing_reason = MissingReason.OCCLUDED
+        elif validity == ObservationValidity.VALID.value:
+            validity = ObservationValidity.REJECTED.value
+            missing_reason = MissingReason.ARTIFACT
+
+        if validity != ObservationValidity.VALID.value:
+            if validity == ObservationValidity.REJECTED.value:
+                self._frames_low_quality_rejected += 1
+            rgb_value = None
+
+        numeric = NumericObservation(
+            observed_at_unix_ms=observation.observed_at_unix_ms,
+            observed_at_mono_ns=observation.observed_at_mono_ns,
+            boot_id=observation.boot_id,
+            sequence=observation.sequence,
+            value=rgb_value,
+            validity=validity,
+            missing_reason=missing_reason,
+            quality=observation.quality if rgb_value is not None else 0.0,
+            head_jitter_deg=head_jitter_deg,
+            head_vertical_face_units=(
+                _face_normalized_vertical_position(landmarks_px)
+                if rgb_value is not None and landmarks_px is not None
+                else None
+            ),
+        )
+        try:
+            self._rgb_observations.append(numeric)
+        except ValueError:
+            logger.warning(
+                "Capture observation time moved backwards; resetting window",
+                exc_info=True,
+            )
+            self._rgb_observations.clear()
+            self._rgb_observations.append(
+                NumericObservation(
+                    observed_at_unix_ms=numeric.observed_at_unix_ms,
+                    observed_at_mono_ns=numeric.observed_at_mono_ns,
+                    boot_id=numeric.boot_id,
+                    sequence=numeric.sequence,
+                    value=None,
+                    validity=ObservationValidity.REJECTED.value,
+                    missing_reason=MissingReason.ARTIFACT,
+                    quality=0.0,
+                )
+            )
+
+        mono_seconds = observation.observed_at_mono_ns / 1_000_000_000.0
+        stride_ns = int(self.config.signal.rppg.stride_seconds * 1_000_000_000)
+        if (
+            self._last_physio_update_mono_ns == 0
+            or observation.observed_at_mono_ns - self._last_physio_update_mono_ns >= stride_ns
+        ):
+            prepared = self._prepare_rppg_window()
+            if (
+                prepared.ready
+                and prepared.values is not None
+                and prepared.sample_times_mono_ns is not None
+            ):
+                pulse_result = self._physiology_v2.pulse.process_window(
+                    prepared.values,
+                    prepared.sample_times_mono_ns,
+                    sample_rate_hz=prepared.sample_rate_hz,
+                    boot_id=observation.boot_id,
+                    observation_quality=prepared.quality,
+                    head_jitter_deg=prepared.mean_head_jitter_deg,
+                    face_presence_ratio=prepared.valid_fraction,
+                )
+                unix_seconds_at_observation = observation.observed_at_unix_ms / 1000.0
+                self._pulse_estimator.process_window(
+                    pulse_result.waveform,
+                    timestamp=unix_seconds_at_observation,
+                    fs=prepared.sample_rate_hz,
+                    head_jitter_deg=prepared.mean_head_jitter_deg,
+                    face_presence_ratio=prepared.valid_fraction,
+                )
+                legacy_physio_shadow = self._pulse_estimator.get_features(
+                    unix_seconds_at_observation
+                )
+                self._services.register(
+                    "legacy_physio_shadow",
+                    legacy_physio_shadow.model_dump(mode="json"),
+                )
+                if pulse_result.summary.hr.value is None:
+                    # The acquisition-aware v2 gate is authoritative for
+                    # availability even while the legacy stabilizer remains
+                    # the displayed pulse implementation. A clean-looking
+                    # spectrum cannot override failed observation evidence.
+                    self._latest_physio = PhysioFeatures(
+                        pulse_bpm=None,
+                        pulse_quality=pulse_result.summary.quality,
+                        pulse_variability_proxy=None,
+                        physio_sqi=pulse_result.summary.quality,
+                        physio_sqi_components={
+                            "observation_quality": prepared.quality,
+                            "valid_fraction": prepared.valid_fraction,
+                            "artifact_fraction": prepared.artifact_fraction,
+                        },
+                        hr_delta_5s=None,
+                        valid=False,
+                    )
+                else:
+                    # The compatibility fields and their evidence must refer
+                    # to the same estimate.  The legacy stabilizer is retained
+                    # only as a shadow comparison during migration; publishing
+                    # its value beside v2 provenance would create an
+                    # unverifiable hybrid result.
+                    self._latest_physio = PhysioFeatures(
+                        pulse_bpm=pulse_result.summary.hr.value,
+                        pulse_quality=pulse_result.summary.quality,
+                        pulse_variability_proxy=None,
+                        physio_sqi=pulse_result.summary.quality,
+                        physio_sqi_components={
+                            "observation_quality": prepared.quality,
+                            "valid_fraction": prepared.valid_fraction,
+                            "artifact_fraction": prepared.artifact_fraction,
+                        },
+                        hr_delta_5s=None,
+                        respiration_rate_bpm=None,
+                        valid=True,
+                    )
+                respiration_window = self._prepare_respiration_window()
+                if (
+                    respiration_window.ready
+                    and respiration_window.values is not None
+                    and respiration_window.sample_times_mono_ns is not None
+                ):
+                    respiration_result = self._physiology_v2.respiration.process_window(
+                        respiration_window.values,
+                        respiration_window.sample_times_mono_ns,
+                        sample_rate_hz=respiration_window.sample_rate_hz,
+                        boot_id=observation.boot_id,
+                        head_vertical_face_units=(respiration_window.head_vertical_face_units),
+                    )
+                    self._latest_respiration_evidence = respiration_result.fused
+                    self._services.register(
+                        "latest_respiration_evidence",
+                        {
+                            "fused": respiration_result.fused.model_dump(mode="json"),
+                            "channels": {
+                                name: estimate.model_dump(mode="json")
+                                for name, estimate in respiration_result.channels.items()
+                            },
+                        },
+                    )
+                self._latest_physio = self._latest_physio.model_copy(
+                    update={
+                        "pulse_evidence": pulse_result.summary.hr,
+                        "hrv_evidence": {
+                            metric.value: estimate
+                            for metric, estimate in pulse_result.hrv_estimates.items()
+                        },
+                        "respiration_evidence": self._latest_respiration_evidence,
+                    }
+                )
+                self._services.register("latest_physio", self._latest_physio)
+                self._services.register(
+                    "latest_pulse_evidence",
+                    {
+                        "summary": pulse_result.summary.model_dump(mode="json"),
+                        "beats": [
+                            item.model_dump(mode="json") for item in pulse_result.beat_events[-32:]
+                        ],
+                        "intervals": [
+                            item.model_dump(mode="json") for item in pulse_result.intervals[-32:]
+                        ],
+                        "hrv": {
+                            metric.value: estimate.model_dump(mode="json")
+                            for metric, estimate in pulse_result.hrv_estimates.items()
+                        },
+                    },
+                )
+                self._services.register(
+                    "physio_window_readiness",
+                    {
+                        "ready": True,
+                        "quality": prepared.quality,
+                        "valid_fraction": prepared.valid_fraction,
+                        "temporal_coverage": prepared.temporal_coverage,
+                        "artifact_fraction": prepared.artifact_fraction,
+                        "sample_rate_hz": prepared.sample_rate_hz,
+                    },
+                )
+                self._feature_fusion.update_physio(
+                    self._latest_physio,
+                    timestamp=mono_seconds,
+                )
+            else:
+                self._publish_unavailable_physio(
+                    prepared,
+                    mono_seconds=mono_seconds,
+                )
+            self._last_physio_update = observation.observed_at_unix_ms / 1000.0
+            self._last_physio_update_mono_ns = observation.observed_at_mono_ns
+
+        if (
+            validity != ObservationValidity.VALID.value
+            or landmarks_px is None
+            or bool(getattr(getattr(output, "tracking", None), "is_replayed", False))
+        ):
+            self._blink_detector.observe_missing(mono_seconds)
+            self._head_pose.observe_missing(mono_seconds)
+            self._posture.observe_missing(mono_seconds)
             return
 
-        # C6 (audit): emit FACE_LOST / FACE_REACQUIRED structured events on
-        # the capture-health transition. SENSING's face_tracker counts
-        # lost-frames internally but does NOT emit the observability event;
-        # the daemon owns that here. Edge-triggered off
-        # ``frame_meta.face_detected`` so we log once per transition, not
-        # once per frame.
-        face_now = bool(output.frame_meta.face_detected)
-        if face_now != self._face_present_prev:
-            if face_now:
-                _emit_event(
-                    EventType.FACE_REACQUIRED,
-                    timestamp=float(output.frame_meta.timestamp),
-                    face_confidence=float(output.frame_meta.face_confidence),
-                )
-            else:
-                _emit_event(
-                    EventType.FACE_LOST,
-                    timestamp=float(output.frame_meta.timestamp),
-                )
-            self._face_present_prev = face_now
-
-        roi_frame = self._roi_extractor.extract(output.frame, output.landmarks_px, output.frame_meta.timestamp)
-        combined_rgb = roi_frame.combined_rgb()
-        if combined_rgb is not None:
-            # P0-2 / audit P1: low-quality frames (motion blur / occlusion)
-            # must NOT contribute their RGB sample to the rPPG window — but
-            # they must STILL advance the window by one slot. ``_rgb_history``
-            # is a fixed-maxlen deque; dropping low-quality frames entirely
-            # made the window span a NON-uniform amount of wall-clock time
-            # (e.g. 300 frames over 14 s instead of 10 s when 30 % of frames
-            # were dropped), which biases the Welch-PSD HR estimate. Append a
-            # NaN-sentinel sample instead so the time axis stays uniform; the
-            # NaN gaps are interpolated away just before ``extract_bvp`` (see
-            # below) so the non-NaN-aware filter never sees a NaN.
-            if output.frame_meta.low_quality:
-                self._frames_low_quality_rejected += 1
-                self._rgb_history.append(
-                    np.full(np.shape(combined_rgb), np.nan, dtype=np.float64)
-                )
-            else:
-                self._rgb_history.append(np.asarray(combined_rgb, dtype=np.float64))
-            # B1: stamp every appended slot (NaN sentinel or real) so the
-            # timestamp deque stays index-aligned with ``_rgb_history`` and
-            # the window's effective fps reflects true frame spacing.
-            self._rgb_ts_history.append(float(output.frame_meta.timestamp))
-
-        stride_seconds = self.config.signal.rppg.stride_seconds
-        window_maxlen = self._rgb_history.maxlen or 0
-        if len(self._rgb_history) >= window_maxlen and window_maxlen > 0 and (
-            output.frame_meta.timestamp - self._last_physio_update
-        ) >= stride_seconds:
-            rgb_window = np.array(self._rgb_history, dtype=np.float64)
-            # audit P1: interpolate over the NaN-sentinel slots left by
-            # low-quality frames so the window stays time-uniform yet the
-            # downstream (non-NaN-aware) bandpass filter + Welch PSD see a
-            # finite signal. Per-channel linear interpolation; if a whole
-            # channel is NaN (no good frame in the window) it falls back to
-            # zeros, which ``extract_bvp`` already tolerates.
-            rgb_window = _interpolate_nan_window(rgb_window)
-            # B1: derive the window's effective fps from the real frame
-            # timestamps (n-1 intervals over the wall-clock span). Self-
-            # correcting and smooth over the ~10 s window; clamped to a
-            # plausible camera band, else we fall back to the configured
-            # rate. This is the single number that makes the Welch BPM
-            # correct (HR = dominant_freq × 60).
-            fs_eff = self._effective_rppg_fps()
-            bvp = extract_bvp(
-                rgb_window,
-                algorithm=self.config.signal.rppg.backend,
-                fs=fs_eff,
-                model_path=self.config.signal.rppg.model_path,
-            )
-            head_jitter_deg = float(roi_frame.head_jitter_px) * (45.0 / max(1.0, float(self.config.capture.width)))
-            self._pulse_estimator.process_window(
-                bvp,
-                timestamp=output.frame_meta.timestamp,
-                fs=fs_eff,
-                head_jitter_deg=head_jitter_deg,
-                face_presence_ratio=1.0 if output.frame_meta.face_detected else 0.0,
-                # C5 (audit): forward the prior frame's blink-suppression
-                # score so ``PulseEstimator`` → ``RespirationEstimator``
-                # can run the apnea sustain timer off real fixation data
-                # (1-frame lag is acceptable; kinematics for THIS frame are
-                # computed below, after the window is built).
-                blink_suppression=self._last_blink_suppression_score,
-            )
-            self._latest_physio = self._pulse_estimator.get_features(output.frame_meta.timestamp)
-            registry.register("latest_physio", self._latest_physio)
-            # P1-PIPE-CLOCK: feature_fusion staleness math (_compute_signal_quality)
-            # subtracts this stamp from time.monotonic() at fuse() time, so it MUST
-            # be a monotonic instant. frame_meta.timestamp is a time.time() EPOCH
-            # (~1.7e9); using it made staleness hugely negative and the staleness
-            # penalties dead. _last_physio_update below is a SEPARATE epoch var used
-            # for the epoch-vs-epoch rPPG-stride gate at :2035 — leave it on epoch.
-            self._feature_fusion.update_physio(self._latest_physio, timestamp=time.monotonic())
-            self._last_physio_update = output.frame_meta.timestamp
-
-        blink = self._blink_detector.update(output.landmarks_px, output.frame_meta.timestamp)
-        pose = self._head_pose.update(output.landmarks_px, output.frame_meta.timestamp)
-        posture = self._posture.update_with_face(output.landmarks_px, output.frame_meta.timestamp)
+        blink = self._blink_detector.update(landmarks_px, mono_seconds)
+        pose = self._head_pose.update(landmarks_px, mono_seconds)
+        posture = self._posture.update(
+            pitch_deg=pose.pitch,
+            face_scale=self._posture.face_scale(landmarks_px),
+            timestamp=mono_seconds,
+            camera_identity_key=identity.identity_key,
+        )
         self._latest_kinematics = KinematicFeatures(
             blink_rate=blink.blink_rate,
             blink_rate_delta=blink.blink_rate_delta,
@@ -2155,116 +3374,54 @@ class CortexDaemon:
             perclos_60s=blink.perclos_60s,
             mean_blink_duration_ms=blink.mean_blink_duration_ms,
             ear_variance=blink.ear_variance,
+            blink_valid_exposure_seconds=blink.valid_exposure_seconds,
             head_pitch=pose.pitch,
             head_yaw=pose.yaw,
             head_roll=pose.roll,
-            slump_score=posture.slump_score,
-            forward_lean_score=posture.forward_lean_score,
-            shoulder_drop_ratio=posture.shoulder_drop_ratio,
+            head_angular_velocity_deg_per_s=pose.angular_velocity_deg_per_s,
+            head_is_jittery=pose.is_jittery,
+            head_is_frozen=pose.is_frozen,
+            head_neck_flexion_angle=posture.head_neck_flexion_angle,
+            head_neck_flexion_score=posture.head_neck_flexion_score,
+            head_neck_flexion_dwell_seconds=posture.sustained_flexion_seconds,
+            head_neck_proxy_available=posture.proxy_available,
+            slump_score=None,
+            forward_lean_score=None,
+            shoulder_drop_ratio=None,
             confidence=output.frame_meta.face_confidence,
         )
-        registry.register("latest_kinematics", self._latest_kinematics)
-        # B22 (Phase 4.1): stamp the monotonic timestamp the
-        # kinematics features were derived from. The state loop reads
-        # this to decide whether the signal is fresh enough to drive a
-        # state estimate (see ``kinematics_age`` check below).
-        # P1-PIPE-CLOCK: the state loop compares this against
-        # time.monotonic() (timestamp - _last_kinematics_ts at :2288), so
-        # it MUST be a monotonic instant — frame_meta.timestamp is a
-        # time.time() epoch, which made kinematics_age hugely negative and
-        # the >2.0s stale guard unreachable.
-        self._last_kinematics_ts = time.monotonic()
-        # C5 (audit): cache this frame's blink-suppression score so the NEXT
-        # frame's rPPG window build can forward it into the apnea path with
-        # a 1-frame lag. ``blink_suppression_score`` is Optional on
-        # KinematicFeatures (None until the blink detector warms up).
-        self._last_blink_suppression_score = float(
-            blink.blink_suppression_score or 0.0
+        self._services.register("latest_kinematics", self._latest_kinematics)
+        self._last_kinematics_ts = mono_seconds
+        self._feature_fusion.update_kinematics(
+            self._latest_kinematics,
+            timestamp=mono_seconds,
         )
-        # P1-PIPE-CLOCK: monotonic stamp for fusion staleness math (see
-        # update_physio above). frame_meta.timestamp is an epoch and would
-        # make _compute_signal_quality's staleness penalty dead code.
-        self._feature_fusion.update_kinematics(self._latest_kinematics, timestamp=time.monotonic())
 
-    async def _telemetry_loop(self) -> None:
-        try:
-            while True:
-                if not self._telemetry_enabled:
-                    await asyncio.sleep(0.5)
-                    continue
-                features = self._aggregator.build_features()
-                registry.register("latest_telemetry", features)
-                self._feature_fusion.update_telemetry(features)
-                await asyncio.sleep(0.5)
-        except asyncio.CancelledError:
-            # B6 (Phase 4.1): graceful telemetry shutdown.
-            logger.debug("telemetry loop cancelled")
+    async def _sample_telemetry(self) -> None:
+        """Publish one telemetry sample; cadence belongs to its coordinator."""
 
-    async def _broadcast_loop(self) -> None:
-        """Broadcast STATE_UPDATE at a steady 500ms cadence (B.3).
+        features = self._aggregator.build_features()
+        self._services.register("latest_telemetry", features)
+        self._runtime_data.publish_telemetry(features)
+        self._feature_fusion.update_telemetry(features)
 
-        The state pipeline (``_state_loop``) can take 1-3s per iteration when
-        an intervention path runs — feature fusion + classification + LLM
-        trigger evaluation, plus the per-iteration ``await asyncio.sleep(0.5)``.
-        That dragged the visible STATE_UPDATE cadence out of spec; UI bars
-        froze for seconds whenever the daemon was actively working.
+    async def _refresh_context(self) -> None:
+        """Build and publish one context snapshot."""
 
-        This dedicated task wakes every 500ms regardless, reads the latest
-        cached estimate + biometrics that ``_state_loop`` produced, and
-        broadcasts. Clients see a stable cadence; the pipeline is free to
-        run as fast (or slow) as it needs.
-        """
-        try:
-            interval = self._broadcast_interval_seconds
-            while True:
-                await asyncio.sleep(interval)
-                # Audit-2 fix: read the (estimate, biometrics) pair from
-                # the atomic snapshot so the broadcast never ships an
-                # estimate(T+1) paired with biometrics(T). The state
-                # loop writes ``_latest_broadcast_snapshot`` as a single
-                # tuple assignment; the GIL guarantees that pointer swap
-                # is atomic, eliminating the pair-write tearing window.
-                snapshot = self._latest_broadcast_snapshot
-                if snapshot is None:
-                    continue
-                estimate, biometrics = snapshot
-                try:
-                    await self._ws_server.broadcast_state(estimate, biometrics)
-                except Exception:
-                    logger.debug("broadcast_state failed", exc_info=True)
-        except asyncio.CancelledError:
-            # B6 (Phase 4.1): graceful broadcast loop shutdown.
-            logger.debug("broadcast loop cancelled")
-
-    async def _context_loop(self) -> None:
-        """Build context every 5s — separate from fast state loop to avoid blocking."""
-        try:
-            while True:
-                try:
-                    context = await self._context_engine.build_context()
-                    # Audit-2 fix: apply user-supplied goal override so the
-                    # planner sees the intent the user typed into the
-                    # dashboard. We mutate the freshly-built context (no
-                    # external reference yet, no race).
-                    if self._user_goal_override:
-                        try:
-                            context.current_goal_hint = self._user_goal_override
-                        except Exception:
-                            logger.debug(
-                                "Failed to apply user goal override",
-                                exc_info=True,
-                            )
-                    self._latest_context = context
-                    registry.register("latest_task_context", context)
-                    self._terminal_adapter.set_running_command(
-                        context.terminal_context.running_command if context.terminal_context else None
-                    )
-                except Exception:
-                    logger.exception("Context loop error")
-                await asyncio.sleep(5.0)
-        except asyncio.CancelledError:
-            # B6 (Phase 4.1): graceful context loop shutdown.
-            logger.debug("context loop cancelled")
+        context = await self._context_engine.build_context()
+        if self._user_goal_override:
+            try:
+                context.current_goal_hint = self._user_goal_override
+            except Exception:
+                logger.debug("Failed to apply user goal override", exc_info=True)
+        self._latest_context = context
+        self._services.register("latest_task_context", context)
+        self._runtime_data.publish_task_context(context)
+        self._terminal_adapter.set_running_command(
+            context.terminal_context.running_command
+            if context.terminal_context
+            else None
+        )
 
     async def _retention_sweep_loop(self) -> None:
         """Run the daily retention sweep (G.2).
@@ -2292,6 +3449,7 @@ class CortexDaemon:
                         self.config.storage,
                         storage_root=storage_root,
                     )
+                    await self._storage_maintenance.enforce_retention()
                 except Exception:
                     logger.debug("Retention sweep failed", exc_info=True)
                 await asyncio.sleep(24 * 60 * 60)
@@ -2332,12 +3490,8 @@ class CortexDaemon:
         the reader cache so the next history query surfaces it. Cancelled in
         stop() BEFORE the finalize write, so there is no write race.
         """
-        interval = float(
-            getattr(self.config.storage, "session_checkpoint_seconds", 90.0)
-        )
-        min_seconds = float(
-            getattr(self.config.storage, "session_checkpoint_min_seconds", 30.0)
-        )
+        interval = float(getattr(self.config.storage, "session_checkpoint_seconds", 90.0))
+        min_seconds = float(getattr(self.config.storage, "session_checkpoint_min_seconds", 30.0))
         if interval <= 0:
             return
         try:
@@ -2351,6 +3505,7 @@ class CortexDaemon:
                         continue
                     wrote = await asyncio.to_thread(self._write_session_file, snap)
                     if wrote:
+                        await self._legacy_data_migrator.upsert_session(snap)
                         # Refresh the listing cache on the main thread so the
                         # next History query picks up the checkpoint.
                         self._session_reader.invalidate(snap.session_id)
@@ -2364,69 +3519,98 @@ class CortexDaemon:
         except asyncio.CancelledError:
             logger.debug("session checkpoint loop cancelled")
 
-    async def _causal_report_loop(self) -> None:
-        """Generate nightly causal report from AMIP policy logs."""
-        try:
-            while True:
-                try:
-                    now = time.localtime()
-                    target_hour = self.config.eval.causal_report.nightly_hour_local
-                    if now.tm_hour == target_hour and now.tm_min < 5:
-                        generate_daily_causal_report(self.config.storage.path)
-                        await asyncio.sleep(300.0)
-                        continue
-                except Exception:
-                    logger.debug("Failed generating causal report", exc_info=True)
-                await asyncio.sleep(60.0)
-        except asyncio.CancelledError:
-            # B6 (Phase 4.1): graceful causal report loop shutdown.
-            logger.debug("causal report loop cancelled")
+    async def _generate_policy_diagnostics_if_due(self) -> bool:
+        """Generate one due diagnostic; polling cadence belongs to WP10."""
+
+        now = utc_datetime(self._clock).astimezone()
+        target_hour = self.config.eval.policy_diagnostics.nightly_hour_local
+        if now.hour != target_hour or now.minute >= 5:
+            return False
+        await generate_daily_policy_diagnostics(
+            self._policy_repository,
+            self.config.storage.path,
+            day=self._clock.today_utc().isoformat(),
+        )
+        return True
+
+    def _policy_outcome_snapshot(self) -> dict[str, Any] | None:
+        """Capture the same bounded behavioral fields for every policy arm."""
+
+        estimate = self._current_state_estimate()
+        context = self._latest_context
+        if estimate is None or context is None:
+            return None
+        browser = getattr(context, "browser_context", None)
+        return {
+            "schema_version": "policy-outcome-snapshot/2.0",
+            "support_state": str(getattr(estimate, "state", "UNKNOWN")),
+            "support_status": str(getattr(estimate, "status", "unavailable")),
+            "support_confidence": float(getattr(estimate, "confidence", 0.0) or 0.0),
+            "evidence_coverage": float(getattr(estimate, "evidence_coverage", 0.0) or 0.0),
+            "complexity_score": float(getattr(context, "complexity_score", 0.0) or 0.0),
+            "tab_count": int(getattr(browser, "tab_count", 0) or 0),
+            "error_count": int(getattr(context, "total_errors", 0) or 0),
+            "thrashing_score": float(getattr(self._aggregator, "thrashing_score", 0.0) or 0.0),
+            "observed_at_unix_ms": self._clock.unix_ms(),
+            "observed_at_mono_ns": self._clock.monotonic_ns(),
+            "boot_id": str(self._clock.boot_id),
+        }
+
+    async def _finalize_policy_outcomes(self) -> None:
+        """Finalize one due outcome batch, including the no-action arm."""
+
+        finalized = await self._policy_lifecycle.finalize_due(
+            self._policy_outcome_snapshot,
+        )
+        if finalized:
+            logger.info("Finalized %d policy outcome window(s)", len(finalized))
 
     async def _state_loop(self) -> None:
         try:
             while True:
-                timestamp = time.monotonic()
+                if self._inference_publication_paused:
+                    await asyncio.sleep(0.05)
+                    continue
+                event_time = EventTime.from_clock(self._clock)
+                timestamp = event_time.observed_at_mono_ns / 1_000_000_000.0
                 try:
-                    vector, quality = self._feature_fusion.fuse(timestamp=timestamp)
+                    vector, quality = self._feature_fusion.fuse(event_time=event_time)
 
                     # v2.0: Inject thrashing score from aggregator. The
                     # FeatureAggregator guarantees ``thrashing_score`` as
                     # a property returning float (0.0 when no events have
                     # accumulated yet) so we can read it unconditionally.
                     vector.thrashing_score = self._aggregator.thrashing_score
-
-                    scores = self._scorer.compute_scores(vector)
-                    # C.2: blend ML classifier into smoother HYPER score
-                    # once we have enough labeled episodes for a useful ramp.
-                    ml_p_hyper: float | None = None
-                    ml_alpha = 0.0
+                    window_switch_value = vector.features.get(FeatureName.TAB_SWITCH_RATE_PER_MIN)
                     if (
-                        self._ml_classifier is not None
-                        and self._ml_classifier.is_fitted
-                        and self._ml_labeled_episodes
-                        >= self.config.state.ml_min_labeled_episodes
+                        vector.telemetry_seen_count >= 5
+                        and quality.telemetry > 0.0
+                        and window_switch_value is not None
+                        and window_switch_value.valid
                     ):
-                        try:
-                            x = np.asarray(vector.to_array(), dtype=np.float64).reshape(1, -1)
-                            # audit P0 (mypy): the real classifier API is
-                            # ``predict_proba`` returning calibrated
-                            # P(HYPER); ``predict`` never existed, so this
-                            # branch raised AttributeError and the ML blend
-                            # was silently skipped on every tick.
-                            ml_p_hyper = float(self._ml_classifier.predict_proba(x)[0])
-                            full_at = max(1, self.config.state.ml_alpha_full_at_episodes)
-                            ramp = min(1.0, self._ml_labeled_episodes / full_at)
-                            ml_alpha = self.config.state.ml_alpha_max * ramp
-                        except Exception:
-                            logger.debug("ML classifier predict failed", exc_info=True)
-                            ml_p_hyper = None
-                            ml_alpha = 0.0
+                        vector.features[FeatureName.THRASHING_SCORE] = FeatureValue(
+                            value=vector.thrashing_score,
+                            valid=True,
+                            quality=quality.telemetry,
+                            age_ms=0,
+                            source_window_ms=60_000,
+                            algorithm_version="focus-transition-graph-v2",
+                        )
+
+                    # Product containment: the current webcam pipeline has
+                    # not met the validation duration/reference gates for
+                    # HRV or respiration. Null them before *any* scorer,
+                    # detector, report, or policy can consume an injected or
+                    # stale value. Heart rate remains quality-gated and live.
+                    vector.hrv_rmssd = None
+                    vector.hrv_sdnn = None
+                    vector.respiration_rate = None
+
+                    evaluation = self._support_inference.evaluate(vector)
                     estimate = self._smoother.update(
-                        scores,
+                        evaluation,
                         quality,
-                        timestamp=timestamp,
-                        ml_p_hyper=ml_p_hyper,
-                        ml_alpha=ml_alpha,
+                        event_time=event_time,
                     )
 
                     # B22 (Phase 4.1): mark the kinematics channel signal-
@@ -2444,8 +3628,7 @@ class CortexDaemon:
                     if kinematics_age is not None and kinematics_age > 2.0:
                         if estimate.signal_quality.kinematics > 0.0:
                             logger.debug(
-                                "kinematics signal stale (age=%.2fs) — "
-                                "zeroing channel quality",
+                                "kinematics signal stale (age=%.2fs) — zeroing channel quality",
                                 kinematics_age,
                             )
                             try:
@@ -2454,6 +3637,7 @@ class CortexDaemon:
                                 from cortex.libs.schemas.state import (
                                     SignalQuality as _SQ,
                                 )
+
                                 estimate.signal_quality = _SQ(
                                     physio=estimate.signal_quality.physio,
                                     kinematics=0.0,
@@ -2465,55 +3649,53 @@ class CortexDaemon:
                                     exc_info=True,
                                 )
 
-                    # v2.0: Update stress integral
-                    if vector.hrv_rmssd is not None:
-                        self._stress_tracker.update(vector.hrv_rmssd, timestamp)
-                        estimate.stress_integral = self._stress_tracker.current_load
-                        # P0 §3.7 audit fix: re-arm BREAK_RECOMMENDATION
-                        # when the stress integral drops back below the
-                        # warning threshold (80% of the break threshold).
-                        # Without this the latch stayed True after a
-                        # dismissed recommendation, so the user only got
-                        # one pulse per session even after their HRV
-                        # recovered and re-degraded.
-                        if (
-                            self._break_recommendation_sent
-                            and self._stress_tracker.load_ratio < 0.8
-                        ):
-                            logger.info(
-                                "Stress integral recovered to %.0f%% — "
-                                "re-arming BREAK_RECOMMENDATION",
-                                self._stress_tracker.load_ratio * 100,
-                            )
-                            self._break_recommendation_sent = False
-                        # B21: remember the timestamp of the most recent
-                        # HRV reading so the time-elapsed re-arm gate
-                        # below can tell "HRV silent for a while" apart
-                        # from "HRV never delivered".
-                        self._last_hrv_seen_at = timestamp
-                    else:
-                        # B21 (Phase 4.1): when HRV has been None for an
-                        # extended period AND the recommendation is
-                        # still latched, allow a time-elapsed re-arm so
-                        # the user can be re-prompted on the NEXT
-                        # genuine stress integral build-up. Pre-fix the
-                        # latch required an HRV reading to clear; if the
-                        # user's camera ROI degraded post-break the
-                        # recommendation would never re-fire.
-                        last_seen = getattr(self, "_last_hrv_seen_at", 0.0)
-                        hrv_silent_for = timestamp - last_seen
-                        if (
-                            self._break_recommendation_sent
-                            and last_seen > 0.0
-                            and hrv_silent_for > 30.0
-                        ):
-                            logger.info(
-                                "HRV silent for %.0fs after a break "
-                                "recommendation — re-arming so the next "
-                                "build-up can re-trigger",
-                                hrv_silent_for,
-                            )
-                            self._break_recommendation_sent = False
+                    # Containment: webcam HRV/respiration and the derived
+                    # stress integral are unavailable until metric-specific
+                    # reference validation lands. Never carry an old tracker
+                    # value into a public state estimate.
+                    estimate.stress_integral = None
+
+                    # Opt-in break reminders use only elapsed active-work time
+                    # and the user's declared interval. They do not consume
+                    # pulse, HRV, state labels, or the retired stress integral.
+                    inactivity_feature = vector.features.get(FeatureName.INACTIVITY_SECONDS)
+                    input_is_active = bool(
+                        inactivity_feature is not None
+                        and inactivity_feature.valid
+                        and inactivity_feature.value is not None
+                        and inactivity_feature.value
+                        < self.config.intervention.focus_break_inactivity_pause_seconds
+                    )
+                    self._focus_break_policy.update_preferences(
+                        enabled=(self.config.intervention.enable_focus_break_reminders),
+                        interval_minutes=(self.config.intervention.focus_break_interval_minutes),
+                        suggested_duration_seconds=(
+                            self.config.intervention.focus_break_duration_seconds
+                        ),
+                    )
+                    break_decision = self._focus_break_policy.evaluate(
+                        active=input_is_active,
+                        timestamp=timestamp,
+                    )
+                    self._services.register("latest_focus_break_decision", break_decision)
+                    if break_decision.should_recommend and self._interventions_enabled:
+                        from cortex.libs.schemas.realtime import BreakRecommendation
+
+                        recommendation = BreakRecommendation(
+                            reason="You've reached your preferred focus interval.",
+                            urgency="low",
+                            basis="elapsed_focus",
+                            focus_elapsed_seconds=(break_decision.active_elapsed_seconds),
+                            preferred_interval_seconds=(break_decision.preferred_interval_seconds),
+                            stress_load=None,
+                            threshold=None,
+                            duration_seconds=(break_decision.suggested_duration_seconds),
+                            breathing_pattern="box",
+                        )
+                        await self._ws_server.send_message(
+                            MessageType.BREAK_RECOMMENDATION.value,
+                            recommendation.model_dump(mode="json"),
+                        )
 
                     # P0 §3.9: feed the causal attributor at the same
                     # cadence so the per-signal sparkline buffers fill
@@ -2523,7 +3705,8 @@ class CortexDaemon:
                     # cold.
                     try:
                         self._causal_attributor.record_feature_vector(vector)
-                        registry.register("latest_feature_vector", vector)
+                        self._services.register("latest_feature_vector", vector)
+                        self._runtime_data.publish_feature_vector(vector)
                     except Exception:
                         # B20 (Phase 4.1): a silent attributor failure
                         # means the per-intervention causal sparkline
@@ -2531,7 +3714,8 @@ class CortexDaemon:
                         # serves stale data. Elevate to WARNING so the
                         # observability path catches it.
                         logger.warning(
-                            "causal attributor feed failed", exc_info=True,
+                            "causal attributor feed failed",
+                            exc_info=True,
                         )
 
                     # v2.0: Feed longitudinal tracker per-sample data.
@@ -2541,12 +3725,13 @@ class CortexDaemon:
                     if vector.hr is not None:
                         self._longitudinal.accumulate(
                             hr=vector.hr,
-                            hrv=vector.hrv_rmssd,
-                            resp=vector.respiration_rate,
+                            hrv=None,
+                            resp=None,
                             state=estimate.state,
                         )
 
-                    registry.register("latest_state_estimate", estimate)
+                    self._services.register("latest_state_estimate", estimate)
+                    self._runtime_data.publish_state_estimate(estimate)
                     self._recorder.append("state_estimate", estimate.model_dump(mode="json"))
                     # G.1: feed the session-debrief generator.
                     try:
@@ -2554,42 +3739,36 @@ class CortexDaemon:
                             self._session_report.start()
                             self._session_report_started = True
                         self._session_report.record_state(
-                            estimate.state, time.time(),
+                            estimate.state,
+                            unix_seconds(self._clock),
                         )
                         if vector.hr:
                             self._session_report.record_hr(float(vector.hr))
-                        if vector.hrv_rmssd:
-                            self._session_report.record_hrv(float(vector.hrv_rmssd))
-                        if estimate.stress_integral is not None:
-                            self._session_report.record_stress(
-                                float(estimate.stress_integral)
-                            )
                     except Exception:
                         logger.debug("session_report record failed", exc_info=True)
-                    # Audit-2 fix: publish ``forward_lean`` as a 0-1 score
-                    # (rescaled from the underlying 0-45° angle). The
-                    # browser extension's posture alert threshold (0.6)
-                    # was previously compared against raw degrees, so
-                    # every user got a posture toast within 3 min of
-                    # session start regardless of actual posture. The
-                    # raw angle is still surfaced as ``forward_lean_angle``
-                    # for any consumer that prefers degrees.
-                    _lean_angle = vector.forward_lean_angle
-                    _lean_score: float | None
-                    if _lean_angle is None:
-                        _lean_score = None
-                    else:
-                        _lean_score = max(0.0, min(1.0, float(_lean_angle) / 45.0))
+                    # The camera measures only a camera-relative head/neck
+                    # pitch proxy.  Publish its calibrated semantics directly;
+                    # the old torso/shoulder-named fields stay unavailable so
+                    # no consumer can mistake the proxy for body posture.
                     biometrics = {
                         "heart_rate": vector.hr,
-                        "hrv_rmssd": vector.hrv_rmssd,
                         "hr_delta": vector.hr_delta,
                         "blink_rate": vector.blink_rate,
-                        "forward_lean": _lean_score,
-                        "forward_lean_angle": _lean_angle,
-                        "respiration_rate": vector.respiration_rate,
+                        "head_neck_flexion_score": (
+                            vector.head_neck_flexion_score
+                            if vector.head_neck_proxy_available
+                            else None
+                        ),
+                        "head_neck_flexion_angle": (
+                            vector.head_neck_flexion_angle
+                            if vector.head_neck_proxy_available
+                            else None
+                        ),
+                        "head_neck_flexion_dwell_seconds": (vector.head_neck_flexion_dwell_seconds),
+                        "head_neck_proxy_available": (vector.head_neck_proxy_available),
+                        "forward_lean": None,
+                        "forward_lean_angle": None,
                         "thrashing_score": vector.thrashing_score,
-                        "stress_integral": self._stress_tracker.current_load,
                     }
                     # B.3: cache for the dedicated broadcast loop instead of
                     # broadcasting inline. Inline broadcasts let LLM/trigger
@@ -2605,7 +3784,7 @@ class CortexDaemon:
                     self._latest_biometrics = biometrics
                     self._latest_broadcast_snapshot = (estimate, biometrics)
 
-                    if self._state_callback is not None:
+                    if self._events.state.subscriber_count:
                         # F17: stamp a monotonic sequence into the payload so
                         # the in-process bridge can drop reordered frames.
                         # ``_seq`` underscore-prefix marks this as a wire
@@ -2625,17 +3804,36 @@ class CortexDaemon:
                         _payload: dict[str, Any] = {
                             "_seq": self._state_callback_seq,
                             "state": estimate.state,
+                            "support_state": estimate.support_state,
+                            "status": estimate.status,
                             "confidence": estimate.confidence,
                             "scores": _scores_dump,
+                            "support_scores": (
+                                estimate.support_scores.model_dump()
+                                if estimate.support_scores is not None
+                                else None
+                            ),
+                            "evidence_coverage": estimate.evidence_coverage,
+                            "contributing_features": [
+                                item.model_dump(mode="json")
+                                for item in estimate.contributing_features
+                            ],
+                            "exclusions": list(estimate.exclusions),
+                            "model": estimate.model.model_dump(mode="json"),
+                            "probabilities": None,
                             "signal_quality": estimate.signal_quality.model_dump(),
                             "dwell_seconds": estimate.dwell_seconds,
                             "reasons": estimate.reasons,
                             "biometrics": biometrics,
-                            "timestamp": float(getattr(estimate, "timestamp", timestamp) or timestamp),
+                            "timestamp": float(
+                                getattr(estimate, "timestamp", timestamp) or timestamp
+                            ),
                             "stress_integral": getattr(estimate, "stress_integral", None),
-                            "source": getattr(estimate, "source", "classifier"),
-                            "degraded": bool(getattr(estimate, "degraded", False)),
-                            "calibrated_probabilities": getattr(estimate, "calibrated_probabilities", None),
+                            "source": "rules",
+                            "degraded": estimate.status != "estimated",
+                            "calibrated_probabilities": estimate.__dict__.get(
+                                "calibrated_probabilities"
+                            ),
                             "classifier_source": getattr(estimate, "classifier_source", None),
                             "classifier_alpha": getattr(estimate, "classifier_alpha", None),
                             # G1 (audit-prod): forward the WS server's view of
@@ -2648,12 +3846,13 @@ class CortexDaemon:
                                 else []
                             ),
                         }
-                        self._state_callback(copy.deepcopy(_payload))
+                        self._events.state.publish(_payload)
 
                     # v2.0: Copilot throttle on state transitions
                     if estimate.state != self._prev_state:
                         await self._copilot_throttle.on_state_change(
-                            estimate.state, estimate.confidence,
+                            estimate.state,
+                            estimate.confidence,
                         )
                         self._prev_state = estimate.state
 
@@ -2663,7 +3862,8 @@ class CortexDaemon:
                     # user dwells in HYPER without state transitions.
                     try:
                         await self._evaluate_auto_distraction_block(
-                            estimate, timestamp,
+                            estimate,
+                            timestamp,
                         )
                     except Exception:
                         logger.debug(
@@ -2672,18 +3872,24 @@ class CortexDaemon:
                         )
 
                     await self._maybe_trigger_leetcode_interventions(
-                        estimate, vector, timestamp,
+                        estimate,
+                        vector,
+                        timestamp,
                     )
 
                     context = self._latest_context
                     if context is not None:
-                        telemetry_for_trigger = registry.get("latest_telemetry")
+                        telemetry_for_trigger = self._current_telemetry()
                         typing_burst_seconds = 0.0
                         if telemetry_for_trigger is not None:
-                            kb_burst = float(getattr(telemetry_for_trigger, "keyboard_burst_score", 0.0))
+                            kb_burst = float(
+                                getattr(telemetry_for_trigger, "keyboard_burst_score", 0.0)
+                            )
                             if kb_burst >= 0.8:
-                                typing_burst_seconds = self.config.intervention.receptivity_typing_burst_seconds
-                        hour_now = time.localtime().tm_hour
+                                typing_burst_seconds = (
+                                    self.config.intervention.receptivity_typing_burst_seconds
+                                )
+                        hour_now = utc_datetime(self._clock).astimezone().hour
                         within_work_hours = (
                             self.config.intervention.receptivity_work_hours_start
                             <= hour_now
@@ -2700,7 +3906,7 @@ class CortexDaemon:
                         # controller can suppress audio when the user
                         # is on a call.
                         if mic_state:
-                            self._last_mic_active_at = time.monotonic()
+                            self._last_mic_active_at = monotonic_seconds(self._clock)
                         decision = self._trigger_policy.evaluate(
                             estimate,
                             context_complexity=context.complexity_score,
@@ -2710,14 +3916,16 @@ class CortexDaemon:
                             within_work_hours=within_work_hours,
                             current_time=timestamp,
                         )
-                        registry.register("latest_trigger_decision", decision)
+                        self._services.register("latest_trigger_decision", decision)
                         await self._handle_restore_updates(estimate, timestamp)
 
                         # v2.0: Check zombie reading
                         active_app = self._current_app_name()
-                        telemetry = registry.get("latest_telemetry")
+                        telemetry = self._current_telemetry()
                         kinematics = self._latest_kinematics
-                        self._zombie_detector.update_baseline(self._scorer.baselines.blink_rate_baseline)
+                        self._zombie_detector.update_baseline(
+                            self._scorer.baselines.blink_rate_baseline
+                        )
                         # audit P2: zombie-reading + rabbit-hole detection feed
                         # off ``estimate.state`` and ``blink_rate`` — the SAME
                         # biometric pipeline the standard intervention trigger
@@ -2727,7 +3935,9 @@ class CortexDaemon:
                         # fired a spurious active-recall / goal-drift overlay.
                         # Apply the same floor here so all HYPER-derived
                         # interventions share one quality gate.
-                        signal_ok = estimate.signal_quality.acceptable
+                        signal_ok = bool(
+                            estimate.status == "estimated" and estimate.evidence_coverage >= 0.45
+                        )
                         # Advance the detector's dwell state on every tick so
                         # its timers stay continuous, but only FIRE the
                         # intervention when the signal is trustworthy.
@@ -2740,7 +3950,9 @@ class CortexDaemon:
                         if signal_ok and zombie_detected:
                             logger.info("Zombie reading detected — triggering active recall")
                             await self._trigger_special_intervention(
-                                context, estimate, template_name="active_recall",
+                                context,
+                                estimate,
+                                template_name="active_recall",
                                 ws_type="ACTIVE_RECALL",
                             )
 
@@ -2758,82 +3970,24 @@ class CortexDaemon:
                             if signal_ok and alert is not None:
                                 logger.info("Rabbit hole detected — goal drift intervention")
                                 await self._trigger_special_intervention(
-                                    context, estimate, template_name="rabbit_hole",
+                                    context,
+                                    estimate,
+                                    template_name="rabbit_hole",
                                     ws_type="INTERVENTION_TRIGGER",
                                 )
 
-                        # v2.0: Check stress integral — break at 100% (priority), warn at 80%
-                        # P0 §3.7 audit fix: feature flag gates the
-                        # *biology-break* augmentations (BREAK_RECOMMENDATION
-                        # pulse + planner promotion) without disturbing the
-                        # legacy breathing_overlay special intervention,
-                        # which always fires on threshold crossing.
-                        biology_break_enabled = bool(
-                            getattr(
-                                self.config.intervention,
-                                "enable_biology_break",
-                                True,
-                            )
-                        )
-                        if self._stress_tracker.should_break():
-                            logger.info("Stress integral threshold — biological break")
-                            # P0 §3.7: emit BREAK_RECOMMENDATION once
-                            # per False→True transition. The pulse
-                            # surfaces a soft pill on every UI even
-                            # when no overlay is active.
-                            if biology_break_enabled and not self._break_recommendation_sent:
-                                try:
-                                    pre_hrv_snapshot = (
-                                        float(vector.hrv_rmssd)
-                                        if vector.hrv_rmssd is not None
-                                        else None
-                                    )
-                                    suggested_pattern = self._suggest_break_pattern(pre_hrv_snapshot)
-                                    urgency = self._classify_break_urgency()
-                                    await self._ws_server.send_message(
-                                        MessageType.BREAK_RECOMMENDATION.value,
-                                        {
-                                            "reason": "stress_integral_crossed_threshold",
-                                            "urgency": urgency,
-                                            "stress_load": float(
-                                                self._stress_tracker.current_load
-                                            ),
-                                            "threshold": float(
-                                                self._stress_tracker.threshold
-                                            ),
-                                            "duration_seconds": 240,
-                                            "breathing_pattern": suggested_pattern,
-                                        },
-                                    )
-                                    self._break_recommendation_sent = True
-                                except Exception:
-                                    logger.debug(
-                                        "BREAK_RECOMMENDATION send failed",
-                                        exc_info=True,
-                                    )
-                            await self._trigger_special_intervention(
-                                context, estimate, template_name="breathing_overlay",
-                                ws_type="BREATHING_OVERLAY",
-                            )
-                            # NB: do NOT reset the integral here — the
-                            # break controller decides whether to reset
-                            # (natural completion) or apply a partial
-                            # recovery credit (early termination). The
-                            # legacy reset() was too eager — it cleared
-                            # the integral even if the user dismissed
-                            # the BREATHING_OVERLAY toast outright.
-                        elif self._stress_tracker.should_warn():
-                            logger.info("Stress integral at 80%% — pre-break warning")
-                            await self._trigger_special_intervention(
-                                context, estimate, template_name="pre_break_warning",
-                                ws_type="PRE_BREAK_WARNING",
-                            )
+                        # HRV-derived stress warnings and break triggers are
+                        # intentionally unavailable. Reintroduction requires
+                        # the validated SignalEstimate contract and the
+                        # intervention transaction from WP-3/WP-6.
 
                         # v2.0: Check shutdown detection
                         if self._shutdown_detector.should_handover(
                             posture_slump=kinematics.slump_score or 0.0,
                             hrv=vector.hrv_rmssd,
-                            error_count=context.total_errors if hasattr(context, 'total_errors') else 0,
+                            error_count=context.total_errors
+                            if hasattr(context, "total_errors")
+                            else 0,
                         ):
                             logger.info("Shutdown signal detected — generating handover")
                             await self._generate_handover(context)
@@ -2844,74 +3998,89 @@ class CortexDaemon:
                             and decision.should_trigger
                             and self._active_intervention_id is None
                             and estimate.signal_quality.acceptable
+                            and self._clock.monotonic_ns() >= self._next_policy_decision_mono_ns
                         ):
-                            bandit_features = np.array(
-                                self._build_bandit_features(estimate, context),
-                                dtype=np.float64,
+                            browser = getattr(context, "browser_context", None)
+                            policy_context = PolicyContextSnapshot(
+                                support_state=str(getattr(estimate, "state", "UNKNOWN")),
+                                support_status=str(getattr(estimate, "status", "unavailable")),
+                                support_confidence=float(
+                                    getattr(estimate, "confidence", 0.0) or 0.0
+                                ),
+                                evidence_coverage=float(
+                                    getattr(estimate, "evidence_coverage", 0.0) or 0.0
+                                ),
+                                complexity_score=float(
+                                    getattr(context, "complexity_score", 0.0) or 0.0
+                                ),
+                                tab_count=int(getattr(browser, "tab_count", 0) or 0),
+                                error_count=int(getattr(context, "total_errors", 0) or 0),
+                                thrashing_score=float(
+                                    getattr(self._aggregator, "thrashing_score", 0.0) or 0.0
+                                ),
+                                hour_utc=utc_datetime(self._clock).hour,
                             )
-                            selected_bandit_arm: int | None = None
-                            if self.config.eval.policy == "amip":
-                                amip_decision = self._amip.choose_action(
-                                    bandit_features,
-                                    confidence=decision.confidence,
-                                    receptive=not decision.receptivity_blocked,
-                                    stress_ratio=self._stress_tracker.load_ratio,
+                            preferred = self.config.eval.production.preferred_low_friction_arm
+                            feasible_arms: tuple[PolicyArm, ...] = (
+                                "no_action",
+                                "suggest_only",
+                            )
+                            if preferred is not None and preferred not in feasible_arms:
+                                feasible_arms = (*feasible_arms, preferred)
+                            try:
+                                report_snapshot = self._session_report.snapshot()
+                                session_id = str(report_snapshot.session_id)
+                            except Exception:
+                                session_id = f"boot:{self._clock.boot_id}"
+                            try:
+                                policy_decision = await self._policy_lifecycle.decide(
+                                    PolicySelectionInput(
+                                        decision_point_id=uuid4(),
+                                        session_id=session_id,
+                                        context=policy_context,
+                                        eligible=True,
+                                        available=not decision.receptivity_blocked,
+                                        availability_reason=(
+                                            "eligible_and_receptive"
+                                            if not decision.receptivity_blocked
+                                            else "receptivity_blocked"
+                                        ),
+                                        feasible_arms=feasible_arms,
+                                        recent_repeated_dismissal=bool(
+                                            decision.dismissal_probability is not None
+                                            and decision.dismissal_probability
+                                            >= self.config.intervention.dismissal_model_threshold
+                                        ),
+                                        preferred_low_friction_arm=preferred,
+                                        reward_version=self.config.eval.outcome.reward_version,
+                                    )
                                 )
-                                self._last_policy_decision_id = amip_decision.decision_id
-                                self._last_policy_arm = amip_decision.action
-                                self._last_policy_propensity = dict(amip_decision.probabilities)
-                                template_name = self._policy_arm_to_template(amip_decision.action)
-                                if amip_decision.action == "no_action":
-                                    await asyncio.sleep(0.5)
-                                    continue
-                            elif self.config.eval.policy == "uniform":
-                                arm_name = np.random.choice(
-                                    [
-                                        "workspace_simplify",
-                                        "task_decompose",
-                                        "breath_box",
-                                        "nature_break",
-                                        "flow_shield",
-                                        "defusion_prompt",
-                                        "circuit_breaker",
-                                    ]
-                                ).item()
-                                self._last_policy_decision_id = None
-                                self._last_policy_arm = arm_name
-                                self._last_policy_propensity = None
-                                template_name = self._policy_arm_to_template(arm_name)
-                            else:
-                                selected_arm = await self._bandit.select_arm_async(bandit_features)
-                                template_name = self._arm_to_template(selected_arm)
-                                self._last_policy_decision_id = None
-                                self._last_policy_arm = self._bandit.get_arm_label(selected_arm)
-                                self._last_policy_propensity = None
-                                selected_bandit_arm = selected_arm
+                            except Exception:
+                                # A decision that cannot be durably recorded
+                                # cannot authorize an interruption.
+                                logger.exception(
+                                    "Policy decision persistence failed; suppressing proposal"
+                                )
+                                continue
+                            self._next_policy_decision_mono_ns = (
+                                self._clock.monotonic_ns()
+                                + self.config.eval.decision_interval_seconds * 1_000_000_000
+                            )
+                            template_name = self._policy_arm_to_template(
+                                policy_decision.selected_arm
+                            )
+                            if policy_decision.selected_arm == "no_action":
+                                continue
 
                             # Run intervention in background so the state
                             # loop keeps updating while the LLM responds.
                             self._active_intervention_id = "__pending__"
-                            # Phase-4b TASK D: thread the decision_id
-                            # explicitly so the trigger doesn't fall back
-                            # to a shared mutable slot for outcome
-                            # attribution under concurrency.
-                            decision_id_snapshot = self._last_policy_decision_id
                             self._spawn_background_task(
                                 self._trigger_intervention(
                                     context,
                                     estimate,
                                     template_name=template_name,
-                                    bandit_features=(
-                                        bandit_features.tolist()
-                                        if self.config.eval.policy == "greedy"
-                                        else None
-                                    ),
-                                    bandit_arm_index=(
-                                        selected_bandit_arm
-                                        if self.config.eval.policy == "greedy"
-                                        else None
-                                    ),
-                                    decision_id=decision_id_snapshot,
+                                    policy_decision=policy_decision,
                                 ),
                                 name="cortex-intervention",
                             )
@@ -2943,24 +4112,108 @@ class CortexDaemon:
             return url
         return None
 
+    async def _close_unpresented_transaction(
+        self,
+        intervention_id: str,
+        *,
+        reason: str,
+        clear_snapshot: bool = True,
+    ) -> None:
+        """Close a registered proposal that never became presentable.
+
+        Delivery and cancellation can race an approval arriving from a
+        surface that received the final bytes before a transport error. The
+        coordinator therefore abandons only pre-effect states; if authority
+        was already consumed this helper asks for the exact owner-bound
+        inverse and keeps it queued until receipt verification succeeds.
+        Local UI/evaluation state is unwound in either case.
+        """
+
+        restore_command: InterventionRestoreCommand | None = None
+        try:
+            abandoned = await self._transaction_coordinator.abandon(
+                intervention_id,
+                reason,
+            )
+            if not abandoned:
+                restore_command = await self._transaction_coordinator.request_restore(
+                    intervention_id,
+                    reason="system_cancelled",
+                )
+        except Exception:
+            # The durable journal remains authoritative. Startup recovery
+            # will retry any APPLYING/APPLIED transaction we could not close.
+            logger.exception(
+                "Could not close unpresented transaction %s",
+                intervention_id,
+            )
+
+        if restore_command is not None:
+            pending = getattr(self, "_pending_startup_restores", None)
+            if isinstance(pending, dict):
+                pending[restore_command.restore_id] = restore_command
+            sender = getattr(self._ws_server, "send_restore_command", None)
+            if callable(sender):
+                try:
+                    await sender(restore_command)
+                except Exception:
+                    logger.exception(
+                        "Immediate recovery dispatch failed for %s; queued",
+                        intervention_id,
+                    )
+
+        if self._active_intervention_id == intervention_id:
+            self._active_intervention_id = None
+        async with self._micro_step_lock:
+            if (
+                self._active_plan is not None
+                and self._active_plan.intervention_id == intervention_id
+            ):
+                self._active_plan = None
+                self._micro_step_recovery_fired = False
+
+        helpfulness = getattr(self, "_helpfulness", None)
+        cancel_tracking = getattr(helpfulness, "cancel_tracking", None)
+        if callable(cancel_tracking):
+            cancel_tracking(intervention_id)
+        for attribute in (
+            "_dismissal_features_by_intervention",
+            "_consent_actions_by_intervention",
+            "_causal_signals_by_intervention",
+        ):
+            mapping = getattr(self, attribute, None)
+            if isinstance(mapping, dict):
+                mapping.pop(intervention_id, None)
+
+        pending_applies = getattr(self, "_pending_apply_results", None)
+        if isinstance(pending_applies, dict):
+            future = pending_applies.pop(intervention_id, None)
+            if future is not None and not future.done():
+                future.set_result(
+                    InterventionApplyResult(
+                        intervention_id=intervention_id,
+                        confirmed=False,
+                        timed_out=False,
+                        errors=[reason[:200]],
+                    )
+                )
+        if clear_snapshot:
+            self._services.register(f"workspace_snapshot:{intervention_id}", None)
+            self._runtime_data.put_workspace_snapshot(intervention_id, None)
+
     async def _trigger_intervention(
         self,
         context: Any,
         estimate: Any,
         *,
         template_name: str | None = None,
-        bandit_features: list[float] | None = None,
-        bandit_arm_index: int | None = None,
-        decision_id: str | None = None,
+        policy_decision: PolicyDecisionRecord | None = None,
     ) -> None:
-        # Phase-4b TASK D: prefer the explicit ``decision_id`` arg so a
-        # second concurrent ``_trigger_intervention`` cannot poison this
-        # call's outcome attribution by overwriting
-        # ``self._last_policy_decision_id`` between the dispatch site
-        # and here. Fall back to the legacy shared slot only when no
-        # explicit id was supplied (test rigs / legacy callers).
-        if decision_id is None:
-            decision_id = self._last_policy_decision_id
+        decision_id = policy_decision.decision_id if policy_decision is not None else None
+        registered_intervention_id: str | None = None
+        presentation_committed = False
+        policy_delivery_finalized = decision_id is None
+        policy_non_delivery_reason = "presentation_pipeline_failed"
         try:
             # Inject learned tab relevance into context for LLM
             goal = getattr(context, "current_goal_hint", "") or ""
@@ -2990,64 +4243,37 @@ class CortexDaemon:
             plan.trigger_url = self._active_trigger_url(context)
 
             # Staleness check: suppress if student genuinely recovered
-            current_state = registry.get("latest_state_estimate")
+            current_state = self._current_state_estimate()
             if current_state:
                 # Suppress only if student is in FLOW for >3s (genuine recovery)
-                if (current_state.state == "FLOW"
-                        and current_state.dwell_seconds >= 3.0):
-                    logger.info("Suppressing stale intervention: student in FLOW for %.1fs", current_state.dwell_seconds)
+                if current_state.state == "FLOW" and current_state.dwell_seconds >= 3.0:
+                    logger.info(
+                        "Suppressing stale intervention: student in FLOW for %.1fs",
+                        current_state.dwell_seconds,
+                    )
                     self._active_intervention_id = None
+                    policy_non_delivery_reason = "stale_state_recovered"
                     return
                 # Also check if workspace context changed significantly
-                if hasattr(context, 'browser_context') and context.browser_context:
-                    current_tab_count = len(context.browser_context.all_tabs) if context.browser_context.all_tabs else 0
+                if hasattr(context, "browser_context") and context.browser_context:
+                    current_tab_count = (
+                        len(context.browser_context.all_tabs)
+                        if context.browser_context.all_tabs
+                        else 0
+                    )
                     if plan.suggested_actions:
-                        stale_actions = sum(1 for a in plan.suggested_actions
-                                            if a.tab_index is not None and a.tab_index >= current_tab_count)
+                        stale_actions = sum(
+                            1
+                            for a in plan.suggested_actions
+                            if a.tab_index is not None and a.tab_index >= current_tab_count
+                        )
                         if stale_actions > len(plan.suggested_actions) * 0.5:
-                            logger.info("Suppressing stale intervention: >50%% tab references invalid")
+                            logger.info(
+                                "Suppressing stale intervention: >50%% tab references invalid"
+                            )
                             self._active_intervention_id = None
+                            policy_non_delivery_reason = "stale_workspace_context"
                             return
-
-            # P0 §3.7: if the stress integral has crossed threshold
-            # (latched by ``_break_recommendation_sent`` so we don't
-            # re-flip the should_break() one-shot), promote
-            # ``take_biology_break`` to the primary action. The biology
-            # break is always the right intervention when the user's
-            # HRV has been suppressed long enough to flag — downstream
-            # LLM plans get rewritten in place rather than competing
-            # for the single-CTA slot. Gated on the feature flag so
-            # operators can disable the entire promotion path without
-            # disabling the legacy breathing_overlay.
-            biology_break_enabled = bool(
-                getattr(self.config.intervention, "enable_biology_break", True)
-            )
-            if biology_break_enabled and self._break_recommendation_sent:
-                try:
-                    pattern_hint = self._suggest_break_pattern(
-                        self._sample_hrv_for_break(),
-                    )
-                    # ``_suggest_break_pattern`` returns a plain ``str``;
-                    # narrow it to the planner's Literal so mypy accepts the
-                    # call (an unrecognised hint maps to None = planner default).
-                    breathing_pattern: Literal["box", "4-7-8", "coherent"] | None
-                    if pattern_hint == "box":
-                        breathing_pattern = "box"
-                    elif pattern_hint == "4-7-8":
-                        breathing_pattern = "4-7-8"
-                    elif pattern_hint == "coherent":
-                        breathing_pattern = "coherent"
-                    else:
-                        breathing_pattern = None
-                    plan = promote_biology_break(
-                        plan,
-                        duration_seconds=240,
-                        breathing_pattern=breathing_pattern,
-                        audio_cue=True,
-                        reason="stress_integral_crossed_threshold",
-                    )
-                except Exception:
-                    logger.debug("promote_biology_break failed", exc_info=True)
 
             # P0 §3.9: attach structured causal signals to every plan
             # so each surface's "Why?" drilldown renders without an
@@ -3055,10 +4281,11 @@ class CortexDaemon:
             # so WHY_DETAIL_REQUEST can resolve even if the surface
             # joined late.
             try:
-                latest_features = registry.get("latest_feature_vector")
+                latest_features = self._current_feature_vector()
                 if latest_features is not None:
                     plan.causal_signals = self._causal_attributor.attribute_top_signals(
-                        latest_features, self._scorer.baselines,
+                        latest_features,
+                        self._scorer.baselines,
                     )
                     self._causal_signals_by_intervention[plan.intervention_id] = [
                         s.model_dump(mode="json") for s in plan.causal_signals
@@ -3078,128 +4305,70 @@ class CortexDaemon:
                 tab_count = len(context.browser_context.all_tabs)
             validation, commands = prepare_plan(plan, tab_count=tab_count)
             if not validation.is_valid:
-                logger.warning("Rejected intervention plan %s: %s", plan.intervention_id, validation.errors)
+                logger.warning(
+                    "Rejected intervention plan %s: %s", plan.intervention_id, validation.errors
+                )
+                policy_non_delivery_reason = "planner_output_rejected"
                 return
             if validation.warnings:
                 plan.plan_warnings.extend(validation.warnings)
 
-            # v2.0: Check consent ladder
-            consent_level_map = {
-                "observe": 0, "suggest": 1, "preview": 2,
-                "reversible_act": 3, "autonomous_act": 4,
-            }
-            # Phase-4b TASK B: an unknown ``consent_level`` literal used to
-            # silently default to PREVIEW (2) — that masked planner bugs
-            # AND let the bandit learn from outcomes attributed to the
-            # wrong consent gate. Reject the plan and log so AMIP /
-            # ops can see the failure.
-            if plan.consent_level not in consent_level_map:
-                logger.warning(
-                    "rejecting plan %s with unknown consent_level=%r",
-                    plan.intervention_id,
-                    plan.consent_level,
-                )
-                # Record the failed plan so AMIP/helpfulness don't lose
-                # the decision. ``record_failed_plan`` is best-effort —
-                # older helpfulness store may not expose it, in which
-                # case the warning above is sufficient observability.
-                failed_recorder = getattr(
-                    self._helpfulness, "record_failed_plan", None,
-                )
-                if failed_recorder is not None:
-                    try:
-                        result = failed_recorder(
-                            intervention_id=plan.intervention_id,
-                            reason="unknown_consent_level",
-                        )
-                        if asyncio.iscoroutine(result):
-                            await result
-                    except Exception:
-                        logger.debug(
-                            "record_failed_plan raised", exc_info=True,
-                        )
-                self._active_intervention_id = None
-                return
-            requested_level = consent_level_map[plan.consent_level]
-            consent = await self._consent_ladder.check(
-                action_type=plan.level, requested_level=requested_level,
-            )
-            if not consent.allowed:
-                logger.info("Consent ladder blocked intervention %s (level=%s)", plan.intervention_id, plan.consent_level)
-                return
+            execution_mode = self.intervention_execution_mode
+            if execution_mode == "suggest_only":
+                # Validation observes the original LLM plan; containment is
+                # then materialized as a new presentation-only plan. The
+                # original requested level is retained in metadata, while no
+                # adapter command survives to the executor.
+                plan = materialize_suggestion_only(plan)
+                commands = []
+            else:
+                plan.metadata = dict(plan.metadata or {})
+                plan.metadata["execution_mode"] = execution_mode
+                plan.metadata["workspace_mutation_allowed"] = True
 
-            snapshot = capture_snapshot(context, intervention_id=plan.intervention_id)
-            mutations = await self._executor.apply(plan, commands)
-            # Phase-4b TASK C: compute the actual applied count so the
-            # downstream broadcast knows whether the workspace mutated.
-            # ``commands`` may legitimately be empty (suggested-action-
-            # only plan) — in that case both ``len(commands) == 0`` and
-            # ``applied == 0``; we still broadcast INTERVENTION_TRIGGER.
-            applied = sum(1 for m in mutations if m.success)
-            expected_mutations = len(commands)
-            if expected_mutations > 0 and applied == 0:
-                # The plan expected to mutate the workspace and every
-                # mutation failed. Skip the restore-manager registration
-                # (nothing to roll back) and broadcast INTERVENTION_FAILED
-                # so the UI can surface the failure mode instead of a
-                # silently-broken intervention.
-                failed_types = sorted({m.action for m in mutations})
-                reasons = sorted({
-                    m.reason for m in mutations if m.reason is not None
-                })
-                error_reason = (
-                    reasons[0] if reasons else "all_mutations_failed"
+            # WP6: the plan is a proposal, never authority. Lower every
+            # possible effect into an immutable digest and persist it before
+            # any surface sees the proposal. Suggest-only carries an empty
+            # manifest even though descriptive SuggestedAction cards remain.
+            action_manifest = build_action_manifest(
+                plan,
+                commands,
+                consent_policy=self._consent_policy,
+                clock=self._clock,
+                include_suggested_actions=(execution_mode != "suggest_only"),
+            )
+            await self._transaction_coordinator.register_proposal(action_manifest)
+            registered_intervention_id = plan.intervention_id
+            snapshot = (
+                capture_snapshot(
+                    context,
+                    intervention_id=plan.intervention_id,
+                    clock=self._clock,
                 )
-                logger.warning(
-                    "Intervention %s: all %d mutations failed (types=%s reason=%s)",
+                if action_manifest.action_count > 0
+                else None
+            )
+            authenticated_count = getattr(
+                self._ws_server,
+                "authenticated_client_count",
+                None,
+            )
+            if (
+                isinstance(authenticated_count, int)
+                and authenticated_count == 0
+                and self._events.intervention.subscriber_count == 0
+            ):
+                await self._close_unpresented_transaction(
                     plan.intervention_id,
-                    expected_mutations,
-                    failed_types,
-                    error_reason,
+                    reason="no_authenticated_presentation_surface",
                 )
-                try:
-                    await self._ws_server.send_message(
-                        MessageType.INTERVENTION_FAILED.value,
-                        {
-                            "intervention_id": plan.intervention_id,
-                            "error_reason": error_reason,
-                            "failed_action_types": failed_types,
-                        },
-                    )
-                except Exception:
-                    logger.debug(
-                        "INTERVENTION_FAILED broadcast failed", exc_info=True,
-                    )
-                self._active_intervention_id = None
+                logger.info(
+                    "Suppressed proposal %s: no authenticated presentation surface is connected",
+                    plan.intervention_id,
+                )
+                policy_non_delivery_reason = "no_authenticated_presentation_surface"
                 return
-            self._restore_manager.start_intervention(plan.intervention_id, snapshot)
-            self._trigger_policy.record_intervention()
-            # P1-PIPE-REPORT: a plan was approved by the trigger policy AND
-            # delivered to the user (mutations applied, restore session
-            # started). Count it on the session report so the persisted
-            # SessionReport.interventions_triggered reflects real deliveries
-            # rather than the constant 0 that fed the longitudinal HYPER
-            # proxy. Mirrors record_intervention()'s placement so the two
-            # counters move together.
-            try:
-                self._session_report.increment_interventions_triggered()
-            except Exception:
-                logger.debug(
-                    "session_report increment_interventions_triggered failed",
-                    exc_info=True,
-                )
             self._active_intervention_id = plan.intervention_id
-            # Phase-4b TASK C: stamp the applied count onto the trigger
-            # payload so the overlay can show "2 of 3 actions applied"
-            # without rebroadcasting from the executor side.
-            if applied > 0:
-                try:
-                    plan.metadata = dict(plan.metadata or {})
-                    plan.metadata["mutations_applied_count"] = applied
-                except Exception:
-                    logger.debug(
-                        "stamping mutations_applied_count failed", exc_info=True,
-                    )
             # P0 §3.6: cache the live plan so MICRO_STEP_TOGGLED can
             # mutate its ``micro_steps`` and rebroadcast the trigger.
             # If a previous intervention shares this id (F16 swap),
@@ -3216,12 +4385,21 @@ class CortexDaemon:
                     from cortex.services.intervention_engine.restore import (
                         merge_micro_steps,
                     )
+
                     plan.micro_steps = merge_micro_steps(
                         self._active_plan.micro_steps, plan.micro_steps
                     )
                 self._active_plan = plan
                 self._micro_step_recovery_fired = False
-            registry.register(f"workspace_snapshot:{plan.intervention_id}", snapshot)
+            if snapshot is not None:
+                self._services.register(
+                    f"workspace_snapshot:{plan.intervention_id}",
+                    snapshot,
+                )
+                self._runtime_data.put_workspace_snapshot(
+                    plan.intervention_id,
+                    snapshot,
+                )
             self._recorder.append("intervention_plan", plan.model_dump(mode="json"))
 
             # v2.0: Start helpfulness tracking
@@ -3231,36 +4409,28 @@ class CortexDaemon:
                 state=estimate.state,
                 confidence=estimate.confidence,
                 complexity=(
-                    float(context.complexity_score)
-                    if hasattr(context, "complexity_score")
-                    else 0.0
+                    float(context.complexity_score) if hasattr(context, "complexity_score") else 0.0
                 ),
                 tab_count=(
                     int(context.browser_context.tab_count)
                     if hasattr(context, "browser_context") and context.browser_context
                     else 0
                 ),
-                error_count=(
-                    int(context.total_errors)
-                    if hasattr(context, "total_errors")
-                    else 0
-                ),
+                error_count=(int(context.total_errors) if hasattr(context, "total_errors") else 0),
                 thrashing_score=float(getattr(self._aggregator, "thrashing_score", 0.0)),
-                stress_integral=float(getattr(self._stress_tracker, "current_load", 0.0)),
-                decision_id=decision_id,
-                propensity=self._last_policy_propensity,
-                policy_arm=self._last_policy_arm,
+                # Compatibility outcome field only; unavailable in product.
+                stress_integral=0.0,
+                decision_id=str(decision_id) if decision_id is not None else None,
+                propensity=(
+                    {
+                        str(arm): probability
+                        for arm, probability in policy_decision.propensities.items()
+                    }
+                    if policy_decision is not None and policy_decision.propensities is not None
+                    else None
+                ),
+                policy_arm=(policy_decision.selected_arm if policy_decision is not None else None),
             )
-            # Bind the policy decision to this intervention ID so reward updates
-            # use the exact action/context that was chosen. Phase-4b TASK D:
-            # use the explicit ``decision_id`` snapshot rather than the
-            # shared mutable slot so a peer trigger cannot steal credit.
-            if decision_id:
-                self._amip_decision_ids_by_intervention[plan.intervention_id] = decision_id
-            if bandit_features is not None and bandit_arm_index is not None:
-                self._bandit_decisions_by_intervention[plan.intervention_id] = (
-                    list(bandit_features), int(bandit_arm_index)
-                )
             # audit C-note: snapshot the trigger-time confidence + context
             # complexity so the eventual engaged/dismissed outcome trains the
             # dismissal model on the SAME features the trigger decision saw.
@@ -3287,15 +4457,10 @@ class CortexDaemon:
             # this the daemon recorded under the literal "intervention",
             # disjoint from the gated keys, so escalation never lifted.
             consent_actions = sorted(
-                {
-                    canonical_action_type(a.action_type)
-                    for a in plan.suggested_actions
-                }
+                {canonical_action_type(a.action_type) for a in plan.suggested_actions}
             )
             if consent_actions:
-                self._consent_actions_by_intervention[plan.intervention_id] = (
-                    consent_actions
-                )
+                self._consent_actions_by_intervention[plan.intervention_id] = consent_actions
                 if len(self._consent_actions_by_intervention) > 64:
                     oldest_ca = next(iter(self._consent_actions_by_intervention))
                     self._consent_actions_by_intervention.pop(oldest_ca, None)
@@ -3317,25 +4482,15 @@ class CortexDaemon:
                 desktop_focused = self._desktop_is_focused()
             else:
                 desktop_focused = None
-            await self._ws_server.send_intervention(
-                plan, desktop_focused=desktop_focused,
+            await self._transaction_coordinator.mark_delivered(plan.intervention_id)
+            sent = await self._ws_server.send_intervention(
+                plan,
+                action_manifest=action_manifest,
+                desktop_focused=desktop_focused,
+                execution_mode=execution_mode,
             )
-            # P0 §3.15: plan-finalised event — push COST_RESPONSE so the
-            # UI cost meter updates without polling lag. Best-effort; a
-            # cost-tracker error must not bubble up here.
-            await self._broadcast_cost_response()
-            # Fire the macOS UNUserNotification path when the desktop
-            # dashboard isn't focused — the WS broadcast covers Chrome /
-            # VS Code; the helper covers Spaces-other-than-the-desktop.
-            if os_notifications_enabled and desktop_focused is False:
-                try:
-                    await self._dispatch_os_notification(plan)
-                except Exception:
-                    logger.debug(
-                        "OS notification dispatch failed", exc_info=True,
-                    )
-
-            if self._intervention_callback is not None:
+            callback_delivered = False
+            if self._events.intervention.subscriber_count:
                 # F17: stamp a monotonic sequence so the in-process bridge
                 # can drop reordered intervention triggers. The plan dict
                 # is augmented with ``_seq`` after deep-copying so we
@@ -3343,6 +4498,8 @@ class CortexDaemon:
                 self._intervention_callback_seq += 1
                 _payload = copy.deepcopy(plan.model_dump(mode="json"))
                 _payload["_seq"] = self._intervention_callback_seq
+                _payload["execution_mode"] = execution_mode
+                _payload["action_manifest"] = action_manifest.model_dump(mode="json")
                 # Audit-prod fix (G4 P0): the overlay's action-buttons gate
                 # browser-bound actions on ``payload.connected_clients``;
                 # without this field every browser button renders disabled
@@ -3363,22 +4520,106 @@ class CortexDaemon:
                 # path is taking over (dual-fire de-dup).
                 if desktop_focused is False:
                     _payload["desktop_not_focused"] = True
-                self._intervention_callback(_payload)
+                callback_delivered = self._events.intervention.publish(_payload) > 0
+
+            if sent == 0 and not callback_delivered:
+                # A surface can disconnect between the preflight count and
+                # the actual broadcast. Close the durable proposal and unwind
+                # every local tracker instead of leaving a delivered-looking
+                # active intervention that no user could ever see.
+                await self._close_unpresented_transaction(
+                    plan.intervention_id,
+                    reason="presentation_delivery_race",
+                )
+                logger.info(
+                    "Abandoned proposal %s after every presentation surface disconnected",
+                    plan.intervention_id,
+                )
+                policy_non_delivery_reason = "presentation_delivery_race"
+                return
+
+            presentation_committed = True
+            if decision_id is not None:
+                await self._policy_lifecycle.mark_delivered(
+                    decision_id,
+                    plan.intervention_id,
+                )
+                policy_delivery_finalized = True
+
+            self._trigger_policy.record_intervention()
+            try:
+                self._session_report.increment_interventions_triggered()
+            except Exception:
+                logger.debug(
+                    "session_report increment_interventions_triggered failed",
+                    exc_info=True,
+                )
+
+            # P0 §3.15: plan-finalised event — push COST_RESPONSE so the
+            # UI cost meter updates without polling lag. Best-effort; a
+            # cost-tracker error must not bubble up here.
+            await self._broadcast_cost_response()
+            # Fire the macOS UNUserNotification path when the desktop
+            # dashboard isn't focused — the WS broadcast covers Chrome /
+            # VS Code; the helper covers Spaces-other-than-the-desktop.
+            if os_notifications_enabled and desktop_focused is False:
+                try:
+                    await self._dispatch_os_notification(plan)
+                except Exception:
+                    logger.debug(
+                        "OS notification dispatch failed",
+                        exc_info=True,
+                    )
         except TimeoutError:
             logger.warning("Intervention LLM call timed out")
-            # Phase-4b TASK D: explicitly clear pending state. Leaving
-            # the pending decision_id slot occupied would let the next
-            # trigger inherit a now-stale id, double-attributing the
-            # outcome to a plan that never landed.
-            if self._last_policy_decision_id == decision_id:
-                self._last_policy_decision_id = None
-                self._last_policy_arm = None
-                self._last_policy_propensity = None
+            policy_non_delivery_reason = "presentation_pipeline_timed_out"
+            if registered_intervention_id is not None and not presentation_committed:
+                await self._close_unpresented_transaction(
+                    registered_intervention_id,
+                    reason="presentation_pipeline_timed_out",
+                )
         except asyncio.CancelledError:
+            policy_non_delivery_reason = "presentation_task_cancelled"
+            if registered_intervention_id is not None and not presentation_committed:
+                await asyncio.shield(
+                    self._close_unpresented_transaction(
+                        registered_intervention_id,
+                        reason="presentation_task_cancelled",
+                    )
+                )
             raise
         except Exception:
             logger.exception("Failed to trigger intervention")
+            policy_non_delivery_reason = "presentation_pipeline_failed"
+            if registered_intervention_id is not None and not presentation_committed:
+                await self._close_unpresented_transaction(
+                    registered_intervention_id,
+                    reason="presentation_pipeline_failed",
+                )
         finally:
+            if decision_id is not None and not policy_delivery_finalized:
+                try:
+                    if presentation_committed and registered_intervention_id is not None:
+                        await asyncio.shield(
+                            self._policy_lifecycle.mark_delivered(
+                                decision_id,
+                                registered_intervention_id,
+                            )
+                        )
+                    else:
+                        await asyncio.shield(
+                            self._policy_lifecycle.mark_not_delivered(
+                                decision_id,
+                                policy_non_delivery_reason,
+                            )
+                        )
+                    policy_delivery_finalized = True
+                except Exception:
+                    logger.critical(
+                        "Could not persist policy delivery status for decision %s",
+                        decision_id,
+                        exc_info=True,
+                    )
             # Clear __pending__ sentinel if intervention didn't complete
             if self._active_intervention_id == "__pending__":
                 self._active_intervention_id = None
@@ -3395,7 +4636,7 @@ class CortexDaemon:
         """Trigger a special v2.0 intervention (breathing, active recall, rabbit hole).
 
         Phase-4b TASK D: ``decision_id`` is an explicit arg. Special
-        interventions do not currently bind to an AMIP arm, so the
+        interventions do not currently bind to a production-policy decision, so the
         default behaviour (clear the shared slot) is preserved; the arg
         is accepted for future symmetry with ``_trigger_intervention``.
         """
@@ -3409,15 +4650,12 @@ class CortexDaemon:
         # twice and broadcast two plans (only one of which won the
         # ``_active_intervention_id`` assignment).
         self._active_intervention_id = "__pending__"
-        # Phase-4b TASK D: special interventions are not AMIP-bound;
-        # clear the shared slot unless the caller threaded an explicit
-        # id (in which case the trigger owns the credit and must clear
-        # on completion below).
-        if decision_id is None:
-            self._last_policy_decision_id = None
-            self._last_policy_arm = None
-            self._last_policy_propensity = None
+        # Special detector interventions are not part of the production
+        # policy experiment ledger. ``decision_id`` remains a compatibility
+        # parameter for older callers but confers no reward attribution.
 
+        registered_intervention_id: str | None = None
+        presentation_committed = False
         try:
             plan = await self._llm_client.generate_intervention_plan(
                 context,
@@ -3427,6 +4665,50 @@ class CortexDaemon:
             plan = enrich_plan_with_context(plan, context)
             # C3 (audit): scope special interventions to the active tab too.
             plan.trigger_url = self._active_trigger_url(context)
+            tab_count = None
+            if hasattr(context, "browser_context") and context.browser_context is not None:
+                tab_count = len(context.browser_context.all_tabs)
+            validation, _commands = prepare_plan(plan, tab_count=tab_count)
+            if not validation.is_valid:
+                logger.warning(
+                    "Rejected special intervention %s: %s",
+                    plan.intervention_id,
+                    validation.errors,
+                )
+                return
+            if validation.warnings:
+                plan.plan_warnings.extend(validation.warnings)
+            # Special detector surfaces are presentation-only until each
+            # detector and capability has its own validated transaction
+            # protocol. A custom message type must never be a second mutation
+            # command hidden beside INTERVENTION_APPLY.
+            plan = materialize_suggestion_only(plan)
+            action_manifest = build_action_manifest(
+                plan,
+                [],
+                consent_policy=self._consent_policy,
+                clock=self._clock,
+                include_suggested_actions=False,
+            )
+            await self._transaction_coordinator.register_proposal(action_manifest)
+            registered_intervention_id = plan.intervention_id
+            authenticated_count = getattr(
+                self._ws_server,
+                "authenticated_client_count",
+                None,
+            )
+            if isinstance(authenticated_count, int) and authenticated_count == 0:
+                await self._close_unpresented_transaction(
+                    plan.intervention_id,
+                    reason="no_authenticated_presentation_surface",
+                )
+                logger.info(
+                    "Suppressed special proposal %s: no authenticated "
+                    "WebSocket surface is connected",
+                    plan.intervention_id,
+                )
+                return
+            await self._transaction_coordinator.mark_delivered(plan.intervention_id)
             self._active_intervention_id = plan.intervention_id
             # P0 §3.6: cache the live plan + merge prior step state on F16 swap.
             # Wave-2 P1: serialise against ``toggle_micro_step`` (same
@@ -3439,15 +4721,51 @@ class CortexDaemon:
                     from cortex.services.intervention_engine.restore import (
                         merge_micro_steps,
                     )
+
                     plan.micro_steps = merge_micro_steps(
                         self._active_plan.micro_steps, plan.micro_steps
                     )
                 self._active_plan = plan
                 self._micro_step_recovery_fired = False
             self._recorder.append("intervention_plan", plan.model_dump(mode="json"))
-            await self._ws_server.send_message(ws_type, plan.model_dump(mode="json"))
+            if ws_type == MessageType.INTERVENTION_TRIGGER.value:
+                sent = await self._ws_server.send_intervention(
+                    plan,
+                    action_manifest=action_manifest,
+                    execution_mode="suggest_only",
+                )
+            else:
+                payload = plan.model_dump(mode="json")
+                payload["action_manifest"] = action_manifest.model_dump(mode="json")
+                payload["execution_mode"] = "suggest_only"
+                sent = await self._ws_server.send_message(ws_type, payload)
+            if not sent:
+                await self._close_unpresented_transaction(
+                    plan.intervention_id,
+                    reason="presentation_delivery_race",
+                )
+                logger.info(
+                    "Abandoned special proposal %s after presentation delivery failed",
+                    plan.intervention_id,
+                )
+                return
+            presentation_committed = True
+        except asyncio.CancelledError:
+            if registered_intervention_id is not None and not presentation_committed:
+                await asyncio.shield(
+                    self._close_unpresented_transaction(
+                        registered_intervention_id,
+                        reason="special_presentation_task_cancelled",
+                    )
+                )
+            raise
         except Exception:
             logger.exception("Failed to trigger special intervention (%s)", template_name)
+            if registered_intervention_id is not None and not presentation_committed:
+                await self._close_unpresented_transaction(
+                    registered_intervention_id,
+                    reason="special_presentation_pipeline_failed",
+                )
         finally:
             # Clear the sentinel if the call failed before assigning the
             # real id; on success the real id stays.
@@ -3471,39 +4789,47 @@ class CortexDaemon:
             sanitized_actions.append(action)
         plan.suggested_actions = sanitized_actions
         plan.micro_steps = [
-            step for step in plan.micro_steps
+            step
+            for step in plan.micro_steps
             if not any(tok in step.text.lower() for tok in blocked_tokens)
         ] or plan.micro_steps[:1]
 
     async def _handle_restore_updates(self, estimate: Any, timestamp: float) -> None:
         outcomes = await self._restore_manager.update(estimate, current_time=timestamp)
         for outcome in outcomes:
-            self._active_intervention_id = None
             self._recorder.append("intervention_outcome", outcome.model_dump(mode="json"))
-            # C.3: credit the stress integral when FLOW recovery confirms
-            # the intervention was restorative. apply_recovery_credit
-            # subtracts a window of sustained-low-deficit equivalent from
-            # the running integral so the AMIP safety floor doesn't keep
-            # firing across recovered sessions.
-            if getattr(outcome, "recovery_detected", False):
-                try:
-                    self._stress_tracker.apply_recovery_credit(seconds=120.0)
-                except Exception:
-                    logger.debug("apply_recovery_credit failed", exc_info=True)
+            if not outcome.workspace_restored:
+                logger.warning(
+                    "Automatic close for %s could not verify restoration; "
+                    "keeping the transaction active for retry",
+                    outcome.intervention_id,
+                )
+                continue
+            if self._active_intervention_id == outcome.intervention_id:
+                self._active_intervention_id = None
+            if (
+                self._active_plan is not None
+                and self._active_plan.intervention_id == outcome.intervention_id
+            ):
+                self._active_plan = None
+            self._micro_step_recovery_fired = False
             await self._ws_server.send_restore(
                 outcome.intervention_id,
                 user_action=outcome.user_action,
             )
 
-    async def dispatch_action_to_browser(
+    async def dispatch_intervention_action(
         self,
         intervention_id: str,
         action: dict[str, Any],
     ) -> int:
-        """G4 (audit-prod): forward a desktop-overlay action click to the
-        browser extension(s) so they actually execute it. Returns the
-        count of clients the dispatch reached (0 = no browser client
-        connected, or validation failed).
+        """Authorize one desktop gesture through the exact remote adapter.
+
+        The in-process shell is a presentation/request surface, not an
+        executor. It may request any action present in the immutable manifest;
+        the WebSocket gateway then routes the consumed command to the exact
+        browser or editor owner and binds receipts to that client identity.
+        Returns the count of executor clients reached.
 
         Audit-prod fix: validate ``intervention_id`` against the active
         plan so a stale overlay click (timer race against dismiss) is
@@ -3512,27 +4838,29 @@ class CortexDaemon:
         is rejected at the daemon boundary instead of confusing the
         extension's switch-default.
         """
+        if not self.workspace_mutation_allowed:
+            logger.info(
+                "ACTION_DISPATCH denied: execution_mode=%s",
+                self.intervention_execution_mode,
+            )
+            return 0
         if not intervention_id or not isinstance(action, dict):
             return 0
         # Reject stale interventions. ``__pending__`` is the sentinel
         # used while the LLM call is in flight; once a real id is set
         # we honour exactly that id and no other.
         active = self._active_intervention_id
-        if (
-            active is None
-            or active == "__pending__"
-            or active != intervention_id
-        ):
+        if active is None or active == "__pending__" or active != intervention_id:
             logger.warning(
-                "ACTION_DISPATCH dropped: stale intervention_id "
-                "(requested=%s active=%s)",
+                "ACTION_DISPATCH dropped: stale intervention_id (requested=%s active=%s)",
                 intervention_id,
                 active,
             )
             return 0
         # Validate the action shape against the Pydantic source of truth.
-        # SuggestedAction's validators enforce the action_type Literal,
-        # url scheme allowlist, tab_index bounds, etc.
+        # SuggestedAction's validators enforce the action_type Literal, URL
+        # scheme allowlist, tab_index bounds, etc. The manifest comparison
+        # below remains authoritative for the digest-covered parameters.
         try:
             from cortex.libs.schemas.intervention import SuggestedAction
 
@@ -3543,69 +4871,119 @@ class CortexDaemon:
                 exc,
             )
             return 0
-        try:
-            sent = await self._ws_server.send_message(
-                MessageType.ACTION_DISPATCH.value,
-                {"intervention_id": intervention_id, "action": validated},
-                target_client_types=["chrome", "edge"],
+        transaction = await self._transaction_coordinator.get_transaction(intervention_id)
+        if transaction is None:
+            logger.warning("Desktop action request has no transaction")
+            return 0
+        action_id = str(validated.get("action_id") or "")
+        manifest_action = next(
+            (
+                item
+                for item in transaction.manifest.body.actions
+                if item.action_id == action_id and item.executor in {"browser", "editor"}
+            ),
+            None,
+        )
+        if manifest_action is None:
+            logger.warning(
+                "Desktop action %s is absent from the executable manifest",
+                action_id,
             )
+            return 0
+        if not manifest_suggestion_matches(transaction.manifest, validated):
+            logger.warning(
+                "Desktop action presentation differs from exact manifest "
+                "(intervention_id=%s action_id=%s)",
+                intervention_id,
+                action_id,
+            )
+            return 0
+        request = InterventionAuthorizationRequest(
+            authorization_request_id=f"desktop_{uuid4().hex}",
+            intervention_id=intervention_id,
+            manifest_sha256=transaction.manifest.manifest_sha256,
+            approved_action_ids=(action_id,),
+            source_surface="desktop",
+            requested_at_unix_ms=self._clock.unix_ms(),
+            requested_at_mono_ns=self._clock.monotonic_ns(),
+            boot_id=self._clock.boot_id,
+        )
+        authorized = await self._authorize_intervention(
+            request,
+            "desktop_shell",
+            "desktop",
+        )
+        if isinstance(authorized, AuthorizationDenied):
+            logger.info(
+                "Desktop action authorization denied: %s",
+                authorized.reason_code,
+            )
+            return 0
+        try:
+            dispatch = await self._ws_server.dispatch_apply_command(authorized)
+            sent = dispatch.delivered_targets
+            if dispatch.attempted_targets == 0:
+                await self._transaction_coordinator.record_dispatch_failure(
+                    authorized.authorization.authorization_id,
+                    reason="desktop_action_no_executor",
+                )
+            elif sent != dispatch.expected_targets:
+                compensation = await self._compensate_partial_intervention_dispatch(
+                    authorized.authorization.authorization_id,
+                    "desktop_action_delivery_ambiguous",
+                )
+                if compensation is not None:
+                    await self._ws_server.send_restore_command(compensation)
         except Exception:
-            logger.exception("ACTION_DISPATCH send failed")
+            logger.exception("Transactional desktop action dispatch failed")
+            try:
+                compensation = await self._compensate_partial_intervention_dispatch(
+                    authorized.authorization.authorization_id,
+                    "desktop_action_dispatch_exception",
+                )
+                if compensation is not None:
+                    await self._ws_server.send_restore_command(compensation)
+            except Exception:
+                logger.exception("Transactional desktop action compensation failed")
             return 0
         if sent == 0:
             logger.info(
-                "ACTION_DISPATCH dropped: no chrome/edge client connected "
-                "(intervention_id=%s action_id=%s)",
+                "Desktop exact action has no connected executor (intervention_id=%s action_id=%s)",
                 intervention_id,
                 validated.get("action_id"),
             )
         return sent
 
+    async def dispatch_action_to_browser(
+        self,
+        intervention_id: str,
+        action: dict[str, Any],
+    ) -> int:
+        """Compatibility facade for old desktop controller/test callers.
+
+        It no longer emits ``ACTION_DISPATCH``. The request is authorized and
+        executed through :meth:`dispatch_intervention_action`.
+        """
+
+        return await self.dispatch_intervention_action(
+            intervention_id,
+            action,
+        )
+
     # ─── P0 §3.7: biology-driven break orchestration ─────────────────
-
-    @staticmethod
-    def _suggest_break_pattern(hrv_rmssd: float | None) -> str:
-        """Map HRV → breathing pattern name (matches break_overlay.select_pattern)."""
-        from cortex.services.intervention_engine.break_overlay import select_pattern
-
-        return select_pattern(hrv_rmssd)
-
-    def _classify_break_urgency(self) -> str:
-        """Map load_ratio → BREAK_RECOMMENDATION urgency string."""
-        ratio = float(self._stress_tracker.load_ratio)
-        if ratio >= 1.3:
-            return "high"
-        if ratio >= 1.05:
-            return "medium"
-        return "low"
-
-    def _sample_hrv_for_break(self) -> float | None:
-        """Return the most recent HRV reading for the break controller."""
-        physio = getattr(self, "_latest_physio", None)
-        if physio is None:
-            return None
-        # Prefer the explicit RMSSD proxy when populated; fall back to
-        # the variability proxy field used in some legacy code paths.
-        for attr in ("hrv_rmssd", "pulse_variability_proxy"):
-            v = getattr(physio, attr, None)
-            if v is not None:
-                try:
-                    return float(v)
-                except (TypeError, ValueError):
-                    continue
-        return None
 
     def _set_break_suppression(self, active: bool) -> None:
         """Toggle the global break-suppression flag.
 
-        Called by :class:`BiologyBreakController` around the overlay
+        Called by :class:`GuidedBreakController` around the overlay
         lifecycle so peer adapters skip trigger evaluation while the
         breathing session runs.
         """
         self._break_active = bool(active)
 
     def set_break_overlay_ui_handler(
-        self, handler: BreakUIHandler | None,
+        self,
+        handler: BreakUIHandler | None,
     ) -> None:
         """Bind the desktop shell's full-screen break overlay handler.
 
@@ -3620,19 +4998,411 @@ class CortexDaemon:
 
     # ─── Phase-4b TASK M: executor-bound hooks ─────────────────────
 
+    async def _authorize_intervention(
+        self,
+        request: InterventionAuthorizationRequest,
+        source_client_id: str,
+        source_client_type: str,
+    ) -> InterventionApplyCommand | AuthorizationDenied:
+        """Turn one exact user gesture into a consumed authorization."""
+
+        active = self._active_intervention_id
+        if active is None or active == "__pending__" or active != request.intervention_id:
+            return AuthorizationDenied(
+                authorization_request_id=request.authorization_request_id,
+                intervention_id=request.intervention_id,
+                manifest_sha256=request.manifest_sha256,
+                reason_code="transaction_closed",
+                detail=f"intervention is no longer active (active={active})"[:500],
+            )
+        result = await self._transaction_coordinator.authorize_and_consume(
+            request,
+            source_client_id=source_client_id,
+        )
+        try:
+            if isinstance(result, AuthorizationDenied):
+                self._recorder.append(
+                    "intervention_authorization_denied",
+                    result.model_dump(mode="json"),
+                )
+            else:
+                self._recorder.append(
+                    "intervention_authorized",
+                    {
+                        "intervention_id": result.authorization.intervention_id,
+                        "authorization_id": result.authorization.authorization_id,
+                        "manifest_sha256": result.authorization.manifest_sha256,
+                        "action_ids": list(result.authorization.authorized_action_ids),
+                        "consent_revision": result.authorization.consent_revision,
+                        "source_client_type": source_client_type,
+                    },
+                )
+        except Exception:
+            logger.debug("authorization recorder append failed", exc_info=True)
+        return result
+
+    async def _record_intervention_receipts(
+        self,
+        batch: InterventionReceiptBatch,
+        source_client_id: str,
+        source_client_type: str,
+    ) -> tuple[
+        InterventionLifecycleState,
+        InterventionRestoreCommand | None,
+    ]:
+        """Persist receipts, update consent evidence, and resolve waiters."""
+
+        state, compensation = await self._transaction_coordinator.record_receipts(
+            batch,
+            source_client_type=source_client_type,
+            source_client_id=source_client_id,
+        )
+        if compensation is not None:
+            # Keep compensation retryable across an offline executor. The WS
+            # server preflights the complete route; this queue is retried as
+            # each required surface identifies and is removed only after
+            # verified inverse receipts reach RESTORED.
+            self._pending_startup_restores[compensation.restore_id] = compensation
+        transaction = await self._transaction_coordinator.get_transaction(batch.intervention_id)
+        if transaction is not None:
+            actions = {action.action_id: action for action in transaction.manifest.body.actions}
+            for receipt in batch.receipts:
+                action = actions.get(receipt.action_id)
+                if (
+                    action is not None
+                    and receipt.phase == "apply"
+                    and receipt.status
+                    in {
+                        ReceiptStatus.SUCCEEDED.value,
+                        ReceiptStatus.ALREADY_COMPLETE.value,
+                    }
+                    and receipt.verification == VerificationStatus.VERIFIED.value
+                    and await self._transaction_coordinator.claim_consent_evidence(
+                        receipt.receipt_id
+                    )
+                ):
+                    await self._consent_ladder.record_approval(
+                        canonical_action_type(action.capability)
+                    )
+
+            # Register the timed restore session only after a verified
+            # workspace effect exists. Proposal delivery never creates a
+            # theatrical "active mutation".
+            if state == InterventionLifecycleState.APPLIED:
+                has_workspace_effect = any(
+                    receipt.authorization_id == batch.authorization_id
+                    and receipt.phase == "apply"
+                    and receipt.status == ReceiptStatus.SUCCEEDED.value
+                    and actions.get(receipt.action_id) is not None
+                    and actions[receipt.action_id].workspace_mutation
+                    for receipt in transaction.receipts
+                )
+                if (
+                    has_workspace_effect
+                    and self._restore_manager.get_active(batch.intervention_id) is None
+                ):
+                    snapshot = self._workspace_snapshot(batch.intervention_id)
+                    if snapshot is not None:
+                        self._restore_manager.start_intervention(
+                            batch.intervention_id,
+                            snapshot,
+                        )
+
+        try:
+            self._recorder.append(
+                "intervention_receipts",
+                {
+                    **batch.model_dump(mode="json"),
+                    "source_client_id": source_client_id,
+                    "source_client_type": source_client_type,
+                    "transaction_state": state.value,
+                },
+            )
+        except Exception:
+            logger.debug("receipt recorder append failed", exc_info=True)
+
+        # Bridge the old HTTP confirmation response onto the new truthful
+        # receipt result during the one-release compatibility window.
+        if state in {
+            InterventionLifecycleState.APPLIED,
+            InterventionLifecycleState.PARTIAL,
+            InterventionLifecycleState.FAILED,
+        } and any(receipt.phase == "apply" for receipt in batch.receipts):
+            future = self._pending_apply_results.pop(batch.intervention_id, None)
+            if future is not None and not future.done():
+                # The lifecycle state is an aggregate across every one-time
+                # authorization in the intervention. Derive this legacy HTTP
+                # acknowledgement from the *current authorization's* complete
+                # receipt set; otherwise a prior active effect could make a
+                # later all-failed grant look confirmed, and the last of
+                # several executor batches could hide earlier results.
+                ledger = (
+                    next(
+                        (
+                            entry
+                            for entry in transaction.authorizations
+                            if entry.authorization.authorization_id == batch.authorization_id
+                        ),
+                        None,
+                    )
+                    if transaction is not None
+                    else None
+                )
+                expected_ids = (
+                    set(ledger.authorization.authorized_action_ids) if ledger is not None else set()
+                )
+                latest: dict[str, ActionReceipt] = {}
+                if transaction is not None:
+                    for receipt in transaction.receipts:
+                        if (
+                            receipt.authorization_id != batch.authorization_id
+                            or receipt.phase != ReceiptPhase.APPLY.value
+                        ):
+                            continue
+                        prior = latest.get(receipt.action_id)
+                        if prior is None or receipt.attempt >= prior.attempt:
+                            latest[receipt.action_id] = receipt
+                successful = sorted(
+                    action_id
+                    for action_id, receipt in latest.items()
+                    if receipt.status
+                    in {
+                        ReceiptStatus.SUCCEEDED.value,
+                        ReceiptStatus.ALREADY_COMPLETE.value,
+                    }
+                    and receipt.verification == VerificationStatus.VERIFIED.value
+                )
+                confirmed = bool(expected_ids) and set(successful) == expected_ids
+                errors = [
+                    (
+                        latest[action_id].error_message
+                        or latest[action_id].error_code
+                        or "action_failed"
+                    )
+                    if action_id in latest
+                    else f"missing_receipt:{action_id}"
+                    for action_id in sorted(expected_ids - set(successful))
+                ]
+                future.set_result(
+                    InterventionApplyResult(
+                        intervention_id=batch.intervention_id,
+                        confirmed=confirmed,
+                        timed_out=False,
+                        applied_actions=successful,
+                        errors=errors,
+                        phase="apply",
+                    )
+                )
+
+        inverse_batch = all(
+            receipt.phase in {"compensate", "restore"} for receipt in batch.receipts
+        )
+        if state in {
+            InterventionLifecycleState.RESTORED,
+            InterventionLifecycleState.RESTORE_FAILED,
+        }:
+            restore_future = self._pending_restore_results.pop(
+                batch.authorization_id,
+                None,
+            )
+            if restore_future is not None and not restore_future.done():
+                restore_future.set_result(state == InterventionLifecycleState.RESTORED)
+            if state == InterventionLifecycleState.RESTORED:
+                self._pending_startup_restores.pop(batch.authorization_id, None)
+        elif inverse_batch and state == InterventionLifecycleState.APPLIED:
+            # A partial compensation can complete while effects from an
+            # earlier, distinct authorization remain active. The aggregate
+            # correctly returns to APPLIED; this restore command itself is
+            # terminal and must not be replayed on every reconnect.
+            self._pending_startup_restores.pop(batch.authorization_id, None)
+            restore_future = self._pending_restore_results.pop(
+                batch.authorization_id,
+                None,
+            )
+            if restore_future is not None and not restore_future.done():
+                restore_future.set_result(True)
+        return state, compensation
+
+    async def _record_intervention_dispatch_failure(
+        self,
+        authorization_id: str,
+        reason: str,
+    ) -> None:
+        """Persist a preflight routing failure for a consumed authorization."""
+
+        await self._transaction_coordinator.record_dispatch_failure(
+            authorization_id,
+            reason=reason,
+        )
+
+    async def _compensate_partial_intervention_dispatch(
+        self,
+        authorization_id: str,
+        reason: str,
+    ) -> InterventionRestoreCommand | None:
+        """Durably enter recovery after a cross-surface send race."""
+
+        command = await self._transaction_coordinator.compensate_partial_dispatch(
+            authorization_id,
+            reason=reason,
+        )
+        if command is not None:
+            self._pending_startup_restores[command.restore_id] = command
+        return command
+
+    async def _restore_transaction_and_wait(
+        self,
+        intervention_id: str,
+        user_action: str,
+    ) -> bool:
+        """Dispatch exact inverse actions and await verified receipts."""
+
+        reason_map: dict[
+            str,
+            Literal[
+                "user_undo",
+                "dismissed",
+                "snoozed",
+                "timed_out",
+                "natural_recovery",
+                "system_cancelled",
+                "partial_compensation",
+                "startup_recovery",
+                "emergency_restore",
+            ],
+        ] = {
+            "restore": "user_undo",
+            "dismissed": "dismissed",
+            "snoozed": "snoozed",
+            "timed_out": "timed_out",
+            "natural_recovery": "natural_recovery",
+            "engaged": "natural_recovery",
+            "system_cancelled": "system_cancelled",
+        }
+        reason = reason_map.get(user_action, "system_cancelled")
+        command = await self._transaction_coordinator.request_restore(
+            intervention_id,
+            reason=reason,
+        )
+        if command is None:
+            transaction = await self._transaction_coordinator.get_transaction(intervention_id)
+            return bool(
+                transaction is not None
+                and transaction.state
+                in {
+                    InterventionLifecycleState.RESTORED.value,
+                    InterventionLifecycleState.ABANDONED.value,
+                }
+            )
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[bool] = loop.create_future()
+        prior = self._pending_restore_results.get(command.restore_id)
+        if prior is not None and not prior.done():
+            prior.set_result(False)
+        self._pending_restore_results[command.restore_id] = future
+        self._pending_startup_restores[command.restore_id] = command
+        sent = await self._ws_server.send_restore_command(command)
+        if sent == 0:
+            self._pending_restore_results.pop(command.restore_id, None)
+            logger.warning(
+                "Restore %s has no connected executor; retaining for retry",
+                command.restore_id,
+            )
+            return False
+        try:
+            return await asyncio.wait_for(future, timeout=10.0)
+        except TimeoutError:
+            logger.warning(
+                "Restore %s receipt timed out; retaining for retry",
+                command.restore_id,
+            )
+            return False
+        finally:
+            current = self._pending_restore_results.get(command.restore_id)
+            if current is future:
+                self._pending_restore_results.pop(command.restore_id, None)
+
+    async def restore_all_transactional_effects(
+        self,
+        *,
+        reason: Literal["system_cancelled", "emergency_restore"] = ("emergency_restore"),
+        timeout_seconds: float = 3.0,
+    ) -> dict[str, int]:
+        """Dispatch every exact inverse and wait for bounded verification.
+
+        Offline owners remain in ``_pending_startup_restores`` and are retried
+        on their next stable-identity reconnect. The returned counts never
+        claim those effects were restored merely because a frame was sent.
+        """
+
+        commands = await self._transaction_coordinator.request_restore_all(
+            reason=reason,
+        )
+        loop = asyncio.get_running_loop()
+        waiters: dict[str, asyncio.Future[bool]] = {}
+        dispatched = 0
+        for command in commands:
+            self._pending_startup_restores[command.restore_id] = command
+            future = self._pending_restore_results.get(command.restore_id)
+            if future is None or future.done():
+                future = loop.create_future()
+                self._pending_restore_results[command.restore_id] = future
+            waiters[command.restore_id] = future
+            try:
+                if await self._ws_server.send_restore_command(command) > 0:
+                    dispatched += 1
+            except Exception:
+                logger.exception(
+                    "Global restore dispatch failed for %s",
+                    command.restore_id,
+                )
+
+        bounded_timeout = max(0.0, min(float(timeout_seconds), 10.0))
+        if waiters and bounded_timeout > 0:
+            await asyncio.wait(
+                set(waiters.values()),
+                timeout=bounded_timeout,
+            )
+
+        restored = 0
+        failed = 0
+        for restore_id, future in waiters.items():
+            if future.done() and not future.cancelled():
+                try:
+                    if future.result():
+                        restored += 1
+                    else:
+                        failed += 1
+                except Exception:
+                    failed += 1
+            current = self._pending_restore_results.get(restore_id)
+            if current is future:
+                self._pending_restore_results.pop(restore_id, None)
+        pending = len(commands) - restored - failed
+        return {
+            "requested": len(commands),
+            "dispatched": dispatched,
+            "restored": restored,
+            "failed": failed,
+            "pending": pending,
+        }
+
     async def _check_action_consent(
-        self, action_type: str, requested_level: int,
+        self,
+        action_type: str,
+        requested_level: int,
     ) -> bool:
         """Phase-4b TASK M: per-action consent gate for the executor.
 
         ``InterventionExecutor.apply`` calls this BEFORE adapter
         dispatch. Returning False short-circuits the mutation into
-        ``success=False, reason="consent_denied"`` so AMIP /
-        helpfulness can record the failure mode.
+        ``success=False, reason="consent_denied"`` so local diagnostics
+        can record the failure mode.
         """
         try:
             decision = await self._consent_ladder.check(
-                action_type=action_type, requested_level=requested_level,
+                action_type=action_type,
+                requested_level=requested_level,
             )
             return bool(decision.allowed)
         except Exception:
@@ -3643,7 +5413,8 @@ class CortexDaemon:
             return False
 
     async def _resume_last_active_file(
-        self, params: dict[str, Any],
+        self,
+        params: dict[str, Any],
     ) -> tuple[bool, str | None]:
         """Phase-4b TASK M: focus the editor on the last active file.
 
@@ -3665,7 +5436,9 @@ class CortexDaemon:
             return (False, "editor_send_failed")
 
     async def _broadcast_prompt(
-        self, action_type: str, params: dict[str, Any],
+        self,
+        action_type: str,
+        params: dict[str, Any],
     ) -> tuple[bool, str | None]:
         """Phase-4b TASK M: WS broadcast for prompt-only special actions.
 
@@ -3680,10 +5453,7 @@ class CortexDaemon:
         try:
             prompt = str(params.get("prompt") or "")
             timeout_seconds = params.get("timeout_seconds")
-            metadata = {
-                k: v for k, v in params.items()
-                if k not in ("prompt", "timeout_seconds")
-            }
+            metadata = {k: v for k, v in params.items() if k not in ("prompt", "timeout_seconds")}
             await self._ws_server.send_message(
                 MessageType.INTERVENTION_PROMPT.value,
                 {
@@ -3696,7 +5466,8 @@ class CortexDaemon:
             return (True, None)
         except Exception:
             logger.exception(
-                "broadcast_prompt failed for action=%s", action_type,
+                "broadcast_prompt failed for action=%s",
+                action_type,
             )
             return (False, "broadcast_failed")
 
@@ -3707,7 +5478,7 @@ class CortexDaemon:
         duration_seconds: int = 240,
         breathing_pattern: str | None = None,
         audio_cue: bool = True,
-        reason: str = "stress_integral_crossed_threshold",
+        reason: str = "preferred_focus_interval_reached",
     ) -> dict[str, Any] | None:
         """Run one guided breathing session and return a BreakRecord dict."""
         if self._break_controller is None:
@@ -3716,7 +5487,9 @@ class CortexDaemon:
         if breathing_pattern in ("box", "4-7-8", "coherent"):
             pattern_arg = breathing_pattern  # type: ignore[assignment]
         else:
-            pattern_arg = None
+            # No biometric auto-selection: a missing preference uses the
+            # neutral product default.
+            pattern_arg = "box"
         # P0 §3.7 audit fix (spec line 643): default audio off when the
         # microphone was active recently. ``last_mic_active_at`` is the
         # most-recent positive ``receptivity.is_microphone_in_use``
@@ -3726,18 +5499,17 @@ class CortexDaemon:
             mute_window = float(
                 getattr(
                     self.config.intervention,
-                    "biology_break_audio_mute_after_mic_seconds",
+                    "guided_break_audio_mute_after_mic_seconds",
                     300.0,
                 )
             )
             if (
                 mute_window > 0
                 and self._last_mic_active_at > 0
-                and time.monotonic() - self._last_mic_active_at < mute_window
+                and monotonic_seconds(self._clock) - self._last_mic_active_at < mute_window
             ):
                 logger.info(
-                    "Biology break: muting audio_cue — microphone "
-                    "was active in the last %.0fs",
+                    "Guided break: muting audio cue — microphone was active in the last %.0fs",
                     mute_window,
                 )
                 audio_cue = False
@@ -3753,7 +5525,8 @@ class CortexDaemon:
             )
         except Exception:
             logger.debug(
-                "BIOLOGY_BREAK_STARTED log failed", exc_info=True,
+                "BIOLOGY_BREAK_STARTED log failed",
+                exc_info=True,
             )
         record = await self._break_controller.start(
             duration_seconds=int(duration_seconds),
@@ -3767,9 +5540,10 @@ class CortexDaemon:
         # legacy code only reset after a successful record — a
         # cancelled or no-handler break left the flag latched and
         # silently suppressed every subsequent threshold crossing.
-        self._break_recommendation_sent = False
         if record is None:
             return None
+        if record.completed:
+            self._focus_break_policy.record_break_taken()
         # Phase-4b TASK G: structured BIOLOGY_BREAK_COMPLETED event.
         try:
             logger.info(
@@ -3777,28 +5551,30 @@ class CortexDaemon:
                 EventType.BIOLOGY_BREAK_COMPLETED.value,
                 intervention_id or "-",
                 float(record.duration_seconds),
-                (
-                    f"{record.recovery_delta:.1f}"
-                    if record.recovery_delta is not None else "n/a"
-                ),
+                (f"{record.recovery_delta:.1f}" if record.recovery_delta is not None else "n/a"),
                 bool(record.completed),
             )
         except Exception:
             logger.debug(
-                "BIOLOGY_BREAK_COMPLETED log failed", exc_info=True,
+                "BIOLOGY_BREAK_COMPLETED log failed",
+                exc_info=True,
             )
         payload = record.model_dump(mode="json")
         if intervention_id:
-            self._recorder.append("biology_break", {
-                "intervention_id": intervention_id,
-                **payload,
-            })
+            self._recorder.append(
+                "biology_break",
+                {
+                    "intervention_id": intervention_id,
+                    **payload,
+                },
+            )
         return payload
 
     # ─── P0 §3.9: causal rationale resolution ────────────────────────
 
     async def get_causal_signals(
-        self, intervention_id: str,
+        self,
+        intervention_id: str,
     ) -> list[dict[str, Any]] | None:
         """Return the cached CausalSignal list for an intervention.
 
@@ -3815,11 +5591,12 @@ class CortexDaemon:
         # Fall back to live attribution against the most recent feature
         # vector + baselines if available.
         try:
-            latest_features = registry.get("latest_feature_vector")
+            latest_features = self._current_feature_vector()
             if latest_features is None:
                 return None
             signals = self._causal_attributor.attribute_top_signals(
-                latest_features, self._scorer.baselines,
+                latest_features,
+                self._scorer.baselines,
             )
         except Exception:
             logger.debug("get_causal_signals fallback failed", exc_info=True)
@@ -3836,21 +5613,33 @@ class CortexDaemon:
         """
         kind = self._quiet_mode_kind
         ends_at = self._quiet_mode_ends_at
-        if kind == "off" or (
-            ends_at is not None and time.time() >= ends_at
-        ):
+        active_clock = getattr(self, "_clock", SYSTEM_CLOCK)
+        deadline = getattr(self, "_quiet_mode_deadline", None)
+        deadline_expired = (
+            deadline.expired(active_clock)
+            if isinstance(deadline, BoundedDeadline)
+            else ends_at is not None and unix_seconds(active_clock) >= ends_at
+        )
+        if kind == "off" or (ends_at is not None and deadline_expired):
             # Stale window — re-normalise so the broadcast is honest.
             kind = "off"
             ends_at = None
             self._quiet_mode_kind = "off"
             self._quiet_mode_ends_at = None
+            self._quiet_mode_deadline = None
         duration_minutes: int | None = None
         if ends_at is not None:
-            duration_minutes = max(0, int(round((ends_at - time.time()) / 60.0)))
+            remaining_seconds = (
+                deadline.remaining_ms(active_clock) / 1_000.0
+                if isinstance(deadline, BoundedDeadline)
+                else max(0.0, ends_at - unix_seconds(active_clock))
+            )
+            duration_minutes = max(0, int(round(remaining_seconds / 60.0)))
         return {
             "kind": kind,
             "duration_minutes": duration_minutes,
             "ends_at": ends_at,
+            "ends_at_unix_ms": int(ends_at * 1_000) if ends_at is not None else None,
             "source": self._quiet_mode_source,
         }
 
@@ -3894,7 +5683,8 @@ class CortexDaemon:
         """
         if kind not in ("snooze_15", "quiet_session", "pause", "off"):
             logger.warning(
-                "set_quiet_mode: unknown kind=%r (treating as 'off')", kind,
+                "set_quiet_mode: unknown kind=%r (treating as 'off')",
+                kind,
             )
             kind = "off"
         # ``duration_minutes == 0`` is the documented "use daemon
@@ -3908,15 +5698,14 @@ class CortexDaemon:
         if kind == "snooze_15":
             minutes = max(1, min(240, int(duration_minutes or 15)))
         elif kind == "quiet_session":
-            minutes = max(1, min(240, int(
-                duration_minutes
-                or self.config.intervention.quiet_mode_minutes
-            )))
+            minutes = max(
+                1, min(240, int(duration_minutes or self.config.intervention.quiet_mode_minutes))
+            )
         else:
             minutes = 0  # pause / off carry no countdown
-        ends_at: float | None = (
-            time.time() + minutes * 60.0 if minutes > 0 else None
-        )
+        active_clock = getattr(self, "_clock", SYSTEM_CLOCK)
+        deadline = BoundedDeadline.after(active_clock, minutes * 60_000) if minutes > 0 else None
+        ends_at = deadline.expires_at_unix_ms / 1_000.0 if deadline is not None else None
 
         # Serialise under the lock so two surfaces flipping kinds
         # simultaneously can't drop the pause-was-capturing latch.
@@ -3973,9 +5762,13 @@ class CortexDaemon:
                 # INTO pause from a non-pause state (Phase-3 P1-DF-11.5
                 # — second pause-click clobbered the latch).
                 if prev_kind != "pause":
-                    was_running = bool(getattr(
-                        self._capture_pipeline, "is_running", False,
-                    ))
+                    was_running = bool(
+                        getattr(
+                            self._capture_pipeline,
+                            "is_running",
+                            False,
+                        )
+                    )
                     self._pause_was_capturing = was_running
                     if was_running:
                         try:
@@ -3990,6 +5783,7 @@ class CortexDaemon:
             # Record state under the same lock to keep readers consistent.
             self._quiet_mode_kind = kind
             self._quiet_mode_ends_at = ends_at
+            self._quiet_mode_deadline = deadline
             self._quiet_mode_source = str(source or "daemon")
 
             # C6 (audit): emit QUIET_MODE_ENTERED / QUIET_MODE_EXITED on the
@@ -4039,6 +5833,7 @@ class CortexDaemon:
                     "quiet_mode": kind != "off",
                     "quiet_mode_kind": kind,
                     "quiet_duration_minutes": minutes if minutes > 0 else 0,
+                    "execution_mode": self.intervention_execution_mode,
                 },
             )
         except Exception:
@@ -4050,11 +5845,15 @@ class CortexDaemon:
             )
         logger.info(
             "Quiet mode set to %s (duration=%s min, source=%s)",
-            kind, minutes if minutes > 0 else "-", source,
+            kind,
+            minutes if minutes > 0 else "-",
+            source,
         )
 
     async def _decay_quiet_mode_after(
-        self, delay_seconds: float, expected_kind: str,
+        self,
+        delay_seconds: float,
+        expected_kind: str,
     ) -> None:
         """Sleep ``delay_seconds`` then broadcast an "off" state IF the
         mode hasn't already transitioned away from ``expected_kind``.
@@ -4069,6 +5868,7 @@ class CortexDaemon:
                 return
             self._quiet_mode_kind = "off"
             self._quiet_mode_ends_at = None
+            self._quiet_mode_deadline = None
             self._quiet_mode_source = "daemon_decay"
             self._trigger_policy.clear_quiet_mode()
         try:
@@ -4079,6 +5879,7 @@ class CortexDaemon:
                     "quiet_mode": False,
                     "quiet_mode_kind": "off",
                     "quiet_duration_minutes": 0,
+                    "execution_mode": self.intervention_execution_mode,
                 },
             )
         except Exception:
@@ -4134,9 +5935,7 @@ class CortexDaemon:
             logger.debug("macOS notification helper unavailable")
             return
         headline = (getattr(plan, "headline", "") or "Cortex").strip()
-        primary_focus = (
-            getattr(plan, "primary_focus", "") or ""
-        ).strip()
+        primary_focus = (getattr(plan, "primary_focus", "") or "").strip()
         # F09 sanitisation: explicit allowlist — no biometric numerics.
         body_parts: list[str] = []
         if primary_focus:
@@ -4152,7 +5951,8 @@ class CortexDaemon:
             )
         except Exception:
             logger.debug(
-                "send_intervention_notification raised", exc_info=True,
+                "send_intervention_notification raised",
+                exc_info=True,
             )
             return
         # C6 (audit): emit OS_NOTIFICATION_SENT when the OS actually posted
@@ -4168,63 +5968,6 @@ class CortexDaemon:
     # ------------------------------------------------------------------
     # P0 §3.10: auto-armed distraction blocking on HYPER
     # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Consent overrides persistence (Phase-3 P0 / Audit-1.1 P0-1)
-    # ------------------------------------------------------------------
-
-    def _load_consent_overrides(self) -> None:
-        """Rehydrate ``ConsentPolicy.set_level`` overrides from disk so
-        the user's autonomous-act opt-ins (e.g. distraction_block)
-        survive a daemon restart. Missing or corrupt file → start with
-        the default policy (REVERSIBLE_ACT for distraction_block, etc.).
-        """
-        path = self._consent_overrides_path
-        if not path.exists():
-            return
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            logger.warning(
-                "consent_overrides.json unreadable; starting from defaults",
-                exc_info=True,
-            )
-            return
-        levels = payload.get("levels") if isinstance(payload, dict) else None
-        if not isinstance(levels, dict):
-            return
-        for action_type, raw_level in levels.items():
-            if not isinstance(action_type, str):
-                continue
-            try:
-                self._consent_policy.set_level(
-                    action_type, int(raw_level),
-                )
-            except Exception:
-                logger.debug(
-                    "skipping malformed consent override %r=%r",
-                    action_type, raw_level,
-                )
-        logger.info(
-            "Restored %d consent overrides from %s",
-            len(levels), path,
-        )
-
-    def _persist_consent_overrides(self) -> None:
-        """Atomically write the current ``ConsentPolicy`` overrides to
-        disk. Called from every ``set_level`` mutation path so a crash
-        between the in-memory flip and the next planned write doesn't
-        lose the user's choice."""
-        from cortex.libs.utils.atomic_write import atomic_write_json
-
-        path = self._consent_overrides_path
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_json(path, self._consent_policy.to_dict())
-        except Exception:
-            logger.warning(
-                "consent_overrides persist failed", exc_info=True,
-            )
 
     def _reset_auto_focus_timers(self) -> None:
         """Phase-3 P1-N3 + Audit-1.1 P1-7: shared reset of every
@@ -4251,8 +5994,8 @@ class CortexDaemon:
           3. The user has approved the ``distraction_block`` consent
              class at ``AUTONOMOUS_ACT`` (default ``REVERSIBLE_ACT``;
              the upshift is explicit, from Settings → Focus protection).
-          4. State is HYPER, confidence ≥ confidence_gate, and the
-             HYPER dwell has met dwell_gate.
+          4. Support is likely, evidence strength ≥ the gate, and the
+             confirmed dwell has met ``dwell_gate``.
           5. Symmetric exit on sustained FLOW/RECOVERY for exit_gate.
           6. When the flag flips OFF / consent downgrades while
              ``_auto_focus_armed`` is True, broadcast STOP_FOCUS_AUTO
@@ -4292,15 +6035,18 @@ class CortexDaemon:
 
         state = getattr(estimate, "state", "")
         confidence = float(getattr(estimate, "confidence", 0.0) or 0.0)
-        confidence_gate = float(
-            getattr(cfg, "auto_distraction_block_confidence", 0.85)
-        )
-        dwell_gate = float(
-            getattr(cfg, "auto_distraction_block_dwell_seconds", 30.0)
-        )
-        exit_gate = float(
-            getattr(cfg, "auto_distraction_block_exit_seconds", 300.0)
-        )
+        if (
+            getattr(estimate, "status", "insufficient_evidence") != "estimated"
+            or float(getattr(estimate, "evidence_coverage", 0.0) or 0.0) < 0.45
+        ):
+            if self._auto_focus_armed:
+                self._auto_focus_armed = False
+                await self._emit_stop_focus_auto(reason="evidence_unavailable")
+            self._reset_auto_focus_timers()
+            return
+        confidence_gate = float(getattr(cfg, "auto_distraction_block_confidence", 0.85))
+        dwell_gate = float(getattr(cfg, "auto_distraction_block_dwell_seconds", 30.0))
+        exit_gate = float(getattr(cfg, "auto_distraction_block_exit_seconds", 300.0))
 
         if state == "HYPER" and confidence >= confidence_gate:
             # Active dwell — clear the recovery countdown so we don't
@@ -4326,14 +6072,15 @@ class CortexDaemon:
                 if cooldown_elapsed < _AUTO_FOCUS_DEBOUNCE_S:
                     logger.debug(
                         "auto-arm suppressed by debounce (cooldown %.1fs < %.1fs)",
-                        cooldown_elapsed, _AUTO_FOCUS_DEBOUNCE_S,
+                        cooldown_elapsed,
+                        _AUTO_FOCUS_DEBOUNCE_S,
                     )
                 else:
                     # Phase-3 P1-2 (Audit-1.1): only flip the armed flag
                     # after the broadcast lands. ``_emit_start_focus_auto``
                     # returns True on success.
                     ok = await self._emit_start_focus_auto(
-                        reason="biometric_hyper",
+                        reason="behavior_support_likely",
                     )
                     if ok:
                         self._auto_focus_armed = True
@@ -4345,13 +6092,14 @@ class CortexDaemon:
                         # with the disarm path.
                         try:
                             logger.info(
-                                "%s phase=arm reason=biometric_hyper dwell_s=%.1f",
+                                "%s phase=arm reason=behavior_support_likely dwell_s=%.1f",
                                 EventType.DISTRACTION_BLOCKED.value,
                                 dwelled,
                             )
                         except Exception:
                             logger.debug(
-                                "arm structured log failed", exc_info=True,
+                                "arm structured log failed",
+                                exc_info=True,
                             )
         elif self._auto_focus_armed and state in ("FLOW", "RECOVERY"):
             if not self._auto_focus_recovery_started:
@@ -4374,7 +6122,8 @@ class CortexDaemon:
                 if held_for < _AUTO_FOCUS_DEBOUNCE_S:
                     logger.debug(
                         "auto-disarm suppressed by debounce (held %.1fs < %.1fs)",
-                        held_for, _AUTO_FOCUS_DEBOUNCE_S,
+                        held_for,
+                        _AUTO_FOCUS_DEBOUNCE_S,
                     )
                 else:
                     await self._emit_stop_focus_auto(reason="sustained_recovery")
@@ -4398,41 +6147,19 @@ class CortexDaemon:
                 self._auto_focus_recovery_started = False
 
     async def _emit_start_focus_auto(self, *, reason: str) -> bool:
-        """Broadcast ``START_FOCUS_AUTO`` to the browser extension.
+        """Fail closed until autonomous focus has a WP-6 transaction.
 
-        Returns True only when the WS send succeeded so the caller can
-        defer flipping ``_auto_focus_armed`` until the wire confirms
-        (Phase-3 P1-2 / Audit-1.1 P1-2).
+        A persisted settings toggle and a state estimate are policy inputs,
+        not a one-time manifest-bound authorization. Manual focus sessions and
+        STOP_FOCUS_AUTO remain available, but this forward effect must not be
+        emitted through the legacy command channel.
         """
-        cfg = self.config.intervention
-        preset = str(getattr(
-            cfg, "auto_distraction_block_preset", "developer",
-        ))
-        duration_minutes = int(getattr(
-            cfg, "auto_distraction_block_session_minutes", 20,
-        ))
-        custom_domains = list(getattr(
-            cfg, "auto_distraction_block_custom_domains", [],
-        ))
-        try:
-            await self._ws_server.send_message(
-                MessageType.START_FOCUS_AUTO.value,
-                {
-                    "duration_minutes": duration_minutes,
-                    "reason": reason,
-                    "preset": preset,
-                    "custom_domains": custom_domains,
-                },
-                target_client_types=["chrome", "edge"],
-            )
-            logger.info(
-                "START_FOCUS_AUTO emitted (preset=%s, %d min, reason=%s)",
-                preset, duration_minutes, reason,
-            )
-            return True
-        except Exception:
-            logger.exception("START_FOCUS_AUTO broadcast failed")
-            return False
+        logger.info(
+            "START_FOCUS_AUTO suppressed pending exact transaction support (mode=%s reason=%s)",
+            getattr(self, "intervention_execution_mode", "suggest_only"),
+            reason,
+        )
+        return False
 
     async def _emit_stop_focus_auto(self, *, reason: str) -> bool:
         """Broadcast ``STOP_FOCUS_AUTO`` to the browser extension.
@@ -4503,7 +6230,7 @@ class CortexDaemon:
         ``RestoreManager.engage`` exactly once (latched by
         ``_micro_step_recovery_fired``) so a tail-click does not
         re-engage an already-closed intervention. The natural
-        recovery path feeds AMIP via the same helpfulness tracker
+        recovery path feeds the local helpfulness diagnostics via the same tracker
         used by the dismiss/engage actions.
         """
         # Wave-2 P1: serialise against the F16 plan-swap path so a
@@ -4523,9 +6250,7 @@ class CortexDaemon:
                 logger.warning("toggle_micro_step: missing intervention_id")
                 return
             if not isinstance(step_index, int) or step_index < 0:
-                logger.warning(
-                    "toggle_micro_step: invalid step_index=%r", step_index
-                )
+                logger.warning("toggle_micro_step: invalid step_index=%r", step_index)
                 return
 
             # ---- locate the live plan ---------------------------------
@@ -4536,8 +6261,7 @@ class CortexDaemon:
                 or self._active_intervention_id != intervention_id
             ):
                 logger.info(
-                    "toggle_micro_step: dropping stale toggle "
-                    "(requested=%s active=%s)",
+                    "toggle_micro_step: dropping stale toggle (requested=%s active=%s)",
                     intervention_id,
                     self._active_intervention_id,
                 )
@@ -4545,8 +6269,7 @@ class CortexDaemon:
 
             if step_index >= len(plan.micro_steps):
                 logger.warning(
-                    "toggle_micro_step: step_index=%d out of range "
-                    "(len=%d) for intervention=%s",
+                    "toggle_micro_step: step_index=%d out of range (len=%d) for intervention=%s",
                     step_index,
                     len(plan.micro_steps),
                     intervention_id,
@@ -4560,7 +6283,7 @@ class CortexDaemon:
             # across timezones. The step schema stores datetimes; the
             # reader at Phase-4a tolerates both naive and tz-aware
             # values for backwards compat with older session JSONs.
-            now = datetime.now(UTC)
+            now = utc_datetime(_daemon_clock(self))
             prior_status = step.status
             step.status = new_status  # type: ignore[assignment]
             # Stamp lifecycle timestamps. ``started_at`` is set the first
@@ -4578,24 +6301,31 @@ class CortexDaemon:
 
             # ---- rebroadcast the updated trigger ----------------------
             try:
-                await self._ws_server.send_message(
-                    MessageType.INTERVENTION_TRIGGER.value,
-                    plan.model_dump(mode="json"),
+                transaction = await self._transaction_coordinator.get_transaction(intervention_id)
+                await self._ws_server.send_intervention(
+                    plan,
+                    action_manifest=(transaction.manifest if transaction is not None else None),
+                    execution_mode=(
+                        self.intervention_execution_mode
+                        if transaction is not None and transaction.manifest.action_count > 0
+                        else "suggest_only"
+                    ),
                 )
             except Exception:
-                logger.debug(
-                    "MICRO_STEP_TOGGLED rebroadcast failed", exc_info=True
-                )
+                logger.debug("MICRO_STEP_TOGGLED rebroadcast failed", exc_info=True)
 
             # Persist via the recorder so the session report sees the
             # ``done`` history per step.
             try:
-                self._recorder.append("micro_step_toggled", {
-                    "intervention_id": intervention_id,
-                    "step_index": step_index,
-                    "new_status": new_status,
-                    "text": step.text,
-                })
+                self._recorder.append(
+                    "micro_step_toggled",
+                    {
+                        "intervention_id": intervention_id,
+                        "step_index": step_index,
+                        "new_status": new_status,
+                        "text": step.text,
+                    },
+                )
             except Exception:
                 logger.debug("micro_step_toggled append failed", exc_info=True)
 
@@ -4618,56 +6348,67 @@ class CortexDaemon:
                 if outcome is not None:
                     # Mirror the bookkeeping path that ``_handle_user_action``
                     # performs for the explicit engage/dismiss flow so the
-                    # bandit / helpfulness ledger sees a consistent close.
-                    self._active_intervention_id = None
-                    self._active_plan = None
+                    # local helpfulness ledger sees a consistent close.
                     try:
                         self._recorder.append(
-                            "intervention_outcome", outcome.model_dump(mode="json"),
+                            "intervention_outcome",
+                            outcome.model_dump(mode="json"),
                         )
                     except Exception:
-                        logger.debug(
-                            "intervention_outcome append failed", exc_info=True
-                        )
-                    try:
-                        await self._ws_server.send_restore(
-                            intervention_id, user_action="natural_recovery",
-                        )
-                    except Exception:
-                        logger.debug(
-                            "send_restore on natural_recovery failed",
-                            exc_info=True,
-                        )
-                    try:
-                        self._helpfulness.record_user_action(
-                            intervention_id, "natural_recovery",
-                        )
-                    except Exception:
-                        logger.debug(
-                            "record_user_action(natural_recovery) failed",
-                            exc_info=True,
-                        )
+                        logger.debug("intervention_outcome append failed", exc_info=True)
+                    if outcome.workspace_restored:
+                        self._active_intervention_id = None
+                        self._active_plan = None
+                        try:
+                            await self._ws_server.send_restore(
+                                intervention_id,
+                                user_action="natural_recovery",
+                            )
+                        except Exception:
+                            logger.debug(
+                                "send_restore on natural_recovery failed",
+                                exc_info=True,
+                            )
+                        try:
+                            self._helpfulness.record_user_action(
+                                intervention_id,
+                                "natural_recovery",
+                            )
+                            await self._policy_lifecycle.observe_intervention(
+                                intervention_id,
+                                kind="user_action",
+                                idempotency_key=(
+                                    f"terminal-action:{intervention_id}:natural_recovery"
+                                ),
+                                payload={"action": "natural_recovery"},
+                            )
+                        except Exception:
+                            logger.debug(
+                                "record_user_action(natural_recovery) failed",
+                                exc_info=True,
+                            )
+                    else:
+                        # The plan remains active and the exact restore is
+                        # retryable. Re-open the all-done latch so a later
+                        # toggle or explicit Undo can retry safely.
+                        self._micro_step_recovery_fired = False
 
     async def _handle_user_action(self, payload: dict[str, Any]) -> None:
-        # Phase-4b TASK F: a dismissed auto-focus interstitial routes
-        # through this callback with ``auto_focus_dismissed: True`` (the
-        # browser extension sends it on the "Not now" button). Route as
-        # a small negative outcome on the bound AMIP decision so the
-        # bandit learns the auto-arm was unwanted in this context.
+        # Auto-focus dismissals are observations inside the one fixed reward
+        # window. They never update policy state or finalize a reward early.
         if payload.get("auto_focus_dismissed") is True:
             iid = str(payload.get("intervention_id") or "")
-            decision_id = (
-                self._amip_decision_ids_by_intervention.get(iid)
-                if iid else None
-            ) or self._last_policy_decision_id
-            if decision_id and self.config.eval.policy == "amip":
+            if iid:
                 try:
-                    # ``AMIPPolicy.update_reward`` is synchronous (returns
-                    # None); awaiting it was a mypy func-returns-value error.
-                    self._amip.update_reward(decision_id, -0.2)
+                    await self._policy_lifecycle.observe_intervention(
+                        iid,
+                        kind="user_action",
+                        idempotency_key=f"auto-focus-dismissed:{iid}",
+                        payload={"action": "dismissed", "surface": "auto_focus"},
+                    )
                 except Exception:
                     logger.debug(
-                        "auto_focus_dismissed AMIP reward update failed",
+                        "auto_focus_dismissed policy observation failed",
                         exc_info=True,
                     )
             return
@@ -4688,17 +6429,26 @@ class CortexDaemon:
             # set to ``desktop_overlay_dispatch``) still records because
             # it carries the actual ``result``.
             is_dispatch_request = (
-                payload.get("result") is None
-                and payload.get("request_dispatch") is True
+                payload.get("result") is None and payload.get("request_dispatch") is True
             )
+            if is_dispatch_request and not self.workspace_mutation_allowed:
+                logger.info(
+                    "Action request denied in suggest-only mode (action_id=%s action_type=%s)",
+                    payload.get("action_id"),
+                    payload.get("action_type"),
+                )
+                return
             if not is_dispatch_request:
-                self._recorder.append("action_executed", {
-                    "intervention_id": payload.get("intervention_id"),
-                    "action_id": payload.get("action_id"),
-                    "action_type": payload.get("action_type"),
-                    "result": payload.get("result"),
-                    "source": payload.get("source") or source_client or None,
-                })
+                self._recorder.append(
+                    "action_executed",
+                    {
+                        "intervention_id": payload.get("intervention_id"),
+                        "action_id": payload.get("action_id"),
+                        "action_type": payload.get("action_type"),
+                        "result": payload.get("result"),
+                        "source": payload.get("source") or source_client or None,
+                    },
+                )
             # G4 (audit-prod): when the request originates from the
             # desktop shell (no ``result`` field; the result only exists
             # on the executed-by-extension reply path), forward to the
@@ -4711,45 +6461,18 @@ class CortexDaemon:
             # An empty source string (legacy in-process callback path
             # that bypasses the WS server) is also honoured because no
             # peer client could have produced it.
-            # P0 §3.7: ``take_biology_break`` is always desktop-local
-            # (full-screen Qt overlay). Run it directly here regardless
-            # of source — any authenticated surface may request a
-            # break and the daemon is the only place with the HRV
-            # context to drive the breathing controller correctly.
-            action_dict_raw = payload.get("action") if isinstance(payload.get("action"), dict) else None
+            # Compatibility action names remain decodable, but unsupported
+            # physiology never confers break-action authority.
+            action_dict_raw = (
+                payload.get("action") if isinstance(payload.get("action"), dict) else None
+            )
             current_action_type = str(
-                payload.get("action_type")
-                or (action_dict_raw or {}).get("action_type")
-                or ""
+                payload.get("action_type") or (action_dict_raw or {}).get("action_type") or ""
             )
             if current_action_type == "take_biology_break":
-                metadata = {}
-                if isinstance(action_dict_raw, dict):
-                    md = action_dict_raw.get("metadata")
-                    if isinstance(md, dict):
-                        metadata = md
-                if not metadata and isinstance(payload.get("metadata"), dict):
-                    metadata = payload["metadata"]
-                duration = int(metadata.get("duration_seconds", 240) or 240)
-                pattern_arg = metadata.get("breathing_pattern")
-                audio_cue = bool(metadata.get("audio_cue", True))
-                reason = str(
-                    metadata.get("reason", "user_requested_break")
-                )[:120]
-                iid = str(payload.get("intervention_id") or "")
-                # Run in background — the controller blocks for
-                # ``duration_seconds`` and we don't want to stall the
-                # WS message dispatch loop. The recorder gets the
-                # outcome via ``start_biology_break``.
-                self._spawn_background_task(
-                    self.start_biology_break(
-                        intervention_id=iid,
-                        duration_seconds=duration,
-                        breathing_pattern=pattern_arg if isinstance(pattern_arg, str) else None,
-                        audio_cue=audio_cue,
-                        reason=reason,
-                    ),
-                    name="cortex-biology-break",
+                logger.info(
+                    "Ignoring compatibility take_biology_break action (intervention_id=%s)",
+                    payload.get("intervention_id"),
                 )
                 return
             if is_dispatch_request and source_client in ("", "desktop"):
@@ -4767,14 +6490,13 @@ class CortexDaemon:
                         "target": payload.get("target"),
                         "tab_index": payload.get("tab_index"),
                     }
-                await self.dispatch_action_to_browser(
+                await self.dispatch_intervention_action(
                     str(payload.get("intervention_id") or ""),
                     action_dict,
                 )
             elif is_dispatch_request:
                 logger.warning(
-                    "ACTION_DISPATCH refused: non-desktop source %r tried "
-                    "to forward action_id=%s",
+                    "ACTION_DISPATCH refused: non-desktop source %r tried to forward action_id=%s",
                     source_client,
                     payload.get("action_id"),
                 )
@@ -4795,45 +6517,28 @@ class CortexDaemon:
             )
             if iid and rating:
                 self._helpfulness.record_rating(
-                    iid, rating, text_feedback=text_feedback,
+                    iid,
+                    rating,
+                    text_feedback=text_feedback,
                 )
-                self._recorder.append("helpfulness", {
-                    "intervention_id": iid,
-                    "user_rating": rating,
-                    "text_feedback": text_feedback,
-                })
-                # Phase-4b TASK A: route the rating into AMIP so the
-                # bandit learns from explicit feedback even when the
-                # implicit engaged/dismissed signal has not arrived yet
-                # (the user may rate-then-keep-the-intervention-open).
-                # Reward shape: thumbs_up → +0.7, thumbs_down → -0.7;
-                # values match the implicit-signal magnitudes the
-                # helpfulness tracker emits on engagement.
-                if (
-                    self.config.eval.policy == "amip"
-                    and rating in ("thumbs_up", "thumbs_down")
-                ):
-                    rating_reward = 0.7 if rating == "thumbs_up" else -0.7
-                    decision_id = self._amip_decision_ids_by_intervention.get(
-                        iid, self._last_policy_decision_id,
-                    )
-                    if decision_id:
-                        try:
-                            cid = get_correlation_id() or "-"
-                            logger.info(
-                                "amip_rating_reward intervention_id=%s "
-                                "decision_id=%s rating=%s reward=%.2f cid=%s",
-                                iid, decision_id, rating, rating_reward, cid,
-                            )
-                            # synchronous; see note at the other call site.
-                            self._amip.update_reward(
-                                decision_id, rating_reward,
-                            )
-                        except Exception:
-                            logger.debug(
-                                "amip rating reward update failed",
-                                exc_info=True,
-                            )
+                self._recorder.append(
+                    "helpfulness",
+                    {
+                        "intervention_id": iid,
+                        "user_rating": rating,
+                        "text_feedback": text_feedback,
+                    },
+                )
+                if rating in ("thumbs_up", "thumbs_down"):
+                    try:
+                        await self._policy_lifecycle.observe_intervention(
+                            iid,
+                            kind="user_rating",
+                            idempotency_key=f"user-rating:{iid}:{rating}",
+                            payload={"rating": rating},
+                        )
+                    except Exception:
+                        logger.debug("policy rating observation failed", exc_info=True)
                 # P0 §3.8: frustration-spiral throttle — 5 thumbs_down in
                 # 30 s escalates the daemon into Quiet Mode for 30 min.
                 if rating == "thumbs_down":
@@ -4847,10 +6552,8 @@ class CortexDaemon:
                         # quiet-mode timer. The latch records the last
                         # activation timestamp; subsequent crossings
                         # are no-ops until the window clears.
-                        now = time.monotonic()
-                        already_latched = (
-                            now - self._quiet_mode_throttle_latched_at < 30.0
-                        )
+                        now = monotonic_seconds(self._clock)
+                        already_latched = now - self._quiet_mode_throttle_latched_at < 30.0
                         if recent >= 5 and not already_latched:
                             logger.info(
                                 "Frustration spiral detected (%d downvotes in 30s) "
@@ -4904,9 +6607,7 @@ class CortexDaemon:
         # Fall back to the trigger-policy's last evaluated confidence and the
         # current context only when the snapshot is missing (e.g. a legacy
         # intervention id from before this cache existed).
-        cached_features = self._dismissal_features_by_intervention.get(
-            intervention_id
-        )
+        cached_features = self._dismissal_features_by_intervention.get(intervention_id)
         if cached_features is not None:
             trigger_conf, trigger_complexity = cached_features
         else:
@@ -4921,15 +6622,15 @@ class CortexDaemon:
         # this intervention acted on (the executor gates on the same keys),
         # so escalation actually lifts the gate on approved actions. Falls
         # back to the legacy "intervention" key when no actions were cached.
-        consent_keys = self._consent_actions_by_intervention.get(
-            intervention_id
-        ) or ["intervention"]
+        consent_keys = self._consent_actions_by_intervention.get(intervention_id) or [
+            "intervention"
+        ]
 
         if action == "engaged":
             outcome = await self._restore_manager.engage(intervention_id)
-            # v2.0: Record consent approval under each gated action-type.
-            for consent_key in consent_keys:
-                await self._consent_ladder.record_approval(consent_key)
+            # Consent approval is evidence only after a verified action
+            # receipt. Merely clicking a micro-step or proposal CTA must not
+            # silently escalate workspace authority.
             self._trigger_policy.record_outcome(
                 dismissed=False,
                 confidence=trigger_conf,
@@ -4973,9 +6674,43 @@ class CortexDaemon:
                 for consent_key in consent_keys:
                     await self._consent_ladder.record_rejection(consent_key)
 
+        try:
+            await self._policy_lifecycle.observe_intervention(
+                intervention_id,
+                kind="user_action",
+                idempotency_key=f"terminal-action:{intervention_id}:{action}",
+                payload={"action": action},
+            )
+            if action == "restore":
+                await self._policy_lifecycle.observe_intervention(
+                    intervention_id,
+                    kind="undo",
+                    idempotency_key=f"undo:{intervention_id}",
+                    payload={"action": action},
+                )
+            if outcome is not None and not outcome.workspace_restored:
+                await self._policy_lifecycle.observe_intervention(
+                    intervention_id,
+                    kind="restore_failure",
+                    idempotency_key=f"restore-failure:{intervention_id}:{action}",
+                    payload={"action": action},
+                )
+        except Exception:
+            logger.debug("policy terminal observation failed", exc_info=True)
+
         if outcome is None:
-            self._amip_decision_ids_by_intervention.pop(intervention_id, None)
-            self._bandit_decisions_by_intervention.pop(intervention_id, None)
+            return
+
+        self._recorder.append("intervention_outcome", outcome.model_dump(mode="json"))
+        if not outcome.workspace_restored:
+            # Closing presentation is not evidence that adapter-owned state
+            # was reversed. Keep the plan and RestoreManager record alive so
+            # Undo/startup recovery can retry the same exact inverses.
+            logger.warning(
+                "User close for %s did not verify restoration; retaining "
+                "active state and retry authority",
+                intervention_id,
+            )
             return
 
         self._active_intervention_id = None
@@ -4986,73 +6721,49 @@ class CortexDaemon:
         if self._active_plan is not None and self._active_plan.intervention_id == intervention_id:
             self._active_plan = None
         self._micro_step_recovery_fired = False
-        self._recorder.append("intervention_outcome", outcome.model_dump(mode="json"))
         await self._ws_server.send_restore(intervention_id, user_action=action)
 
-        # v2.0: End helpfulness tracking and update bandit
-        # Fold the user's action into the tracker first so the implicit-signal
-        # term (engaged/ignored/undone) contributes to the reward.
+        # Keep the immediate score for the local descriptive helpfulness UI.
+        # It is not a policy update; the durable reward finalizes only after
+        # the prespecified proximal window.
         self._helpfulness.record_user_action(intervention_id, action)
         context = self._latest_context
-        state_estimate = registry.get("latest_state_estimate")
+        state_estimate = self._current_state_estimate()
         if state_estimate:
             reward_record = await self._helpfulness.end_tracking(
                 intervention_id=intervention_id,
                 state=state_estimate.state,
                 confidence=state_estimate.confidence,
-                complexity=context.complexity_score if context and hasattr(context, 'complexity_score') else 0.0,
+                complexity=context.complexity_score
+                if context and hasattr(context, "complexity_score")
+                else 0.0,
                 tab_count=(
                     int(context.browser_context.tab_count)
                     if context and hasattr(context, "browser_context") and context.browser_context
                     else 0
                 ),
-                error_count=int(context.total_errors) if context and hasattr(context, "total_errors") else 0,
+                error_count=int(context.total_errors)
+                if context and hasattr(context, "total_errors")
+                else 0,
             )
             if reward_record is not None:
                 reward = float(reward_record.get("reward_signal", 0.0))
-                self._recorder.append("helpfulness", {
-                    "intervention_id": intervention_id,
-                    "reward_signal": reward,
-                })
-                # Update bandit with reward
-                if self.config.eval.policy == "amip":
-                    decision_id = self._amip_decision_ids_by_intervention.pop(
-                        intervention_id, self._last_policy_decision_id
-                    )
-                    if decision_id:
-                        self._amip.update_reward(decision_id, reward)
-                elif self.config.eval.policy != "uniform":
-                    decision = self._bandit_decisions_by_intervention.pop(intervention_id, None)
-                    if decision is not None:
-                        feature_vec, arm_index = decision
-                        await self._bandit.update_async(
-                            np.array(feature_vec, dtype=np.float64),
-                            arm_index,
-                            reward,
-                        )
-                    elif context:
-                        # Fallback path for older interventions lacking bound
-                        # decision metadata.
-                        features = self._build_bandit_features(state_estimate, context)
-                        bandit_features = np.array(features, dtype=np.float64)
-                        arm_index = 0
-                        if self._last_policy_arm:
-                            mapped = self._bandit.get_arm_index(self._last_policy_arm)
-                            if mapped is not None:
-                                arm_index = mapped
-                        await self._bandit.update_async(bandit_features, arm_index, reward)
-            else:
-                self._amip_decision_ids_by_intervention.pop(intervention_id, None)
-                self._bandit_decisions_by_intervention.pop(intervention_id, None)
-        else:
-            self._amip_decision_ids_by_intervention.pop(intervention_id, None)
-            self._bandit_decisions_by_intervention.pop(intervention_id, None)
+                self._recorder.append(
+                    "helpfulness",
+                    {
+                        "intervention_id": intervention_id,
+                        "descriptive_helpfulness_score": reward,
+                    },
+                )
 
         # Record tab relevance feedback (skip if per-tab feedback was already received)
         await self._record_tab_relevance_feedback(action, outcome, intervention_id)
 
     async def _record_tab_relevance_feedback(
-        self, action: str, outcome: Any, intervention_id: str = "",
+        self,
+        action: str,
+        outcome: Any,
+        intervention_id: str = "",
     ) -> None:
         """Record tab relevance feedback based on user action.
 
@@ -5131,9 +6842,7 @@ class CortexDaemon:
     # longitudinal task-pattern aggregator reads. Work-relevant types
     # (documentation/stackoverflow/search/code_host/goal_relevant) are NOT
     # distractions and are excluded.
-    _DISTRACTION_TAB_TYPES = frozenset(
-        {"distraction", "social", "video_platform"}
-    )
+    _DISTRACTION_TAB_TYPES = frozenset({"distraction", "social", "video_platform"})
 
     async def _handle_activity_sync(self, payload: dict[str, Any]) -> None:
         """Handle ACTIVITY_SYNC from browser extension — aggregate into daily timeline."""
@@ -5212,7 +6921,7 @@ class CortexDaemon:
             self._rebound_detector.reset()
 
         self._leetcode_adapter.update_context(context.model_dump(mode="json"))
-        registry.register("latest_leetcode_context", context)
+        self._services.register("latest_leetcode_context", context)
 
     async def _handle_intervention_applied(self, payload: dict[str, Any]) -> None:
         """Reconcile optimistic mutation tracking with the client's ack.
@@ -5349,12 +7058,11 @@ class CortexDaemon:
                 return
 
             baselines = self._scorer.baselines
-            telemetry = registry.get("latest_telemetry")
+            telemetry = self._current_telemetry()
+            # Biology-derived mode inputs are contained until their separate
+            # reference/label validation gates pass. Domain behavior (typing,
+            # submissions, rereads) remains available.
             blink_delta = 0.0
-            if vector.blink_rate_delta is not None:
-                blink_delta = float(vector.blink_rate_delta)
-            elif vector.blink_rate is not None:
-                blink_delta = float(vector.blink_rate - baselines.blink_rate_baseline)
 
             key_velocity = min(max(float(context.chars_per_min) / 240.0, 0.0), 1.0)
             if telemetry is not None:
@@ -5374,14 +7082,14 @@ class CortexDaemon:
                 else None
             )
             aai_score = self._amygdala_detector.update(
-                hr_delta=float(vector.hr_delta or 0.0),
+                hr_delta=0.0,
                 blink_delta=blink_delta,
                 key_velocity=key_velocity,
                 wa_timestamp=wa_timestamp,
                 current_time=timestamp,
             )
 
-            current_load = float(estimate.stress_integral or self._stress_tracker.current_load)
+            current_load = 0.0
             hrv_current = (
                 float(vector.hrv_rmssd)
                 if vector.hrv_rmssd is not None
@@ -5407,10 +7115,10 @@ class CortexDaemon:
             accepted = bool(context.accepted or last_result == "Accepted")
             rebound = self._rebound_detector.update(
                 accepted=accepted,
-                hr=vector.hr,
+                hr=None,
                 hr_baseline=float(baselines.hr_baseline),
-                hrv_current=vector.hrv_rmssd,
-                hrv_prev=self._last_leetcode_hrv_rmssd,
+                hrv_current=None,
+                hrv_prev=None,
                 last_submission_ts=submission_epoch if accepted else None,
             )
 
@@ -5421,7 +7129,7 @@ class CortexDaemon:
                 destructive=destructive,
                 parasympathetic_rebound=rebound,
             )
-            registry.register("latest_leetcode_mode_estimate", mode_estimate)
+            self._services.register("latest_leetcode_mode_estimate", mode_estimate)
 
             for action in self._leetcode_interventions.select(mode_estimate, context):
                 action_name = str(action.get("action") or "")
@@ -5429,14 +7137,16 @@ class CortexDaemon:
                 if not action_name or not isinstance(params, dict):
                     continue
 
-                signature = ":".join([
-                    action_name,
-                    str(context.problem_id),
-                    context.stage.value,
-                    str(context.submission_count),
-                    str(context.wrong_answer_count),
-                    str(context.last_submission_ts or ""),
-                ])
+                signature = ":".join(
+                    [
+                        action_name,
+                        str(context.problem_id),
+                        context.stage.value,
+                        str(context.submission_count),
+                        str(context.wrong_answer_count),
+                        str(context.last_submission_ts or ""),
+                    ]
+                )
                 last_sent = self._leetcode_action_signatures.get(signature)
                 if last_sent is not None and timestamp - last_sent < 30.0:
                     continue
@@ -5460,16 +7170,26 @@ class CortexDaemon:
                     )
                     continue
 
+                if not self.workspace_mutation_allowed:
+                    logger.debug(
+                        "LeetCode action %s suppressed in suggest-only mode",
+                        action_name,
+                    )
+                    continue
+
                 result = await self._leetcode_adapter.execute(action_name, params)
                 if result.success:
                     self._leetcode_action_signatures[signature] = timestamp
-                    self._recorder.append("leetcode_intervention", {
-                        "action": action_name,
-                        "payload": params,
-                        "mode": mode_estimate.mode.value,
-                        "stage": mode_estimate.stage.value,
-                        "problem_id": context.problem_id,
-                    })
+                    self._recorder.append(
+                        "leetcode_intervention",
+                        {
+                            "action": action_name,
+                            "payload": params,
+                            "mode": mode_estimate.mode.value,
+                            "stage": mode_estimate.stage.value,
+                            "problem_id": context.problem_id,
+                        },
+                    )
                 else:
                     logger.debug("LeetCode action %s failed: %s", action_name, result.error)
 
@@ -5489,6 +7209,8 @@ class CortexDaemon:
     @staticmethod
     def _leetcode_submission_epoch_seconds(context: LeetCodeContext) -> float | None:
         """Normalize content-script submission timestamps to epoch seconds."""
+        if context.last_submission_at_unix_ms is not None:
+            return float(context.last_submission_at_unix_ms) / 1_000.0
         value = context.last_submission_ts
         if value is None:
             return None
@@ -5499,55 +7221,22 @@ class CortexDaemon:
             return None
         return ts
 
-    @classmethod
-    def _leetcode_submission_monotonic(cls, context: LeetCodeContext) -> float | None:
+    def _leetcode_submission_monotonic(self, context: LeetCodeContext) -> float | None:
         """Convert a LeetCode submission epoch timestamp to monotonic time."""
-        epoch_seconds = cls._leetcode_submission_epoch_seconds(context)
+        epoch_seconds = self._leetcode_submission_epoch_seconds(context)
         if epoch_seconds is None:
             return None
-        age = max(0.0, time.time() - epoch_seconds)
-        return time.monotonic() - age
+        age = max(0.0, unix_seconds(self._clock) - epoch_seconds)
+        return monotonic_seconds(self._clock) - age
 
     # --- v2.0 helper methods ---
 
-    def _build_bandit_features(self, estimate: Any, context: Any) -> list[float]:
-        """Build 8-dimensional feature vector for the contextual bandit."""
-        state_map = {"FLOW": 0.0, "HYPO": 0.25, "RECOVERY": 0.5, "HYPER": 1.0}
-        # Phase-4b TASK N: UTC for the hour-of-day feature so the bandit
-        # learns a single global chronotype rather than one per timezone
-        # the user travels through.
-        import datetime as dt
-        hour = dt.datetime.now(dt.UTC).hour
-        return [
-            state_map.get(estimate.state, 0.5),
-            context.complexity_score if hasattr(context, 'complexity_score') else 0.0,
-            float(context.browser_context.tab_count if context.browser_context else 0) / 20.0,
-            float(context.total_errors if hasattr(context, 'total_errors') else 0) / 10.0,
-            hour / 24.0,
-            self._aggregator.thrashing_score if hasattr(self._aggregator, 'thrashing_score') else 0.0,
-            self._stress_tracker.current_load / 500.0,
-            0.5,  # consent level placeholder
-        ]
-
-    @staticmethod
-    def _arm_to_template(arm_index: int) -> str | None:
-        """Map bandit arm index to prompt template name."""
-        arm_templates = {
-            0: None,  # overlay_only → auto-select
-            1: "code_focus_reduction",  # simplified_workspace
-            2: "micro_step_planner",  # guided_mode
-            3: "breathing_overlay",
-            4: "active_recall",
-            5: "rabbit_hole",
-            6: None,  # no intervention
-        }
-        return arm_templates.get(arm_index)
-
     @staticmethod
     def _policy_arm_to_template(arm_name: str) -> str | None:
-        """Map AMIP policy arm names to template names."""
+        """Map the finite policy catalog to reviewed planner templates."""
         mapping = {
             "no_action": None,
+            "suggest_only": None,
             "workspace_simplify": "code_focus_reduction",
             "task_decompose": "micro_step_planner",
             "breath_box": "breathing_overlay",
@@ -5570,22 +7259,28 @@ class CortexDaemon:
             content = await briefing.check_and_generate()
             if content is not None:
                 logger.info("Morning briefing available: %s", content.summary[:80])
-                await self._ws_server.send_message("MORNING_BRIEFING", {
-                    "summary": content.summary,
-                    "action_items": content.action_items,
-                    # ``BriefingContent`` has no ``left_off_at`` field; the
-                    # wire contract's ``left_off_at`` is the "where you left
-                    # off" headline the popup feeds into START_FOCUS as the
-                    # resume goal — that is the briefing ``title``.
-                    "left_off_at": content.title,
-                })
+                await self._ws_server.send_message(
+                    "MORNING_BRIEFING",
+                    {
+                        "summary": content.summary,
+                        "action_items": content.action_items,
+                        # ``BriefingContent`` has no ``left_off_at`` field; the
+                        # wire contract's ``left_off_at`` is the "where you left
+                        # off" headline the popup feeds into START_FOCUS as the
+                        # resume goal — that is the briefing ``title``.
+                        "left_off_at": content.title,
+                    },
+                )
         except Exception:
             logger.debug("No morning briefing available")
 
     async def _generate_handover(self, context: Any) -> None:
         """Generate a handover snapshot for tomorrow's morning briefing."""
         try:
-            snapshot = HandoverSnapshot(str(self.config.storage.path))
+            snapshot = HandoverSnapshot(
+                str(self.config.storage.path),
+                clock=self._clock,
+            )
 
             # Gather recent activity data for the handover
             activity_timeline: list[dict[str, Any]] | None = None
@@ -5597,9 +7292,15 @@ class CortexDaemon:
                 logger.debug("Failed to fetch activities for handover")
 
             await snapshot.capture_and_write(
-                browser_context=context.browser_context.model_dump() if hasattr(context, "browser_context") and context.browser_context else None,
-                editor_context=context.editor_context.model_dump() if hasattr(context, "editor_context") and context.editor_context else None,
-                terminal_context=context.terminal_context.model_dump() if hasattr(context, "terminal_context") and context.terminal_context else None,
+                browser_context=context.browser_context.model_dump()
+                if hasattr(context, "browser_context") and context.browser_context
+                else None,
+                editor_context=context.editor_context.model_dump()
+                if hasattr(context, "editor_context") and context.editor_context
+                else None,
+                terminal_context=context.terminal_context.model_dump()
+                if hasattr(context, "terminal_context") and context.terminal_context
+                else None,
                 activity_timeline=activity_timeline,
                 llm_client=self._llm_client,
             )
@@ -5614,10 +7315,10 @@ class CortexDaemon:
                 try:
                     # Snapshot daily data to store
                     await self._longitudinal.snapshot_daily()
-                    # Compute trend and update sensitivity
+                    # Compute the longitudinal trend for reporting only. It
+                    # no longer tunes the unvalidated HRV stress prototype.
                     trend = await self._longitudinal.compute_trend()
                     multiplier = trend.get("sensitivity_multiplier", 1.0)
-                    self._stress_tracker.update_sensitivity(multiplier)
                     logger.debug("Longitudinal snapshot: multiplier=%.2f", multiplier)
                 except Exception:
                     logger.exception("Longitudinal loop error")
@@ -5627,7 +7328,8 @@ class CortexDaemon:
             logger.debug("longitudinal loop cancelled")
 
     def register_client_identified_listener(
-        self, listener: Callable[[str, bool], None],
+        self,
+        listener: Callable[[str, bool], None],
     ) -> None:
         """Audit-prod G1: subscribe to (client_type, connected) events.
 
@@ -5638,7 +7340,7 @@ class CortexDaemon:
         if listener not in self._client_identified_listeners:
             self._client_identified_listeners.append(listener)
 
-    def _on_client_identified(self, client_type: str, connected: bool) -> None:
+    async def _on_client_identified(self, client_type: str, connected: bool) -> None:
         """Fan-out helper bound to ``WebSocketServer._client_identified_callback``.
 
         Runs on the daemon's asyncio loop thread. Each listener is
@@ -5648,8 +7350,26 @@ class CortexDaemon:
             try:
                 listener(client_type, connected)
             except Exception:
-                logger.debug(
-                    "client_identified listener raised", exc_info=True
+                logger.debug("client_identified listener raised", exc_info=True)
+        if not connected or not self._pending_startup_restores:
+            return
+        executor = {
+            "chrome": "browser",
+            "edge": "browser",
+            "vscode": "editor",
+            "desktop": "desktop",
+        }.get(client_type)
+        if executor is None:
+            return
+        for command in list(self._pending_startup_restores.values()):
+            if not any(action.executor == executor for action in command.actions):
+                continue
+            try:
+                await self._ws_server.send_restore_command(command)
+            except Exception:
+                logger.exception(
+                    "Startup restore retry failed for %s",
+                    command.restore_id,
                 )
 
     async def reload_llm_credentials(self) -> bool:
@@ -5754,7 +7474,8 @@ class CortexDaemon:
         # (the CostResponse schema promises the two surfaces are identical).
         prompt_tokens, completion_tokens = probe_token_totals(tracker)
         model = probe_active_model(self._llm_client)
-        return CostResponse(
+        return CostResponse.from_clock(
+            _daemon_clock(self),
             cost_today=cost_today,
             budget_today=budget_today,
             provider=provider,
@@ -5832,7 +7553,8 @@ class CortexDaemon:
         # Probe path: prefer a tiny diagnostic ``ping`` if the client
         # exposes one; otherwise fall back to a token-count call. Both
         # paths run inside a 5 s wall-clock cap.
-        start = time.monotonic()
+        clock = _daemon_clock(self)
+        start = monotonic_seconds(clock)
         try:
             probe = getattr(client, "ping", None)
             if probe is None or not asyncio.iscoroutinefunction(probe):
@@ -5854,7 +7576,7 @@ class CortexDaemon:
                 # attribute we treat construction-time success as a
                 # probe (the network call is gated by an env-bound 5 s
                 # timeout but production tests already inject stubs).
-                latency_ms = (time.monotonic() - start) * 1000.0
+                latency_ms = (monotonic_seconds(clock) - start) * 1000.0
                 return TestProviderResult(
                     provider=canonical,
                     ok=True,
@@ -5862,7 +7584,7 @@ class CortexDaemon:
                     error=None,
                 )
             await asyncio.wait_for(probe(), timeout=5.0)
-            latency_ms = (time.monotonic() - start) * 1000.0
+            latency_ms = (monotonic_seconds(clock) - start) * 1000.0
             return TestProviderResult(
                 provider=canonical,
                 ok=True,
@@ -5899,8 +7621,13 @@ class CortexDaemon:
             return
         cleaned: dict[str, list[str]] = {}
         valid_days = {
-            "monday", "tuesday", "wednesday", "thursday",
-            "friday", "saturday", "sunday",
+            "monday",
+            "tuesday",
+            "wednesday",
+            "thursday",
+            "friday",
+            "saturday",
+            "sunday",
         }
         for day, slots in schedule.items():
             if not isinstance(day, str):
@@ -5937,15 +7664,17 @@ class CortexDaemon:
         if ws is None:
             return False
         recap_payload: dict[str, Any]
+        clock = _daemon_clock(self)
         try:
             if self._session_report_started and self._session_report is not None:
                 # C4 (audit): wrap the real report in the declared
                 # ``SessionRecap`` envelope (forced recap is never persisted).
                 from cortex.libs.schemas.realtime import SessionRecap
+
                 report = self._session_report.finish()
                 recap_payload = SessionRecap(
                     report=report,
-                    generated_at=datetime.now(UTC).isoformat(),
+                    generated_at=utc_datetime(clock).isoformat(),
                     persisted=False,
                 ).model_dump(mode="json")
             else:
@@ -5954,8 +7683,8 @@ class CortexDaemon:
                 # ``session_id`` presence and tolerates this shape.
                 recap_payload = {
                     "session_id": "force_recap",
-                    "start_time": datetime.now(UTC).isoformat(),
-                    "end_time": datetime.now(UTC).isoformat(),
+                    "start_time": utc_datetime(clock).isoformat(),
+                    "end_time": utc_datetime(clock).isoformat(),
                     "duration_seconds": 0.0,
                     "persisted": False,
                 }
@@ -6020,8 +7749,9 @@ class CortexDaemon:
                 self._trigger_policy = TriggerPolicy(
                     self.config.intervention,
                     state_config=self.config.state,
+                    clock=self._clock,
                 )
-            registry.register("trigger_policy", self._trigger_policy)
+            self._services.register("trigger_policy", self._trigger_policy)
         if "cooldown_seconds" in settings:
             self.config.intervention.cooldown_seconds = int(settings["cooldown_seconds"])
             if hasattr(self._trigger_policy, "update_thresholds"):
@@ -6033,8 +7763,9 @@ class CortexDaemon:
                 self._trigger_policy = TriggerPolicy(
                     self.config.intervention,
                     state_config=self.config.state,
+                    clock=self._clock,
                 )
-            registry.register("trigger_policy", self._trigger_policy)
+            self._services.register("trigger_policy", self._trigger_policy)
         if "webcam_enabled" in settings:
             desired_capture = bool(settings["webcam_enabled"])
             self._capture_processing_enabled = desired_capture
@@ -6046,7 +7777,11 @@ class CortexDaemon:
                     logger.exception("Failed to enable capture pipeline")
                     self._capture_available = False
                     self._capture_processing_enabled = False
-            elif not desired_capture and self._capture_available and self._capture_pipeline.is_running:
+            elif (
+                not desired_capture
+                and self._capture_available
+                and self._capture_pipeline.is_running
+            ):
                 await self._capture_pipeline.stop()
                 self._capture_available = False
         if "input_telemetry_enabled" in settings:
@@ -6102,14 +7837,14 @@ class CortexDaemon:
             # ``REVERSIBLE_ACT`` so the user can still manually arm a
             # focus session without daemon involvement.
             try:
-                self._consent_policy.set_level(
+                await self._consent_ladder.set_policy_level(
                     "distraction_block",
                     AUTONOMOUS_ACT if new_value else REVERSIBLE_ACT,
                 )
-                self._persist_consent_overrides()
             except Exception:
                 logger.debug(
-                    "distraction_block consent flip failed", exc_info=True,
+                    "distraction_block consent flip failed",
+                    exc_info=True,
                 )
             # Phase-3 P0-N4 + Audit-1.1 P0-2: if the user opted OUT
             # while a focus session is daemon-armed, disarm it so the
@@ -6121,7 +7856,8 @@ class CortexDaemon:
                     await self.disarm_auto_focus()
                 except Exception:
                     logger.debug(
-                        "disarm_auto_focus on opt-out failed", exc_info=True,
+                        "disarm_auto_focus on opt-out failed",
+                        exc_info=True,
                     )
         if "auto_distraction_block_preset" in settings:
             preset = str(settings["auto_distraction_block_preset"])
@@ -6139,6 +7875,32 @@ class CortexDaemon:
             self.config.intervention.enable_os_notifications = bool(
                 settings["enable_os_notifications"]
             )
+        # External model transport is a separate, revision-bound privacy
+        # choice from provider selection.  Every update rebuilds the planner
+        # once and burns pending previews from the prior configuration.
+        privacy_changed = False
+        requested_planner_mode = settings.get("llm_planner_mode")
+        if requested_planner_mode is not None:
+            mode = str(requested_planner_mode)
+            if mode in {"no_llm", "no_content", "external_redacted"}:
+                self.config.llm.privacy.planner_mode = mode  # type: ignore[assignment]
+                privacy_changed = True
+
+        if "external_context_enabled" in settings or "llm_context_consent_revision" in settings:
+            requested_enabled = bool(settings.get("external_context_enabled", False))
+            requested_revision = str(settings.get("llm_context_consent_revision") or "")
+            required_revision = self.config.llm.privacy.required_consent_revision
+            acknowledged = requested_enabled and requested_revision == required_revision
+            self.config.llm.privacy.external_context_enabled = acknowledged
+            self.config.llm.privacy.consent_revision = (
+                required_revision if acknowledged else ""
+            )
+            privacy_changed = True
+
+        if self.config.llm.privacy.planner_mode != "external_redacted":
+            self.config.llm.privacy.external_context_enabled = False
+            self.config.llm.privacy.consent_revision = ""
+
         # B.4 fix: accept both "llm_provider" (canonical, new clients) and
         # "llm_mode" (legacy from the SettingsDialog) so the dropdown in
         # the desktop settings actually rebuilds the client.
@@ -6147,13 +7909,24 @@ class CortexDaemon:
             provider_value = str(settings["llm_provider"])
         elif "llm_mode" in settings:
             provider_value = str(settings["llm_mode"])
+        provider_changed = False
         if provider_value is not None:
             if provider_value in {"bedrock", "vertex", "direct"}:
+                provider_changed = self.config.llm.provider != provider_value
                 self.config.llm.provider = provider_value  # type: ignore[assignment]
             elif provider_value == "rule_based":
                 self.config.llm.fallback_mode = "rule_based"
-            self._llm_client = create_llm_client(self.config.llm)
-            registry.register("llm_client", self._llm_client)
+                self.config.llm.privacy.planner_mode = "no_llm"
+                self.config.llm.privacy.external_context_enabled = False
+                self.config.llm.privacy.consent_revision = ""
+                privacy_changed = True
+        if privacy_changed or provider_changed:
+            old_client = self._llm_client
+            clear_previews = getattr(old_client, "clear_previews", None)
+            if callable(clear_previews):
+                clear_previews()
+            self._llm_client = create_llm_client(self.config.llm, clock=self._clock)
+            self._services.register("llm_client", self._llm_client)
         # Re-broadcast settings with the values the daemon actually applied,
         # plus any keys clients need to mirror (W-16 cooldown sync).
         # NOTE: dismiss-cooldowns are SEPARATE from the trigger-spacing
@@ -6170,6 +7943,10 @@ class CortexDaemon:
             "url_dismiss_cooldown_ms",
             int(self.config.intervention.url_dismiss_cooldown_ms),
         )
+        # Execution authority is not client-writable. Echo the daemon's
+        # validated configuration even if a compromised client attempted to
+        # smuggle a more-authoritative value in SETTINGS_SYNC.
+        applied["execution_mode"] = self.intervention_execution_mode
         await self._ws_server.broadcast_settings(applied)
 
     # ------------------------------------------------------------------
@@ -6188,17 +7965,22 @@ class CortexDaemon:
         """
         clamped = max(1, min(100, int(limit) if limit is not None else 30))
         return await asyncio.to_thread(
-            self._session_reader.list_sessions, since, clamped,
+            self._session_reader.list_sessions,
+            since,
+            clamped,
         )
 
     async def get_session(self, session_id: str) -> SessionDetailResponse:
         """P0 §3.1: single-report lookup (validated session_id)."""
         return await asyncio.to_thread(
-            self._session_reader.read_session, session_id,
+            self._session_reader.read_session,
+            session_id,
         )
 
     async def restore_intervention(
-        self, intervention_id: str,
+        self,
+        intervention_id: str,
+        user_action: str = "system_cancelled",
     ) -> Any | None:
         """Public Undo entry point for the desktop "Undo" pill.
 
@@ -6210,6 +7992,12 @@ class CortexDaemon:
         controller) does not need to depend on RestoreManager
         internals — this method is the stable contract.
         """
+        if user_action == "engaged":
+            return await self._restore_manager.engage(intervention_id)
+        if user_action == "snoozed":
+            return await self._restore_manager.snooze(intervention_id)
+        if user_action == "dismissed":
+            return await self._restore_manager.dismiss(intervention_id)
         return await self._restore_manager.cancel(intervention_id)
 
     async def get_trends(
@@ -6235,12 +8023,12 @@ class CortexDaemon:
         elif window == "week":
             resolved_window = "week"
         else:
-            logger.warning(
-                "get_trends: unknown window=%r; falling back to 'week'", window
-            )
+            logger.warning("get_trends: unknown window=%r; falling back to 'week'", window)
             resolved_window = "week"
         return await asyncio.to_thread(
-            self._session_aggregator.get_trends, resolved_window, refresh=refresh,
+            self._session_aggregator.get_trends,
+            resolved_window,
+            refresh=refresh,
         )
 
     def latest_session_recap(self) -> dict[str, Any] | None:
@@ -6253,7 +8041,8 @@ class CortexDaemon:
         return self._latest_session_recap
 
     async def acknowledge_session_recap(
-        self, session_id: str | None = None,
+        self,
+        session_id: str | None = None,
     ) -> None:
         """P0 §3.3 (Wave-2 P1): release the ``stop()`` wait on recap dismissal.
 
@@ -6273,8 +8062,7 @@ class CortexDaemon:
             self._recap_dismissed_event.set()
         except Exception:
             logger.debug(
-                "acknowledge_session_recap: failed to set event "
-                "(session_id=%r)",
+                "acknowledge_session_recap: failed to set event (session_id=%r)",
                 session_id,
                 exc_info=True,
             )

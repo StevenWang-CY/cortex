@@ -31,12 +31,13 @@ import asyncio
 import logging
 import os
 import random
-import time
 from collections import deque
 from typing import Any, Literal, cast
 
 from anthropic import APIError, APIStatusError, APITimeoutError, RateLimitError
 from pydantic import ValidationError
+
+from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 
 # audit Phase-I: ``keyring`` is imported lazily inside
 # :func:`_keychain_get_bedrock_token`. The module is heavyweight
@@ -58,6 +59,7 @@ from cortex.libs.schemas.intervention import (
     InterventionPlan,
     SimplificationConstraints,
 )
+from cortex.libs.schemas.privacy import ContextFieldDisclosure
 from cortex.libs.schemas.state import StateEstimate
 from cortex.libs.utils.platform import get_config_dir
 from cortex.services.llm_engine.cache import LLMCache
@@ -113,8 +115,9 @@ def _make_intervention_plan_tool() -> dict[str, Any]:
         "name": _PLAN_TOOL_NAME,
         "description": (
             "Emit a structured intervention plan that the Cortex daemon "
-            "will execute against the user's workspace. Always call this "
-            "tool — never reply with plain text."
+            "will validate and present as a non-authoritative proposal. "
+            "The plan cannot grant permission or execute by itself. Always "
+            "call this tool — never reply with plain text."
         ),
         "input_schema": schema,
         "cache_control": {"type": "ephemeral"},
@@ -129,7 +132,10 @@ def _extract_tool_use_input(response: Any) -> dict[str, Any]:
             wrong tool name.
     """
     for block in getattr(response, "content", []) or []:
-        if getattr(block, "type", None) == "tool_use" and getattr(block, "name", None) == _PLAN_TOOL_NAME:
+        if (
+            getattr(block, "type", None) == "tool_use"
+            and getattr(block, "name", None) == _PLAN_TOOL_NAME
+        ):
             payload = getattr(block, "input", None)
             if isinstance(payload, dict):
                 return payload
@@ -304,8 +310,12 @@ class AnthropicPlanner:
         *,
         sdk: Any | None = None,
         cost_tracker: CostTracker | None = None,
+        clock: Clock | None = None,
+        _allow_unbrokered_test_requests: bool = False,
     ) -> None:
         self._config = config or LLMConfig()
+        self._clock = clock or SYSTEM_CLOCK
+        self._allow_unbrokered_test_requests = _allow_unbrokered_test_requests
 
         # F11: previously the keychain-sourced Bedrock token was written
         # to ``os.environ`` permanently, which then propagated to every
@@ -362,7 +372,10 @@ class AnthropicPlanner:
             ),
         }
 
-        self._cache = cache or LLMCache(default_ttl=self._config.cache_ttl_seconds)
+        self._cache = cache or LLMCache(
+            default_ttl=self._config.cache_ttl_seconds,
+            clock=self._clock,
+        )
         self._semaphore = asyncio.Semaphore(self._config.max_concurrent_requests)
         self._circuit = _CircuitBreaker(
             threshold=self._config.circuit_failure_threshold,
@@ -383,6 +396,7 @@ class AnthropicPlanner:
                     ledger_path=ledger_path,
                     warn_usd=self._config.cost_warn_usd,
                     kill_usd=self._config.daily_cost_budget_usd,
+                    clock=self._clock,
                 )
             except (OSError, ValueError) as exc:
                 # Cost tracking is best-effort: a broken ledger path
@@ -463,6 +477,11 @@ class AnthropicPlanner:
                 return _TEMPLATE_TIER[template_name]
         return "default"
 
+    def model_for_template(self, template_name: str | None) -> str:
+        """Return the exact provider model id a request would use."""
+
+        return self._models[self._select_tier(template_name)]
+
     async def generate_intervention_plan(
         self,
         context: TaskContext,
@@ -471,12 +490,36 @@ class AnthropicPlanner:
         *,
         template_name: str | None = None,
         extra_context: str = "",
+        disclosure_manifest: tuple[ContextFieldDisclosure, ...] | None = None,
+        privacy_preview_id: str | None = None,
+        privacy_confirmation: str | None = None,
     ) -> InterventionPlan:
         """Generate a typed intervention plan, with cache + retry + fallback."""
-        now_mono = time.monotonic()
+        # Authorization is owned by PrivacyAwarePlanner. These arguments are
+        # accepted only for Protocol compatibility; callers must never compose
+        # this transport primitive directly in production.
+        del privacy_preview_id, privacy_confirmation
+        if not disclosure_manifest and not self._allow_unbrokered_test_requests:
+            logger.error(
+                "Blocked unbrokered external planner request (cid=%s)",
+                get_correlation_id() or "-",
+            )
+            blocked = build_fallback_plan(context)
+            blocked.metadata["fallback_reason"] = "context_disclosure_manifest_required"
+            blocked.metadata["network_used"] = False
+            return blocked
+        now_mono = monotonic_seconds(self._clock)
 
         # Cache hit short-circuits everything.
-        cached = self._cache.get(context, state, constraints, now=now_mono)
+        cached = self._cache.get(
+            context,
+            state,
+            constraints,
+            template_name=template_name,
+            extra_context=extra_context,
+            disclosure_manifest=disclosure_manifest,
+            now=now_mono,
+        )
         if cached is not None:
             logger.debug("LLM cache hit (template=%s)", template_name)
             return cached
@@ -484,13 +527,9 @@ class AnthropicPlanner:
         # F20: hard kill-switch — once today's spend crosses the
         # configured ceiling, serve the deterministic fallback plan and
         # stamp the metadata so the dashboard banner can explain why.
-        if (
-            self._cost_tracker is not None
-            and self._cost_tracker.check_budget() == "KILL"
-        ):
+        if self._cost_tracker is not None and self._cost_tracker.check_budget() == "KILL":
             logger.error(
-                "LLM daily budget exceeded; serving deterministic fallback "
-                "(cid=%s)",
+                "LLM daily budget exceeded; serving deterministic fallback (cid=%s)",
                 get_correlation_id() or "-",
             )
             killed = build_fallback_plan(context)
@@ -533,6 +572,7 @@ class AnthropicPlanner:
                 constraints,
                 template_name=template_name,
                 extra_context=extra_context,
+                disclosure_manifest=disclosure_manifest,
             )
 
         # F30: estimate the input-token cost before issuing the call so
@@ -542,7 +582,8 @@ class AnthropicPlanner:
         # chars/4 heuristic over the assembled prompt — same heuristic
         # ``prompts._estimate_tokens`` uses internally.
         estimated_input_tokens = _estimate_request_input_tokens(
-            system_blocks, messages,
+            system_blocks,
+            messages,
         )
 
         attempts = 3
@@ -569,7 +610,7 @@ class AnthropicPlanner:
                 killed.metadata["budget_killed"] = True
                 killed.metadata["budget_killed_on_retry"] = attempt + 1
                 return killed
-            t0 = time.perf_counter()
+            t0 = monotonic_seconds(self._clock)
             response: Any = None
             try:
                 async with self._semaphore:
@@ -621,7 +662,7 @@ class AnthropicPlanner:
                         )
                         raise
             except (RateLimitError, APITimeoutError, APIStatusError) as exc:
-                latency_ms = (time.perf_counter() - t0) * 1000.0
+                latency_ms = (monotonic_seconds(self._clock) - t0) * 1000.0
                 # Audit-2 fix: surface 401 / 403 (revoked or invalid
                 # BYOK token) as a distinct, non-retryable failure so the
                 # user gets an immediate signal that their token is bad.
@@ -640,7 +681,7 @@ class AnthropicPlanner:
                         status,
                         type(exc).__name__,
                     )
-                    self._circuit.record_failure(time.monotonic())
+                    self._circuit.record_failure(monotonic_seconds(self._clock))
                     auth_fallback = build_fallback_plan(context)
                     auth_fallback.metadata["fallback_reason"] = "auth_error"
                     auth_fallback.metadata["source"] = "fallback"
@@ -656,7 +697,7 @@ class AnthropicPlanner:
                     type(exc).__name__,
                 )
                 if attempt == attempts - 1:
-                    self._circuit.record_failure(time.monotonic())
+                    self._circuit.record_failure(monotonic_seconds(self._clock))
                     break
                 # Bounded exponential backoff with jitter. Wrap in
                 # try/finally so a cancellation during the sleep still
@@ -664,7 +705,7 @@ class AnthropicPlanner:
                 # attempt's billed call (audit-2 fix for F30 retry-loop
                 # gap).
                 try:
-                    await asyncio.sleep(min(2 ** attempt + random.random(), 8.0))
+                    await asyncio.sleep(min(2**attempt + random.random(), 8.0))
                 except asyncio.CancelledError:
                     self._record_cost_on_cancellation(
                         model_id,
@@ -674,16 +715,15 @@ class AnthropicPlanner:
                     raise
                 continue
             except APIError as exc:
-                latency_ms = (time.perf_counter() - t0) * 1000.0
+                latency_ms = (monotonic_seconds(self._clock) - t0) * 1000.0
                 logger.error(
-                    "llm.request status=fatal model=%s template=%s "
-                    "latency_ms=%.0f err=%s",
+                    "llm.request status=fatal model=%s template=%s latency_ms=%.0f err=%s",
                     model_id,
                     template_name,
                     latency_ms,
                     type(exc).__name__,
                 )
-                self._circuit.record_failure(time.monotonic())
+                self._circuit.record_failure(monotonic_seconds(self._clock))
                 break
 
             # Successful HTTP — now validate the tool_use payload.
@@ -696,17 +736,16 @@ class AnthropicPlanner:
                         line_errors=[],
                     )
             except (ValueError, ValidationError) as exc:
-                latency_ms = (time.perf_counter() - t0) * 1000.0
+                latency_ms = (monotonic_seconds(self._clock) - t0) * 1000.0
                 logger.warning(
-                    "llm.request status=invalid model=%s template=%s "
-                    "latency_ms=%.0f err=%s",
+                    "llm.request status=invalid model=%s template=%s latency_ms=%.0f err=%s",
                     model_id,
                     template_name,
                     latency_ms,
                     type(exc).__name__,
                 )
                 if attempt == attempts - 1:
-                    self._circuit.record_failure(time.monotonic())
+                    self._circuit.record_failure(monotonic_seconds(self._clock))
                     # B11 (Phase 4.1): stash the discriminator so the
                     # post-loop fallback path can stamp the right
                     # failure_mode (parse_error vs. timeout). Without
@@ -718,7 +757,7 @@ class AnthropicPlanner:
 
             self._circuit.record_success()
             self._last_validation_error = False
-            latency_ms = (time.perf_counter() - t0) * 1000.0
+            latency_ms = (monotonic_seconds(self._clock) - t0) * 1000.0
             usage = getattr(response, "usage", None)
             # F19: include the active correlation id so downstream cost
             # accounting (F20) can group spend by originating request.
@@ -760,7 +799,16 @@ class AnthropicPlanner:
                 enriched.metadata["context_truncated_sections"] = list(
                     _truncation_report.sections_trimmed
                 )
-            self._cache.put(context, enriched, state, constraints)
+            self._cache.put(
+                context,
+                enriched,
+                state,
+                constraints,
+                template_name=template_name,
+                extra_context=extra_context,
+                disclosure_manifest=disclosure_manifest,
+                now=monotonic_seconds(self._clock),
+            )
             return enriched
 
         # All retries exhausted → deterministic fallback.
@@ -808,9 +856,7 @@ class AnthropicPlanner:
         input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
         output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
         cache_read = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
-        cache_write = int(
-            getattr(usage, "cache_creation_input_tokens", 0) or 0
-        )
+        cache_write = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
         try:
             usd = usd_cost(
                 model_id,
@@ -853,9 +899,7 @@ class AnthropicPlanner:
         """
         if self._cost_tracker is None:
             return
-        usage = (
-            getattr(response, "usage", None) if response is not None else None
-        )
+        usage = getattr(response, "usage", None) if response is not None else None
         if usage is not None:
             # Response arrived — bill real numbers but tag cancelled.
             self._record_cost(model_id, usage, cancelled=True)

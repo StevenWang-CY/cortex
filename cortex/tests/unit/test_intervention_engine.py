@@ -33,6 +33,7 @@ from cortex.services.intervention_engine.executor import InterventionExecutor, M
 from cortex.services.intervention_engine.planner import (
     AdapterCommand,
     map_hide_targets,
+    materialize_suggestion_only,
     prepare_plan,
     validate_plan,
 )
@@ -449,6 +450,32 @@ class TestHideTargetMapping(unittest.TestCase):
         assert len(result.warnings) > 0
         assert len(commands) > 0
 
+    def test_materialize_suggestion_only_strips_mutations(self):
+        original = _make_plan(hide_targets=[
+            "browser_tabs_except_active",
+            "editor_symbols_except_current_function",
+        ])
+        proposal = materialize_suggestion_only(original)
+
+        assert proposal is not original
+        assert proposal.hide_targets == []
+        assert proposal.level == "overlay_only"
+        assert proposal.consent_level == "suggest"
+        assert proposal.ui_plan.show_overlay is True
+        assert proposal.ui_plan.fold_unrelated_code is False
+        assert proposal.ui_plan.intervention_type == "overlay_only"
+        assert proposal.metadata["workspace_mutation_allowed"] is False
+        proposal_commands = map_hide_targets(proposal)
+        assert {command.adapter for command in proposal_commands} == {"overlay"}
+        assert {command.action for command in proposal_commands} == {
+            "dim_background", "show_overlay",
+        }
+
+        # Conversion is copy-on-write: audit/debug retains the validated
+        # original request without mutating it underfoot.
+        assert original.hide_targets
+        assert original.ui_plan.fold_unrelated_code is True
+
 
 # ===========================================================================
 # Executor Tests
@@ -457,7 +484,7 @@ class TestHideTargetMapping(unittest.TestCase):
 
 @pytest.mark.asyncio
 async def test_executor_apply_commands():
-    executor = InterventionExecutor()
+    executor = InterventionExecutor(execution_mode="authorized")
     # P1-7 escape hatch: test rigs that don't wire a consent handler must
     # opt in explicitly so production callers still get default-deny.
     executor._allow_unwired_consent = True
@@ -476,7 +503,7 @@ async def test_executor_apply_commands():
 
 @pytest.mark.asyncio
 async def test_executor_missing_adapter():
-    executor = InterventionExecutor()
+    executor = InterventionExecutor(execution_mode="authorized")
     executor._allow_unwired_consent = True  # P1-7 test escape hatch
     # No adapters registered
     plan = _make_plan()
@@ -488,7 +515,7 @@ async def test_executor_missing_adapter():
 
 @pytest.mark.asyncio
 async def test_executor_failing_adapter():
-    executor = InterventionExecutor()
+    executor = InterventionExecutor(execution_mode="authorized")
     executor._allow_unwired_consent = True  # P1-7 test escape hatch
     executor.register_adapter("editor", MockAdapter(fail=True))
 
@@ -500,7 +527,7 @@ async def test_executor_failing_adapter():
 
 @pytest.mark.asyncio
 async def test_executor_reverse():
-    executor = InterventionExecutor()
+    executor = InterventionExecutor(execution_mode="authorized")
     executor._allow_unwired_consent = True  # P1-7 test escape hatch
     adapter = MockAdapter()
     executor.register_adapter("editor", adapter)
@@ -525,7 +552,7 @@ async def test_executor_reverse_reports_failure_when_adapter_missing():
     reversals list, which made the RestoreManager report
     ``workspace_restored=True`` even though nothing was reverted.
     """
-    executor = InterventionExecutor()
+    executor = InterventionExecutor(execution_mode="authorized")
     executor._allow_unwired_consent = True
     executor.register_adapter("editor", MockAdapter())
 
@@ -553,7 +580,7 @@ async def test_restore_reports_not_restored_when_reverse_failed():
     With the adapter gone, the reversal fails, so the outcome must report
     ``workspace_restored=False`` and carry the failure in restore_errors.
     """
-    executor = InterventionExecutor()
+    executor = InterventionExecutor(execution_mode="authorized")
     executor._allow_unwired_consent = True
     executor.register_adapter("editor", MockAdapter())
 
@@ -576,7 +603,7 @@ async def test_restore_reports_not_restored_when_reverse_failed():
 
 @pytest.mark.asyncio
 async def test_executor_active_interventions():
-    executor = InterventionExecutor()
+    executor = InterventionExecutor(execution_mode="authorized")
     executor._allow_unwired_consent = True  # P1-7 test escape hatch
     executor.register_adapter("editor", MockAdapter())
 
@@ -590,7 +617,7 @@ async def test_executor_active_interventions():
 
 @pytest.mark.asyncio
 async def test_executor_reverse_clears_active():
-    executor = InterventionExecutor()
+    executor = InterventionExecutor(execution_mode="authorized")
     executor._allow_unwired_consent = True  # P1-7 test escape hatch
     executor.register_adapter("editor", MockAdapter())
 
@@ -610,7 +637,7 @@ async def test_executor_reverse_clears_active():
 @pytest.mark.asyncio
 async def test_restore_timeout():
     """Intervention should auto-end after timeout."""
-    executor = InterventionExecutor()
+    executor = InterventionExecutor(execution_mode="authorized")
     executor.register_adapter("editor", MockAdapter())
     manager = RestoreManager(executor, timeout_seconds=60.0)
 
@@ -758,7 +785,7 @@ async def test_full_intervention_cycle():
     assert len(commands) > 0
 
     # 4. Execute
-    executor = InterventionExecutor()
+    executor = InterventionExecutor(execution_mode="authorized")
     executor._allow_unwired_consent = True  # P1-7 test escape hatch
     editor_adapter = MockAdapter()
     overlay_adapter = MockAdapter()
@@ -866,8 +893,8 @@ class TestMutation(unittest.TestCase):
 class TestIsDestructive(unittest.TestCase):
     """Test is_destructive uses action_type checking, not label substring matching."""
 
-    def test_close_tab_is_not_destructive(self):
-        """close_tab action is reversible, not destructive."""
+    def test_close_tab_is_destructive(self):
+        """Reopening a URL cannot reconstruct a closed browser session."""
         from cortex.libs.schemas.intervention import SuggestedAction
         plan = _make_plan()
         plan.suggested_actions = [
@@ -878,16 +905,16 @@ class TestIsDestructive(unittest.TestCase):
                 reason="Unrelated",
             ),
         ]
-        assert plan.is_destructive is False
+        assert plan.is_destructive is True
 
     def test_new_tab_label_not_destructive(self):
-        """A tab titled 'New Tab' with close_tab action should NOT trigger is_destructive."""
+        """Destructive-looking label copy does not override the action type."""
         from cortex.libs.schemas.intervention import SuggestedAction
         plan = _make_plan(headline="Simplify your workspace")
         plan.suggested_actions = [
             SuggestedAction(
-                action_type="close_tab",
-                tab_index=2,
+                action_type="open_url",
+                target="https://example.com/new-tab-guide",
                 label="Close New Tab",
                 reason="Empty tab",
                 metadata={"tab_title": "New Tab"},
@@ -914,15 +941,15 @@ class TestIsDestructive(unittest.TestCase):
         plan.suggested_actions = []
         assert plan.is_destructive is False
 
-    def test_close_tab_reversible_tracked(self):
-        """close_tab action should have reversible=True by default."""
+    def test_close_tab_not_claimed_reversible(self):
+        """A proposal cannot claim URL reopening is an exact inverse."""
         from cortex.libs.schemas.intervention import SuggestedAction
         action = SuggestedAction(
             action_type="close_tab",
             tab_index=1,
             label="Close Stack Overflow",
         )
-        assert action.reversible is True
+        assert action.reversible is False
 
 
 # ===========================================================================

@@ -103,6 +103,7 @@ function PulseRoom(): React.ReactElement {
         breathPhase: 0,
         traceHistory: [] as number[],
     });
+    const canvasBackgroundRef = useRef<string>(CX.light.window_bg);
 
     const [displayHR, setDisplayHR] = useState(0);
     const [displayConnected, setDisplayConnected] = useState(false);
@@ -132,6 +133,70 @@ function PulseRoom(): React.ReactElement {
                 from { opacity: 0; transform: translateY(8px); }
                 to { opacity: 1; transform: translateY(0); }
             }
+            .cortex-newtab-enter {
+                animation: activityFadeIn 240ms ${CX.easeOut} both;
+            }
+            .cortex-launch-button {
+                transition: background-color ${CX.durationFast} ${CX.easeOut},
+                    border-color ${CX.durationFast} ${CX.easeOut},
+                    box-shadow ${CX.durationFast} ${CX.easeOut},
+                    opacity ${CX.durationFast} ${CX.easeOut},
+                    transform ${CX.durationFast} ${CX.easeOut};
+            }
+            .cortex-launch-button:active:not(:disabled),
+            .cortex-resume-card:active {
+                transform: scale(0.97);
+            }
+            .cortex-launch-button:focus-visible,
+            .cortex-resume-card:focus-visible {
+                outline: 2px solid ${CX.accent};
+                outline-offset: 3px;
+            }
+            .cortex-resume-card {
+                flex: 0 0 220px;
+                scroll-snap-align: start;
+                opacity: 0;
+                animation: activityFadeIn 240ms ${CX.easeOut} both;
+                transition: transform ${CX.durationMicro} ${CX.easeOut},
+                    box-shadow ${CX.durationFast} ${CX.easeOut};
+            }
+            @media (hover: hover) and (pointer: fine) {
+                .cortex-resume-card:hover {
+                    transform: translateY(-4px);
+                    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.08), inset 0 0 0 1px rgba(255,255,255,0.8) !important;
+                }
+            }
+            .cortex-resume-list {
+                position: absolute;
+                right: 32px;
+                bottom: 32px;
+                left: 32px;
+                z-index: 10;
+                display: flex;
+                gap: 16px;
+                max-width: calc(100vw - 64px);
+                padding: 4px;
+                overflow-x: auto;
+                scroll-snap-type: x proximity;
+                scrollbar-width: thin;
+            }
+            @media (max-width: 640px) {
+                .cortex-resume-list {
+                    right: 12px;
+                    bottom: 12px;
+                    left: 12px;
+                    gap: 12px;
+                    max-width: calc(100vw - 24px);
+                }
+            }
+            @media (prefers-reduced-motion: reduce) {
+                .cortex-newtab-enter,
+                .cortex-resume-card {
+                    animation: none !important;
+                    opacity: 1 !important;
+                    transform: none !important;
+                }
+            }
         `;
         document.head.appendChild(style);
 
@@ -139,10 +204,21 @@ function PulseRoom(): React.ReactElement {
         setReducedMotion(mq.matches);
         const handler = (e: MediaQueryListEvent) => setReducedMotion(e.matches);
         mq.addEventListener("change", handler);
+        const colorMq = window.matchMedia("(prefers-color-scheme: dark)");
+        const syncCanvasTheme = (dark: boolean) => {
+            canvasBackgroundRef.current = dark
+                ? CX.dark.window_bg
+                : CX.light.window_bg;
+        };
+        syncCanvasTheme(colorMq.matches);
+        const colorHandler = (event: MediaQueryListEvent) =>
+            syncCanvasTheme(event.matches);
+        colorMq.addEventListener("change", colorHandler);
 
         return () => {
             document.head.removeChild(style);
             mq.removeEventListener("change", handler);
+            colorMq.removeEventListener("change", colorHandler);
         };
     }, []);
 
@@ -196,20 +272,16 @@ function PulseRoom(): React.ReactElement {
         };
     }, []);
 
-    // Fetch recent activities with delay
+    // Fetch recent activities immediately; the cards' short entrance provides
+    // visual continuity without an artificial data or interaction delay.
     useEffect(() => {
-        const timer = setTimeout(() => {
-            try {
-                chrome.runtime.sendMessage({ type: "GET_RECENT_ACTIVITIES", limit: 3 }, (result) => {
-                    if (chrome.runtime.lastError || !Array.isArray(result)) return;
-                    setActivities(result);
-                    if (result.length > 0) {
-                        setTimeout(() => setShowActivities(true), 500);
-                    }
-                });
-            } catch { /* context lost */ }
-        }, 2000);
-        return () => clearTimeout(timer);
+        try {
+            chrome.runtime.sendMessage({ type: "GET_RECENT_ACTIVITIES", limit: 3 }, (result) => {
+                if (chrome.runtime.lastError || !Array.isArray(result)) return;
+                setActivities(result);
+                setShowActivities(result.length > 0);
+            });
+        } catch { /* extension context lost */ }
     }, []);
 
     // Canvas animation loop + Logo Interaction
@@ -220,7 +292,12 @@ function PulseRoom(): React.ReactElement {
     const lastPacerPhaseRef = useRef<"inhale" | "hold" | "exhale">("inhale");
 
     useEffect(() => {
-        if (reducedMotion) return;
+        if (reducedMotion) {
+            animRef.current.rings = [];
+            if (logoRef.current) logoRef.current.style.transform = "scale(1)";
+            if (auraRef.current) auraRef.current.style.filter = "none";
+            return;
+        }
 
         const canvas = canvasRef.current;
         if (!canvas) return;
@@ -237,7 +314,7 @@ function PulseRoom(): React.ReactElement {
             canvas.height = window.innerHeight * dpr;
             ctx!.scale(dpr, dpr);
             // Fill immediately on resize to prevent white flash
-            ctx!.fillStyle = CX.bg;
+            ctx!.fillStyle = canvasBackgroundRef.current;
             ctx!.fillRect(0, 0, window.innerWidth, window.innerHeight);
         }
         resize();
@@ -259,7 +336,7 @@ function PulseRoom(): React.ReactElement {
 
             // --- Background Paint ---
             ctx.clearRect(0, 0, w, h);
-            ctx.fillStyle = CX.bg;
+            ctx.fillStyle = canvasBackgroundRef.current;
             ctx.fillRect(0, 0, w, h);
 
             // Beat timing computing based on heartbeat
@@ -443,20 +520,19 @@ function PulseRoom(): React.ReactElement {
                     zIndex: 10,
                 }}
             >
-                <div style={{
+                <div className="cortex-newtab-enter cortex-motion-enter" style={{
                     display: "flex",
                     flexDirection: "column",
                     alignItems: "center",
                     justifyContent: "center",
                     textAlign: "center",
-                    animation: "activityFadeIn 2.5s cubic-bezier(0.16, 1, 0.3, 1) forwards",
                 }}>
                 {/* The Breathing Logo */}
                 <div 
                     ref={auraRef}
                     style={{
                         marginBottom: 40,
-                        transition: "filter 0.05s linear", 
+                        transition: reducedMotion ? "none" : "filter 0.05s linear",
                     }}
                 >
                     <div 
@@ -465,11 +541,11 @@ function PulseRoom(): React.ReactElement {
                             color: displayConnected ? `rgb(${col.r}, ${col.g}, ${col.b})` : CX.textSecondary,
                             willChange: "transform",
                             transformOrigin: "center center",
-                            transition: "transform 0.05s linear",
+                            transition: reducedMotion ? "none" : "transform 0.05s linear",
                         }}
                     >
                         <svg width="100" height="100" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
-                            <path d="M 51.8 12.2 A 28 28 0 1 0 51.8 51.8" fill="none" stroke="#1a1a1a" strokeWidth="6" strokeLinecap="round" />
+                            <path d="M 51.8 12.2 A 28 28 0 1 0 51.8 51.8" fill="none" stroke={CX.text} strokeWidth="6" strokeLinecap="round" />
                             <path d="M 12 32 L 22 32 L 27 15 L 37 49 L 42 32 L 60 32" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
                             <circle cx="60" cy="32" r="3" fill="currentColor" />
                         </svg>
@@ -513,7 +589,8 @@ function PulseRoom(): React.ReactElement {
                         <div style={{ fontSize: 13, color: CX.textTertiary, fontFamily: CX.mono, letterSpacing: "0.15em", userSelect: "none" }}>
                             VISUAL ENGINE OFFLINE
                         </div>
-                        <button
+                            <button
+                                className="cortex-launch-button"
                             onClick={handleLaunch}
                             disabled={launching}
                             style={{
@@ -530,7 +607,6 @@ function PulseRoom(): React.ReactElement {
                                 cursor: launching ? "default" : "pointer",
                                 opacity: launching ? 0.6 : 1,
                                 boxShadow: "0 4px 12px rgba(0,0,0,0.03)",
-                                transition: `all ${CX.durationNormal} ${CX.easeDefault}`,
                                 letterSpacing: 0.5,
                             }}
                         >
@@ -549,18 +625,13 @@ function PulseRoom(): React.ReactElement {
             {/* Resume cards — Glassmorphic Artifacts */}
             {showActivities && activities.length > 0 && (
                 <div
+                    className="cortex-resume-list"
+                    aria-label="Recent activities"
                     style={{
-                        position: "absolute",
-                        bottom: 32,
-                        left: 32,
-                        display: "flex",
-                        gap: 16,
-                        zIndex: 10,
-                        opacity: 0,
-                        animation: "activityFadeIn 2s cubic-bezier(0.16, 1, 0.3, 1) 0.5s forwards",
+                        WebkitOverflowScrolling: "touch",
                     }}
                 >
-                    {activities.slice(0, 3).map((a) => {
+                    {activities.slice(0, 3).map((a, index) => {
                         const pct = Math.round(a.completion_pct || a.max_completion_pct || 0);
                         const posLabel = formatActivityPosition(a.position);
                         const resumeUrl = getResumeUrl(a);
@@ -568,6 +639,7 @@ function PulseRoom(): React.ReactElement {
                             <a
                                 key={a.content_id}
                                 href={resumeUrl}
+                                className="cortex-resume-card cortex-motion-enter"
                                 style={{
                                     display: "block",
                                     textDecoration: "none",
@@ -579,15 +651,7 @@ function PulseRoom(): React.ReactElement {
                                     WebkitBackdropFilter: "blur(24px)",
                                     boxShadow: "0 8px 32px rgba(0, 0, 0, 0.05), inset 0 0 0 1px rgba(255,255,255,0.6)",
                                     cursor: "pointer",
-                                    transition: `transform ${CX.durationNormal} ${CX.easeDefault}, box-shadow ${CX.durationNormal} ${CX.easeDefault}`,
-                                }}
-                                onMouseEnter={(e) => { 
-                                    e.currentTarget.style.transform = "translateY(-4px)";
-                                    e.currentTarget.style.boxShadow = "0 12px 40px rgba(0, 0, 0, 0.08), inset 0 0 0 1px rgba(255,255,255,0.8)";
-                                }}
-                                onMouseLeave={(e) => { 
-                                    e.currentTarget.style.transform = "translateY(0)";
-                                    e.currentTarget.style.boxShadow = "0 8px 32px rgba(0, 0, 0, 0.05), inset 0 0 0 1px rgba(255,255,255,0.6)";
+                                    animationDelay: `${index * 50}ms`,
                                 }}
                                 title={a.title}
                             >
@@ -617,7 +681,7 @@ function PulseRoom(): React.ReactElement {
             )}
 
             {/* Brand watermark — bottom-right, whispered */}
-            <div
+            {!showActivities && <div
                 style={{
                     position: "absolute",
                     bottom: 24,
@@ -632,7 +696,7 @@ function PulseRoom(): React.ReactElement {
                 }}
             >
                 Cortex
-            </div>
+            </div>}
         </div>
     );
 }

@@ -66,6 +66,8 @@ from cortex.apps.desktop_shell.tokens import (
     BRAND_ACCENT,
     BRAND_ACCENT_DIM,
     BRAND_ACCENT_HOVER,
+    BRAND_ACCENT_PRESSED,
+    BRAND_ACCENT_TEXT,
     BRAND_DISPLAY_FONT,
     CX_TEXT_SECONDARY,
     CX_TEXT_TERTIARY,
@@ -117,8 +119,9 @@ def _is_embedded_daemon_runtime() -> bool:
 # for documentation, it is a trust-building inline reminder.
 _WHY_COPY: dict[str, str] = {
     "camera": (
-        "Cortex reads tiny facial cues (blink rate, breathing rhythm) "
-        "to detect overwhelm. The video stream never leaves your Mac."
+        "Cortex can estimate blink timing and a camera-relative head/neck "
+        "position proxy. Camera pulse and breathing research estimates stay "
+        "experimental. Frames are processed locally and are not stored."
     ),
     "accessibility": (
         "Cortex listens for keyboard idle time and window switches to "
@@ -130,9 +133,10 @@ _WHY_COPY: dict[str, str] = {
         "it once at launch and never persists it elsewhere."
     ),
     "calibration": (
-        "Cortex compares each frame against YOUR resting baseline. "
-        "Without calibration we fall back to population averages and "
-        "miss the personal subtleties."
+        "Calibration records quality-gated rest and representative-work "
+        "evidence for supported personal baselines. You review what is "
+        "available before a measured profile can replace the current one; "
+        "missing signals remain unavailable."
     ),
     "extensions": (
         "The browser + VS Code extensions are how Cortex sees what "
@@ -178,8 +182,8 @@ def _detect_continuity_camera() -> bool:
 # F49 / P0 §3.4: canonical step identifiers used by ``OnboardingState``.
 # Order matches the cards rendered in ``OnboardingWindow``. Step 4
 # ("calibration") was added in P0 §3.4 — it sits between LLM backend
-# and Extensions so the new user finishes the wizard with personal
-# baselines on disk rather than relying on population averages.
+# and Extensions so the user can explicitly review a measured profile;
+# skipping leaves unavailable channels unavailable.
 ONBOARDING_STEPS: tuple[str, ...] = (
     "camera",
     "accessibility",
@@ -551,12 +555,12 @@ class _ProgressStrip(QWidget):
             if i == self._current:
                 dot.setStyleSheet(
                     f"background: {BRAND_ACCENT};"
-                    f" color: #FFF; border-radius: 11px;"
+                    f" color: {_LABEL}; border-radius: 11px;"
                 )
             elif i < self._current:
                 dot.setStyleSheet(
                     f"background: {BRAND_ACCENT_DIM};"
-                    f" color: {BRAND_ACCENT}; border-radius: 11px;"
+                    f" color: {BRAND_ACCENT_TEXT}; border-radius: 11px;"
                 )
             else:
                 dot.setStyleSheet(
@@ -728,7 +732,7 @@ class OnboardingWindow(QWidget):
             f"font-family: {BRAND_DISPLAY_FONT}, ui-serif, Georgia, serif;"
             f"font-style: italic; font-size: {FS_BODY}px;"
             f"font-weight: {FW_REGULAR};"
-            f"color: {BRAND_ACCENT}; background: transparent;"
+            f"color: {BRAND_ACCENT_TEXT}; background: transparent;"
         )
         layout.addWidget(brand)
         layout.addSpacing(SP2)
@@ -816,9 +820,10 @@ class OnboardingWindow(QWidget):
             "  padding: 6px 16px;"
             f"  border-radius: {RADIUS_BUTTON}px;"
             f"  background: {BRAND_ACCENT};"
-            "  color: #FFF; border: none;"
+            f"  color: {_LABEL}; border: none;"
             "}"
-            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
+            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
+            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
         )
         connect_btn.clicked.connect(self.extensions_requested.emit)
         # P1-20: log USER_ACTION so the extension-connect step is traceable.
@@ -863,9 +868,10 @@ class OnboardingWindow(QWidget):
             "  padding: 6px 16px;"
             f"  border-radius: {RADIUS_BUTTON}px;"
             f"  background: {BRAND_ACCENT};"
-            "  color: #FFF; border: none;"
+            f"  color: {_LABEL}; border: none;"
             "}"
-            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
+            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
+            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
         )
         notif_btn.clicked.connect(self._on_request_notifications)
         set_accessible_name(notif_btn, "Enable macOS notifications")
@@ -1125,7 +1131,7 @@ class OnboardingWindow(QWidget):
         num_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         num_label.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
         num_label.setStyleSheet(
-            f"color: {BRAND_ACCENT}; background: {BRAND_ACCENT_DIM};"
+            f"color: {BRAND_ACCENT_TEXT}; background: {BRAND_ACCENT_DIM};"
             f" border: none; border-radius: 11px;"
         )
         header.addWidget(num_label)
@@ -1152,10 +1158,10 @@ class OnboardingWindow(QWidget):
                 "  padding: 2px 8px;"
                 f"  border-radius: {RADIUS_BUTTON}px;"
                 "  background: transparent;"
-                f"  color: {BRAND_ACCENT};"
+                f"  color: {BRAND_ACCENT_TEXT};"
                 "  border: none;"
                 "}"
-                f"QPushButton:hover {{ color: {BRAND_ACCENT_HOVER}; }}"
+                f"QPushButton:hover {{ color: {BRAND_ACCENT_TEXT}; background: {BRAND_ACCENT_DIM}; }}"
             )
             set_accessible_name(why_btn, f"Why Cortex needs {title}")
             set_accessible_description(
@@ -1233,7 +1239,7 @@ class OnboardingWindow(QWidget):
             callout.setFont(mac_native.system_font(FS_CAPTION, "medium"))
             callout.setStyleSheet(
                 "QLabel#CortexContinuityCallout {"
-                f"  color: {BRAND_ACCENT};"
+                f"  color: {BRAND_ACCENT_TEXT};"
                 f"  background: {BRAND_ACCENT_DIM};"
                 f"  border-radius: {RADIUS_BUTTON}px;"
                 "  padding: 6px 10px;"
@@ -1260,9 +1266,10 @@ class OnboardingWindow(QWidget):
             "  padding: 4px 12px;"
             f"  border-radius: {RADIUS_BUTTON}px;"
             f"  background: {BRAND_ACCENT};"
-            "  color: #FFF; border: none;"
+            f"  color: {_LABEL}; border: none;"
             "}"
-            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
+            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
+            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
         )
         if callable(action):
             btn.clicked.connect(action)
@@ -1307,10 +1314,10 @@ class OnboardingWindow(QWidget):
 
         * ECG-style live trace (`_ECGTrace`) at the top.
         * Three good/poor status pills (lighting, motion, face).
-        * Live HR / HRV / SQI numerics.
+        * Experimental camera-pulse, quality, and valid-exposure numerics.
         * A primary Begin button that emits ``run_calibration_requested``.
         * A horizontal progress bar that fills over the 120 s.
-        * A subtle "Skip — use generic baselines" link.
+        * A subtle skip link that leaves unsupported signals unavailable.
 
         On successful completion the controller calls
         :meth:`apply_calibration_progress` with status ``completed``;
@@ -1321,11 +1328,14 @@ class OnboardingWindow(QWidget):
         layout = frame.layout()
 
         desc = QLabel(
-            "Sit calmly for 2 minutes while Cortex learns your resting baseline."
+            "Cortex first checks camera quality, then records a quiet rest "
+            "sample and a representative work sample. You review the evidence "
+            "before anything is saved."
         )
         desc.setWordWrap(True)
         desc.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         desc.setStyleSheet(f"color: {_LABEL_SECONDARY}; border: none;")
+        self._cal_description = desc
         layout.addWidget(desc)
 
         # ECG trace — gives the user something to look at and signals
@@ -1348,7 +1358,9 @@ class OnboardingWindow(QWidget):
         layout.addLayout(pill_row)
 
         # Live numerics line.
-        self._cal_numerics = QLabel("HR: — bpm  ·  HRV: — ms  ·  SQI: —")
+        self._cal_numerics = QLabel(
+            "Experimental camera pulse: — bpm  ·  Quality: —  ·  Valid: 0s"
+        )
         self._cal_numerics.setFont(mac_native.system_font(FS_CAPTION, "medium"))
         self._cal_numerics.setStyleSheet(
             f"color: {_LABEL_SECONDARY}; border: none; background: transparent;"
@@ -1376,7 +1388,7 @@ class OnboardingWindow(QWidget):
 
         # Action row — Begin button + Skip link.
         action_row = QHBoxLayout()
-        begin_btn = QPushButton("Begin")
+        begin_btn = QPushButton("Start calibration")
         begin_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         begin_btn.setMinimumHeight(32)
         begin_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
@@ -1385,21 +1397,22 @@ class OnboardingWindow(QWidget):
             "  padding: 6px 20px;"
             f"  border-radius: {RADIUS_BUTTON}px;"
             f"  background: {BRAND_ACCENT};"
-            "  color: #FFF; border: none;"
+            f"  color: {_LABEL}; border: none;"
             "}"
-            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
+            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
+            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
             "QPushButton:disabled { background: rgba(0,0,0,0.10); color: rgba(0,0,0,0.30); }"
         )
         begin_btn.clicked.connect(self._on_begin_calibration)
         set_accessible_name(begin_btn, "Begin calibration")
         set_accessible_description(
             begin_btn,
-            "Start the 2-minute calibration capture. Cortex will read your resting baseline.",
+            "Start the guided camera, rest, and representative-work capture. Nothing is saved until you review it.",
         )
         self._begin_calibration_btn = begin_btn
         action_row.addWidget(begin_btn)
 
-        skip_btn = QPushButton("Skip — use generic baselines")
+        skip_btn = QPushButton("Skip for now")
         skip_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         skip_btn.setFlat(True)
         skip_btn.setFont(mac_native.system_font(FS_CAPTION, "regular"))
@@ -1416,7 +1429,7 @@ class OnboardingWindow(QWidget):
         set_accessible_name(skip_btn, "Skip calibration")
         set_accessible_description(
             skip_btn,
-            "Skip calibration and use generic baselines. You can recalibrate later from Settings.",
+            "Skip calibration. Missing signals stay unavailable; you can calibrate later from Settings.",
         )
         self._skip_calibration_btn = skip_btn
         action_row.addStretch()
@@ -1424,7 +1437,7 @@ class OnboardingWindow(QWidget):
         layout.addLayout(action_row)
 
         # Success label — hidden until completion.
-        self._cal_success_label = QLabel("✓ Recalibrated · baselines saved")
+        self._cal_success_label = QLabel("✓ Measured profile saved and applied")
         self._cal_success_label.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
         self._cal_success_label.setStyleSheet(
             f"color: {_SUCCESS}; background: {_SUCCESS_DIM};"
@@ -1443,7 +1456,9 @@ class OnboardingWindow(QWidget):
         try:
             self._begin_calibration_btn.setEnabled(False)
             self._cal_progress_bar.setValue(1)
-            self._cal_numerics.setText("HR: — bpm  ·  HRV: — ms  ·  SQI: starting…")
+            self._cal_numerics.setText(
+                "Experimental camera pulse: — bpm  ·  Quality: starting…  ·  Valid: 0s"
+            )
         except AttributeError:
             pass
         self.run_calibration_requested.emit()
@@ -1457,7 +1472,7 @@ class OnboardingWindow(QWidget):
             self._begin_calibration_btn.setVisible(False)
             self._skip_calibration_btn.setVisible(False)
             self._cal_progress_bar.setVisible(False)
-            self._cal_success_label.setText("Skipped — using generic baselines")
+            self._cal_success_label.setText("Skipped — unavailable signals remain unavailable")
             self._cal_success_label.setVisible(True)
         except AttributeError:
             pass
@@ -1475,6 +1490,10 @@ class OnboardingWindow(QWidget):
         face_ok: bool,
         pct_complete: float,
         status: str,
+        phase: str = "camera_quality_check",
+        phase_instruction: str = "",
+        valid_duration_seconds: float = 0.0,
+        missing_fraction: float = 1.0,
     ) -> None:
         """Slot wired by the controller to the calibration progress
         callback. Updates the live trace, pills, numerics, and bar.
@@ -1488,11 +1507,19 @@ class OnboardingWindow(QWidget):
             pass
         try:
             hr_text = f"{current_hr:.0f}" if current_hr is not None else "—"
-            hrv_text = f"{current_hrv:.0f}" if current_hrv is not None else "—"
             sqi_text = f"{current_sqi:.2f}" if current_sqi is not None else "—"
             self._cal_numerics.setText(
-                f"HR: {hr_text} bpm  ·  HRV: {hrv_text} ms  ·  SQI: {sqi_text}"
+                f"Experimental camera pulse: {hr_text} bpm  ·  "
+                f"Quality: {sqi_text}  ·  Valid: {valid_duration_seconds:.0f}s"
             )
+        except AttributeError:
+            pass
+        try:
+            if phase_instruction:
+                missing_pct = int(round(max(0.0, min(1.0, missing_fraction)) * 100))
+                self._cal_description.setText(
+                    f"{phase_instruction} Missing or rejected exposure: {missing_pct}%."
+                )
         except AttributeError:
             pass
         try:
@@ -1516,9 +1543,28 @@ class OnboardingWindow(QWidget):
                 self._cal_success_label.setVisible(True)
             except AttributeError:
                 pass
+        elif status == "review_required":
+            try:
+                self._cal_progress_bar.setValue(100)
+                self._cal_success_label.setText(
+                    "Ready to review · nothing has been saved yet"
+                )
+                self._cal_success_label.setVisible(True)
+            except AttributeError:
+                pass
+        elif status == "applying":
+            try:
+                self._cal_success_label.setText("Saving and applying measured profile…")
+                self._cal_success_label.setVisible(True)
+            except AttributeError:
+                pass
         elif status in ("aborted", "failed"):
             try:
                 self._begin_calibration_btn.setEnabled(True)
+                self._cal_success_label.setText(
+                    "Application not confirmed · check the active profile"
+                )
+                self._cal_success_label.setVisible(True)
             except AttributeError:
                 pass
 
@@ -1587,9 +1633,10 @@ class OnboardingWindow(QWidget):
             "  padding: 6px 16px;"
             f"  border-radius: {RADIUS_BUTTON}px;"
             f"  background: {BRAND_ACCENT};"
-            "  color: #FFF; border: none;"
+            f"  color: {_LABEL}; border: none;"
             "}"
-            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
+            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
+            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
         )
         save_key_btn.clicked.connect(self._save_api_key)
         set_accessible_name(save_key_btn, "Save Bedrock bearer token")

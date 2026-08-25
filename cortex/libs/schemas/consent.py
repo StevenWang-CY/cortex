@@ -9,8 +9,15 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import IntEnum
+from typing import Literal
 
 from pydantic import BaseModel, Field
+
+from cortex.application.clock import SYSTEM_CLOCK, utc_datetime
+
+
+def _utc_now() -> datetime:
+    return utc_datetime(SYSTEM_CLOCK)
 
 
 class ConsentLevel(IntEnum):
@@ -27,7 +34,10 @@ class ConsentRecord(BaseModel):
     action_type: str = Field(..., description="Type of action (close_tab, fold_code, etc.)")
     level: int = Field(..., ge=0, le=4, description="ConsentLevel value")
     approved: bool = Field(..., description="Whether user approved")
-    timestamp: datetime = Field(default_factory=datetime.now, description="When decision was made")
+    timestamp: datetime = Field(
+        default_factory=_utc_now,
+        description="Timezone-aware UTC instant when the decision was made",
+    )
 
 
 class ActionConsentState(BaseModel):
@@ -55,12 +65,19 @@ class ConsentLadderState(BaseModel):
         ConsentLevel.REVERSIBLE_ACT, ge=0, le=4,
         description="Global maximum consent level (user-configurable cap)"
     )
-    created_at: datetime = Field(default_factory=datetime.now)
-    updated_at: datetime = Field(default_factory=datetime.now)
+    created_at: datetime = Field(default_factory=_utc_now)
+    updated_at: datetime = Field(default_factory=_utc_now)
 
 
 class ConsentDecision(BaseModel):
     """Result of a consent check."""
+    outcome: Literal["permit", "downgrade", "deny"] = Field(
+        ...,
+        description=(
+            "Exact decision outcome. Only permit authorizes execution; "
+            "downgrade is a non-executable proposal for a lower-level plan."
+        ),
+    )
     allowed: bool = Field(..., description="Whether the action is allowed")
     effective_level: int = Field(..., ge=0, le=4, description="Level the action will execute at")
     requested_level: int = Field(..., ge=0, le=4, description="Level that was requested")

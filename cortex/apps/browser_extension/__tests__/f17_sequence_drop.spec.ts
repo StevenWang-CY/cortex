@@ -30,7 +30,7 @@ type WSMessage = Omit<WSMessageSchema, "payload"> & {
     payload: Record<string, unknown>;
 };
 
-function frame(type: string, seq: number): WSMessage {
+function frame(type: string, seq: number, eventId?: string): WSMessage {
     return {
         type: type as WSMessage["type"],
         payload: {},
@@ -39,6 +39,7 @@ function frame(type: string, seq: number): WSMessage {
         correlation_id: null,
         target_client_types: null,
         source_client_type: null,
+        ...(eventId ? { event_id: eventId } : {}),
     } as WSMessage;
 }
 
@@ -69,6 +70,14 @@ describe("F17 — extension drops stale WS frames", () => {
         bg._resetLastSeqByType();
         expect(bg._acceptSequencedFrame(frame("STATE_UPDATE", 5))).toBe(true);
         expect(bg._acceptSequencedFrame(frame("STATE_UPDATE", 5))).toBe(false);
+        expect(bg._getLastSeq("STATE_UPDATE")).toBe(5);
+    });
+
+    it("rejects a replayed v2 event even if its sequence changes", async () => {
+        const bg = await import("../background");
+        bg._resetLastSeqByType();
+        expect(bg._acceptSequencedFrame(frame("STATE_UPDATE", 5, "event-a"))).toBe(true);
+        expect(bg._acceptSequencedFrame(frame("STATE_UPDATE", 6, "event-a"))).toBe(false);
         expect(bg._getLastSeq("STATE_UPDATE")).toBe(5);
     });
 

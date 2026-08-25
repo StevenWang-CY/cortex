@@ -1,5 +1,5 @@
 """
-Cortex Calibration — 2-Minute Baseline Capture (CLI thin wrapper)
+Cortex Calibration — measured multi-phase profile capture (CLI wrapper)
 
 P0 §3.4: the live + simulate loops now live in
 :mod:`cortex.services.capture_service.calibration_runner` so the desktop
@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import sys
 from pathlib import Path
 
 from cortex.libs.schemas.state import UserBaselines
@@ -41,11 +42,21 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output", "-o", type=str, default=None,
-        help="Output file path (default: storage/baselines/baseline_<timestamp>.json)",
+        help="Optional copy of the immutable profile JSON (the canonical profile remains in storage)",
     )
     parser.add_argument(
         "--simulate", action="store_true",
-        help="Simulate calibration with synthetic data (no webcam needed)",
+        help="Preview a demo profile with synthetic data; never activates calibration",
+    )
+    parser.add_argument(
+        "--approve",
+        action="store_true",
+        help="Explicitly approve a measured profile after capture (for non-interactive use)",
+    )
+    parser.add_argument(
+        "--save-demo",
+        action="store_true",
+        help="Persist a simulated demo profile in the isolated demo namespace",
     )
     return parser.parse_args()
 
@@ -119,18 +130,37 @@ async def _run(args: argparse.Namespace) -> None:
     print("=" * 50)
 
     await runner.start(on_progress=_cli_progress)
-    baselines = await runner.finish()
+    profile = runner.preview_profile()
 
-    print("\n--- Calibration Results ---")
-    print(f"  Heart Rate:       {baselines.hr_baseline:.1f} BPM "
-          f"(std: {baselines.hr_std:.1f})")
-    print(f"  HRV (RMSSD):      {baselines.hrv_baseline:.1f} ms")
-    print(f"  Blink Rate:       {baselines.blink_rate_baseline:.1f} /min")
-    print(f"  Mouse Velocity:   {baselines.mouse_velocity_baseline:.0f} px/s")
-    print(f"  Mouse Variance:   {baselines.mouse_variance_baseline:.0f}")
-    print(f"  Shoulder Y:       {baselines.shoulder_neutral_y:.3f}")
-    print(f"  Calibrated At:    {baselines.calibrated_at}")
-    print("\nBaseline saved to: storage/baselines/default.json")
+    print("\n--- Calibration Review ---")
+    for metric in profile.metrics:
+        value = "unavailable" if metric.value is None else f"{metric.value:.2f} {metric.unit}"
+        print(
+            f"  {str(metric.metric):30s} {value:20s} "
+            f"[{metric.maturity}; {metric.reference_task}]"
+        )
+    print("  Raw frames, landmarks, key contents, and workspace text are not stored.")
+    print("  Webcam heart/respiration estimates remain experimental and are not used for scoring.")
+
+    if args.simulate:
+        if args.save_demo:
+            demo = await runner.save_demo()
+            print(f"\nDemo profile saved (inactive): {demo.profile_id}")
+        else:
+            print("\nDemo preview only. No active calibration was written.")
+        return
+
+    approved = bool(args.approve)
+    if not approved and sys.stdin.isatty():
+        response = input("\nSave and apply this measured profile? [y/N] ").strip().lower()
+        approved = response in {"y", "yes"}
+    if not approved:
+        print("\nNot saved: explicit approval was not provided.")
+        return
+    committed = await runner.finish(approved_by_user=True)
+    runner.activate_for_next_start(str(committed.profile_id))
+    print(f"\nMeasured profile activated for the next daemon start: {committed.profile_id}")
+    print("If Cortex is already running, restart it to apply this CLI-created profile.")
 
 
 def main() -> None:

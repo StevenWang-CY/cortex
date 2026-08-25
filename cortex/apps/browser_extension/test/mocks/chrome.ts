@@ -105,6 +105,7 @@ export interface ChromeFake {
         create: ReturnType<typeof vi.fn>;
         remove: ReturnType<typeof vi.fn>;
         update: ReturnType<typeof vi.fn>;
+        group: ReturnType<typeof vi.fn>;
         ungroup: ReturnType<typeof vi.fn>;
         sendMessage: ReturnType<typeof vi.fn>;
         onRemoved: ReturnType<typeof makeEvent>;
@@ -113,6 +114,13 @@ export interface ChromeFake {
     };
     scripting: {
         executeScript: ReturnType<typeof vi.fn>;
+    };
+    permissions: {
+        contains: ReturnType<typeof vi.fn>;
+        request: ReturnType<typeof vi.fn>;
+        remove: ReturnType<typeof vi.fn>;
+        onAdded: ReturnType<typeof makeEvent>;
+        onRemoved: ReturnType<typeof makeEvent>;
     };
     alarms: {
         create: ReturnType<typeof vi.fn>;
@@ -126,8 +134,11 @@ export interface ChromeFake {
     };
     bookmarks: {
         create: ReturnType<typeof vi.fn>;
+        get: ReturnType<typeof vi.fn>;
+        remove: ReturnType<typeof vi.fn>;
     };
     tabGroups: {
+        get: ReturnType<typeof vi.fn>;
         update: ReturnType<typeof vi.fn>;
         query: ReturnType<typeof vi.fn>;
     };
@@ -185,6 +196,7 @@ export function buildChromeFake(): ChromeFake {
             create: vi.fn(() => Promise.resolve({ id: 1 })),
             remove: vi.fn(() => Promise.resolve()),
             update: vi.fn(() => Promise.resolve()),
+            group: vi.fn(() => Promise.resolve(17)),
             ungroup: vi.fn(() => Promise.resolve()),
             sendMessage: vi.fn(() => Promise.resolve(undefined)),
             onRemoved: makeEvent(),
@@ -193,6 +205,13 @@ export function buildChromeFake(): ChromeFake {
         },
         scripting: {
             executeScript: vi.fn(() => Promise.resolve([])),
+        },
+        permissions: {
+            contains: vi.fn(() => Promise.resolve(false)),
+            request: vi.fn(() => Promise.resolve(false)),
+            remove: vi.fn(() => Promise.resolve(false)),
+            onAdded: makeEvent(),
+            onRemoved: makeEvent(),
         },
         alarms: {
             create: vi.fn(),
@@ -206,8 +225,15 @@ export function buildChromeFake(): ChromeFake {
         },
         bookmarks: {
             create: vi.fn(() => Promise.resolve({ id: "bm1" })),
+            get: vi.fn(() => Promise.resolve([])),
+            remove: vi.fn(() => Promise.resolve()),
         },
         tabGroups: {
+            get: vi.fn((groupId: number) => Promise.resolve({
+                id: groupId,
+                collapsed: true,
+                title: "Cortex: Hidden",
+            })),
             update: vi.fn(() => Promise.resolve()),
             query: vi.fn(() => Promise.resolve([])),
         },
@@ -252,12 +278,18 @@ export function resetChromeFake(fake: ChromeFake): void {
     fake.tabs.create.mockClear();
     fake.tabs.remove.mockClear();
     fake.tabs.update.mockClear();
+    fake.tabs.group.mockClear();
     fake.tabs.ungroup.mockClear();
     fake.tabs.sendMessage.mockClear();
     fake.tabs.onRemoved.__clear();
     fake.tabs.onUpdated.__clear();
     fake.tabs.onActivated.__clear();
     fake.scripting.executeScript.mockClear();
+    fake.permissions.contains.mockClear();
+    fake.permissions.request.mockClear();
+    fake.permissions.remove.mockClear();
+    fake.permissions.onAdded.__clear();
+    fake.permissions.onRemoved.__clear();
     fake.alarms.create.mockClear();
     fake.alarms.clear.mockClear();
     fake.alarms.onAlarm.__clear();
@@ -265,7 +297,10 @@ export function resetChromeFake(fake: ChromeFake): void {
     fake.webNavigation.onCompleted.__clear();
     fake.webNavigation.onHistoryStateUpdated.__clear();
     fake.bookmarks.create.mockClear();
+    fake.bookmarks.get.mockClear();
+    fake.bookmarks.remove.mockClear();
     fake.tabGroups.update.mockClear();
+    fake.tabGroups.get.mockClear();
     fake.tabGroups.query.mockClear();
     fake.notifications.create.mockClear();
     fake.notifications.clear.mockClear();

@@ -23,14 +23,16 @@ export const PANEL_FS = {
 } as const;
 
 export const PANEL_STATE_LABELS: Record<string, string> = {
-    FLOW: "Focused",
-    HYPER: "Elevated",
-    HYPO: "Idle",
-    RECOVERY: "Recovering",
+    UNKNOWN: "Still gathering",
+    FLOW: "Steady activity",
+    HYPER: "Support may help",
+    HYPO: "Quiet activity",
+    RECOVERY: "Settling",
 };
 
 // Optional state tints when the editor theme can't express the role.
 export const PANEL_STATE_HEX_LIGHT: Record<string, string> = {
+    UNKNOWN: "#3C3C432E",
     FLOW: "#D97757",
     HYPER: "#D70015",
     HYPO: "#3C3C432E",

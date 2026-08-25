@@ -14,6 +14,7 @@ from typing import Final
 BRAND_ACCENT: Final[str] = '#D97757'
 BRAND_ACCENT_HOVER: Final[str] = '#C46547'
 BRAND_ACCENT_PRESSED: Final[str] = '#B45638'
+BRAND_ACCENT_TEXT: Final[str] = '#A4472E'
 BRAND_ACCENT_DARK: Final[str] = '#E08E6F'
 BRAND_ACCENT_DIM: Final[str] = 'rgba(217, 119, 87, 0.12)'
 BRAND_ACCENT_SUBTLE: Final[str] = 'rgba(217, 119, 87, 0.06)'
@@ -44,7 +45,7 @@ SEMANTIC_DARK: Final[dict[str, str]] = {
     "sidebar_bg": "#232326",
     "label_primary": "#FFFFFF",
     "label_secondary": "#EBEBF599",
-    "label_tertiary": "#EBEBF54D",
+    "label_tertiary": "#EBEBF58C",
     "label_quaternary": "#EBEBF528",
     "separator": "#5454584C",
     "danger": "#FF453A",
@@ -55,13 +56,15 @@ SEMANTIC_DARK: Final[dict[str, str]] = {
 
 # --- State palette mapping (FLOW/HYPER/HYPO/RECOVERY) ---
 STATE_LABELS: Final[dict[str, str]] = {
-    "FLOW": "Focused",
-    "HYPER": "Elevated",
-    "HYPO": "Idle",
-    "RECOVERY": "Recovering",
+    "UNKNOWN": "Still gathering",
+    "FLOW": "Steady activity",
+    "HYPER": "Support may help",
+    "HYPO": "Quiet activity",
+    "RECOVERY": "Settling",
 }
 
 STATE_ACCENT_ROLES: Final[dict[str, str]] = {
+    "UNKNOWN": "label_tertiary",
     "FLOW": "brand",
     "HYPER": "danger",
     "HYPO": "label_tertiary",
@@ -70,10 +73,20 @@ STATE_ACCENT_ROLES: Final[dict[str, str]] = {
 
 # Hex fallbacks for non-mac / pre-resolution callers.
 STATE_COLORS: Final[dict[str, str]] = {
+    "UNKNOWN": "#3C3C432E",
     "FLOW": "#D97757",
     "HYPER": "#D70015",
     "HYPO": "#3C3C432E",
     "RECOVERY": "#0A84FF",
+}
+
+# Foreground-safe state colors for small text on light surfaces.
+STATE_TEXT_COLORS: Final[dict[str, str]] = {
+    "UNKNOWN": "#5C5854",
+    "FLOW": BRAND_ACCENT_TEXT,
+    "HYPER": "#D70015",
+    "HYPO": "#5C5854",
+    "RECOVERY": "#0062CC",
 }
 
 # --- Biometric channel tints ---
@@ -120,10 +133,10 @@ RADIUS_CONTROL: Final[int] = 6
 RADIUS_PILL: Final[int] = 9999
 
 # --- Motion (ms) ---
-DURATION_MICRO: Final[int] = 100
-DURATION_FAST: Final[int] = 150
+DURATION_MICRO: Final[int] = 120
+DURATION_FAST: Final[int] = 160
 DURATION_NORMAL: Final[int] = 200
-DURATION_SLOW: Final[int] = 400
+DURATION_SLOW: Final[int] = 280
 DURATION_AMBIENT: Final[int] = 3000
 
 # --- Dimensions ---
@@ -155,24 +168,28 @@ HUD_HALO: Final[tuple[int, int, int, int]] = (217, 119, 87, 24)
 # Maps palette name -> {state_name: hex} for STATE_COLORS swap.
 PALETTE_VARIANTS: Final[dict[str, dict[str, str]]] = {
     "default": {
+        "UNKNOWN": "#3C3C432E",
         "FLOW": "#D97757",
         "HYPER": "#D70015",
         "HYPO": "#3C3C432E",
         "RECOVERY": "#0A84FF",
     },
     "deuteranopia": {
+        "UNKNOWN": "#999999",
         "FLOW": "#0072B2",
         "HYPER": "#E69F00",
         "HYPO": "#999999",
         "RECOVERY": "#009E73",
     },
     "protanopia": {
+        "UNKNOWN": "#999999",
         "FLOW": "#0072B2",
         "HYPER": "#E69F00",
         "HYPO": "#999999",
         "RECOVERY": "#56B4E9",
     },
     "tritanopia": {
+        "UNKNOWN": "#999999",
         "FLOW": "#D55E00",
         "HYPER": "#CC79A7",
         "HYPO": "#999999",
@@ -191,6 +208,7 @@ CX_TEXT_TERTIARY: Final[str] = "#6B6661"
 CX_TEXT_INVERSE: Final[str] = "#FFFFFF"
 CX_ACCENT: Final[str] = BRAND_ACCENT
 CX_ACCENT_HOVER: Final[str] = BRAND_ACCENT_HOVER
+CX_ACCENT_TEXT: Final[str] = BRAND_ACCENT_TEXT
 CX_ACCENT_DIM: Final[str] = BRAND_ACCENT_DIM
 CX_ACCENT_SUBTLE: Final[str] = BRAND_ACCENT_SUBTLE
 CX_SUCCESS: Final[str] = SEMANTIC_LIGHT["success"]
@@ -210,26 +228,12 @@ CX_FONT_DISPLAY: Final[str] = FONT_DISPLAY
 CX_FONT_SERIF: Final[str] = "Georgia, \"Times New Roman\", ui-serif, serif"
 CX_FONT_BRAND: Final[str] = FONT_DISPLAY
 CX_FONT_MONO: Final[str] = FONT_MONO
-SP1: Final[int] = 4
-SP2: Final[int] = 8
-SP3: Final[int] = 12
-SP4: Final[int] = 16
-SP5: Final[int] = 20
-SP6: Final[int] = 24
-SP7: Final[int] = 28
-SP8: Final[int] = 32
-SP10: Final[int] = 40
 RADIUS_XS: Final[int] = 6
 RADIUS_SM: Final[int] = RADIUS_BUTTON
 RADIUS_MD: Final[int] = RADIUS_CARD
 RADIUS_LG: Final[int] = RADIUS_WINDOW
 RADIUS_XL: Final[int] = 24
 RADIUS_FULL: Final[int] = RADIUS_PILL
-DURATION_MICRO: Final[int] = 100
-DURATION_FAST: Final[int] = 150
-DURATION_NORMAL: Final[int] = 200
-DURATION_SLOW: Final[int] = 400
-DURATION_AMBIENT: Final[int] = 3000
 HEADER_HEIGHT: Final[int] = 52
 GOAL_INPUT_HEIGHT: Final[int] = 36
 TOGGLE_TRACK_W: Final[int] = 40
@@ -264,13 +268,15 @@ BTN_ACCENT_QSS: Final[str] = (
     f"  padding: 6px 14px;"
     f"  border-radius: {RADIUS_BUTTON}px;"
     f"  background: {BRAND_ACCENT};"
-    "  color: #FFF;"
+    f"  color: {SEMANTIC_LIGHT['label_primary']};"
     f"  font-family: {FONT_SYSTEM};"
     f"  font-size: {FS_FOOTNOTE}px;"
     f"  font-weight: {FW_SEMIBOLD};"
     "  border: none;"
     "}"
-    f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
+    f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
+    f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
+    f"QPushButton:disabled {{ background: {SEMANTIC_LIGHT['grouped_bg']}; color: #6B6661; }}"
 )
 
 BTN_GHOST_QSS: Final[str] = (
@@ -285,6 +291,8 @@ BTN_GHOST_QSS: Final[str] = (
     f"  border: 1px solid {SEMANTIC_LIGHT['separator']};"
     "}"
     "QPushButton:hover { background: rgba(0,0,0,0.03); color: #1A1A1A; }"
+    "QPushButton:pressed { background: rgba(0,0,0,0.07); color: #1A1A1A; }"
+    "QPushButton:disabled { color: #827D77; border-color: rgba(0,0,0,0.08); }"
 )
 
 SECTION_HEADING_QSS: Final[str] = (

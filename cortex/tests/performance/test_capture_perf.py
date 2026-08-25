@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from statistics import median
+from typing import cast
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -29,7 +32,9 @@ import pytest
 
 from cortex.libs.config.settings import CaptureConfig
 from cortex.services.capture_service.face_tracker import FaceTrackingResult
+from cortex.services.capture_service.pipeline import CapturePipeline
 from cortex.services.capture_service.quality import FrameQualityScorer
+from cortex.services.capture_service.webcam import CapturedFrame
 
 
 @dataclass(frozen=True)
@@ -98,40 +103,110 @@ def _make_frame(rng: np.random.Generator, w: int = 640, h: int = 480) -> np.ndar
 
 
 def test_capture_pipeline_per_frame_budget() -> None:
-    """1000 synthetic frames through the cache-aware path stays inside
-    a generous wall-time budget.
+    """A steady-state synthetic batch stays inside the per-frame budget.
 
-    On a developer M-series Mac the loop completes in well under a
-    second; the threshold is set to 5 s so noisy shared CI hardware
-    still passes while catching the kind of regression that would
-    re-double the cvtColor cost or disable the mediapipe sub-sample.
+    Frame acquisition is deliberately outside the timed region.  Generating
+    random 640x480 frames in this loop previously measured NumPy's allocator
+    and PRNG (about 922 MB for 1000 frames), not the capture pipeline, and made
+    the absolute threshold architecture-dependent under Rosetta.  Multiple
+    short batches plus a median reject one-off shared-runner pauses while the
+    companion structural test below fails deterministically if a redundant
+    colour conversion is reintroduced.
     """
     config = CaptureConfig(face_mesh_subsample_n=2)
     scorer = FrameQualityScorer(config)
     tracker = _FakeFaceTracker(config)
     rng = np.random.default_rng(seed=12345)
 
-    n_frames = 1000
-    start = time.perf_counter()
-    for _ in range(n_frames):
-        frame = _make_frame(rng)
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        tracker.process_frame(frame, rgb_frame=rgb)
-        scorer.score(frame, 0.0, gray_frame=gray)
-    elapsed = time.perf_counter() - start
+    frames = tuple(_make_frame(rng) for _ in range(8))
 
-    # Budget: 5 ms per frame averaged over 1000 frames = 5 s wall.
-    # Real laptop measurements come in below 1 s; the wide margin is
-    # for shared CI runners.
-    assert elapsed < 5.0, f"capture pipeline regressed: {elapsed:.2f}s for {n_frames} frames"
+    # Warm OpenCV/NumPy dispatch before measuring steady-state work. Startup
+    # latency has its own regression test and is not a per-frame cost.
+    warm_frame = frames[0]
+    warm_rgb = cv2.cvtColor(warm_frame, cv2.COLOR_BGR2RGB)
+    warm_gray = cv2.cvtColor(warm_frame, cv2.COLOR_BGR2GRAY)
+    _FakeFaceTracker(config).process_frame(warm_frame, rgb_frame=warm_rgb)
+    FrameQualityScorer(config).score(warm_frame, 0.0, gray_frame=warm_gray)
+
+    batch_frames = 100
+    sample_seconds: list[float] = []
+    for _ in range(5):
+        start = time.perf_counter()
+        for index in range(batch_frames):
+            frame = frames[index % len(frames)]
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            tracker.process_frame(frame, rgb_frame=rgb)
+            scorer.score(frame, 0.0, gray_frame=gray)
+        sample_seconds.append(time.perf_counter() - start)
+
+    median_seconds_per_frame = median(sample_seconds) / batch_frames
+    total_frames = batch_frames * len(sample_seconds)
+
+    # The synthetic stages must use less than one quarter of a 30 Hz frame
+    # interval, preserving >25 ms for landmark inference and downstream work.
+    # Exact conversion counts and cache behavior are asserted independently,
+    # so this wall-clock smoke guard need not encode runner-specific speed.
+    assert median_seconds_per_frame < 0.008, (
+        "capture pipeline regressed: median "
+        f"{median_seconds_per_frame * 1000:.2f}ms/frame across "
+        f"{len(sample_seconds)}x{batch_frames}-frame batches "
+        f"(samples={sample_seconds!r})"
+    )
 
     # Sub-sample cache must have actually skipped mediapipe on at least
     # half the frames. If the cache stops working ``mp_invocations``
-    # equals ``n_frames``.
-    assert tracker.mp_invocations <= (n_frames // 2) + 1, (
-        f"sub-sample cache failed: mediapipe ran {tracker.mp_invocations}/{n_frames} times"
+    # equals ``total_frames``.
+    assert tracker.mp_invocations <= (total_frames // 2) + 1, (
+        "sub-sample cache failed: mediapipe ran "
+        f"{tracker.mp_invocations}/{total_frames} times"
     )
+
+
+def test_capture_pipeline_converts_each_colour_space_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real orchestration path owns exactly one RGB and one gray convert.
+
+    This is the deterministic regression guard for the optimisation measured
+    above.  It observes the production ``CapturePipeline._process_frame``
+    call graph, including any conversion the quality scorer might perform,
+    rather than relying on a wall-clock threshold to infer call counts.
+    """
+    config = CaptureConfig()
+    pipeline = CapturePipeline(config)
+    frame = _make_frame(np.random.default_rng(seed=9876), w=64, h=48)
+    captured = CapturedFrame(frame=frame, timestamp=1.0, sequence=0)
+    tracking = FaceTrackingResult(
+        face_detected=False,
+        confidence=0.0,
+        landmarks=None,
+        landmarks_px=None,
+        bounding_box=None,
+        face_stable=False,
+    )
+
+    original_cvt_color = cv2.cvtColor
+    conversion_codes: list[int] = []
+
+    def recording_cvt_color(
+        source: np.ndarray,
+        conversion_code: int,
+    ) -> np.ndarray:
+        conversion_codes.append(conversion_code)
+        return cast(np.ndarray, original_cvt_color(source, conversion_code))
+
+    monkeypatch.setattr(cv2, "cvtColor", recording_cvt_color)
+    with patch.object(
+        pipeline._face_tracker,
+        "process_frame",
+        return_value=tracking,
+    ) as process_frame:
+        pipeline._process_frame(captured)
+
+    assert conversion_codes == [cv2.COLOR_BGR2RGB, cv2.COLOR_BGR2GRAY]
+    process_frame.assert_called_once()
+    assert process_frame.call_args.kwargs["rgb_frame"] is not None
 
 
 def test_quality_scorer_accepts_cached_gray() -> None:

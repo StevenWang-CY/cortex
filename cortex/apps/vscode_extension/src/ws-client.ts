@@ -12,6 +12,12 @@ import WebSocket from "ws";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { randomUUID } from "crypto";
+import type {
+    InterventionAuthorizationRequest,
+    InterventionReceiptBatch,
+    WSMessage as WSMessageSchema,
+} from "./generated/cortex_schemas";
 
 /**
  * Audit Debt-2: read the local capability token the daemon mints at
@@ -50,15 +56,39 @@ function readCapabilityToken(): string | null {
     }
 }
 
-/** WebSocket message envelope matching the daemon's WSMessage format. */
-interface WSMessage {
-    type: string;
+/** Generated wire envelope with metadata optional only before send stamping. */
+type WSMetadataKeys =
+    | "schema_version"
+    | "protocol_version"
+    | "event_id"
+    | "sent_at_unix_ms"
+    | "sent_at_mono_ns"
+    | "boot_id";
+type WSMessage = Omit<WSMessageSchema, "payload" | WSMetadataKeys> &
+    Partial<Pick<WSMessageSchema, WSMetadataKeys>> & {
     payload: Record<string, unknown>;
-    timestamp: number;
-    sequence: number;
-    correlation_id?: string;
-    target_client_types?: string[];
-    source_client_type?: string;
+};
+
+const WIRE_SCHEMA_VERSION = "2.0";
+const PROTOCOL_VERSION = "2.0";
+const SUPPORTED_PROTOCOL_VERSIONS = ["2.0", "1.0"] as const;
+const CLIENT_BOOT_ID = randomUUID();
+
+function withWireMetadata(
+    msg: WSMessage,
+    protocolVersion = PROTOCOL_VERSION,
+): WSMessage {
+    const sentAtUnixMs = Date.now();
+    return {
+        ...msg,
+        schema_version: WIRE_SCHEMA_VERSION,
+        protocol_version: protocolVersion,
+        event_id: randomUUID(),
+        sent_at_unix_ms: sentAtUnixMs,
+        sent_at_mono_ns: Math.max(0, Math.round(performance.now() * 1_000_000)),
+        boot_id: CLIENT_BOOT_ID,
+        timestamp: sentAtUnixMs / 1000,
+    } as WSMessage;
 }
 
 type StateUpdateHandler = (payload: Record<string, unknown>) => void;
@@ -106,6 +136,11 @@ export class CortexWSClient {
     private _maxReconnectDelay = 30000;
     private _intentionalDisconnect = false;
     private _sequence = 0;
+    private _negotiatedProtocolVersion = PROTOCOL_VERSION;
+    private readonly _lastInboundSequenceByType = new Map<string, number>();
+    private readonly _seenInboundEventIds = new Set<string>();
+    private readonly _seenInboundEventOrder: string[] = [];
+    private static readonly _MAX_SEEN_EVENT_IDS = 512;
 
     /**
      * F6 (Phase-4 audit): WebSocket frame-level ping/pong heartbeat.
@@ -169,7 +204,10 @@ export class CortexWSClient {
         }
     > = new Map();
 
-    constructor(url: string) {
+    constructor(
+        url: string,
+        private readonly _clientInstanceId = `vscode_${CLIENT_BOOT_ID}`,
+    ) {
         this._url = url;
     }
 
@@ -185,6 +223,11 @@ export class CortexWSClient {
      */
     get isConnected(): boolean {
         return this._connected;
+    }
+
+    /** Per-process identity used to bind editor-origin authorizations. */
+    get clientBootId(): string {
+        return CLIENT_BOOT_ID;
     }
 
     /** Register a handler for STATE_UPDATE messages. */
@@ -242,6 +285,10 @@ export class CortexWSClient {
             this._ws = new WebSocket(this._url);
 
             this._ws.on("open", () => {
+                this._lastInboundSequenceByType.clear();
+                this._seenInboundEventIds.clear();
+                this._seenInboundEventOrder.length = 0;
+                this._negotiatedProtocolVersion = PROTOCOL_VERSION;
                 this._connected = true;
                 this._reconnectDelay = 3000; // Reset backoff
                 this._notifyConnection(true);
@@ -264,12 +311,18 @@ export class CortexWSClient {
                 if (token && this._ws) {
                     try {
                         this._ws.send(
-                            JSON.stringify({
+                            JSON.stringify(withWireMetadata({
                                 type: "AUTH",
-                                payload: { auth_token: token },
+                                payload: {
+                                    auth_token: token,
+                                    protocol_version: PROTOCOL_VERSION,
+                                    supported_protocol_versions: [
+                                        ...SUPPORTED_PROTOCOL_VERSIONS,
+                                    ],
+                                },
                                 timestamp: Date.now() / 1000,
                                 sequence: ++this._sequence,
-                            }),
+                            } as WSMessage, this._negotiatedProtocolVersion)),
                         );
                     } catch {
                         // Will be retried on reconnect
@@ -279,7 +332,10 @@ export class CortexWSClient {
                 // Identify as VS Code extension
                 this._send({
                     type: "IDENTIFY",
-                    payload: { client_type: "vscode" },
+                    payload: {
+                        client_type: "vscode",
+                        client_instance_id: this._clientInstanceId,
+                    },
                     timestamp: Date.now() / 1000,
                     sequence: ++this._sequence,
                 });
@@ -294,7 +350,10 @@ export class CortexWSClient {
                 this._overflowWarned = false;
                 for (const msg of queued) {
                     try {
-                        this._ws?.send(JSON.stringify(msg));
+                        this._ws?.send(JSON.stringify(withWireMetadata(
+                            msg,
+                            this._negotiatedProtocolVersion,
+                        )));
                     } catch {
                         // Connection torn down mid-flush; remaining
                         // messages will be lost. The reconnect handler
@@ -438,6 +497,28 @@ export class CortexWSClient {
         });
     }
 
+    /** Send one explicit editor-surface authorization request. */
+    sendInterventionAuthorization(
+        request: InterventionAuthorizationRequest,
+    ): void {
+        this._send({
+            type: "INTERVENTION_AUTHORIZE",
+            payload: request as unknown as Record<string, unknown>,
+            timestamp: Date.now() / 1000,
+            sequence: ++this._sequence,
+        });
+    }
+
+    /** Send typed per-action apply/compensation/restore receipts. */
+    sendInterventionReceipt(batch: InterventionReceiptBatch): void {
+        this._send({
+            type: "INTERVENTION_RECEIPT",
+            payload: batch as unknown as Record<string, unknown>,
+            timestamp: Date.now() / 1000,
+            sequence: ++this._sequence,
+        });
+    }
+
     /**
      * P0 §3.6: send a MICRO_STEP_TOGGLED message to the daemon.
      *
@@ -573,7 +654,8 @@ export class CortexWSClient {
      * populated ``action.metadata`` block mirroring the popup CTA
      * shape. The daemon's ``_handle_user_action`` matches on
      * ``action_type == "take_biology_break"`` and routes to the
-     * ``BiologyBreakController`` regardless of source client.
+     * compatibility action is decoded by the daemon. The supported reminder
+     * path is elapsed-focus/user-requested and never physiology-triggered.
      */
     sendBiologyBreakRequest(
         interventionId: string,
@@ -723,7 +805,10 @@ export class CortexWSClient {
             return;
         }
         try {
-            this._ws.send(JSON.stringify(msg));
+            this._ws.send(JSON.stringify(withWireMetadata(
+                msg,
+                this._negotiatedProtocolVersion,
+            )));
         } catch {
             // Connection may have dropped between check and send
         }
@@ -737,7 +822,34 @@ export class CortexWSClient {
             return;
         }
 
+        if (!this._acceptIncomingMessage(msg)) return;
+
         switch (msg.type) {
+            case "AUTH_OK": {
+                const selected = msg.payload.selected_protocol_version;
+                if (selected === "1.0" || selected === "2.0") {
+                    this._negotiatedProtocolVersion = selected;
+                }
+                if (selected !== PROTOCOL_VERSION) {
+                    console.warn(
+                        `[Cortex] daemon selected protocol ${String(selected)}; expected ${PROTOCOL_VERSION}`,
+                    );
+                }
+                break;
+            }
+
+            case "PROTOCOL_ERROR":
+                console.error(
+                    `[Cortex] protocol negotiation failed: ${JSON.stringify(msg.payload)}`,
+                );
+                this._intentionalDisconnect = true;
+                try {
+                    this._ws?.close(1002, "unsupported Cortex protocol");
+                } catch {
+                    // Server may already have closed after the error frame.
+                }
+                break;
+
             case "STATE_UPDATE":
                 for (const handler of this._stateUpdateHandlers) {
                     try {
@@ -848,6 +960,35 @@ export class CortexWSClient {
                 }
                 break;
         }
+    }
+
+    /** Drop duplicate event identities and stale per-type sequences.
+     *
+     * Event identity is authoritative for v2 replays. Sequence ordering is
+     * scoped by message type so a high-rate STATE_UPDATE cannot suppress a
+     * lower-frequency intervention frame. Sequence zero remains the v1
+     * compatibility sentinel and bypasses ordering.
+     */
+    private _acceptIncomingMessage(msg: WSMessage): boolean {
+        if (typeof msg.event_id === "string" && msg.event_id.length > 0) {
+            if (this._seenInboundEventIds.has(msg.event_id)) return false;
+            this._seenInboundEventIds.add(msg.event_id);
+            this._seenInboundEventOrder.push(msg.event_id);
+            if (
+                this._seenInboundEventOrder.length >
+                CortexWSClient._MAX_SEEN_EVENT_IDS
+            ) {
+                const evicted = this._seenInboundEventOrder.shift();
+                if (evicted) this._seenInboundEventIds.delete(evicted);
+            }
+        }
+
+        const sequence = typeof msg.sequence === "number" ? msg.sequence : 0;
+        if (sequence <= 0 || !msg.type) return true;
+        const last = this._lastInboundSequenceByType.get(msg.type) ?? 0;
+        if (sequence <= last) return false;
+        this._lastInboundSequenceByType.set(msg.type, sequence);
+        return true;
     }
 
     private async _handleContextRequest(msg: WSMessage): Promise<void> {

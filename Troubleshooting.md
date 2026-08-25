@@ -130,7 +130,7 @@ The Anthropic SDK reads the resulting credentials automatically.
 
 **Fallback.** `CORTEX_LLM__FALLBACK_MODE=rule_based` (the default) keeps the daemon working with a deterministic rule-based plan when every provider is unavailable. Set it explicitly if you want to test without any LLM at all.
 
-See [Setup](Setup) for the full per-provider configuration.
+See [Setup](Setup.md) for the full per-provider configuration.
 
 ---
 

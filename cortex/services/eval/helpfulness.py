@@ -1,19 +1,18 @@
 """
 Eval — Helpfulness Tracker
 
-Tracks pre- and post-intervention state to compute a helpfulness
-reward signal. Records both implicit signals (undo, ignore) and
-explicit signals (thumbs up/down).
-
-The reward signal feeds the contextual bandit learning loop.
+Tracks pre- and post-intervention state for the immediate local helpfulness
+summary. This descriptive score does not update the production policy. The
+durable policy reward is finalized separately after its prespecified window.
 """
 
 from __future__ import annotations
 
 import logging
-import time
 from collections import deque
 from typing import Any, TypedDict
+
+from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -41,16 +40,17 @@ class HelpfulnessSummary(TypedDict):
     positive_rate: float
     recent_rewards: list[float]
 
+
 # P0 §3.8: 200-character cap on the optional 👎 free-text feedback so
 # the helpfulness store never balloons even under adversarial input.
 # The text never reaches the LLM — it is stored locally only.
 _MAX_TEXT_FEEDBACK_CHARS = 200
 
 # Reward computation weights
-_RECOVERY_WEIGHT = 0.40   # Did user return to FLOW?
+_RECOVERY_WEIGHT = 0.40  # Did user return to FLOW?
 _COMPLEXITY_WEIGHT = 0.15  # Did complexity decrease?
-_RATING_WEIGHT = 0.30     # Explicit user rating
-_IMPLICIT_WEIGHT = 0.15   # Was it engaged with vs ignored?
+_RATING_WEIGHT = 0.30  # Explicit user rating
+_IMPLICIT_WEIGHT = 0.15  # Was it engaged with vs ignored?
 
 # Timing
 _POST_OBSERVATION_SECONDS = 300.0  # 5 minutes post-intervention
@@ -105,14 +105,14 @@ class _TrackedIntervention:
         self.user_rating: str | None = None  # "thumbs_up" or "thumbs_down"
         self.user_action: str = "dismissed"
         # P0 §3.8: optional one-line free-text feedback that the user
-        # typed on a 👎. Stored locally for offline causal analysis;
+        # typed on a 👎. Stored locally for qualitative product diagnostics;
         # NEVER sent to the LLM.
         self.text_feedback: str | None = None
 
 
 class HelpfulnessTracker:
     """
-    Tracks intervention helpfulness for the learning loop.
+    Tracks intervention helpfulness for the descriptive product summary.
 
     On intervention start: captures pre-state snapshot.
     On intervention end (or +5 min): captures post-state, computes reward.
@@ -124,8 +124,9 @@ class HelpfulnessTracker:
         record = await tracker.end_tracking(intervention_id, state, context, outcome)
     """
 
-    def __init__(self, store: Any = None) -> None:
+    def __init__(self, store: Any = None, *, clock: Clock | None = None) -> None:
         self._store = store
+        self._clock = clock or SYSTEM_CLOCK
         self._active: dict[str, _TrackedIntervention] = {}
         self._recent_rewards: list[float] = []
         self._recent_engaged: list[bool] = []
@@ -166,11 +167,20 @@ class HelpfulnessTracker:
             pre_error_count=error_count,
             pre_thrashing=thrashing_score,
             pre_stress=stress_integral,
-            started_at=time.monotonic(),
+            started_at=monotonic_seconds(self._clock),
             decision_id=decision_id,
             propensity=propensity,
             policy_arm=policy_arm,
         )
+
+    def cancel_tracking(self, intervention_id: str) -> bool:
+        """Discard a proposal that never reached any presentation surface.
+
+        Cancellation records no reward or engagement observation; it is a
+        transport non-delivery, not a user outcome.
+        """
+
+        return self._active.pop(intervention_id, None) is not None
 
     def record_user_action(
         self,
@@ -184,7 +194,7 @@ class HelpfulnessTracker:
             return
 
         tracked.user_action = action
-        ts = timestamp or time.monotonic()
+        ts = monotonic_seconds(self._clock) if timestamp is None else timestamp
 
         if action == "engaged":
             tracked.was_engaged = True
@@ -225,20 +235,20 @@ class HelpfulnessTracker:
             # end_tracking) — a user who downvotes the dismissal toast
             # of a stale intervention shouldn't be silently lost.
             if rating == "thumbs_down":
-                self._recent_downvotes.append(time.monotonic())
+                self._recent_downvotes.append(monotonic_seconds(self._clock))
             return
         tracked.user_rating = rating
         if text_feedback is not None:
             cleaned = text_feedback.strip()[:_MAX_TEXT_FEEDBACK_CHARS]
             tracked.text_feedback = cleaned or None
         if rating == "thumbs_down":
-            self._recent_downvotes.append(time.monotonic())
+            self._recent_downvotes.append(monotonic_seconds(self._clock))
 
     def downvote_count_within(self, window_seconds: float) -> int:
         """Count thumbs_down events within the last ``window_seconds``."""
         if window_seconds <= 0:
             return 0
-        cutoff = time.monotonic() - float(window_seconds)
+        cutoff = monotonic_seconds(self._clock) - float(window_seconds)
         # Drop entries that fall outside the window so the deque doesn't
         # accumulate stale timestamps forever.
         while self._recent_downvotes and self._recent_downvotes[0] < cutoff:
@@ -272,7 +282,7 @@ class HelpfulnessTracker:
         tracked.post_complexity = complexity
         tracked.post_tab_count = tab_count
         tracked.post_error_count = error_count
-        tracked.ended_at = time.monotonic()
+        tracked.ended_at = monotonic_seconds(self._clock)
 
         # Compute time to FLOW
         if state == "FLOW":
@@ -309,7 +319,9 @@ class HelpfulnessTracker:
             "decision_id": tracked.decision_id,
             "policy_arm": tracked.policy_arm,
             "propensity": tracked.propensity,
-            "duration_seconds": (tracked.ended_at - tracked.started_at) if tracked.ended_at else None,
+            "duration_seconds": (tracked.ended_at - tracked.started_at)
+            if tracked.ended_at
+            else None,
         }
 
         # Persist to store
@@ -322,8 +334,11 @@ class HelpfulnessTracker:
 
         logger.info(
             "Helpfulness: %s → reward=%.2f (action=%s, rating=%s, flow=%s)",
-            intervention_id, reward, tracked.user_action,
-            tracked.user_rating, tracked.time_to_flow,
+            intervention_id,
+            reward,
+            tracked.user_action,
+            tracked.user_rating,
+            tracked.time_to_flow,
         )
         return record
 
@@ -399,13 +414,9 @@ class HelpfulnessTracker:
         """
         total = len(self._recent_rewards)
         engagement_rate = (
-            sum(1 for engaged in self._recent_engaged if engaged) / total
-            if total > 0 else 0.0
+            sum(1 for engaged in self._recent_engaged if engaged) / total if total > 0 else 0.0
         )
-        positive_rate = (
-            sum(1 for r in self._recent_rewards if r > 0) / total
-            if total > 0 else 0.0
-        )
+        positive_rate = sum(1 for r in self._recent_rewards if r > 0) / total if total > 0 else 0.0
         return HelpfulnessSummary(
             total_interventions=total,
             total_tracked=total,  # backward compatibility

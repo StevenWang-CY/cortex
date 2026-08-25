@@ -96,7 +96,7 @@ def is_disengaged(
     Returns:
         ``(should_fire, reason)``. ``reason`` is a short human-readable
         label suitable for surfacing through
-        :class:`TriggerDecision.reason` and the AMIP outcome telemetry.
+        :class:`TriggerDecision.reason` and local outcome diagnostics.
     """
     cfg = config or HypoGateConfig()
 

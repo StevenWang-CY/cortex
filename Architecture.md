@@ -1,113 +1,119 @@
 # Architecture
 
-## Overview
+Cortex is a local modular monolith. Splitting camera ownership, authorization,
+and recovery into network microservices would add failure and privacy surfaces
+without helping a single-user macOS app.
 
-Cortex is an in-process supervisor (`cortex/services/runtime_daemon.py`) orchestrating a 5-layer sensing-to-action loop exposed via FastAPI (`:9472`) and WebSocket (`:9473`), with an optional sidecar launcher agent on `:9471` that the browser extension uses to start/stop the daemon.
+## Application ownership
 
-## Ports
+`cortex/application/` contains the typed kernel, command/event ports, bounded
+coordinators, and named task owner. Sensing, inference, intervention, policy,
+context, and lifecycle coordinators own use cases. The large runtime daemon is
+a compatibility composition facade; it is no longer the owner of domain
+algorithms. Browser and desktop view/controller modules share domain routers
+rather than implementing parallel policy.
 
-| Port | Service | Bound by | Notes |
-|------|---------|----------|-------|
-| 9471 | Launcher agent (HTTP) | `cortex/scripts/launcher_agent.py` | Sidecar that the extension and the desktop shell call to spawn or kill the daemon. `/stop` is capability-token gated (audit F08); `/health` is open for liveness probes. |
-| 9472 | FastAPI HTTP API | `cortex/services/api_gateway/app.py` | Mutating endpoints (`/shutdown`, `/apply_intervention`, `/state/infer`, `/llm/plan`) carry the per-request correlation id from F19 in `X-Cortex-Request-ID`. |
-| 9473 | WebSocket | `cortex/services/api_gateway/websocket_server.py` | Real-time STATE_UPDATE / INTERVENTION_TRIGGER stream. `SHUTDOWN` payloads require the local capability token (audit F07). |
-
-All three bind to `127.0.0.1` only.
-
-## Layered Design
-
-```
-L1 Bio/Telemetry Extraction
-  capture_service + physio_engine + kinematics_engine + telemetry_engine
-        │
-        ▼
-L2 State Engine
-  feature_fusion + rule_scorer + smoother + detectors + stress_integral
-        │
-        ▼
-L3 Trigger/Policy
-  trigger_policy + eval/amip (or legacy bandit modes)
-        │
-        ▼
-L4 LLM Planning
-  llm_engine (Anthropic SDK over AWS Bedrock / GCP Vertex / direct Anthropic
-  API, with a deterministic rule-based fallback) + parser + planner validation
-        │
-        ▼
-L5 Intervention Execution
-  consent ladder + executor + restore + helpfulness logging
+```text
+camera/activity/client observations
+              ↓
+quality + missingness + dual-clock envelopes
+              ↓
+deterministic evidence-aware support estimate / unknown
+              ↓
+eligibility, receptivity, cooldown, deterministic policy
+              ↓
+local plan or preview-confirmed external plan
+              ↓
+side-effect-free proposal
+              ↓ optional explicit authority
+manifest → authorization → apply → receipt → verify → restore
 ```
 
-## Core Data Contracts
+## Boundaries
 
-- `PhysioFeatures` now includes expanded HRV + SQI fields.
-- `KinematicFeatures` includes `perclos_60s`, blink duration, EAR variance.
-- `TelemetryFeatures` includes correction/scroll-back rates.
-- `StateEstimate` includes calibrated probabilities and classifier metadata.
-- `InterventionPlan` includes non-fatal `plan_warnings`.
+- **Domain:** immutable value objects, signal validity, support estimates,
+  consent outcomes, manifests, receipts, and policies.
+- **Application:** kernel, coordinators, injected dual clock, event store,
+  privacy broker, command/event ports, and structured background tasks.
+- **Infrastructure:** camera, SQLite, provider, OS, browser, editor, Keychain,
+  and compatibility cache adapters.
+- **Interfaces:** authenticated FastAPI/WebSocket/native messaging, PySide6,
+  Chrome/Edge MV3, and VS Code.
+- **Composition:** constructs dependencies and compatibility facades without
+  owning domain decisions.
 
-All additions are backward-compatible (additive fields only).
+## Service topology
 
-## L1 Details
+The deployable remains one process, but service packages have deliberately
+narrow responsibilities:
 
-- rPPG backends: POS/CHROM/green with optional ONNX TSCAN.
-- ROI extraction includes adaptive patch weighting and motion penalties.
-- Pulse estimator computes expanded HRV metrics and composite SQI.
-- Physiology is SQI-gated before publication.
-- Respiration is dual-path (BVP + motion proxy fusion).
+| Package | Responsibility |
+| --- | --- |
+| `capture_service` | Webcam ownership and raw-frame acquisition |
+| `physio_engine` | Experimental camera-derived physiology and signal quality |
+| `kinematics_engine` | Face and motion observations |
+| `telemetry_engine` | Aggregate input/window telemetry features |
+| `state_engine` | Evidence-aware state estimation and trigger policy |
+| `context_engine` | Privacy-filtered application context |
+| `eval` | Offline replay, regression, and research evaluation |
+| `llm_engine` | Optional untrusted planning providers |
+| `intervention_engine` | Proposal construction and bounded orchestration |
+| `consent` | Consent and authority decisions |
+| `session_report` | Local session summaries and persistence adapters |
+| `api_gateway` | Authenticated HTTP and WebSocket interfaces |
+| `launcher` | Process lifecycle coordination |
+| `janitor` | Retention and cleanup work |
+| `activity_tracker` | Coarse foreground activity observations |
 
-## L2 Details
+The loopback interfaces are fixed and intentionally distinct: launcher HTTP on
+`9471`, authenticated FastAPI HTTP on `9472`, and authenticated WebSocket on
+`9473`. These ports are local transports, not independent microservices.
 
-- Rule scorer uses personalized baseline distributions where present.
-- FLOW rule aligns with near-baseline engagement signatures and long dwell.
-- Smoother outputs calibrated probabilities while retaining hysteresis behavior.
-- Stress integral tracks standardized HRV deficit and supports recovery credit.
-- Optional per-user logistic model exists in `state_engine/ml_classifier.py`.
+## Trust and authority
 
-## L3 Details
+Loopback clients are untrusted. HTTP mutation routes require a bearer
+capability; WebSocket clients authenticate before identification; native
+messages have a generated discriminated union and size limit. LLM output is
+untrusted proposal data. No transport message, model response, policy arm, or
+consent downgrade confers workspace authority.
 
-- Trigger policy adds receptivity gates and learned dismissal suppression.
-- Dwell defaults are evidence-updated: HYPER 30s, HYPO 60s, FLOW 120s.
-- AMIP policy (`services/eval/amip.py`) performs contextual Thompson sampling with:
-  - temperature softmax,
-  - deterministic safety floor,
-  - propensity logging,
-  - write-ahead decision logging.
-- Nightly causal report generation: `services/eval/causal_report.py`.
+An optional effect requires an exact manifest digest, capability, target,
+consent revision, expiry, and one-time nonce. SQLite commits intent before
+apply, records typed receipts/inverses, verifies postconditions, and recovers
+unresolved work after restart. Duplicate/replayed commands are idempotent.
 
-## L4/L5 Safety
+## Time and storage
 
-- Prompt inputs are sanitized before interpolation.
-- LLM output is parsed as structured JSON and verified against schema.
-- Invalid actions are dropped in-place (graceful degradation).
-- Causal explanations are checked against observed context metrics.
-- Destructive-looking actions undergo a self-critique filter before execution.
-- Consent is recency-aware and applied consistently, including LeetCode actions.
+Public time is explicit: UNIX milliseconds for display/persistence and
+monotonic nanoseconds scoped by `boot_id` for same-process duration/order.
+Every sensor interval is a typed observation, including missing/rejected/stale
+intervals.
 
-## Durable Learning Artifacts
+SQLite is authoritative with single-owner writes, rollback journaling,
+`synchronous=FULL`, checksummed migrations, verified backups, integrity checks,
+bounded analytics backpressure, retention, export/delete, and recovery.
+Legacy JSON/JSONL is migrated or diagnostic. Redis/in-memory is not authority.
 
-- Policy log WAL: `storage/policy_log/YYYY-MM-DD.jsonl`
-- Causal report: `storage/reports/causal_YYYY-MM-DD.md`
-- Helpfulness records include `decision_id`, `policy_arm`, and `propensity`.
+## Evidence boundary
 
-## Repository Map
+Production support inference is a deterministic telemetry model with
+abstention and no learned classifier. Retired AMIP/contextual-bandit
+implementations were deleted; only read-only legacy diagnostics remain.
+Research MRT/OPE is separately consented and fixed by a checksummed study
+specification. Camera physiology cannot influence production support scores.
+Optional planning transports are AWS Bedrock, GCP Vertex, and the direct
+Anthropic API; all are BYOK, network-off by default, and remain outside the
+authority boundary.
 
-- `cortex/services/capture_service/*`: camera selection (incl. Continuity Camera filtering), frame capture.
-- `cortex/services/physio_engine/*`: rPPG, SQI, pulse, respiration, ROI.
-- `cortex/services/kinematics_engine/*`: blink/EAR/PERCLOS, head pose, posture from face landmarks.
-- `cortex/services/telemetry_engine/*`: keyboard / mouse / scroll variability + correction/scroll-back rates.
-- `cortex/services/state_engine/*`: scoring, smoothing, trigger, detectors, ML classifier, persisted dismissal model (F21) and quiet-mode escalation memory (F26).
-- `cortex/services/context_engine/*`: workspace context fusion (editor / terminal / browser tab snapshots) used to build the prompt envelope.
-- `cortex/services/eval/*`: legacy bandit + AMIP + causal report + replay.
-- `cortex/services/llm_engine/*`: backend clients, prompt construction (with F09 prompt-injection wrappers and F29 truncation telemetry), parsing, parser-side action allowlist (F10), cost tracker (F20).
-- `cortex/services/intervention_engine/*`: planner, executor, restore, LeetCode interventions.
-- `cortex/services/consent/*`: policy + ladder.
-- `cortex/services/session_report/*`: per-session aggregate report (state breakdown, flow streaks, golden hour, comparison stats).
-- `cortex/services/api_gateway/*`: FastAPI app, WebSocket server, route handlers (`/state/infer`, `/apply_intervention`, `/llm/plan`, `/shutdown`).
-- `cortex/services/launcher/*`: project-config-driven workspace launcher (with the F12 shell-injection allowlist).
-- `cortex/services/janitor/*`: retention sweep (`storage/sessions/`, `storage/logs/`, `storage/policy_log/`).
-- `cortex/services/activity_tracker/*`: browser tab/activity feed forwarded by the extension.
-- `cortex/services/handover/*`, `cortex/services/throttle/*`: ancillary helpers for hand-off between modes and rate-limiting helpers used by the API gateway.
-- `cortex/scripts/launcher_agent.py`, `cortex/scripts/native_host.py`: out-of-process glue (port 9471 launcher and Chrome native messaging host) — described under "Ports" above.
-- `cortex/apps/desktop_shell/*`: PySide6 macOS UI (dashboard, overlay, settings, tray, onboarding).
-- `cortex/apps/browser_extension/*`: Plasmo / React MV3 extension.
+## Release topology
+
+PyInstaller bundles the in-process daemon and desktop shell. Architecture-
+specific arm64/x86_64 DMGs include Chrome/Edge builds, VSIX, native-host
+installer, migrations, model/resource files, and a secret-free configuration.
+Release tags require locked inputs, Developer ID hardened-runtime signing,
+Apple notarization/stapling, mounted-artifact smoke, SBOMs, checksums, and
+GitHub attestations.
+
+Canonical detail: [cortex/docs/architecture.md](cortex/docs/architecture.md),
+[ADRs](docs/adr/README.md), [data flow](docs/data-flow.md), and
+[implementation audit](IMPLEMENTATION.md).

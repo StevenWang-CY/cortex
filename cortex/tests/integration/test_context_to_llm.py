@@ -425,7 +425,7 @@ class TestEndToEnd:
                 self.calls.append((action, params))
                 return True
 
-        executor = InterventionExecutor()
+        executor = InterventionExecutor(execution_mode="authorized")
         mock_editor = MockAdapter()
         mock_browser = MockAdapter()
         executor.register_adapter("editor", mock_editor)
