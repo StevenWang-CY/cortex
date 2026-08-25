@@ -226,7 +226,7 @@ class RoiExtractor:
 
         # Create binary mask from convex hull
         mask = np.zeros((height, width), dtype=np.uint8)
-        cv2.fillConvexPoly(mask, hull, 1)
+        cv2.fillConvexPoly(mask, hull, (1,))
 
         # Count pixels in ROI
         pixel_count = int(np.sum(mask))

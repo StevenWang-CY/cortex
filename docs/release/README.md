@@ -6,12 +6,20 @@ verification below is present.
 
 ## Reproducible inputs
 
-- Python: `cortex/uv.lock`, uv 0.10.12, `uv sync --locked`.
+- Python: 184-package `cortex/uv.lock`, uv 0.10.12, `uv sync --locked`.
 - Browser: Node 22.23.2, pnpm 9.15.9, `pnpm-lock.yaml`, frozen install.
 - VS Code: Node 22.23.2, `package-lock.json`, `npm ci`.
 - Version: `cortex/pyproject.toml`, projected by `sync_versions`.
 - Platforms: clean macOS arm64/Python 3.11.15 and
   x86_64/Python 3.12.13 builders.
+
+The lock explicitly requires wheels for both macOS architectures. MediaPipe
+stopped publishing Intel wheels after 0.10.21, so x86_64 uses that release and
+its NumPy 1.x-compatible dependency branch; arm64 and Linux use the maintained
+MediaPipe/NumPy branch. Both are subjected to the same source gate, and the
+artifact metadata records the resolved architecture-specific graph. The lock
+uses `opencv-contrib-python<5` as the sole `cv2` provider on both architectures;
+the repository gate rejects co-installing the overlapping base OpenCV wheel.
 
 The locks make resolution repeatable. Apple signing/notarization timestamps and
 DMG metadata mean the final archive is not promised to be byte-for-byte

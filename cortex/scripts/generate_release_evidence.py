@@ -30,13 +30,18 @@ def sha256_file(path: Path) -> str:
 
 
 def _command(command: list[str]) -> str:
-    completed = subprocess.run(
-        command,
-        cwd=_ROOT,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return "unavailable (not found)"
+    except OSError as exc:
+        return f"unavailable (os error {exc.errno})"
     if completed.returncode != 0:
         return f"unavailable ({completed.returncode})"
     return (completed.stdout or completed.stderr).strip()

@@ -12,6 +12,7 @@ from jsonschema import Draft202012Validator, FormatChecker
 from cortex import __version__
 from cortex.scripts.generate_release_evidence import (
     ReleaseEvidenceError,
+    _command,
     generate,
     sha256_file,
 )
@@ -153,6 +154,12 @@ def test_release_evidence_hashes_every_input(tmp_path: Path) -> None:
     assert verification.name in sums
     assert metadata_path.name in sums
     assert sums_path.name == "SHA256SUMS-arm64"
+
+
+def test_release_evidence_records_missing_optional_builder_tool() -> None:
+    assert _command(["cortex-builder-tool-that-does-not-exist", "--version"]) == (
+        "unavailable (not found)"
+    )
 
 
 def test_release_evidence_rejects_checksum_paths(tmp_path: Path) -> None:

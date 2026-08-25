@@ -1983,9 +1983,15 @@ README/wiki pages, finding ledger, ADRs, model cards, and release templates
 
 **Changes:**
 
-1. Committed a universal 172-package `uv.lock`; constrained supported Python
+1. Committed a universal 184-package `uv.lock`; constrained supported Python
    to 3.11/3.12 and pinned Python 3.11.15, Node 22.23.2, pnpm 9.15.9, and uv
-   0.10.12 at repository and workflow boundaries.
+   0.10.12 at repository and workflow boundaries. Required wheel environments
+   include both macOS architectures; the Intel branch pins MediaPipe 0.10.21
+   and its NumPy 1.x-compatible graph because later MediaPipe releases publish
+   no macOS x86_64 wheel, while arm64/Linux retain the maintained line. The
+   graph installs only the capped `opencv-contrib-python` provider required by
+   MediaPipe; a repository contract rejects a second `opencv-python` wheel
+   that could overwrite the same `cv2` package and bypass the major-version cap.
 2. Added one canonical Python gate for Ruff, strict mypy, wheel inspection,
    the complete non-Qt suite, and isolated Qt suite. CI exercises identical
    arm64/3.11.15 and x86_64/3.12.13 matrices, exports `UV_PYTHON` so
@@ -1995,7 +2001,9 @@ README/wiki pages, finding ledger, ADRs, model cards, and release templates
    overrides in the pnpm-9-compatible package manifest location. Patchable
    transitive advisories are lifted; remaining dormant builder paths require
    narrow, expiring, package-chain-verified exceptions. VS Code uses a tracked
-   lock, frozen install, real tests, and package gate.
+   lock, frozen install, real tests, and package gate. CI activates pnpm through
+   exact Corepack selection rather than `pnpm/action-setup` v6, whose current
+   version shim can execute a newer multi-document-lockfile implementation.
 4. Added a schema-1.1 dataset manifest with path containment, checksums,
    participant-disjoint split enforcement, license/source/citation, explicit
    participant-data policy, reference sensor, clock alignment, condition

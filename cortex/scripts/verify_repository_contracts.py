@@ -280,13 +280,22 @@ def check_toolchain_pins() -> list[str]:
         pnpm_version = match.group(1)
     with (_PROJECT / "pyproject.toml").open("rb") as handle:
         project_metadata = tomllib.load(handle)
-    uv_required = str(project_metadata.get("tool", {}).get("uv", {}).get("required-version", ""))
+    uv_config = project_metadata.get("tool", {}).get("uv", {})
+    uv_required = str(uv_config.get("required-version", ""))
     uv_version = uv_required.removeprefix("==")
     if not uv_required.startswith("=="):
         problems.append("tool.uv.required-version must be an exact == pin")
+    required_environments = set(uv_config.get("required-environments", []))
+    expected_macos_environments = {
+        "sys_platform == 'darwin' and platform_machine == 'arm64'",
+        "sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    }
+    if required_environments != expected_macos_environments:
+        problems.append("tool.uv.required-environments must cover exact macOS arm64/x86_64 wheels")
     workflow_payloads: dict[str, dict[str, Any]] = {}
     for workflow in sorted((_ROOT / ".github" / "workflows").glob("*.yml")):
-        payload = yaml.safe_load(workflow.read_text(encoding="utf-8")) or {}
+        workflow_text = workflow.read_text(encoding="utf-8")
+        payload = yaml.safe_load(workflow_text) or {}
         workflow_payloads[workflow.name] = payload
         environment = payload.get("env", {}) if isinstance(payload, dict) else {}
         expected = {
@@ -298,6 +307,24 @@ def check_toolchain_pins() -> list[str]:
         for key, value in expected.items():
             if environment.get(key) != value:
                 problems.append(f"{workflow.relative_to(_ROOT)} env.{key} must equal {value!r}")
+        if "pnpm/action-setup@" in workflow_text:
+            problems.append(f"{workflow.relative_to(_ROOT)} must not use the pnpm v6 version shim")
+        for job_name, job in payload.get("jobs", {}).items():
+            steps = job.get("steps", []) if isinstance(job, dict) else []
+            run_blocks = [str(step.get("run") or "") for step in steps if isinstance(step, dict)]
+            invokes_pnpm = any(
+                re.search(r"(^|\s)pnpm(?:\s|$)", block, re.MULTILINE) for block in run_blocks
+            )
+            activates_exact_pnpm = any(
+                'corepack prepare "pnpm@${PNPM_VERSION}" --activate' in block
+                and 'test "$(pnpm --version)" = "${PNPM_VERSION}"' in block
+                for block in run_blocks
+            )
+            if invokes_pnpm and not activates_exact_pnpm:
+                problems.append(
+                    f"{workflow.relative_to(_ROOT)} job {job_name} invokes pnpm "
+                    "without exact Corepack activation"
+                )
 
     matrix_jobs = (("ci.yml", "python"), ("release.yml", "build-dmg"))
     matrices: list[list[dict[str, Any]]] = []
@@ -324,6 +351,52 @@ def check_toolchain_pins() -> list[str]:
     return problems
 
 
+def check_dependency_graph_contract() -> list[str]:
+    """Reject mutually overwriting native providers in the locked runtime."""
+
+    problems: list[str] = []
+    with (_PROJECT / "pyproject.toml").open("rb") as handle:
+        project_metadata = tomllib.load(handle)
+    dependencies = [
+        str(dependency).split(";", 1)[0].strip()
+        for dependency in project_metadata.get("project", {}).get("dependencies", [])
+    ]
+    opencv_dependencies = [
+        dependency
+        for dependency in dependencies
+        if re.match(r"^opencv-(?:contrib-)?python(?:\W|$)", dependency)
+    ]
+    if opencv_dependencies != ["opencv-contrib-python>=4.9.0,<5"]:
+        problems.append(
+            "project dependencies must use one capped opencv-contrib-python provider; "
+            f"found {opencv_dependencies!r}"
+        )
+
+    with (_PROJECT / "uv.lock").open("rb") as handle:
+        lock = tomllib.load(handle)
+    locked_packages = [package for package in lock.get("package", []) if isinstance(package, dict)]
+    base_versions = sorted(
+        str(package.get("version") or "")
+        for package in locked_packages
+        if package.get("name") == "opencv-python"
+    )
+    if base_versions:
+        problems.append(
+            "uv.lock must not co-install opencv-python with opencv-contrib-python; "
+            f"found base versions {base_versions!r}"
+        )
+    contrib_versions = sorted(
+        str(package.get("version") or "")
+        for package in locked_packages
+        if package.get("name") == "opencv-contrib-python"
+    )
+    if not contrib_versions:
+        problems.append("uv.lock is missing the canonical opencv-contrib-python provider")
+    elif any(not re.fullmatch(r"[0-4](?:\.\d+)+", version) for version in contrib_versions):
+        problems.append(f"uv.lock contains an uncapped OpenCV contrib major: {contrib_versions!r}")
+    return problems
+
+
 def all_problems() -> list[str]:
     return [
         *check_local_markdown_links(),
@@ -332,6 +405,7 @@ def all_problems() -> list[str]:
         *check_generated_surfaces(),
         *check_workflow_action_pins(),
         *check_toolchain_pins(),
+        *check_dependency_graph_contract(),
     ]
 
 
@@ -350,6 +424,7 @@ def main() -> int:
         *check_generated_surfaces(),
         *check_workflow_action_pins(),
         *check_toolchain_pins(),
+        *check_dependency_graph_contract(),
     ]
     if problems:
         print("repository contracts FAILED:", file=sys.stderr)
@@ -358,7 +433,8 @@ def main() -> int:
         return 1
     print(
         "repository contracts pass "
-        "(links, config reachability, live messages, generated surfaces, action/tool pins)"
+        "(links, config reachability, live messages, generated surfaces, "
+        "action/tool pins, dependency graph)"
     )
     return 0
 

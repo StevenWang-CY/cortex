@@ -28,7 +28,11 @@ from cortex.services.capture_service.face_tracker import (
 )
 from cortex.services.capture_service.pipeline import AdaptiveFrameSkipper
 from cortex.services.capture_service.quality import FrameQualityScorer
-from cortex.services.capture_service.webcam import CapturedFrame, WebcamCapture
+from cortex.services.capture_service.webcam import (
+    CameraSelection,
+    CapturedFrame,
+    WebcamCapture,
+)
 
 # =============================================================================
 # Helpers
@@ -64,6 +68,31 @@ def make_blurry_frame(width: int = 640, height: int = 480) -> np.ndarray:
     """Create a blurry frame by heavy Gaussian smoothing."""
     frame = make_synthetic_frame(width, height, brightness=128)
     return cv2.GaussianBlur(frame, (31, 31), 10)
+
+
+def make_opened_mock_camera(
+    frame: np.ndarray | None = None,
+) -> tuple[MagicMock, CameraSelection]:
+    """Return a platform-independent opened-camera boundary for lifecycle tests.
+
+    Selection/enumeration behavior has dedicated tests below. Lifecycle tests
+    inject the result of that boundary so a hosted macOS runner without a real
+    AVFoundation device cannot leak into otherwise synthetic tests.
+    """
+
+    mock_cap = MagicMock()
+    mock_cap.isOpened.return_value = True
+    mock_cap.read.return_value = (
+        True,
+        frame if frame is not None else make_synthetic_frame(),
+    )
+    selection = CameraSelection(
+        device_id=0,
+        backend=None,
+        source="test_fixture",
+        device_name="Synthetic Camera",
+    )
+    return mock_cap, selection
 
 
 # =============================================================================
@@ -210,10 +239,8 @@ class TestFaceTracker:
         tracker = FaceTracker()
         mock_landmarker = self._make_mock_landmarker()
         stub_mp = MagicMock()
-        stub_mp.tasks.vision.FaceLandmarker.create_from_options.return_value = (
-            mock_landmarker
-        )
-        with patch.object(tracker, '_model_path') as mock_path:
+        stub_mp.tasks.vision.FaceLandmarker.create_from_options.return_value = mock_landmarker
+        with patch.object(tracker, "_model_path") as mock_path:
             mock_path.exists.return_value = True
             with patch(
                 "cortex.services.capture_service.face_tracker._ensure_mediapipe",
@@ -309,9 +336,7 @@ class TestFaceTracker:
 
         # Simulate reacquire by calling _process_detected_face
         # Create fake landmarks (new Tasks API format: list of landmark objects)
-        fake_landmarks = [
-            MagicMock(x=0.5, y=0.5, z=0.03) for _ in range(478)
-        ]
+        fake_landmarks = [MagicMock(x=0.5, y=0.5, z=0.03) for _ in range(478)]
         result = tracker._process_detected_face(fake_landmarks, 480, 640)
 
         assert result.face_detected is True
@@ -490,12 +515,11 @@ class TestWebcamCapture:
         config = CaptureConfig(device_id=0, fps=30)
         capture = WebcamCapture(config)
 
-        with patch("cortex.services.capture_service.webcam.cv2.VideoCapture") as MockCap:
-            mock_cap = MagicMock()
-            mock_cap.isOpened.return_value = True
-            mock_cap.read.return_value = (True, make_synthetic_frame())
-            MockCap.return_value = mock_cap
-
+        mock_cap, selection = make_opened_mock_camera()
+        with patch(
+            "cortex.services.capture_service.webcam.open_video_capture",
+            return_value=(mock_cap, selection),
+        ):
             await capture.start()
             assert capture.is_running
 
@@ -511,12 +535,14 @@ class TestWebcamCapture:
         """Default camera selection should prefer the built-in macOS camera."""
         capture = WebcamCapture(CaptureConfig(device_id=None, fps=30))
 
-        with patch("cortex.services.capture_service.webcam.is_macos", return_value=True), \
-             patch(
-                 "cortex.services.capture_service.webcam._list_macos_video_device_names",
-                 return_value=["Logitech BRIO", "FaceTime HD Camera"],
-             ), \
-             patch("cortex.services.capture_service.webcam.cv2.VideoCapture") as MockCap:
+        with (
+            patch("cortex.services.capture_service.webcam.is_macos", return_value=True),
+            patch(
+                "cortex.services.capture_service.webcam._list_macos_video_device_names",
+                return_value=["Logitech BRIO", "FaceTime HD Camera"],
+            ),
+            patch("cortex.services.capture_service.webcam.cv2.VideoCapture") as MockCap,
+        ):
             mock_cap = MagicMock()
             mock_cap.isOpened.return_value = True
             mock_cap.read.return_value = (True, make_synthetic_frame())
@@ -533,11 +559,10 @@ class TestWebcamCapture:
         """Start should raise RuntimeError if camera can't be opened."""
         capture = WebcamCapture()
 
-        with patch("cortex.services.capture_service.webcam.cv2.VideoCapture") as MockCap:
-            mock_cap = MagicMock()
-            mock_cap.isOpened.return_value = False
-            MockCap.return_value = mock_cap
-
+        with patch(
+            "cortex.services.capture_service.webcam.open_video_capture",
+            return_value=(None, None),
+        ):
             with pytest.raises(RuntimeError, match="Cannot open webcam"):
                 await capture.start()
 
@@ -548,12 +573,11 @@ class TestWebcamCapture:
         capture = WebcamCapture(config)
 
         synthetic = make_synthetic_frame()
-        with patch("cortex.services.capture_service.webcam.cv2.VideoCapture") as MockCap:
-            mock_cap = MagicMock()
-            mock_cap.isOpened.return_value = True
-            mock_cap.read.return_value = (True, synthetic)
-            MockCap.return_value = mock_cap
-
+        mock_cap, selection = make_opened_mock_camera(synthetic)
+        with patch(
+            "cortex.services.capture_service.webcam.open_video_capture",
+            return_value=(mock_cap, selection),
+        ):
             await capture.start()
             try:
                 frame = await capture.get_frame(timeout=1.0)
@@ -583,12 +607,11 @@ class TestWebcamCapture:
         """Calling start() twice should not error."""
         capture = WebcamCapture()
 
-        with patch("cortex.services.capture_service.webcam.cv2.VideoCapture") as MockCap:
-            mock_cap = MagicMock()
-            mock_cap.isOpened.return_value = True
-            mock_cap.read.return_value = (True, make_synthetic_frame())
-            MockCap.return_value = mock_cap
-
+        mock_cap, selection = make_opened_mock_camera()
+        with patch(
+            "cortex.services.capture_service.webcam.open_video_capture",
+            return_value=(mock_cap, selection),
+        ):
             await capture.start()
             await capture.start()  # Should be a no-op
             assert capture.is_running
@@ -605,12 +628,11 @@ class TestWebcamCapture:
         """Metrics (frames_captured, frames_dropped) should update."""
         capture = WebcamCapture(queue_maxsize=5)
 
-        with patch("cortex.services.capture_service.webcam.cv2.VideoCapture") as MockCap:
-            mock_cap = MagicMock()
-            mock_cap.isOpened.return_value = True
-            mock_cap.read.return_value = (True, make_synthetic_frame())
-            MockCap.return_value = mock_cap
-
+        mock_cap, selection = make_opened_mock_camera()
+        with patch(
+            "cortex.services.capture_service.webcam.open_video_capture",
+            return_value=(mock_cap, selection),
+        ):
             await capture.start()
             await asyncio.sleep(0.3)  # Let frames accumulate
             await capture.stop()

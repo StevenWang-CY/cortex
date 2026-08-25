@@ -43,14 +43,14 @@ jobs:
           version: ${{ env.UV_VERSION }}
           python-version: ${{ env.PYTHON_PRIMARY }}
           enable-cache: true
-      - uses: pnpm/action-setup@08c4be7e2e672a47d11bd04269e27e5f3e8529cb # v6.0.0
-        with:
-          version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: pnpm
-          cache-dependency-path: cortex/apps/browser_extension/pnpm-lock.yaml
+      - name: Activate exact pnpm without the action-setup version shim
+        run: |
+          corepack enable
+          corepack prepare "pnpm@${PNPM_VERSION}" --activate
+          test "$(pnpm --version)" = "${PNPM_VERSION}"
       - name: Install frozen dependency graphs
         run: |
           uv sync --project cortex --locked --extra codegen
@@ -72,14 +72,14 @@ jobs:
           version: ${{ env.UV_VERSION }}
           python-version: ${{ env.PYTHON_PRIMARY }}
           enable-cache: true
-      - uses: pnpm/action-setup@08c4be7e2e672a47d11bd04269e27e5f3e8529cb # v6.0.0
-        with:
-          version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: pnpm
-          cache-dependency-path: cortex/apps/browser_extension/pnpm-lock.yaml
+      - name: Activate exact pnpm without the action-setup version shim
+        run: |
+          corepack enable
+          corepack prepare "pnpm@${PNPM_VERSION}" --activate
+          test "$(pnpm --version)" = "${PNPM_VERSION}"
       - name: Install frozen dependency graphs
         run: |
           uv sync --project cortex --locked --extra dev --extra codegen
@@ -140,6 +140,8 @@ jobs:
           EXPECTED_ARCH: ${{ matrix.arch }}
           EXPECTED_PYTHON: ${{ matrix.python }}
         run: uv run --project cortex --locked python -c 'import platform, os; actual=(platform.python_version(), platform.machine()); expected=(os.environ["EXPECTED_PYTHON"], os.environ["EXPECTED_ARCH"]); assert actual == expected, (actual, expected)'
+      - name: Audit the resolved architecture-specific Python graph
+        run: uv run --project cortex --locked --extra dev pip-audit
       - name: Canonical Python gate
         run: ./cortex/scripts/run_python_gate.sh
 
@@ -176,14 +178,14 @@ jobs:
           version: ${{ env.UV_VERSION }}
           python-version: ${{ env.PYTHON_PRIMARY }}
           enable-cache: true
-      - uses: pnpm/action-setup@08c4be7e2e672a47d11bd04269e27e5f3e8529cb # v6.0.0
-        with:
-          version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: pnpm
-          cache-dependency-path: cortex/apps/browser_extension/pnpm-lock.yaml
+      - name: Activate exact pnpm without the action-setup version shim
+        run: |
+          corepack enable
+          corepack prepare "pnpm@${PNPM_VERSION}" --activate
+          test "$(pnpm --version)" = "${PNPM_VERSION}"
       - name: Install frozen Python/native and browser graphs
         run: |
           uv sync --project ../.. --locked

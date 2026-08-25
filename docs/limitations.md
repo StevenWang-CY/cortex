@@ -69,6 +69,12 @@ attest those external settings. See the [privacy disclosure](../cortex/docs/priv
 ## Platform, reliability, and release scope
 
 - Supported release target: macOS 13 or later, arm64 and x86_64 artifacts.
+  MediaPipe no longer publishes current Intel wheels, so the locked Intel
+  artifact uses the last compatible 0.10.21/NumPy 1.x branch. Architecture
+  parity is therefore test-gated, not assumed; both candidate artifacts still
+  require the physical validation protocol before public promotion. MediaPipe's
+  capped OpenCV contrib dependency is the sole `cv2` provider so wheel install
+  order cannot silently change the runtime OpenCV major.
 - Browser integration targets current Chrome/Edge MV3 behavior; browser
   updates, enterprise policy, service-worker suspension, and native-host
   installation can affect operation.
