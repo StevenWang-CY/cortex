@@ -33,9 +33,85 @@ and 216 Markdown link checks with no errors.
 
 Both local Python executions used arm64 hardware. The committed CI/release
 matrix assigns Python 3.12.13 to `macos-15-intel` and asserts `x86_64`; that
-runner result remains a remote release/CI gate, not locally fabricated evidence.
+runner result was still a remote release/CI gate at `47cf7dc`, not locally
+fabricated evidence.
 
 The signed/notarized installation matrix is intentionally not marked executed
 in this source log. Each release candidate must attach its own credentialed,
 hardware-specific record using the templates under
 [`docs/release/`](../docs/release/README.md).
+
+## Post-WP11 portability and evidence closure
+
+| Commit | Result |
+| --- | --- |
+| `1828741` | Bound the WP11 verification record to its immutable source commit |
+| `d529761` | Replaced the pnpm action version shim, made architecture-sensitive dependency/test paths portable, and kept release evidence optional-tool safe |
+| `d756645` | Added a fail-closed, architecture-scoped Intel Protobuf exception policy with expiry, source-boundary checks, and a real bundled-model smoke |
+| `94b9195` | Made the numerical path valid and strictly typed across NumPy 1.26 and 2.3, including SciPy trapezoidal integration and explicit OpenCV/array dtype boundaries |
+| `59e5d17` | Made wheel inputs VCS-aware and deterministic, with independent rejection of local logs, state databases, environment files, interpreter debris, and credential containers |
+
+The wheel correction follows
+[Hatch's documented file-selection semantics](https://hatch.pypa.io/dev/config/build/):
+ordinary explicit selection respects VCS ignores and gives `exclude` precedence,
+whereas forced directory inclusion recursively includes its contents. This
+distinction mattered because a Git-ignored native-host debug log existed in the
+developer workspace. The old force-inclusion map admitted it locally, producing
+281 members while clean hosted builders produced 280. The final source rewrite
+and verifier produce the same 280-member wheel locally and on both native hosted
+architectures.
+
+### Hosted diagnostic sequence
+
+The failed runs below are retained as diagnostic evidence rather than hidden:
+
+1. [Run 32851889271](https://github.com/StevenWang-CY/cortex/actions/runs/32851889271)
+   at `1828741` exposed three clean-run assumptions: the pnpm action selected a
+   newer parser incompatible with the committed pnpm-9 lock, the dependency
+   graph requested a MediaPipe release without an Intel wheel, and macOS
+   camera/release tests leaked host-specific optional-tool assumptions.
+2. [Run 32859665250](https://github.com/StevenWang-CY/cortex/actions/runs/32859665250)
+   at `d529761` passed six jobs and then correctly surfaced
+   `PYSEC-2026-1805` in the last Intel-compatible Protobuf graph. It was not
+   suppressed globally: `d756645` introduced an exact package/advisory/path,
+   severity, architecture, reason, mitigation, and 2026-09-22 expiry contract.
+3. [Run 32861740878](https://github.com/StevenWang-CY/cortex/actions/runs/32861740878)
+   at `d756645` proved the scoped audit policy but exposed 33 NumPy-1.26 typing
+   errors in the Intel canonical gate. Exact local Intel reproduction also
+   established that the NumPy-2-only `np.trapezoid` runtime call was unavailable.
+4. [Run 32864342288](https://github.com/StevenWang-CY/cortex/actions/runs/32864342288)
+   at `94b9195` passed all seven jobs on both native architectures. Comparing its
+   280-file hosted wheels with the 281-file local wheel then exposed the ignored
+   debug-log inclusion described above.
+5. [Run 32866469753](https://github.com/StevenWang-CY/cortex/actions/runs/32866469753)
+   at `59e5d17a5d7fd4747395117f58a0c787cc6309c6` is the final source proof: all
+   seven jobs passed, including dependency policy, repository/link/schema
+   contracts, replay regression, browser and editor gates, and both native
+   Python architecture rows.
+
+### Final software evidence
+
+- arm64/Python 3.11.15 resolved MediaPipe 0.10.35, NumPy 2.3.5, and Protobuf
+  7.36.0; the architecture audit found zero known vulnerabilities.
+- x86_64/Python 3.12.13 resolved MediaPipe 0.10.21, NumPy 1.26.4, and Protobuf
+  4.25.9; its one finding matched only the reviewed `PYSEC-2026-1805` exception,
+  and the exception verifier reported `pass` after the real model/source-boundary
+  tests ran in the canonical gate.
+- Each native row passed Ruff, strict mypy over 511 source files, a 280-file
+  wheel inspection, 2,560 non-Qt tests with 3 declared skips, and 62 isolated
+  Qt tests. Both builders produced the byte-identical wheel SHA-256
+  `eee56574ab13837cad507719e7a6f38c015ee2131f553c7501a3d73b60154a97`.
+- Browser TypeScript, 248 Vitest tests, Chrome/Edge MV3 production builds,
+  editor compile/30 Jest tests/VSIX packaging, all four replay-regression
+  metrics, schema drift, configuration/version/design-token contracts, and
+  Markdown link checks passed in the same immutable run.
+
+### Evidence that remains external
+
+No source or hosted CI run is represented as a signed release candidate. Apple
+Developer ID signing/notarization credentials, the clean-profile arm64/Intel
+14-case TCC/camera/browser/editor/stop/restore matrix, independent release
+review, reference-sensor/participant validation, and independent statistical
+review remain mandatory external gates. The Intel Protobuf exception must be
+replaced by a patched compatible backend or Intel support must be removed before
+its 2026-09-22 expiry; expiry causes CI/release failure by design.

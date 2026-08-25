@@ -57,13 +57,22 @@ style-only checklist.
 
 ### 0.1 Verification snapshot
 
-The final working tree was exercised with locked dependencies:
+The release-relevant source at `59e5d17a5d7fd4747395117f58a0c787cc6309c6`
+passed all seven jobs in the
+[final dual-architecture CI run](https://github.com/StevenWang-CY/cortex/actions/runs/32866469753)
+with locked dependencies:
 
-- Python 3.11.15 and 3.12.13: Ruff, strict mypy over 510 source files,
-  a verified 281-file wheel, 2,548 non-Qt tests passed with 3 declared skips, and
-  62 isolated Qt tests passed on each interpreter. The local 3.12 execution was
-  arm64; CI and release contracts require the 3.12.13 row on x86_64 and assert
-  both exact interpreter and architecture.
+- Native arm64/Python 3.11.15 and x86_64/Python 3.12.13: exact interpreter and
+  CPU assertions, architecture-specific dependency audits, Ruff, strict mypy
+  over 511 source files, a verified 280-file wheel, 2,560 non-Qt tests passed
+  with 3 declared skips, and 62 isolated Qt tests passed on each architecture.
+- Reproducible artifact surface: local arm64, local Rosetta x86_64, hosted
+  arm64, and hosted Intel builds all produced the same 280 runtime members;
+  both hosted native builders produced the byte-identical wheel SHA-256
+  `eee56574ab13837cad507719e7a6f38c015ee2131f553c7501a3d73b60154a97`.
+  Wheel selection respects VCS ignores and explicit sensitive-artifact
+  exclusions, while the independent archive verifier rejects environment
+  files, logs, databases, interpreter debris, and credential/key containers.
 - Browser: a clean pnpm 9.15.9 frozen install, TypeScript check, 248 Vitest
   tests, and Chrome/Edge MV3 production builds.
 - VS Code: clean `npm ci`, TypeScript compile, 30 Jest tests, zero npm audit
@@ -71,14 +80,14 @@ The final working tree was exercised with locked dependencies:
 - Contracts/evaluation: generated Python→TypeScript schemas, design tokens,
   versions, configuration docs, 203-setting reachability, local Markdown links,
   workflow action/tool pins, and all four committed replay-regression metrics.
-- Dependency policy: zero known Python findings on the maintained dependency
-  branch and zero VS Code findings; 11 browser build/test-chain advisories are
-  path-constrained, expiry-bounded, reviewed exceptions after patchable
-  critical/high transitive versions were lifted. The Intel-only MediaPipe
-  compatibility graph has one separately reviewed
-  Protobuf `ParseDict` denial-of-service exception through 2026-09-22; Cortex
-  and the installed MediaPipe Python sources do not import that JSON parser,
-  and CI loads and runs the real bundled model before accepting the exception.
+- Dependency policy: the arm64 graph has zero known Python findings and VS Code
+  has zero findings; 11 browser build/test-chain advisories are path-constrained,
+  expiry-bounded, reviewed exceptions after patchable critical/high transitive
+  versions were lifted. The Intel-only MediaPipe 0.10.21/NumPy 1.26.4 graph has
+  one separately reviewed Protobuf 4.25.9 `ParseDict` denial-of-service exception
+  through 2026-09-22; Cortex and the installed MediaPipe Python sources do not
+  import that JSON parser, and CI loads and runs the real bundled model before
+  accepting the exception.
 
 No signed DMG, Apple notarization response, physical camera/TCC matrix,
 reference-sensor dataset, participant study, penetration test, or independent
