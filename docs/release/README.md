@@ -73,9 +73,9 @@ For each architecture, the tag workflow:
 5. submits to Apple with `notarytool --wait`, requires `Accepted`, captures the
    request log, staples, and validates the ticket;
 6. verifies DMG integrity, mounts read-only, validates bundle ID/version/minimum
-   OS/single architecture/signature, scans credentials and absolute
-   home-directory markers, and runs `Cortex --release-smoke` before any
-   UI/network/camera;
+   OS/single architecture/signature, scans complete high-confidence credential
+   forms and the actual non-generic build home roots, and runs
+   `Cortex --release-smoke` before any UI/network/camera;
 7. generates application SPDX and locked-Python CycloneDX SBOMs,
    architecture-specific `SHA256SUMS-<arch>`, `release-metadata.json`, and
    command evidence;
@@ -88,7 +88,7 @@ Run the same artifact verifier locally:
 
 ```bash
 uv run --project cortex --locked python -m cortex.scripts.verify_macos_release \
-  dist/Cortex-0.3.1-macos-arm64.dmg \
+  dist/Cortex-0.3.2-macos-arm64.dmg \
   --expected-arch arm64 \
   --require-notarized \
   --output dist/evidence-arm64/release-verification.json
@@ -102,11 +102,11 @@ the checksum file before running:
 
 ```bash
 shasum -a 256 -c SHA256SUMS-arm64
-gh attestation verify Cortex-0.3.1-macos-arm64.dmg \
+gh attestation verify Cortex-0.3.2-macos-arm64.dmg \
   --repo StevenWang-CY/cortex
-xcrun stapler validate Cortex-0.3.1-macos-arm64.dmg
+xcrun stapler validate Cortex-0.3.2-macos-arm64.dmg
 spctl -a -vv --type open --context context:primary-signature \
-  Cortex-0.3.1-macos-arm64.dmg
+  Cortex-0.3.2-macos-arm64.dmg
 ```
 
 The checksum file covers the DMG, metadata, SBOMs, verifier output, and command
