@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import tomllib
 import zipfile
 from pathlib import Path
 
 import pytest
 
 from cortex.scripts.verify_python_artifact import REQUIRED_MEMBERS, verify_wheel
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _write_wheel(path: Path, members: set[str]) -> None:
@@ -39,6 +42,11 @@ def test_required_runtime_wheel_is_accepted(tmp_path: Path) -> None:
         "cortex/apps/browser_extension/background.ts",
         "cortex/services/__pycache__/runtime.pyc",
         "cortex/.env",
+        "cortex/.env.local",
+        "cortex/scripts/native_host_debug.log",
+        "cortex/scripts/notarization.key",
+        "cortex/scripts/APP_STORE_CONNECT.P8",
+        "cortex/storage/runtime.sqlite3",
     ],
 )
 def test_forbidden_wheel_members_are_rejected(
@@ -54,3 +62,24 @@ def test_forbidden_wheel_members_are_rejected(
     with pytest.raises(ValueError, match="forbidden source/artifacts"):
         verify_wheel(wheel)
 
+
+def test_wheel_build_excludes_machine_local_artifact_patterns() -> None:
+    config = tomllib.loads((_PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    wheel = config["tool"]["hatch"]["build"]["targets"]["wheel"]
+    assert "force-include" not in wheel
+    assert wheel["sources"] == {"": "cortex"}
+    excludes = set(wheel["exclude"])
+    assert {
+        "**/.env",
+        "**/.env.*",
+        "**/__pycache__/**",
+        "**/*.log",
+        "**/*.pem",
+        "**/*.key",
+        "**/*.p8",
+        "**/*.jks",
+        "**/*.keystore",
+        "**/*.db",
+        "**/*.sqlite",
+        "**/*.sqlite3",
+    } <= excludes

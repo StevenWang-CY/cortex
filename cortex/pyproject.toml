@@ -179,25 +179,59 @@ cortex-dev = "cortex.scripts.run_dev:main"
 cortex-capture = "cortex.scripts.run_capture:main"
 cortex-calibrate = "cortex.scripts.calibrate:main"
 
+[tool.hatch.build]
+# The source rewrite below adds the package prefix for distributable wheels.
+# Editable installs instead expose the repository root so ``import cortex``
+# resolves this project directory without relying on unsupported prefix-adding
+# behavior from the ``editables`` backend.
+dev-mode-dirs = [".."]
+
 [tool.hatch.build.targets.wheel]
 # ``pyproject.toml`` lives inside the package directory in this repository,
 # rather than beside it. Explicit mappings avoid the former ``cortex/cortex``
 # lookup (which silently produced a metadata-only wheel) and keep browser/
 # editor source trees and tests out of the Python artifact.
+#
+# Use ordinary explicit selection so Hatch respects both VCS ignores and the
+# denylist below. ``force-include`` recursively admits ignored files and made a
+# developer-only native-host log alter local wheel contents. The source rewrite
+# restores the required ``cortex/`` package prefix without that bypass.
+only-include = [
+    "__init__.py",
+    "_version.py",
+    "application",
+    "apps/__init__.py",
+    "apps/desktop_shell",
+    "assets/audio",
+    "assets/logo.svg",
+    "libs",
+    "models",
+    "scripts",
+    "services",
+    "storage",
+]
+exclude = [
+    "**/.DS_Store",
+    "**/.env",
+    "**/.env.*",
+    "**/__pycache__/**",
+    "**/*.pyc",
+    "**/*.pyo",
+    "**/*.log",
+    "**/*.pem",
+    "**/*.key",
+    "**/*.p8",
+    "**/*.p12",
+    "**/*.pfx",
+    "**/*.jks",
+    "**/*.keystore",
+    "**/*.db",
+    "**/*.sqlite",
+    "**/*.sqlite3",
+]
 
-[tool.hatch.build.targets.wheel.force-include]
-"__init__.py" = "cortex/__init__.py"
-"_version.py" = "cortex/_version.py"
-"application" = "cortex/application"
-"apps/__init__.py" = "cortex/apps/__init__.py"
-"apps/desktop_shell" = "cortex/apps/desktop_shell"
-"assets/audio" = "cortex/assets/audio"
-"assets/logo.svg" = "cortex/assets/logo.svg"
-"libs" = "cortex/libs"
-"models" = "cortex/models"
-"scripts" = "cortex/scripts"
-"services" = "cortex/services"
-"storage" = "cortex/storage"
+[tool.hatch.build.targets.wheel.sources]
+"" = "cortex"
 
 [tool.pytest.ini_options]
 minversion = "8.0"

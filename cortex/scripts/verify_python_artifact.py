@@ -29,6 +29,33 @@ FORBIDDEN_PREFIXES = (
     "cortex/apps/browser_extension/",
     "cortex/apps/vscode_extension/",
 )
+FORBIDDEN_BASENAMES = frozenset({".ds_store", ".env"})
+FORBIDDEN_SUFFIXES = (
+    ".pyc",
+    ".pyo",
+    ".log",
+    ".pem",
+    ".key",
+    ".p8",
+    ".p12",
+    ".pfx",
+    ".jks",
+    ".keystore",
+    ".db",
+    ".sqlite",
+    ".sqlite3",
+)
+
+
+def _is_forbidden_member(name: str) -> bool:
+    basename = name.rsplit("/", maxsplit=1)[-1].casefold()
+    return (
+        name.startswith(FORBIDDEN_PREFIXES)
+        or basename in FORBIDDEN_BASENAMES
+        or basename.startswith(".env.")
+        or basename.endswith(FORBIDDEN_SUFFIXES)
+        or "/__pycache__/" in name
+    )
 
 
 def verify_wheel(path: Path) -> tuple[int, int]:
@@ -45,9 +72,7 @@ def verify_wheel(path: Path) -> tuple[int, int]:
     forbidden = sorted(
         name
         for name in names
-        if name.startswith(FORBIDDEN_PREFIXES)
-        or name.endswith((".pyc", ".DS_Store", ".env"))
-        or "/__pycache__/" in name
+        if _is_forbidden_member(name)
     )
     if forbidden:
         raise ValueError(f"wheel contains forbidden source/artifacts: {forbidden[:20]}")
