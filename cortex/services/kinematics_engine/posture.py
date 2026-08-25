@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -80,7 +81,7 @@ class PostureAnalyzer:
         )
 
     @staticmethod
-    def face_scale(face_landmarks_px: NDArray[np.floating]) -> float:
+    def face_scale(face_landmarks_px: NDArray[np.floating[Any]]) -> float:
         landmarks = np.asarray(face_landmarks_px, dtype=np.float64)
         if landmarks.ndim != 2 or landmarks.shape[1] < 2:
             raise ValueError("face landmarks must be an (N, 2+) array")

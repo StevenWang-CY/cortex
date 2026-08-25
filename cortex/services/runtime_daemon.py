@@ -24,6 +24,7 @@ from uuid import uuid4
 
 import numpy as np
 import uvicorn
+from numpy.typing import NDArray
 
 from cortex.application.clock import (
     SYSTEM_CLOCK,
@@ -353,7 +354,7 @@ def _emit_event(event: EventType, **fields: Any) -> None:
         logger.debug("structured event %s emit failed", event.value, exc_info=True)
 
 
-def _interpolate_nan_window(window: np.ndarray) -> np.ndarray:
+def _interpolate_nan_window(window: NDArray[np.float64]) -> NDArray[np.float64]:
     """Legacy bounded-input helper for a prevalidated rPPG RGB window.
 
     ``window`` is shape ``(N, C)``. The production path first applies the
@@ -2771,7 +2772,7 @@ class CortexDaemon:
         return await self._capture_pipeline.get_output(timeout=0.5)
 
     @property
-    def _rgb_history(self) -> deque[np.ndarray]:
+    def _rgb_history(self) -> deque[NDArray[np.float64]]:
         """Derived legacy view; the canonical store is one observation deque."""
 
         maxlen = max(1, self.config.signal.rppg.window_seconds * self.config.capture.fps)
@@ -3130,7 +3131,7 @@ class CortexDaemon:
 
         validity = str(observation.validity)
         missing_reason = observation.missing_reason
-        rgb_value: np.ndarray | None = None
+        rgb_value: NDArray[np.float64] | None = None
         head_jitter_deg = 0.0
         frame = getattr(output, "frame", None)
         landmarks_px = getattr(output, "landmarks_px", None)

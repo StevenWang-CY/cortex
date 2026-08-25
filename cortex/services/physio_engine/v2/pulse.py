@@ -411,10 +411,12 @@ class PulsePipelineV2:
             refined_index = float(index) + _quadratic_peak_offset(signal, int(index))
             absolute_ns = int(
                 round(
-                    np.interp(
-                        refined_index,
-                        np.arange(len(times), dtype=np.float64),
-                        times.astype(np.float64),
+                    float(
+                        np.interp(
+                            refined_index,
+                            np.arange(len(times), dtype=np.float64),
+                            times.astype(np.float64),
+                        )
                     )
                 )
             )

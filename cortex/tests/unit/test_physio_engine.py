@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 
 from cortex.libs.config.settings import LandmarksConfig
+from cortex.libs.signal.peak_detection import compute_lf_hf_ratio_lomb_scargle
 from cortex.services.physio_engine.pulse_estimator import PulseEstimate, PulseEstimator
 from cortex.services.physio_engine.quality_scorer import QualityScorer
 from cortex.services.physio_engine.roi_extractor import RoiExtractor, RoiTrace, RoiTraceFrame
@@ -594,6 +595,23 @@ def test_product_estimator_never_publishes_unvalidated_metrics() -> None:
     assert features.hrv_lf_hf_ratio is None
     assert features.hrv_sample_entropy is None
     assert features.respiration_rate_bpm is None
+
+
+def test_lf_hf_integration_is_numpy_1_and_2_compatible() -> None:
+    """The offline HRV research metric must run on both release graphs."""
+
+    sample = np.arange(120, dtype=np.float64)
+    ibi_ms = (
+        900.0
+        + 60.0 * np.sin(2.0 * np.pi * 0.10 * sample * 0.9)
+        + 30.0 * np.sin(2.0 * np.pi * 0.25 * sample * 0.9)
+    )
+
+    ratio = compute_lf_hf_ratio_lomb_scargle(ibi_ms)
+
+    assert ratio is not None
+    assert np.isfinite(ratio)
+    assert ratio > 0.0
 
 
 class TestParabolicInterpolation:

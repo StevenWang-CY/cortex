@@ -21,10 +21,12 @@ import logging
 from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from typing import cast
 from uuid import UUID, uuid4
 
 import cv2
 import numpy as np
+from numpy.typing import NDArray
 
 from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 from cortex.libs.config.settings import CaptureConfig, get_config
@@ -52,9 +54,9 @@ class PipelineOutput:
     """Output of the capture pipeline for downstream consumers."""
 
     frame_meta: FrameMeta
-    landmarks: np.ndarray | None  # (468, 3) normalized, or None
-    landmarks_px: np.ndarray | None  # (468, 2) pixel coords, or None
-    frame: np.ndarray | None  # BGR image (kept in memory only, never saved)
+    landmarks: NDArray[np.float32] | None  # (468, 3) normalized, or None
+    landmarks_px: NDArray[np.float32] | None  # (468, 2) pixel coords, or None
+    frame: NDArray[np.uint8] | None  # BGR image (kept in memory only, never saved)
     quality: FrameQuality
     tracking: FaceTrackingResult
     observation: CameraObservationEnvelope
@@ -446,8 +448,12 @@ class CapturePipeline:
         # would otherwise convert twice — once per metric). On an
         # M-series Mac at 30 Hz / 640×480 this halves the per-frame
         # cvtColor cost.
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        rgb_frame = cast(
+            NDArray[np.uint8], cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        )
+        gray_frame = cast(
+            NDArray[np.uint8], cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        )
 
         # Step 1: Face tracking
         tracking = self._face_tracker.process_frame(

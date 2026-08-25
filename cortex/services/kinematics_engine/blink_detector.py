@@ -11,6 +11,7 @@ import logging
 import math
 from collections import deque
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -120,7 +121,7 @@ class BlinkDetector:
         self._baseline_blink_rate = max(1.0, float(value))
 
     @staticmethod
-    def compute_ear(eye_landmarks: NDArray[np.floating]) -> float:
+    def compute_ear(eye_landmarks: NDArray[np.floating[Any]]) -> float:
         points = np.asarray(eye_landmarks, dtype=np.float64)
         if points.shape != (6, 2) or not bool(np.isfinite(points).all()):
             raise ValueError("eye landmarks must be a finite (6, 2) array")
@@ -134,7 +135,7 @@ class BlinkDetector:
 
     def update(
         self,
-        landmarks_px: NDArray[np.floating],
+        landmarks_px: NDArray[np.floating[Any]],
         timestamp: float,
     ) -> BlinkState:
         """Consume one valid eye-visible observation at monotonic seconds."""

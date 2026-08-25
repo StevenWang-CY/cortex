@@ -21,6 +21,7 @@ from typing import Literal
 from uuid import uuid4
 
 import numpy as np
+from numpy.typing import NDArray
 
 from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds, utc_datetime
 from cortex.libs.config.settings import CortexConfig, get_config
@@ -440,7 +441,7 @@ async def _collect_live_calibration(
             latest_lighting_ok = output.quality.brightness_score >= 0.2
             latest_motion_ok = output.quality.motion_score >= 0.3
             valid = latest_face_ok and output.frame is not None
-            rgb_value: np.ndarray | None = None
+            rgb_value: NDArray[np.float64] | None = None
             head_jitter_deg = 0.0
             if valid:
                 assert output.landmarks_px is not None

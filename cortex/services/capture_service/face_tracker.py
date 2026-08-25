@@ -18,10 +18,11 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import cv2
 import numpy as np
+from numpy.typing import NDArray
 
 from cortex.libs.config.settings import CaptureConfig
 
@@ -84,8 +85,8 @@ class FaceTrackingResult:
 
     face_detected: bool
     confidence: float  # 0.0 to 1.0
-    landmarks: np.ndarray | None  # (N, 3) normalized x,y,z or None
-    landmarks_px: np.ndarray | None  # (N, 2) pixel coordinates or None
+    landmarks: NDArray[np.float32] | None  # (N, 3) normalized x,y,z or None
+    landmarks_px: NDArray[np.float32] | None  # (N, 2) pixel coordinates or None
     bounding_box: BoundingBox | None
     face_stable: bool  # True if face has been consistently detected (hysteresis passed)
     # audit Phase-I: True when these landmarks are a byte-for-byte replay
@@ -138,7 +139,7 @@ class FaceTracker:
         self._last_face_seen_mono_ns: int | None = None
 
         # Previous landmarks for motion tracking
-        self._prev_landmarks_px: np.ndarray | None = None
+        self._prev_landmarks_px: NDArray[np.float32] | None = None
         self._prev_landmarks_mono_ns: int | None = None
         self._prev_face_width_px: float | None = None
 
@@ -212,8 +213,8 @@ class FaceTracker:
 
     def process_frame(
         self,
-        frame: np.ndarray,
-        rgb_frame: np.ndarray | None = None,
+        frame: NDArray[np.uint8],
+        rgb_frame: NDArray[np.uint8] | None = None,
         *,
         capture_mono_ns: int | None = None,
     ) -> FaceTrackingResult:
@@ -270,7 +271,9 @@ class FaceTracker:
         # cache) to avoid duplicating the cvtColor across detectors that
         # share the same frame.
         if rgb_frame is None:
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb_frame = cast(
+                NDArray[np.uint8], cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            )
         mp = _ensure_mediapipe()
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
@@ -473,7 +476,7 @@ class FaceTracker:
             return explicit
         return self._config.face_lost_tolerance_frames / max(1.0, float(self._config.fps))
 
-    def _compute_confidence(self, landmarks: np.ndarray) -> float:
+    def _compute_confidence(self, landmarks: NDArray[np.float32]) -> float:
         """
         Compute face detection confidence from landmark quality.
 
@@ -503,7 +506,9 @@ class FaceTracker:
         confidence = 0.6 * z_score + 0.4 * aspect_score
         return float(np.clip(confidence, 0.0, 1.0))
 
-    def compute_nose_tip_displacement(self, current_landmarks_px: np.ndarray) -> float:
+    def compute_nose_tip_displacement(
+        self, current_landmarks_px: NDArray[np.float32]
+    ) -> float:
         """
         Compute inter-frame nose tip displacement in pixels.
 
@@ -526,8 +531,8 @@ class FaceTracker:
         return displacement
 
     def get_landmark_subset(
-        self, landmarks: np.ndarray, indices: list[int]
-    ) -> np.ndarray:
+        self, landmarks: NDArray[np.float32], indices: list[int]
+    ) -> NDArray[np.float32]:
         """
         Extract a subset of landmarks by index.
 

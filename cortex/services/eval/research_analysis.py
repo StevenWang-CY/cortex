@@ -318,10 +318,10 @@ def _load_verified_export(path: str | Path) -> tuple[dict[str, Any], str]:
 
 
 def _wcls_fit(
-    treatment: np.ndarray,
-    probability: np.ndarray,
-    outcome: np.ndarray,
-    clusters: np.ndarray,
+    treatment: NDArray[np.float64],
+    probability: NDArray[np.float64],
+    outcome: NDArray[np.float64],
+    clusters: NDArray[np.generic],
 ) -> tuple[float, float | None]:
     centered = treatment - probability
     design = np.column_stack((np.ones_like(centered), centered))

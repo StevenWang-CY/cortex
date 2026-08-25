@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import cast
 
 import cv2
 import numpy as np
+from numpy.typing import NDArray
 
 from cortex.libs.config.settings import CaptureConfig
 from cortex.libs.schemas.observations import MissingReason
@@ -66,9 +68,9 @@ class FrameQualityScorer:
 
     def score(
         self,
-        frame: np.ndarray,
+        frame: NDArray[np.uint8],
         nose_displacement: float = 0.0,
-        gray_frame: np.ndarray | None = None,
+        gray_frame: NDArray[np.uint8] | None = None,
         *,
         motion_face_widths_per_second: float | None = None,
     ) -> FrameQuality:
@@ -93,7 +95,9 @@ class FrameQualityScorer:
         # ran cvtColor independently, doubling the conversion cost on
         # every frame.
         if gray_frame is None:
-            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray_frame = cast(
+                NDArray[np.uint8], cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            )
         brightness = self._score_brightness(gray_frame)
         blur = self._score_blur(gray_frame)
         motion = (
@@ -132,7 +136,7 @@ class FrameQualityScorer:
             return MissingReason.ARTIFACT
         return MissingReason.UNKNOWN
 
-    def _score_brightness(self, gray: np.ndarray) -> float:
+    def _score_brightness(self, gray: NDArray[np.uint8]) -> float:
         """
         Score frame brightness.
 
@@ -159,7 +163,7 @@ class FrameQualityScorer:
             distance_from_ideal = abs(mean_intensity - 128) / 128
             return 1.0 - 0.3 * distance_from_ideal
 
-    def _score_blur(self, gray: np.ndarray) -> float:
+    def _score_blur(self, gray: NDArray[np.uint8]) -> float:
         """
         Score frame sharpness using Laplacian variance.
 

@@ -243,7 +243,7 @@ def extract_bvp_green(
     # Zero-mean
     green -= np.mean(green)
 
-    return green
+    return np.asarray(green, dtype=np.float64)
 
 
 def extract_bvp(

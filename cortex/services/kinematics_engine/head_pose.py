@@ -6,6 +6,7 @@ import logging
 import math
 from collections import deque
 from dataclasses import dataclass
+from typing import Any
 
 import cv2
 import numpy as np
@@ -98,7 +99,7 @@ class HeadPoseEstimator:
 
     def update(
         self,
-        landmarks_px: NDArray[np.floating],
+        landmarks_px: NDArray[np.floating[Any]],
         timestamp: float,
     ) -> HeadPoseResult:
         now = self._validate_time(timestamp)

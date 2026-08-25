@@ -22,10 +22,12 @@ import threading
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
+from typing import cast
 from uuid import UUID, uuid4
 
 import cv2
 import numpy as np
+from numpy.typing import NDArray
 
 from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 from cortex.libs.config.settings import CaptureConfig
@@ -67,7 +69,7 @@ class CapturedFrame:
     production capture always supplies the complete tuple.
     """
 
-    frame: np.ndarray | None  # BGR uint8, shape (H, W, 3), or missing
+    frame: NDArray[np.uint8] | None  # BGR uint8, shape (H, W, 3), or missing
     timestamp: float  # UNIX epoch seconds (time.time()), to match FrameMeta.timestamp schema
     sequence: int  # monotonically increasing frame counter
     observed_at_unix_ms: int | None = None
@@ -950,7 +952,7 @@ class WebcamCapture:
 
                 # Create captured frame (wall-clock timestamp per schema).
                 captured = CapturedFrame(
-                    frame=frame,
+                    frame=cast(NDArray[np.uint8], frame),
                     timestamp=wall_ts,
                     sequence=sequence,
                     observed_at_unix_ms=event_time.observed_at_unix_ms,
