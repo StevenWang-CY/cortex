@@ -3469,6 +3469,8 @@ class WebSocketServer:
         stale = False
         capture_sequence: int | None = None
         store_degraded = False
+        store_backend: str | None = None
+        store_healthy: bool | None = None
         try:
             from cortex.services.api_gateway.app import registry as _registry
             frame_meta = _registry.get("latest_frame_meta")
@@ -3518,6 +3520,12 @@ class WebSocketServer:
             if frames_flowing:
                 stale = False
             store_degraded = bool(_registry.get("store_degraded") or False)
+            raw_backend = _registry.get("store_backend")
+            store_backend = str(raw_backend) if raw_backend is not None else None
+            raw_healthy = _registry.get("store_healthy")
+            store_healthy = (
+                bool(raw_healthy) if raw_healthy is not None else None
+            )
         except Exception:
             # Registry lookup is best-effort; never block a broadcast.
             logger.debug("registry lookup for capture/store status failed", exc_info=True)
@@ -3531,7 +3539,11 @@ class WebSocketServer:
         # B4 (Phase 4.1): expose the store degradation indicator on
         # every broadcast so a late-joining client still learns the
         # daemon is running on an in-memory store.
-        store_health = StoreHealth(degraded=store_degraded)
+        store_health = StoreHealth(
+            degraded=store_degraded,
+            backend=store_backend,
+            healthy=store_healthy,
+        )
 
         # ── Biometrics sub-payload (optional) ──────────────────────────
         # The producer omits the ``biometrics`` key entirely when the

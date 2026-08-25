@@ -78,7 +78,10 @@ class ResolvedBackend:
 def _implementation_sha256(definition: BackendDefinition) -> str:
     """Hash executable code, dependencies declared by the backend, and defaults."""
 
-    functions = (definition.extractor, *definition.implementation_components)
+    functions: tuple[Callable[..., object], ...] = (
+        definition.extractor,
+        *definition.implementation_components,
+    )
     return code_sha256(functions)
 
 

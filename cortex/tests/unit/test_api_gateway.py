@@ -17,15 +17,21 @@ from __future__ import annotations
 import asyncio
 import json
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
 
+from cortex.application.clock import FakeClock
 from cortex.libs.schemas.intervention import InterventionPlan
 from cortex.libs.schemas.state import (
     SignalQuality,
     StateEstimate,
     StateScores,
+)
+from cortex.libs.schemas.storage import (
+    StorageExportResponse,
+    StorageHealthReport,
 )
 from cortex.services.api_gateway.app import ServiceRegistry, create_app, registry
 from cortex.services.api_gateway.websocket_server import (
@@ -40,6 +46,45 @@ from cortex.services.intervention_engine.restore import RestoreManager
 # =============================================================================
 # Fixtures
 # =============================================================================
+
+
+class _StorageMaintenanceStub:
+    retention_days = {"sessions": 7, "policy": 90, "interventions": 90}
+
+    def __init__(self) -> None:
+        self.clock = FakeClock(
+            wall_unix_ms=1_800_000_000_000,
+            mono_ns=5_000,
+            _boot_id=UUID("00000000-0000-0000-0000-000000000808"),
+        )
+
+    async def health(self) -> StorageHealthReport:
+        return StorageHealthReport(
+            healthy=True,
+            degraded=False,
+            journal_mode="delete",
+            synchronous="full",
+            foreign_keys=True,
+            schema_version=1,
+            sqlite_version="3.45.0",
+            database_filename="cortex.sqlite3",
+            database_bytes=4096,
+            pending_operations=0,
+            record_counts={"sessions": 1},
+        )
+
+    async def export(self, _categories: object) -> StorageExportResponse:
+        return StorageExportResponse.from_clock(
+            self.clock,
+            export_id=UUID("00000000-0000-0000-0000-000000000809"),
+            filename="cortex-export-test.json",
+            sha256="a" * 64,
+            bytes_written=128,
+            record_counts={"sessions": 1},
+        )
+
+    async def delete(self, _scopes: object) -> tuple[dict[str, int], bool]:
+        return {"sessions": 1, "projection_files": 2}, True
 
 
 @pytest.fixture(autouse=True)
@@ -66,9 +111,7 @@ def client(tmp_path, monkeypatch) -> TestClient:
     from cortex.libs.auth.local_token import load_or_create_token
 
     token_file = tmp_path / "auth.token"
-    monkeypatch.setattr(
-        "cortex.libs.auth.local_token.auth_token_path", lambda: token_file
-    )
+    monkeypatch.setattr("cortex.libs.auth.local_token.auth_token_path", lambda: token_file)
     token = load_or_create_token(token_file)
     app = create_app()
     with TestClient(app) as c:
@@ -240,6 +283,49 @@ class TestHealthEndpoint:
         assert "capture" in data["services"]
         assert "physio" in data["services"]
 
+    def test_storage_health_status_export_and_confirmed_delete(
+        self,
+        client: TestClient,
+    ) -> None:
+        registry.register("storage_maintenance", _StorageMaintenanceStub())
+
+        health = client.get("/health")
+        assert health.status_code == 200
+        assert health.json()["storage"]["journal_mode"] == "delete"
+
+        status = client.get("/storage/status")
+        assert status.status_code == 200
+        assert status.json()["retention_days"]["sessions"] == 7
+        assert status.json()["storage"]["database_filename"] == "cortex.sqlite3"
+
+        exported = client.post(
+            "/storage/export",
+            json={"categories": ["sessions"]},
+        )
+        assert exported.status_code == 200
+        assert exported.json()["sha256"] == "a" * 64
+        assert exported.json()["record_counts"] == {"sessions": 1}
+
+        unconfirmed = client.post(
+            "/storage/delete",
+            json={"scopes": ["sessions"], "confirmation": "delete"},
+        )
+        assert unconfirmed.status_code == 422
+
+        deleted = client.post(
+            "/storage/delete",
+            json={
+                "scopes": ["sessions"],
+                "confirmation": "DELETE CORTEX DATA",
+            },
+        )
+        assert deleted.status_code == 200
+        assert deleted.json()["deleted_counts"] == {
+            "sessions": 1,
+            "projection_files": 2,
+        }
+        assert deleted.json()["vacuumed"] is True
+
 
 class TestStatusEndpoint:
     """Test /status/current endpoint."""
@@ -355,9 +441,7 @@ class TestStateInferEndpoint:
         # actionable state from one sample.
         assert data["source"] == "rules"
         est = data["estimate"]
-        assert est["status"] in (
-            "warming_up", "insufficient_evidence", "estimated"
-        )
+        assert est["status"] in ("warming_up", "insufficient_evidence", "estimated")
         if est["status"] != "estimated":
             assert est["state"] == "UNKNOWN"
             assert est["support_state"] == "unknown"
@@ -431,6 +515,7 @@ class TestContextAndLLMEndpoints:
         (``metadata.source == 'fallback'``), the HTTP route must report
         ``fallback_used=True`` — pre-fix it hard-coded False on every
         production branch, masking the degradation from the caller."""
+
         class FallbackLLMClient:
             async def generate_intervention_plan(self, context, state):
                 return InterventionPlan(
@@ -463,6 +548,7 @@ class TestContextAndLLMEndpoints:
         """Finding #6: a planner client that RAISES must not surface an
         unhandled 500. The route maps it to the deterministic-fallback
         envelope (``plan=None``, ``fallback_used=True``)."""
+
         class RaisingLLMClient:
             async def generate_intervention_plan(self, context, state):
                 raise RuntimeError("anthropic SDK exploded")
@@ -577,7 +663,8 @@ class TestInterventionEndpoints:
         assert data["restored"] is False
 
     def test_legacy_apply_cannot_bypass_transaction_authority(
-        self, client: TestClient,
+        self,
+        client: TestClient,
     ):
         class OverlayAdapter:
             async def execute(self, action: str, params: dict) -> bool:
@@ -614,7 +701,8 @@ class TestInterventionEndpoints:
         assert restore_manager.active_count == 0
 
     def test_legacy_restore_manager_cannot_bypass_daemon_transactions(
-        self, client: TestClient,
+        self,
+        client: TestClient,
     ):
         class OverlayAdapter:
             async def execute(self, action: str, params: dict) -> bool:
@@ -657,13 +745,16 @@ class TestInterventionEndpoints:
         assert restore_manager.active_count == 0
 
     def test_restore_prefers_daemon_transaction_boundary(
-        self, client: TestClient,
+        self,
+        client: TestClient,
     ) -> None:
         calls: list[tuple[str, str]] = []
 
         class _Daemon:
             async def restore_intervention(
-                self, intervention_id: str, user_action: str,
+                self,
+                intervention_id: str,
+                user_action: str,
             ) -> None:
                 calls.append((intervention_id, user_action))
                 return None
@@ -678,13 +769,17 @@ class TestInterventionEndpoints:
         assert calls == [("int_exact", "dismissed")]
 
     def test_emergency_restore_all_reports_verified_summary(
-        self, client: TestClient,
+        self,
+        client: TestClient,
     ) -> None:
         calls: list[tuple[str, float]] = []
 
         class _Daemon:
             async def restore_all_transactional_effects(
-                self, *, reason: str, timeout_seconds: float,
+                self,
+                *,
+                reason: str,
+                timeout_seconds: float,
             ) -> dict[str, int]:
                 calls.append((reason, timeout_seconds))
                 return {
@@ -705,7 +800,8 @@ class TestInterventionEndpoints:
         assert calls == [("emergency_restore", 3.0)]
 
     def test_emergency_restore_all_fails_closed_without_daemon(
-        self, client: TestClient,
+        self,
+        client: TestClient,
     ) -> None:
         response = client.post("/intervention/restore-all")
         assert response.status_code == 200
@@ -735,12 +831,14 @@ class TestWSMessage:
         assert parsed["sequence"] == 1
 
     def test_from_json(self):
-        raw = json.dumps({
-            "type": "USER_ACTION",
-            "payload": {"action": "dismissed", "intervention_id": "int_123"},
-            "timestamp": 100.0,
-            "sequence": 5,
-        })
+        raw = json.dumps(
+            {
+                "type": "USER_ACTION",
+                "payload": {"action": "dismissed", "intervention_id": "int_123"},
+                "timestamp": 100.0,
+                "sequence": 5,
+            }
+        )
         msg = WSMessage.from_json(raw)
         assert msg.type == "USER_ACTION"
         assert msg.payload["action"] == "dismissed"
@@ -928,6 +1026,7 @@ class TestConsentEndpoints:
     def test_get_consent_level_with_ladder(self, client: TestClient):
         from cortex.services.consent.ladder import ConsentLadder
         from cortex.services.consent.policy import ConsentPolicy
+
         ladder = ConsentLadder(policy=ConsentPolicy(), store=None)
         registry.register("consent_ladder", ladder)
 
@@ -935,6 +1034,7 @@ class TestConsentEndpoints:
         # F24 made ConsentLadder methods async — use ``asyncio.run`` rather
         # than ``get_event_loop`` so Python 3.10+ does not raise.
         import asyncio
+
         asyncio.run(ladder.check("close_tab"))
 
         resp = client.get("/consent/level")
@@ -952,6 +1052,7 @@ class TestConsentEndpoints:
     def test_reset_consent_with_ladder(self, client: TestClient):
         from cortex.services.consent.ladder import ConsentLadder
         from cortex.services.consent.policy import ConsentPolicy
+
         ladder = ConsentLadder(policy=ConsentPolicy(), store=None)
         registry.register("consent_ladder", ladder)
 
@@ -960,6 +1061,7 @@ class TestConsentEndpoints:
         async def _prime() -> None:
             for _ in range(5):
                 await ladder.record_approval("close_tab")
+
         asyncio.run(_prime())
 
         # Reset
@@ -970,7 +1072,8 @@ class TestConsentEndpoints:
         assert data["levels"] == {}  # All states cleared after reset
 
     def test_reset_consent_requests_exact_global_restore(
-        self, client: TestClient,
+        self,
+        client: TestClient,
     ) -> None:
         from cortex.services.consent.ladder import ConsentLadder
         from cortex.services.consent.policy import ConsentPolicy
@@ -979,7 +1082,10 @@ class TestConsentEndpoints:
 
         class _Daemon:
             async def restore_all_transactional_effects(
-                self, *, reason: str, timeout_seconds: float,
+                self,
+                *,
+                reason: str,
+                timeout_seconds: float,
             ) -> dict[str, int]:
                 calls.append((reason, timeout_seconds))
                 return {
@@ -1011,10 +1117,12 @@ class TestAPIGatewayImports:
 
     def test_import_create_app(self):
         from cortex.services.api_gateway import create_app
+
         assert create_app is not None
 
     def test_import_registry(self):
         from cortex.services.api_gateway import ServiceRegistry, registry
+
         assert ServiceRegistry is not None
         assert registry is not None
 

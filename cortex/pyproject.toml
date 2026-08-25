@@ -163,7 +163,24 @@ cortex-capture = "cortex.scripts.run_capture:main"
 cortex-calibrate = "cortex.scripts.calibrate:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["cortex"]
+# ``pyproject.toml`` lives inside the package directory in this repository,
+# rather than beside it. Explicit mappings avoid the former ``cortex/cortex``
+# lookup (which silently produced a metadata-only wheel) and keep browser/
+# editor source trees and tests out of the Python artifact.
+
+[tool.hatch.build.targets.wheel.force-include]
+"__init__.py" = "cortex/__init__.py"
+"_version.py" = "cortex/_version.py"
+"application" = "cortex/application"
+"apps/__init__.py" = "cortex/apps/__init__.py"
+"apps/desktop_shell" = "cortex/apps/desktop_shell"
+"assets/audio" = "cortex/assets/audio"
+"assets/logo.svg" = "cortex/assets/logo.svg"
+"libs" = "cortex/libs"
+"models" = "cortex/models"
+"scripts" = "cortex/scripts"
+"services" = "cortex/services"
+"storage" = "cortex/storage"
 
 [tool.pytest.ini_options]
 minversion = "8.0"

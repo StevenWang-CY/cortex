@@ -532,10 +532,8 @@ class CaptureStatus(BaseModel):
 class StoreHealth(BaseModel):
     """Persistence-layer health indicator surfaced on every STATE_UPDATE.
 
-    The desktop dashboard uses ``degraded`` to render an in-memory
-    "you'll lose state on restart" hint when Redis is unavailable; the
-    DMG default deployment now uses :func:`make_default_store` so this
-    flag is only True when both Redis is configured AND unreachable.
+    The desktop dashboard uses ``degraded`` to render a durable-storage
+    warning. WP7's shipped backend is rollback-journal SQLite.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -543,15 +541,14 @@ class StoreHealth(BaseModel):
     degraded: bool = Field(
         False,
         description=(
-            "True when the daemon is running on the InMemoryStore "
-            "fallback (intended Redis unreachable). The dashboard uses "
-            "this to surface a soft 'no Redis' hint."
+            "True when the authoritative local database is unavailable or "
+            "failed its integrity/durability checks."
         ),
     )
     backend: str | None = Field(
         None,
         description=(
-            "Backend identifier (``redis`` / ``in_memory``). Optional — "
+            "Backend identifier (normally ``sqlite``). Optional — "
             "present when the daemon plants it in the registry; None "
             "otherwise."
         ),

@@ -291,6 +291,10 @@ jobs:
         # dropped and the gate reports false errors. Kept byte-identical
         # with release.yml's pre-release gate.
         run: mypy --config-file cortex/pyproject.toml cortex/ --strict
+      - name: Build and verify installable Python wheel
+        run: |
+          python -m pip wheel --no-deps ./cortex --wheel-dir python-artifact
+          python cortex/scripts/verify_python_artifact.py python-artifact/cortex-*.whl
       - name: Test (pytest)
         # ci-pytest-split (audit): a single ``pytest cortex/tests/``
         # SEGFAULTs during collection because PySide6/shiboken loads

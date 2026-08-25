@@ -1661,6 +1661,31 @@ VSIX packaging.
 
 ### WP-7 — Transactional local storage (`L`)
 
+**Implementation status (2026-08-25): complete at the WP-7 boundary.** One
+current-user-only SQLite database now owns durable consent, intervention
+authority, calibration identity, minimal session aggregates, policy records,
+and bounded derived analytics. A single dedicated connection/thread enforces
+foreign keys, `STRICT` tables, `DELETE` rollback journaling,
+`synchronous=FULL`, checksummed forward migrations, full startup integrity and
+write probes, and fail-closed future-schema/corruption handling. Critical
+transactions await commit or rollback even under cancellation; best-effort
+analytics use a bounded non-blocking queue with explicit drop/failure counts.
+Legacy JSON/JSONL sources are byte-for-byte backed up, checksummed, imported
+idempotently, and retained as compatibility projections; malformed
+non-authority history is audibly skipped while malformed intervention
+authority fails closed. Authenticated status/export/confirmed-delete APIs,
+purpose-specific retention, active-effect deletion guards, exact projection
+and migration-backup cleanup, calibration reload, and restart recovery are
+wired through the runtime. Secrets remain in Keychain and opaque legacy keys
+are never migrated. The Python wheel and PyInstaller spec both ship the SQL
+migration; a new artifact gate prevents the former metadata-only wheel from
+recurring. Completion evidence: forced-termination hot-journal recovery,
+disk-full/read-only/corruption/permission/migration/backpressure tests; 2,501
+non-desktop Python tests with three declared skips and 62 isolated desktop
+tests; strict mypy across 484 files; Ruff, schema/version/design drift gates;
+208 browser tests plus Chrome/Edge builds; 30 VS Code tests, compile, and VSIX
+packaging; and an isolated built-wheel schema-creation smoke test.
+
 **Files:** new `cortex/storage/`; migrations from existing state files; health and settings endpoints; build spec/package resources
 
 **Changes:**
@@ -1971,7 +1996,7 @@ Move one cohesive flow at a time behind the kernel after characterization tests.
 - [x] P1-05 calibrated profile provenance and live reload
 - [x] P1-06 evidence-normalized inference with unknown state
 - [x] P1-07 manifest/authorization/receipt intervention protocol
-- [ ] P1-08 event store and restart recovery
+- [x] P1-08 event store and restart recovery
 - [ ] P1-09 deterministic production policy and one finalized reward
 - [ ] P1-10 privacy context preview/redaction and optional browser permissions
 

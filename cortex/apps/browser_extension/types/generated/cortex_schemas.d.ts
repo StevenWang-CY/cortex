@@ -3,7 +3,7 @@
 //
 // Source of truth: cortex/libs/schemas/*.py (Pydantic v2 models).
 // Schema package: cortex-wire/2.0
-// Source SHA-256: 825d9450d537b2a95dae213d854466b1d84f166ce8ed572957d022d0b626800a
+// Source SHA-256: 72cda90f3d373260fd16c06382c601d5e73104fa668af59d278f5f0faa85217e
 // Drift-gate: a pre-commit hook and the GitHub Actions CI run
 //   `python -m cortex.scripts.generate_ts_schemas --check`
 // and fail if this file is out of sync with the Python models.
@@ -1621,7 +1621,31 @@ export interface HealthResponse {
   duplicate_intervention_acks?: number;
   frames_dropped_total?: number;
   store_degraded?: boolean;
+  storage?: StorageHealthReport | null;
   feedback_log_read_failures?: number;
+}
+/**
+ * Path-redacted local database health exposed over loopback APIs.
+ */
+export interface StorageHealthReport {
+  healthy: boolean;
+  degraded: boolean;
+  backend?: "sqlite";
+  journal_mode: "delete" | "unavailable";
+  synchronous: "full" | "unsupported" | "unavailable";
+  foreign_keys: boolean;
+  schema_version: number;
+  sqlite_version: string;
+  database_filename: string;
+  database_bytes: number;
+  pending_operations: number;
+  analytics_queue_depth?: number;
+  analytics_dropped_total?: number;
+  last_integrity_check_unix_ms?: number | null;
+  error_code?: string | null;
+  record_counts?: {
+    [k: string]: number;
+  };
 }
 /**
  * Complete evaluation record for a single intervention.
@@ -3192,6 +3216,82 @@ export interface StopResponse {
   status: "stopped" | "error";
   error?: string | null;
 }
+export interface StorageDeleteRequest {
+  scopes: ("consent" | "interventions" | "policy" | "calibration" | "sessions" | "derived" | "analytics" | "all")[];
+  confirmation: "DELETE CORTEX DATA";
+}
+export interface StorageDeleteResponse {
+  schema_version?: "1.0" | "2.0";
+  observed_at_unix_ms?: number;
+  observed_at_mono_ns?: number;
+  boot_id?: string;
+  /**
+   * @deprecated
+   * Deprecated v1 compatibility mirror in UTC Unix seconds; never use it for elapsed-time decisions.
+   */
+  timestamp?: number | null;
+  deleted_counts: {
+    [k: string]: number;
+  };
+  vacuumed: boolean;
+}
+export interface StorageExportRequest {
+  categories?: ("consent" | "interventions" | "policy" | "calibration" | "sessions" | "derived")[];
+}
+export interface StorageExportResponse {
+  schema_version?: "1.0" | "2.0";
+  observed_at_unix_ms?: number;
+  observed_at_mono_ns?: number;
+  boot_id?: string;
+  /**
+   * @deprecated
+   * Deprecated v1 compatibility mirror in UTC Unix seconds; never use it for elapsed-time decisions.
+   */
+  timestamp?: number | null;
+  export_id: string;
+  filename: string;
+  sha256: string;
+  bytes_written: number;
+  record_counts: {
+    [k: string]: number;
+  };
+}
+export interface StorageStatusResponse {
+  schema_version?: "1.0" | "2.0";
+  observed_at_unix_ms?: number;
+  observed_at_mono_ns?: number;
+  boot_id?: string;
+  /**
+   * @deprecated
+   * Deprecated v1 compatibility mirror in UTC Unix seconds; never use it for elapsed-time decisions.
+   */
+  timestamp?: number | null;
+  storage: StorageHealthReport;
+  retention_days: {
+    [k: string]: number;
+  };
+  exports_directory_name?: string;
+}
+/**
+ * Bounded, content-addressed derived event accepted by the writer.
+ *
+ * Callers supply a canonical JSON string rather than an open dictionary so
+ * the exact persisted payload cannot change after queue admission.
+ */
+export interface StoredAnalyticsEvent {
+  schema_version?: "1.0";
+  event_id?: string;
+  event_type: string;
+  aggregate_type: string;
+  aggregate_id?: string | null;
+  occurred_at_unix_ms: number;
+  occurred_at_mono_ns: number;
+  boot_id: string;
+  privacy_class: "operational" | "derived" | "sensitive_derived";
+  payload_json: string;
+  payload_sha256: string;
+  expires_at_unix_ms: number;
+}
 export interface StressIntegralResponse {
   schema_version?: "1.0" | "2.0";
   observed_at_unix_ms?: number;
@@ -4560,11 +4660,11 @@ export interface CaptureStatus1 {
  */
 export interface StoreHealth {
   /**
-   * True when the daemon is running on the InMemoryStore fallback (intended Redis unreachable). The dashboard uses this to surface a soft 'no Redis' hint.
+   * True when the authoritative local database is unavailable or failed its integrity/durability checks.
    */
   degraded?: boolean;
   /**
-   * Backend identifier (``redis`` / ``in_memory``). Optional — present when the daemon plants it in the registry; None otherwise.
+   * Backend identifier (normally ``sqlite``). Optional — present when the daemon plants it in the registry; None otherwise.
    */
   backend?: string | null;
   /**
@@ -4588,18 +4688,16 @@ export interface StopFocusAutoPayload {
 /**
  * Persistence-layer health indicator surfaced on every STATE_UPDATE.
  *
- * The desktop dashboard uses ``degraded`` to render an in-memory
- * "you'll lose state on restart" hint when Redis is unavailable; the
- * DMG default deployment now uses :func:`make_default_store` so this
- * flag is only True when both Redis is configured AND unreachable.
+ * The desktop dashboard uses ``degraded`` to render a durable-storage
+ * warning. WP7's shipped backend is rollback-journal SQLite.
  */
 export interface StoreHealth1 {
   /**
-   * True when the daemon is running on the InMemoryStore fallback (intended Redis unreachable). The dashboard uses this to surface a soft 'no Redis' hint.
+   * True when the authoritative local database is unavailable or failed its integrity/durability checks.
    */
   degraded?: boolean;
   /**
-   * Backend identifier (``redis`` / ``in_memory``). Optional — present when the daemon plants it in the registry; None otherwise.
+   * Backend identifier (normally ``sqlite``). Optional — present when the daemon plants it in the registry; None otherwise.
    */
   backend?: string | null;
   /**

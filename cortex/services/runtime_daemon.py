@@ -45,6 +45,7 @@ from cortex.libs.logging.structured import (
 from cortex.libs.schemas.calibration import (
     CALIBRATION_FEATURE_SCHEMA_VERSION,
     CALIBRATION_PROTOCOL_VERSION,
+    ActiveCalibrationPointer,
     CalibrationMetricMaturity,
     CalibrationMetricName,
     CalibrationProfile,
@@ -94,7 +95,13 @@ from cortex.libs.schemas.temporal import EventTime
 from cortex.libs.schemas.ws_message_types import MessageType
 
 # v2.0 imports
-from cortex.libs.store import InMemoryStore, RedisStore, make_default_store
+from cortex.libs.store import (
+    InMemoryStore,
+    RedisStore,
+    SQLiteKeyValueStore,
+    default_legacy_store_path,
+    make_default_store,
+)
 from cortex.libs.utils import receptivity
 from cortex.services.activity_tracker.aggregator import ActivityAggregator
 from cortex.services.api_gateway.app import create_app, registry
@@ -154,7 +161,7 @@ from cortex.services.intervention_engine.transaction import (
     build_action_manifest,
 )
 from cortex.services.intervention_engine.transaction_store import (
-    JsonInterventionTransactionStore,
+    SQLiteInterventionTransactionStore,
 )
 from cortex.services.janitor.retention import (
     enforce_chronotype_retention,
@@ -187,6 +194,10 @@ from cortex.services.telemetry_engine.feature_aggregator import FeatureAggregato
 from cortex.services.telemetry_engine.input_hooks import InputHooks
 from cortex.services.telemetry_engine.window_tracker import WindowTracker
 from cortex.services.throttle.copilot_throttle import CopilotThrottle
+from cortex.storage import SQLiteDatabase
+from cortex.storage.event_writer import BoundedAnalyticsWriter
+from cortex.storage.legacy_migrator import LegacyDataMigrator
+from cortex.storage.maintenance import StorageMaintenance
 
 logger = logging.getLogger(__name__)
 
@@ -244,11 +255,7 @@ def _build_rgb_observation_buffer(
         float(config.signal.rppg.window_seconds),
         float(config.signal.rppg.respiration_window_seconds),
     )
-    max_age_seconds = (
-        window_seconds
-        + config.signal.rppg.max_interpolation_gap_ms / 1000.0
-        + 1.0
-    )
+    max_age_seconds = window_seconds + config.signal.rppg.max_interpolation_gap_ms / 1000.0 + 1.0
     return ObservationBuffer(
         max_age_seconds=max_age_seconds,
         max_items=max(
@@ -286,16 +293,14 @@ def _validate_runtime_calibration_profile(
         if algorithm_key is None or summary.value is None:
             continue
         if summary.algorithm != expected_algorithms[algorithm_key]:
-            raise ValueError(
-                "calibration algorithm identity is incompatible for "
-                f"{summary.metric}"
-            )
+            raise ValueError(f"calibration algorithm identity is incompatible for {summary.metric}")
 
 
 def _daemon_clock(owner: object) -> Clock:
     """Resolve the daemon clock at legacy unbound-method boundaries."""
 
     return clock_or_system(getattr(owner, "_clock", None))
+
 
 # C6 (audit): structured event sink. ``configure_logging`` (invoked once at
 # daemon startup, see ``start()``) wires the structlog processor chain; this
@@ -397,6 +402,7 @@ def _supervise_background_task(task: asyncio.Task[Any]) -> None:
         exc_info=exc,
     )
 
+
 # P0 §3.3: bound on the SESSION_RECAP broadcast inside ``stop()`` so a
 # stuck WS client (e.g. a dead browser tab that never reads its frame)
 # cannot deadlock the daemon shutdown.
@@ -418,9 +424,13 @@ _AUTO_FOCUS_DEBOUNCE_S: float = 30.0
 # ``storage/chronotype/daily/*.json``.
 _CHRONOTYPE_WINDOW_DAYS: int = 90
 
-_EXECUTION_MODES = frozenset({
-    "suggest_only", "authorized", "research_autonomous",
-})
+_EXECUTION_MODES = frozenset(
+    {
+        "suggest_only",
+        "authorized",
+        "research_autonomous",
+    }
+)
 
 
 def enforce_session_storage_budget(
@@ -474,14 +484,13 @@ def enforce_session_storage_budget(
             total -= size
             evicted += 1
         except OSError:
-            logger.warning(
-                "F36 storage budget: could not evict %s", path, exc_info=True
-            )
+            logger.warning("F36 storage budget: could not evict %s", path, exc_info=True)
     if evicted > 0:
         logger.info(
-            "F36 storage budget: evicted %d session(s) to make room for "
-            "%d-byte write (cap=%d MB)",
-            evicted, incoming_bytes, max_total_size_mb,
+            "F36 storage budget: evicted %d session(s) to make room for %d-byte write (cap=%d MB)",
+            evicted,
+            incoming_bytes,
+            max_total_size_mb,
         )
     return evicted
 
@@ -556,8 +565,8 @@ class SessionRecorder:
         # Bounded queue so a runaway producer can't exhaust memory; if
         # the writer thread falls behind by more than 4096 records we
         # drop the oldest and log so the data loss is observable.
-        self._queue: queue.Queue[tuple[str, dict[str, Any], float] | None] = (
-            queue.Queue(maxsize=4096)
+        self._queue: queue.Queue[tuple[str, dict[str, Any], float] | None] = queue.Queue(
+            maxsize=4096
         )
         self._stop_event = threading.Event()
         # B19 (Phase 4.1): consecutive-overflow tracker for the
@@ -696,6 +705,36 @@ class CortexDaemon:
     ) -> None:
         self.config = config or get_config()
         self._clock = clock or SYSTEM_CLOCK
+        storage_root = Path(self.config.storage.path).expanduser()
+        self._database = SQLiteDatabase(
+            storage_root / self.config.storage.sqlite_filename,
+            clock=self._clock,
+            busy_timeout_ms=int(getattr(self.config.storage, "sqlite_busy_timeout_ms", 5_000)),
+            backup_retention_count=int(getattr(self.config.storage, "backup_retention_count", 3)),
+        )
+        self._analytics_writer = BoundedAnalyticsWriter(
+            self._database,
+            capacity=self.config.storage.analytics_queue_capacity,
+        )
+        self._storage_maintenance = StorageMaintenance(
+            self._database,
+            storage_root=storage_root,
+            analytics_writer=self._analytics_writer,
+            clock=self._clock,
+            retention_days={
+                "sessions": self.config.storage.session_retention_days,
+                "policy": self.config.storage.error_retention_days,
+                "interventions": self.config.storage.error_retention_days,
+            },
+            namespace=self.config.redis.key_prefix,
+            legacy_store_path=default_legacy_store_path(),
+        )
+        self._legacy_data_migrator = LegacyDataMigrator(
+            self._database,
+            storage_root=storage_root,
+            clock=self._clock,
+            session_retention_days=self.config.storage.session_retention_days,
+        )
         self._calibration_store = CalibrationProfileStore(
             self.config.storage.path,
             clock=self._clock,
@@ -705,9 +744,7 @@ class CortexDaemon:
         try:
             loaded_calibration_profile = self._calibration_store.load_active()
         except Exception:
-            logger.exception(
-                "Active calibration profile failed validation; starting uncalibrated"
-            )
+            logger.exception("Active calibration profile failed validation; starting uncalibrated")
         self._baseline_snapshot = UserBaselines()
         self._inference_publication_paused = False
         self._shutdown = asyncio.Event()
@@ -766,21 +803,16 @@ class CortexDaemon:
                 )
             except Exception:
                 logger.exception(
-                    "Active calibration profile is incompatible; "
-                    "starting uncalibrated"
+                    "Active calibration profile is incompatible; starting uncalibrated"
                 )
             else:
                 self._active_calibration_profile = loaded_calibration_profile
-                self._baseline_snapshot = (
-                    loaded_calibration_profile.to_user_baselines()
-                )
+                self._baseline_snapshot = loaded_calibration_profile.to_user_baselines()
         self._roi_extractor = camera_features.roi_extractor
         self._pulse_estimator = _build_legacy_pulse_estimator(self.config)
         self._physiology_v2 = camera_features.physiology
         self._blink_detector = camera_features.blink
-        self._blink_detector.baseline_blink_rate = (
-            self._baseline_snapshot.blink_rate_baseline
-        )
+        self._blink_detector.baseline_blink_rate = self._baseline_snapshot.blink_rate_baseline
         self._head_pose = camera_features.head_pose
         self._posture = camera_features.head_neck_proxy
         self._feature_fusion = FeatureFusion(clock=self._clock)
@@ -829,9 +861,7 @@ class CortexDaemon:
         self._ws_server = WebSocketServer(self.config.api, clock=self._clock)
         self._ws_server.set_user_action_callback(self._handle_user_action)
         self._ws_server.set_settings_callback(self.apply_settings)
-        self._ws_server.set_calibration_reload_callback(
-            self.activate_calibration_profile
-        )
+        self._ws_server.set_calibration_reload_callback(self.activate_calibration_profile)
         self._ws_server.set_shutdown_callback(self._request_shutdown)
         self._ws_server.set_leetcode_context_callback(self._handle_leetcode_context_update)
         self._ws_server.set_intervention_applied_callback(self._handle_intervention_applied)
@@ -947,9 +977,7 @@ class CortexDaemon:
         # ``_handle_intervention_applied`` callback resolves it; the 30 s
         # timeout watcher resolves it to ``confirmed=False`` if no ack
         # arrives.
-        self._pending_apply_results: dict[
-            str, asyncio.Future[Any]
-        ] = {}
+        self._pending_apply_results: dict[str, asyncio.Future[Any]] = {}
         # F05: ``_background_tasks`` (declared above at __init__ top) tracks
         # timeout watchers etc. Mirrors the F03 pattern from the audit
         # Ledger: any new task spawn must use ``_spawn_background_task`` so
@@ -994,8 +1022,12 @@ class CortexDaemon:
         # inside the recorder).
 
         # --- v2.0 services ---
-        # Store (Redis with in-memory fallback)
-        self._store: RedisStore | InMemoryStore
+        # WP7: one embedded SQLite database is authoritative for durable
+        # consent, small state, policy records, and intervention authority.
+        # Redis/InMemory remain import-compatible adapters for external test
+        # composition, but the shipped runtime never splits authority across
+        # them.
+        self._store: RedisStore | InMemoryStore | SQLiteKeyValueStore
         # B4 (Phase 4.1): flips True the moment the daemon falls back
         # to ``InMemoryStore`` from Redis. Surfaced on every subsequent
         # STATE_UPDATE under ``store.degraded`` so the dashboard's
@@ -1007,33 +1039,26 @@ class CortexDaemon:
         # react to the degradation.
         self._store_degraded: bool = False
         if self.config.redis.enabled:
+            # Compatibility diagnostic for operators who still carry the
+            # pre-WP7 Redis setting. SQLite remains authoritative; constructing
+            # the lazy adapter performs no network I/O, but preserves the
+            # established degraded signal exposed by custom/test adapters.
             try:
-                self._store = RedisStore(
+                requested_redis = RedisStore(
                     host=self.config.redis.host,
                     port=self.config.redis.port,
                     db=self.config.redis.db,
                     key_prefix=self.config.redis.key_prefix,
                 )
+                self._store_degraded = bool(getattr(requested_redis, "degraded", False))
             except Exception:
-                logger.warning(
-                    "Redis unavailable, falling back to in-memory store",
-                    exc_info=True,
-                )
-                # P0 durability fix: use make_default_store so the
-                # fallback InMemoryStore writes JSON to ~/Library/...
-                # — without this, ConsentLadder._persist + earned
-                # escalation state are lost on every daemon restart in
-                # the DMG-default no-Redis deployment.
-                self._store = make_default_store(self.config)
-                # B4: mark store as degraded so the next broadcast cycle
-                # stamps the indicator on STATE_UPDATE and the one-time
-                # announcement task fires from ``start()``.
                 self._store_degraded = True
-        else:
-            # DMG default: no Redis. The persisted file-backed
-            # InMemoryStore preserves consent / helpfulness across
-            # restarts.
-            self._store = make_default_store(self.config)
+        self._consent_overrides_path = storage_root / "consent_overrides.json"
+        self._store = make_default_store(
+            self.config,
+            database=self._database,
+            consent_overrides_path=self._consent_overrides_path,
+        )
 
         # C7 (audit): mirror the store's own ``degraded`` flag onto the
         # daemon flag after construction. ``RedisStore`` exposes a public
@@ -1043,16 +1068,12 @@ class CortexDaemon:
         # DMG-default backend), so ``getattr(..., False)`` keeps the flag
         # False there. We OR with the existing value so the explicit
         # except-branch above (construction failure) is never un-set.
-        self._store_degraded = self._store_degraded or bool(
-            getattr(self._store, "degraded", False)
-        )
+        self._store_degraded = self._store_degraded or bool(getattr(self._store, "degraded", False))
 
         self._focus_break_policy = FocusBreakPolicy(
             enabled=self.config.intervention.enable_focus_break_reminders,
             interval_minutes=self.config.intervention.focus_break_interval_minutes,
-            suggested_duration_seconds=(
-                self.config.intervention.focus_break_duration_seconds
-            ),
+            suggested_duration_seconds=(self.config.intervention.focus_break_duration_seconds),
             clock=self._clock,
         )
 
@@ -1100,31 +1121,20 @@ class CortexDaemon:
         # opt-in to ``distraction_block`` at AUTONOMOUS_ACT silently
         # reverts to REVERSIBLE_ACT on reboot — the toggle in Settings
         # stays "on" but the HYPER auto-arm gate never opens.
-        self._consent_overrides_path: Path = (
-            Path(self.config.storage.path).expanduser() / "consent_overrides.json"
-        )
-        self._load_consent_overrides()
         self._transaction_coordinator = InterventionTransactionCoordinator(
             self._consent_ladder,
-            store=JsonInterventionTransactionStore(
-                Path(self.config.storage.path).expanduser()
-                / "intervention_transactions.json"
+            store=SQLiteInterventionTransactionStore(
+                self._database,
+                legacy_json_path=storage_root / "intervention_transactions.json",
+                clock=self._clock,
             ),
             clock=self._clock,
             execution_mode=self.intervention_execution_mode,
         )
-        self._executor.set_authorization_verifier(
-            self._transaction_coordinator.validate_consumed
-        )
-        self._restore_manager.set_restore_callback(
-            self._restore_transaction_and_wait
-        )
-        self._ws_server.set_intervention_authorize_callback(
-            self._authorize_intervention
-        )
-        self._ws_server.set_intervention_receipt_callback(
-            self._record_intervention_receipts
-        )
+        self._executor.set_authorization_verifier(self._transaction_coordinator.validate_consumed)
+        self._restore_manager.set_restore_callback(self._restore_transaction_and_wait)
+        self._ws_server.set_intervention_authorize_callback(self._authorize_intervention)
+        self._ws_server.set_intervention_receipt_callback(self._record_intervention_receipts)
         self._ws_server.set_intervention_dispatch_failure_callback(
             self._record_intervention_dispatch_failure
         )
@@ -1173,7 +1183,9 @@ class CortexDaemon:
 
         # Tab relevance learning
         self._tab_relevance = TabRelevanceTracker(store=self._store)
-        self._per_tab_feedback_ids: deque[str] = deque(maxlen=50)  # intervention IDs with per-tab feedback
+        self._per_tab_feedback_ids: deque[str] = deque(
+            maxlen=50
+        )  # intervention IDs with per-tab feedback
 
         # Contextual bandit
         self._bandit = ContextualBandit(store=self._store)
@@ -1207,9 +1219,7 @@ class CortexDaemon:
         # quantities (recovery confidence is a FLOW-recovery score, not the
         # trigger confidence) and so the dismissal model learned from
         # mislabelled features. ``(confidence, context_complexity)``.
-        self._dismissal_features_by_intervention: dict[
-            str, tuple[float, float]
-        ] = {}
+        self._dismissal_features_by_intervention: dict[str, tuple[float, float]] = {}
 
         # Copilot throttle
         self._copilot_throttle = CopilotThrottle(ws_server=self._ws_server)
@@ -1614,6 +1624,24 @@ class CortexDaemon:
             )
         except Exception:
             logger.debug("configure_logging failed; continuing", exc_info=True)
+        # Open and fully verify durable authority before capture, transports,
+        # or proposal producers start. A corrupt/future/read-only database is
+        # a startup failure: continuing would be unable to prove whether a
+        # prior workspace effect still needs restoration.
+        await self._database.start()
+        await self._legacy_data_migrator.migrate_all()
+        sqlite_calibration = await self._legacy_data_migrator.load_active_calibration()
+        if sqlite_calibration is not None and (
+            self._active_calibration_profile is None
+            or self._active_calibration_profile.profile_id != sqlite_calibration.profile_id
+            or calibration_profile_sha256(self._active_calibration_profile)
+            != calibration_profile_sha256(sqlite_calibration)
+        ):
+            # Reconcile the composition graph to SQLite, which is now the
+            # authority. The file pointer remains a compatibility projection
+            # for synchronous desktop readers.
+            self.apply_calibration_profile(sqlite_calibration)
+        await self._analytics_writer.start()
         # F07: ensure the local capability token exists before any service
         # that gates on it (WebSocket SHUTDOWN, launcher /stop) comes up.
         # Generated lazily, persists across restarts.
@@ -1627,6 +1655,7 @@ class CortexDaemon:
         # came up cleanly.
         try:
             from cortex.libs.auth import load_or_create_token
+
             load_or_create_token()
         except (OSError, ImportError, RuntimeError) as exc:
             logger.warning(
@@ -1664,16 +1693,12 @@ class CortexDaemon:
         # Recover crash-interrupted transactions before accepting new
         # intervention work. With no extension connected yet, exact restore
         # commands remain queued and are retried when their executor identifies.
-        startup_restores = (
-            await self._transaction_coordinator.recover_unfinished()
-        )
+        startup_restores = await self._transaction_coordinator.recover_unfinished()
         for restore_command in startup_restores:
             # Retain until the coordinator observes every inverse receipt.
             # A partial restore send is expected when only one owning surface
             # has reconnected during startup.
-            self._pending_startup_restores[
-                restore_command.restore_id
-            ] = restore_command
+            self._pending_startup_restores[restore_command.restore_id] = restore_command
             await self._ws_server.send_restore_command(restore_command)
         self._start_api_server()
 
@@ -1786,8 +1811,7 @@ class CortexDaemon:
                 # ValueError: nested asyncio.run reusing a loop without
                 # privileges to install handlers.
                 logger.debug(
-                    "loop.add_signal_handler unsupported for %s; "
-                    "falling back to outer harness",
+                    "loop.add_signal_handler unsupported for %s; falling back to outer harness",
                     sig,
                 )
 
@@ -1802,6 +1826,7 @@ class CortexDaemon:
         """Request process shutdown via SIGTERM (triggers full graceful stop chain)."""
         import os
         import signal as _signal
+
         logger.info("Shutdown requested via WebSocket")
         try:
             loop = asyncio.get_running_loop()
@@ -1827,10 +1852,12 @@ class CortexDaemon:
         # non-mac / when PyObjC isn't installed.
         try:
             from cortex.libs.utils import macos_notifications as _mn
+
             _mn.mark_shutting_down()
         except Exception:
             logger.debug(
-                "macos_notifications.mark_shutting_down failed", exc_info=True,
+                "macos_notifications.mark_shutting_down failed",
+                exc_info=True,
             )
         # Phase-3 P0-N5: a daemon stop while an auto-armed focus
         # session is live would leave the browser blocking sites
@@ -1843,7 +1870,8 @@ class CortexDaemon:
                 await self.disarm_auto_focus()
             except Exception:
                 logger.debug(
-                    "disarm_auto_focus during stop failed", exc_info=True,
+                    "disarm_auto_focus during stop failed",
+                    exc_info=True,
                 )
         if self._uvicorn_server is not None:
             self._uvicorn_server.should_exit = True
@@ -1858,9 +1886,7 @@ class CortexDaemon:
         if self._background_tasks:
             for task in list(self._background_tasks):
                 task.cancel()
-            await asyncio.gather(
-                *list(self._background_tasks), return_exceptions=True
-            )
+            await asyncio.gather(*list(self._background_tasks), return_exceptions=True)
             self._background_tasks.clear()
         # WP6: while authenticated clients and receipt handlers are still
         # alive, request every exact inverse and wait a bounded interval for
@@ -1877,9 +1903,7 @@ class CortexDaemon:
                     restore_summary,
                 )
         except Exception:
-            logger.exception(
-                "Shutdown exact-restore barrier failed; journal retained for startup"
-            )
+            logger.exception("Shutdown exact-restore barrier failed; journal retained for startup")
         # F05 / B18 (Phase 4.1): any apply-confirmation future still
         # pending at shutdown is treated as a missed ack — resolve to
         # confirmed=False so awaiters don't hang.
@@ -1893,8 +1917,7 @@ class CortexDaemon:
         # set instead of inferring it from absent ack frames.
         if self._pending_apply_results:
             logger.warning(
-                "B18: aborting %d in-flight apply-confirmation futures "
-                "on daemon shutdown",
+                "B18: aborting %d in-flight apply-confirmation futures on daemon shutdown",
                 len(self._pending_apply_results),
             )
         for intervention_id, future in list(self._pending_apply_results.items()):
@@ -1930,9 +1953,7 @@ class CortexDaemon:
         # AVFoundation handle is reclaimed by the kernel on process exit
         # regardless, but only if we actually exit.
         try:
-            await asyncio.wait_for(
-                self._capture_pipeline.stop(), timeout=5.0
-            )
+            await asyncio.wait_for(self._capture_pipeline.stop(), timeout=5.0)
         except TimeoutError:
             logger.error(
                 "Capture pipeline stop() exceeded 5s; abandoning graceful "
@@ -1975,9 +1996,8 @@ class CortexDaemon:
                 if duration_seconds >= 90.0:
                     try:
                         from cortex.libs.utils.atomic_write import atomic_write_json
-                        sessions_dir = (
-                            Path(self.config.storage.path).expanduser() / "sessions"
-                        )
+
+                        sessions_dir = Path(self.config.storage.path).expanduser() / "sessions"
                         sessions_dir.mkdir(parents=True, exist_ok=True)
                         session_path = sessions_dir / f"session_{report.session_id}.json"
                         payload = report.model_dump(mode="json")
@@ -1990,6 +2010,7 @@ class CortexDaemon:
                             ),
                         )
                         atomic_write_json(session_path, payload)
+                        await self._legacy_data_migrator.upsert_session(report)
                         logger.info("Wrote session report to %s", session_path)
                         self._session_reader.invalidate(report.session_id)
                         persisted_ok = True
@@ -2008,6 +2029,7 @@ class CortexDaemon:
                     # ``report.end_time``). Building via the Pydantic model
                     # guarantees the shape matches the generated TS type.
                     from cortex.libs.schemas.realtime import SessionRecap
+
                     recap_payload = SessionRecap(
                         report=report,
                         generated_at=utc_datetime(self._clock).isoformat(),
@@ -2046,9 +2068,7 @@ class CortexDaemon:
                             self._recap_dismissed_event.wait(),
                             timeout=_SESSION_RECAP_DISMISSAL_TIMEOUT_S,
                         )
-                        logger.info(
-                            "SESSION_RECAP acknowledged by UI; proceeding with shutdown"
-                        )
+                        logger.info("SESSION_RECAP acknowledged by UI; proceeding with shutdown")
                     except TimeoutError:
                         logger.warning(
                             "SESSION_RECAP dismissal ACK not received within %.1fs; "
@@ -2062,13 +2082,10 @@ class CortexDaemon:
                     # instead of waiting the full 6s.
                     try:
                         from cortex.libs.utils.atomic_write import atomic_write_json
-                        sessions_dir = (
-                            Path(self.config.storage.path).expanduser() / "sessions"
-                        )
+
+                        sessions_dir = Path(self.config.storage.path).expanduser() / "sessions"
                         sessions_dir.mkdir(parents=True, exist_ok=True)
-                        session_path_short = (
-                            sessions_dir / f"session_{report.session_id}.json"
-                        )
+                        session_path_short = sessions_dir / f"session_{report.session_id}.json"
                         payload_short = report.model_dump(mode="json")
                         encoded_short = json.dumps(payload_short, indent=2).encode("utf-8")
                         enforce_session_storage_budget(
@@ -2079,6 +2096,7 @@ class CortexDaemon:
                             ),
                         )
                         atomic_write_json(session_path_short, payload_short)
+                        await self._legacy_data_migrator.upsert_session(report)
                         self._session_reader.invalidate(report.session_id)
                     except Exception:
                         logger.debug(
@@ -2095,9 +2113,7 @@ class CortexDaemon:
                             timeout=1.0,
                         )
                     except (TimeoutError, Exception):
-                        logger.debug(
-                            "synthetic empty SESSION_RECAP broadcast failed (non-fatal)"
-                        )
+                        logger.debug("synthetic empty SESSION_RECAP broadcast failed (non-fatal)")
         # P0 §3.2: stop the midnight scheduler cleanly before the WS server
         # tears down so we don't await a callback that needs a WS broadcast.
         if self._midnight_scheduler is not None:
@@ -2125,6 +2141,11 @@ class CortexDaemon:
             self._recorder.flush(timeout=5.0)
         except Exception:
             logger.debug("Recorder flush failed (non-fatal)", exc_info=True)
+        try:
+            await self._analytics_writer.stop()
+            await self._store.close()
+        finally:
+            await self._database.close()
         self._uvicorn_server = None
         registry.reset()
         logger.info("Cortex daemon stopped")
@@ -2158,6 +2179,10 @@ class CortexDaemon:
             "daemon": self,
             # v2.0 services
             "store": self._store,
+            "database": self._database,
+            "analytics_writer": self._analytics_writer,
+            "storage_maintenance": self._storage_maintenance,
+            "legacy_data_migrator": self._legacy_data_migrator,
             "longitudinal_tracker": self._longitudinal,
             "zombie_detector": self._zombie_detector,
             "rabbit_hole_detector": self._rabbit_hole,
@@ -2169,6 +2194,8 @@ class CortexDaemon:
             "copilot_throttle": self._copilot_throttle,
         }.items():
             registry.register(name, service)
+        registry.register("store_backend", "sqlite")
+        registry.register("store_healthy", not self._store_degraded)
         registry.healthy = True
 
     def _start_api_server(self) -> None:
@@ -2203,6 +2230,7 @@ class CortexDaemon:
         from cortex.services.intervention_engine.snapshot import (
             capture_snapshot as _cap,
         )
+
         daemon_clock = self._clock
 
         class _DefaultInterventionPort:
@@ -2265,9 +2293,7 @@ class CortexDaemon:
                 # Normal shutdown path.
                 raise
             except Exception:
-                logger.exception(
-                    "API server crashed unexpectedly; triggering daemon shutdown"
-                )
+                logger.exception("API server crashed unexpectedly; triggering daemon shutdown")
                 self._shutdown.set()
 
         self._api_task = asyncio.create_task(_supervised_serve(), name="cortex-api")
@@ -2289,12 +2315,10 @@ class CortexDaemon:
     ) -> CalibrationUpdated:
         """Reload the already-active pointer, primarily for startup recovery."""
 
-        profile = self._calibration_store.load_active()
+        profile = self._legacy_data_migrator.load_active_calibration_blocking()
         if profile is None:
             raise ValueError("no active calibration profile exists")
-        if expected_profile_id is not None and str(profile.profile_id) != str(
-            expected_profile_id
-        ):
+        if expected_profile_id is not None and str(profile.profile_id) != str(expected_profile_id):
             raise ValueError("active calibration profile does not match request")
         return self.apply_calibration_profile(profile)
 
@@ -2318,7 +2342,31 @@ class CortexDaemon:
         if expected_sha256 is not None and actual_sha256 != expected_sha256:
             raise ValueError("staged calibration profile checksum mismatch")
         prepared = self._prepare_calibration_profile(profile)
-        self._calibration_store.activate(profile)
+        pointer = ActiveCalibrationPointer(
+            profile_id=profile.profile_id,
+            profile_sha256=actual_sha256,
+            activated_at_unix_ms=self._clock.unix_ms(),
+        )
+        # SQLite commits first and is the authoritative pointer. The JSON
+        # pointer is a compatibility projection for synchronous desktop
+        # readers; a projection failure cannot roll back proven authority or
+        # the prepared live graph.
+        prior_sqlite_calibration = (
+            self._legacy_data_migrator.load_active_calibration_record_blocking()
+        )
+        self._legacy_data_migrator.upsert_calibration_blocking(
+            profile,
+            active=pointer,
+        )
+        try:
+            self._calibration_store.activate(profile, pointer=pointer)
+        except (OSError, ValueError):
+            # Cross-file atomicity is emulated by restoring the prior SQLite
+            # pointer if the compatibility projection cannot commit. The new
+            # immutable profile may remain staged, but neither authority nor
+            # the live graph changes.
+            self._legacy_data_migrator.restore_active_calibration_blocking(prior_sqlite_calibration)
+            raise
         return self._commit_calibration_graph(prepared)
 
     def apply_calibration_profile(
@@ -2333,9 +2381,7 @@ class CortexDaemon:
         either the prior component graph or the complete replacement graph.
         """
 
-        return self._commit_calibration_graph(
-            self._prepare_calibration_profile(profile)
-        )
+        return self._commit_calibration_graph(self._prepare_calibration_profile(profile))
 
     def _prepare_calibration_profile(
         self,
@@ -2359,8 +2405,7 @@ class CortexDaemon:
             profile.camera is not None
             and self._active_camera_identity_key is not None
             and profile.camera.identity_key == self._active_camera_identity_key
-            and self._active_camera_geometry
-            == (profile.camera.width, profile.camera.height)
+            and self._active_camera_geometry == (profile.camera.width, profile.camera.height)
             and values.neutral_head_pitch_deg is not None
             and values.neutral_face_scale_px is not None
         )
@@ -2378,9 +2423,7 @@ class CortexDaemon:
         new_fusion = FeatureFusion(clock=self._clock)
         new_scorer = RuleScorer(config=self.config.state, baselines=new_baselines)
         new_smoother = ScoreSmoother(self.config.state, clock=self._clock)
-        new_zombie = ZombieReadingDetector(
-            blink_baseline=new_baselines.blink_rate_baseline
-        )
+        new_zombie = ZombieReadingDetector(blink_baseline=new_baselines.blink_rate_baseline)
         new_shutdown = ShutdownDetector(
             hrv_baseline=new_baselines.hrv_baseline,
             config=self.config.handover,
@@ -2538,9 +2581,7 @@ class CortexDaemon:
     def _rgb_history(self) -> deque[np.ndarray]:
         """Derived legacy view; the canonical store is one observation deque."""
 
-        maxlen = max(
-            1, self.config.signal.rppg.window_seconds * self.config.capture.fps
-        )
+        maxlen = max(1, self.config.signal.rppg.window_seconds * self.config.capture.fps)
         rows = (
             item.value
             if item.is_valid and item.value is not None
@@ -2553,9 +2594,7 @@ class CortexDaemon:
     def _rgb_ts_history(self) -> deque[float]:
         """Derived legacy timestamp view; no parallel timestamp state exists."""
 
-        maxlen = max(
-            1, self.config.signal.rppg.window_seconds * self.config.capture.fps
-        )
+        maxlen = max(1, self.config.signal.rppg.window_seconds * self.config.capture.fps)
         return deque(
             (
                 item.observed_at_mono_ns / 1_000_000_000.0
@@ -2591,9 +2630,7 @@ class CortexDaemon:
         frame_meta = output.frame_meta
         sequence = self._legacy_capture_sequence
         self._legacy_capture_sequence += 1
-        interval_ns = max(
-            1, int(1_000_000_000 / max(1, self.config.capture.fps))
-        )
+        interval_ns = max(1, int(1_000_000_000 / max(1, self.config.capture.fps)))
         mono_ns = self._legacy_capture_mono_origin_ns + sequence * interval_ns
         unix_ms = max(0, int(float(frame_meta.timestamp) * 1000))
         identity = self._camera_identity_from_output(output)
@@ -2602,11 +2639,13 @@ class CortexDaemon:
         frame = getattr(output, "frame", None)
         landmarks_px = getattr(output, "landmarks_px", None)
         valid = face_detected and not low_quality and frame is not None and landmarks_px is not None
-        validity = ObservationValidity.VALID if valid else (
-            ObservationValidity.REJECTED if low_quality else ObservationValidity.MISSING
+        validity = (
+            ObservationValidity.VALID
+            if valid
+            else (ObservationValidity.REJECTED if low_quality else ObservationValidity.MISSING)
         )
-        reason = None if valid else (
-            MissingReason.ARTIFACT if low_quality else MissingReason.NO_FACE
+        reason = (
+            None if valid else (MissingReason.ARTIFACT if low_quality else MissingReason.NO_FACE)
         )
         components = {
             "brightness": float(getattr(frame_meta, "brightness_score", 0.0)),
@@ -2727,13 +2766,9 @@ class CortexDaemon:
             and self._active_calibration_profile.camera is not None
             else None
         )
-        profile_camera_key = (
-            profile_camera.identity_key if profile_camera is not None else None
-        )
+        profile_camera_key = profile_camera.identity_key if profile_camera is not None else None
         profile_geometry = (
-            (profile_camera.width, profile_camera.height)
-            if profile_camera is not None
-            else None
+            (profile_camera.width, profile_camera.height) if profile_camera is not None else None
         )
         physical_changed = old_key is not None and (
             old_key != identity.identity_key or old_geometry != new_geometry
@@ -2741,10 +2776,7 @@ class CortexDaemon:
         initial_profile_mismatch = (
             old_key is None
             and profile_camera is not None
-            and (
-                profile_camera_key != identity.identity_key
-                or profile_geometry != new_geometry
-            )
+            and (profile_camera_key != identity.identity_key or profile_geometry != new_geometry)
         )
         source_changed = (
             self._active_camera_source_instance_id is not None
@@ -2752,11 +2784,7 @@ class CortexDaemon:
         )
         if physical_changed or initial_profile_mismatch:
             self._reset_camera_dependent_state(invalidate_calibration=True)
-            self._camera_calibration_valid = (
-                self._apply_camera_bound_posture_calibration(
-                    identity
-                )
-            )
+            self._camera_calibration_valid = self._apply_camera_bound_posture_calibration(identity)
             _emit_event(
                 EventType.CAMERA_IDENTITY_CHANGED,
                 previous_identity_key=old_key or profile_camera_key,
@@ -2768,11 +2796,7 @@ class CortexDaemon:
             and profile_camera_key == identity.identity_key
             and profile_geometry == new_geometry
         ):
-            self._camera_calibration_valid = (
-                self._apply_camera_bound_posture_calibration(
-                    identity
-                )
-            )
+            self._camera_calibration_valid = self._apply_camera_bound_posture_calibration(identity)
         elif source_changed:
             # Same camera reopened: preserve its calibration, but never bridge
             # signal windows or temporal detector state across acquisitions.
@@ -2986,8 +3010,7 @@ class CortexDaemon:
         stride_ns = int(self.config.signal.rppg.stride_seconds * 1_000_000_000)
         if (
             self._last_physio_update_mono_ns == 0
-            or observation.observed_at_mono_ns - self._last_physio_update_mono_ns
-            >= stride_ns
+            or observation.observed_at_mono_ns - self._last_physio_update_mono_ns >= stride_ns
         ):
             prepared = self._prepare_rppg_window()
             if (
@@ -3063,16 +3086,12 @@ class CortexDaemon:
                     and respiration_window.values is not None
                     and respiration_window.sample_times_mono_ns is not None
                 ):
-                    respiration_result = (
-                        self._physiology_v2.respiration.process_window(
-                            respiration_window.values,
-                            respiration_window.sample_times_mono_ns,
-                            sample_rate_hz=respiration_window.sample_rate_hz,
-                            boot_id=observation.boot_id,
-                            head_vertical_face_units=(
-                                respiration_window.head_vertical_face_units
-                            ),
-                        )
+                    respiration_result = self._physiology_v2.respiration.process_window(
+                        respiration_window.values,
+                        respiration_window.sample_times_mono_ns,
+                        sample_rate_hz=respiration_window.sample_rate_hz,
+                        boot_id=observation.boot_id,
+                        head_vertical_face_units=(respiration_window.head_vertical_face_units),
                     )
                     self._latest_respiration_evidence = respiration_result.fused
                     registry.register(
@@ -3101,12 +3120,10 @@ class CortexDaemon:
                     {
                         "summary": pulse_result.summary.model_dump(mode="json"),
                         "beats": [
-                            item.model_dump(mode="json")
-                            for item in pulse_result.beat_events[-32:]
+                            item.model_dump(mode="json") for item in pulse_result.beat_events[-32:]
                         ],
                         "intervals": [
-                            item.model_dump(mode="json")
-                            for item in pulse_result.intervals[-32:]
+                            item.model_dump(mode="json") for item in pulse_result.intervals[-32:]
                         ],
                         "hrv": {
                             metric.value: estimate.model_dump(mode="json")
@@ -3256,7 +3273,9 @@ class CortexDaemon:
                     self._latest_context = context
                     registry.register("latest_task_context", context)
                     self._terminal_adapter.set_running_command(
-                        context.terminal_context.running_command if context.terminal_context else None
+                        context.terminal_context.running_command
+                        if context.terminal_context
+                        else None
                     )
                 except Exception:
                     logger.exception("Context loop error")
@@ -3291,6 +3310,7 @@ class CortexDaemon:
                         self.config.storage,
                         storage_root=storage_root,
                     )
+                    await self._storage_maintenance.enforce_retention()
                 except Exception:
                     logger.debug("Retention sweep failed", exc_info=True)
                 await asyncio.sleep(24 * 60 * 60)
@@ -3331,12 +3351,8 @@ class CortexDaemon:
         the reader cache so the next history query surfaces it. Cancelled in
         stop() BEFORE the finalize write, so there is no write race.
         """
-        interval = float(
-            getattr(self.config.storage, "session_checkpoint_seconds", 90.0)
-        )
-        min_seconds = float(
-            getattr(self.config.storage, "session_checkpoint_min_seconds", 30.0)
-        )
+        interval = float(getattr(self.config.storage, "session_checkpoint_seconds", 90.0))
+        min_seconds = float(getattr(self.config.storage, "session_checkpoint_min_seconds", 30.0))
         if interval <= 0:
             return
         try:
@@ -3350,6 +3366,7 @@ class CortexDaemon:
                         continue
                     wrote = await asyncio.to_thread(self._write_session_file, snap)
                     if wrote:
+                        await self._legacy_data_migrator.upsert_session(snap)
                         # Refresh the listing cache on the main thread so the
                         # next History query picks up the checkpoint.
                         self._session_reader.invalidate(snap.session_id)
@@ -3397,9 +3414,7 @@ class CortexDaemon:
                     # a property returning float (0.0 when no events have
                     # accumulated yet) so we can read it unconditionally.
                     vector.thrashing_score = self._aggregator.thrashing_score
-                    window_switch_value = vector.features.get(
-                        FeatureName.TAB_SWITCH_RATE_PER_MIN
-                    )
+                    window_switch_value = vector.features.get(FeatureName.TAB_SWITCH_RATE_PER_MIN)
                     if (
                         vector.telemetry_seen_count >= 5
                         and quality.telemetry > 0.0
@@ -3446,8 +3461,7 @@ class CortexDaemon:
                     if kinematics_age is not None and kinematics_age > 2.0:
                         if estimate.signal_quality.kinematics > 0.0:
                             logger.debug(
-                                "kinematics signal stale (age=%.2fs) — "
-                                "zeroing channel quality",
+                                "kinematics signal stale (age=%.2fs) — zeroing channel quality",
                                 kinematics_age,
                             )
                             try:
@@ -3456,6 +3470,7 @@ class CortexDaemon:
                                 from cortex.libs.schemas.state import (
                                     SignalQuality as _SQ,
                                 )
+
                                 estimate.signal_quality = _SQ(
                                     physio=estimate.signal_quality.physio,
                                     kinematics=0.0,
@@ -3476,9 +3491,7 @@ class CortexDaemon:
                     # Opt-in break reminders use only elapsed active-work time
                     # and the user's declared interval. They do not consume
                     # pulse, HRV, state labels, or the retired stress integral.
-                    inactivity_feature = vector.features.get(
-                        FeatureName.INACTIVITY_SECONDS
-                    )
+                    inactivity_feature = vector.features.get(FeatureName.INACTIVITY_SECONDS)
                     input_is_active = bool(
                         inactivity_feature is not None
                         and inactivity_feature.valid
@@ -3487,12 +3500,8 @@ class CortexDaemon:
                         < self.config.intervention.focus_break_inactivity_pause_seconds
                     )
                     self._focus_break_policy.update_preferences(
-                        enabled=(
-                            self.config.intervention.enable_focus_break_reminders
-                        ),
-                        interval_minutes=(
-                            self.config.intervention.focus_break_interval_minutes
-                        ),
+                        enabled=(self.config.intervention.enable_focus_break_reminders),
+                        interval_minutes=(self.config.intervention.focus_break_interval_minutes),
                         suggested_duration_seconds=(
                             self.config.intervention.focus_break_duration_seconds
                         ),
@@ -3502,27 +3511,18 @@ class CortexDaemon:
                         timestamp=timestamp,
                     )
                     registry.register("latest_focus_break_decision", break_decision)
-                    if (
-                        break_decision.should_recommend
-                        and self._interventions_enabled
-                    ):
+                    if break_decision.should_recommend and self._interventions_enabled:
                         from cortex.libs.schemas.realtime import BreakRecommendation
 
                         recommendation = BreakRecommendation(
                             reason="You've reached your preferred focus interval.",
                             urgency="low",
                             basis="elapsed_focus",
-                            focus_elapsed_seconds=(
-                                break_decision.active_elapsed_seconds
-                            ),
-                            preferred_interval_seconds=(
-                                break_decision.preferred_interval_seconds
-                            ),
+                            focus_elapsed_seconds=(break_decision.active_elapsed_seconds),
+                            preferred_interval_seconds=(break_decision.preferred_interval_seconds),
                             stress_load=None,
                             threshold=None,
-                            duration_seconds=(
-                                break_decision.suggested_duration_seconds
-                            ),
+                            duration_seconds=(break_decision.suggested_duration_seconds),
                             breathing_pattern="box",
                         )
                         await self._ws_server.send_message(
@@ -3546,7 +3546,8 @@ class CortexDaemon:
                         # serves stale data. Elevate to WARNING so the
                         # observability path catches it.
                         logger.warning(
-                            "causal attributor feed failed", exc_info=True,
+                            "causal attributor feed failed",
+                            exc_info=True,
                         )
 
                     # v2.0: Feed longitudinal tracker per-sample data.
@@ -3569,7 +3570,8 @@ class CortexDaemon:
                             self._session_report.start()
                             self._session_report_started = True
                         self._session_report.record_state(
-                            estimate.state, unix_seconds(self._clock),
+                            estimate.state,
+                            unix_seconds(self._clock),
                         )
                         if vector.hr:
                             self._session_report.record_hr(float(vector.hr))
@@ -3593,12 +3595,8 @@ class CortexDaemon:
                             if vector.head_neck_proxy_available
                             else None
                         ),
-                        "head_neck_flexion_dwell_seconds": (
-                            vector.head_neck_flexion_dwell_seconds
-                        ),
-                        "head_neck_proxy_available": (
-                            vector.head_neck_proxy_available
-                        ),
+                        "head_neck_flexion_dwell_seconds": (vector.head_neck_flexion_dwell_seconds),
+                        "head_neck_proxy_available": (vector.head_neck_proxy_available),
                         "forward_lean": None,
                         "forward_lean_angle": None,
                         "thrashing_score": vector.thrashing_score,
@@ -3658,7 +3656,9 @@ class CortexDaemon:
                             "dwell_seconds": estimate.dwell_seconds,
                             "reasons": estimate.reasons,
                             "biometrics": biometrics,
-                            "timestamp": float(getattr(estimate, "timestamp", timestamp) or timestamp),
+                            "timestamp": float(
+                                getattr(estimate, "timestamp", timestamp) or timestamp
+                            ),
                             "stress_integral": getattr(estimate, "stress_integral", None),
                             "source": "rules",
                             "degraded": estimate.status != "estimated",
@@ -3682,7 +3682,8 @@ class CortexDaemon:
                     # v2.0: Copilot throttle on state transitions
                     if estimate.state != self._prev_state:
                         await self._copilot_throttle.on_state_change(
-                            estimate.state, estimate.confidence,
+                            estimate.state,
+                            estimate.confidence,
                         )
                         self._prev_state = estimate.state
 
@@ -3692,7 +3693,8 @@ class CortexDaemon:
                     # user dwells in HYPER without state transitions.
                     try:
                         await self._evaluate_auto_distraction_block(
-                            estimate, timestamp,
+                            estimate,
+                            timestamp,
                         )
                     except Exception:
                         logger.debug(
@@ -3701,7 +3703,9 @@ class CortexDaemon:
                         )
 
                     await self._maybe_trigger_leetcode_interventions(
-                        estimate, vector, timestamp,
+                        estimate,
+                        vector,
+                        timestamp,
                     )
 
                     context = self._latest_context
@@ -3709,9 +3713,13 @@ class CortexDaemon:
                         telemetry_for_trigger = registry.get("latest_telemetry")
                         typing_burst_seconds = 0.0
                         if telemetry_for_trigger is not None:
-                            kb_burst = float(getattr(telemetry_for_trigger, "keyboard_burst_score", 0.0))
+                            kb_burst = float(
+                                getattr(telemetry_for_trigger, "keyboard_burst_score", 0.0)
+                            )
                             if kb_burst >= 0.8:
-                                typing_burst_seconds = self.config.intervention.receptivity_typing_burst_seconds
+                                typing_burst_seconds = (
+                                    self.config.intervention.receptivity_typing_burst_seconds
+                                )
                         hour_now = utc_datetime(self._clock).astimezone().hour
                         within_work_hours = (
                             self.config.intervention.receptivity_work_hours_start
@@ -3746,7 +3754,9 @@ class CortexDaemon:
                         active_app = self._current_app_name()
                         telemetry = registry.get("latest_telemetry")
                         kinematics = self._latest_kinematics
-                        self._zombie_detector.update_baseline(self._scorer.baselines.blink_rate_baseline)
+                        self._zombie_detector.update_baseline(
+                            self._scorer.baselines.blink_rate_baseline
+                        )
                         # audit P2: zombie-reading + rabbit-hole detection feed
                         # off ``estimate.state`` and ``blink_rate`` — the SAME
                         # biometric pipeline the standard intervention trigger
@@ -3757,8 +3767,7 @@ class CortexDaemon:
                         # Apply the same floor here so all HYPER-derived
                         # interventions share one quality gate.
                         signal_ok = bool(
-                            estimate.status == "estimated"
-                            and estimate.evidence_coverage >= 0.45
+                            estimate.status == "estimated" and estimate.evidence_coverage >= 0.45
                         )
                         # Advance the detector's dwell state on every tick so
                         # its timers stay continuous, but only FIRE the
@@ -3772,7 +3781,9 @@ class CortexDaemon:
                         if signal_ok and zombie_detected:
                             logger.info("Zombie reading detected — triggering active recall")
                             await self._trigger_special_intervention(
-                                context, estimate, template_name="active_recall",
+                                context,
+                                estimate,
+                                template_name="active_recall",
                                 ws_type="ACTIVE_RECALL",
                             )
 
@@ -3790,7 +3801,9 @@ class CortexDaemon:
                             if signal_ok and alert is not None:
                                 logger.info("Rabbit hole detected — goal drift intervention")
                                 await self._trigger_special_intervention(
-                                    context, estimate, template_name="rabbit_hole",
+                                    context,
+                                    estimate,
+                                    template_name="rabbit_hole",
                                     ws_type="INTERVENTION_TRIGGER",
                                 )
 
@@ -3803,7 +3816,9 @@ class CortexDaemon:
                         if self._shutdown_detector.should_handover(
                             posture_slump=kinematics.slump_score or 0.0,
                             hrv=vector.hrv_rmssd,
-                            error_count=context.total_errors if hasattr(context, 'total_errors') else 0,
+                            error_count=context.total_errors
+                            if hasattr(context, "total_errors")
+                            else 0,
                         ):
                             logger.info("Shutdown signal detected — generating handover")
                             await self._generate_handover(context)
@@ -3939,11 +3954,9 @@ class CortexDaemon:
                 reason,
             )
             if not abandoned:
-                restore_command = (
-                    await self._transaction_coordinator.request_restore(
-                        intervention_id,
-                        reason="system_cancelled",
-                    )
+                restore_command = await self._transaction_coordinator.request_restore(
+                    intervention_id,
+                    reason="system_cancelled",
                 )
         except Exception:
             # The durable journal remains authoritative. Startup recovery
@@ -4059,19 +4072,30 @@ class CortexDaemon:
             current_state = registry.get("latest_state_estimate")
             if current_state:
                 # Suppress only if student is in FLOW for >3s (genuine recovery)
-                if (current_state.state == "FLOW"
-                        and current_state.dwell_seconds >= 3.0):
-                    logger.info("Suppressing stale intervention: student in FLOW for %.1fs", current_state.dwell_seconds)
+                if current_state.state == "FLOW" and current_state.dwell_seconds >= 3.0:
+                    logger.info(
+                        "Suppressing stale intervention: student in FLOW for %.1fs",
+                        current_state.dwell_seconds,
+                    )
                     self._active_intervention_id = None
                     return
                 # Also check if workspace context changed significantly
-                if hasattr(context, 'browser_context') and context.browser_context:
-                    current_tab_count = len(context.browser_context.all_tabs) if context.browser_context.all_tabs else 0
+                if hasattr(context, "browser_context") and context.browser_context:
+                    current_tab_count = (
+                        len(context.browser_context.all_tabs)
+                        if context.browser_context.all_tabs
+                        else 0
+                    )
                     if plan.suggested_actions:
-                        stale_actions = sum(1 for a in plan.suggested_actions
-                                            if a.tab_index is not None and a.tab_index >= current_tab_count)
+                        stale_actions = sum(
+                            1
+                            for a in plan.suggested_actions
+                            if a.tab_index is not None and a.tab_index >= current_tab_count
+                        )
                         if stale_actions > len(plan.suggested_actions) * 0.5:
-                            logger.info("Suppressing stale intervention: >50%% tab references invalid")
+                            logger.info(
+                                "Suppressing stale intervention: >50%% tab references invalid"
+                            )
                             self._active_intervention_id = None
                             return
 
@@ -4084,7 +4108,8 @@ class CortexDaemon:
                 latest_features = registry.get("latest_feature_vector")
                 if latest_features is not None:
                     plan.causal_signals = self._causal_attributor.attribute_top_signals(
-                        latest_features, self._scorer.baselines,
+                        latest_features,
+                        self._scorer.baselines,
                     )
                     self._causal_signals_by_intervention[plan.intervention_id] = [
                         s.model_dump(mode="json") for s in plan.causal_signals
@@ -4104,7 +4129,9 @@ class CortexDaemon:
                 tab_count = len(context.browser_context.all_tabs)
             validation, commands = prepare_plan(plan, tab_count=tab_count)
             if not validation.is_valid:
-                logger.warning("Rejected intervention plan %s: %s", plan.intervention_id, validation.errors)
+                logger.warning(
+                    "Rejected intervention plan %s: %s", plan.intervention_id, validation.errors
+                )
                 return
             if validation.warnings:
                 plan.plan_warnings.extend(validation.warnings)
@@ -4133,9 +4160,7 @@ class CortexDaemon:
                 clock=self._clock,
                 include_suggested_actions=(execution_mode != "suggest_only"),
             )
-            await self._transaction_coordinator.register_proposal(
-                action_manifest
-            )
+            await self._transaction_coordinator.register_proposal(action_manifest)
             registered_intervention_id = plan.intervention_id
             snapshot = (
                 capture_snapshot(
@@ -4161,8 +4186,7 @@ class CortexDaemon:
                     reason="no_authenticated_presentation_surface",
                 )
                 logger.info(
-                    "Suppressed proposal %s: no authenticated presentation "
-                    "surface is connected",
+                    "Suppressed proposal %s: no authenticated presentation surface is connected",
                     plan.intervention_id,
                 )
                 return
@@ -4183,6 +4207,7 @@ class CortexDaemon:
                     from cortex.services.intervention_engine.restore import (
                         merge_micro_steps,
                     )
+
                     plan.micro_steps = merge_micro_steps(
                         self._active_plan.micro_steps, plan.micro_steps
                     )
@@ -4190,7 +4215,8 @@ class CortexDaemon:
                 self._micro_step_recovery_fired = False
             if snapshot is not None:
                 registry.register(
-                    f"workspace_snapshot:{plan.intervention_id}", snapshot,
+                    f"workspace_snapshot:{plan.intervention_id}",
+                    snapshot,
                 )
             self._recorder.append("intervention_plan", plan.model_dump(mode="json"))
 
@@ -4201,20 +4227,14 @@ class CortexDaemon:
                 state=estimate.state,
                 confidence=estimate.confidence,
                 complexity=(
-                    float(context.complexity_score)
-                    if hasattr(context, "complexity_score")
-                    else 0.0
+                    float(context.complexity_score) if hasattr(context, "complexity_score") else 0.0
                 ),
                 tab_count=(
                     int(context.browser_context.tab_count)
                     if hasattr(context, "browser_context") and context.browser_context
                     else 0
                 ),
-                error_count=(
-                    int(context.total_errors)
-                    if hasattr(context, "total_errors")
-                    else 0
-                ),
+                error_count=(int(context.total_errors) if hasattr(context, "total_errors") else 0),
                 thrashing_score=float(getattr(self._aggregator, "thrashing_score", 0.0)),
                 # Compatibility outcome field only; unavailable in product.
                 stress_integral=0.0,
@@ -4230,7 +4250,8 @@ class CortexDaemon:
                 self._amip_decision_ids_by_intervention[plan.intervention_id] = decision_id
             if bandit_features is not None and bandit_arm_index is not None:
                 self._bandit_decisions_by_intervention[plan.intervention_id] = (
-                    list(bandit_features), int(bandit_arm_index)
+                    list(bandit_features),
+                    int(bandit_arm_index),
                 )
             # audit C-note: snapshot the trigger-time confidence + context
             # complexity so the eventual engaged/dismissed outcome trains the
@@ -4258,15 +4279,10 @@ class CortexDaemon:
             # this the daemon recorded under the literal "intervention",
             # disjoint from the gated keys, so escalation never lifted.
             consent_actions = sorted(
-                {
-                    canonical_action_type(a.action_type)
-                    for a in plan.suggested_actions
-                }
+                {canonical_action_type(a.action_type) for a in plan.suggested_actions}
             )
             if consent_actions:
-                self._consent_actions_by_intervention[plan.intervention_id] = (
-                    consent_actions
-                )
+                self._consent_actions_by_intervention[plan.intervention_id] = consent_actions
                 if len(self._consent_actions_by_intervention) > 64:
                     oldest_ca = next(iter(self._consent_actions_by_intervention))
                     self._consent_actions_by_intervention.pop(oldest_ca, None)
@@ -4288,9 +4304,7 @@ class CortexDaemon:
                 desktop_focused = self._desktop_is_focused()
             else:
                 desktop_focused = None
-            await self._transaction_coordinator.mark_delivered(
-                plan.intervention_id
-            )
+            await self._transaction_coordinator.mark_delivered(plan.intervention_id)
             sent = await self._ws_server.send_intervention(
                 plan,
                 action_manifest=action_manifest,
@@ -4307,9 +4321,7 @@ class CortexDaemon:
                 _payload = copy.deepcopy(plan.model_dump(mode="json"))
                 _payload["_seq"] = self._intervention_callback_seq
                 _payload["execution_mode"] = execution_mode
-                _payload["action_manifest"] = action_manifest.model_dump(
-                    mode="json"
-                )
+                _payload["action_manifest"] = action_manifest.model_dump(mode="json")
                 # Audit-prod fix (G4 P0): the overlay's action-buttons gate
                 # browser-bound actions on ``payload.connected_clients``;
                 # without this field every browser button renders disabled
@@ -4334,9 +4346,7 @@ class CortexDaemon:
                     self._intervention_callback(_payload)
                     callback_delivered = True
                 except Exception:
-                    logger.exception(
-                        "In-process intervention presentation failed"
-                    )
+                    logger.exception("In-process intervention presentation failed")
 
             if sent == 0 and not callback_delivered:
                 # A surface can disconnect between the preflight count and
@@ -4348,8 +4358,7 @@ class CortexDaemon:
                     reason="presentation_delivery_race",
                 )
                 logger.info(
-                    "Abandoned proposal %s after every presentation "
-                    "surface disconnected",
+                    "Abandoned proposal %s after every presentation surface disconnected",
                     plan.intervention_id,
                 )
                 return
@@ -4377,7 +4386,8 @@ class CortexDaemon:
                     await self._dispatch_os_notification(plan)
                 except Exception:
                     logger.debug(
-                        "OS notification dispatch failed", exc_info=True,
+                        "OS notification dispatch failed",
+                        exc_info=True,
                     )
         except TimeoutError:
             logger.warning("Intervention LLM call timed out")
@@ -4462,10 +4472,7 @@ class CortexDaemon:
             # C3 (audit): scope special interventions to the active tab too.
             plan.trigger_url = self._active_trigger_url(context)
             tab_count = None
-            if (
-                hasattr(context, "browser_context")
-                and context.browser_context is not None
-            ):
+            if hasattr(context, "browser_context") and context.browser_context is not None:
                 tab_count = len(context.browser_context.all_tabs)
             validation, _commands = prepare_plan(plan, tab_count=tab_count)
             if not validation.is_valid:
@@ -4489,19 +4496,14 @@ class CortexDaemon:
                 clock=self._clock,
                 include_suggested_actions=False,
             )
-            await self._transaction_coordinator.register_proposal(
-                action_manifest
-            )
+            await self._transaction_coordinator.register_proposal(action_manifest)
             registered_intervention_id = plan.intervention_id
             authenticated_count = getattr(
                 self._ws_server,
                 "authenticated_client_count",
                 None,
             )
-            if (
-                isinstance(authenticated_count, int)
-                and authenticated_count == 0
-            ):
+            if isinstance(authenticated_count, int) and authenticated_count == 0:
                 await self._close_unpresented_transaction(
                     plan.intervention_id,
                     reason="no_authenticated_presentation_surface",
@@ -4512,9 +4514,7 @@ class CortexDaemon:
                     plan.intervention_id,
                 )
                 return
-            await self._transaction_coordinator.mark_delivered(
-                plan.intervention_id
-            )
+            await self._transaction_coordinator.mark_delivered(plan.intervention_id)
             self._active_intervention_id = plan.intervention_id
             # P0 §3.6: cache the live plan + merge prior step state on F16 swap.
             # Wave-2 P1: serialise against ``toggle_micro_step`` (same
@@ -4527,6 +4527,7 @@ class CortexDaemon:
                     from cortex.services.intervention_engine.restore import (
                         merge_micro_steps,
                     )
+
                     plan.micro_steps = merge_micro_steps(
                         self._active_plan.micro_steps, plan.micro_steps
                     )
@@ -4541,9 +4542,7 @@ class CortexDaemon:
                 )
             else:
                 payload = plan.model_dump(mode="json")
-                payload["action_manifest"] = action_manifest.model_dump(
-                    mode="json"
-                )
+                payload["action_manifest"] = action_manifest.model_dump(mode="json")
                 payload["execution_mode"] = "suggest_only"
                 sent = await self._ws_server.send_message(ws_type, payload)
             if not sent:
@@ -4552,8 +4551,7 @@ class CortexDaemon:
                     reason="presentation_delivery_race",
                 )
                 logger.info(
-                    "Abandoned special proposal %s after presentation "
-                    "delivery failed",
+                    "Abandoned special proposal %s after presentation delivery failed",
                     plan.intervention_id,
                 )
                 return
@@ -4597,7 +4595,8 @@ class CortexDaemon:
             sanitized_actions.append(action)
         plan.suggested_actions = sanitized_actions
         plan.micro_steps = [
-            step for step in plan.micro_steps
+            step
+            for step in plan.micro_steps
             if not any(tok in step.text.lower() for tok in blocked_tokens)
         ] or plan.micro_steps[:1]
 
@@ -4657,14 +4656,9 @@ class CortexDaemon:
         # used while the LLM call is in flight; once a real id is set
         # we honour exactly that id and no other.
         active = self._active_intervention_id
-        if (
-            active is None
-            or active == "__pending__"
-            or active != intervention_id
-        ):
+        if active is None or active == "__pending__" or active != intervention_id:
             logger.warning(
-                "ACTION_DISPATCH dropped: stale intervention_id "
-                "(requested=%s active=%s)",
+                "ACTION_DISPATCH dropped: stale intervention_id (requested=%s active=%s)",
                 intervention_id,
                 active,
             )
@@ -4683,9 +4677,7 @@ class CortexDaemon:
                 exc,
             )
             return 0
-        transaction = await self._transaction_coordinator.get_transaction(
-            intervention_id
-        )
+        transaction = await self._transaction_coordinator.get_transaction(intervention_id)
         if transaction is None:
             logger.warning("Desktop action request has no transaction")
             return 0
@@ -4694,8 +4686,7 @@ class CortexDaemon:
             (
                 item
                 for item in transaction.manifest.body.actions
-                if item.action_id == action_id
-                and item.executor in {"browser", "editor"}
+                if item.action_id == action_id and item.executor in {"browser", "editor"}
             ),
             None,
         )
@@ -4743,34 +4734,27 @@ class CortexDaemon:
                     reason="desktop_action_no_executor",
                 )
             elif sent != dispatch.expected_targets:
-                compensation = (
-                    await self._compensate_partial_intervention_dispatch(
-                        authorized.authorization.authorization_id,
-                        "desktop_action_delivery_ambiguous",
-                    )
+                compensation = await self._compensate_partial_intervention_dispatch(
+                    authorized.authorization.authorization_id,
+                    "desktop_action_delivery_ambiguous",
                 )
                 if compensation is not None:
                     await self._ws_server.send_restore_command(compensation)
         except Exception:
             logger.exception("Transactional desktop action dispatch failed")
             try:
-                compensation = (
-                    await self._compensate_partial_intervention_dispatch(
-                        authorized.authorization.authorization_id,
-                        "desktop_action_dispatch_exception",
-                    )
+                compensation = await self._compensate_partial_intervention_dispatch(
+                    authorized.authorization.authorization_id,
+                    "desktop_action_dispatch_exception",
                 )
                 if compensation is not None:
                     await self._ws_server.send_restore_command(compensation)
             except Exception:
-                logger.exception(
-                    "Transactional desktop action compensation failed"
-                )
+                logger.exception("Transactional desktop action compensation failed")
             return 0
         if sent == 0:
             logger.info(
-                "Desktop exact action has no connected executor "
-                "(intervention_id=%s action_id=%s)",
+                "Desktop exact action has no connected executor (intervention_id=%s action_id=%s)",
                 intervention_id,
                 validated.get("action_id"),
             )
@@ -4804,7 +4788,8 @@ class CortexDaemon:
         self._break_active = bool(active)
 
     def set_break_overlay_ui_handler(
-        self, handler: BreakUIHandler | None,
+        self,
+        handler: BreakUIHandler | None,
     ) -> None:
         """Bind the desktop shell's full-screen break overlay handler.
 
@@ -4828,11 +4813,7 @@ class CortexDaemon:
         """Turn one exact user gesture into a consumed authorization."""
 
         active = self._active_intervention_id
-        if (
-            active is None
-            or active == "__pending__"
-            or active != request.intervention_id
-        ):
+        if active is None or active == "__pending__" or active != request.intervention_id:
             return AuthorizationDenied(
                 authorization_request_id=request.authorization_request_id,
                 intervention_id=request.intervention_id,
@@ -4857,9 +4838,7 @@ class CortexDaemon:
                         "intervention_id": result.authorization.intervention_id,
                         "authorization_id": result.authorization.authorization_id,
                         "manifest_sha256": result.authorization.manifest_sha256,
-                        "action_ids": list(
-                            result.authorization.authorized_action_ids
-                        ),
+                        "action_ids": list(result.authorization.authorized_action_ids),
                         "consent_revision": result.authorization.consent_revision,
                         "source_client_type": source_client_type,
                     },
@@ -4879,29 +4858,20 @@ class CortexDaemon:
     ]:
         """Persist receipts, update consent evidence, and resolve waiters."""
 
-        state, compensation = (
-            await self._transaction_coordinator.record_receipts(
-                batch,
-                source_client_type=source_client_type,
-                source_client_id=source_client_id,
-            )
+        state, compensation = await self._transaction_coordinator.record_receipts(
+            batch,
+            source_client_type=source_client_type,
+            source_client_id=source_client_id,
         )
         if compensation is not None:
             # Keep compensation retryable across an offline executor. The WS
             # server preflights the complete route; this queue is retried as
             # each required surface identifies and is removed only after
             # verified inverse receipts reach RESTORED.
-            self._pending_startup_restores[
-                compensation.restore_id
-            ] = compensation
-        transaction = await self._transaction_coordinator.get_transaction(
-            batch.intervention_id
-        )
+            self._pending_startup_restores[compensation.restore_id] = compensation
+        transaction = await self._transaction_coordinator.get_transaction(batch.intervention_id)
         if transaction is not None:
-            actions = {
-                action.action_id: action
-                for action in transaction.manifest.body.actions
-            }
+            actions = {action.action_id: action for action in transaction.manifest.body.actions}
             for receipt in batch.receipts:
                 action = actions.get(receipt.action_id)
                 if (
@@ -4912,8 +4882,7 @@ class CortexDaemon:
                         ReceiptStatus.SUCCEEDED.value,
                         ReceiptStatus.ALREADY_COMPLETE.value,
                     }
-                    and receipt.verification
-                    == VerificationStatus.VERIFIED.value
+                    and receipt.verification == VerificationStatus.VERIFIED.value
                     and await self._transaction_coordinator.claim_consent_evidence(
                         receipt.receipt_id
                     )
@@ -4936,12 +4905,9 @@ class CortexDaemon:
                 )
                 if (
                     has_workspace_effect
-                    and self._restore_manager.get_active(batch.intervention_id)
-                    is None
+                    and self._restore_manager.get_active(batch.intervention_id) is None
                 ):
-                    snapshot = registry.get(
-                        f"workspace_snapshot:{batch.intervention_id}"
-                    )
+                    snapshot = registry.get(f"workspace_snapshot:{batch.intervention_id}")
                     if snapshot is not None:
                         self._restore_manager.start_intervention(
                             batch.intervention_id,
@@ -4963,15 +4929,11 @@ class CortexDaemon:
 
         # Bridge the old HTTP confirmation response onto the new truthful
         # receipt result during the one-release compatibility window.
-        if (
-            state
-            in {
-                InterventionLifecycleState.APPLIED,
-                InterventionLifecycleState.PARTIAL,
-                InterventionLifecycleState.FAILED,
-            }
-            and any(receipt.phase == "apply" for receipt in batch.receipts)
-        ):
+        if state in {
+            InterventionLifecycleState.APPLIED,
+            InterventionLifecycleState.PARTIAL,
+            InterventionLifecycleState.FAILED,
+        } and any(receipt.phase == "apply" for receipt in batch.receipts):
             future = self._pending_apply_results.pop(batch.intervention_id, None)
             if future is not None and not future.done():
                 # The lifecycle state is an aggregate across every one-time
@@ -4985,8 +4947,7 @@ class CortexDaemon:
                         (
                             entry
                             for entry in transaction.authorizations
-                            if entry.authorization.authorization_id
-                            == batch.authorization_id
+                            if entry.authorization.authorization_id == batch.authorization_id
                         ),
                         None,
                     )
@@ -4994,9 +4955,7 @@ class CortexDaemon:
                     else None
                 )
                 expected_ids = (
-                    set(ledger.authorization.authorized_action_ids)
-                    if ledger is not None
-                    else set()
+                    set(ledger.authorization.authorized_action_ids) if ledger is not None else set()
                 )
                 latest: dict[str, ActionReceipt] = {}
                 if transaction is not None:
@@ -5017,8 +4976,7 @@ class CortexDaemon:
                         ReceiptStatus.SUCCEEDED.value,
                         ReceiptStatus.ALREADY_COMPLETE.value,
                     }
-                    and receipt.verification
-                    == VerificationStatus.VERIFIED.value
+                    and receipt.verification == VerificationStatus.VERIFIED.value
                 )
                 confirmed = bool(expected_ids) and set(successful) == expected_ids
                 errors = [
@@ -5043,8 +5001,7 @@ class CortexDaemon:
                 )
 
         inverse_batch = all(
-            receipt.phase in {"compensate", "restore"}
-            for receipt in batch.receipts
+            receipt.phase in {"compensate", "restore"} for receipt in batch.receipts
         )
         if state in {
             InterventionLifecycleState.RESTORED,
@@ -5055,15 +5012,10 @@ class CortexDaemon:
                 None,
             )
             if restore_future is not None and not restore_future.done():
-                restore_future.set_result(
-                    state == InterventionLifecycleState.RESTORED
-                )
+                restore_future.set_result(state == InterventionLifecycleState.RESTORED)
             if state == InterventionLifecycleState.RESTORED:
                 self._pending_startup_restores.pop(batch.authorization_id, None)
-        elif (
-            inverse_batch
-            and state == InterventionLifecycleState.APPLIED
-        ):
+        elif inverse_batch and state == InterventionLifecycleState.APPLIED:
             # A partial compensation can complete while effects from an
             # earlier, distinct authorization remain active. The aggregate
             # correctly returns to APPLIED; this restore command itself is
@@ -5096,11 +5048,9 @@ class CortexDaemon:
     ) -> InterventionRestoreCommand | None:
         """Durably enter recovery after a cross-surface send race."""
 
-        command = (
-            await self._transaction_coordinator.compensate_partial_dispatch(
-                authorization_id,
-                reason=reason,
-            )
+        command = await self._transaction_coordinator.compensate_partial_dispatch(
+            authorization_id,
+            reason=reason,
         )
         if command is not None:
             self._pending_startup_restores[command.restore_id] = command
@@ -5113,17 +5063,20 @@ class CortexDaemon:
     ) -> bool:
         """Dispatch exact inverse actions and await verified receipts."""
 
-        reason_map: dict[str, Literal[
-            "user_undo",
-            "dismissed",
-            "snoozed",
-            "timed_out",
-            "natural_recovery",
-            "system_cancelled",
-            "partial_compensation",
-            "startup_recovery",
-            "emergency_restore",
-        ]] = {
+        reason_map: dict[
+            str,
+            Literal[
+                "user_undo",
+                "dismissed",
+                "snoozed",
+                "timed_out",
+                "natural_recovery",
+                "system_cancelled",
+                "partial_compensation",
+                "startup_recovery",
+                "emergency_restore",
+            ],
+        ] = {
             "restore": "user_undo",
             "dismissed": "dismissed",
             "snoozed": "snoozed",
@@ -5138,9 +5091,7 @@ class CortexDaemon:
             reason=reason,
         )
         if command is None:
-            transaction = await self._transaction_coordinator.get_transaction(
-                intervention_id
-            )
+            transaction = await self._transaction_coordinator.get_transaction(intervention_id)
             return bool(
                 transaction is not None
                 and transaction.state
@@ -5180,9 +5131,7 @@ class CortexDaemon:
     async def restore_all_transactional_effects(
         self,
         *,
-        reason: Literal["system_cancelled", "emergency_restore"] = (
-            "emergency_restore"
-        ),
+        reason: Literal["system_cancelled", "emergency_restore"] = ("emergency_restore"),
         timeout_seconds: float = 3.0,
     ) -> dict[str, int]:
         """Dispatch every exact inverse and wait for bounded verification.
@@ -5245,7 +5194,9 @@ class CortexDaemon:
         }
 
     async def _check_action_consent(
-        self, action_type: str, requested_level: int,
+        self,
+        action_type: str,
+        requested_level: int,
     ) -> bool:
         """Phase-4b TASK M: per-action consent gate for the executor.
 
@@ -5256,7 +5207,8 @@ class CortexDaemon:
         """
         try:
             decision = await self._consent_ladder.check(
-                action_type=action_type, requested_level=requested_level,
+                action_type=action_type,
+                requested_level=requested_level,
             )
             return bool(decision.allowed)
         except Exception:
@@ -5267,7 +5219,8 @@ class CortexDaemon:
             return False
 
     async def _resume_last_active_file(
-        self, params: dict[str, Any],
+        self,
+        params: dict[str, Any],
     ) -> tuple[bool, str | None]:
         """Phase-4b TASK M: focus the editor on the last active file.
 
@@ -5289,7 +5242,9 @@ class CortexDaemon:
             return (False, "editor_send_failed")
 
     async def _broadcast_prompt(
-        self, action_type: str, params: dict[str, Any],
+        self,
+        action_type: str,
+        params: dict[str, Any],
     ) -> tuple[bool, str | None]:
         """Phase-4b TASK M: WS broadcast for prompt-only special actions.
 
@@ -5304,10 +5259,7 @@ class CortexDaemon:
         try:
             prompt = str(params.get("prompt") or "")
             timeout_seconds = params.get("timeout_seconds")
-            metadata = {
-                k: v for k, v in params.items()
-                if k not in ("prompt", "timeout_seconds")
-            }
+            metadata = {k: v for k, v in params.items() if k not in ("prompt", "timeout_seconds")}
             await self._ws_server.send_message(
                 MessageType.INTERVENTION_PROMPT.value,
                 {
@@ -5320,7 +5272,8 @@ class CortexDaemon:
             return (True, None)
         except Exception:
             logger.exception(
-                "broadcast_prompt failed for action=%s", action_type,
+                "broadcast_prompt failed for action=%s",
+                action_type,
             )
             return (False, "broadcast_failed")
 
@@ -5359,12 +5312,10 @@ class CortexDaemon:
             if (
                 mute_window > 0
                 and self._last_mic_active_at > 0
-                and monotonic_seconds(self._clock) - self._last_mic_active_at
-                < mute_window
+                and monotonic_seconds(self._clock) - self._last_mic_active_at < mute_window
             ):
                 logger.info(
-                    "Biology break: muting audio_cue — microphone "
-                    "was active in the last %.0fs",
+                    "Biology break: muting audio_cue — microphone was active in the last %.0fs",
                     mute_window,
                 )
                 audio_cue = False
@@ -5380,7 +5331,8 @@ class CortexDaemon:
             )
         except Exception:
             logger.debug(
-                "BIOLOGY_BREAK_STARTED log failed", exc_info=True,
+                "BIOLOGY_BREAK_STARTED log failed",
+                exc_info=True,
             )
         record = await self._break_controller.start(
             duration_seconds=int(duration_seconds),
@@ -5405,28 +5357,30 @@ class CortexDaemon:
                 EventType.BIOLOGY_BREAK_COMPLETED.value,
                 intervention_id or "-",
                 float(record.duration_seconds),
-                (
-                    f"{record.recovery_delta:.1f}"
-                    if record.recovery_delta is not None else "n/a"
-                ),
+                (f"{record.recovery_delta:.1f}" if record.recovery_delta is not None else "n/a"),
                 bool(record.completed),
             )
         except Exception:
             logger.debug(
-                "BIOLOGY_BREAK_COMPLETED log failed", exc_info=True,
+                "BIOLOGY_BREAK_COMPLETED log failed",
+                exc_info=True,
             )
         payload = record.model_dump(mode="json")
         if intervention_id:
-            self._recorder.append("biology_break", {
-                "intervention_id": intervention_id,
-                **payload,
-            })
+            self._recorder.append(
+                "biology_break",
+                {
+                    "intervention_id": intervention_id,
+                    **payload,
+                },
+            )
         return payload
 
     # ─── P0 §3.9: causal rationale resolution ────────────────────────
 
     async def get_causal_signals(
-        self, intervention_id: str,
+        self,
+        intervention_id: str,
     ) -> list[dict[str, Any]] | None:
         """Return the cached CausalSignal list for an intervention.
 
@@ -5447,7 +5401,8 @@ class CortexDaemon:
             if latest_features is None:
                 return None
             signals = self._causal_attributor.attribute_top_signals(
-                latest_features, self._scorer.baselines,
+                latest_features,
+                self._scorer.baselines,
             )
         except Exception:
             logger.debug("get_causal_signals fallback failed", exc_info=True)
@@ -5471,9 +5426,7 @@ class CortexDaemon:
             if isinstance(deadline, BoundedDeadline)
             else ends_at is not None and unix_seconds(active_clock) >= ends_at
         )
-        if kind == "off" or (
-            ends_at is not None and deadline_expired
-        ):
+        if kind == "off" or (ends_at is not None and deadline_expired):
             # Stale window — re-normalise so the broadcast is honest.
             kind = "off"
             ends_at = None
@@ -5536,7 +5489,8 @@ class CortexDaemon:
         """
         if kind not in ("snooze_15", "quiet_session", "pause", "off"):
             logger.warning(
-                "set_quiet_mode: unknown kind=%r (treating as 'off')", kind,
+                "set_quiet_mode: unknown kind=%r (treating as 'off')",
+                kind,
             )
             kind = "off"
         # ``duration_minutes == 0`` is the documented "use daemon
@@ -5550,23 +5504,14 @@ class CortexDaemon:
         if kind == "snooze_15":
             minutes = max(1, min(240, int(duration_minutes or 15)))
         elif kind == "quiet_session":
-            minutes = max(1, min(240, int(
-                duration_minutes
-                or self.config.intervention.quiet_mode_minutes
-            )))
+            minutes = max(
+                1, min(240, int(duration_minutes or self.config.intervention.quiet_mode_minutes))
+            )
         else:
             minutes = 0  # pause / off carry no countdown
         active_clock = getattr(self, "_clock", SYSTEM_CLOCK)
-        deadline = (
-            BoundedDeadline.after(active_clock, minutes * 60_000)
-            if minutes > 0
-            else None
-        )
-        ends_at = (
-            deadline.expires_at_unix_ms / 1_000.0
-            if deadline is not None
-            else None
-        )
+        deadline = BoundedDeadline.after(active_clock, minutes * 60_000) if minutes > 0 else None
+        ends_at = deadline.expires_at_unix_ms / 1_000.0 if deadline is not None else None
 
         # Serialise under the lock so two surfaces flipping kinds
         # simultaneously can't drop the pause-was-capturing latch.
@@ -5623,9 +5568,13 @@ class CortexDaemon:
                 # INTO pause from a non-pause state (Phase-3 P1-DF-11.5
                 # — second pause-click clobbered the latch).
                 if prev_kind != "pause":
-                    was_running = bool(getattr(
-                        self._capture_pipeline, "is_running", False,
-                    ))
+                    was_running = bool(
+                        getattr(
+                            self._capture_pipeline,
+                            "is_running",
+                            False,
+                        )
+                    )
                     self._pause_was_capturing = was_running
                     if was_running:
                         try:
@@ -5702,11 +5651,15 @@ class CortexDaemon:
             )
         logger.info(
             "Quiet mode set to %s (duration=%s min, source=%s)",
-            kind, minutes if minutes > 0 else "-", source,
+            kind,
+            minutes if minutes > 0 else "-",
+            source,
         )
 
     async def _decay_quiet_mode_after(
-        self, delay_seconds: float, expected_kind: str,
+        self,
+        delay_seconds: float,
+        expected_kind: str,
     ) -> None:
         """Sleep ``delay_seconds`` then broadcast an "off" state IF the
         mode hasn't already transitioned away from ``expected_kind``.
@@ -5788,9 +5741,7 @@ class CortexDaemon:
             logger.debug("macOS notification helper unavailable")
             return
         headline = (getattr(plan, "headline", "") or "Cortex").strip()
-        primary_focus = (
-            getattr(plan, "primary_focus", "") or ""
-        ).strip()
+        primary_focus = (getattr(plan, "primary_focus", "") or "").strip()
         # F09 sanitisation: explicit allowlist — no biometric numerics.
         body_parts: list[str] = []
         if primary_focus:
@@ -5806,7 +5757,8 @@ class CortexDaemon:
             )
         except Exception:
             logger.debug(
-                "send_intervention_notification raised", exc_info=True,
+                "send_intervention_notification raised",
+                exc_info=True,
             )
             return
         # C6 (audit): emit OS_NOTIFICATION_SENT when the OS actually posted
@@ -5822,63 +5774,6 @@ class CortexDaemon:
     # ------------------------------------------------------------------
     # P0 §3.10: auto-armed distraction blocking on HYPER
     # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Consent overrides persistence (Phase-3 P0 / Audit-1.1 P0-1)
-    # ------------------------------------------------------------------
-
-    def _load_consent_overrides(self) -> None:
-        """Rehydrate ``ConsentPolicy.set_level`` overrides from disk so
-        the user's autonomous-act opt-ins (e.g. distraction_block)
-        survive a daemon restart. Missing or corrupt file → start with
-        the default policy (REVERSIBLE_ACT for distraction_block, etc.).
-        """
-        path = self._consent_overrides_path
-        if not path.exists():
-            return
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            logger.warning(
-                "consent_overrides.json unreadable; starting from defaults",
-                exc_info=True,
-            )
-            return
-        levels = payload.get("levels") if isinstance(payload, dict) else None
-        if not isinstance(levels, dict):
-            return
-        for action_type, raw_level in levels.items():
-            if not isinstance(action_type, str):
-                continue
-            try:
-                self._consent_policy.set_level(
-                    action_type, int(raw_level),
-                )
-            except Exception:
-                logger.debug(
-                    "skipping malformed consent override %r=%r",
-                    action_type, raw_level,
-                )
-        logger.info(
-            "Restored %d consent overrides from %s",
-            len(levels), path,
-        )
-
-    def _persist_consent_overrides(self) -> None:
-        """Atomically write the current ``ConsentPolicy`` overrides to
-        disk. Called from every ``set_level`` mutation path so a crash
-        between the in-memory flip and the next planned write doesn't
-        lose the user's choice."""
-        from cortex.libs.utils.atomic_write import atomic_write_json
-
-        path = self._consent_overrides_path
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_json(path, self._consent_policy.to_dict())
-        except Exception:
-            logger.warning(
-                "consent_overrides persist failed", exc_info=True,
-            )
 
     def _reset_auto_focus_timers(self) -> None:
         """Phase-3 P1-N3 + Audit-1.1 P1-7: shared reset of every
@@ -5955,15 +5850,9 @@ class CortexDaemon:
                 await self._emit_stop_focus_auto(reason="evidence_unavailable")
             self._reset_auto_focus_timers()
             return
-        confidence_gate = float(
-            getattr(cfg, "auto_distraction_block_confidence", 0.85)
-        )
-        dwell_gate = float(
-            getattr(cfg, "auto_distraction_block_dwell_seconds", 30.0)
-        )
-        exit_gate = float(
-            getattr(cfg, "auto_distraction_block_exit_seconds", 300.0)
-        )
+        confidence_gate = float(getattr(cfg, "auto_distraction_block_confidence", 0.85))
+        dwell_gate = float(getattr(cfg, "auto_distraction_block_dwell_seconds", 30.0))
+        exit_gate = float(getattr(cfg, "auto_distraction_block_exit_seconds", 300.0))
 
         if state == "HYPER" and confidence >= confidence_gate:
             # Active dwell — clear the recovery countdown so we don't
@@ -5989,7 +5878,8 @@ class CortexDaemon:
                 if cooldown_elapsed < _AUTO_FOCUS_DEBOUNCE_S:
                     logger.debug(
                         "auto-arm suppressed by debounce (cooldown %.1fs < %.1fs)",
-                        cooldown_elapsed, _AUTO_FOCUS_DEBOUNCE_S,
+                        cooldown_elapsed,
+                        _AUTO_FOCUS_DEBOUNCE_S,
                     )
                 else:
                     # Phase-3 P1-2 (Audit-1.1): only flip the armed flag
@@ -6014,7 +5904,8 @@ class CortexDaemon:
                             )
                         except Exception:
                             logger.debug(
-                                "arm structured log failed", exc_info=True,
+                                "arm structured log failed",
+                                exc_info=True,
                             )
         elif self._auto_focus_armed and state in ("FLOW", "RECOVERY"):
             if not self._auto_focus_recovery_started:
@@ -6037,7 +5928,8 @@ class CortexDaemon:
                 if held_for < _AUTO_FOCUS_DEBOUNCE_S:
                     logger.debug(
                         "auto-disarm suppressed by debounce (held %.1fs < %.1fs)",
-                        held_for, _AUTO_FOCUS_DEBOUNCE_S,
+                        held_for,
+                        _AUTO_FOCUS_DEBOUNCE_S,
                     )
                 else:
                     await self._emit_stop_focus_auto(reason="sustained_recovery")
@@ -6069,8 +5961,7 @@ class CortexDaemon:
         emitted through the legacy command channel.
         """
         logger.info(
-            "START_FOCUS_AUTO suppressed pending exact transaction support "
-            "(mode=%s reason=%s)",
+            "START_FOCUS_AUTO suppressed pending exact transaction support (mode=%s reason=%s)",
             getattr(self, "intervention_execution_mode", "suggest_only"),
             reason,
         )
@@ -6165,9 +6056,7 @@ class CortexDaemon:
                 logger.warning("toggle_micro_step: missing intervention_id")
                 return
             if not isinstance(step_index, int) or step_index < 0:
-                logger.warning(
-                    "toggle_micro_step: invalid step_index=%r", step_index
-                )
+                logger.warning("toggle_micro_step: invalid step_index=%r", step_index)
                 return
 
             # ---- locate the live plan ---------------------------------
@@ -6178,8 +6067,7 @@ class CortexDaemon:
                 or self._active_intervention_id != intervention_id
             ):
                 logger.info(
-                    "toggle_micro_step: dropping stale toggle "
-                    "(requested=%s active=%s)",
+                    "toggle_micro_step: dropping stale toggle (requested=%s active=%s)",
                     intervention_id,
                     self._active_intervention_id,
                 )
@@ -6187,8 +6075,7 @@ class CortexDaemon:
 
             if step_index >= len(plan.micro_steps):
                 logger.warning(
-                    "toggle_micro_step: step_index=%d out of range "
-                    "(len=%d) for intervention=%s",
+                    "toggle_micro_step: step_index=%d out of range (len=%d) for intervention=%s",
                     step_index,
                     len(plan.micro_steps),
                     intervention_id,
@@ -6220,35 +6107,31 @@ class CortexDaemon:
 
             # ---- rebroadcast the updated trigger ----------------------
             try:
-                transaction = await self._transaction_coordinator.get_transaction(
-                    intervention_id
-                )
+                transaction = await self._transaction_coordinator.get_transaction(intervention_id)
                 await self._ws_server.send_intervention(
                     plan,
-                    action_manifest=(
-                        transaction.manifest if transaction is not None else None
-                    ),
+                    action_manifest=(transaction.manifest if transaction is not None else None),
                     execution_mode=(
                         self.intervention_execution_mode
-                        if transaction is not None
-                        and transaction.manifest.action_count > 0
+                        if transaction is not None and transaction.manifest.action_count > 0
                         else "suggest_only"
                     ),
                 )
             except Exception:
-                logger.debug(
-                    "MICRO_STEP_TOGGLED rebroadcast failed", exc_info=True
-                )
+                logger.debug("MICRO_STEP_TOGGLED rebroadcast failed", exc_info=True)
 
             # Persist via the recorder so the session report sees the
             # ``done`` history per step.
             try:
-                self._recorder.append("micro_step_toggled", {
-                    "intervention_id": intervention_id,
-                    "step_index": step_index,
-                    "new_status": new_status,
-                    "text": step.text,
-                })
+                self._recorder.append(
+                    "micro_step_toggled",
+                    {
+                        "intervention_id": intervention_id,
+                        "step_index": step_index,
+                        "new_status": new_status,
+                        "text": step.text,
+                    },
+                )
             except Exception:
                 logger.debug("micro_step_toggled append failed", exc_info=True)
 
@@ -6274,18 +6157,18 @@ class CortexDaemon:
                     # bandit / helpfulness ledger sees a consistent close.
                     try:
                         self._recorder.append(
-                            "intervention_outcome", outcome.model_dump(mode="json"),
+                            "intervention_outcome",
+                            outcome.model_dump(mode="json"),
                         )
                     except Exception:
-                        logger.debug(
-                            "intervention_outcome append failed", exc_info=True
-                        )
+                        logger.debug("intervention_outcome append failed", exc_info=True)
                     if outcome.workspace_restored:
                         self._active_intervention_id = None
                         self._active_plan = None
                         try:
                             await self._ws_server.send_restore(
-                                intervention_id, user_action="natural_recovery",
+                                intervention_id,
+                                user_action="natural_recovery",
                             )
                         except Exception:
                             logger.debug(
@@ -6294,7 +6177,8 @@ class CortexDaemon:
                             )
                         try:
                             self._helpfulness.record_user_action(
-                                intervention_id, "natural_recovery",
+                                intervention_id,
+                                "natural_recovery",
                             )
                         except Exception:
                             logger.debug(
@@ -6316,8 +6200,7 @@ class CortexDaemon:
         if payload.get("auto_focus_dismissed") is True:
             iid = str(payload.get("intervention_id") or "")
             decision_id = (
-                self._amip_decision_ids_by_intervention.get(iid)
-                if iid else None
+                self._amip_decision_ids_by_intervention.get(iid) if iid else None
             ) or self._last_policy_decision_id
             if decision_id and self.config.eval.policy == "amip":
                 try:
@@ -6347,25 +6230,26 @@ class CortexDaemon:
             # set to ``desktop_overlay_dispatch``) still records because
             # it carries the actual ``result``.
             is_dispatch_request = (
-                payload.get("result") is None
-                and payload.get("request_dispatch") is True
+                payload.get("result") is None and payload.get("request_dispatch") is True
             )
             if is_dispatch_request and not self.workspace_mutation_allowed:
                 logger.info(
-                    "Action request denied in suggest-only mode "
-                    "(action_id=%s action_type=%s)",
+                    "Action request denied in suggest-only mode (action_id=%s action_type=%s)",
                     payload.get("action_id"),
                     payload.get("action_type"),
                 )
                 return
             if not is_dispatch_request:
-                self._recorder.append("action_executed", {
-                    "intervention_id": payload.get("intervention_id"),
-                    "action_id": payload.get("action_id"),
-                    "action_type": payload.get("action_type"),
-                    "result": payload.get("result"),
-                    "source": payload.get("source") or source_client or None,
-                })
+                self._recorder.append(
+                    "action_executed",
+                    {
+                        "intervention_id": payload.get("intervention_id"),
+                        "action_id": payload.get("action_id"),
+                        "action_type": payload.get("action_type"),
+                        "result": payload.get("result"),
+                        "source": payload.get("source") or source_client or None,
+                    },
+                )
             # G4 (audit-prod): when the request originates from the
             # desktop shell (no ``result`` field; the result only exists
             # on the executed-by-extension reply path), forward to the
@@ -6380,16 +6264,15 @@ class CortexDaemon:
             # peer client could have produced it.
             # Compatibility action names remain decodable, but unsupported
             # physiology never confers break-action authority.
-            action_dict_raw = payload.get("action") if isinstance(payload.get("action"), dict) else None
+            action_dict_raw = (
+                payload.get("action") if isinstance(payload.get("action"), dict) else None
+            )
             current_action_type = str(
-                payload.get("action_type")
-                or (action_dict_raw or {}).get("action_type")
-                or ""
+                payload.get("action_type") or (action_dict_raw or {}).get("action_type") or ""
             )
             if current_action_type == "take_biology_break":
                 logger.info(
-                    "Ignoring compatibility take_biology_break action "
-                    "(intervention_id=%s)",
+                    "Ignoring compatibility take_biology_break action (intervention_id=%s)",
                     payload.get("intervention_id"),
                 )
                 return
@@ -6414,8 +6297,7 @@ class CortexDaemon:
                 )
             elif is_dispatch_request:
                 logger.warning(
-                    "ACTION_DISPATCH refused: non-desktop source %r tried "
-                    "to forward action_id=%s",
+                    "ACTION_DISPATCH refused: non-desktop source %r tried to forward action_id=%s",
                     source_client,
                     payload.get("action_id"),
                 )
@@ -6436,13 +6318,18 @@ class CortexDaemon:
             )
             if iid and rating:
                 self._helpfulness.record_rating(
-                    iid, rating, text_feedback=text_feedback,
+                    iid,
+                    rating,
+                    text_feedback=text_feedback,
                 )
-                self._recorder.append("helpfulness", {
-                    "intervention_id": iid,
-                    "user_rating": rating,
-                    "text_feedback": text_feedback,
-                })
+                self._recorder.append(
+                    "helpfulness",
+                    {
+                        "intervention_id": iid,
+                        "user_rating": rating,
+                        "text_feedback": text_feedback,
+                    },
+                )
                 # Phase-4b TASK A: route the rating into AMIP so the
                 # bandit learns from explicit feedback even when the
                 # implicit engaged/dismissed signal has not arrived yet
@@ -6450,13 +6337,11 @@ class CortexDaemon:
                 # Reward shape: thumbs_up → +0.7, thumbs_down → -0.7;
                 # values match the implicit-signal magnitudes the
                 # helpfulness tracker emits on engagement.
-                if (
-                    self.config.eval.policy == "amip"
-                    and rating in ("thumbs_up", "thumbs_down")
-                ):
+                if self.config.eval.policy == "amip" and rating in ("thumbs_up", "thumbs_down"):
                     rating_reward = 0.7 if rating == "thumbs_up" else -0.7
                     decision_id = self._amip_decision_ids_by_intervention.get(
-                        iid, self._last_policy_decision_id,
+                        iid,
+                        self._last_policy_decision_id,
                     )
                     if decision_id:
                         try:
@@ -6464,11 +6349,16 @@ class CortexDaemon:
                             logger.info(
                                 "amip_rating_reward intervention_id=%s "
                                 "decision_id=%s rating=%s reward=%.2f cid=%s",
-                                iid, decision_id, rating, rating_reward, cid,
+                                iid,
+                                decision_id,
+                                rating,
+                                rating_reward,
+                                cid,
                             )
                             # synchronous; see note at the other call site.
                             self._amip.update_reward(
-                                decision_id, rating_reward,
+                                decision_id,
+                                rating_reward,
                             )
                         except Exception:
                             logger.debug(
@@ -6489,9 +6379,7 @@ class CortexDaemon:
                         # activation timestamp; subsequent crossings
                         # are no-ops until the window clears.
                         now = monotonic_seconds(self._clock)
-                        already_latched = (
-                            now - self._quiet_mode_throttle_latched_at < 30.0
-                        )
+                        already_latched = now - self._quiet_mode_throttle_latched_at < 30.0
                         if recent >= 5 and not already_latched:
                             logger.info(
                                 "Frustration spiral detected (%d downvotes in 30s) "
@@ -6545,9 +6433,7 @@ class CortexDaemon:
         # Fall back to the trigger-policy's last evaluated confidence and the
         # current context only when the snapshot is missing (e.g. a legacy
         # intervention id from before this cache existed).
-        cached_features = self._dismissal_features_by_intervention.get(
-            intervention_id
-        )
+        cached_features = self._dismissal_features_by_intervention.get(intervention_id)
         if cached_features is not None:
             trigger_conf, trigger_complexity = cached_features
         else:
@@ -6562,9 +6448,9 @@ class CortexDaemon:
         # this intervention acted on (the executor gates on the same keys),
         # so escalation actually lifts the gate on approved actions. Falls
         # back to the legacy "intervention" key when no actions were cached.
-        consent_keys = self._consent_actions_by_intervention.get(
-            intervention_id
-        ) or ["intervention"]
+        consent_keys = self._consent_actions_by_intervention.get(intervention_id) or [
+            "intervention"
+        ]
 
         if action == "engaged":
             outcome = await self._restore_manager.engage(intervention_id)
@@ -6652,20 +6538,27 @@ class CortexDaemon:
                 intervention_id=intervention_id,
                 state=state_estimate.state,
                 confidence=state_estimate.confidence,
-                complexity=context.complexity_score if context and hasattr(context, 'complexity_score') else 0.0,
+                complexity=context.complexity_score
+                if context and hasattr(context, "complexity_score")
+                else 0.0,
                 tab_count=(
                     int(context.browser_context.tab_count)
                     if context and hasattr(context, "browser_context") and context.browser_context
                     else 0
                 ),
-                error_count=int(context.total_errors) if context and hasattr(context, "total_errors") else 0,
+                error_count=int(context.total_errors)
+                if context and hasattr(context, "total_errors")
+                else 0,
             )
             if reward_record is not None:
                 reward = float(reward_record.get("reward_signal", 0.0))
-                self._recorder.append("helpfulness", {
-                    "intervention_id": intervention_id,
-                    "reward_signal": reward,
-                })
+                self._recorder.append(
+                    "helpfulness",
+                    {
+                        "intervention_id": intervention_id,
+                        "reward_signal": reward,
+                    },
+                )
                 # Update bandit with reward
                 if self.config.eval.policy == "amip":
                     decision_id = self._amip_decision_ids_by_intervention.pop(
@@ -6704,7 +6597,10 @@ class CortexDaemon:
         await self._record_tab_relevance_feedback(action, outcome, intervention_id)
 
     async def _record_tab_relevance_feedback(
-        self, action: str, outcome: Any, intervention_id: str = "",
+        self,
+        action: str,
+        outcome: Any,
+        intervention_id: str = "",
     ) -> None:
         """Record tab relevance feedback based on user action.
 
@@ -6783,9 +6679,7 @@ class CortexDaemon:
     # longitudinal task-pattern aggregator reads. Work-relevant types
     # (documentation/stackoverflow/search/code_host/goal_relevant) are NOT
     # distractions and are excluded.
-    _DISTRACTION_TAB_TYPES = frozenset(
-        {"distraction", "social", "video_platform"}
-    )
+    _DISTRACTION_TAB_TYPES = frozenset({"distraction", "social", "video_platform"})
 
     async def _handle_activity_sync(self, payload: dict[str, Any]) -> None:
         """Handle ACTIVITY_SYNC from browser extension — aggregate into daily timeline."""
@@ -7080,14 +6974,16 @@ class CortexDaemon:
                 if not action_name or not isinstance(params, dict):
                     continue
 
-                signature = ":".join([
-                    action_name,
-                    str(context.problem_id),
-                    context.stage.value,
-                    str(context.submission_count),
-                    str(context.wrong_answer_count),
-                    str(context.last_submission_ts or ""),
-                ])
+                signature = ":".join(
+                    [
+                        action_name,
+                        str(context.problem_id),
+                        context.stage.value,
+                        str(context.submission_count),
+                        str(context.wrong_answer_count),
+                        str(context.last_submission_ts or ""),
+                    ]
+                )
                 last_sent = self._leetcode_action_signatures.get(signature)
                 if last_sent is not None and timestamp - last_sent < 30.0:
                     continue
@@ -7121,13 +7017,16 @@ class CortexDaemon:
                 result = await self._leetcode_adapter.execute(action_name, params)
                 if result.success:
                     self._leetcode_action_signatures[signature] = timestamp
-                    self._recorder.append("leetcode_intervention", {
-                        "action": action_name,
-                        "payload": params,
-                        "mode": mode_estimate.mode.value,
-                        "stage": mode_estimate.stage.value,
-                        "problem_id": context.problem_id,
-                    })
+                    self._recorder.append(
+                        "leetcode_intervention",
+                        {
+                            "action": action_name,
+                            "payload": params,
+                            "mode": mode_estimate.mode.value,
+                            "stage": mode_estimate.stage.value,
+                            "problem_id": context.problem_id,
+                        },
+                    )
                 else:
                     logger.debug("LeetCode action %s failed: %s", action_name, result.error)
 
@@ -7178,11 +7077,13 @@ class CortexDaemon:
         hour = utc_datetime(self._clock).hour
         return [
             state_map.get(estimate.state, 0.5),
-            context.complexity_score if hasattr(context, 'complexity_score') else 0.0,
+            context.complexity_score if hasattr(context, "complexity_score") else 0.0,
             float(context.browser_context.tab_count if context.browser_context else 0) / 20.0,
-            float(context.total_errors if hasattr(context, 'total_errors') else 0) / 10.0,
+            float(context.total_errors if hasattr(context, "total_errors") else 0) / 10.0,
             hour / 24.0,
-            self._aggregator.thrashing_score if hasattr(self._aggregator, 'thrashing_score') else 0.0,
+            self._aggregator.thrashing_score
+            if hasattr(self._aggregator, "thrashing_score")
+            else 0.0,
             0.0,  # retired HRV stress-integral feature
             0.5,  # consent level placeholder
         ]
@@ -7228,15 +7129,18 @@ class CortexDaemon:
             content = await briefing.check_and_generate()
             if content is not None:
                 logger.info("Morning briefing available: %s", content.summary[:80])
-                await self._ws_server.send_message("MORNING_BRIEFING", {
-                    "summary": content.summary,
-                    "action_items": content.action_items,
-                    # ``BriefingContent`` has no ``left_off_at`` field; the
-                    # wire contract's ``left_off_at`` is the "where you left
-                    # off" headline the popup feeds into START_FOCUS as the
-                    # resume goal — that is the briefing ``title``.
-                    "left_off_at": content.title,
-                })
+                await self._ws_server.send_message(
+                    "MORNING_BRIEFING",
+                    {
+                        "summary": content.summary,
+                        "action_items": content.action_items,
+                        # ``BriefingContent`` has no ``left_off_at`` field; the
+                        # wire contract's ``left_off_at`` is the "where you left
+                        # off" headline the popup feeds into START_FOCUS as the
+                        # resume goal — that is the briefing ``title``.
+                        "left_off_at": content.title,
+                    },
+                )
         except Exception:
             logger.debug("No morning briefing available")
 
@@ -7258,9 +7162,15 @@ class CortexDaemon:
                 logger.debug("Failed to fetch activities for handover")
 
             await snapshot.capture_and_write(
-                browser_context=context.browser_context.model_dump() if hasattr(context, "browser_context") and context.browser_context else None,
-                editor_context=context.editor_context.model_dump() if hasattr(context, "editor_context") and context.editor_context else None,
-                terminal_context=context.terminal_context.model_dump() if hasattr(context, "terminal_context") and context.terminal_context else None,
+                browser_context=context.browser_context.model_dump()
+                if hasattr(context, "browser_context") and context.browser_context
+                else None,
+                editor_context=context.editor_context.model_dump()
+                if hasattr(context, "editor_context") and context.editor_context
+                else None,
+                terminal_context=context.terminal_context.model_dump()
+                if hasattr(context, "terminal_context") and context.terminal_context
+                else None,
                 activity_timeline=activity_timeline,
                 llm_client=self._llm_client,
             )
@@ -7288,7 +7198,8 @@ class CortexDaemon:
             logger.debug("longitudinal loop cancelled")
 
     def register_client_identified_listener(
-        self, listener: Callable[[str, bool], None],
+        self,
+        listener: Callable[[str, bool], None],
     ) -> None:
         """Audit-prod G1: subscribe to (client_type, connected) events.
 
@@ -7309,9 +7220,7 @@ class CortexDaemon:
             try:
                 listener(client_type, connected)
             except Exception:
-                logger.debug(
-                    "client_identified listener raised", exc_info=True
-                )
+                logger.debug("client_identified listener raised", exc_info=True)
         if not connected or not self._pending_startup_restores:
             return
         executor = {
@@ -7582,8 +7491,13 @@ class CortexDaemon:
             return
         cleaned: dict[str, list[str]] = {}
         valid_days = {
-            "monday", "tuesday", "wednesday", "thursday",
-            "friday", "saturday", "sunday",
+            "monday",
+            "tuesday",
+            "wednesday",
+            "thursday",
+            "friday",
+            "saturday",
+            "sunday",
         }
         for day, slots in schedule.items():
             if not isinstance(day, str):
@@ -7626,6 +7540,7 @@ class CortexDaemon:
                 # C4 (audit): wrap the real report in the declared
                 # ``SessionRecap`` envelope (forced recap is never persisted).
                 from cortex.libs.schemas.realtime import SessionRecap
+
                 report = self._session_report.finish()
                 recap_payload = SessionRecap(
                     report=report,
@@ -7732,7 +7647,11 @@ class CortexDaemon:
                     logger.exception("Failed to enable capture pipeline")
                     self._capture_available = False
                     self._capture_processing_enabled = False
-            elif not desired_capture and self._capture_available and self._capture_pipeline.is_running:
+            elif (
+                not desired_capture
+                and self._capture_available
+                and self._capture_pipeline.is_running
+            ):
                 await self._capture_pipeline.stop()
                 self._capture_available = False
         if "input_telemetry_enabled" in settings:
@@ -7792,10 +7711,10 @@ class CortexDaemon:
                     "distraction_block",
                     AUTONOMOUS_ACT if new_value else REVERSIBLE_ACT,
                 )
-                self._persist_consent_overrides()
             except Exception:
                 logger.debug(
-                    "distraction_block consent flip failed", exc_info=True,
+                    "distraction_block consent flip failed",
+                    exc_info=True,
                 )
             # Phase-3 P0-N4 + Audit-1.1 P0-2: if the user opted OUT
             # while a focus session is daemon-armed, disarm it so the
@@ -7807,7 +7726,8 @@ class CortexDaemon:
                     await self.disarm_auto_focus()
                 except Exception:
                     logger.debug(
-                        "disarm_auto_focus on opt-out failed", exc_info=True,
+                        "disarm_auto_focus on opt-out failed",
+                        exc_info=True,
                     )
         if "auto_distraction_block_preset" in settings:
             preset = str(settings["auto_distraction_block_preset"])
@@ -7878,13 +7798,16 @@ class CortexDaemon:
         """
         clamped = max(1, min(100, int(limit) if limit is not None else 30))
         return await asyncio.to_thread(
-            self._session_reader.list_sessions, since, clamped,
+            self._session_reader.list_sessions,
+            since,
+            clamped,
         )
 
     async def get_session(self, session_id: str) -> SessionDetailResponse:
         """P0 §3.1: single-report lookup (validated session_id)."""
         return await asyncio.to_thread(
-            self._session_reader.read_session, session_id,
+            self._session_reader.read_session,
+            session_id,
         )
 
     async def restore_intervention(
@@ -7933,12 +7856,12 @@ class CortexDaemon:
         elif window == "week":
             resolved_window = "week"
         else:
-            logger.warning(
-                "get_trends: unknown window=%r; falling back to 'week'", window
-            )
+            logger.warning("get_trends: unknown window=%r; falling back to 'week'", window)
             resolved_window = "week"
         return await asyncio.to_thread(
-            self._session_aggregator.get_trends, resolved_window, refresh=refresh,
+            self._session_aggregator.get_trends,
+            resolved_window,
+            refresh=refresh,
         )
 
     def latest_session_recap(self) -> dict[str, Any] | None:
@@ -7951,7 +7874,8 @@ class CortexDaemon:
         return self._latest_session_recap
 
     async def acknowledge_session_recap(
-        self, session_id: str | None = None,
+        self,
+        session_id: str | None = None,
     ) -> None:
         """P0 §3.3 (Wave-2 P1): release the ``stop()`` wait on recap dismissal.
 
@@ -7971,8 +7895,7 @@ class CortexDaemon:
             self._recap_dismissed_event.set()
         except Exception:
             logger.debug(
-                "acknowledge_session_recap: failed to set event "
-                "(session_id=%r)",
+                "acknowledge_session_recap: failed to set event (session_id=%r)",
                 session_id,
                 exc_info=True,
             )

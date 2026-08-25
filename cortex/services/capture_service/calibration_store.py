@@ -62,7 +62,12 @@ class CalibrationProfileStore:
         atomic_write_json(path, profile.model_dump(mode="json"))
         return path
 
-    def activate(self, profile: CalibrationProfile) -> ActiveCalibrationPointer:
+    def activate(
+        self,
+        profile: CalibrationProfile,
+        *,
+        pointer: ActiveCalibrationPointer | None = None,
+    ) -> ActiveCalibrationPointer:
         """Commit a measured profile; the pointer is written last."""
 
         if profile.provenance != CalibrationProvenance.MEASURED.value:
@@ -71,11 +76,18 @@ class CalibrationProfileStore:
             raise ValueError("an active calibration profile requires explicit approval")
         self.save_inactive(profile)
 
-        pointer = ActiveCalibrationPointer(
-            profile_id=profile.profile_id,
-            profile_sha256=calibration_profile_sha256(profile),
-            activated_at_unix_ms=self._clock.unix_ms(),
-        )
+        expected_sha256 = calibration_profile_sha256(profile)
+        if pointer is None:
+            pointer = ActiveCalibrationPointer(
+                profile_id=profile.profile_id,
+                profile_sha256=expected_sha256,
+                activated_at_unix_ms=self._clock.unix_ms(),
+            )
+        elif (
+            pointer.profile_id != profile.profile_id
+            or pointer.profile_sha256 != expected_sha256
+        ):
+            raise ValueError("active calibration pointer does not match profile")
         atomic_write_json(
             self.active_pointer_path,
             pointer.model_dump(mode="json"),

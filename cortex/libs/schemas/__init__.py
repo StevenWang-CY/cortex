@@ -208,6 +208,15 @@ from cortex.libs.schemas.state import (
     UserBaselines,
     UserState,
 )
+from cortex.libs.schemas.storage import (
+    StorageDeleteRequest,
+    StorageDeleteResponse,
+    StorageExportRequest,
+    StorageExportResponse,
+    StorageHealthReport,
+    StorageStatusResponse,
+    StoredAnalyticsEvent,
+)
 from cortex.libs.schemas.temporal import (
     DualClockModel,
     EventMetadata,
@@ -397,4 +406,12 @@ __all__ = [
     # WS Envelope (Debt-1 codegen source of truth)
     "WSMessage",
     "MessageType",
+    # Local storage and maintenance
+    "StoredAnalyticsEvent",
+    "StorageHealthReport",
+    "StorageStatusResponse",
+    "StorageExportRequest",
+    "StorageExportResponse",
+    "StorageDeleteRequest",
+    "StorageDeleteResponse",
 ]

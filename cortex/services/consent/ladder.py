@@ -153,7 +153,18 @@ class ConsentLadder:
                 data = await self._store.get_json("consent_ladder_state")
                 if data and isinstance(data, dict):
                     self._action_states = data.get("action_states", {})
-                    if "global_max" in data:
+                    policy_state = data.get("policy")
+                    if isinstance(policy_state, dict):
+                        levels = policy_state.get("levels", {})
+                        if isinstance(levels, dict):
+                            for action_type, level in levels.items():
+                                if isinstance(action_type, str) and isinstance(level, int):
+                                    self._policy.set_level(action_type, level)
+                        policy_global_max = policy_state.get("global_max")
+                        if isinstance(policy_global_max, int):
+                            self._policy.global_max_level = policy_global_max
+                    elif "global_max" in data:
+                        # Decode-only support for the pre-SQLite state shape.
                         self._policy.global_max_level = data["global_max"]
                     revision = data.get("revision", 0)
                     if isinstance(revision, int) and revision >= 0:
@@ -173,6 +184,7 @@ class ConsentLadder:
             await self._store.set_json("consent_ladder_state", {
                 "action_states": self._action_states,
                 "global_max": self._policy.global_max_level,
+                "policy": self._policy.to_dict(),
                 "revision": self._revision,
             })
         except Exception:

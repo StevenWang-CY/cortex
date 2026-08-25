@@ -16,6 +16,7 @@ from cortex.libs.schemas.intervention_transaction import (
     InterventionTransactionJournal,
 )
 from cortex.libs.utils.atomic_write import atomic_write_json
+from cortex.storage.intervention_store import SQLiteInterventionTransactionStore
 
 logger = logging.getLogger(__name__)
 
@@ -105,4 +106,5 @@ class JsonInterventionTransactionStore:
 __all__ = [
     "InMemoryInterventionTransactionStore",
     "JsonInterventionTransactionStore",
+    "SQLiteInterventionTransactionStore",
 ]

@@ -63,4 +63,17 @@ storage/logs/*
 storage/exports/*
 storage/models/*
 storage/.onboarding_complete
+storage/*.sqlite3
+storage/*.sqlite3-*
+storage/migration-backups/
+storage/calibration/
+storage/policy_log/
+storage/reports/
+storage/chronotype/
+storage/handovers/
+storage/intervention_transactions.json
+storage/consent_overrides.json
 !storage/**/.gitkeep
+
+# Local wheel verification output (CI uploads or discards its own copy).
+python-artifact/

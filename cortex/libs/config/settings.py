@@ -734,6 +734,14 @@ class StorageConfig(BaseModel):
     """Storage configuration."""
 
     path: str = Field(default_factory=_bundled_storage_path)
+    sqlite_filename: str = Field(
+        "cortex.sqlite3",
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*\.sqlite3$",
+        description="Filename only; the database always remains under storage.path.",
+    )
+    sqlite_busy_timeout_ms: int = Field(5_000, ge=1, le=60_000)
+    backup_retention_count: int = Field(3, ge=1, le=20)
+    analytics_queue_capacity: int = Field(256, ge=16, le=16_384)
     session_retention_days: int = 7
     feature_retention_days: int = 7
     error_retention_days: int = 90

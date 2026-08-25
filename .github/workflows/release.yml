@@ -58,6 +58,11 @@ jobs:
         # with release.yml's pre-release gate.
         run: mypy --config-file cortex/pyproject.toml cortex/ --strict
 
+      - name: Build and verify installable Python wheel
+        run: |
+          python -m pip wheel --no-deps ./cortex --wheel-dir python-artifact
+          python cortex/scripts/verify_python_artifact.py python-artifact/cortex-*.whl
+
       - name: Schema codegen drift
         run: python -m cortex.scripts.generate_ts_schemas --check
 

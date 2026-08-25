@@ -26,6 +26,7 @@ from cortex.libs.schemas.state import (
     StateEstimate,
     SupportState,
 )
+from cortex.libs.schemas.storage import StorageHealthReport
 from cortex.libs.schemas.temporal import DualClockModel
 
 
@@ -54,6 +55,7 @@ class HealthResponse(DualClockModel):
     duplicate_intervention_acks: int = 0
     frames_dropped_total: int = 0
     store_degraded: bool = False
+    storage: StorageHealthReport | None = None
     feedback_log_read_failures: int = 0
 
 

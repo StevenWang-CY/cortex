@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Literal
 
-from fastapi import APIRouter, Path, Request
+from fastapi import APIRouter, HTTPException, Path, Request
 from fastapi.responses import Response
 
 from cortex.application.clock import Clock, clock_or_system, utc_datetime
@@ -84,6 +84,14 @@ from cortex.libs.schemas.session_history import (
     TrendsResponse,
 )
 from cortex.libs.schemas.state import StateEstimate, StateScores
+from cortex.libs.schemas.storage import (
+    StorageDeleteRequest,
+    StorageDeleteResponse,
+    StorageExportRequest,
+    StorageExportResponse,
+    StorageHealthReport,
+    StorageStatusResponse,
+)
 from cortex.libs.schemas.temporal import EventTime
 from cortex.libs.schemas.ws_message_types import MessageType
 from cortex.services.intervention_engine import (
@@ -95,6 +103,7 @@ from cortex.services.intervention_engine import (
 from cortex.services.intervention_engine import (
     prepare_plan as _engine_prepare_plan,
 )
+from cortex.storage.maintenance import ActiveInterventionDataError
 
 
 def _get_intervention_port(request: Request) -> InterventionPort | None:
@@ -364,6 +373,7 @@ async def health_check(request: Request) -> HealthResponse:
     duplicate_acks = 0
     frames_dropped_total = 0
     store_degraded = False
+    storage_report: StorageHealthReport | None = None
     daemon = reg.get("daemon") if hasattr(reg, "get") else None
     if daemon is not None:
         duplicate_acks = int(
@@ -375,6 +385,16 @@ async def health_check(request: Request) -> HealthResponse:
             frames_dropped_total = int(
                 getattr(pipeline, "frames_dropped_total", 0) or 0
             )
+    storage_maintenance = (
+        reg.get("storage_maintenance") if hasattr(reg, "get") else None
+    )
+    if storage_maintenance is not None and hasattr(storage_maintenance, "health"):
+        try:
+            storage_report = await storage_maintenance.health()
+            store_degraded = store_degraded or storage_report.degraded
+        except Exception:
+            logger.warning("Storage health probe failed", exc_info=True)
+            store_degraded = True
 
     clock = _get_clock(request)
     app_state = getattr(getattr(request, "app", None), "state", None)
@@ -393,7 +413,60 @@ async def health_check(request: Request) -> HealthResponse:
         duplicate_intervention_acks=duplicate_acks,
         frames_dropped_total=frames_dropped_total,
         store_degraded=store_degraded,
+        storage=storage_report,
         feedback_log_read_failures=int(_feedback_log_read_failures),
+    )
+
+
+@router.get("/storage/status", response_model=StorageStatusResponse)
+async def storage_status(request: Request) -> StorageStatusResponse:
+    """Return authenticated persistence settings and a live integrity probe."""
+
+    reg = _get_registry(request)
+    maintenance = reg.get("storage_maintenance")
+    if maintenance is None or not hasattr(maintenance, "health"):
+        raise HTTPException(status_code=503, detail="storage_unavailable")
+    report = await maintenance.health()
+    return StorageStatusResponse.from_clock(
+        _get_clock(request),
+        storage=report,
+        retention_days=dict(getattr(maintenance, "retention_days", {})),
+    )
+
+
+@router.post("/storage/export", response_model=StorageExportResponse)
+async def storage_export(
+    body: StorageExportRequest,
+    request: Request,
+) -> StorageExportResponse:
+    """Create a local, checksummed data export in Cortex's exports folder."""
+
+    maintenance = _get_registry(request).get("storage_maintenance")
+    if maintenance is None or not hasattr(maintenance, "export"):
+        raise HTTPException(status_code=503, detail="storage_unavailable")
+    return StorageExportResponse.model_validate(
+        await maintenance.export(body.categories)
+    )
+
+
+@router.post("/storage/delete", response_model=StorageDeleteResponse)
+async def storage_delete(
+    body: StorageDeleteRequest,
+    request: Request,
+) -> StorageDeleteResponse:
+    """Delete confirmed local scopes without erasing active restore evidence."""
+
+    maintenance = _get_registry(request).get("storage_maintenance")
+    if maintenance is None or not hasattr(maintenance, "delete"):
+        raise HTTPException(status_code=503, detail="storage_unavailable")
+    try:
+        deleted, vacuumed = await maintenance.delete(body.scopes)
+    except ActiveInterventionDataError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return StorageDeleteResponse.from_clock(
+        _get_clock(request),
+        deleted_counts=deleted,
+        vacuumed=vacuumed,
     )
 
 

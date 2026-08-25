@@ -202,6 +202,10 @@ landmarks:
 
 storage:
   path: ./storage
+  sqlite_filename: cortex.sqlite3
+  sqlite_busy_timeout_ms: 5000
+  backup_retention_count: 3
+  analytics_queue_capacity: 256
   session_retention_days: 7
   feature_retention_days: 7
   error_retention_days: 90

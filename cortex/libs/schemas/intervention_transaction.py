@@ -1037,7 +1037,7 @@ class InterventionTransaction(BaseModel):
         }
         for receipt_id in self.consent_evidence_receipt_ids:
             evidence = receipts_by_id.get(receipt_id)
-            inverse = (
+            decoded_inverse = (
                 json.loads(evidence.inverse_payload_json)
                 if evidence is not None
                 and evidence.inverse_payload_json is not None
@@ -1053,7 +1053,7 @@ class InterventionTransaction(BaseModel):
                 }
                 or value(evidence.verification)
                 != VerificationStatus.VERIFIED.value
-                or inverse.get("noEffect") is True
+                or decoded_inverse.get("noEffect") is True
             ):
                 raise ValueError("claimed consent evidence is not a verified apply")
         return self
