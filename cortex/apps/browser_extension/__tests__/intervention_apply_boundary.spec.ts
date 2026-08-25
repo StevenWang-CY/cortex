@@ -160,10 +160,8 @@ async function bootAuthorizedBackground(): Promise<NonNullable<ReturnType<typeof
         cortex_client_instance_id_v1: BROWSER_INSTANCE_ID,
     });
     await import("../background");
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    const socket = getLatestSocket();
-    if (!socket) throw new Error("background WebSocket did not start");
-    socket.__deliver({
+    const socket = latestOpenSocket();
+    await socket.__deliver({
         type: "INTERVENTION_TRIGGER",
         payload: {
             intervention_id: "intervention-boundary",
@@ -175,7 +173,16 @@ async function bootAuthorizedBackground(): Promise<NonNullable<ReturnType<typeof
         },
         sequence: 1,
     });
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    return socket;
+}
+
+function latestOpenSocket(): NonNullable<ReturnType<typeof getLatestSocket>> {
+    const socket = getLatestSocket();
+    if (!socket) throw new Error("background WebSocket did not start");
+    if (socket.readyState === WebSocket.CONNECTING) socket.__open();
+    if (socket.readyState !== WebSocket.OPEN) {
+        throw new Error(`background WebSocket is not open: ${socket.readyState}`);
+    }
     return socket;
 }
 
@@ -202,12 +209,11 @@ describe("browser exact apply boundary", () => {
         const socket = await bootAuthorizedBackground();
         const command = await exactCommand();
 
-        socket.__deliver({
+        await socket.__deliver({
             type: "INTERVENTION_APPLY",
             payload: command,
             sequence: 2,
         });
-        await new Promise((resolve) => setTimeout(resolve, 30));
         expect(globalThis.__cortexChrome.tabs.create).toHaveBeenCalledTimes(1);
 
         const firstReceipt = sentFrames(socket).find(
@@ -229,12 +235,11 @@ describe("browser exact apply boundary", () => {
             };
         expect(journalAfterApply.receipt_outbox).toHaveLength(1);
 
-        socket.__deliver({
+        await socket.__deliver({
             type: "INTERVENTION_APPLY",
             payload: command,
             sequence: 3,
         });
-        await new Promise((resolve) => setTimeout(resolve, 30));
         expect(globalThis.__cortexChrome.tabs.create).toHaveBeenCalledTimes(1);
 
         const receipts = sentFrames(socket).filter(
@@ -249,7 +254,7 @@ describe("browser exact apply boundary", () => {
             }),
         ]);
 
-        socket.__deliver({
+        await socket.__deliver({
             type: "INTERVENTION_TRANSACTION_STATE",
             payload: {
                 intervention_id: "intervention-boundary",
@@ -258,7 +263,6 @@ describe("browser exact apply boundary", () => {
             },
             sequence: 4,
         });
-        await new Promise((resolve) => setTimeout(resolve, 20));
         const acknowledged = globalThis.__cortexChrome.storage.local
             .__peek().cortex_intervention_transaction_journal_v1 as {
                 receipt_outbox: unknown[];
@@ -291,13 +295,11 @@ describe("browser exact apply boundary", () => {
         );
 
         const socket = await bootAuthorizedBackground();
-        socket.__deliver({
+        await socket.__deliver({
             type: "INTERVENTION_APPLY",
             payload: await exactCommand(),
             sequence: 2,
         });
-        await new Promise((resolve) => setTimeout(resolve, 30));
-
         expect(stagingUrl).toMatch(
             /^about:blank#cortex-created-tab=[0-9a-f-]{36}$/i,
         );
@@ -372,7 +374,7 @@ describe("browser exact apply boundary", () => {
             stagedTabExists = false;
         });
 
-        socket.__deliver({
+        await socket.__deliver({
             type: "INTERVENTION_RESTORE",
             payload: {
                 ...restoreCommand(command, "{}", "restore-crash-recovery"),
@@ -380,8 +382,6 @@ describe("browser exact apply boundary", () => {
             },
             sequence: 2,
         });
-        await new Promise((resolve) => setTimeout(resolve, 40));
-
         expect(globalThis.__cortexChrome.tabs.remove).toHaveBeenCalledWith(77);
         const receipt = sentFrames(socket).find(
             (frame) => frame.type === "INTERVENTION_RECEIPT"
@@ -418,13 +418,11 @@ describe("browser exact apply boundary", () => {
             metadata: {},
         });
 
-        socket.__deliver({
+        await socket.__deliver({
             type: "INTERVENTION_APPLY",
             payload: command,
             sequence: 2,
         });
-        await new Promise((resolve) => setTimeout(resolve, 30));
-
         expect(globalThis.__cortexChrome.tabs.update).not.toHaveBeenCalled();
         const batch = sentFrames(socket).find(
             (frame) => frame.type === "INTERVENTION_RECEIPT",
@@ -451,13 +449,11 @@ describe("browser exact apply boundary", () => {
         const socket = await bootAuthorizedBackground();
         const command = await exactCommand();
 
-        socket.__deliver({
+        await socket.__deliver({
             type: "INTERVENTION_APPLY",
             payload: command,
             sequence: 2,
         });
-        await new Promise((resolve) => setTimeout(resolve, 30));
-
         const receipt = sentFrames(socket).find(
             (frame) => frame.type === "INTERVENTION_RECEIPT",
         );
@@ -497,13 +493,11 @@ describe("browser exact apply boundary", () => {
             capability: "search_error",
         };
 
-        socket.__deliver({
+        await socket.__deliver({
             type: "INTERVENTION_APPLY",
             payload: command,
             sequence: 2,
         });
-        await new Promise((resolve) => setTimeout(resolve, 20));
-
         expect(globalThis.__cortexChrome.tabs.create).not.toHaveBeenCalled();
         expect(sentFrames(socket).some(
             (frame) => frame.type === "INTERVENTION_RECEIPT",
@@ -534,8 +528,11 @@ describe("browser exact apply boundary", () => {
             manifest_sha256: command.manifest.manifest_sha256,
         };
 
-        socket.__deliver({ type: "INTERVENTION_APPLY", payload: command, sequence: 2 });
-        await new Promise((resolve) => setTimeout(resolve, 30));
+        await socket.__deliver({
+            type: "INTERVENTION_APPLY",
+            payload: command,
+            sequence: 2,
+        });
 
         expect(globalThis.__cortexChrome.tabs.create).not.toHaveBeenCalled();
         expect(globalThis.__cortexChrome.tabs.remove).not.toHaveBeenCalled();
@@ -561,8 +558,11 @@ describe("browser exact apply boundary", () => {
             reversible: true,
             metadata: {},
         });
-        socket.__deliver({ type: "INTERVENTION_APPLY", payload: command, sequence: 2 });
-        await new Promise((resolve) => setTimeout(resolve, 30));
+        await socket.__deliver({
+            type: "INTERVENTION_APPLY",
+            payload: command,
+            sequence: 2,
+        });
         const applyReceipt = sentFrames(socket)
             .filter((frame) => frame.type === "INTERVENTION_RECEIPT")[0]
             ?.payload.receipts as Array<Record<string, unknown>>;
@@ -571,7 +571,7 @@ describe("browser exact apply boundary", () => {
         globalThis.__cortexChrome.tabs.remove.mockRejectedValue(
             new Error("Chrome refused removal"),
         );
-        socket.__deliver({
+        await socket.__deliver({
             type: "INTERVENTION_RESTORE",
             payload: restoreCommand(
                 command,
@@ -580,8 +580,6 @@ describe("browser exact apply boundary", () => {
             ),
             sequence: 3,
         });
-        await new Promise((resolve) => setTimeout(resolve, 30));
-
         const restoreReceipt = sentFrames(socket)
             .filter((frame) => frame.type === "INTERVENTION_RECEIPT")[1]
             ?.payload.receipts as Array<Record<string, unknown>>;
@@ -619,27 +617,27 @@ describe("browser exact apply boundary", () => {
             reversible: true,
             metadata: {},
         });
-        socket.__deliver({ type: "INTERVENTION_APPLY", payload: command, sequence: 2 });
-        await new Promise((resolve) => setTimeout(resolve, 30));
+        await socket.__deliver({
+            type: "INTERVENTION_APPLY",
+            payload: command,
+            sequence: 2,
+        });
         const applyReceipt = sentFrames(socket)
             .filter((frame) => frame.type === "INTERVENTION_RECEIPT")[0]
             ?.payload.receipts as Array<Record<string, unknown>>;
         expect(applyReceipt[0]).toMatchObject({ status: "succeeded" });
         const inverse = String(applyReceipt[0].inverse_payload_json);
 
-        socket.__deliver({
+        await socket.__deliver({
             type: "INTERVENTION_RESTORE",
             payload: restoreCommand(command, inverse, "restore-open-first"),
             sequence: 3,
         });
-        await new Promise((resolve) => setTimeout(resolve, 30));
-        socket.__deliver({
+        await socket.__deliver({
             type: "INTERVENTION_RESTORE",
             payload: restoreCommand(command, inverse, "restore-open-retry"),
             sequence: 4,
         });
-        await new Promise((resolve) => setTimeout(resolve, 30));
-
         expect(globalThis.__cortexChrome.tabs.remove).toHaveBeenCalledTimes(1);
         const receipts = sentFrames(socket)
             .filter((frame) => frame.type === "INTERVENTION_RECEIPT");
@@ -651,18 +649,16 @@ describe("browser exact apply boundary", () => {
 
     it("returns a failed receipt when local suggestion-only mode denies apply", async () => {
         const socket = await bootAuthorizedBackground();
-        socket.__deliver({
+        await socket.__deliver({
             type: "SETTINGS_SYNC",
             payload: { execution_mode: "suggest_only" },
             sequence: 1,
         });
-        socket.__deliver({
+        await socket.__deliver({
             type: "INTERVENTION_APPLY",
             payload: await exactCommand(),
             sequence: 2,
         });
-        await new Promise((resolve) => setTimeout(resolve, 20));
-
         expect(globalThis.__cortexChrome.tabs.create).not.toHaveBeenCalled();
         const receipt = sentFrames(socket).find(
             (frame) => frame.type === "INTERVENTION_RECEIPT",
@@ -691,13 +687,11 @@ describe("browser exact apply boundary", () => {
             reason: "partial_compensation",
         };
 
-        socket.__deliver({
+        await socket.__deliver({
             type: "INTERVENTION_RESTORE",
             payload: restore,
             sequence: 2,
         });
-        await new Promise((resolve) => setTimeout(resolve, 30));
-
         expect(globalThis.__cortexChrome.tabs.create).not.toHaveBeenCalled();
         const batch = sentFrames(socket).find(
             (frame) => frame.type === "INTERVENTION_RECEIPT"
@@ -725,13 +719,11 @@ describe("browser exact apply boundary", () => {
             },
         });
 
-        socket.__deliver({
+        await socket.__deliver({
             type: "INTERVENTION_APPLY",
             payload: await exactCommand(),
             sequence: 2,
         });
-        await new Promise((resolve) => setTimeout(resolve, 20));
-
         expect(globalThis.__cortexChrome.tabs.create).not.toHaveBeenCalled();
     });
 
@@ -747,13 +739,11 @@ describe("browser exact apply boundary", () => {
             },
         });
 
-        socket.__deliver({
+        await socket.__deliver({
             type: "INTERVENTION_APPLY",
             payload: await exactCommand(),
             sequence: 2,
         });
-        await new Promise((resolve) => setTimeout(resolve, 20));
-
         expect(globalThis.__cortexChrome.tabs.create).not.toHaveBeenCalled();
     });
 
@@ -805,22 +795,18 @@ describe("browser exact apply boundary", () => {
             },
         });
 
-        socket.__deliver({
+        await socket.__deliver({
             type: "INTERVENTION_APPLY",
             payload: await exactCommand(),
             sequence: 2,
         });
-        await new Promise((resolve) => setTimeout(resolve, 30));
-
         expect(globalThis.__cortexChrome.tabs.create).not.toHaveBeenCalled();
     });
 
     it("cannot authorize an action whose displayed copy differs from the manifest", async () => {
         vi.resetModules();
         await import("../background");
-        await new Promise((resolve) => setTimeout(resolve, 0));
-        const socket = getLatestSocket();
-        if (!socket) throw new Error("background WebSocket did not start");
+        const socket = latestOpenSocket();
         const displayed = {
             action_id: "open-presentation",
             action_type: "open_url",
@@ -837,7 +823,7 @@ describe("browser exact apply boundary", () => {
             ...displayed,
             label: "Open a different displayed reference",
         });
-        socket.__deliver({
+        await socket.__deliver({
             type: "INTERVENTION_TRIGGER",
             payload: {
                 intervention_id: "intervention-boundary",
@@ -850,25 +836,26 @@ describe("browser exact apply boundary", () => {
             },
             sequence: 1,
         });
-        await new Promise((resolve) => setTimeout(resolve, 0));
-
         const listener = globalThis.__cortexChrome.runtime.onMessage.addListener
             .mock.calls[0][0] as (
                 message: Record<string, unknown>,
                 sender: unknown,
                 respond: (value: unknown) => void,
             ) => boolean | void;
-        let response: unknown;
-        listener(
-            {
-                type: "EXECUTE_ACTION",
-                intervention_id: "intervention-boundary",
-                action: displayed,
-            },
-            undefined,
-            (value) => { response = value; },
-        );
-        await new Promise((resolve) => setTimeout(resolve, 10));
+        const response = await new Promise<unknown>((resolve, reject) => {
+            const keepsChannelOpen = listener(
+                {
+                    type: "EXECUTE_ACTION",
+                    intervention_id: "intervention-boundary",
+                    action: displayed,
+                },
+                undefined,
+                resolve,
+            );
+            if (keepsChannelOpen !== true) {
+                reject(new Error("background listener did not keep the response channel open"));
+            }
+        });
 
         expect(response).toMatchObject({
             success: false,
