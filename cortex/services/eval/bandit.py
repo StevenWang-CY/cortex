@@ -1,8 +1,9 @@
-"""
-Eval — Contextual Bandit (LinUCB)
+"""Retired pre-v2 contextual-bandit experiment (LinUCB).
 
-Implements a contextual bandit that learns which intervention types
-work best for this specific user given the workspace context.
+This module remains temporarily importable for historical compatibility tests
+only. It is not composed into the daemon, not exported from
+``cortex.services.eval``, and cannot produce valid causal or off-policy
+evidence because its old logs lack the v2 decision/outcome contract.
 
 State features: [state_code, complexity, tab_count, error_count,
                  time_of_day, thrashing_score, stress_integral, consent_level]
@@ -10,7 +11,7 @@ State features: [state_code, complexity, tab_count, error_count,
 Arms: intervention types (overlay_only, simplified_workspace, guided_mode,
       breathing, active_recall, circuit_breaker, none)
 
-Algorithm: LinUCB (Disjoint) — O(d^2) per update, trivially fast on CPU.
+Do not build new code on this API.
 """
 
 from __future__ import annotations
@@ -64,16 +65,19 @@ def encode_context(
     if hour is None:
         hour = datetime.now().hour
 
-    return np.array([
-        STATE_CODES.get(state, 0.5),
-        min(1.0, complexity),
-        min(1.0, tab_count / 20.0),
-        min(1.0, error_count / 10.0),
-        hour / 24.0,
-        min(1.0, thrashing_score),
-        min(1.0, stress_integral / 1000.0),
-        consent_level / 4.0,
-    ], dtype=np.float64)
+    return np.array(
+        [
+            STATE_CODES.get(state, 0.5),
+            min(1.0, complexity),
+            min(1.0, tab_count / 20.0),
+            min(1.0, error_count / 10.0),
+            hour / 24.0,
+            min(1.0, thrashing_score),
+            min(1.0, stress_integral / 1000.0),
+            consent_level / 4.0,
+        ],
+        dtype=np.float64,
+    )
 
 
 class ContextualBandit:
@@ -229,11 +233,13 @@ class ContextualBandit:
         for a in range(self._n_arms):
             A_inv = np.linalg.inv(self._A[a])
             theta = A_inv @ self._b[a]
-            stats.append({
-                "arm": ARM_LABELS[a] if a < len(ARM_LABELS) else f"arm_{a}",
-                "mean_theta": float(np.mean(theta)),
-                "theta_norm": float(np.linalg.norm(theta)),
-            })
+            stats.append(
+                {
+                    "arm": ARM_LABELS[a] if a < len(ARM_LABELS) else f"arm_{a}",
+                    "mean_theta": float(np.mean(theta)),
+                    "theta_norm": float(np.linalg.norm(theta)),
+                }
+            )
         return stats
 
     def _to_dict(self) -> dict[str, Any]:
@@ -245,7 +251,7 @@ class ContextualBandit:
             "total_updates": self._total_updates,
             "A": [a.tolist() for a in self._A],
             "b": [b.tolist() for b in self._b],
-            "arm_labels": ARM_LABELS[:self._n_arms],
+            "arm_labels": ARM_LABELS[: self._n_arms],
         }
 
     def _from_dict(self, data: dict[str, Any]) -> None:

@@ -26,7 +26,11 @@ Status & Health:
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
 import logging
+from pathlib import Path as FilePath
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Path, Request
@@ -77,6 +81,15 @@ from cortex.libs.schemas.intervention import (
     InterventionPlan,
     WorkspaceSnapshot,
 )
+from cortex.libs.schemas.policy import (
+    MRTAnalysisRequest,
+    MRTAnalysisResponse,
+    MRTExportRequest,
+    MRTExportResponse,
+    PolicyDiagnosticsRequest,
+    PolicyDiagnosticsResponse,
+    policy_payload_sha256,
+)
 from cortex.libs.schemas.realtime import CostResponse
 from cortex.libs.schemas.session_history import (
     SessionDetailResponse,
@@ -94,6 +107,17 @@ from cortex.libs.schemas.storage import (
 )
 from cortex.libs.schemas.temporal import EventTime
 from cortex.libs.schemas.ws_message_types import MessageType
+from cortex.services.eval.policy_diagnostics import generate_daily_policy_diagnostics
+from cortex.services.eval.research_analysis import (
+    ResearchExportError,
+    analyze_mrt_export,
+    export_mrt_dataset,
+    write_mrt_analysis_report,
+)
+from cortex.services.eval.research_policy import (
+    RESEARCH_POLICY_NAME,
+    RESEARCH_POLICY_VERSION,
+)
 from cortex.services.intervention_engine import (
     capture_snapshot as _engine_capture_snapshot,
 )
@@ -133,10 +157,14 @@ def capture_snapshot(
     port = _get_intervention_port(request) if request is not None else None
     if port is not None:
         return port.capture_snapshot(
-            context, intervention_id, timestamp=timestamp,
+            context,
+            intervention_id,
+            timestamp=timestamp,
         )
     return _engine_capture_snapshot(
-        context, intervention_id=intervention_id, timestamp=timestamp,
+        context,
+        intervention_id=intervention_id,
+        timestamp=timestamp,
     )
 
 
@@ -153,6 +181,7 @@ def prepare_plan(
         return port.prepare_plan(plan, tab_count=tab_count)
     return _engine_prepare_plan(plan, tab_count=tab_count)
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -162,6 +191,7 @@ def _get_clock(request: Request) -> Clock:
     state = getattr(getattr(request, "app", None), "state", None)
     candidate = getattr(state, "clock", None) if state is not None else None
     return clock_or_system(candidate)
+
 
 # Two routers — a public liveness-only router and an authenticated
 # router that owns every mutating endpoint. ``app.py`` mounts each with
@@ -192,6 +222,7 @@ async def shutdown(request: Request) -> ShutdownResponse:
     import asyncio
     import os
     import signal as _signal
+
     logger.info(
         f"Shutdown requested via API (port={HTTP_API_PORT})",
     )
@@ -199,7 +230,8 @@ async def shutdown(request: Request) -> ShutdownResponse:
     loop = asyncio.get_running_loop()
     loop.call_later(0.5, os.kill, os.getpid(), _signal.SIGTERM)
     return ShutdownResponse.from_clock(
-        _get_clock(request), status="shutting_down",
+        _get_clock(request),
+        status="shutting_down",
     )
 
 
@@ -232,10 +264,14 @@ async def raise_dashboard(
                 WEBSOCKET_PORT,
             )
             return DashboardRaiseResponse.from_clock(
-                _get_clock(request), raised=False, target=target,
+                _get_clock(request),
+                raised=False,
+                target=target,
             )
     return DashboardRaiseResponse.from_clock(
-        _get_clock(request), raised=True, target=target,
+        _get_clock(request),
+        raised=True,
+        target=target,
     )
 
 
@@ -340,7 +376,9 @@ async def _build_snapshot_for_plan(
             except Exception:
                 logger.exception("Failed to build context while snapshotting intervention")
     snapshot = capture_snapshot(
-        context, intervention_id=plan.intervention_id, request=request,
+        context,
+        intervention_id=plan.intervention_id,
+        request=request,
     )
     registry.register(f"workspace_snapshot:{plan.intervention_id}", snapshot)
     return snapshot
@@ -376,18 +414,12 @@ async def health_check(request: Request) -> HealthResponse:
     storage_report: StorageHealthReport | None = None
     daemon = reg.get("daemon") if hasattr(reg, "get") else None
     if daemon is not None:
-        duplicate_acks = int(
-            getattr(daemon, "_duplicate_intervention_ack_count", 0) or 0
-        )
+        duplicate_acks = int(getattr(daemon, "_duplicate_intervention_ack_count", 0) or 0)
         store_degraded = bool(getattr(daemon, "_store_degraded", False))
         pipeline = getattr(daemon, "_capture_pipeline", None)
         if pipeline is not None:
-            frames_dropped_total = int(
-                getattr(pipeline, "frames_dropped_total", 0) or 0
-            )
-    storage_maintenance = (
-        reg.get("storage_maintenance") if hasattr(reg, "get") else None
-    )
+            frames_dropped_total = int(getattr(pipeline, "frames_dropped_total", 0) or 0)
+    storage_maintenance = reg.get("storage_maintenance") if hasattr(reg, "get") else None
     if storage_maintenance is not None and hasattr(storage_maintenance, "health"):
         try:
             storage_report = await storage_maintenance.health()
@@ -444,9 +476,7 @@ async def storage_export(
     maintenance = _get_registry(request).get("storage_maintenance")
     if maintenance is None or not hasattr(maintenance, "export"):
         raise HTTPException(status_code=503, detail="storage_unavailable")
-    return StorageExportResponse.model_validate(
-        await maintenance.export(body.categories)
-    )
+    return StorageExportResponse.model_validate(await maintenance.export(body.categories))
 
 
 @router.post("/storage/delete", response_model=StorageDeleteResponse)
@@ -467,6 +497,102 @@ async def storage_delete(
         _get_clock(request),
         deleted_counts=deleted,
         vacuumed=vacuumed,
+    )
+
+
+@router.post("/policy/diagnostics", response_model=PolicyDiagnosticsResponse)
+async def policy_diagnostics(
+    body: PolicyDiagnosticsRequest,
+    request: Request,
+) -> PolicyDiagnosticsResponse:
+    """Generate an explicitly descriptive, non-causal lifecycle report."""
+
+    repository = _get_registry(request).get("policy_repository")
+    configured = getattr(request.app.state, "cortex_config", None)
+    if repository is None or configured is None:
+        raise HTTPException(status_code=503, detail="policy_repository_unavailable")
+    path = await generate_daily_policy_diagnostics(
+        repository,
+        configured.storage.path,
+        day=body.day_utc,
+    )
+    payload = await asyncio.to_thread(path.read_bytes)
+    return PolicyDiagnosticsResponse.from_clock(
+        _get_clock(request),
+        filename=path.name,
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+
+@router.post("/research/mrt/export", response_model=MRTExportResponse)
+async def research_mrt_export(
+    body: MRTExportRequest,
+    request: Request,
+) -> MRTExportResponse:
+    """Export one explicitly enabled and prespecified local MRT epoch."""
+
+    repository = _get_registry(request).get("policy_repository")
+    configured = getattr(request.app.state, "cortex_config", None)
+    if repository is None or configured is None:
+        raise HTTPException(status_code=503, detail="policy_repository_unavailable")
+    research = configured.eval.research
+    specification = body.specification
+    if not research.enabled or configured.eval.policy != "research_randomized":
+        raise HTTPException(status_code=409, detail="research_mode_not_enabled")
+    expected = research.mrt_specification(
+        policy_name=RESEARCH_POLICY_NAME,
+        policy_version=RESEARCH_POLICY_VERSION,
+        reward_version=configured.eval.outcome.reward_version,
+        proximal_window_seconds=configured.eval.outcome.reward_window_seconds,
+    )
+    if specification != expected:
+        raise HTTPException(status_code=409, detail="research_specification_mismatch")
+    destination_root = FilePath(configured.storage.path).expanduser().resolve() / "research-exports"
+    try:
+        path = await export_mrt_dataset(
+            repository,
+            specification,
+            destination_root,
+            clock=_get_clock(request),
+        )
+    except ResearchExportError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    payload = await asyncio.to_thread(path.read_bytes)
+    document = json.loads(payload)
+    return MRTExportResponse.from_clock(
+        _get_clock(request),
+        filename=path.name,
+        sha256=hashlib.sha256(payload).hexdigest(),
+        specification_sha256=policy_payload_sha256(specification.model_dump(mode="json")),
+        row_count=int(document.get("row_count", 0)),
+    )
+
+
+@router.post("/research/mrt/analyze", response_model=MRTAnalysisResponse)
+async def research_mrt_analyze(
+    body: MRTAnalysisRequest,
+    request: Request,
+) -> MRTAnalysisResponse:
+    """Recompute WCLS and cluster uncertainty from an immutable export."""
+
+    configured = getattr(request.app.state, "cortex_config", None)
+    if configured is None:
+        raise HTTPException(status_code=503, detail="configuration_unavailable")
+    root = FilePath(configured.storage.path).expanduser().resolve() / "research-exports"
+    source = (root / body.filename).resolve()
+    if source.parent != root or not source.is_file():
+        raise HTTPException(status_code=404, detail="research_export_not_found")
+    report = root / f"mrt_analysis_{source.stem}.md"
+    try:
+        result = await asyncio.to_thread(analyze_mrt_export, source)
+        await asyncio.to_thread(write_mrt_analysis_report, source, report)
+    except ResearchExportError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return MRTAnalysisResponse.from_clock(
+        _get_clock(request),
+        source_filename=source.name,
+        report_filename=report.name,
+        analysis=result.to_dict(),
     )
 
 
@@ -552,7 +678,8 @@ async def get_current_status(request: Request) -> StatusResponse:
 
 @router.post("/capture/frame_meta", response_model=AckResponse)
 async def submit_frame_meta(
-    frame_meta: FrameMeta, request: Request,
+    frame_meta: FrameMeta,
+    request: Request,
 ) -> AckResponse:
     """Submit frame metadata from capture service."""
     reg = _get_registry(request)
@@ -570,7 +697,8 @@ async def submit_frame_meta(
 
 @router.post("/features/physio", response_model=AckResponse)
 async def submit_physio_features(
-    features: PhysioFeatures, request: Request,
+    features: PhysioFeatures,
+    request: Request,
 ) -> AckResponse:
     """Submit physio features from physio engine."""
     reg = _get_registry(request)
@@ -587,7 +715,8 @@ async def submit_physio_features(
 
 @router.post("/features/kinematics", response_model=AckResponse)
 async def submit_kinematic_features(
-    features: KinematicFeatures, request: Request,
+    features: KinematicFeatures,
+    request: Request,
 ) -> AckResponse:
     """Submit kinematic features from kinematics engine."""
     reg = _get_registry(request)
@@ -603,7 +732,8 @@ async def submit_kinematic_features(
 
 @router.post("/features/telemetry", response_model=AckResponse)
 async def submit_telemetry_features(
-    features: TelemetryFeatures, request: Request,
+    features: TelemetryFeatures,
+    request: Request,
 ) -> AckResponse:
     """Submit telemetry features from telemetry engine."""
     reg = _get_registry(request)
@@ -624,7 +754,8 @@ async def submit_telemetry_features(
 
 @router.post("/state/infer", response_model=StateInferResponse)
 async def infer_state(
-    body: StateInferRequest, request: Request,
+    body: StateInferRequest,
+    request: Request,
 ) -> StateInferResponse:
     """Compute state from fused features.
 
@@ -728,7 +859,8 @@ async def infer_state(
 
 @router.post("/context/build", response_model=ContextBuildResponse)
 async def build_context(
-    body: ContextBuildRequest, request: Request,
+    body: ContextBuildRequest,
+    request: Request,
 ) -> ContextBuildResponse:
     """Build task context from workspace adapters."""
     reg = _get_registry(request)
@@ -741,11 +873,14 @@ async def build_context(
             include_browser=body.include_browser,
         )
         return ContextBuildResponse.from_clock(
-            _get_clock(request), context=ctx, available=True,
+            _get_clock(request),
+            context=ctx,
+            available=True,
         )
 
     return ContextBuildResponse.from_clock(
-        _get_clock(request), available=False,
+        _get_clock(request),
+        available=False,
     )
 
 
@@ -773,6 +908,7 @@ def _plan_served_fallback(plan: Any) -> bool:
         from cortex.services.llm_engine.anthropic_planner import (
             classify_plan_failure_mode,
         )
+
         return classify_plan_failure_mode(plan) != "ok"
     except Exception:
         # Classifier import / inspection failed — fall back to the raw
@@ -787,7 +923,8 @@ def _plan_served_fallback(plan: Any) -> bool:
 
 @router.post("/llm/plan", response_model=LLMPlanResponse)
 async def request_llm_plan(
-    body: LLMPlanRequest, request: Request,
+    body: LLMPlanRequest,
+    request: Request,
 ) -> LLMPlanResponse:
     """Request intervention plan from LLM engine.
 
@@ -838,7 +975,8 @@ async def request_llm_plan(
                     extra={"planner_method": "llm_engine.generate_plan"},
                 )
                 plan = await llm_engine.generate_plan(
-                    body.state_estimate, body.task_context,
+                    body.state_estimate,
+                    body.task_context,
                 )
                 return LLMPlanResponse.from_clock(
                     _get_clock(request),
@@ -877,7 +1015,9 @@ async def request_llm_plan(
             exc_info=True,
         )
         return LLMPlanResponse.from_clock(
-            _get_clock(request), plan=None, fallback_used=True,
+            _get_clock(request),
+            plan=None,
+            fallback_used=True,
         )
 
     logger.info(
@@ -885,7 +1025,8 @@ async def request_llm_plan(
         extra={"planner_method": "fallback"},
     )
     return LLMPlanResponse.from_clock(
-        _get_clock(request), fallback_used=True,
+        _get_clock(request),
+        fallback_used=True,
     )
 
 
@@ -913,11 +1054,7 @@ async def apply_intervention(
     ``correlation_id``.
     """
     reg = _get_registry(request)
-    correlation_id = (
-        request.headers.get("X-Cortex-Request-ID")
-        if request is not None
-        else None
-    )
+    correlation_id = request.headers.get("X-Cortex-Request-ID") if request is not None else None
 
     # The HTTP route is an authority boundary of its own. Do not rely only on
     # executor-level per-command rejection: suggestion-only must also avoid
@@ -996,12 +1133,10 @@ async def _maybe_await_confirmation(
     if daemon is None or not hasattr(daemon, "await_apply_confirmation"):
         return None
     try:
-        confirmation: InterventionApplyResult | None = (
-            await daemon.await_apply_confirmation(
-                intervention_id,
-                timeout_seconds=timeout_seconds,
-                correlation_id=correlation_id,
-            )
+        confirmation: InterventionApplyResult | None = await daemon.await_apply_confirmation(
+            intervention_id,
+            timeout_seconds=timeout_seconds,
+            correlation_id=correlation_id,
         )
         return confirmation
     except Exception:
@@ -1023,7 +1158,8 @@ async def _maybe_await_confirmation(
 
 @router.post("/intervention/restore", response_model=InterventionRestoreResponse)
 async def restore_intervention(
-    body: InterventionRestoreRequest, request: Request,
+    body: InterventionRestoreRequest,
+    request: Request,
 ) -> InterventionRestoreResponse:
     """Restore workspace to pre-intervention state."""
     reg = _get_registry(request)
@@ -1040,9 +1176,7 @@ async def restore_intervention(
         )
         return InterventionRestoreResponse.from_clock(
             _get_clock(request),
-            restored=bool(
-                outcome is not None and outcome.workspace_restored
-            ),
+            restored=bool(outcome is not None and outcome.workspace_restored),
             outcome=outcome,
         )
 
@@ -1050,7 +1184,8 @@ async def restore_intervention(
     # no receipt waiter. Fail closed instead of reviving the pre-WP6 direct
     # executor/RestoreManager bypass.
     return InterventionRestoreResponse.from_clock(
-        _get_clock(request), restored=False,
+        _get_clock(request),
+        restored=False,
     )
 
 
@@ -1122,7 +1257,8 @@ async def get_consent_level(request: Request) -> ConsentLevelResponse:
     if ladder is not None and hasattr(ladder, "get_all_states"):
         states = await ladder.get_all_states()
         return ConsentLevelResponse.from_clock(
-            _get_clock(request), levels=states,
+            _get_clock(request),
+            levels=states,
         )
     return ConsentLevelResponse.from_clock(_get_clock(request))
 
@@ -1172,12 +1308,12 @@ async def reset_consent(
                         summary,
                     )
             except Exception:
-                logger.exception(
-                    "Consent reset restore barrier failed; recovery remains durable"
-                )
+                logger.exception("Consent reset restore barrier failed; recovery remains durable")
         states = await ladder.get_all_states()
         return ConsentResetResponse.from_clock(
-            _get_clock(request), reset=True, levels=states,
+            _get_clock(request),
+            reset=True,
+            levels=states,
         )
     return ConsentResetResponse.from_clock(_get_clock(request))
 
@@ -1366,10 +1502,7 @@ async def list_projects(request: Request) -> ProjectListResponse:
         projects = launcher.list_projects()
         return ProjectListResponse.from_clock(
             _get_clock(request),
-            projects=[
-                p.model_dump() if hasattr(p, "model_dump") else p
-                for p in projects
-            ],
+            projects=[p.model_dump() if hasattr(p, "model_dump") else p for p in projects],
         )
     return ProjectListResponse.from_clock(_get_clock(request))
 
@@ -1411,7 +1544,9 @@ async def launch_project(
     try:
         await _asyncio.wait_for(launcher.launch(project_name), timeout=20.0)
         return LaunchProjectResponse.from_clock(
-            _get_clock(request), launched=True, project_name=project_name,
+            _get_clock(request),
+            launched=True,
+            project_name=project_name,
         )
     except TimeoutError:
         logger.warning("Project launch timed out: %s", project_name)
@@ -1574,9 +1709,7 @@ async def get_trends_route(
 # request.
 import re as _re  # noqa: E402  (placement keeps imports near use site)
 
-_FEEDBACK_AUTH_HEADER_RE = _re.compile(
-    r"(?i)(x-cortex-auth\s*[:=]\s*)\S+"
-)
+_FEEDBACK_AUTH_HEADER_RE = _re.compile(r"(?i)(x-cortex-auth\s*[:=]\s*)\S+")
 _FEEDBACK_USER_PATH_RE = _re.compile(r"/Users/[^/\s'\")]+")
 
 # B5 (Phase 4.1): module-level counter of bug-report log-tail read
@@ -1633,7 +1766,8 @@ async def submit_feedback(
         try:
             if log_path.exists():
                 lines = log_path.read_text(
-                    encoding="utf-8", errors="replace",
+                    encoding="utf-8",
+                    errors="replace",
                 ).splitlines()[-1000:]
                 record["log_tail"] = _scrub_log_tail(lines)
         except OSError as exc:
@@ -1661,9 +1795,13 @@ async def submit_feedback(
     except OSError:
         logger.exception("POST /api/feedback failed to persist")
         return FeedbackResponse.from_clock(
-            _get_clock(request), ok=False, report_id=report_id,
+            _get_clock(request),
+            ok=False,
+            report_id=report_id,
         )
 
     return FeedbackResponse.from_clock(
-        _get_clock(request), ok=True, report_id=report_id,
+        _get_clock(request),
+        ok=True,
+        report_id=report_id,
     )

@@ -50,9 +50,10 @@ The complete target design, migration order, and definition of done are in
    abstain; named validity and coverage gates enforce that invariant.
 4. **Planning.** `llm_engine` calls a configured Anthropic transport or a
    deterministic fallback, then parses and validates the returned plan.
-5. **Presentation/experimental execution.** `intervention_engine` and the
-   clients present proposals. The legacy apply/restore code is contained until
-   WP-6 adds manifest-bound authorization and durable receipts.
+5. **Presentation/authorized execution.** `intervention_engine` and the clients
+   present proposals. The shipping default is non-mutating. Any enabled
+   capability requires a manifest-bound authorization, idempotent command,
+   durable effect receipt, verification result, and restore lifecycle.
 
 ## Trust boundaries
 
@@ -65,9 +66,9 @@ The complete target design, migration order, and definition of done are in
   confer execution authority.
 - Client messages are untrusted and must be schema-, authorization-, replay-,
   and target-validated.
-- Workspace excerpts sent to a cloud LLM can be sensitive. The planned privacy
-  broker must make categories previewable and controllable before production
-  promotion.
+- Workspace excerpts sent to a cloud LLM can be sensitive. Until the WP-9
+  privacy broker makes every category previewable and controllable, cloud
+  planning remains an explicit alpha-risk boundary.
 
 ## Time and schema contracts
 
@@ -86,20 +87,25 @@ TypeScript is checked in CI. Unknown major protocol versions are rejected.
 
 ## Evidence boundary
 
-The following modules remain in the tree for compatibility or research:
+The following modules remain in the tree for compatibility or gated research:
 
 - expanded camera-derived HRV and respiration algorithms;
 - stress integral and physiology-triggered break detectors;
 - optional per-user ML classifier;
-- AMIP/contextual-bandit learning and “causal report” generation;
+- retired AMIP/contextual-bandit implementations and legacy diagnostic replay;
 - action adapters and undo helpers.
 
 Their existence is not evidence that their output is valid or release-ready.
 The classifier and stress-integral modules are not exported, instantiated, or
 registered on the production daemon path.
-Product promotion requires the metric-, policy-, privacy-, and transaction
-gates in the implementation plan. Legacy “causal report” files are diagnostic
-summaries and must be labeled as such.
+Production policy selection is deterministic and non-learning. Every v2 action
+or no-action decision has one durable outcome window and at most one versioned
+reward. Separately consented research mode is restricted to a fixed two-arm
+micro-randomized epoch whose specification checksum is bound to every
+assignment. See
+[`research/policy-evaluation-protocol.md`](research/policy-evaluation-protocol.md).
+Legacy “causal report” files are renamed diagnostic summaries and cannot enter
+the research export.
 
 ## Target module ownership
 
@@ -121,11 +127,15 @@ precede moving each flow out of the current runtime daemon.
 
 ## Persistence status
 
-Current persistence is fragmented across Redis/in-memory stores and local
-JSON/JSONL artifacts. It cannot yet atomically bind a decision, authorization,
-effect receipt, outcome, and reward. WP-7 introduces a transactional SQLite
-event store with migrations, retention, export/delete, and restart recovery.
-Until then, production learning and mutation remain disabled.
+The authoritative durable path is a single-owner SQLite store using rollback
+journaling, `synchronous=FULL`, checksummed migrations, verified pre-migration
+backups, integrity checks, bounded analytics backpressure, retention, scoped
+export/delete, and restart recovery. It transactionally stores intervention
+authorizations/receipts/restores and the policy decision→delivery→outcome→reward
+lifecycle. Legacy JSON/JSONL artifacts are imported only through checksummed,
+reversible migration or retained as diagnostics. Keychain secrets remain in
+Keychain. Redis/in-memory storage is compatibility/ephemeral state, not the
+authority for v2 intervention or policy lifecycles.
 
 ## macOS lifecycle
 

@@ -175,6 +175,20 @@ from cortex.libs.schemas.physiology import (
     SignalAlgorithmIdentity,
     SignalEstimate,
 )
+from cortex.libs.schemas.policy import (
+    MRTAnalysisRequest,
+    MRTAnalysisResponse,
+    MRTExportRequest,
+    MRTExportResponse,
+    MRTStudySpecification,
+    PolicyContextSnapshot,
+    PolicyDecisionRecord,
+    PolicyDeliveryRecord,
+    PolicyDiagnosticsRequest,
+    PolicyDiagnosticsResponse,
+    PolicyObservation,
+    PolicyRewardRecord,
+)
 from cortex.libs.schemas.protocol import (
     AuthOkPayload,
     AuthRequestPayload,
@@ -312,6 +326,19 @@ __all__ = [
     "BeatEvent",
     "InterBeatInterval",
     "PulseWindowSummary",
+    # Policy and research evaluation
+    "PolicyContextSnapshot",
+    "PolicyDecisionRecord",
+    "PolicyDeliveryRecord",
+    "PolicyObservation",
+    "PolicyRewardRecord",
+    "PolicyDiagnosticsRequest",
+    "PolicyDiagnosticsResponse",
+    "MRTStudySpecification",
+    "MRTExportRequest",
+    "MRTExportResponse",
+    "MRTAnalysisRequest",
+    "MRTAnalysisResponse",
     # Scheduled sensor observations
     "ObservationSource",
     "ObservationValidity",

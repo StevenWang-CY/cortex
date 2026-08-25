@@ -136,9 +136,7 @@ def _pipeline_output(ts: float = 0.0, face: bool = True, low_quality: bool = Fal
     )
 
 
-async def _drive_frames(
-    daemon: Any, blink_scores: list[float], n_per_frame: int
-) -> list[float]:
+async def _drive_frames(daemon: Any, blink_scores: list[float], n_per_frame: int) -> list[float]:
     """Fill the rPPG window and capture legacy pulse keyword arguments."""
     captured: list[float] = []
     fake_roi = MagicMock()
@@ -244,8 +242,12 @@ async def test_face_lost_and_reacquired_events(daemon) -> None:  # type: ignore[
     fake_roi.combined_rgb.return_value = np.ones(3, dtype=np.float64)
     fake_roi.head_jitter_px = 0.0
     fake_blink = SimpleNamespace(
-        blink_rate=None, blink_rate_delta=None, blink_suppression_score=None,
-        perclos_60s=None, mean_blink_duration_ms=None, ear_variance=None,
+        blink_rate=None,
+        blink_rate_delta=None,
+        blink_suppression_score=None,
+        perclos_60s=None,
+        mean_blink_duration_ms=None,
+        ear_variance=None,
         valid_exposure_seconds=0.0,
     )
     fake_pose = SimpleNamespace(
@@ -288,9 +290,7 @@ async def test_face_lost_and_reacquired_events(daemon) -> None:  # type: ignore[
     assert events.count(EventType.FACE_LOST.value) == 1, events
     assert events.count(EventType.FACE_REACQUIRED.value) == 1, events
     # Order: lost precedes reacquired.
-    assert events.index(EventType.FACE_LOST.value) < events.index(
-        EventType.FACE_REACQUIRED.value
-    )
+    assert events.index(EventType.FACE_LOST.value) < events.index(EventType.FACE_REACQUIRED.value)
 
 
 # ─── C6: QUIET_MODE_ENTERED / QUIET_MODE_EXITED ──────────────────────────
@@ -346,9 +346,7 @@ async def test_global_restore_reports_only_verified_completion(daemon) -> None: 
     class _WS:
         async def send_restore_command(self, candidate: Any) -> int:
             assert candidate is command
-            daemon._pending_restore_results[candidate.restore_id].set_result(
-                True
-            )
+            daemon._pending_restore_results[candidate.restore_id].set_result(True)
             return 1
 
     daemon._transaction_coordinator = _Coordinator()
@@ -423,9 +421,7 @@ def test_ml_classifier_uses_predict_proba_api() -> None:
 def test_active_trigger_url_reads_active_tab_url(daemon) -> None:  # type: ignore[no-untyped-def]
     from cortex.services.runtime_daemon import CortexDaemon
 
-    ctx = SimpleNamespace(
-        browser_context=SimpleNamespace(active_tab_url="https://example.com/x")
-    )
+    ctx = SimpleNamespace(browser_context=SimpleNamespace(active_tab_url="https://example.com/x"))
     assert CortexDaemon._active_trigger_url(ctx) == "https://example.com/x"
     # No browser context → None.
     assert CortexDaemon._active_trigger_url(SimpleNamespace(browser_context=None)) is None
@@ -452,16 +448,11 @@ async def test_dismissal_uses_cached_trigger_time_features(daemon) -> None:  # t
     # that MUST be ignored by the dismissal-model training call.
     outcome = SimpleNamespace(recovery_confidence=0.05, intervention_id=iid)
     daemon._restore_manager.dismiss = AsyncMock(return_value=outcome)
-    # Short-circuit the rest of the handler after record_outcome.
-    daemon._amip_decision_ids_by_intervention.pop(iid, None)
-
     # Drive only the dismissal branch; the handler does more afterwards but
     # the record_outcome call is what we assert.
     with patch("cortex.services.runtime_daemon.registry"):
         try:
-            await daemon._handle_user_action(
-                {"intervention_id": iid, "action": "dismissed"}
-            )
+            await daemon._handle_user_action({"intervention_id": iid, "action": "dismissed"})
         except Exception:
             pass  # later stages may need wiring we didn't stub; ignore.
 
@@ -487,8 +478,6 @@ async def test_unpresented_proposal_cleanup_unwinds_every_local_tracker(
     daemon._active_intervention_id = iid
     daemon._active_plan = SimpleNamespace(intervention_id=iid)
     daemon._micro_step_recovery_fired = True
-    daemon._amip_decision_ids_by_intervention[iid] = "decision"
-    daemon._bandit_decisions_by_intervention[iid] = ([1.0], 0)
     daemon._dismissal_features_by_intervention[iid] = (0.8, 0.2)
     daemon._consent_actions_by_intervention[iid] = ["open_url"]
     daemon._causal_signals_by_intervention[iid] = [{"signal": "synthetic"}]
@@ -506,8 +495,6 @@ async def test_unpresented_proposal_cleanup_unwinds_every_local_tracker(
     assert daemon._active_plan is None
     assert daemon._micro_step_recovery_fired is False
     for mapping in (
-        daemon._amip_decision_ids_by_intervention,
-        daemon._bandit_decisions_by_intervention,
         daemon._dismissal_features_by_intervention,
         daemon._consent_actions_by_intervention,
         daemon._causal_signals_by_intervention,

@@ -92,6 +92,9 @@ def test_state_infer_without_token_returns_401(
     [
         ("get", "/storage/status", None),
         ("post", "/storage/export", {"categories": ["sessions"]}),
+        ("post", "/policy/diagnostics", {}),
+        ("post", "/research/mrt/export", {}),
+        ("post", "/research/mrt/analyze", {}),
         (
             "post",
             "/storage/delete",

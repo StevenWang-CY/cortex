@@ -108,6 +108,7 @@ class StorageMaintenance:
                     "LEFT JOIN policy_deliveries l ON l.decision_id=d.decision_id "
                     "LEFT JOIN policy_outcomes o ON o.decision_id=d.decision_id "
                     "LEFT JOIN policy_rewards r ON r.decision_id=d.decision_id "
+                    "AND r.reward_version=d.reward_version "
                     "ORDER BY d.occurred_at_unix_ms, d.decision_id"
                 ):
                     decisions.append(
@@ -225,7 +226,7 @@ class StorageMaintenance:
         self,
         scopes: tuple[StorageDeleteScope, ...],
     ) -> tuple[dict[str, int], bool]:
-        selected = (
+        selected: set[str] = (
             {
                 "consent",
                 "interventions",

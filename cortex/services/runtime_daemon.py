@@ -36,7 +36,6 @@ from cortex.application.clock import (
 )
 from cortex.libs.adapters.leetcode_adapter import LeetCodeAdapter
 from cortex.libs.config.settings import CortexConfig, get_config
-from cortex.libs.logging.correlation import get_correlation_id
 from cortex.libs.logging.structured import (
     EventType,
     configure_logging,
@@ -85,6 +84,12 @@ from cortex.libs.schemas.observations import (
     ObservationValidity,
 )
 from cortex.libs.schemas.physiology import SignalAlgorithmIdentity, SignalEstimate
+from cortex.libs.schemas.policy import (
+    PolicyArm,
+    PolicyContextSnapshot,
+    PolicyDecisionRecord,
+    policy_payload_sha256,
+)
 from cortex.libs.schemas.session_history import (
     SessionDetailResponse,
     SessionListResponse,
@@ -136,10 +141,19 @@ from cortex.services.context_engine import (
     TerminalAdapter,
     classify_tab_type,
 )
-from cortex.services.eval.amip import AMIPPolicy
-from cortex.services.eval.bandit import ContextualBandit
-from cortex.services.eval.causal_report import generate_daily_causal_report
 from cortex.services.eval.helpfulness import HelpfulnessTracker
+from cortex.services.eval.policy_diagnostics import (
+    generate_daily_policy_diagnostics,
+    migrate_legacy_causal_report_names,
+)
+from cortex.services.eval.policy_lifecycle import PolicyLifecycleService
+from cortex.services.eval.policy_repository import PolicyRepository
+from cortex.services.eval.production_policy import PolicySelectionInput
+from cortex.services.eval.research_policy import (
+    RESEARCH_POLICY_NAME,
+    RESEARCH_POLICY_VERSION,
+    ResearchPolicySettings,
+)
 from cortex.services.eval.tab_relevance import TabRelevanceTracker
 from cortex.services.handover.briefing import MorningBriefing
 from cortex.services.handover.detector import ShutdownDetector
@@ -1187,22 +1201,38 @@ class CortexDaemon:
             maxlen=50
         )  # intervention IDs with per-tab feedback
 
-        # Contextual bandit
-        self._bandit = ContextualBandit(store=self._store)
-        self._amip = AMIPPolicy(
-            storage_root=self.config.storage.path,
-            n_features=8,
-            tau0=self.config.eval.amip.tau0,
-            tau_min=self.config.eval.amip.tau_min,
-            epsilon_explore=self.config.eval.amip.epsilon_explore,
-            epsilon_explore_after_500=self.config.eval.amip.epsilon_explore_after_500,
-            stress_ratio_threshold=self.config.eval.amip.safety_floor_stress_ratio,
+        # WP8: production is a deterministic, non-learning policy. The only
+        # randomized path requires an explicit fixed research epoch and
+        # separate consent configuration; deterministic records never expose
+        # propensities suitable for causal/off-policy analysis.
+        self._policy_repository = PolicyRepository(self._database, clock=self._clock)
+        research_settings: ResearchPolicySettings | None = None
+        if self.config.eval.policy == "research_randomized":
+            research = self.config.eval.research
+            specification = research.mrt_specification(
+                policy_name=RESEARCH_POLICY_NAME,
+                policy_version=RESEARCH_POLICY_VERSION,
+                reward_version=self.config.eval.outcome.reward_version,
+                proximal_window_seconds=self.config.eval.outcome.reward_window_seconds,
+            )
+            research_settings = ResearchPolicySettings(
+                study_id=research.study_id,
+                study_epoch=research.study_epoch,
+                consent_version=research.consent_version,
+                seed_hex=research.seed_hex,
+                specification_sha256=policy_payload_sha256(specification.model_dump(mode="json")),
+                action_catalog=research.action_catalog,
+                minimum_probability=research.minimum_probability,
+                online_learning=research.online_learning,
+            )
+        self._policy_lifecycle = PolicyLifecycleService(
+            self._policy_repository,
+            clock=self._clock,
+            mode=self.config.eval.policy,
+            reward_window_seconds=self.config.eval.outcome.reward_window_seconds,
+            research_settings=research_settings,
         )
-        self._last_policy_decision_id: str | None = None
-        self._last_policy_arm: str | None = None
-        self._last_policy_propensity: dict[str, float] | None = None
-        self._amip_decision_ids_by_intervention: dict[str, str] = {}
-        self._bandit_decisions_by_intervention: dict[str, tuple[list[float], int]] = {}
+        self._next_policy_decision_mono_ns = 0
         # P1: canonical consent action-types for each applied intervention,
         # captured at apply time keyed by intervention_id. On engage/dismiss
         # the daemon records the approval/rejection under THESE keys (the
@@ -1630,6 +1660,11 @@ class CortexDaemon:
         # prior workspace effect still needs restoration.
         await self._database.start()
         await self._legacy_data_migrator.migrate_all()
+        await self._policy_lifecycle.start()
+        await asyncio.to_thread(
+            migrate_legacy_causal_report_names,
+            self.config.storage.path,
+        )
         sqlite_calibration = await self._legacy_data_migrator.load_active_calibration()
         if sqlite_calibration is not None and (
             self._active_calibration_profile is None
@@ -1727,10 +1762,14 @@ class CortexDaemon:
             asyncio.create_task(self._broadcast_loop(), name="cortex-broadcast-loop"),
             asyncio.create_task(self._context_loop(), name="cortex-context-loop"),
             asyncio.create_task(self._longitudinal_loop(), name="cortex-longitudinal-loop"),
+            asyncio.create_task(self._policy_outcome_loop(), name="cortex-policy-outcome-loop"),
         ]
-        if self.config.eval.causal_report.enabled:
+        if self.config.eval.policy_diagnostics.enabled:
             self._tasks.append(
-                asyncio.create_task(self._causal_report_loop(), name="cortex-causal-report-loop")
+                asyncio.create_task(
+                    self._policy_diagnostics_loop(),
+                    name="cortex-policy-diagnostics-loop",
+                )
             )
         # G.2: daily retention sweep so storage doesn't grow forever.
         self._tasks.append(
@@ -2189,8 +2228,8 @@ class CortexDaemon:
             "shutdown_detector": self._shutdown_detector,
             "consent_ladder": self._consent_ladder,
             "helpfulness_tracker": self._helpfulness,
-            "contextual_bandit": self._bandit,
-            "amip_policy": self._amip,
+            "policy_repository": self._policy_repository,
+            "policy_lifecycle": self._policy_lifecycle,
             "copilot_throttle": self._copilot_throttle,
         }.items():
             registry.register(name, service)
@@ -3380,23 +3419,70 @@ class CortexDaemon:
         except asyncio.CancelledError:
             logger.debug("session checkpoint loop cancelled")
 
-    async def _causal_report_loop(self) -> None:
-        """Generate nightly causal report from AMIP policy logs."""
+    async def _policy_diagnostics_loop(self) -> None:
+        """Generate a nightly descriptive policy-lifecycle report."""
         try:
             while True:
                 try:
                     now = utc_datetime(self._clock).astimezone()
-                    target_hour = self.config.eval.causal_report.nightly_hour_local
+                    target_hour = self.config.eval.policy_diagnostics.nightly_hour_local
                     if now.hour == target_hour and now.minute < 5:
-                        generate_daily_causal_report(self.config.storage.path)
+                        await generate_daily_policy_diagnostics(
+                            self._policy_repository,
+                            self.config.storage.path,
+                            day=self._clock.today_utc().isoformat(),
+                        )
                         await asyncio.sleep(300.0)
                         continue
                 except Exception:
-                    logger.debug("Failed generating causal report", exc_info=True)
+                    logger.debug("Failed generating policy diagnostics", exc_info=True)
                 await asyncio.sleep(60.0)
         except asyncio.CancelledError:
-            # B6 (Phase 4.1): graceful causal report loop shutdown.
-            logger.debug("causal report loop cancelled")
+            logger.debug("policy diagnostics loop cancelled")
+
+    def _policy_outcome_snapshot(self) -> dict[str, Any] | None:
+        """Capture the same bounded behavioral fields for every policy arm."""
+
+        estimate = registry.get("latest_state_estimate")
+        context = self._latest_context
+        if estimate is None or context is None:
+            return None
+        browser = getattr(context, "browser_context", None)
+        return {
+            "schema_version": "policy-outcome-snapshot/2.0",
+            "support_state": str(getattr(estimate, "state", "UNKNOWN")),
+            "support_status": str(getattr(estimate, "status", "unavailable")),
+            "support_confidence": float(getattr(estimate, "confidence", 0.0) or 0.0),
+            "evidence_coverage": float(getattr(estimate, "evidence_coverage", 0.0) or 0.0),
+            "complexity_score": float(getattr(context, "complexity_score", 0.0) or 0.0),
+            "tab_count": int(getattr(browser, "tab_count", 0) or 0),
+            "error_count": int(getattr(context, "total_errors", 0) or 0),
+            "thrashing_score": float(getattr(self._aggregator, "thrashing_score", 0.0) or 0.0),
+            "observed_at_unix_ms": self._clock.unix_ms(),
+            "observed_at_mono_ns": self._clock.monotonic_ns(),
+            "boot_id": str(self._clock.boot_id),
+        }
+
+    async def _policy_outcome_loop(self) -> None:
+        """Finalize every due window, including no-action, after restart."""
+
+        interval = self.config.eval.outcome.collector_interval_seconds
+        try:
+            while True:
+                try:
+                    finalized = await self._policy_lifecycle.finalize_due(
+                        self._policy_outcome_snapshot,
+                    )
+                    if finalized:
+                        logger.info(
+                            "Finalized %d policy outcome window(s)",
+                            len(finalized),
+                        )
+                except Exception:
+                    logger.exception("Policy outcome finalization failed")
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            logger.debug("policy outcome loop cancelled")
 
     async def _state_loop(self) -> None:
         try:
@@ -3829,76 +3915,89 @@ class CortexDaemon:
                             and decision.should_trigger
                             and self._active_intervention_id is None
                             and estimate.signal_quality.acceptable
+                            and self._clock.monotonic_ns() >= self._next_policy_decision_mono_ns
                         ):
-                            bandit_features = np.array(
-                                self._build_bandit_features(estimate, context),
-                                dtype=np.float64,
+                            browser = getattr(context, "browser_context", None)
+                            policy_context = PolicyContextSnapshot(
+                                support_state=str(getattr(estimate, "state", "UNKNOWN")),
+                                support_status=str(getattr(estimate, "status", "unavailable")),
+                                support_confidence=float(
+                                    getattr(estimate, "confidence", 0.0) or 0.0
+                                ),
+                                evidence_coverage=float(
+                                    getattr(estimate, "evidence_coverage", 0.0) or 0.0
+                                ),
+                                complexity_score=float(
+                                    getattr(context, "complexity_score", 0.0) or 0.0
+                                ),
+                                tab_count=int(getattr(browser, "tab_count", 0) or 0),
+                                error_count=int(getattr(context, "total_errors", 0) or 0),
+                                thrashing_score=float(
+                                    getattr(self._aggregator, "thrashing_score", 0.0) or 0.0
+                                ),
+                                hour_utc=utc_datetime(self._clock).hour,
                             )
-                            selected_bandit_arm: int | None = None
-                            if self.config.eval.policy == "amip":
-                                amip_decision = self._amip.choose_action(
-                                    bandit_features,
-                                    confidence=decision.confidence,
-                                    receptive=not decision.receptivity_blocked,
-                                    # Research-only HRV load cannot influence
-                                    # production action selection.
-                                    stress_ratio=0.0,
+                            preferred = self.config.eval.production.preferred_low_friction_arm
+                            feasible_arms: tuple[PolicyArm, ...] = (
+                                "no_action",
+                                "suggest_only",
+                            )
+                            if preferred is not None and preferred not in feasible_arms:
+                                feasible_arms = (*feasible_arms, preferred)
+                            try:
+                                report_snapshot = self._session_report.snapshot()
+                                session_id = str(report_snapshot.session_id)
+                            except Exception:
+                                session_id = f"boot:{self._clock.boot_id}"
+                            try:
+                                policy_decision = await self._policy_lifecycle.decide(
+                                    PolicySelectionInput(
+                                        decision_point_id=uuid4(),
+                                        session_id=session_id,
+                                        context=policy_context,
+                                        eligible=True,
+                                        available=not decision.receptivity_blocked,
+                                        availability_reason=(
+                                            "eligible_and_receptive"
+                                            if not decision.receptivity_blocked
+                                            else "receptivity_blocked"
+                                        ),
+                                        feasible_arms=feasible_arms,
+                                        recent_repeated_dismissal=bool(
+                                            decision.dismissal_probability is not None
+                                            and decision.dismissal_probability
+                                            >= self.config.intervention.dismissal_model_threshold
+                                        ),
+                                        preferred_low_friction_arm=preferred,
+                                        reward_version=self.config.eval.outcome.reward_version,
+                                    )
                                 )
-                                self._last_policy_decision_id = amip_decision.decision_id
-                                self._last_policy_arm = amip_decision.action
-                                self._last_policy_propensity = dict(amip_decision.probabilities)
-                                template_name = self._policy_arm_to_template(amip_decision.action)
-                                if amip_decision.action == "no_action":
-                                    await asyncio.sleep(0.5)
-                                    continue
-                            elif self.config.eval.policy == "uniform":
-                                arm_name = np.random.choice(
-                                    [
-                                        "workspace_simplify",
-                                        "task_decompose",
-                                        "breath_box",
-                                        "nature_break",
-                                        "flow_shield",
-                                        "defusion_prompt",
-                                        "circuit_breaker",
-                                    ]
-                                ).item()
-                                self._last_policy_decision_id = None
-                                self._last_policy_arm = arm_name
-                                self._last_policy_propensity = None
-                                template_name = self._policy_arm_to_template(arm_name)
-                            else:
-                                selected_arm = await self._bandit.select_arm_async(bandit_features)
-                                template_name = self._arm_to_template(selected_arm)
-                                self._last_policy_decision_id = None
-                                self._last_policy_arm = self._bandit.get_arm_label(selected_arm)
-                                self._last_policy_propensity = None
-                                selected_bandit_arm = selected_arm
+                            except Exception:
+                                # A decision that cannot be durably recorded
+                                # cannot authorize an interruption.
+                                logger.exception(
+                                    "Policy decision persistence failed; suppressing proposal"
+                                )
+                                continue
+                            self._next_policy_decision_mono_ns = (
+                                self._clock.monotonic_ns()
+                                + self.config.eval.decision_interval_seconds * 1_000_000_000
+                            )
+                            template_name = self._policy_arm_to_template(
+                                policy_decision.selected_arm
+                            )
+                            if policy_decision.selected_arm == "no_action":
+                                continue
 
                             # Run intervention in background so the state
                             # loop keeps updating while the LLM responds.
                             self._active_intervention_id = "__pending__"
-                            # Phase-4b TASK D: thread the decision_id
-                            # explicitly so the trigger doesn't fall back
-                            # to a shared mutable slot for outcome
-                            # attribution under concurrency.
-                            decision_id_snapshot = self._last_policy_decision_id
                             self._spawn_background_task(
                                 self._trigger_intervention(
                                     context,
                                     estimate,
                                     template_name=template_name,
-                                    bandit_features=(
-                                        bandit_features.tolist()
-                                        if self.config.eval.policy == "greedy"
-                                        else None
-                                    ),
-                                    bandit_arm_index=(
-                                        selected_bandit_arm
-                                        if self.config.eval.policy == "greedy"
-                                        else None
-                                    ),
-                                    decision_id=decision_id_snapshot,
+                                    policy_decision=policy_decision,
                                 ),
                                 name="cortex-intervention",
                             )
@@ -3995,8 +4094,6 @@ class CortexDaemon:
         if callable(cancel_tracking):
             cancel_tracking(intervention_id)
         for attribute in (
-            "_amip_decision_ids_by_intervention",
-            "_bandit_decisions_by_intervention",
             "_dismissal_features_by_intervention",
             "_consent_actions_by_intervention",
             "_causal_signals_by_intervention",
@@ -4026,20 +4123,13 @@ class CortexDaemon:
         estimate: Any,
         *,
         template_name: str | None = None,
-        bandit_features: list[float] | None = None,
-        bandit_arm_index: int | None = None,
-        decision_id: str | None = None,
+        policy_decision: PolicyDecisionRecord | None = None,
     ) -> None:
-        # Phase-4b TASK D: prefer the explicit ``decision_id`` arg so a
-        # second concurrent ``_trigger_intervention`` cannot poison this
-        # call's outcome attribution by overwriting
-        # ``self._last_policy_decision_id`` between the dispatch site
-        # and here. Fall back to the legacy shared slot only when no
-        # explicit id was supplied (test rigs / legacy callers).
-        if decision_id is None:
-            decision_id = self._last_policy_decision_id
+        decision_id = policy_decision.decision_id if policy_decision is not None else None
         registered_intervention_id: str | None = None
         presentation_committed = False
+        policy_delivery_finalized = decision_id is None
+        policy_non_delivery_reason = "presentation_pipeline_failed"
         try:
             # Inject learned tab relevance into context for LLM
             goal = getattr(context, "current_goal_hint", "") or ""
@@ -4078,6 +4168,7 @@ class CortexDaemon:
                         current_state.dwell_seconds,
                     )
                     self._active_intervention_id = None
+                    policy_non_delivery_reason = "stale_state_recovered"
                     return
                 # Also check if workspace context changed significantly
                 if hasattr(context, "browser_context") and context.browser_context:
@@ -4097,6 +4188,7 @@ class CortexDaemon:
                                 "Suppressing stale intervention: >50%% tab references invalid"
                             )
                             self._active_intervention_id = None
+                            policy_non_delivery_reason = "stale_workspace_context"
                             return
 
             # P0 §3.9: attach structured causal signals to every plan
@@ -4132,6 +4224,7 @@ class CortexDaemon:
                 logger.warning(
                     "Rejected intervention plan %s: %s", plan.intervention_id, validation.errors
                 )
+                policy_non_delivery_reason = "planner_output_rejected"
                 return
             if validation.warnings:
                 plan.plan_warnings.extend(validation.warnings)
@@ -4189,6 +4282,7 @@ class CortexDaemon:
                     "Suppressed proposal %s: no authenticated presentation surface is connected",
                     plan.intervention_id,
                 )
+                policy_non_delivery_reason = "no_authenticated_presentation_surface"
                 return
             self._active_intervention_id = plan.intervention_id
             # P0 §3.6: cache the live plan so MICRO_STEP_TOGGLED can
@@ -4238,21 +4332,17 @@ class CortexDaemon:
                 thrashing_score=float(getattr(self._aggregator, "thrashing_score", 0.0)),
                 # Compatibility outcome field only; unavailable in product.
                 stress_integral=0.0,
-                decision_id=decision_id,
-                propensity=self._last_policy_propensity,
-                policy_arm=self._last_policy_arm,
+                decision_id=str(decision_id) if decision_id is not None else None,
+                propensity=(
+                    {
+                        str(arm): probability
+                        for arm, probability in policy_decision.propensities.items()
+                    }
+                    if policy_decision is not None and policy_decision.propensities is not None
+                    else None
+                ),
+                policy_arm=(policy_decision.selected_arm if policy_decision is not None else None),
             )
-            # Bind the policy decision to this intervention ID so reward updates
-            # use the exact action/context that was chosen. Phase-4b TASK D:
-            # use the explicit ``decision_id`` snapshot rather than the
-            # shared mutable slot so a peer trigger cannot steal credit.
-            if decision_id:
-                self._amip_decision_ids_by_intervention[plan.intervention_id] = decision_id
-            if bandit_features is not None and bandit_arm_index is not None:
-                self._bandit_decisions_by_intervention[plan.intervention_id] = (
-                    list(bandit_features),
-                    int(bandit_arm_index),
-                )
             # audit C-note: snapshot the trigger-time confidence + context
             # complexity so the eventual engaged/dismissed outcome trains the
             # dismissal model on the SAME features the trigger decision saw.
@@ -4361,9 +4451,16 @@ class CortexDaemon:
                     "Abandoned proposal %s after every presentation surface disconnected",
                     plan.intervention_id,
                 )
+                policy_non_delivery_reason = "presentation_delivery_race"
                 return
 
             presentation_committed = True
+            if decision_id is not None:
+                await self._policy_lifecycle.mark_delivered(
+                    decision_id,
+                    plan.intervention_id,
+                )
+                policy_delivery_finalized = True
 
             self._trigger_policy.record_intervention()
             try:
@@ -4391,20 +4488,14 @@ class CortexDaemon:
                     )
         except TimeoutError:
             logger.warning("Intervention LLM call timed out")
+            policy_non_delivery_reason = "presentation_pipeline_timed_out"
             if registered_intervention_id is not None and not presentation_committed:
                 await self._close_unpresented_transaction(
                     registered_intervention_id,
                     reason="presentation_pipeline_timed_out",
                 )
-            # Phase-4b TASK D: explicitly clear pending state. Leaving
-            # the pending decision_id slot occupied would let the next
-            # trigger inherit a now-stale id, double-attributing the
-            # outcome to a plan that never landed.
-            if self._last_policy_decision_id == decision_id:
-                self._last_policy_decision_id = None
-                self._last_policy_arm = None
-                self._last_policy_propensity = None
         except asyncio.CancelledError:
+            policy_non_delivery_reason = "presentation_task_cancelled"
             if registered_intervention_id is not None and not presentation_committed:
                 await asyncio.shield(
                     self._close_unpresented_transaction(
@@ -4415,12 +4506,36 @@ class CortexDaemon:
             raise
         except Exception:
             logger.exception("Failed to trigger intervention")
+            policy_non_delivery_reason = "presentation_pipeline_failed"
             if registered_intervention_id is not None and not presentation_committed:
                 await self._close_unpresented_transaction(
                     registered_intervention_id,
                     reason="presentation_pipeline_failed",
                 )
         finally:
+            if decision_id is not None and not policy_delivery_finalized:
+                try:
+                    if presentation_committed and registered_intervention_id is not None:
+                        await asyncio.shield(
+                            self._policy_lifecycle.mark_delivered(
+                                decision_id,
+                                registered_intervention_id,
+                            )
+                        )
+                    else:
+                        await asyncio.shield(
+                            self._policy_lifecycle.mark_not_delivered(
+                                decision_id,
+                                policy_non_delivery_reason,
+                            )
+                        )
+                    policy_delivery_finalized = True
+                except Exception:
+                    logger.critical(
+                        "Could not persist policy delivery status for decision %s",
+                        decision_id,
+                        exc_info=True,
+                    )
             # Clear __pending__ sentinel if intervention didn't complete
             if self._active_intervention_id == "__pending__":
                 self._active_intervention_id = None
@@ -4437,7 +4552,7 @@ class CortexDaemon:
         """Trigger a special v2.0 intervention (breathing, active recall, rabbit hole).
 
         Phase-4b TASK D: ``decision_id`` is an explicit arg. Special
-        interventions do not currently bind to an AMIP arm, so the
+        interventions do not currently bind to a production-policy decision, so the
         default behaviour (clear the shared slot) is preserved; the arg
         is accepted for future symmetry with ``_trigger_intervention``.
         """
@@ -4451,14 +4566,9 @@ class CortexDaemon:
         # twice and broadcast two plans (only one of which won the
         # ``_active_intervention_id`` assignment).
         self._active_intervention_id = "__pending__"
-        # Phase-4b TASK D: special interventions are not AMIP-bound;
-        # clear the shared slot unless the caller threaded an explicit
-        # id (in which case the trigger owns the credit and must clear
-        # on completion below).
-        if decision_id is None:
-            self._last_policy_decision_id = None
-            self._last_policy_arm = None
-            self._last_policy_propensity = None
+        # Special detector interventions are not part of the production
+        # policy experiment ledger. ``decision_id`` remains a compatibility
+        # parameter for older callers but confers no reward attribution.
 
         registered_intervention_id: str | None = None
         presentation_committed = False
@@ -5202,8 +5312,8 @@ class CortexDaemon:
 
         ``InterventionExecutor.apply`` calls this BEFORE adapter
         dispatch. Returning False short-circuits the mutation into
-        ``success=False, reason="consent_denied"`` so AMIP /
-        helpfulness can record the failure mode.
+        ``success=False, reason="consent_denied"`` so local diagnostics
+        can record the failure mode.
         """
         try:
             decision = await self._consent_ladder.check(
@@ -6036,7 +6146,7 @@ class CortexDaemon:
         ``RestoreManager.engage`` exactly once (latched by
         ``_micro_step_recovery_fired``) so a tail-click does not
         re-engage an already-closed intervention. The natural
-        recovery path feeds AMIP via the same helpfulness tracker
+        recovery path feeds the local helpfulness diagnostics via the same tracker
         used by the dismiss/engage actions.
         """
         # Wave-2 P1: serialise against the F16 plan-swap path so a
@@ -6154,7 +6264,7 @@ class CortexDaemon:
                 if outcome is not None:
                     # Mirror the bookkeeping path that ``_handle_user_action``
                     # performs for the explicit engage/dismiss flow so the
-                    # bandit / helpfulness ledger sees a consistent close.
+                    # local helpfulness ledger sees a consistent close.
                     try:
                         self._recorder.append(
                             "intervention_outcome",
@@ -6180,6 +6290,14 @@ class CortexDaemon:
                                 intervention_id,
                                 "natural_recovery",
                             )
+                            await self._policy_lifecycle.observe_intervention(
+                                intervention_id,
+                                kind="user_action",
+                                idempotency_key=(
+                                    f"terminal-action:{intervention_id}:natural_recovery"
+                                ),
+                                payload={"action": "natural_recovery"},
+                            )
                         except Exception:
                             logger.debug(
                                 "record_user_action(natural_recovery) failed",
@@ -6192,24 +6310,21 @@ class CortexDaemon:
                         self._micro_step_recovery_fired = False
 
     async def _handle_user_action(self, payload: dict[str, Any]) -> None:
-        # Phase-4b TASK F: a dismissed auto-focus interstitial routes
-        # through this callback with ``auto_focus_dismissed: True`` (the
-        # browser extension sends it on the "Not now" button). Route as
-        # a small negative outcome on the bound AMIP decision so the
-        # bandit learns the auto-arm was unwanted in this context.
+        # Auto-focus dismissals are observations inside the one fixed reward
+        # window. They never update policy state or finalize a reward early.
         if payload.get("auto_focus_dismissed") is True:
             iid = str(payload.get("intervention_id") or "")
-            decision_id = (
-                self._amip_decision_ids_by_intervention.get(iid) if iid else None
-            ) or self._last_policy_decision_id
-            if decision_id and self.config.eval.policy == "amip":
+            if iid:
                 try:
-                    # ``AMIPPolicy.update_reward`` is synchronous (returns
-                    # None); awaiting it was a mypy func-returns-value error.
-                    self._amip.update_reward(decision_id, -0.2)
+                    await self._policy_lifecycle.observe_intervention(
+                        iid,
+                        kind="user_action",
+                        idempotency_key=f"auto-focus-dismissed:{iid}",
+                        payload={"action": "dismissed", "surface": "auto_focus"},
+                    )
                 except Exception:
                     logger.debug(
-                        "auto_focus_dismissed AMIP reward update failed",
+                        "auto_focus_dismissed policy observation failed",
                         exc_info=True,
                     )
             return
@@ -6330,41 +6445,16 @@ class CortexDaemon:
                         "text_feedback": text_feedback,
                     },
                 )
-                # Phase-4b TASK A: route the rating into AMIP so the
-                # bandit learns from explicit feedback even when the
-                # implicit engaged/dismissed signal has not arrived yet
-                # (the user may rate-then-keep-the-intervention-open).
-                # Reward shape: thumbs_up → +0.7, thumbs_down → -0.7;
-                # values match the implicit-signal magnitudes the
-                # helpfulness tracker emits on engagement.
-                if self.config.eval.policy == "amip" and rating in ("thumbs_up", "thumbs_down"):
-                    rating_reward = 0.7 if rating == "thumbs_up" else -0.7
-                    decision_id = self._amip_decision_ids_by_intervention.get(
-                        iid,
-                        self._last_policy_decision_id,
-                    )
-                    if decision_id:
-                        try:
-                            cid = get_correlation_id() or "-"
-                            logger.info(
-                                "amip_rating_reward intervention_id=%s "
-                                "decision_id=%s rating=%s reward=%.2f cid=%s",
-                                iid,
-                                decision_id,
-                                rating,
-                                rating_reward,
-                                cid,
-                            )
-                            # synchronous; see note at the other call site.
-                            self._amip.update_reward(
-                                decision_id,
-                                rating_reward,
-                            )
-                        except Exception:
-                            logger.debug(
-                                "amip rating reward update failed",
-                                exc_info=True,
-                            )
+                if rating in ("thumbs_up", "thumbs_down"):
+                    try:
+                        await self._policy_lifecycle.observe_intervention(
+                            iid,
+                            kind="user_rating",
+                            idempotency_key=f"user-rating:{iid}:{rating}",
+                            payload={"rating": rating},
+                        )
+                    except Exception:
+                        logger.debug("policy rating observation failed", exc_info=True)
                 # P0 §3.8: frustration-spiral throttle — 5 thumbs_down in
                 # 30 s escalates the daemon into Quiet Mode for 30 min.
                 if rating == "thumbs_down":
@@ -6500,9 +6590,31 @@ class CortexDaemon:
                 for consent_key in consent_keys:
                     await self._consent_ladder.record_rejection(consent_key)
 
+        try:
+            await self._policy_lifecycle.observe_intervention(
+                intervention_id,
+                kind="user_action",
+                idempotency_key=f"terminal-action:{intervention_id}:{action}",
+                payload={"action": action},
+            )
+            if action == "restore":
+                await self._policy_lifecycle.observe_intervention(
+                    intervention_id,
+                    kind="undo",
+                    idempotency_key=f"undo:{intervention_id}",
+                    payload={"action": action},
+                )
+            if outcome is not None and not outcome.workspace_restored:
+                await self._policy_lifecycle.observe_intervention(
+                    intervention_id,
+                    kind="restore_failure",
+                    idempotency_key=f"restore-failure:{intervention_id}:{action}",
+                    payload={"action": action},
+                )
+        except Exception:
+            logger.debug("policy terminal observation failed", exc_info=True)
+
         if outcome is None:
-            self._amip_decision_ids_by_intervention.pop(intervention_id, None)
-            self._bandit_decisions_by_intervention.pop(intervention_id, None)
             return
 
         self._recorder.append("intervention_outcome", outcome.model_dump(mode="json"))
@@ -6527,9 +6639,9 @@ class CortexDaemon:
         self._micro_step_recovery_fired = False
         await self._ws_server.send_restore(intervention_id, user_action=action)
 
-        # v2.0: End helpfulness tracking and update bandit
-        # Fold the user's action into the tracker first so the implicit-signal
-        # term (engaged/ignored/undone) contributes to the reward.
+        # Keep the immediate score for the local descriptive helpfulness UI.
+        # It is not a policy update; the durable reward finalizes only after
+        # the prespecified proximal window.
         self._helpfulness.record_user_action(intervention_id, action)
         context = self._latest_context
         state_estimate = registry.get("latest_state_estimate")
@@ -6556,42 +6668,9 @@ class CortexDaemon:
                     "helpfulness",
                     {
                         "intervention_id": intervention_id,
-                        "reward_signal": reward,
+                        "descriptive_helpfulness_score": reward,
                     },
                 )
-                # Update bandit with reward
-                if self.config.eval.policy == "amip":
-                    decision_id = self._amip_decision_ids_by_intervention.pop(
-                        intervention_id, self._last_policy_decision_id
-                    )
-                    if decision_id:
-                        self._amip.update_reward(decision_id, reward)
-                elif self.config.eval.policy != "uniform":
-                    decision = self._bandit_decisions_by_intervention.pop(intervention_id, None)
-                    if decision is not None:
-                        feature_vec, arm_index = decision
-                        await self._bandit.update_async(
-                            np.array(feature_vec, dtype=np.float64),
-                            arm_index,
-                            reward,
-                        )
-                    elif context:
-                        # Fallback path for older interventions lacking bound
-                        # decision metadata.
-                        features = self._build_bandit_features(state_estimate, context)
-                        bandit_features = np.array(features, dtype=np.float64)
-                        arm_index = 0
-                        if self._last_policy_arm:
-                            mapped = self._bandit.get_arm_index(self._last_policy_arm)
-                            if mapped is not None:
-                                arm_index = mapped
-                        await self._bandit.update_async(bandit_features, arm_index, reward)
-            else:
-                self._amip_decision_ids_by_intervention.pop(intervention_id, None)
-                self._bandit_decisions_by_intervention.pop(intervention_id, None)
-        else:
-            self._amip_decision_ids_by_intervention.pop(intervention_id, None)
-            self._bandit_decisions_by_intervention.pop(intervention_id, None)
 
         # Record tab relevance feedback (skip if per-tab feedback was already received)
         await self._record_tab_relevance_feedback(action, outcome, intervention_id)
@@ -7068,45 +7147,12 @@ class CortexDaemon:
 
     # --- v2.0 helper methods ---
 
-    def _build_bandit_features(self, estimate: Any, context: Any) -> list[float]:
-        """Build 8-dimensional feature vector for the contextual bandit."""
-        state_map = {"FLOW": 0.0, "HYPO": 0.25, "RECOVERY": 0.5, "HYPER": 1.0}
-        # Phase-4b TASK N: UTC for the hour-of-day feature so the bandit
-        # learns a single global chronotype rather than one per timezone
-        # the user travels through.
-        hour = utc_datetime(self._clock).hour
-        return [
-            state_map.get(estimate.state, 0.5),
-            context.complexity_score if hasattr(context, "complexity_score") else 0.0,
-            float(context.browser_context.tab_count if context.browser_context else 0) / 20.0,
-            float(context.total_errors if hasattr(context, "total_errors") else 0) / 10.0,
-            hour / 24.0,
-            self._aggregator.thrashing_score
-            if hasattr(self._aggregator, "thrashing_score")
-            else 0.0,
-            0.0,  # retired HRV stress-integral feature
-            0.5,  # consent level placeholder
-        ]
-
-    @staticmethod
-    def _arm_to_template(arm_index: int) -> str | None:
-        """Map bandit arm index to prompt template name."""
-        arm_templates = {
-            0: None,  # overlay_only → auto-select
-            1: "code_focus_reduction",  # simplified_workspace
-            2: "micro_step_planner",  # guided_mode
-            3: "breathing_overlay",
-            4: "active_recall",
-            5: "rabbit_hole",
-            6: None,  # no intervention
-        }
-        return arm_templates.get(arm_index)
-
     @staticmethod
     def _policy_arm_to_template(arm_name: str) -> str | None:
-        """Map AMIP policy arm names to template names."""
+        """Map the finite policy catalog to reviewed planner templates."""
         mapping = {
             "no_action": None,
+            "suggest_only": None,
             "workspace_simplify": "code_focus_reduction",
             "task_decompose": "micro_step_planner",
             "breath_box": "breathing_overlay",

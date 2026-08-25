@@ -191,8 +191,8 @@ class InterventionExecutor:
         The gate runs BEFORE adapter dispatch inside :meth:`apply`. A
         denial short-circuits the command into a Mutation with
         ``success=False, reason="consent_denied"`` so the daemon can
-        record the outcome and inform AMIP that this plan should have
-        been gated at LLM time.
+        record the outcome and diagnose that this plan should have been
+        gated before authorization.
         """
         self._consent_check = fn
 

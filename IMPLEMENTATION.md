@@ -170,7 +170,7 @@ flowchart LR
     Fusion --> Rules["RuleScorer"]
     Rules --> Smooth["EMA + dwell/hysteresis"]
     Smooth --> Trigger["TriggerPolicy + special detectors"]
-    Trigger --> Policy["AMIP or legacy bandit action selection"]
+    Trigger --> Policy["Deterministic product policy or separately consented fixed MRT"]
     Policy --> Context["browser/editor context collection"]
     Context --> LLM["Anthropic planner + parser + validator"]
     LLM --> Consent["ConsentLadder"]
@@ -212,7 +212,7 @@ The modes have already diverged in safety-relevant behavior: calibration simulat
 | planning                  | `cortex/services/llm_engine/`                                                  | Anthropic request, prompt/cache/cost, parse/repair, bounded plan output                                             |
 | consent                   | `cortex/services/consent/`                                                     | per-action escalation and policy ceiling; downgrade result currently misconsumed                                    |
 | intervention              | `cortex/services/intervention_engine/`                                         | plan validation/mapping, adapter execution, snapshot, restore, special intervention flows                           |
-| adaptation/evaluation     | `cortex/services/eval/`                                                        | AMIP/bandit, helpfulness/rewards, diagnostic/causal report, regression harness                                      |
+| adaptation/evaluation     | `cortex/services/eval/`                                                        | deterministic product policy, one-window/one-reward lifecycle, descriptive diagnostics, separately governed MRT/OPE tooling |
 | HTTP/WS gateway           | `cortex/services/api_gateway/`                                                 | FastAPI on 9472, WebSocket on 9473, token auth, client callbacks and broadcasts                                     |
 | application orchestration | `cortex/services/runtime_daemon.py`                                            | composition, loops, callbacks, most cross-domain workflows; principal Python change hotspot                         |
 | desktop                   | `cortex/apps/desktop_shell/`                                                   | PySide6 lifecycle, onboarding, settings, history/dashboard, in-process and WS transports                            |
@@ -511,11 +511,24 @@ AMIP's matrices and counts are not restored after restart. Decision objects are 
 
 **Fix:** one immutable decision point produces at most one finalized proximal outcome and one reward under a versioned reward function. Intermediate feedback is stored as outcome components, not separate bandit updates. Persist sufficient statistics and/or replayable finalized rows transactionally; make finalization idempotent.
 
+**Implementation status (2026-08-25): resolved for the production path.**
+SQLite schema v2 stores immutable decision points, one bounded outcome window,
+idempotent intermediate observations, one composite reward per
+`(decision_id, reward_version)`, and checksummed policy state. Finalization is
+transactional and survives restart. The retired trainer now rejects legacy
+observational helpfulness logs at every training/evaluation entry point.
+
 #### F-025 — The no-action arm is not a valid control (P0, observed)
 
 When `no_action` is chosen, processing exits without scheduling the same follow-up outcome window. Its decision remains unclosed. This is informative censoring: treatment arms are observed and control is missing.
 
 **Fix:** every eligible decision point, including no-action, gets the same outcome collection schedule. Log availability, eligibility, feasible action set, all action propensities, chosen action, delivery, contamination by other interventions, censoring, and outcome completeness.
+
+**Implementation status (2026-08-25): resolved.** Both product and research
+no-action decisions receive the same durable proximal window and finalization
+schedule as delivered suggestions. Missing delivery, missing outcome,
+censoring, and overlapping policy deliveries are explicit rather than silently
+dropped.
 
 #### F-026 — Current “causal report” does not identify a causal estimand (P0, observed + research basis)
 
@@ -534,11 +547,31 @@ Micro-randomized trials establish proximal effects by randomizing intervention o
 - positivity/effective-sample-size/weight-tail diagnostics;
 - frozen analysis version and reproducible report dataset.
 
+**Implementation status (2026-08-25): invalid product claims removed; research
+software implemented, external review still required.** Product output is now
+named `policy_diagnostics` and is explicitly descriptive. A separate,
+separately consented fixed two-arm MRT path binds each decision to the exact
+study-specification checksum, creates owner-only immutable exports with sidecar
+digests, and analyzes them with prespecified centered WCLS and session-cluster
+bootstrap uncertainty. Target-policy IPS, SNIPS, direct-method, doubly robust,
+and clipped/SWITCH-style estimates reject deterministic logs and include
+overlap, weight-tail, support, effective-sample-size, and exact-input hashes.
+No effect or efficacy claim is made until an independent statistician reviews
+the frozen protocol and real study data.
+
 #### F-027 — Policy safeguards are mixed with learned choice (P1, observed)
 
 Feasibility is only partially represented; capability availability and exact consent are not an action mask. A stress rule zeros the no-action probability and forces selected recovery arms, which is a behavioral mandate rather than a safety floor. Feature vectors lack an intercept and robust normalization; matrix inversion is recomputed directly; RNG/version provenance is insufficient.
 
 **Fix:** hard safety and consent constraints produce a feasible action set before policy selection and are never learnable. Add intercept, versioned normalization, Cholesky/solve rather than explicit inverse, a reproducible CSPRNG-derived decision seed, UUID decision IDs, bounded matrices, and startup integrity checks. Production defaults to a deterministic policy; online learning is research-only until the validation and governance gates pass.
+
+**Implementation status (2026-08-25): resolved for the supported policy
+surface.** Production is a versioned deterministic policy and never emits a
+research propensity. Research mode is disabled by default, requires an
+explicit fixed epoch and separate consent version, is restricted to
+`no_action`/`suggest_only`, randomizes only after deterministic eligibility and
+feasibility exclusions, serializes reproducible draw counters, and freezes
+online learning off in the public configuration.
 
 ### 5.9 LLM privacy and planner safety
 
@@ -1703,6 +1736,37 @@ packaging; and an isolated built-wheel schema-creation smoke test.
 
 ### WP-8 — Policy and causal-evaluation correction (`XL`, depends on WP-6/7)
 
+**Implementation status (2026-08-25): complete at the software boundary; the
+independent research-method review remains an external promotion gate.** The
+runtime now composes a deterministic non-learning production policy. SQLite
+schema v2 records exact availability, eligibility, feasible arms, delivery,
+the common proximal window, bounded idempotent observations, contamination,
+censoring, and one versioned reward. No-action follows the identical lifecycle;
+restart recovery and concurrent research draws are deterministic. Legacy
+AMIP/bandit execution is disconnected from composition and its offline trainer
+fails closed. Reports are descriptive policy diagnostics. The separately
+consented research path freezes a two-arm MRT specification and analysis seed,
+binds the specification checksum into policy state and every randomized
+decision, persists reproducible HMAC-derived draw identifiers/counters, creates
+exclusive owner-only immutable exports, and verifies exact input digests.
+Centered WCLS with session-cluster bootstrap and target-policy OPE estimators
+carry explicit support/positivity/weight/ESS diagnostics and reject production
+records. The detailed estimand, inclusion rules, sensitivity analyses, and
+promotion boundaries are tracked in
+`cortex/docs/research/policy-evaluation-protocol.md`. Completion evidence
+includes the real v1→v2 backup migration, deterministic replay, 40-way draw
+serialization, one-reward/idempotency and no-action restart tests, contamination
+timing, synthetic known-effect recovery, extreme-weight diagnostics, immutable
+export checks, legacy-name migration, hard payload/date bounds, and 74 focused
+runtime/evaluation/auth/artifact tests. The phase-closing matrix also passed
+2,209 non-Qt Python tests with five declared skips, all 38 Qt-bearing test
+modules in isolated processes, strict mypy across 493 files, Ruff and all
+schema/design/version drift gates, 208 browser tests plus Chrome and Edge
+builds, 30 VS Code tests plus compile/VSIX packaging, and a verified 264-file
+wheel containing schema migration v2. This closes product correctness; it does
+not substitute for preregistration, ethics review where applicable, or an
+independent statistical review of a real study.
+
 **Files:** AMIP/bandit/causal services under `cortex/services/eval/`; helpfulness and runtime reward paths; configuration; report UI/export
 
 **Changes:**
@@ -1997,7 +2061,7 @@ Move one cohesive flow at a time behind the kernel after characterization tests.
 - [x] P1-06 evidence-normalized inference with unknown state
 - [x] P1-07 manifest/authorization/receipt intervention protocol
 - [x] P1-08 event store and restart recovery
-- [ ] P1-09 deterministic production policy and one finalized reward
+- [x] P1-09 deterministic production policy and one finalized reward
 - [ ] P1-10 privacy context preview/redaction and optional browser permissions
 
 ### P2 — Architecture and research quality
@@ -2008,7 +2072,7 @@ Move one cohesive flow at a time behind the kernel after characterization tests.
 - [ ] P2-04 browser background/popup split
 - [ ] P2-05 one desktop domain path
 - [ ] P2-06 reference-sensor and participant-held-out validation program
-- [ ] P2-07 MRT/OPE research pipeline and independent statistical review
+- [ ] P2-07 MRT/OPE research pipeline and independent statistical review — software pipeline complete; independent review outstanding
 - [ ] P2-08 reproducible dependency/build/SBOM/provenance flow
 
 ### P3 — Documentation and cleanup

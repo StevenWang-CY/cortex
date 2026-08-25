@@ -35,9 +35,11 @@ or validated estimator of a person's cognitive state.
   validation.
 - FLOW/HYPER/HYPO/RECOVERY are legacy heuristic support labels. Their scores
   are not calibrated probabilities and must not be interpreted as diagnoses.
-- The legacy adaptive-policy and “causal report” modules are research
-  diagnostics. They do not establish causal effects and do not receive
-  workspace mutation authority in the default product.
+- Production policy selection is deterministic and does not learn online.
+  Retired adaptive-policy logs and former “causal reports” are legacy
+  diagnostics only. Separately consented research randomization has its own
+  frozen protocol and never receives workspace mutation authority merely by
+  selecting an arm.
 - No raw camera frames are intentionally persisted. Workspace context selected
   for an LLM request can leave the machine; review provider configuration and
   the privacy documentation before enabling cloud planning.
@@ -89,6 +91,12 @@ The schema package under `libs/schemas` is the source of truth for Python and
 generated TypeScript boundary models. Native-messaging requests and responses
 use a length-prefixed JSON discriminated union and the canonical
 `auth_token` field.
+
+Policy evidence is governed by the
+[`docs/research/policy-evaluation-protocol.md`](docs/research/policy-evaluation-protocol.md):
+action and no-action decisions share one durable follow-up window and reward,
+product logs never masquerade as propensity data, and research export/analysis
+requires an exact checksummed study epoch.
 
 ## Supported and compatibility-only signals
 

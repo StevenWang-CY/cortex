@@ -223,16 +223,37 @@ logging:
   include_timestamp: true
 
 eval:
-  policy: amip
-  amip:
-    enabled: true
-    tau0: 1.0
-    tau_min: 0.1
-    epsilon_explore: 0.05
-    epsilon_explore_after_500: 0.01
-    safety_floor_stress_ratio: 1.0
+  policy: deterministic
+  decision_interval_seconds: 60
+  production:
+    preferred_low_friction_arm: null
+  outcome:
     reward_window_seconds: 300
-  causal_report:
+    reward_version: helpfulness-v2
+    collector_interval_seconds: 5.0
+  research:
+    enabled: false
+    study_id: ""
+    study_epoch: ""
+    consent_version: ""
+    seed_hex: ""
+    action_catalog: [no_action, suggest_only]
+    minimum_probability: 0.1
+    bootstrap_samples: 1000
+    analysis_seed: 0
+    eligibility_rule: >-
+      Eligible when the reviewed deterministic trigger gate passes and both MRT arms
+      remain safe and feasible.
+    availability_rule: >-
+      Available when the receptivity gate passes, no repeated-dismissal suppression
+      is active, and no other safety exclusion applies.
+    missing_outcome_rule: >-
+      Retain the decision point, mark the proximal outcome censored, and exclude it
+      from the complete-case primary analysis.
+    contamination_rule: >-
+      Retain the decision point, record every overlapping delivery, and exclude a
+      contaminated proximal window from the primary analysis.
+    online_learning: false
+  policy_diagnostics:
     enabled: true
-    bootstrap_samples: 300
     nightly_hour_local: 2

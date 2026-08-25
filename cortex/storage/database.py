@@ -40,7 +40,7 @@ T = TypeVar("T")
 # were introduced in SQLite 3.37.0, so accepting an older runtime would make
 # migration behavior platform-dependent.
 MINIMUM_SQLITE_VERSION = (3, 37, 0)
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 CORTEX_APPLICATION_ID = 0x43545831  # ASCII-ish "CTX1", positive signed int.
 
 
@@ -195,9 +195,7 @@ class SQLiteDatabase:
 
     def _prepare_directory_sync(self) -> None:
         if self._requested_path.is_symlink():
-            raise StorageCompatibilityError(
-                "SQLite database path must not be a symbolic link"
-            )
+            raise StorageCompatibilityError("SQLite database path must not be a symbolic link")
         broad_roots = {
             Path(self.path.anchor).resolve(),
             Path.home().resolve(),
@@ -211,9 +209,7 @@ class SQLiteDatabase:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         directory_stat = self.path.parent.stat()
         if hasattr(os, "getuid") and directory_stat.st_uid != os.getuid():
-            raise StorageCompatibilityError(
-                "SQLite directory is not owned by the current user"
-            )
+            raise StorageCompatibilityError("SQLite directory is not owned by the current user")
         try:
             self.path.parent.chmod(0o700)
         except OSError as exc:
@@ -223,13 +219,9 @@ class SQLiteDatabase:
         if self.path.exists():
             file_stat = self.path.stat()
             if not stat.S_ISREG(file_stat.st_mode):
-                raise StorageCompatibilityError(
-                    "SQLite path exists but is not a regular file"
-                )
+                raise StorageCompatibilityError("SQLite path exists but is not a regular file")
             if hasattr(os, "getuid") and file_stat.st_uid != os.getuid():
-                raise StorageCompatibilityError(
-                    "SQLite database is not owned by the current user"
-                )
+                raise StorageCompatibilityError("SQLite database is not owned by the current user")
             # Preserve an intentional owner read-only mode so the startup
             # write probe can report it, while stripping group/other access.
             restricted_mode = stat.S_IMODE(file_stat.st_mode) & 0o700

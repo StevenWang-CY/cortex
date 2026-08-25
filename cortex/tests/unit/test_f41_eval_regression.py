@@ -22,7 +22,7 @@ from cortex.services.eval.regression_harness import (
     _cli,
     any_regression,
     compare_to_baseline,
-    compute_bandit_regret_p95,
+    compute_deterministic_policy_replay_mismatch_rate,
     compute_flow_negative_trigger_rate,
     compute_oscillation_rate_per_hr,
     compute_sustained_overwhelm_pass_rate,
@@ -48,18 +48,14 @@ def test_run_harness_is_deterministic() -> None:
 
 
 def test_run_harness_responds_to_seed() -> None:
-    """A different seed changes at least one metric (the bandit's
-    regret depends on the synthetic context stream). Confirms the
-    seed is actually plumbed through."""
+    """A different corpus seed preserves all required invariants."""
     a = run_harness(seed=DEFAULT_SEED)
     b = run_harness(seed=DEFAULT_SEED + 1)
-    # Trigger-policy metrics use seedless synthetic traces, so they
-    # match; bandit_regret_p95 should differ for at least some seeds.
-    # We test the WEAKER property: at least one metric is allowed to
-    # differ, and the deterministic ones don't.
     assert a.oscillation_intervention_rate_per_hr == b.oscillation_intervention_rate_per_hr
     assert a.sustained_overwhelm_pass_rate == b.sustained_overwhelm_pass_rate
     assert a.flow_negative_trigger_rate == b.flow_negative_trigger_rate
+    assert a.deterministic_policy_replay_mismatch_rate == 0.0
+    assert b.deterministic_policy_replay_mismatch_rate == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -73,18 +69,14 @@ def test_oscillation_rate_is_clamped_by_f25_cap() -> None:
     ≤ ``max_interventions_per_hour`` (default 6/hr) — and in practice
     well below thanks to the oscillation-dwell multiplier."""
     rate = compute_oscillation_rate_per_hr(hours=4.0)
-    assert 0.0 < rate <= 6.0, (
-        f"oscillation rate must be in (0, 6]; got {rate}"
-    )
+    assert 0.0 < rate <= 6.0, f"oscillation rate must be in (0, 6]; got {rate}"
 
 
 def test_sustained_overwhelm_passes() -> None:
     """Genuinely sustained HYPER must still produce ≥1 trigger even
     with F25 hysteresis active."""
     rate = compute_sustained_overwhelm_pass_rate(n_traces=5)
-    assert rate >= 0.8, (
-        f"sustained overwhelm pass-rate must be >= 0.8; got {rate}"
-    )
+    assert rate >= 0.8, f"sustained overwhelm pass-rate must be >= 0.8; got {rate}"
 
 
 def test_flow_negative_trigger_rate_is_zero() -> None:
@@ -93,11 +85,12 @@ def test_flow_negative_trigger_rate_is_zero() -> None:
     assert rate == 0.0, f"FLOW-only trace fired a trigger: rate={rate}"
 
 
-def test_bandit_regret_is_bounded() -> None:
-    """Synthetic contextual bandit converges to the optimal arm; the
-    95th percentile of regret is bounded by exploration noise."""
-    regret = compute_bandit_regret_p95(n_steps=200, seed=DEFAULT_SEED)
-    assert 0.0 <= regret <= 0.5, f"unexpected bandit regret: {regret}"
+def test_deterministic_policy_replays_exactly() -> None:
+    mismatch_rate = compute_deterministic_policy_replay_mismatch_rate(
+        n_steps=200,
+        seed=DEFAULT_SEED,
+    )
+    assert mismatch_rate == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +105,7 @@ def test_save_and_load_baseline_round_trip(tmp_path: Path) -> None:
     loaded = load_baseline(target)
     assert loaded.metrics == metrics.to_dict()
     assert loaded.seed == DEFAULT_SEED
-    assert loaded.version == 1
+    assert loaded.version == 2
 
 
 def test_committed_baseline_is_valid_json() -> None:
@@ -128,7 +121,7 @@ def test_committed_baseline_is_valid_json() -> None:
         "oscillation_intervention_rate_per_hr",
         "sustained_overwhelm_pass_rate",
         "flow_negative_trigger_rate",
-        "bandit_regret_p95",
+        "deterministic_policy_replay_mismatch_rate",
     }
 
 
@@ -158,7 +151,7 @@ def _baseline_with(**overrides: float) -> BaselineFile:
     metrics and overriding select fields."""
     real = load_baseline().metrics.copy()
     real.update(overrides)
-    return BaselineFile(version=1, seed=DEFAULT_SEED, metrics=real)
+    return BaselineFile(version=2, seed=DEFAULT_SEED, metrics=real)
 
 
 def test_compare_detects_higher_is_regression() -> None:
@@ -170,10 +163,9 @@ def test_compare_detects_higher_is_regression() -> None:
     bad = _baseline_with(oscillation_intervention_rate_per_hr=0.0)
     deltas = compare_to_baseline(metrics, bad)
     regressed = [d for d in deltas if d.regressed]
-    assert any(
-        d.name == "oscillation_intervention_rate_per_hr"
-        for d in regressed
-    ), f"expected oscillation regression; got {regressed}"
+    assert any(d.name == "oscillation_intervention_rate_per_hr" for d in regressed), (
+        f"expected oscillation regression; got {regressed}"
+    )
 
 
 def test_compare_detects_lower_is_regression() -> None:
@@ -181,10 +173,7 @@ def test_compare_detects_lower_is_regression() -> None:
     metrics = run_harness()
     bad = _baseline_with(sustained_overwhelm_pass_rate=2.0)
     deltas = compare_to_baseline(metrics, bad)
-    assert any(
-        d.name == "sustained_overwhelm_pass_rate" and d.regressed
-        for d in deltas
-    )
+    assert any(d.name == "sustained_overwhelm_pass_rate" and d.regressed for d in deltas)
 
 
 def test_compare_allows_in_band_drift() -> None:
@@ -203,23 +192,23 @@ def test_compare_handles_missing_metric_gracefully(tmp_path: Path) -> None:
     — it's a prompt to update the baseline. The harness returns it as
     non-regressing with ``baseline=NaN``."""
     bad_path = tmp_path / "baseline.json"
-    atomic_write_json(bad_path, {
-        "version": 1,
-        "seed": DEFAULT_SEED,
-        "metrics": {
-            "oscillation_intervention_rate_per_hr": 1.0,
-            "sustained_overwhelm_pass_rate": 1.0,
-            # flow_negative_trigger_rate intentionally absent
-            "bandit_regret_p95": 0.0,
+    atomic_write_json(
+        bad_path,
+        {
+            "version": 2,
+            "seed": DEFAULT_SEED,
+            "metrics": {
+                "oscillation_intervention_rate_per_hr": 1.0,
+                "sustained_overwhelm_pass_rate": 1.0,
+                # flow_negative_trigger_rate intentionally absent
+                "deterministic_policy_replay_mismatch_rate": 0.0,
+            },
         },
-    })
+    )
     metrics = run_harness()
     baseline = load_baseline(bad_path)
     deltas = compare_to_baseline(metrics, baseline)
-    missing = [
-        d for d in deltas
-        if d.name == "flow_negative_trigger_rate"
-    ]
+    missing = [d for d in deltas if d.name == "flow_negative_trigger_rate"]
     assert len(missing) == 1
     assert missing[0].regressed is False
     # NaN-baseline is the sentinel.
@@ -234,15 +223,16 @@ def test_compare_uses_abs_tolerance_near_zero() -> None:
         oscillation_intervention_rate_per_hr=0.2,
         sustained_overwhelm_pass_rate=1.0,
         flow_negative_trigger_rate=0.0,
-        bandit_regret_p95=0.0,
+        deterministic_policy_replay_mismatch_rate=0.0,
     )
     baseline = BaselineFile(
-        version=1, seed=DEFAULT_SEED,
+        version=2,
+        seed=DEFAULT_SEED,
         metrics={
             "oscillation_intervention_rate_per_hr": 0.0,
             "sustained_overwhelm_pass_rate": 1.0,
             "flow_negative_trigger_rate": 0.0,
-            "bandit_regret_p95": 0.0,
+            "deterministic_policy_replay_mismatch_rate": 0.0,
         },
     )
     deltas = compare_to_baseline(metrics, baseline)
@@ -259,25 +249,26 @@ def test_compare_uses_abs_tolerance_near_zero() -> None:
 def test_cli_exits_zero_against_committed_baseline(capsys) -> None:
     rc = _cli([])
     captured = capsys.readouterr()
-    assert rc == 0, (
-        f"committed baseline must self-compare clean (rc={rc}); output:\n{captured.out}"
-    )
+    assert rc == 0, f"committed baseline must self-compare clean (rc={rc}); output:\n{captured.out}"
 
 
 def test_cli_exits_one_on_regression(tmp_path: Path, capsys) -> None:
     """Point the CLI at a baseline that makes the harness look bad
     and assert exit 1 + a useful report."""
     bad_path = tmp_path / "baseline.json"
-    atomic_write_json(bad_path, {
-        "version": 1,
-        "seed": DEFAULT_SEED,
-        "metrics": {
-            "oscillation_intervention_rate_per_hr": 0.0,
-            "sustained_overwhelm_pass_rate": 2.0,
-            "flow_negative_trigger_rate": -1.0,
-            "bandit_regret_p95": -1.0,
+    atomic_write_json(
+        bad_path,
+        {
+            "version": 2,
+            "seed": DEFAULT_SEED,
+            "metrics": {
+                "oscillation_intervention_rate_per_hr": 0.0,
+                "sustained_overwhelm_pass_rate": 2.0,
+                "flow_negative_trigger_rate": -1.0,
+                "deterministic_policy_replay_mismatch_rate": -1.0,
+            },
         },
-    })
+    )
     rc = _cli(["--baseline", str(bad_path)])
     assert rc == 1
     out = capsys.readouterr().out
@@ -290,7 +281,7 @@ def test_cli_update_baseline_writes_fresh(tmp_path: Path, capsys) -> None:
     target = tmp_path / "baseline.json"
     # Seed the destination with a stale baseline so we can confirm
     # the rewrite.
-    atomic_write_json(target, {"version": 1, "seed": 0, "metrics": {}})
+    atomic_write_json(target, {"version": 2, "seed": 0, "metrics": {}})
     rc = _cli(["--update-baseline", "--baseline", str(target)])
     assert rc == 0
     refreshed = load_baseline(target)

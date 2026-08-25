@@ -1,7 +1,10 @@
 """
 Cortex Evaluation Schemas
 
-Models for tracking intervention helpfulness and contextual bandit learning.
+Models for local intervention-helpfulness diagnostics.
+
+The bandit-shaped fields remain decode-only compatibility for legacy records;
+the production policy and v2 research lifecycle use ``schemas.policy``.
 """
 
 from __future__ import annotations
@@ -49,7 +52,7 @@ class InterventionSnapshot(BaseModel):
 
 
 class HelpfulnessRecord(BaseModel):
-    """Complete evaluation record for a single intervention."""
+    """Legacy local product-diagnostic record for one intervention."""
     intervention_id: str = Field(..., description="ID of the evaluated intervention")
     intervention_type: str = Field(..., description="Type of intervention (overlay_only, etc.)")
 
@@ -78,19 +81,19 @@ class HelpfulnessRecord(BaseModel):
     # Computed reward
     reward_signal: float = Field(
         0.0, ge=-1.0, le=1.0,
-        description="Computed reward signal for bandit learning"
+        description="Legacy descriptive score; never causal or production-policy training data"
     )
 
-    # Context features for bandit
+    # Decode-only compatibility fields from the retired contextual bandit.
     context_features: list[float] = Field(
         default_factory=list,
-        description="Feature vector for contextual bandit [state, complexity, tabs, errors, hour, thrashing, stress, consent]"
+        description="Legacy feature vector retained only for historical record decoding"
     )
-    arm_index: int = Field(0, ge=0, description="Bandit arm index that was selected")
+    arm_index: int = Field(0, ge=0, description="Legacy retired-policy arm index")
 
 
 class BanditWeights(BaseModel):
-    """Persisted weights for the LinUCB contextual bandit."""
+    """Decode-only weights for the retired LinUCB experiment."""
     n_arms: int = Field(..., ge=1, description="Number of arms (intervention types)")
     n_features: int = Field(..., ge=1, description="Feature dimension")
     # A matrices and b vectors stored as flat lists for JSON serialization

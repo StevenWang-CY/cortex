@@ -33,7 +33,7 @@ Design decisions (from P0_IMPLEMENTATION_DESIGN.md §3.2):
   *relative* (~5 %) threshold so a high-HRV user is not flagged
   "improving" for a small absolute change (P0 §3.2 fix #15).
 * ``interventions_count`` per day = sum of HYPER state-transition
-  counts (same proxy AMIP uses elsewhere; documented in-line).
+  counts (a legacy proxy, documented in-line).
 * ``interventions_accepted`` mirrors ``interventions_count`` until we
   have an explicit accept counter on SessionReport.
 

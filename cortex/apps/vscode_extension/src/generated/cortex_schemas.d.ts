@@ -3,7 +3,7 @@
 //
 // Source of truth: cortex/libs/schemas/*.py (Pydantic v2 models).
 // Schema package: cortex-wire/2.0
-// Source SHA-256: 72cda90f3d373260fd16c06382c601d5e73104fa668af59d278f5f0faa85217e
+// Source SHA-256: 5a2b61f5dc68e2037b273866c2c566c12b025cd0e9287d916fdea48a91a41af2
 // Drift-gate: a pre-commit hook and the GitHub Actions CI run
 //   `python -m cortex.scripts.generate_ts_schemas --check`
 // and fail if this file is out of sync with the Python models.
@@ -485,7 +485,7 @@ export interface AuthorizationLedgerEntry {
   state_reason?: string | null;
 }
 /**
- * Persisted weights for the LinUCB contextual bandit.
+ * Decode-only weights for the retired LinUCB experiment.
  */
 export interface BanditWeights {
   /**
@@ -1648,7 +1648,7 @@ export interface StorageHealthReport {
   };
 }
 /**
- * Complete evaluation record for a single intervention.
+ * Legacy local product-diagnostic record for one intervention.
  */
 export interface HelpfulnessRecord {
   /**
@@ -1685,15 +1685,15 @@ export interface HelpfulnessRecord {
   interaction_duration_seconds?: number;
   user_rating?: "thumbs_up" | "thumbs_down" | null;
   /**
-   * Computed reward signal for bandit learning
+   * Legacy descriptive score; never causal or production-policy training data
    */
   reward_signal?: number;
   /**
-   * Feature vector for contextual bandit [state, complexity, tabs, errors, hour, thrashing, stress, consent]
+   * Legacy feature vector retained only for historical record decoding
    */
   context_features?: number[];
   /**
-   * Bandit arm index that was selected
+   * Legacy retired-policy arm index
    */
   arm_index?: number;
 }
@@ -2693,6 +2693,70 @@ export interface LaunchResponse {
   status: "launched" | "already_running" | "timeout" | "error";
   error?: string | null;
 }
+export interface MRTAnalysisRequest {
+  filename: string;
+}
+export interface MRTAnalysisResponse {
+  schema_version?: "1.0" | "2.0";
+  observed_at_unix_ms?: number;
+  observed_at_mono_ns?: number;
+  boot_id?: string;
+  /**
+   * @deprecated
+   * Deprecated v1 compatibility mirror in UTC Unix seconds; never use it for elapsed-time decisions.
+   */
+  timestamp?: number | null;
+  source_filename: string;
+  report_filename: string;
+  analysis: {
+    [k: string]: unknown;
+  };
+}
+export interface MRTExportRequest {
+  specification: MRTStudySpecification;
+  confirmation: "EXPORT CONSENTED RESEARCH DATA";
+}
+/**
+ * Prespecified two-arm MRT analysis contract embedded in every export.
+ */
+export interface MRTStudySpecification {
+  schema_version?: "mrt-spec/1.0";
+  study_id: string;
+  study_epoch: string;
+  consent_version: string;
+  policy_name: string;
+  policy_version: string;
+  /**
+   * @minItems 2
+   * @maxItems 2
+   */
+  action_catalog: [unknown, unknown];
+  reward_version: string;
+  proximal_window_seconds: number;
+  estimand?: "marginal_proximal_effect_suggest_only_vs_no_action";
+  eligibility_rule: string;
+  availability_rule: string;
+  missing_outcome_rule: string;
+  contamination_rule: string;
+  cluster_key?: "session_id";
+  bootstrap_samples?: number;
+  analysis_seed: number;
+}
+export interface MRTExportResponse {
+  schema_version?: "1.0" | "2.0";
+  observed_at_unix_ms?: number;
+  observed_at_mono_ns?: number;
+  boot_id?: string;
+  /**
+   * @deprecated
+   * Deprecated v1 compatibility mirror in UTC Unix seconds; never use it for elapsed-time decisions.
+   */
+  timestamp?: number | null;
+  filename: string;
+  sha256: string;
+  specification_sha256: string;
+  row_count: number;
+}
 export interface NativeErrorResponse {
   command: "error";
   status?: "error";
@@ -2802,6 +2866,123 @@ export interface SignalEstimate {
   window_start_mono_ns: number;
   window_end_mono_ns: number;
   boot_id: string;
+}
+/**
+ * Minimal, content-free context frozen at a policy decision point.
+ */
+export interface PolicyContextSnapshot {
+  schema_version?: "policy-context/2.0";
+  support_state: string;
+  support_status: string;
+  support_confidence: number;
+  evidence_coverage: number;
+  complexity_score: number;
+  tab_count: number;
+  error_count: number;
+  thrashing_score: number;
+  hour_utc: number;
+}
+/**
+ * Complete immutable decision-point record written before delivery.
+ */
+export interface PolicyDecisionRecord {
+  schema_version?: "policy-decision/2.0";
+  decision_id?: string;
+  decision_point_id: string;
+  session_id: string;
+  policy_name: string;
+  policy_version: string;
+  policy_mode: "deterministic" | "research_randomized" | "legacy_diagnostic";
+  policy_state_sha256: string;
+  context: PolicyContextSnapshot;
+  eligible: boolean;
+  available: boolean;
+  availability_reason: string;
+  feasible_arms: (
+    | "no_action"
+    | "suggest_only"
+    | "workspace_simplify"
+    | "task_decompose"
+    | "breath_box"
+    | "nature_break"
+    | "flow_shield"
+    | "defusion_prompt"
+    | "circuit_breaker"
+  )[];
+  propensities?: {
+    [k: string]: number;
+  } | null;
+  selected_arm:
+    | "no_action"
+    | "suggest_only"
+    | "workspace_simplify"
+    | "task_decompose"
+    | "breath_box"
+    | "nature_break"
+    | "flow_shield"
+    | "defusion_prompt"
+    | "circuit_breaker";
+  selected_probability: number;
+  supports_ope?: boolean;
+  randomization_id?: string | null;
+  random_seed_hex?: string | null;
+  random_counter?: number | null;
+  research_study_id?: string | null;
+  research_study_epoch?: string | null;
+  research_consent_version?: string | null;
+  research_specification_sha256?: string | null;
+  reward_version: string;
+  occurred_at_unix_ms: number;
+  occurred_at_mono_ns: number;
+  boot_id: string;
+}
+export interface PolicyDeliveryRecord {
+  schema_version?: "policy-delivery/2.0";
+  decision_id: string;
+  status: "delivered" | "not_delivered" | "not_applicable";
+  delivered_at_unix_ms?: number | null;
+  intervention_id?: string | null;
+  reason: string;
+}
+export interface PolicyDiagnosticsRequest {
+  day_utc?: string | null;
+}
+export interface PolicyDiagnosticsResponse {
+  schema_version?: "1.0" | "2.0";
+  observed_at_unix_ms?: number;
+  observed_at_mono_ns?: number;
+  boot_id?: string;
+  /**
+   * @deprecated
+   * Deprecated v1 compatibility mirror in UTC Unix seconds; never use it for elapsed-time decisions.
+   */
+  timestamp?: number | null;
+  filename: string;
+  sha256: string;
+  report_kind?: "descriptive_policy_diagnostics";
+  causal_claim?: false;
+}
+export interface PolicyObservation {
+  schema_version?: "policy-observation/2.0";
+  observation_id?: string;
+  decision_id: string;
+  reward_version: string;
+  kind: "user_rating" | "user_action" | "undo" | "restore_failure";
+  idempotency_key: string;
+  observed_at_unix_ms: number;
+  payload: {
+    [k: string]: unknown;
+  };
+}
+export interface PolicyRewardRecord {
+  schema_version?: "policy-reward/2.0";
+  decision_id: string;
+  reward_version: string;
+  value: number;
+  finalized_at_unix_ms: number;
+  components: {
+    [k: string]: number | string | boolean | null;
+  };
 }
 export interface ProjectListResponse {
   schema_version?: "1.0" | "2.0";

@@ -13,7 +13,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -28,6 +28,9 @@ from cortex.libs.config.ports import (
     LAUNCHER_AGENT_PORT,
     WEBSOCKET_PORT,
 )
+
+if TYPE_CHECKING:
+    from cortex.libs.schemas.policy import MRTStudySpecification
 
 
 class StorageConfigError(RuntimeError):
@@ -80,6 +83,7 @@ def get_bedrock_token(config: CortexConfig | None = None) -> str | None:
         return None
     try:
         from cortex.libs.utils.secrets import get_password_safe
+
         token = get_password_safe(
             cfg.llm.bedrock.keychain_service,
             cfg.llm.bedrock.keychain_account,
@@ -139,6 +143,7 @@ def bedrock_token_env_scope(
         else:
             os.environ["AWS_BEARER_TOKEN_BEDROCK"] = prior
 
+
 # Bound at module-import time so Pydantic field defaults read from the
 # same constants without re-importing on every model construction.
 _PORTS: dict[str, int] = {
@@ -160,7 +165,7 @@ def _bundled_env_files() -> tuple[str, ...]:
         meipass = Path(sys._MEIPASS)  # type: ignore[attr-defined]
         return (
             str(app_support / ".env"),  # User overrides (highest priority)
-            str(meipass / ".env"),       # Bundled defaults
+            str(meipass / ".env"),  # Bundled defaults
         )
     return (".env", ".env.local")
 
@@ -170,6 +175,7 @@ def _bundled_storage_path() -> str:
     if _is_bundled():
         return str(Path.home() / "Library" / "Application Support" / "Cortex" / "Data")
     return "./storage"
+
 
 # =============================================================================
 # Sub-configuration Models
@@ -274,6 +280,7 @@ class LLMConfig(BaseModel):
             # Legacy values: azure, local, remote, openai_compat → bedrock
             return "bedrock"
         return v
+
     # Circuit-breaker: open after this many consecutive failures, in this window.
     circuit_failure_threshold: int = 5
     circuit_window_seconds: float = 60.0
@@ -362,9 +369,7 @@ class StateConfig(BaseModel):
     @model_validator(mode="after")
     def _estimate_hysteresis_is_ordered(self) -> StateConfig:
         if self.estimate_exit_threshold >= self.estimate_entry_threshold:
-            raise ValueError(
-                "estimate_exit_threshold must be below estimate_entry_threshold"
-            )
+            raise ValueError("estimate_exit_threshold must be below estimate_entry_threshold")
         return self
 
 
@@ -377,7 +382,9 @@ class InterventionConfig(BaseModel):
     # behaviour. ``authorized`` is reserved for exact, materialized user
     # authorizations; ``research_autonomous`` requires separate study consent.
     execution_mode: Literal[
-        "suggest_only", "authorized", "research_autonomous",
+        "suggest_only",
+        "authorized",
+        "research_autonomous",
     ] = "suggest_only"
 
     overlay_threshold: float = 0.70
@@ -446,8 +453,8 @@ class InterventionConfig(BaseModel):
     # P0 §3.5: HYPO / RECOVERY intervention catalog. Opt-in for the
     # first release — the new arms (re-engagement nudge, recovery
     # reinforcement) are only evaluated when this flag is True.
-    # AMIP starts cold for these arms, so leaving the default at False
-    # avoids any early all-in on a not-yet-trained reward signal.
+    # The production policy does not expose these experimental templates;
+    # leaving the default false avoids silently expanding its reviewed catalog.
     enable_hypo_recovery_interventions: bool = False
 
     # Decode-only compatibility field. The HRV-derived stress algorithm has
@@ -503,7 +510,10 @@ class InterventionConfig(BaseModel):
     # Default preset for the merged blocklist. Browser extension owns
     # the per-preset domain map. ``custom`` reads ``custom_domains``.
     auto_distraction_block_preset: Literal[
-        "developer", "student", "writer", "custom",
+        "developer",
+        "student",
+        "writer",
+        "custom",
     ] = "developer"
     # User-editable extra domains layered on top of the preset (or the
     # exclusive set when ``preset == "custom"``).
@@ -643,11 +653,11 @@ class RPPGSignalConfig(BaseModel):
     # signal loss. Ref: PMC13000236 "Adaptive physiology-informed
     # correction"; pyVHR window-statistics post-processing.
     stabilize: bool = True
-    lock_enter_windows: int = 1          # consecutive valid windows to lock
-    lock_grace_seconds: float = 4.0      # hold last BPM through brief dropouts
-    snr_release_db: float = 0.0          # unlock only below this SNR …
-    sqi_release: float = 0.20            # … or this composite SQI (hysteresis)
-    bpm_smoothing_seconds: float = 6.0   # trailing median/EMA window
+    lock_enter_windows: int = 1  # consecutive valid windows to lock
+    lock_grace_seconds: float = 4.0  # hold last BPM through brief dropouts
+    snr_release_db: float = 0.0  # unlock only below this SNR …
+    sqi_release: float = 0.20  # … or this composite SQI (hysteresis)
+    bpm_smoothing_seconds: float = 6.0  # trailing median/EMA window
     bpm_max_slew_bpm_per_s: float = 12.0  # reject implausible window-to-window jumps
 
 
@@ -692,32 +702,174 @@ class SignalConfig(BaseModel):
     posture: PostureSignalConfig = Field(default_factory=PostureSignalConfig)
 
 
-class AMIPConfig(BaseModel):
-    """Adaptive microrandomized intervention policy configuration."""
+class ProductionPolicyConfig(BaseModel):
+    """Non-learning product policy preferences."""
+
+    preferred_low_friction_arm: (
+        Literal[
+            "suggest_only",
+            "workspace_simplify",
+            "task_decompose",
+            "breath_box",
+            "nature_break",
+            "flow_shield",
+            "defusion_prompt",
+            "circuit_breaker",
+        ]
+        | None
+    ) = None
+
+
+class PolicyOutcomeConfig(BaseModel):
+    """Prespecified proximal outcome collection."""
+
+    reward_window_seconds: int = Field(300, ge=30, le=86_400)
+    reward_version: Literal["helpfulness-v2"] = "helpfulness-v2"
+    collector_interval_seconds: float = Field(5.0, ge=0.25, le=60.0)
+
+
+class ResearchPolicyConfig(BaseModel):
+    """Separately consented fixed-epoch research configuration.
+
+    Disabled by default. Enabling requires an explicit consent document and
+    a 32-byte seed so the exact randomization can be independently replayed.
+    """
+
+    enabled: bool = False
+    study_id: str = Field("", pattern=r"^$|^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
+    study_epoch: str = Field("", pattern=r"^$|^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
+    consent_version: str = Field("", pattern=r"^$|^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+    seed_hex: str = ""
+    action_catalog: tuple[Literal["no_action", "suggest_only"], ...] = (
+        "no_action",
+        "suggest_only",
+    )
+    minimum_probability: float = Field(0.10, gt=0.0, le=0.5)
+    bootstrap_samples: int = Field(1_000, ge=200, le=100_000)
+    analysis_seed: int = Field(0, ge=0, le=2**63 - 1)
+    eligibility_rule: str = Field(
+        "Eligible when the reviewed deterministic trigger gate passes and both MRT arms "
+        "remain safe and feasible.",
+        min_length=1,
+        max_length=500,
+    )
+    availability_rule: str = Field(
+        "Available when the receptivity gate passes, no repeated-dismissal suppression "
+        "is active, and no other safety exclusion applies.",
+        min_length=1,
+        max_length=500,
+    )
+    missing_outcome_rule: str = Field(
+        "Retain the decision point, mark the proximal outcome censored, and exclude it "
+        "from the complete-case primary analysis.",
+        min_length=1,
+        max_length=500,
+    )
+    contamination_rule: str = Field(
+        "Retain the decision point, record every overlapping delivery, and exclude a "
+        "contaminated proximal window from the primary analysis.",
+        min_length=1,
+        max_length=500,
+    )
+    online_learning: Literal[False] = False
+
+    @model_validator(mode="after")
+    def _research_requires_frozen_epoch(self) -> ResearchPolicyConfig:
+        if not self.enabled:
+            return self
+        if not self.study_id or not self.study_epoch or not self.consent_version:
+            raise ValueError(
+                "research mode requires study_id, study_epoch, and separate consent_version"
+            )
+        if len(self.seed_hex) != 64:
+            raise ValueError("research seed_hex must encode exactly 32 bytes")
+        try:
+            bytes.fromhex(self.seed_hex)
+        except ValueError as exc:
+            raise ValueError("research seed_hex must be hexadecimal") from exc
+        if self.seed_hex != self.seed_hex.lower():
+            raise ValueError("research seed_hex must be lowercase")
+        if self.action_catalog != ("no_action", "suggest_only"):
+            raise ValueError("the reviewed first research epoch is fixed to no_action/suggest_only")
+        return self
+
+    def mrt_specification(
+        self,
+        *,
+        policy_name: str,
+        policy_version: str,
+        reward_version: str,
+        proximal_window_seconds: int,
+    ) -> MRTStudySpecification:
+        """Build the sole frozen study specification for this config epoch."""
+
+        from cortex.libs.schemas.policy import MRTStudySpecification
+
+        return MRTStudySpecification(
+            study_id=self.study_id,
+            study_epoch=self.study_epoch,
+            consent_version=self.consent_version,
+            policy_name=policy_name,
+            policy_version=policy_version,
+            action_catalog=self.action_catalog,
+            reward_version=reward_version,
+            proximal_window_seconds=proximal_window_seconds,
+            eligibility_rule=self.eligibility_rule,
+            availability_rule=self.availability_rule,
+            missing_outcome_rule=self.missing_outcome_rule,
+            contamination_rule=self.contamination_rule,
+            bootstrap_samples=self.bootstrap_samples,
+            analysis_seed=self.analysis_seed,
+        )
+
+
+class PolicyDiagnosticsConfig(BaseModel):
+    """Descriptive operational reporting; never a causal-effect report."""
 
     enabled: bool = True
-    tau0: float = 1.0
-    tau_min: float = 0.1
-    epsilon_explore: float = 0.05
-    epsilon_explore_after_500: float = 0.01
-    safety_floor_stress_ratio: float = 1.0
-    reward_window_seconds: int = 300
-
-
-class CausalReportConfig(BaseModel):
-    """Nightly causal reporting configuration."""
-
-    enabled: bool = True
-    bootstrap_samples: int = 300
-    nightly_hour_local: int = 2
+    nightly_hour_local: int = Field(2, ge=0, le=23)
 
 
 class EvalConfig(BaseModel):
     """Evaluation and policy-learning configuration."""
 
-    policy: Literal["amip", "greedy", "uniform"] = "amip"
-    amip: AMIPConfig = Field(default_factory=AMIPConfig)
-    causal_report: CausalReportConfig = Field(default_factory=CausalReportConfig)
+    policy: Literal["deterministic", "research_randomized"] = "deterministic"
+    decision_interval_seconds: int = Field(60, ge=10, le=3_600)
+    production: ProductionPolicyConfig = Field(default_factory=ProductionPolicyConfig)
+    outcome: PolicyOutcomeConfig = Field(default_factory=PolicyOutcomeConfig)
+    research: ResearchPolicyConfig = Field(default_factory=ResearchPolicyConfig)
+    policy_diagnostics: PolicyDiagnosticsConfig = Field(default_factory=PolicyDiagnosticsConfig)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _contain_legacy_adaptive_defaults(cls, value: Any) -> Any:
+        """Map old AMIP/greedy/uniform config to safe deterministic mode."""
+
+        if not isinstance(value, dict):
+            return value
+        migrated = dict(value)
+        if migrated.get("policy") in {"amip", "greedy", "uniform"}:
+            migrated["policy"] = "deterministic"
+        old_amip = migrated.pop("amip", None)
+        if isinstance(old_amip, dict) and "reward_window_seconds" in old_amip:
+            outcome = dict(migrated.get("outcome") or {})
+            outcome.setdefault("reward_window_seconds", old_amip["reward_window_seconds"])
+            migrated["outcome"] = outcome
+        old_report = migrated.pop("causal_report", None)
+        if isinstance(old_report, dict):
+            diagnostics = dict(migrated.get("policy_diagnostics") or {})
+            if "enabled" in old_report:
+                diagnostics.setdefault("enabled", old_report["enabled"])
+            if "nightly_hour_local" in old_report:
+                diagnostics.setdefault("nightly_hour_local", old_report["nightly_hour_local"])
+            migrated["policy_diagnostics"] = diagnostics
+        return migrated
+
+    @model_validator(mode="after")
+    def _research_mode_is_explicitly_enabled(self) -> EvalConfig:
+        if self.policy == "research_randomized" and not self.research.enabled:
+            raise ValueError("research_randomized policy requires eval.research.enabled=true")
+        return self
 
 
 class LandmarksConfig(BaseModel):

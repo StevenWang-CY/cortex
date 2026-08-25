@@ -1,5 +1,10 @@
-"""
-Eval — Adaptive Microrandomized Intervention Policy (AMIP)
+"""Retired pre-v2 adaptive-policy implementation.
+
+Kept solely so historical tests and local diagnostic tooling can read old
+artifacts during the migration window. It is not composed into the daemon,
+not exported from :mod:`cortex.services.eval`, and is not valid product or
+research evidence. New code must use ``production_policy`` or the separately
+consented ``research_policy``.
 """
 
 from __future__ import annotations

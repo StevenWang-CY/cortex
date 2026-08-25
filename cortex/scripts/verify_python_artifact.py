@@ -19,6 +19,7 @@ REQUIRED_MEMBERS = frozenset(
         "cortex/services/runtime_daemon.py",
         "cortex/storage/database.py",
         "cortex/storage/migrations/0001_initial.sql",
+        "cortex/storage/migrations/0002.sql",
     }
 )
 FORBIDDEN_PREFIXES = (
@@ -78,4 +79,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
