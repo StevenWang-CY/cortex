@@ -1,6 +1,6 @@
 # Cortex
 
-Cortex 0.3.0 is a macOS alpha research prototype for local, user-controlled
+Cortex 0.3.1 is a macOS alpha research prototype for local, user-controlled
 workspace support. It combines bounded activity telemetry, optional
 experimental camera signals, browser/editor context, and a deterministic or
 schema-validated planner to present conservative suggestions.

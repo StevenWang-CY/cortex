@@ -4,6 +4,27 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.3.1] — 2026-08-25
+
+This patch preserves the exact Node toolchain selected by the release runner.
+It contains no runtime algorithm, authority, privacy, or interaction-policy
+change from v0.3.0.
+
+### Fixed
+
+* The macOS builder now appends Homebrew locations as GUI-launch fallbacks
+  instead of prepending them. The previous order could replace the repository's
+  pinned `actions/setup-node` binary with a different preinstalled runner
+  version after all pre-release gates had passed.
+* Added a release-tooling regression contract that rejects reintroducing the
+  precedence inversion.
+
+### Release process
+
+* The immutable v0.3.0 tag is retained as the failed, artifact-free candidate
+  that exposed this packaging defect. v0.3.1 supersedes it as the first binary
+  release candidate for the reviewed v0.3 line.
+
 ## [v0.3.0] — 2026-08-25
 
 This minor release rebuilds Cortex's safety-critical path around truthful
