@@ -4,6 +4,39 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.3.3] — 2026-08-25
+
+This patch makes the post-notarization bundle scanner distinguish genuine
+secrets from official provider fixtures and opaque native-library bytes. It
+contains no runtime algorithm, authority, privacy, or interaction-policy
+change from v0.3.0.
+
+### Fixed
+
+* Generic credential signatures now run only against UTF-8/text-like bundle
+  members. Exact sensitive build-environment values and non-generic personal
+  roots remain byte-scanned in every member, including native binaries.
+* Complete private keys require a base64 PEM payload and matching footer,
+  including compact PKCS#8 and encrypted-key forms; parser marker strings
+  embedded by TLS libraries no longer count as keys.
+* AWS access-key IDs ending in the documented `EXAMPLE` fixture suffix and
+  same-named SDK constants/parameters no longer count as credentials. Real AWS
+  secret assignments retain length and alphabet validation.
+* The macOS bundle now collects only immutable `*.sql` migration resources,
+  preventing ignored local bytecode caches and their absolute builder paths
+  from entering an otherwise clean distributable.
+* Added a release-failure corpus covering boto3/botocore example IDs, native
+  crypto/parser literals, random opaque bytes, complete text credentials,
+  exact secrets inside binaries, boundary-spanning tokens, local paths, and
+  unreadable files. The scanner also completes with zero findings across the
+  full locked Python `site-packages` tree.
+
+### Release process
+
+* The immutable v0.3.2 tag is retained as the artifact-free candidate whose
+  arm64 DMG was signed, accepted by Apple, and stapled before third-party
+  fixtures triggered the fail-closed scanner. v0.3.3 supersedes it.
+
 ## [v0.3.2] — 2026-08-25
 
 This patch makes post-notarization bundle scanning distinguish complete

@@ -85,6 +85,13 @@ def test_macos_builder_preserves_caller_selected_node_before_gui_fallbacks() -> 
     assert 'export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"' not in build_script
 
 
+def test_macos_spec_packages_only_sql_migration_resources() -> None:
+    spec = (_ROOT / "cortex/scripts/cortex.spec").read_text(encoding="utf-8")
+    migration_root = 'CORTEX / "storage" / "migrations"'
+    assert f'{migration_root} / "*.sql"' in spec
+    assert f'(str({migration_root}), "cortex/storage/migrations")' not in spec
+
+
 def _write_approved_release_record(
     root: Path,
     *,
@@ -274,7 +281,14 @@ def test_release_bundle_scan_finds_embedded_credentials(tmp_path: Path) -> None:
             b"AWS_SECRET_ACCESS_KEY=" + b"abcdefghijklmnopqrstuvwxyz1234567890ABCD",
             "credential-assignment",
         ),
-        (b"-----BEGIN " + b"PRIVATE KEY-----", "private-key"),
+        (
+            b"-----BEGIN PRIVATE KEY-----\n"
+            + b"A" * 64
+            + b"\n"
+            + b"B" * 64
+            + b"\n-----END PRIVATE KEY-----",
+            "private-key",
+        ),
         (b"AKIA" + b"ABCDEFGHIJKLMNOP", "aws-access-key-id"),
         (b"ASIA" + b"ABCDEFGHIJKLMNOP", "aws-access-key-id"),
         (b"sk-" + b"proj-" + b"abcdefghijklmnopqrstuvwxyz123456", "openai-api-key"),
@@ -340,6 +354,144 @@ def test_release_bundle_scan_ignores_detector_literals_and_generic_runner_paths(
     )
 
     assert _scan_forbidden(tmp_path, personal_roots=()) == []
+
+
+@pytest.mark.parametrize(
+    "placeholder",
+    (
+        b"AKIAIOSFODNN7EXAMPLE",
+        b"AKIAI44QH8DHBEXAMPLE",
+        b"AKIA111111111EXAMPLE",
+        b"AKIA222222222EXAMPLE",
+    ),
+)
+def test_release_bundle_scan_ignores_official_aws_example_ids(
+    tmp_path: Path,
+    placeholder: bytes,
+) -> None:
+    (tmp_path / "examples.json").write_bytes(b'{"AccessKeyId":"' + placeholder + b'"}')
+
+    assert _scan_forbidden(tmp_path, personal_roots=(), sensitive_values=()) == []
+
+
+def test_release_bundle_scan_ignores_parser_markers_and_token_shapes_in_opaque_binaries(
+    tmp_path: Path,
+) -> None:
+    payload = b"".join(
+        (
+            b"\xcf\xfa\xed\xfe\x00\x00\x00\x00",
+            b"-----BEGIN PRIVATE KEY-----",
+            b"sk-",
+            b"abcdefghijklmnopqrstuvwxyz1234567890",
+            b"ghp_",
+            b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJ",
+        )
+    )
+    (tmp_path / "libcrypto-fixture.dylib").write_bytes(payload)
+
+    assert _scan_forbidden(tmp_path, personal_roots=(), sensitive_values=()) == []
+
+
+def test_release_bundle_scan_finds_exact_sensitive_value_in_opaque_binary(
+    tmp_path: Path,
+) -> None:
+    secret = b"release-secret-value-1234567890"
+    (tmp_path / "compiled.bin").write_bytes(b"\x00\xffprefix" + secret + b"suffix")
+
+    assert _scan_forbidden(
+        tmp_path,
+        personal_roots=(),
+        sensitive_values=(("TEST_RELEASE_SECRET", secret),),
+    ) == ["compiled.bin contains exact sensitive value TEST_RELEASE_SECRET"]
+
+
+def test_release_bundle_scan_finds_exact_sensitive_value_across_read_boundary(
+    tmp_path: Path,
+) -> None:
+    secret = b"exact-release-secret-crossing-the-stream-boundary"
+    prefix = b"\x00" + b"x" * (1024 * 1024 - 12)
+    (tmp_path / "compiled.bin").write_bytes(prefix + secret + b"suffix")
+
+    assert _scan_forbidden(
+        tmp_path,
+        personal_roots=(),
+        sensitive_values=(("TEST_RELEASE_SECRET", secret),),
+    ) == ["compiled.bin contains exact sensitive value TEST_RELEASE_SECRET"]
+
+
+def test_release_bundle_scan_requires_complete_private_key_not_parser_header(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "pem-parser.txt").write_bytes(
+        b"accepted marker: -----BEGIN PRIVATE KEY-----"
+    )
+
+    assert _scan_forbidden(tmp_path, personal_roots=(), sensitive_values=()) == []
+
+
+@pytest.mark.parametrize(
+    "kind,preamble",
+    (
+        (b"PRIVATE KEY", b""),
+        (b"ENCRYPTED PRIVATE KEY", b""),
+        (
+            b"RSA PRIVATE KEY",
+            b"Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,0123456789ABCDEF\n\n",
+        ),
+    ),
+)
+def test_release_bundle_scan_finds_compact_and_encrypted_private_keys(
+    tmp_path: Path,
+    kind: bytes,
+    preamble: bytes,
+) -> None:
+    (tmp_path / "private-key.pem").write_bytes(
+        b"-----BEGIN "
+        + kind
+        + b"-----\n"
+        + preamble
+        + b"A" * 64
+        + b"\n-----END "
+        + kind
+        + b"-----"
+    )
+
+    assert _scan_forbidden(
+        tmp_path,
+        personal_roots=(),
+        sensitive_values=(),
+    ) == ["private-key.pem matches credential rule private-key"]
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    (
+        b'AWS_SECRET_ACCESS_KEY = "AWS_SECRET_ACCESS_KEY"',
+        b"aws_secret_access_key=aws_secret_access_key",
+        b"ANTHROPIC_API_KEY = ANTHROPIC_API_KEY",
+    ),
+)
+def test_release_bundle_scan_ignores_same_named_sdk_constants_and_parameters(
+    tmp_path: Path,
+    declaration: bytes,
+) -> None:
+    (tmp_path / "sdk.py").write_bytes(declaration)
+
+    assert _scan_forbidden(tmp_path, personal_roots=(), sensitive_values=()) == []
+
+
+def test_release_bundle_scan_still_checks_personal_roots_in_opaque_binaries(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "compiled.bin").write_bytes(
+        b"\x00\xff debug metadata /Users/alice/private-project/source.c"
+    )
+
+    assert _scan_forbidden(
+        tmp_path,
+        personal_roots=("/Users/alice",),
+        sensitive_values=(),
+    ) == ["compiled.bin contains a non-generic local home path"]
 
 
 def test_release_bundle_scan_rejects_explicit_personal_build_root(tmp_path: Path) -> None:

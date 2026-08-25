@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import json
 import os
 import platform
@@ -33,19 +34,47 @@ _CREDENTIAL_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
     ),
     (
         "aws-access-key-id",
-        re.compile(rb"(?<![A-Z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Z0-9])"),
+        # AWS documentation reserves values ending in EXAMPLE for public
+        # fixtures (for example AKIAIOSFODNN7EXAMPLE). Those fixtures ship in
+        # boto3/botocore and are not credentials.
+        re.compile(
+            rb"(?<![A-Z0-9])(?:AKIA|ASIA)(?![0-9A-Z]{9}EXAMPLE)"
+            rb"[0-9A-Z]{16}(?![A-Z0-9])"
+        ),
     ),
     (
         "credential-assignment",
         re.compile(
-            rb"\b(?:AWS_SECRET_ACCESS_KEY|AWS_BEARER_TOKEN_BEDROCK|ANTHROPIC_API_KEY)"
-            rb"\s*=\s*['\"]?[A-Za-z0-9_./+=-]{16,512}",
+            # AWS secret access keys are exactly 40 base64-like characters.
+            # The bearer token is variable length but is still an opaque value,
+            # not a dotted Python expression or same-named SDK constant.
+            rb"\b(?:"
+            rb"AWS_SECRET_ACCESS_KEY\s*=\s*['\"]?[A-Za-z0-9/+=]{40}"
+            rb"(?![A-Za-z0-9/+=])|"
+            rb"AWS_BEARER_TOKEN_BEDROCK\s*=\s*['\"]?"
+            rb"(?!AWS_BEARER_TOKEN_BEDROCK\b)[A-Za-z0-9_+/=-]{20,512}"
+            rb"(?![A-Za-z0-9_+/=-])"
+            rb")",
             re.IGNORECASE,
         ),
     ),
     (
         "private-key",
-        re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+        # Crypto/TLS libraries legitimately embed PEM parser marker strings.
+        # Require a complete PEM payload with a matching footer.
+        re.compile(
+            rb"-----BEGIN (?P<kind>(?:(?:RSA|EC|DSA|OPENSSH|ENCRYPTED) )?"
+            rb"PRIVATE KEY)-----\r?\n"
+            rb"(?:(?:Proc-Type|DEK-Info):[^\r\n]{1,200}\r?\n){0,2}(?:\r?\n)?"
+            rb"(?:"
+            # Compact PKCS#8 Ed25519 keys can have one 64-character line.
+            rb"[A-Za-z0-9+/]{40,76}={0,2}\r?\n|"
+            # Larger keys have at least two lines; the final line may be short.
+            rb"[A-Za-z0-9+/]{16,76}\r?\n"
+            rb"(?:[A-Za-z0-9+/]{4,76}={0,2}\r?\n){1,511}"
+            rb")"
+            rb"-----END (?P=kind)-----"
+        ),
     ),
     (
         "github-token",
@@ -65,10 +94,31 @@ _CREDENTIAL_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
         ),
     ),
 )
-# Must exceed the longest accepted credential form so a match cannot evade the
-# scanner by straddling two 1 MiB reads.
-_SCAN_OVERLAP_BYTES = 4096
+# Must exceed the longest accepted generic credential form (including a
+# complete PEM block) so a match cannot evade the scanner by straddling two
+# 1 MiB reads.
+_SCAN_OVERLAP_BYTES = 32 * 1024
+_TEXT_SAMPLE_BYTES = 64 * 1024
 _NON_PERSONAL_BUILD_USERS = frozenset({"root", "runner", "runneradmin"})
+_SENSITIVE_ENV_NAMES = (
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "SLACK_BOT_TOKEN",
+    "SLACK_APP_TOKEN",
+    "APPLE_DEVELOPER_ID_P12_BASE64",
+    "APPLE_DEVELOPER_ID_P12_PASSWORD",
+    "APPLE_NOTARY_KEY_P8_BASE64",
+    "APPLE_ID_USERNAME",
+    "APPLE_ID_APP_PASSWORD",
+    "APPLE_TEMP_KEYCHAIN_PASSWORD",
+    "TEMP_KEYCHAIN_PASSWORD",
+)
 
 
 class ReleaseVerificationError(RuntimeError):
@@ -133,27 +183,78 @@ def _default_personal_roots() -> tuple[str, ...]:
     return tuple(roots)
 
 
+def _default_sensitive_values() -> tuple[tuple[str, bytes], ...]:
+    """Return non-trivial secret values explicitly present in the build env.
+
+    Exact values are scanned in every file, including opaque native binaries.
+    Labels may be reported, but values are never included in findings or logs.
+    """
+
+    values: list[tuple[str, bytes]] = []
+    seen: set[bytes] = set()
+    for name in _SENSITIVE_ENV_NAMES:
+        raw_value = os.environ.get(name, "")
+        encoded = raw_value.encode("utf-8")
+        # Short values create unacceptable collision risk in native binaries.
+        if len(encoded) < 8 or encoded in seen:
+            continue
+        seen.add(encoded)
+        values.append((name, encoded))
+    return tuple(values)
+
+
+def _is_probably_text(data: bytes) -> bool:
+    """Conservatively identify UTF-8 text for generic signature matching.
+
+    Opaque Mach-O/shared-library bytes can randomly contain token-shaped ASCII
+    and crypto libraries intentionally contain PEM parser markers. Exact build
+    secrets and personal roots are still checked in all bytes; only generic
+    provider signatures are limited to text-like members.
+    """
+
+    sample = data[:_TEXT_SAMPLE_BYTES]
+    if not sample:
+        return True
+    if b"\x00" in sample:
+        return False
+    try:
+        sample.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    controls = sum(byte < 32 and byte not in b"\t\n\r\f\b" for byte in sample)
+    return controls / len(sample) <= 0.01
+
+
 def _scan_forbidden(
     root: Path,
     *,
     personal_roots: tuple[str, ...] | None = None,
+    sensitive_values: tuple[tuple[str, bytes], ...] | None = None,
 ) -> list[str]:
-    """Scan for complete credentials and non-generic local home paths.
+    """Scan for exact secrets, complete credentials, and local home paths.
 
     Prefix-only matching is deliberately rejected: Cortex ships redaction
     rules containing strings such as ``sk-ant-``, while native dependencies
-    contain generic ``/Users/runner`` debug paths. Credential expressions are
-    length-bounded and path checks target only the actual non-generic build
-    homes (or explicit roots supplied by a test/caller).
+    contain generic ``/Users/runner`` debug paths and credential-parser marker
+    strings. Exact build secrets and personal paths are checked in all bytes.
+    Generic provider expressions are length-bounded and checked only in
+    UTF-8/text-like members, avoiding random opaque-binary collisions. Path
+    checks target only the actual non-generic build homes (or explicit roots
+    supplied by a test/caller).
     """
 
     findings: list[str] = []
     roots = _default_personal_roots() if personal_roots is None else personal_roots
+    secrets = _default_sensitive_values() if sensitive_values is None else sensitive_values
     encoded_roots = tuple(
         (candidate + separator).encode("utf-8")
         for root_value in roots
         if (candidate := root_value.strip().rstrip("/\\"))
         for separator in ("/", "\\")
+    )
+    overlap_bytes = max(
+        _SCAN_OVERLAP_BYTES,
+        max((len(value) - 1 for _, value in secrets), default=0),
     )
     for path in root.rglob("*"):
         if not path.is_file() or path.is_symlink():
@@ -161,24 +262,39 @@ def _scan_forbidden(
         relative = path.relative_to(root)
         try:
             with path.open("rb") as handle:
+                first_block = handle.read(1024 * 1024)
+                scan_generic_credentials = _is_probably_text(first_block)
                 tail = b""
                 matched_credentials: set[str] = set()
+                matched_exact_secrets: set[str] = set()
                 matched_local_path = False
-                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                blocks = itertools.chain(
+                    (first_block,) if first_block else (),
+                    iter(lambda: handle.read(1024 * 1024), b""),
+                )
+                for block in blocks:
                     searchable = tail + block
-                    matched_credentials.update(
-                        name
-                        for name, pattern in _CREDENTIAL_PATTERNS
-                        if pattern.search(searchable) is not None
+                    if scan_generic_credentials:
+                        matched_credentials.update(
+                            name
+                            for name, pattern in _CREDENTIAL_PATTERNS
+                            if pattern.search(searchable) is not None
+                        )
+                    matched_exact_secrets.update(
+                        label for label, value in secrets if value in searchable
                     )
                     if any(root_bytes in searchable for root_bytes in encoded_roots):
                         matched_local_path = True
-                    tail = searchable[-_SCAN_OVERLAP_BYTES:]
+                    tail = searchable[-overlap_bytes:]
         except OSError as exc:
             findings.append(f"{relative} could not be scanned ({type(exc).__name__})")
             continue
         findings.extend(
             f"{relative} matches credential rule {name}" for name in sorted(matched_credentials)
+        )
+        findings.extend(
+            f"{relative} contains exact sensitive value {label}"
+            for label in sorted(matched_exact_secrets)
         )
         if matched_local_path:
             findings.append(f"{relative} contains a non-generic local home path")

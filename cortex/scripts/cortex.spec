@@ -52,8 +52,11 @@ datas = [
     (str(CORTEX / "libs" / "config" / "defaults.yaml"), "cortex/libs/config"),
 
     # WP7 SQLite schema migrations are loaded through importlib.resources at
-    # first launch and checksum-verified on every subsequent launch.
-    (str(CORTEX / "storage" / "migrations"), "cortex/storage/migrations"),
+    # first launch and checksum-verified on every subsequent launch. Package
+    # only the immutable SQL resources: copying the directory wholesale would
+    # also collect ignored local __pycache__ files whose code objects embed the
+    # builder's absolute source path.
+    (str(CORTEX / "storage" / "migrations" / "*.sql"), "cortex/storage/migrations"),
 
     # Browser extensions (pre-built) — loaded via "Load unpacked" from the
     # ConnectionsPanel, which expects Contents/Resources/<ext_subdir>.
