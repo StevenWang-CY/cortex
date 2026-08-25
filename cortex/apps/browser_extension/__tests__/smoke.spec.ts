@@ -21,10 +21,9 @@ describe("background.ts smoke", () => {
 
     it("accepts a STATE_UPDATE through the mock WebSocket without exception", async () => {
         await import("../background");
-        // Wait for the auto-open microtask to fire.
-        await new Promise((r) => setTimeout(r, 0));
         const sock = getLatestSocket();
         expect(sock).not.toBeNull();
+        if (sock?.readyState === WebSocket.CONNECTING) sock.__open();
         const frame = {
             type: "STATE_UPDATE",
             payload: {
@@ -38,6 +37,6 @@ describe("background.ts smoke", () => {
             timestamp: Date.now() / 1000,
             sequence: 1,
         };
-        expect(() => sock!.__deliver(frame)).not.toThrow();
+        await expect(sock!.__deliver(frame)).resolves.toBeUndefined();
     });
 });

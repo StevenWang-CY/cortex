@@ -870,9 +870,7 @@ function connect(): void {
             broadcastToPopup({ type: "CONNECTION_CHANGED", connected: true });
         };
 
-        ws.onmessage = (event) => {
-            void handleMessage(event.data as string);
-        };
+        ws.onmessage = (event) => handleMessage(event.data as string);
 
         ws.onclose = () => {
             handleDisconnect();
@@ -1468,7 +1466,7 @@ async function handleMessage(raw: string): Promise<void> {
             break;
 
         case "INTERVENTION_TRANSACTION_STATE":
-            void acknowledgeReceiptOutbox(msg.payload);
+            await acknowledgeReceiptOutbox(msg.payload);
             settleAuthorizationFromState(msg.payload);
             broadcastToPopup({
                 type: "INTERVENTION_TRANSACTION_STATE",

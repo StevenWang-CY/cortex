@@ -3,8 +3,9 @@
  *
  * Tests instantiate `installFakeWebSocket()` once per case, capture
  * the latest socket via `getLatestSocket()`, then push canned inbound
- * frames with `socket.__deliver(...)` and inspect outbound sends via
- * `socket.sent`.
+ * frames with `await socket.__deliver(...)` and inspect outbound sends via
+ * `socket.sent`. Awaiting delivery observes completion of an asynchronous
+ * message handler, so boundary tests never need timing-based sleeps.
  */
 
 import { vi } from "vitest";
@@ -17,13 +18,13 @@ export interface FakeWebSocket {
     onopen: ((ev: Event) => void) | null;
     onclose: ((ev: CloseEvent) => void) | null;
     onerror: ((ev: Event) => void) | null;
-    onmessage: ((ev: MessageEvent) => void) | null;
+    onmessage: ((ev: MessageEvent) => void | Promise<void>) | null;
     send: (data: string) => void;
     close: (code?: number, reason?: string) => void;
     sent: string[];
     closedCalls: Array<{ code?: number; reason?: string }>;
     __open: () => void;
-    __deliver: (data: string | object) => void;
+    __deliver: (data: string | object) => Promise<void>;
     __error: () => void;
     __remoteClose: (code?: number, reason?: string) => void;
 }
@@ -71,11 +72,11 @@ export function installFakeWebSocket(): FakeSocketRegistry {
                 sock.readyState = 1;
                 if (sock.onopen) sock.onopen(new Event("open"));
             },
-            __deliver: (data: string | object) => {
+            __deliver: async (data: string | object) => {
                 const str =
                     typeof data === "string" ? data : JSON.stringify(data);
                 if (sock.onmessage) {
-                    sock.onmessage({ data: str } as MessageEvent);
+                    await sock.onmessage({ data: str } as MessageEvent);
                 }
             },
             __error: () => {

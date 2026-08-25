@@ -7,9 +7,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [v0.3.3] — 2026-08-25
 
 This patch makes the post-notarization bundle scanner distinguish genuine
-secrets from official provider fixtures and opaque native-library bytes. It
-contains no runtime algorithm, authority, privacy, or interaction-policy
-change from v0.3.0.
+secrets from official provider fixtures and opaque native-library bytes, and
+makes receipt acknowledgement ordering explicit. It contains no sensing or
+inference-algorithm, authority, privacy, or interaction-policy change from
+v0.3.0.
 
 ### Fixed
 
@@ -25,6 +26,14 @@ change from v0.3.0.
 * The macOS bundle now collects only immutable `*.sql` migration resources,
   preventing ignored local bytecode caches and their absolute builder paths
   from entering an otherwise clean distributable.
+* Browser transaction-state handling now awaits durable receipt-outbox
+  acknowledgement before settling and broadcasting the acknowledged state.
+  Observers of that state can no longer see receipts that the daemon has
+  already acknowledged.
+* The WebSocket test transport exposes an awaitable delivery boundary, and the
+  exact intervention apply/restore suite now synchronizes on handler
+  completion instead of fixed-duration sleeps. Negative mutation assertions
+  therefore execute after rejection has finished, not before a delayed effect.
 * Added a release-failure corpus covering boto3/botocore example IDs, native
   crypto/parser literals, random opaque bytes, complete text credentials,
   exact secrets inside binaries, boundary-spanning tokens, local paths, and
