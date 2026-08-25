@@ -17,6 +17,12 @@ from cortex.scripts.generate_release_evidence import (
     sha256_file,
 )
 from cortex.scripts.release_smoke import inspect_release_resources
+from cortex.scripts.select_notary_auth import (
+    API_KEY_VARIABLES,
+    APPLE_ID_VARIABLES,
+    NotaryAuthConfigurationError,
+    select_notary_auth_mode,
+)
 from cortex.scripts.validate_release_records import (
     REQUIRED_CASE_IDS,
     ReleaseRecordError,
@@ -25,6 +31,51 @@ from cortex.scripts.validate_release_records import (
 from cortex.scripts.verify_macos_release import _scan_forbidden
 
 _ROOT = Path(__file__).resolve().parents[3]
+
+
+def _credential_environment(names: tuple[str, ...]) -> dict[str, str]:
+    return {name: f"fixture-for-{name.lower()}" for name in names}
+
+
+def test_notary_auth_selector_accepts_each_complete_mode() -> None:
+    assert select_notary_auth_mode(_credential_environment(API_KEY_VARIABLES)) == "api-key"
+    assert select_notary_auth_mode(_credential_environment(APPLE_ID_VARIABLES)) == "apple-id"
+
+
+@pytest.mark.parametrize("group", [API_KEY_VARIABLES, APPLE_ID_VARIABLES])
+def test_notary_auth_selector_rejects_every_partial_mode(group: tuple[str, ...]) -> None:
+    for omitted in group:
+        environment = _credential_environment(group)
+        environment.pop(omitted)
+        with pytest.raises(NotaryAuthConfigurationError, match=omitted):
+            select_notary_auth_mode(environment)
+
+
+def test_notary_auth_selector_rejects_missing_or_mixed_modes() -> None:
+    with pytest.raises(NotaryAuthConfigurationError, match="missing notarization"):
+        select_notary_auth_mode({})
+
+    both = _credential_environment((*API_KEY_VARIABLES, *APPLE_ID_VARIABLES))
+    with pytest.raises(NotaryAuthConfigurationError, match="exactly one"):
+        select_notary_auth_mode(both)
+
+
+def test_release_workflow_wires_both_notary_modes_through_selector() -> None:
+    workflow = (_ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+    for variable in (*API_KEY_VARIABLES, *APPLE_ID_VARIABLES):
+        assert f"{variable}: ${{{{ secrets.{variable} }}}}" in workflow
+    assert "-m cortex.scripts.select_notary_auth" in workflow
+    assert '--key "${NOTARY_KEY_PATH}"' in workflow
+    assert '--apple-id "${APPLE_ID_USERNAME}"' in workflow
+    assert '--password "${APPLE_ID_APP_PASSWORD}"' in workflow
+    assert '--team-id "${APPLE_TEAM_ID}"' in workflow
+
+
+def test_release_workflow_stages_versioned_changelog_notes() -> None:
+    workflow = (_ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+    assert 'HEADING="## [${RELEASE_TAG}]"' in workflow
+    assert 'body_path: ${{ env.CORTEX_RELEASE_NOTES }}' in workflow
+    assert "generate_release_notes: false" in workflow
 
 
 def _write_approved_release_record(

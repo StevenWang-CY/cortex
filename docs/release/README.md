@@ -39,10 +39,17 @@ artifact hashes, signatures, notarization, SBOMs, and GitHub attestations.
 ## Credential boundary
 
 The protected GitHub `production-release` environment must provide a Developer
-ID Application certificate, its password, a temporary-Keychain password, App
-Store Connect notary API key, key ID/issuer, and exact
-`CORTEX_SIGN_IDENTITY`. Secrets are decoded only into the runner temporary
-directory, imported into a temporary Keychain, removed after import, and the
+ID Application certificate, its password, a temporary-Keychain password, exact
+`CORTEX_SIGN_IDENTITY`, and exactly one complete Apple notarization credential
+set:
+
+- App Store Connect API key (`APPLE_NOTARY_KEY_P8_BASE64`, key ID, and issuer
+  ID); or
+- Apple ID (`APPLE_ID_USERNAME`, app-specific password, and team ID).
+
+Partial or mixed credential sets fail before a Keychain is created. Secrets are
+decoded only into the runner temporary directory, imported into a temporary
+Keychain, removed after import even when credential validation fails, and the
 Keychain is deleted in an `always()` cleanup step.
 
 The separate protected `production-publish` environment controls public
@@ -81,7 +88,7 @@ Run the same artifact verifier locally:
 
 ```bash
 uv run --project cortex --locked python -m cortex.scripts.verify_macos_release \
-  dist/Cortex-0.2.2-macos-arm64.dmg \
+  dist/Cortex-0.3.0-macos-arm64.dmg \
   --expected-arch arm64 \
   --require-notarized \
   --output dist/evidence-arm64/release-verification.json
@@ -95,11 +102,11 @@ the checksum file before running:
 
 ```bash
 shasum -a 256 -c SHA256SUMS-arm64
-gh attestation verify Cortex-0.2.2-macos-arm64.dmg \
+gh attestation verify Cortex-0.3.0-macos-arm64.dmg \
   --repo StevenWang-CY/cortex
-xcrun stapler validate Cortex-0.2.2-macos-arm64.dmg
+xcrun stapler validate Cortex-0.3.0-macos-arm64.dmg
 spctl -a -vv --type open --context context:primary-signature \
-  Cortex-0.2.2-macos-arm64.dmg
+  Cortex-0.3.0-macos-arm64.dmg
 ```
 
 The checksum file covers the DMG, metadata, SBOMs, verifier output, and command

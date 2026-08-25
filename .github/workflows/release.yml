@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to release (for example v0.2.2)"
+        description: "Existing tag to release (for example v0.3.0)"
         required: true
         type: string
 
@@ -137,31 +137,52 @@ jobs:
           APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
           APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
           APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_ID_USERNAME: ${{ secrets.APPLE_ID_USERNAME }}
+          APPLE_ID_APP_PASSWORD: ${{ secrets.APPLE_ID_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           TEMP_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_TEMP_KEYCHAIN_PASSWORD }}
         run: |
           : "${APPLE_DEVELOPER_ID_P12_BASE64:?missing certificate secret}"
           : "${APPLE_DEVELOPER_ID_P12_PASSWORD:?missing certificate password}"
-          : "${APPLE_NOTARY_KEY_P8_BASE64:?missing notary key secret}"
-          : "${APPLE_NOTARY_KEY_ID:?missing notary key ID}"
-          : "${APPLE_NOTARY_ISSUER_ID:?missing notary issuer ID}"
           : "${TEMP_KEYCHAIN_PASSWORD:?missing temporary keychain password}"
+          NOTARY_AUTH_MODE="$(
+            uv run --project cortex --locked python \
+              -m cortex.scripts.select_notary_auth
+          )"
           CERTIFICATE_PATH="${RUNNER_TEMP}/developer-id.p12"
-          NOTARY_KEY_PATH="${RUNNER_TEMP}/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
           KEYCHAIN_PATH="${RUNNER_TEMP}/cortex-signing.keychain-db"
-          echo "${APPLE_DEVELOPER_ID_P12_BASE64}" | base64 --decode > "${CERTIFICATE_PATH}"
-          echo "${APPLE_NOTARY_KEY_P8_BASE64}" | base64 --decode > "${NOTARY_KEY_PATH}"
+          CREDENTIAL_FILES=("${CERTIFICATE_PATH}")
+          cleanup_decoded_credentials() {
+            rm -f "${CREDENTIAL_FILES[@]}"
+          }
+          trap cleanup_decoded_credentials EXIT
+          printf '%s' "${APPLE_DEVELOPER_ID_P12_BASE64}" | base64 --decode > "${CERTIFICATE_PATH}"
+          if [[ "${NOTARY_AUTH_MODE}" == "api-key" ]]; then
+            NOTARY_KEY_PATH="${RUNNER_TEMP}/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
+            CREDENTIAL_FILES+=("${NOTARY_KEY_PATH}")
+            printf '%s' "${APPLE_NOTARY_KEY_P8_BASE64}" | base64 --decode > "${NOTARY_KEY_PATH}"
+          fi
           security create-keychain -p "${TEMP_KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
           security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
           security unlock-keychain -p "${TEMP_KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
           security import "${CERTIFICATE_PATH}" -P "${APPLE_DEVELOPER_ID_P12_PASSWORD}" -A -t cert -f pkcs12 -k "${KEYCHAIN_PATH}"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${TEMP_KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
           security list-keychains -d user -s "${KEYCHAIN_PATH}" login.keychain-db
-          xcrun notarytool store-credentials cortex-ci-notary \
-            --key "${NOTARY_KEY_PATH}" \
-            --key-id "${APPLE_NOTARY_KEY_ID}" \
-            --issuer "${APPLE_NOTARY_ISSUER_ID}" \
-            --keychain "${KEYCHAIN_PATH}"
-          rm -f "${CERTIFICATE_PATH}" "${NOTARY_KEY_PATH}"
+          if [[ "${NOTARY_AUTH_MODE}" == "api-key" ]]; then
+            xcrun notarytool store-credentials cortex-ci-notary \
+              --key "${NOTARY_KEY_PATH}" \
+              --key-id "${APPLE_NOTARY_KEY_ID}" \
+              --issuer "${APPLE_NOTARY_ISSUER_ID}" \
+              --keychain "${KEYCHAIN_PATH}"
+          else
+            xcrun notarytool store-credentials cortex-ci-notary \
+              --apple-id "${APPLE_ID_USERNAME}" \
+              --password "${APPLE_ID_APP_PASSWORD}" \
+              --team-id "${APPLE_TEAM_ID}" \
+              --keychain "${KEYCHAIN_PATH}"
+          fi
+          cleanup_decoded_credentials
+          trap - EXIT
           echo "CORTEX_CI_KEYCHAIN=${KEYCHAIN_PATH}" >> "${GITHUB_ENV}"
           echo "CORTEX_NOTARIZE_KEYCHAIN=${KEYCHAIN_PATH}" >> "${GITHUB_ENV}"
 
@@ -253,6 +274,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
       - uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
         with:
           pattern: cortex-release-*
@@ -274,10 +299,24 @@ jobs:
           if EXISTING_DRAFT="$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft 2>/dev/null)"; then
             test "${EXISTING_DRAFT}" = "true"
           fi
+      - name: Render this version's release notes from the changelog
+        run: |
+          NOTES_PATH="${RUNNER_TEMP}/release-notes.md"
+          HEADING="## [${RELEASE_TAG}]"
+          awk -v heading="${HEADING}" '
+            index($0, heading) == 1 { capture = 1 }
+            capture && /^## \[/ && index($0, heading) != 1 { exit }
+            capture { print }
+          ' CHANGELOG.md > "${NOTES_PATH}"
+          test -s "${NOTES_PATH}"
+          grep -Fq "${HEADING}" "${NOTES_PATH}"
+          echo "CORTEX_RELEASE_NOTES=${NOTES_PATH}" >> "${GITHUB_ENV}"
       - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
+          name: Cortex ${{ env.RELEASE_TAG }}
           draft: true
+          body_path: ${{ env.CORTEX_RELEASE_NOTES }}
           files: |
             artifact/**/*.dmg
             artifact/**/*-evidence.zip
