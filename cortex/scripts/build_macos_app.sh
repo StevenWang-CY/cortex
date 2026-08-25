@@ -66,8 +66,11 @@ mkdir -p "${EVIDENCE_DIR}"
 export CORTEX_ARTIFACT_ARCH="${ARTIFACT_ARCH}"
 
 # Non-interactive bash launched from GUI tools often lacks Homebrew/NVM paths.
-# Add the common macOS Node locations before building bundled extensions.
-export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
+# Keep a toolchain already selected by the caller (for example setup-node in
+# release CI) authoritative, then append common macOS fallback locations.
+# Prepending these directories can silently replace the pinned Node binary with
+# an unrelated Homebrew version installed on the runner.
+export PATH="${PATH}:/opt/homebrew/bin:/usr/local/bin"
 if ! command -v npm &>/dev/null && [ -s "${HOME}/.nvm/nvm.sh" ]; then
     # shellcheck disable=SC1090,SC1091
     source "${HOME}/.nvm/nvm.sh"

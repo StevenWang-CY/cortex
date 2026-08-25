@@ -1,6 +1,6 @@
 # Data flow and deletion map
 
-This document names the implemented flows in Cortex 0.3.0. The canonical
+This document names the implemented flows in Cortex 0.3.1. The canonical
 external-context disclosure is [cortex/docs/privacy.md](../cortex/docs/privacy.md);
 security controls are in [cortex/docs/security.md](../cortex/docs/security.md).
 

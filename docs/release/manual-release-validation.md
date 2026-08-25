@@ -92,7 +92,7 @@ uv run --project cortex --locked --extra dev \
   python -m cortex.scripts.validate_release_records \
   --records-dir release-assets \
   --asset-dir release-assets \
-  --expected-version 0.3.0 \
+  --expected-version 0.3.1 \
   --expected-commit "$(git rev-parse HEAD)" \
   --output release-assets/release-promotion-validation.json
 ```

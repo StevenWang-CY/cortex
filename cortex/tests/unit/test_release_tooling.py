@@ -78,6 +78,14 @@ def test_release_workflow_stages_versioned_changelog_notes() -> None:
     assert "generate_release_notes: false" in workflow
 
 
+def test_macos_builder_preserves_caller_selected_node_before_gui_fallbacks() -> None:
+    build_script = (_ROOT / "cortex/scripts/build_macos_app.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'export PATH="${PATH}:/opt/homebrew/bin:/usr/local/bin"' in build_script
+    assert 'export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"' not in build_script
+
+
 def _write_approved_release_record(
     root: Path,
     *,
