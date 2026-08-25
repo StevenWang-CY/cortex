@@ -33,15 +33,13 @@ class ActivitySummary(BaseModel):
 
 
 class BreakRecord(BaseModel):
-    """P0 §3.7: a single biology-driven break event.
+    """A single user-requested or elapsed-focus guided-break event.
 
-    Captured by :class:`cortex.services.intervention_engine.break_overlay.BiologyBreakController`
-    when a guided breathing session starts; ``pre_hrv`` is the most
-    recent HRV reading before the overlay shows, ``post_hrv`` is the
-    reading captured on exit (natural completion or early termination),
-    and ``recovery_delta = post_hrv - pre_hrv``. ``completed`` is True
-    only when the breathing pattern ran the full ``duration_seconds``;
-    early termination still preserves the record for the reward signal.
+    Captured by :class:`cortex.services.intervention_engine.break_overlay.GuidedBreakController`
+    when a guided breathing session starts. The legacy ``pre_hrv``,
+    ``post_hrv``, and ``recovery_delta`` fields decode historical reports but
+    remain ``None`` in the supported production path. ``completed`` is true
+    only when the UI reports a natural completion; early exits remain visible.
     """
 
     started_at: datetime = Field(..., description="UTC timestamp when the break began")
@@ -52,13 +50,13 @@ class BreakRecord(BaseModel):
         ..., description="Breathing pattern that paced the session"
     )
     pre_hrv: float | None = Field(
-        None, description="HRV (RMSSD) immediately before the break began"
+        None, description="Legacy compatibility field; unavailable in production"
     )
     post_hrv: float | None = Field(
-        None, description="HRV (RMSSD) immediately after the break ended"
+        None, description="Legacy compatibility field; unavailable in production"
     )
     recovery_delta: float | None = Field(
-        None, description="post_hrv - pre_hrv (positive = recovery)"
+        None, description="Legacy compatibility field; unavailable in production"
     )
     completed: bool = Field(
         True, description="True if the breathing pattern ran the full duration"

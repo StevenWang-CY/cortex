@@ -78,10 +78,11 @@ clients connect over authenticated local transports.
 | `services/physio_engine` | experimental rPPG pulse estimation; unsupported derived physiology is contained |
 | `services/kinematics_engine` | blink and head/neck proxy features |
 | `services/telemetry_engine` | local input/window and focus-transition telemetry |
-| `services/state_engine` | legacy heuristic scoring, smoothing, eligibility, and detector research code |
+| `application` | typed kernel, command/event ports, bounded coordinators, and task ownership |
+| `services/state_engine` | deterministic evidence-aware scoring, smoothing, eligibility, and compatibility decoders |
 | `services/context_engine` | browser/editor/terminal context assembly |
 | `services/llm_engine` | Anthropic transport, prompt construction, parsing, and deterministic fallback |
-| `services/intervention_engine` | plan validation and the currently contained execution path |
+| `services/intervention_engine` | manifest validation, exact authorization, receipts, verification, compensation, and restore |
 | `services/api_gateway` | authenticated HTTP/WebSocket boundary |
 | `apps/browser_extension` | Plasmo MV3 client and proposal UI |
 | `apps/vscode_extension` | editor context client and proposal notifications |
@@ -103,7 +104,7 @@ requires an exact checksummed study epoch.
 | Surface | Product status |
 |---|---|
 | camera pulse/BPM | experimental, quality-gated wellness estimate |
-| blink rate and PERCLOS | heuristic local feature; elapsed-time redesign is in progress |
+| blink rate and PERCLOS | time-based heuristic local feature; not externally validated |
 | head/neck pose proxy | heuristic local feature; not a shoulder/posture diagnosis |
 | input/window telemetry | local behavioral context |
 | HRV/RMSSD/SDNN/pNN50/LF-HF/entropy | unavailable in product mode |
@@ -128,10 +129,9 @@ default:
 - clients reject apply traffic while in suggestion-only mode;
 - the emergency stop path remains independent of the LLM and policy modules.
 
-The repository still contains experimental adapters and legacy action types so
-old data can be decoded and transactional execution can be built behind a
-feature boundary. Their presence is not a claim that restart-safe restoration
-or autonomous execution is release-ready.
+The repository still contains experimental adapters and legacy action fields
+so old data can be decoded. Their presence is not authority: mutation requires
+the implemented manifest-bound transaction and explicit release enablement.
 
 ## LLM configuration and privacy
 
@@ -147,37 +147,35 @@ belong in environment configuration or macOS Keychain; never commit or bundle
 them.
 
 See [`docs/deploy_anthropic.md`](docs/deploy_anthropic.md) for provider setup.
-The context-preview/redaction broker and per-category controls are tracked in
-WP-9 of the implementation plan; until those gates pass, cloud planning should
-be enabled only with informed test data.
+The implemented privacy broker requires per-category selection, exact redacted
+preview, a short-lived one-time confirmation, and conservative provider
+retention disclosure. Cloud planning should still use only data the user is
+authorized to disclose.
 
 ## Install and run
 
-Requirements: macOS 13+, Python 3.11+, Node.js 18+, pnpm, and a webcam for
-camera features. Redis is optional; the daemon can use its in-memory fallback.
+Requirements: macOS 13+, uv 0.10.12, Python 3.11.15/3.12.13, Node.js 22.23.2, pnpm 9.15.9,
+and a webcam only for experimental camera features.
 
 ```bash
 git clone https://github.com/StevenWang-CY/cortex.git
 cd cortex
-python -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip setuptools
-pip install -e '.[dev]'
-cp .env.example .env
-python -m cortex.scripts.run_dev
+uv sync --project cortex --locked --extra dev --extra codegen
+cp cortex/.env.example .env  # optional overrides; generated lines are commented
+uv run --project cortex --locked --extra dev --extra codegen python -m cortex.scripts.run_dev
 ```
 
 Desktop shell:
 
 ```bash
-python -m cortex.apps.desktop_shell.main
-python -m cortex.apps.desktop_shell.main --in-process
+uv run --project cortex --locked python -m cortex.apps.desktop_shell.main
+uv run --project cortex --locked python -m cortex.apps.desktop_shell.main --in-process
 ```
 
 Browser extension:
 
 ```bash
-cd apps/browser_extension
+cd cortex/apps/browser_extension
 pnpm install --frozen-lockfile
 pnpm exec plasmo build
 ```
@@ -188,7 +186,7 @@ Load `build/chrome-mv3-prod/` from `chrome://extensions`. For Edge, run
 VS Code extension:
 
 ```bash
-cd apps/vscode_extension
+cd cortex/apps/vscode_extension
 npm ci
 npm run compile
 npm test
@@ -198,7 +196,7 @@ npm run package:vsix
 ### Native messaging on macOS
 
 ```bash
-python -m cortex.scripts.install_native_host
+uv run --project cortex --locked python -m cortex.scripts.install_native_host
 ```
 
 Fully quit the Chromium browser with Cmd+Q and relaunch it after installing or
@@ -248,16 +246,16 @@ See [`docs/apis.md`](docs/apis.md) for payloads and compatibility notes.
 Pydantic models in `libs/schemas` are canonical for daemon/client payloads.
 
 ```bash
-python -m cortex.scripts.generate_ts_schemas
-python -m cortex.scripts.generate_ts_schemas --check
+uv run --project cortex --locked --extra codegen python -m cortex.scripts.generate_ts_schemas
+uv run --project cortex --locked --extra codegen python -m cortex.scripts.generate_ts_schemas --check
 ```
 
 `pyproject.toml` is the hand-edited version source. Generated/runtime/package
 surfaces are synchronized and checked with:
 
 ```bash
-python -m cortex.scripts.sync_versions
-python -m cortex.scripts.sync_versions --check
+uv run --project cortex --locked python -m cortex.scripts.sync_versions
+uv run --project cortex --locked python -m cortex.scripts.sync_versions --check
 ```
 
 ## Verification
@@ -270,7 +268,7 @@ make codegen-check
 make version-check
 make audit
 
-cd apps/browser_extension
+cd cortex/apps/browser_extension
 pnpm exec tsc --noEmit
 pnpm test
 pnpm exec plasmo build
@@ -290,13 +288,15 @@ expire; path drift or severity escalation fails the gate.
 ## Build the macOS application
 
 ```bash
-./scripts/build_macos_app.sh
+./cortex/scripts/build_macos_app.sh
 ```
 
-The output is `dist/Cortex-<version>.dmg`. Ad-hoc builds intentionally avoid
+The output is `dist/Cortex-<version>-macos-<arch>.dmg`. Ad-hoc builds intentionally avoid
 hardened runtime because it conflicts with differently ad-hoc-signed bundled
-frameworks. Production distribution requires a real Developer ID identity and
-notarization. API keys are never bundled.
+frameworks. Production distribution requires a real Developer ID identity,
+notarization, architecture-specific evidence/SBOMs, and the installed-artifact
+protocol in [`../docs/release/README.md`](../docs/release/README.md). API keys
+are never bundled.
 
 ## Documentation
 

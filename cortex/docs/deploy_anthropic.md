@@ -6,12 +6,9 @@ Use this flow to experience Cortex as a real product on macOS. Cortex talks to C
 
 ```bash
 cd /path/to/cortex-repo
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install -e "./cortex[dev]"
-export PYTHONPATH="$PWD"
+uv sync --project cortex --locked --extra dev --extra codegen
 cp cortex/.env.example .env
-python -m cortex.scripts.seed_config --root .
+uv run --project cortex --locked python -m cortex.scripts.seed_config --root .
 ```
 
 Set the provider in `.env`. Pick one option below.
@@ -77,7 +74,7 @@ CORTEX_LLM__FALLBACK_MODE=rule_based   # default — deterministic plan if all e
 ### 2. Optional research calibration
 
 ```bash
-cortex-calibrate --duration 120
+uv run --project cortex --locked cortex-calibrate --duration 120
 ```
 
 This writes the active baseline to `storage/baselines/default.json`.
@@ -88,7 +85,7 @@ VS Code:
 
 ```bash
 cd cortex/apps/vscode_extension
-npm install
+npm ci
 npm run compile
 ```
 
@@ -96,8 +93,8 @@ Chrome:
 
 ```bash
 cd cortex/apps/browser_extension
-pnpm install
-pnpm build
+pnpm install --frozen-lockfile
+pnpm exec plasmo build
 ```
 
 Load the browser extension from `chrome://extensions`.
@@ -112,13 +109,13 @@ Open **Cortex.app** from `/Applications` (installed via DMG). The app starts the
 Terminal 1:
 
 ```bash
-cortex-dev
+uv run --project cortex --locked cortex-dev
 ```
 
 Terminal 2:
 
 ```bash
-python -m cortex.apps.desktop_shell.main
+uv run --project cortex --locked python -m cortex.apps.desktop_shell.main
 ```
 
 ### 5. Experience the product
@@ -140,8 +137,7 @@ gate as a diagnosis of overwhelm.
 ### 6. Package a macOS app
 
 ```bash
-cd cortex
-./scripts/build_macos_app.sh
+./cortex/scripts/build_macos_app.sh
 ```
 
 Use code signing and DMG packaging for distribution after local verification. Bedrock bearer tokens, Anthropic API keys, and Vertex ADC files are NOT bundled — every user supplies their own credentials during onboarding (BYOK).

@@ -62,9 +62,7 @@ def _exception(**updates: object) -> dict[str, object]:
         "package": "unsafe",
         "max_severity": "moderate",
         "path_prefixes": [".>root>unsafe"],
-        "expires_on": (
-            datetime.now(UTC).date() + timedelta(days=30)
-        ).isoformat(),
+        "expires_on": (datetime.now(UTC).date() + timedelta(days=30)).isoformat(),
         "reason": "The vulnerable parser is unreachable from shipped runtime code.",
         "mitigation": "The release excludes that build-only path and tracks upstream.",
     }
@@ -77,6 +75,34 @@ def test_exact_reviewed_path_is_permitted(monkeypatch: object, tmp_path: Path) -
         monkeypatch,
         tmp_path,
         report=_report(),
+        exceptions=[_exception()],
+    )
+    assert code == 0
+    assert summary["status"] == "pass"
+
+
+def test_pnpm_path_spacing_is_not_dependency_drift(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    code, summary = _run(
+        monkeypatch,
+        tmp_path,
+        report=_report(path=". > root > unsafe"),
+        exceptions=[_exception()],
+    )
+    assert code == 0
+    assert summary["status"] == "pass"
+
+
+def test_pnpm_resolved_versions_are_not_dependency_drift(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    code, summary = _run(
+        monkeypatch,
+        tmp_path,
+        report=_report(path=". > root@1.2.3 > unsafe@4.5.6"),
         exceptions=[_exception()],
     )
     assert code == 0

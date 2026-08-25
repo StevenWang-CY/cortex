@@ -339,16 +339,11 @@ class MessageType(str, Enum):  # noqa: UP042 — pydantic-to-typescript requires
     Payload: ``{intervention_id: str, causal_signals: list[CausalSignal]}``."""
 
     BREAK_RECOMMENDATION = "BREAK_RECOMMENDATION"
-    """P0 §3.7: daemon nudges the user to take a biology-driven break.
+    """Compatibility frame for an opt-in elapsed-focus break reminder.
 
-    Emitted exactly once per ``StressIntegralTracker.should_break()``
-    transition (False → True). The popup / desktop overlay surfaces a
-    soft pill with a single CTA that fires ``take_biology_break`` via
-    ``EXECUTE_ACTION``. Payload mirrors the contract documented next to
-    the ``_break_recommendation_sent`` flag in
-    :class:`cortex.services.runtime_daemon.CortexDaemon`:
-    ``{reason: str, urgency: "low"|"medium"|"high", stress_load: float,
-    threshold: float, duration_seconds: int, breathing_pattern: str}``."""
+    The current producer is time-based and does not use pulse, HRV, a stress
+    integral, or a support-state score. Legacy physiological payload fields
+    remain decode-only and cannot confer action authority."""
 
     QUIET_MODE_STATE = "QUIET_MODE_STATE"
     """P0 §3.11: broadcast of the active quiet / pause mode (or its clear).
@@ -463,52 +458,3 @@ class MessageType(str, Enum):  # noqa: UP042 — pydantic-to-typescript requires
 
     LEETCODE_SHOW_SOLUTION_FRICTION = "LEETCODE_SHOW_SOLUTION_FRICTION"
     """Friction overlay before revealing the editorial / solution."""
-
-    LEETCODE_SHOW_SESSION_BRIEFING = "LEETCODE_SHOW_SESSION_BRIEFING"
-    """Daily LeetCode briefing for the popup/newtab.
-
-    Reserved capability: the adapter advertises this in
-    ``LeetCodeAdapter.capabilities`` but ``InterventionMatrix.select``
-    does not yet emit it. Browser-side handler at
-    ``audit_w2_unhandled_ws_frame.spec.ts`` asserts the silent-drop
-    contract."""
-
-    LEETCODE_LOCK_EDITOR = "LEETCODE_LOCK_EDITOR"
-    """Force-focus the LeetCode editor (no other tabs).
-
-    Reserved capability — see ``LEETCODE_SHOW_SESSION_BRIEFING``."""
-
-    LEETCODE_INTERCEPT_SUBMIT = "LEETCODE_INTERCEPT_SUBMIT"
-    """Intercept the submit button until acknowledgement.
-
-    Reserved capability — see ``LEETCODE_SHOW_SESSION_BRIEFING``."""
-
-    LEETCODE_GATE_SOLUTIONS = "LEETCODE_GATE_SOLUTIONS"
-    """Gate the editorial / community-solution tab.
-
-    Reserved capability — see ``LEETCODE_SHOW_SESSION_BRIEFING``."""
-
-    LEETCODE_AI_RESTATEMENT_CHECK = "LEETCODE_AI_RESTATEMENT_CHECK"
-    """Trigger AI-powered restatement check (paraphrase the problem).
-
-    Reserved capability — see ``LEETCODE_SHOW_SESSION_BRIEFING``."""
-
-    LEETCODE_AI_COMPREHENSION_CHECK = "LEETCODE_AI_COMPREHENSION_CHECK"
-    """Trigger AI-powered comprehension check (examples / edges).
-
-    Reserved capability — see ``LEETCODE_SHOW_SESSION_BRIEFING``."""
-
-    LEETCODE_AI_HYPOTHESIS_CHECK = "LEETCODE_AI_HYPOTHESIS_CHECK"
-    """Trigger AI-powered hypothesis check (approach articulation).
-
-    Reserved capability — see ``LEETCODE_SHOW_SESSION_BRIEFING``."""
-
-    LEETCODE_AI_STUCK_ANALYSIS = "LEETCODE_AI_STUCK_ANALYSIS"
-    """Trigger AI-powered stuck-analysis explanation.
-
-    Reserved capability — see ``LEETCODE_SHOW_SESSION_BRIEFING``."""
-
-    LEETCODE_AI_SESSION_BRIEFING = "LEETCODE_AI_SESSION_BRIEFING"
-    """Trigger AI-powered session-briefing generation.
-
-    Reserved capability — see ``LEETCODE_SHOW_SESSION_BRIEFING``."""

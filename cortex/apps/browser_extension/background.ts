@@ -1743,19 +1743,10 @@ async function handleMessage(raw: string): Promise<void> {
         }
 
         default: {
-            // audit-w2 (audit contract sweep): the schema catalogue in
-            // ``ws_message_types.py`` registers wire types the daemon
-            // may emit (e.g. nine ``LEETCODE_*`` cues such as
-            // ``LEETCODE_LOCK_EDITOR`` / ``LEETCODE_AI_*``) that no
-            // active runtime selector emits today — they are reserved
-            // for the leetcode adapter's future capabilities. Without a
-            // default arm the switch silently dropped any frame whose
-            // type isn't enumerated above, which makes a future
-            // regression (extension drifts behind a new daemon-side
-            // emit) invisible in logs. A debug log line here lets a
-            // developer see "extension received a known-but-unhandled
-            // frame" without breaking the wire (the schema's
-            // round-trip parse already validated ``msg.type``).
+            // Defensive visibility for a schema-valid frame introduced
+            // before this client has gained a dedicated handler. The
+            // repository contract gate separately rejects catalogue
+            // members without a production producer or consumer.
             if (DEBUG) {
                 console.warn(
                     "Cortex: received WS frame with no handler",

@@ -2,11 +2,14 @@
 
 ## Product boundary
 
-Cortex is currently a modular monolith supervised by
-`cortex/services/runtime_daemon.py`. It exposes an authenticated FastAPI
-service on port 9472 and WebSocket service on port 9473, and can run inside the
-PySide6 macOS shell. Browser and VS Code extensions are untrusted clients at
-the process boundary.
+Cortex is a local modular monolith composed through `cortex/application/`.
+The application kernel binds typed commands and isolated events; bounded
+coordinators own sensing, inference, intervention, policy, context, and
+lifecycle tasks. `cortex/services/runtime_daemon.py` remains the compatibility
+composition facade, not the owner of domain algorithms. Cortex exposes an
+authenticated FastAPI service on port 9472 and WebSocket service on port 9473,
+and can run inside the PySide6 macOS shell. Browser and VS Code extensions are
+untrusted clients at the process boundary.
 
 The shipping execution mode is `suggest_only`. Sensing and planning can
 produce a proposal; receipt of a proposal is never authority to mutate a tab,
@@ -88,17 +91,19 @@ TypeScript is checked in CI. Unknown major protocol versions are rejected.
 
 ## Evidence boundary
 
-The following modules remain in the tree for compatibility or gated research:
+The following compatibility fields or bounded research surfaces remain for
+decoded historical data or explicitly gated analysis:
 
 - expanded camera-derived HRV and respiration algorithms;
-- stress integral and physiology-triggered break detectors;
-- optional per-user ML classifier;
-- retired AMIP/contextual-bandit implementations and legacy diagnostic replay;
+- legacy stress-integral/report fields, emitted as unavailable or neutral;
+- legacy AMIP diagnostic replay (the retired policy implementations and
+  unregistered per-user classifier have been deleted);
 - action adapters and undo helpers.
 
 Their existence is not evidence that their output is valid or release-ready.
-The classifier and stress-integral modules are not exported, instantiated, or
-registered on the production daemon path.
+The former stress-integral implementation, physiology-triggered break
+controller, adaptive bandit/AMIP implementations, and unregistered classifier
+have been deleted. Compatibility routes and fields cannot restore them.
 Production policy selection is deterministic and non-learning. Every v2 action
 or no-action decision has one durable outcome window and at most one versioned
 reward. Separately consented research mode is restricted to a fixed two-arm
@@ -108,23 +113,23 @@ assignment. See
 Legacy “causal report” files are renamed diagnostic summaries and cannot enter
 the research export.
 
-## Target module ownership
+## Module ownership
 
-The incremental target is:
+The implemented ownership boundary is:
 
 - **domain:** pure value objects, signal/status semantics, consent outcomes,
   manifests, receipts, and policies;
-- **application:** use cases coordinated with injected clock, event store,
-  context broker, and command/event ports;
+- **application:** kernel and bounded coordinators using injected clock, event
+  store, context broker, command/event ports, and named task ownership;
 - **infrastructure:** camera, Redis/SQLite, Anthropic, OS, browser, and editor
   adapters;
 - **interfaces:** FastAPI, WebSocket, native messaging, PySide6, browser, and
   VS Code transport adapters;
-- **composition:** one root that constructs dependencies and owns structured
-  background tasks.
+- **composition:** a compatibility facade that constructs dependencies while
+  the kernel owns structured background tasks.
 
-This is an incremental extraction, not a rewrite. Characterization tests must
-precede moving each flow out of the current runtime daemon.
+Compatibility facades remain intentionally thin and are removed only after
+transport parity coverage proves no external caller relies on them.
 
 ## Persistence status
 
@@ -156,7 +161,7 @@ tests.
 
 ## Repository map
 
-- `cortex/application`: application ports, beginning with the clock
+- `cortex/application`: kernel, typed commands/events, coordinators, task owner
 - `cortex/libs/schemas`: canonical process-boundary models
 - `cortex/libs/store`: current Redis/in-memory abstraction
 - `cortex/services/capture_service`: camera, tracking, ROI, and quality

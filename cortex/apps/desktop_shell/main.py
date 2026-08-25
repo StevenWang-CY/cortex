@@ -1781,6 +1781,14 @@ def main() -> None:
     :class:`CortexAppController`.  In dev mode, falls back to the
     WebSocket-based :class:`CortexApp` unless ``--in-process`` is passed.
     """
+    if "--release-smoke" in sys.argv:
+        # This path deliberately runs before QApplication, camera ownership,
+        # network listeners, or user storage. The release verifier executes it
+        # from the mounted DMG to prove the frozen resource graph is complete.
+        from cortex.scripts.release_smoke import main as release_smoke_main
+
+        sys.exit(release_smoke_main())
+
     # C6 (audit): install the structured-logging pipeline once, before any
     # logger is used, replacing the bare ``logging.basicConfig`` so the
     # desktop shell emits the same JSON event stream as the daemon and

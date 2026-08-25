@@ -115,17 +115,8 @@ class ScoreSmoother:
         timestamp: float | None = None,
         *,
         event_time: EventTime | None = None,
-        ml_p_hyper: float | None = None,
-        ml_alpha: float = 0.0,
     ) -> StateEstimate:
-        """Consume a rule evaluation and publish a support estimate.
-
-        ``ml_*`` arguments are accepted for one compatibility release but are
-        ignored. Production cannot blend an unregistered classifier into the
-        deterministic score path.
-        """
-
-        del ml_p_hyper, ml_alpha
+        """Consume a rule evaluation and publish a support estimate."""
         if event_time is not None:
             supplied_now = event_time.observed_at_mono_ns / 1_000_000_000.0
         else:

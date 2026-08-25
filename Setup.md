@@ -1,247 +1,107 @@
 # Setup
 
-## DMG Install (Recommended)
+## Install a published release
 
-1. Download **Cortex.dmg** from [Releases](https://github.com/StevenWang-CY/cortex/releases/latest)
-2. Drag **Cortex.app** to `/Applications`
-3. Strip the quarantine attribute:
-   ```bash
-   xattr -cr /Applications/Cortex.app
-   ```
-4. Open Cortex from Applications
-5. Follow the setup wizard to configure your LLM backend and grant permissions
-6. Use the in-app **Connect Chrome/Edge** button to install the browser extension
+1. Choose the arm64 or x86_64 DMG for your Mac from the GitHub release.
+2. Verify its matching `SHA256SUMS-<arch>` line and GitHub attestation; optionally run `stapler`
+   and `spctl` as shown in the [release guide](docs/release/README.md).
+3. Mount the DMG and drag Cortex to `/Applications`.
+4. Launch the installed copy and complete onboarding. A properly notarized
+   release should not require removing quarantine attributes.
+5. Grant only the permissions you want. Denial must degrade visibly; it should
+   not produce synthetic sensor values.
+6. Install browser/editor integrations from Connections. Fully quit Chrome or
+   Edge with Cmd+Q and reopen after native-host installation or update.
 
-The desktop app bundles the daemon, dashboard, and system tray. No Python, Node.js, or terminal setup required.
+The optional model-provider step is BYOK. The default planner is local and
+network-off; Cortex remains usable without a provider credential.
 
----
+## Developer prerequisites
 
-## Developer Setup (from source)
+| Tool | Supported input |
+| --- | --- |
+| macOS | 13 or later |
+| Python | 3.11.15 primary; 3.12.13 compatibility builder |
+| uv | 0.10.12 |
+| Node | 22.23.2 (`.node-version`) |
+| pnpm | 9.15.9 |
+| Browser | Chrome or Edge for the MV3 client |
 
-### Prerequisites
+Redis is not required for authoritative storage. SQLite under the configured
+storage root owns v2 transactions; Redis/in-memory paths are compatibility or
+ephemeral caches.
 
-| Requirement | Install |
-|-------------|---------|
-| **macOS 13+ (Ventura or later)** | Required — Linux/Windows not supported |
-| **Python 3.11 or 3.12** | `brew install python@3.11` or [python.org](https://www.python.org/downloads/) |
-| **Node.js 18+** | `brew install node` or [nodejs.org](https://nodejs.org/) |
-| **pnpm** | `npm install -g pnpm` |
-| **LLM backend** | AWS Bedrock (default), GCP Vertex, or direct Anthropic API — see [Provider Setup](#2-configuration) |
-| **Redis** (optional) | `brew install redis && brew services start redis` — auto-falls back to in-memory |
-
-> **Apple Silicon:** Use native ARM Python, not Rosetta. Verify: `python3 -c "import platform; print(platform.machine())"` should print `arm64`.
-
----
-
-### 1. Clone & Virtual Environment
+## Source setup
 
 ```bash
 git clone https://github.com/StevenWang-CY/cortex.git
-cd cortex   # repo root
-
-python3 -m venv .venv
-source .venv/bin/activate
+cd cortex
+make setup
+make precommit
+cp cortex/.env.example .env  # optional; every generated setting is commented
+make dev
 ```
 
----
+`make setup` uses `uv sync --locked`, `pnpm install --frozen-lockfile`, and
+`npm ci`. Do not replace them with unconstrained installs when diagnosing a
+release issue.
 
-### 2. Configuration
-
-Copy the example config:
+Desktop shell:
 
 ```bash
-cp cortex/.env.example .env
+uv run --project cortex --locked python -m cortex.apps.desktop_shell.main
+uv run --project cortex --locked python -m cortex.apps.desktop_shell.main --in-process
 ```
 
-Cortex talks to Claude exclusively via the Anthropic SDK. Three transport
-providers ship today, all selected with a single env var:
+Browser and native host:
 
 ```bash
-CORTEX_LLM__PROVIDER=bedrock   # default — AWS Bedrock
-# CORTEX_LLM__PROVIDER=vertex  # GCP Vertex AI
-# CORTEX_LLM__PROVIDER=direct  # Anthropic API (ANTHROPIC_API_KEY)
+make ext
+make ext-edge
+uv run --project cortex --locked python -m cortex.scripts.install_native_host
 ```
 
-The same value is mirrored into `ANTHROPIC_PROVIDER` at startup so the
-underlying SDK picks the right transport.
+## Configuration
 
-### Option A — AWS Bedrock (default)
+The generated [configuration reference](cortex/docs/configuration-reference.md)
+lists every runtime setting, type, default, and environment name. Edit only the
+overrides you need. Important safe defaults are:
+
+```text
+CORTEX_INTERVENTION__EXECUTION_MODE=suggest_only
+CORTEX_LLM__PRIVACY__PLANNER_MODE=no_llm
+CORTEX_LLM__PRIVACY__EXTERNAL_CONTEXT_ENABLED=false
+CORTEX_EVAL__POLICY=deterministic
+```
+
+Secrets are not `CortexConfig` fields. Prefer macOS Keychain for Bedrock or
+direct Anthropic API BYOK; use provider-standard ADC for Vertex. Select the
+transport with `CORTEX_LLM__PROVIDER=bedrock`, `vertex`, or `direct`. Never
+commit a populated `.env`.
+
+## Permissions and TCC
+
+- Camera: experimental pulse/acquisition; optional for telemetry-only use.
+- Input Monitoring/Accessibility: aggregate input/window support and optional
+  authorized effects.
+- Automation: only for an explicitly authorized OS capability.
+- Notifications: optional user-facing proposal fallback.
+
+Processes launched directly by Chrome inherit Chrome's camera permission
+context. The development native host therefore uses a foreground Terminal.app
+launch. `start_new_session`, `nohup`, or `setsid` do not fix TCC lineage. Never
+run a global `tccutil reset Camera`; if a developer reset is unavoidable,
+target only `com.cortex.daemon`.
+
+## Verify
 
 ```bash
-CORTEX_LLM__PROVIDER=bedrock
-CORTEX_LLM__BEDROCK__AWS_REGION=us-east-2
+make contracts
+make ci
+cd cortex/apps/browser_extension && pnpm exec tsc --noEmit && pnpm test
+cd ../vscode_extension && npm run compile && npm test
 ```
 
-The bearer token lives in macOS Keychain — never in `.env`:
-
-```bash
-security add-generic-password -s cortex.bedrock -a bearer_token -w YOUR_BEDROCK_TOKEN
-# CORTEX_LLM__USE_KEYCHAIN=true is the default; the daemon reads
-# from Keychain and exports AWS_BEARER_TOKEN_BEDROCK for the SDK.
-```
-
-### Option B — GCP Vertex AI
-
-```bash
-CORTEX_LLM__PROVIDER=vertex
-```
-
-Authenticate Vertex per the standard `gcloud` flow (`gcloud auth
-application-default login`). The Anthropic SDK reads the resulting
-credentials directly.
-
-### Option C — Direct Anthropic API
-
-```bash
-CORTEX_LLM__PROVIDER=direct
-export ANTHROPIC_API_KEY=sk-ant-...
-```
-
-Useful when you have an Anthropic API key and want to bypass the
-Bedrock / Vertex transports.
-
-If every transport fails the daemon falls back to a deterministic
-rule-based plan (`CORTEX_LLM__FALLBACK_MODE=rule_based`, the default),
-so a missing key never crashes the session — you just lose the
-LLM-generated copy until the provider comes back.
-
-### Camera Configuration
-
-Leave `CORTEX_CAPTURE__DEVICE_ID` commented out for automatic selection. Cortex will:
-- Enumerate cameras via AVFoundation
-- Skip iPhone/iPad Continuity Camera devices
-- Prefer the MacBook's built-in camera
-- Probe only non-Continuity indices as fallback
-- Reject any camera it cannot verify by name
-
-Camera selection runs once at daemon startup. Restart the daemon after turning off an iPhone.
-
-To override:
-```bash
-CORTEX_CAPTURE__DEVICE_ID=0   # or 1, 2, etc.
-```
-
----
-
-### 3. Install Python Dependencies
-
-```bash
-pip install -e "./cortex[dev]"
-```
-
-Verify:
-```bash
-python -c "from cortex.libs.config.settings import get_config; print(f'LLM provider: {get_config().llm.provider}')"
-```
-
----
-
-### 4. Initialize Storage
-
-```bash
-python -m cortex.scripts.seed_config --root .
-```
-
-Creates the `storage/` directory tree and a default baseline profile.
-
----
-
-### 5. macOS Permissions
-
-Cortex needs two permissions, both prompted automatically on first use:
-
-**Camera** — macOS asks when the daemon first opens the webcam. Click **Allow**.
-
-**Input Monitoring** — required for keyboard/mouse telemetry:
-`System Settings → Privacy & Security → Input Monitoring → add your terminal app`
-
-> If you launch the daemon from the browser extension, it runs via **Terminal.app** — grant permission to Terminal.app specifically.
-
----
-
-### 6. Start the Daemon
-
-### From terminal
-
-```bash
-source .venv/bin/activate
-cortex-dev
-```
-
-Starts:
-- REST API on `http://127.0.0.1:9472`
-- WebSocket on `ws://127.0.0.1:9473`
-- All capture, signal processing, state engine, and intervention services
-
-### Webcam-only test
-
-```bash
-cortex-capture
-```
-
-Opens a window showing the webcam feed with face detection overlays and FPS counter. Press `q` to quit.
-
----
-
-### 7. Browser Extension
-
-```bash
-cd cortex/apps/browser_extension
-pnpm install
-```
-
-| Browser | Build | Load from |
-|---------|-------|-----------|
-| Chrome | `npx plasmo build` | `chrome://extensions` → Developer mode → Load unpacked → `build/chrome-mv3-prod/` |
-| Edge | `npx plasmo build --target=edge-mv3` | `edge://extensions` → Developer mode → Load unpacked → `build/edge-mv3-prod/` |
-
-For development with hot reload: `pnpm dev`
-
-### Native Messaging (one-click Start/Stop from browser)
-
-```bash
-cd /path/to/repo-root
-python -m cortex.scripts.install_native_host
-```
-
-This auto-detects all installed Chromium browsers and patches `native_host.py` with the absolute venv Python path. No manual extension ID needed.
-
-**Then fully restart your browser** (Cmd+Q, reopen). Native messaging manifests only load at browser startup.
-
-First-time dialogs:
-1. macOS: *"Chrome/Edge wants to control Terminal. Allow?"* — click **Allow** (one-time)
-2. A Terminal window opens when the daemon starts — this is normal
-
----
-
-### 8. Calibration (recommended)
-
-```bash
-cortex-calibrate --duration 120
-```
-
-Sit relaxed for 2 minutes while Cortex learns your resting heart rate, HRV, blink rate, and posture. Results saved to `storage/baselines/`. See [Calibration](Calibration) for details.
-
----
-
-### 9. VS Code Extension (optional)
-
-```bash
-cd cortex/apps/vscode_extension
-npm install && npm run compile
-code --install-extension cortex-somatic-0.1.0.vsix
-```
-
-Provides editor context (open file, diagnostics, cursor position) to the daemon for more accurate interventions.
-
----
-
-### 10. Running Tests
-
-```bash
-pytest                                      # all tests
-pytest tests/unit/                          # unit tests only
-pytest tests/integration/                   # integration tests
-pytest --cov=cortex --cov-report=html       # with coverage
-pytest -m "not requires_webcam"             # skip hardware tests
-```
+The Python gate isolates the Qt desktop test process because loading PySide6
+after other native scientific/macOS libraries can crash the interpreter during
+collection. See [Troubleshooting](Troubleshooting.md) for lifecycle issues.

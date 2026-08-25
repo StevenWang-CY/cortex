@@ -1,12 +1,8 @@
-"""Tests covering Phase 4.5 infrastructure audit fixes: I5, I7, I10, I12.
-
-(I1/I2/I3/I6/I13 live in their own dedicated test files.)
-"""
+"""Installer, storage-error, and cost-ledger infrastructure contracts."""
 
 from __future__ import annotations
 
 import json
-import logging
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,64 +10,6 @@ import pytest
 
 from cortex.libs.config import settings
 from cortex.services.llm_engine.cost_tracker import CostTracker
-
-# ---------------------------------------------------------------------------
-# I5: feature toggle suppression honoured ONLY when CORTEX_ENV=test
-# ---------------------------------------------------------------------------
-
-
-def test_suppression_flag_alone_does_not_silence_warnings(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Production setting the flag must NOT suppress warnings — I5."""
-    monkeypatch.setenv("CORTEX_SUPPRESS_FEATURE_TOGGLE_WARNINGS", "1")
-    monkeypatch.delenv("CORTEX_ENV", raising=False)
-    # Wipe the toggles so we're guaranteed to hit the warning path. Also
-    # neutralise the .env-file probe — the repo's checked-in .env defines
-    # the toggles, which would silence the warning even with the flag
-    # disabled.
-    for key in (
-        "CORTEX_INTERVENTION__ENABLE_BIOLOGY_BREAK",
-        "CORTEX_INTERVENTION__ENABLE_AUTO_DISTRACTION_BLOCK",
-        "CORTEX_INTERVENTION__ENABLE_OS_NOTIFICATIONS",
-    ):
-        monkeypatch.delenv(key, raising=False)
-    monkeypatch.setattr(settings, "_bundled_env_files", lambda: ())
-
-    with caplog.at_level(logging.WARNING, logger="cortex.libs.config.settings"):
-        settings._check_required_feature_toggles()
-
-    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-    assert warnings, (
-        "I5: suppression flag must NOT silence warnings outside test env; "
-        "but no WARNING records were emitted"
-    )
-
-
-def test_suppression_flag_silences_only_in_test_env(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """With both flags set, suppression engages — I5."""
-    monkeypatch.setenv("CORTEX_SUPPRESS_FEATURE_TOGGLE_WARNINGS", "1")
-    monkeypatch.setenv("CORTEX_ENV", "test")
-    for key in (
-        "CORTEX_INTERVENTION__ENABLE_BIOLOGY_BREAK",
-        "CORTEX_INTERVENTION__ENABLE_AUTO_DISTRACTION_BLOCK",
-        "CORTEX_INTERVENTION__ENABLE_OS_NOTIFICATIONS",
-    ):
-        monkeypatch.delenv(key, raising=False)
-    monkeypatch.setattr(settings, "_bundled_env_files", lambda: ())
-
-    with caplog.at_level(logging.WARNING, logger="cortex.libs.config.settings"):
-        settings._check_required_feature_toggles()
-
-    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
-        "I5: with CORTEX_ENV=test + suppression flag set, the warning "
-        "should be silenced"
-    )
-
 
 # ---------------------------------------------------------------------------
 # I7: install_native_host.py exits non-zero when no browsers detected

@@ -1,0 +1,18 @@
+cache = true
+max_retries = 3
+retry_wait_time = 2
+timeout = 20
+# NCBI/PubMed deliberately returns 203 for valid publication records to some
+# automated clients. Rate-limited 429 endpoints are retried before acceptance.
+accept = [200, 203, 204, 206, 429]
+exclude = [
+  "^https://example\\.invalid",
+  "^https?://(127\\.0\\.0\\.1|localhost)",
+  "^https://github\\.com/StevenWang-CY/cortex/security/advisories/new$"
+]
+exclude_path = [
+  "cortex/apps/browser_extension/node_modules",
+  "cortex/apps/browser_extension/.plasmo",
+  "build",
+  "dist"
+]

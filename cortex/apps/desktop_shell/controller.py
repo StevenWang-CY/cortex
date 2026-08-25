@@ -786,7 +786,7 @@ class CortexAppController:
         # P0 §3.7: hand the desktop shell's full-screen break overlay to
         # the daemon. The handler is async because the controller has
         # to marshal back onto the Qt thread; the daemon owns the
-        # asyncio loop and the BiologyBreakController calls our handler
+        # asyncio loop and the GuidedBreakController calls our handler
         # whenever the user takes a break.
         self._daemon.set_break_overlay_ui_handler(self._run_break_overlay)
         # P0 §3.12: register the desktop-focus probe so the daemon
@@ -1506,7 +1506,7 @@ class CortexAppController:
         ``run`` returns.
 
         The contract returned to the controller — ``(elapsed_seconds,
-        completed)`` — feeds the daemon's BiologyBreakController which
+        completed)`` — feeds the daemon's GuidedBreakController which
         in turn computes ``recovery_delta`` and persists the BreakRecord.
         """
         import concurrent.futures

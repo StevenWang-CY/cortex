@@ -64,10 +64,6 @@ state:
 
   # Exponential moving average alpha for smoothing
   ema_alpha: 0.3
-  ml_enabled: false
-  ml_min_labeled_episodes: 30
-  ml_alpha_max: 0.7
-  ml_alpha_full_at_episodes: 150
 
   # Overwhelm score weights (should sum to 1.0)
   weights:
@@ -115,16 +111,13 @@ intervention:
   dismissal_model_enabled: true
   dismissal_model_threshold: 0.6
 
-  # Compatibility-only. Runtime coercion keeps this false until the
-  # underlying physiology is reference-validated.
-  enable_biology_break: false
-
   # Opt-in, preference-based reminder. Active time pauses while input is idle;
   # camera, pulse, HRV, and support labels are never inputs to this policy.
   enable_focus_break_reminders: false
   focus_break_interval_minutes: 50
   focus_break_duration_seconds: 300
   focus_break_inactivity_pause_seconds: 60.0
+  guided_break_audio_mute_after_mic_seconds: 300.0
 
   # P0 §3.10 — Auto-armed distraction blocking on sustained HYPER.
   # Defaults OFF (principle of least surprise; users opt in from Settings).
@@ -144,7 +137,6 @@ api:
 
 telemetry:
   mouse_sample_hz: 60
-  downsample_hz: 10
   window_seconds: 15
 
 signal:
@@ -194,8 +186,6 @@ signal:
     min_valid_exposure_seconds: 15.0
     history_window_seconds: 60.0
     max_valid_gap_ms: 250.0
-    perclos_threshold: 0.2
-    personalize_ear_percentile: 0.15
 
   posture:
     head_neck_flexion_threshold_deg: 20.0

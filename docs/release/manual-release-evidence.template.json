@@ -1,0 +1,117 @@
+{
+  "schema_version": "1.0",
+  "artifact": {
+    "version": "replace",
+    "filename": "Cortex-replace-macos-arm64.dmg",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "git_commit": "0000000000000000000000000000000000000000",
+    "notarized": true
+  },
+  "host": {
+    "architecture": "arm64",
+    "macos_version": "replace",
+    "device_class": "replace without serial number or username",
+    "clean_profile": true
+  },
+  "cases": [
+    {
+      "id": "artifact.identity",
+      "result": "blocked",
+      "observed": "Template only; verify signatures, hashes, attestations, and notarization.",
+      "evidence_files": []
+    },
+    {
+      "id": "install.launch",
+      "result": "blocked",
+      "observed": "Template only; install to Applications and launch the installed copy.",
+      "evidence_files": []
+    },
+    {
+      "id": "onboarding.keyboard_voiceover",
+      "result": "blocked",
+      "observed": "Template only; complete onboarding by keyboard and with VoiceOver.",
+      "evidence_files": []
+    },
+    {
+      "id": "permissions.deny_grant_revoke",
+      "result": "blocked",
+      "observed": "Template only; exercise permission denial, grant, and revocation paths.",
+      "evidence_files": []
+    },
+    {
+      "id": "credentials.keychain_containment",
+      "result": "blocked",
+      "observed": "Template only; prove BYOK containment and absence from every export surface.",
+      "evidence_files": []
+    },
+    {
+      "id": "browser.chrome_native",
+      "result": "blocked",
+      "observed": "Template only; install Chrome integration and exercise native lifecycle.",
+      "evidence_files": []
+    },
+    {
+      "id": "browser.edge_native",
+      "result": "blocked",
+      "observed": "Template only; install Edge integration and exercise native lifecycle.",
+      "evidence_files": []
+    },
+    {
+      "id": "editor.vscode",
+      "result": "blocked",
+      "observed": "Template only; install, update, exercise, and uninstall the VS Code package.",
+      "evidence_files": []
+    },
+    {
+      "id": "runtime.lifecycle_camera_tcc",
+      "result": "blocked",
+      "observed": "Template only; exercise lifecycle, camera selection, TCC, sleep, and failure modes.",
+      "evidence_files": []
+    },
+    {
+      "id": "authority.transaction_restore",
+      "result": "blocked",
+      "observed": "Template only; prove inert proposal, exact authorization, receipt, and restore.",
+      "evidence_files": []
+    },
+    {
+      "id": "fault.recovery",
+      "result": "blocked",
+      "observed": "Template only; inject transaction, disconnect, crash, and shutdown failures.",
+      "evidence_files": []
+    },
+    {
+      "id": "update.migration",
+      "result": "blocked",
+      "observed": "Template only; update from the prior version and verify durable migration.",
+      "evidence_files": []
+    },
+    {
+      "id": "export.delete",
+      "result": "blocked",
+      "observed": "Template only; verify scoped export, guarded deletion, and complete erasure.",
+      "evidence_files": []
+    },
+    {
+      "id": "uninstall.cleanup",
+      "result": "blocked",
+      "observed": "Template only; uninstall integrations and verify ports, processes, and camera cleanup.",
+      "evidence_files": []
+    }
+  ],
+  "reviewers": [
+    {
+      "role": "builder",
+      "reviewer_id": "builder-id",
+      "signed_at_utc": "1970-01-01T00:00:00Z",
+      "attestation": "UNSIGNED TEMPLATE - DO NOT RELEASE"
+    },
+    {
+      "role": "independent_reviewer",
+      "reviewer_id": "independent-reviewer-id",
+      "signed_at_utc": "1970-01-01T00:00:00Z",
+      "attestation": "UNSIGNED TEMPLATE - DO NOT RELEASE"
+    }
+  ],
+  "decision": "block"
+}

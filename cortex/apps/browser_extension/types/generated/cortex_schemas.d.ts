@@ -3,7 +3,7 @@
 //
 // Source of truth: cortex/libs/schemas/*.py (Pydantic v2 models).
 // Schema package: cortex-wire/2.0
-// Source SHA-256: f8dbaed192c9edc9c86b343e49ff1c0cad2d7b886536c5da3e4cabaef2270c00
+// Source SHA-256: 27c81d048a583bed79a062f355edd33e3abbbb6e1e4c3433a6ad782e6bd737fa
 // Drift-gate: a pre-commit hook and the GitHub Actions CI run
 //   `python -m cortex.scripts.generate_ts_schemas --check`
 // and fail if this file is out of sync with the Python models.
@@ -214,16 +214,7 @@ export type MessageType =
   | "LEETCODE_SHOW_LOCKOUT"
   | "LEETCODE_SHOW_CONSOLIDATION"
   | "LEETCODE_SHOW_SUBMISSION_GATE"
-  | "LEETCODE_SHOW_SOLUTION_FRICTION"
-  | "LEETCODE_SHOW_SESSION_BRIEFING"
-  | "LEETCODE_LOCK_EDITOR"
-  | "LEETCODE_INTERCEPT_SUBMIT"
-  | "LEETCODE_GATE_SOLUTIONS"
-  | "LEETCODE_AI_RESTATEMENT_CHECK"
-  | "LEETCODE_AI_COMPREHENSION_CHECK"
-  | "LEETCODE_AI_HYPOTHESIS_CHECK"
-  | "LEETCODE_AI_STUCK_ANALYSIS"
-  | "LEETCODE_AI_SESSION_BRIEFING";
+  | "LEETCODE_SHOW_SOLUTION_FRICTION";
 /**
  * LeetCode submission outcome types.
  */
@@ -3322,15 +3313,13 @@ export interface SessionReport {
   comparison_to_7day?: ComparisonStats | null;
 }
 /**
- * P0 §3.7: a single biology-driven break event.
+ * A single user-requested or elapsed-focus guided-break event.
  *
- * Captured by :class:`cortex.services.intervention_engine.break_overlay.BiologyBreakController`
- * when a guided breathing session starts; ``pre_hrv`` is the most
- * recent HRV reading before the overlay shows, ``post_hrv`` is the
- * reading captured on exit (natural completion or early termination),
- * and ``recovery_delta = post_hrv - pre_hrv``. ``completed`` is True
- * only when the breathing pattern ran the full ``duration_seconds``;
- * early termination still preserves the record for the reward signal.
+ * Captured by :class:`cortex.services.intervention_engine.break_overlay.GuidedBreakController`
+ * when a guided breathing session starts. The legacy ``pre_hrv``,
+ * ``post_hrv``, and ``recovery_delta`` fields decode historical reports but
+ * remain ``None`` in the supported production path. ``completed`` is true
+ * only when the UI reports a natural completion; early exits remain visible.
  */
 export interface BreakRecord {
   /**
@@ -3346,15 +3335,15 @@ export interface BreakRecord {
    */
   pattern: "box" | "4-7-8" | "coherent";
   /**
-   * HRV (RMSSD) immediately before the break began
+   * Legacy compatibility field; unavailable in production
    */
   pre_hrv?: number | null;
   /**
-   * HRV (RMSSD) immediately after the break ended
+   * Legacy compatibility field; unavailable in production
    */
   post_hrv?: number | null;
   /**
-   * post_hrv - pre_hrv (positive = recovery)
+   * Legacy compatibility field; unavailable in production
    */
   recovery_delta?: number | null;
   /**

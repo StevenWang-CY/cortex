@@ -122,7 +122,7 @@ class EventType(StrEnum):
     AUTH_TOKEN_ROTATED = "auth_token_rotated"
 
     # P0 §3.7 (Phase-4a): biology-driven break lifecycle. STARTED fires
-    # when ``BiologyBreakController`` shows the breathing overlay;
+    # when ``GuidedBreakController`` shows the breathing overlay;
     # COMPLETED fires on natural completion OR early termination
     # (``completed=False`` on the resulting ``BreakRecord``). Wired by
     # the runtime daemon in Phase-4b — Phase-4a only adds the enum

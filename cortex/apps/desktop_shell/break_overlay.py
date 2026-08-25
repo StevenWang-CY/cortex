@@ -3,7 +3,7 @@ Desktop Shell — Full-screen Biology Break Overlay (P0 §3.7).
 
 A frameless ``QWidget`` that dims the entire screen and paces the user
 through a guided breathing pattern (``box`` / ``4-7-8`` / ``coherent``).
-The overlay is shown by :class:`BiologyBreakController` via the
+The overlay is shown by :class:`GuidedBreakController` via the
 ``ui_handler`` registered on the daemon.
 
 Design notes:

@@ -144,15 +144,6 @@ def test_message_type_catalog_covers_leetcode_adapter_emissions() -> None:
         "LEETCODE_SHOW_CONSOLIDATION",
         "LEETCODE_SHOW_SUBMISSION_GATE",
         "LEETCODE_SHOW_SOLUTION_FRICTION",
-        "LEETCODE_SHOW_SESSION_BRIEFING",
-        "LEETCODE_LOCK_EDITOR",
-        "LEETCODE_INTERCEPT_SUBMIT",
-        "LEETCODE_GATE_SOLUTIONS",
-        "LEETCODE_AI_RESTATEMENT_CHECK",
-        "LEETCODE_AI_COMPREHENSION_CHECK",
-        "LEETCODE_AI_HYPOTHESIS_CHECK",
-        "LEETCODE_AI_STUCK_ANALYSIS",
-        "LEETCODE_AI_SESSION_BRIEFING",
     }
     catalog = {m.value for m in MessageType}
     missing = leetcode_outbound - catalog

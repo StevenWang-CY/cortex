@@ -1,8 +1,15 @@
 # Cortex: Rigorous Algorithm, Architecture, and Implementation Plan
 
-**Status:** implementation-ready technical audit and redesign blueprint
+**Status:** release-relevant software implementation complete through WP-11;
+credentialed release-candidate, reference-sensor, participant, and independent-review
+gates remain external
 
-**Repository snapshot:** `fac5db965b0568a73ea64d78fbb6eb594080073c` on `main`, reviewed 2026-08-24
+**Historical audit snapshot:** `fac5db965b0568a73ea64d78fbb6eb594080073c`
+on `main`, reviewed 2026-08-24
+
+**Implementation record:** `implementation-hardening`, implemented and verified
+through 2026-08-25; immutable WP commits are listed in
+[`audit/execution-log.md`](audit/execution-log.md)
 
 **Scope:** macOS application, in-process daemon, HTTP/WebSocket gateways, webcam physiology and kinematics, state inference, intervention planning/execution/restoration, adaptive policy evaluation, Chrome/Edge extension, optional VS Code extension, persistence, packaging, tests, documentation, privacy, and supply chain
 
@@ -10,18 +17,84 @@
 
 ---
 
+## 0. Document state and completion boundary
+
+This is both the original repository audit and the implementation record that
+closed it. Sections 1–11 preserve the as-built evidence and design reasoning at
+the historical snapshot above; present-tense defect descriptions in those
+sections must not be read as claims about the hardened branch. Sections 12,
+15, and 18 record implementation and closure. Current operational truth lives
+in the [architecture](Architecture.md), [limitations](docs/limitations.md),
+[data-flow](docs/data-flow.md), and [release evidence](docs/release/README.md)
+documents.
+
+The high-impact software boundary is complete. Cortex is now a local modular
+monolith with explicit application coordinators, evidence-aware deterministic
+support inference, exact authorization and receipt-backed restoration,
+transactional SQLite authority, a privacy context broker, deterministic product
+policy, separately governed research evaluation, and a reproducible release
+pipeline. “Complete” here does not mean clinically validated, independently
+audited, or already shipped as a signed/notarized artifact.
+
+| Boundary | Implemented result | Remaining evidence, if any |
+| --- | --- | --- |
+| User authority | Inert proposal → exact manifest authorization → apply receipt → postcondition verification → idempotent restore | Per-release installed-artifact exercise remains mandatory |
+| Signals and inference | Explicit missingness/quality, unique beat timeline, time-correct kinematics, deterministic abstaining support estimate; unsupported medical/physiology claims are unavailable | Reference-sensor and participant-held-out data are required before adding physiological accuracy claims |
+| Architecture and storage | Typed kernel/coordinators, named task ownership, one desktop domain path, bounded browser modules, transactional SQLite authority and recovery | None at the source-code boundary |
+| Policy and evidence | Deterministic production policy and exactly-once outcomes; consented fixed MRT/OPE research path with immutable exports and diagnostics | Independent statistical review and any human-subject approvals remain external |
+| Privacy and UI | Exact redacted preview, one-time external send, optional permissions, semantic tokens, keyboard/accessibility/reduced-motion contracts, restrained feedback and interruption behavior | Real-user usability/accessibility studies remain external |
+| Supply chain and release | Universal `uv.lock`, exact Python/Node/pnpm/uv pins, frozen installs, audited dependency exceptions, dual-architecture workflow, SBOMs, attestations, signing/notarization/stapling verification, mounted smoke, draft staging, and fail-closed evidence promotion | Apple credentials, protected release/publish environments, x86_64 runner, independent reviewers, and the physical TCC/device matrix are required per candidate |
+| Documentation and governance | Tracked finding ledger/ADRs, generated 203-setting reference and safe env template, version/schema/design-token/config/link/action-pin contracts | External links and audit exceptions continue to be scheduled, time-varying gates |
+
+The UI implementation applies the interaction principles from
+[Emil Kowalski’s design-engineering skills](https://github.com/emilkowalski/skills):
+motion communicates state rather than decorates it; transitions remain short,
+interruptible, and reduced-motion aware; destructive or authority-bearing
+actions are explicit; visual hierarchy uses semantic tokens; and every polished
+surface retains keyboard, focus, contrast, and assistive-name contracts. WP-9
+contains the implementation evidence rather than treating the reference as a
+style-only checklist.
+
+### 0.1 Verification snapshot
+
+The final working tree was exercised with locked dependencies:
+
+- Python 3.11.15 and 3.12.13: Ruff, strict mypy over 510 source files,
+  a verified 281-file wheel, 2,548 non-Qt tests passed with 3 declared skips, and
+  62 isolated Qt tests passed on each interpreter. The local 3.12 execution was
+  arm64; CI and release contracts require the 3.12.13 row on x86_64 and assert
+  both exact interpreter and architecture.
+- Browser: a clean pnpm 9.15.9 frozen install, TypeScript check, 248 Vitest
+  tests, and Chrome/Edge MV3 production builds.
+- VS Code: clean `npm ci`, TypeScript compile, 30 Jest tests, zero npm audit
+  findings, and a packaged 0.2.2 VSIX.
+- Contracts/evaluation: generated Python→TypeScript schemas, design tokens,
+  versions, configuration docs, 203-setting reachability, local Markdown links,
+  workflow action/tool pins, and all four committed replay-regression metrics.
+- Dependency policy: zero known Python and VS Code findings; 11 browser
+  build/test-chain advisories are path-constrained, expiry-bounded, reviewed
+  exceptions after patchable critical/high transitive versions were lifted.
+
+No signed DMG, Apple notarization response, physical camera/TCC matrix,
+reference-sensor dataset, participant study, penetration test, or independent
+statistical review was fabricated during this work. The repository now makes
+those gates executable and evidence-bearing; the parties with credentials,
+hardware, data authority, or independence must execute them.
+
 ## 1. Executive determination
 
 Cortex has a credible product shape and several good engineering foundations: local-first capture, no raw-frame persistence in the normal path, explicit signal-quality objects, a consent vocabulary, reversible adapters, localhost capability-token authentication, schema generation for much of the daemon/browser boundary, extensive Python and browser tests, clean static analysis, and thoughtful macOS packaging work.
 
-The current implementation does **not**, however, support several of its strongest behavioral and physiological claims. Four classes of issue are release-critical:
+At the historical audit snapshot, the implementation did **not** support
+several of its strongest behavioral and physiological claims. Four classes of
+issue were release-critical:
 
 1. **A real native-messaging authentication contract mismatch prevents the browser from accepting the token returned by the Python host.** Python emits `token`; TypeScript accepts only `auth_token`. Each side's isolated tests encode its own incompatible shape.
 2. **Consent downgrade is treated as permission to execute the original higher-level action, and mutations occur before the plan is presented.** Both browser and VS Code clients also apply workspace changes as soon as `INTERVENTION_TRIGGER` arrives. The implemented path is therefore not a true preview/approval transaction.
 3. **The physiological feature path can manufacture or duplicate evidence.** Overlapping rPPG windows repeatedly insert the same inter-beat intervals; global beat order is wrong; missing face samples are interpolated without a window missingness limit; the successful face-tracking path makes measured nose displacement zero; and the respiration band cannot produce the rate that the code labels as an apnea condition.
 4. **The adaptive-policy report is descriptive, not causal.** Policy matrices are not durably restored, a decision can receive multiple reward updates, the no-action arm is not followed to an outcome, and the current IPS/SNIPS and excursion calculations do not define or estimate a defensible target-policy or proximal causal estimand.
 
-The immediate product posture should therefore be:
+The immediate product posture at that snapshot was therefore:
 
 - default to **suggest-only** behavior;
 - require a new authorization record for every workspace mutation;
@@ -30,7 +103,9 @@ The immediate product posture should therefore be:
 - freeze online policy learning outside an explicitly consented research mode;
 - retain the current modular-monolith deployment and replace the large orchestrators incrementally, not with network microservices.
 
-This is containment, not abandonment. The architecture can be repaired without discarding the existing UI, capture adapters, schemas, or most domain services.
+This was containment, not abandonment. WP-0 through WP-11 implemented the
+repair without discarding the existing UI, capture adapters, schemas, or most
+domain services.
 
 ### 1.1 Release-blocking gates
 
@@ -85,7 +160,10 @@ At the start of review:
 - there were 586 tracked files and approximately 181,895 tracked lines when generated and non-text artifacts were included;
 - the largest authored orchestrators were `runtime_daemon.py` (~6,300 lines), browser `background.ts` (~5,475), browser `popup.tsx` (~3,572), desktop `dashboard.py` (~3,532), WebSocket server (~2,573), desktop history tab (~2,440), desktop controller (~2,376), and VS Code panel provider (~1,091).
 
-The clean starting state matters: the findings below describe the reviewed commit, not an unknown mixture of uncommitted source changes. This document is the only intended repository change from the audit.
+The clean starting state matters: the findings below describe the reviewed
+commit, not an unknown mixture of uncommitted source changes. The original
+audit first introduced this document; the bounded WP commits in the execution
+log then implemented it incrementally.
 
 The local workspace is much larger than the tracked project because it contains ignored environments, caches, builds, and generated assets. Those should remain untracked. In particular, `.plasmo/`, `build/`, `dist/`, application bundles, VSIX files, and editor metadata must continue to be treated as generated artifacts.
 
@@ -1605,7 +1683,7 @@ build; and 12 VS Code tests, TypeScript compile, and VSIX packaging.
 
 ### WP-5 — Evidence-aware support inference (`XL`)
 
-**Implementation status (2026-08-24): complete.** Shipped as
+**Implementation status (2026-08-25): complete and subsequently pruned.** Shipped as
 `deterministic-support@2.1.0` with `support-features-v2.1.0` and an operational
 `safety_null` rollback. The production path is behavior-only, fixed-denominator,
 quality/availability bounded, explicitly abstaining, and probability-free.
@@ -1615,18 +1693,17 @@ the preregisterable study protocol, cross-surface unknown-state rendering, and
 adversarial missingness/monotonicity/replay tests are tracked in-repo. Window
 tracking has explicit source availability and a bounded event-identity ledger,
 so repeated reads of its sliding window cannot inflate tab-switch or thrashing
-evidence. Completion evidence: 2,079 non-Qt Python tests with five declared
-dataset/platform skips; all 41 Qt-boundary files passed in isolated processes;
-strict mypy across 467 source files; Ruff, schema/design/version drift gates;
-178 browser tests plus Chrome and Edge builds; and 12 VS Code tests plus VSIX
-packaging.
+evidence. WP-11 then deleted the unregistered ML classifier, invalid stress
+integral, obsolete settings, and causal/bandit product code rather than leaving
+disabled mechanisms available for accidental resurrection. Current aggregate
+verification evidence is in Section 0.1.
 
 **Files:**
 
 - `cortex/services/state_engine/feature_fusion.py`
-- `rule_scorer.py`, `smoother.py`, `stress_integral.py`
-- optional classifier, trigger policy, schema and UI presentation files
+- `rule_scorer.py`, `smoother.py`, trigger policy, schema and UI presentation files
 - new `cortex/services/state_engine/feature_schema.py` and model registry
+- deleted `stress_integral.py`, the optional classifier, and their dead settings/tests
 
 **Changes:**
 
@@ -1634,8 +1711,8 @@ packaging.
 2. Implement quality/availability-normalized deterministic rules and coverage gates.
 3. Rename scores/probabilities and emit `UNKNOWN`/insufficient evidence.
 4. Convert dwell and recovery logic to injected monotonic durations.
-5. Disable the stress integral as a production trigger; add time/preference break policy.
-6. Remove the dead optional classifier or implement the explicit model lifecycle only after a valid dataset exists.
+5. Delete the stress integral; use elapsed focus time and explicit user preference for guided-break recommendations.
+6. Delete the dead optional classifier; require a new validated lifecycle before any learned model can be introduced.
 7. Define state/support target, labels, exclusions, and study protocol before Level B modeling.
 8. Generate model cards and retain model rollback.
 
@@ -1894,20 +1971,82 @@ ownership, browser module boundaries, and shared desktop routing/view models.
 
 ### WP-11 — Validation, documentation, and reproducible release (`L`, continuous)
 
-**Files:** CI/release workflows, build scripts/spec, tests/datasets tooling, docs, README/CONTRIBUTING, new ADRs and validation reports
+**Implementation status (2026-08-25): complete at the repository/software
+boundary.** The remaining work is evidence that cannot truthfully be produced
+from source alone: a signed/notarized release candidate on both architectures,
+the physical permission/device matrix, participant/reference-sensor data, and
+independent review.
+
+**Files:** CI/release workflows, `uv.lock`, toolchain pins, build scripts/spec,
+release/dataset validators, repository-contract generators, tests, docs,
+README/wiki pages, finding ledger, ADRs, model cards, and release templates
 
 **Changes:**
 
-1. Implement the matrix in Section 13.
-2. Track dataset manifests/checksums/licenses without committing prohibited participant data.
-3. Freeze dependency resolution and build on clean supported machines/architectures.
-4. Generate SBOM, provenance, checksums, signatures, and notarization evidence as applicable.
-5. Add Markdown link checker, config-use check, dead schema message check, version check, and generated-doc checks.
-6. Replace missing audit links with a tracked finding ledger and ADR index.
-7. Publish a limitations/model card and exact privacy/data-flow documentation.
-8. Test signed/notarized DMG installation, onboarding, permissions, browser restart, native host, launch/stop, camera release, update, and uninstall/data deletion.
+1. Committed a universal 172-package `uv.lock`; constrained supported Python
+   to 3.11/3.12 and pinned Python 3.11.15, Node 22.23.2, pnpm 9.15.9, and uv
+   0.10.12 at repository and workflow boundaries.
+2. Added one canonical Python gate for Ruff, strict mypy, wheel inspection,
+   the complete non-Qt suite, and isolated Qt suite. CI exercises identical
+   arm64/3.11.15 and x86_64/3.12.13 matrices, exports `UV_PYTHON` so
+   `.python-version` cannot mask the compatibility row, and asserts exact
+   interpreter plus CPU architecture.
+3. Made the browser lock reproducible under the pinned pnpm version by placing
+   overrides in the pnpm-9-compatible package manifest location. Patchable
+   transitive advisories are lifted; remaining dormant builder paths require
+   narrow, expiring, package-chain-verified exceptions. VS Code uses a tracked
+   lock, frozen install, real tests, and package gate.
+4. Added a schema-1.1 dataset manifest with path containment, checksums,
+   participant-disjoint split enforcement, license/source/citation, explicit
+   participant-data policy, reference sensor, clock alignment, condition
+   reports, and declared aggregate/p95 error fields. A JSON Schema, safe
+   example, validator, and replay tests make the contract executable without
+   committing prohibited data.
+5. Added a source/frozen release smoke and a mounted-DMG verifier that checks
+   version/architecture identity, bundle plist, single-architecture Mach-O,
+   nested signing, embedded credentials/personal identifiers, frozen resources,
+   notarization/stapling, and Gatekeeper when requested. Secret scanning is
+   streaming and catches patterns spanning read boundaries.
+6. Hardened the release workflow around a protected environment, temporary
+   Keychain, Developer ID hardened-runtime signing, accepted Apple notary log,
+   stapling, per-architecture names/checksums/evidence, application and Python
+   SBOMs, GitHub attestations, clean-tag evidence hashing, and a two-architecture
+   draft-staging guard. A separately protected promotion workflow refuses an
+   already-public target, verifies both provenance attestations, and publishes
+   only after machine-validating the complete physical-test record. All
+   third-party actions are full-commit pinned.
+7. Added a release-record JSON Schema and promotion validator whose `release`
+   decision is impossible unless all 14 fixed cases passed on clean arm64 and
+   Intel profiles, artifact/tag/commit/hash bindings agree, every dedicated
+   architecture-specific manual-evidence asset exists and is non-empty, and no
+   independent reviewer is also a builder. The committed template remains
+   `blocked` by design; each candidate must create its own truthful records.
+8. Generated a 203-setting configuration reference and fully commented safe
+   env template directly from `CortexConfig`. Repository contracts check local
+   Markdown links, canonical config keys/reachability, dead message types,
+   generated schema/design/version/config surfaces, exact tool versions,
+   Python matrices, and workflow action pins. Lychee checks external links.
+9. Added the tracked 56-finding historical ledger, execution log, six ADRs,
+   limitations, data flow, release guidance, and corrected architecture,
+   setup, API, privacy, calibration, browser, and product-language docs.
+10. Deleted unregistered/invalid product mechanisms and their dead controls:
+    optional ML classifier, stress integral, production AMIP/bandit/causal
+    report, obsolete message types, unused settings, and synthetic
+    physiology-backed break semantics. The replacement guided break is driven
+    by user choice and elapsed focus time.
 
-**Exit:** a clean release commit produces a reproducible, traceable artifact whose claims are linked to passing evidence.
+**Verification:** Section 0.1 records the complete local matrix. The committed
+regression harness also preserves exact baseline values for oscillation rate,
+sustained-overwhelm pass rate, flow false-trigger rate, and deterministic
+policy replay mismatch. Release JSON and dataset JSON examples are validated
+against their published schemas in the Python gate.
+
+**Exit:** achieved for source, dependency, CI, validation tooling, and release
+automation. A particular release satisfies the full exit only after a clean
+tag produces both credentialed architecture artifacts and independently
+reviewed `release` records with attached installed-artifact, hardware,
+notarization, SBOM, checksum, attestation, and claim evidence. Source completion
+does not pre-approve a future artifact.
 
 ---
 
@@ -2140,17 +2279,24 @@ Move one cohesive flow at a time behind the kernel after characterization tests.
 - [x] P2-03 gateway callback/registry removal
 - [x] P2-04 browser background/popup split
 - [x] P2-05 one desktop domain path
-- [ ] P2-06 reference-sensor and participant-held-out validation program
-- [ ] P2-07 MRT/OPE research pipeline and independent statistical review — software pipeline complete; independent review outstanding
-- [ ] P2-08 reproducible dependency/build/SBOM/provenance flow
+- [ ] P2-06 reference-sensor and participant-held-out validation program —
+  manifest/schema/replay/report tooling complete; real reference data,
+  participants, approvals, and analysis remain external
+- [ ] P2-07 MRT/OPE research pipeline and independent statistical review —
+  immutable software pipeline and diagnostics complete; independent review and
+  any approved study execution remain external
+- [x] P2-08 reproducible dependency/build/SBOM/provenance flow
 
 ### P3 — Documentation and cleanup
 
-- [ ] P3-01 tracked finding ledger and ADRs
-- [ ] P3-02 generated configuration/version/schema docs
-- [ ] P3-03 link checker and broken-link repair
-- [ ] P3-04 delete dead settings/backends/classifier paths
-- [ ] P3-05 replace historical audit comments with current invariants
+- [x] P3-01 tracked finding ledger and ADRs
+- [x] P3-02 generated configuration/version/schema docs
+- [x] P3-03 link checker and broken-link repair
+- [x] P3-04 delete dead settings/backends/classifier paths
+- [ ] P3-05 replace every historical audit comment/test label with current
+  invariants — intentionally non-blocking: modified production boundaries use
+  current language, while a repository-wide mechanical rename would add large
+  blame churn without changing behavior or evidence
 
 ---
 
@@ -2189,51 +2335,61 @@ Move one cohesive flow at a time behind the kernel after characterization tests.
 
 ## 18. Definition of done
 
-The redesign is complete only when all of the following are true:
+The release-relevant redesign is complete at the software boundary. `[x]`
+means enforced by committed implementation/tests; `[ ] external` means the
+repository supplies a protocol and evidence format but cannot perform the gate
+without credentials, hardware, participant authority, or an independent party.
 
 ### Build and contracts
 
-- clean checkout installs with frozen dependency inputs;
-- Python, browser, VS Code, desktop, schema, docs, audit, and build gates pass;
-- one version is reported everywhere;
-- every external/native/desktop message is generated and contract-tested;
-- public time fields have explicit clock and unit semantics.
+- [x] clean checkout installs with frozen dependency inputs;
+- [x] Python, browser, VS Code, desktop, schema, docs, audit, and build gates pass;
+- [x] one version is reported everywhere;
+- [x] every external/native/desktop message is generated and contract-tested;
+- [x] public time fields have explicit clock and unit semantics.
 
 ### Signals and state
 
-- every scheduled camera interval becomes a valid/missing/rejected observation;
-- no insufficient window yields a ready signal;
-- beats are unique, chronological, and provenance-linked;
-- published metrics meet their metric-specific validation gate;
-- unsupported HRV/respiration measures are unavailable, not approximated;
-- missing modalities can produce unknown, never false certainty;
-- state wording and probability claims match the validated construct/model.
+- [x] every scheduled camera interval becomes a valid/missing/rejected observation;
+- [x] no insufficient window yields a ready signal;
+- [x] beats are unique, chronological, and provenance-linked;
+- [ ] **external:** any future user-visible physiological accuracy claim meets
+  its reference-sensor, participant-disjoint, condition, and subgroup gate;
+- [x] unsupported HRV/respiration measures are unavailable, not approximated;
+- [x] missing modalities can produce unknown, never false certainty;
+- [x] state wording and probability claims match the deterministic support construct.
 
 ### User authority
 
-- proposal handlers are non-mutating;
-- every adapter apply has a prior exact authorization;
-- downgrade cannot execute the original manifest;
-- every applied effect has a durable verified receipt or a visible restore failure;
-- duplicate/reordered/replayed messages are harmless;
-- suggestion-only and emergency restore always work without LLM/policy access.
+- [x] proposal handlers are non-mutating;
+- [x] every adapter apply has a prior exact authorization;
+- [x] downgrade cannot execute the original manifest;
+- [x] every applied effect has a durable verified receipt or a visible restore failure;
+- [x] duplicate/reordered/replayed messages are harmless;
+- [x] suggestion-only and emergency restore work without LLM/policy access.
 
 ### Policy and evidence
 
-- every eligible action and no-action decision has one outcome lifecycle;
-- one reward/version is finalized at most once;
-- policy state survives restart or production learning is disabled;
-- diagnostic and causal reports are named according to evidence;
-- any causal report has a prespecified estimand, propensities, control, missingness rules, and uncertainty.
+- [x] every eligible action and no-action decision has one outcome lifecycle;
+- [x] one reward/version is finalized at most once;
+- [x] production learning is disabled; fixed research policy state survives restart;
+- [x] diagnostic and causal reports are named according to evidence;
+- [x] any research causal export requires a prespecified estimand,
+  propensities, control, missingness rules, overlap diagnostics, and uncertainty;
+- [ ] **external:** an independent statistician reviews the study design and
+  any efficacy result before publication or product use.
 
 ### Privacy and operations
 
-- the user can preview and control external context categories;
-- permissions match current need and are revocable;
-- ordinary stores/logs contain no raw frames or workspace excerpts;
-- export/delete/retention behavior is tested;
-- installed signed artifacts pass camera, auth, client, stop, restore, update, and uninstall checks;
-- health surfaces readiness, degradation, algorithm identity, storage compatibility, and restore failures without exposing private content.
+- [x] the user can preview and control external context categories;
+- [x] permissions match current need and are revocable;
+- [x] ordinary stores/logs contain no raw frames or workspace excerpts;
+- [x] export/delete/retention behavior is tested;
+- [ ] **external:** each installed signed/notarized candidate passes camera,
+  TCC, auth, browser/editor, stop, restore, update, and uninstall checks on the
+  declared architecture/device matrix;
+- [x] health surfaces readiness, degradation, algorithm identity, storage
+  compatibility, and restore failures without exposing private content.
 
 ---
 

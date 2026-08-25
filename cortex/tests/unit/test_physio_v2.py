@@ -418,17 +418,24 @@ def _write_replay_manifest(
                 "path": trace_path.name,
                 "sha256": hashlib.sha256(trace_path.read_bytes()).hexdigest(),
                 "sample_rate_hz": fs,
+                "condition": "stationary",
             }
         )
     manifest_path = root / "manifest.json"
     manifest_path.write_text(
         json.dumps(
             {
-                "schema_version": "1.0",
+                "schema_version": "1.1",
                 "dataset_name": "synthetic-contract-fixture",
                 "dataset_version": "1",
                 "license_name": "test-only",
+                "license_url": "https://example.invalid/test-license",
                 "source_url": "https://example.invalid/test-fixture",
+                "citation": "Synthetic unit-test fixture; not participant data.",
+                "data_use_notes": "Unit tests only.",
+                "reference_sensor": "synthetic sinusoid",
+                "clock_alignment_method": "shared synthetic sample clock",
+                "participant_data_committed": False,
                 "sequences": sequences,
             }
         ),
@@ -449,6 +456,8 @@ def test_checksum_verified_subject_disjoint_dataset_replay(tmp_path: Path) -> No
     assert report.attempted_windows == 3
     assert report.coverage == 1.0
     assert report.mae_bpm is not None and report.mae_bpm < 3.0
+    assert report.p95_absolute_error_bpm is not None
+    assert report.conditions[0].condition == "stationary"
     assert len(report.backend_sha256) == 64
 
 

@@ -119,23 +119,6 @@ class BlinkDetector:
             raise ValueError("baseline blink rate must be finite and positive")
         self._baseline_blink_rate = max(1.0, float(value))
 
-    def personalize_threshold_from_ear_samples(
-        self,
-        ear_samples: list[float],
-        *,
-        percentile: float = 0.15,
-    ) -> None:
-        finite = [float(value) for value in ear_samples if math.isfinite(value)]
-        if not finite:
-            return
-        pct = float(np.clip(percentile, 0.05, 0.45))
-        threshold = float(np.percentile(np.asarray(finite), pct * 100.0))
-        self._config.ear_threshold = float(np.clip(threshold, 0.12, 0.30))
-        self._config.ear_recovery = max(
-            self._config.ear_threshold + 0.03,
-            self._config.ear_recovery,
-        )
-
     @staticmethod
     def compute_ear(eye_landmarks: NDArray[np.floating]) -> float:
         points = np.asarray(eye_landmarks, dtype=np.float64)

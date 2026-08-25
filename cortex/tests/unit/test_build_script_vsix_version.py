@@ -33,11 +33,13 @@ def test_build_script_does_not_hardcode_vsix_version() -> None:
 
 
 def test_build_script_reads_canonical_project_version() -> None:
-    """The build must obtain one version from the drift-checked source."""
+    """The locked build interpreter must read the drift-checked source."""
     text = _BUILD_SCRIPT.read_text(encoding="utf-8")
-    assert "python -m cortex.scripts.sync_versions --check" in text
+    assert 'PYTHON_BIN="${CORTEX_DIR}/.venv/bin/python"' in text
+    assert '"${PYTHON_BIN}" -m cortex.scripts.sync_versions --check' in text
     assert (
-        "CORTEX_VERSION=$(python -m cortex.scripts.sync_versions --print)" in text
+        'CORTEX_VERSION=$("${PYTHON_BIN}" -m '
+        "cortex.scripts.sync_versions --print)" in text
     )
 
 
@@ -49,4 +51,4 @@ def test_vsix_and_dmg_paths_use_canonical_version_variable() -> None:
     assert "${CORTEX_VERSION}" in vsix_assign.group(0)
     dmg_assign = re.search(r"^DMG_PATH=.*$", text, re.MULTILINE)
     assert dmg_assign is not None
-    assert "Cortex-${CORTEX_VERSION}.dmg" in dmg_assign.group(0)
+    assert "Cortex-${CORTEX_VERSION}-macos-${ARTIFACT_ARCH}.dmg" in dmg_assign.group(0)

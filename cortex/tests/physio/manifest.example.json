@@ -1,0 +1,24 @@
+{
+  "schema_version": "1.1",
+  "dataset_name": "replace-with-authoritative-dataset-name",
+  "dataset_version": "replace-with-immutable-version",
+  "license_name": "replace-with-license-or-data-use-agreement",
+  "license_url": "https://example.invalid/replace-with-license-url",
+  "source_url": "https://example.invalid/replace-with-authoritative-source",
+  "citation": "Replace with the dataset's required citation.",
+  "data_use_notes": "Document access approval, allowed uses, exclusions, and redistribution constraints.",
+  "reference_sensor": "Replace with reference device, firmware, channel, and sampling configuration.",
+  "clock_alignment_method": "Replace with synchronization signal, residual error, and drift handling.",
+  "participant_data_committed": false,
+  "sequences": [
+    {
+      "subject_id": "pseudonymous-subject-001",
+      "sequence_id": "pseudonymous-subject-001-stationary",
+      "split": "evaluation",
+      "path": "traces/DO-NOT-COMMIT-PARTICIPANT-DATA.npz",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "sample_rate_hz": 30.0,
+      "condition": "stationary"
+    }
+  ]
+}

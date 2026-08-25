@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Cortex signed release-candidate evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "artifact", "host", "cases", "reviewers", "decision"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "filename", "sha256", "git_commit", "notarized"],
+      "properties": {
+        "version": { "type": "string", "minLength": 1 },
+        "filename": { "type": "string", "pattern": "^Cortex-.+-macos-(arm64|x86_64)\\.dmg$" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "git_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "notarized": { "const": true }
+      }
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["architecture", "macos_version", "device_class", "clean_profile"],
+      "properties": {
+        "architecture": { "enum": ["arm64", "x86_64"] },
+        "macos_version": { "type": "string", "minLength": 1 },
+        "device_class": { "type": "string", "minLength": 1 },
+        "clean_profile": { "type": "boolean" }
+      }
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 14,
+      "maxItems": 14,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "result", "observed", "evidence_files"],
+        "properties": {
+          "id": {
+            "enum": [
+              "artifact.identity",
+              "install.launch",
+              "onboarding.keyboard_voiceover",
+              "permissions.deny_grant_revoke",
+              "credentials.keychain_containment",
+              "browser.chrome_native",
+              "browser.edge_native",
+              "editor.vscode",
+              "runtime.lifecycle_camera_tcc",
+              "authority.transaction_restore",
+              "fault.recovery",
+              "update.migration",
+              "export.delete",
+              "uninstall.cleanup"
+            ]
+          },
+          "result": { "enum": ["passed", "failed", "blocked"] },
+          "observed": { "type": "string", "minLength": 20 },
+          "evidence_files": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": { "type": "string", "pattern": "^[^/\\\\]+$" }
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "required": ["result"],
+              "properties": { "result": { "const": "passed" } }
+            },
+            "then": {
+              "properties": { "evidence_files": { "minItems": 1 } }
+            }
+          }
+        ]
+      }
+    },
+    "reviewers": {
+      "type": "array",
+      "minItems": 2,
+      "uniqueItems": true,
+      "allOf": [
+        {
+          "contains": {
+            "type": "object",
+            "required": ["role"],
+            "properties": { "role": { "const": "builder" } }
+          },
+          "minContains": 1
+        },
+        {
+          "contains": {
+            "type": "object",
+            "required": ["role"],
+            "properties": { "role": { "const": "independent_reviewer" } }
+          },
+          "minContains": 1
+        }
+      ],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["role", "reviewer_id", "signed_at_utc", "attestation"],
+        "properties": {
+          "role": { "enum": ["builder", "independent_reviewer"] },
+          "reviewer_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@-]{2,127}$"
+          },
+          "signed_at_utc": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "Z$"
+          },
+          "attestation": { "type": "string", "minLength": 20 }
+        }
+      }
+    },
+    "decision": { "enum": ["release", "block"] }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["decision"],
+        "properties": { "decision": { "const": "release" } }
+      },
+      "then": {
+        "properties": {
+          "host": {
+            "required": ["clean_profile"],
+            "properties": { "clean_profile": { "const": true } }
+          },
+          "cases": {
+            "items": {
+              "required": ["result"],
+              "properties": { "result": { "const": "passed" } }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

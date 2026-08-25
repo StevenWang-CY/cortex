@@ -398,23 +398,6 @@ async def test_morning_briefing_awaits_and_uses_real_constructor(daemon) -> None
     assert payload["left_off_at"] == "Refining the logomark"
 
 
-# ─── fix #2: ML classifier predict_proba ─────────────────────────────────
-
-
-def test_ml_classifier_uses_predict_proba_api() -> None:
-    """The real classifier exposes predict_proba (not predict); calling
-    predict_proba on a fitted model returns a probability vector."""
-    from cortex.services.state_engine.ml_classifier import PerUserLogisticClassifier
-
-    clf = PerUserLogisticClassifier(n_features=3)
-    x = np.array([[0.1, 0.2, 0.3], [0.9, 0.8, 0.7]], dtype=np.float64)
-    y = np.array([0, 1], dtype=np.float64)
-    clf.fit(x, y, epochs=50)
-    assert not hasattr(clf, "predict"), "predict no longer exists; use predict_proba"
-    proba = clf.predict_proba(np.array([[0.5, 0.5, 0.5]], dtype=np.float64))
-    assert 0.0 <= float(proba[0]) <= 1.0
-
-
 # ─── C3: trigger_url helper ──────────────────────────────────────────────
 
 

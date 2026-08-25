@@ -1,77 +1,42 @@
-# Cortex Wiki
+# Cortex
 
-**Cortex** is a real-time biofeedback engine that watches you work through your webcam and input devices, detects cognitive overwhelm, and actively restructures your digital workspace so you can stay focused.
+Cortex 0.2.2 is a macOS alpha research prototype for local, user-controlled
+workspace support. It combines bounded activity telemetry, optional
+experimental camera signals, browser/editor context, and a deterministic or
+schema-validated planner to present conservative suggestions.
 
-> Platform: **macOS only** (requires AVFoundation, TCC, and macOS-specific frameworks)
+It does **not** diagnose or measure stress, overwhelm, attention, fatigue,
+flow, apnea, productivity, or any medical/cognitive condition. Production
+support scores are heuristic telemetry summaries with an explicit `unknown`
+state. Camera-derived HRV, respiration, LF/HF, breath-pause detection, and
+physiology-triggered breaks are unavailable. Webcam pulse is experimental and
+does not affect the production support decision.
 
----
+The default `suggest_only` mode cannot close/hide tabs, fold or edit code,
+rearrange windows, or otherwise change a workspace. Optional effects require
+an exact displayed manifest, one-time authorization, durable receipt,
+postcondition verification, and scoped restore.
 
-## Pages
+## Start here
 
-| Page | Description |
-|------|-------------|
-| [Setup](Setup) | Installation, configuration, and first run |
-| [How It Works](How-It-Works) | Signal pipeline, state classification, and AI interventions |
-| [Architecture](Architecture) | Layer-by-layer technical design and data flow |
-| [Browser Extension](Browser-Extension) | Chrome/Edge extension features and usage |
-| [Calibration](Calibration) | Personal baseline calibration guide |
-| [API Reference](API-Reference) | REST API and WebSocket protocol |
-| [Troubleshooting](Troubleshooting) | Common issues and fixes |
-| [Privacy](Privacy) | What data is collected, where it goes, and what never leaves your machine |
+- [Setup](Setup.md)
+- [How it works](How-It-Works.md)
+- [Architecture](Architecture.md)
+- [Browser extension](Browser-Extension.md)
+- [Calibration](Calibration.md)
+- [Privacy](Privacy.md)
+- [API reference](API-Reference.md)
+- [Limitations and prohibited uses](docs/limitations.md)
+- [Engineering finding ledger](audit/findings.md)
+- [Release verification](docs/release/README.md)
 
----
+## Runtime boundary
 
-## Quick Start
+The app is a local modular monolith. FastAPI (`127.0.0.1:9472`), WebSocket
+(`127.0.0.1:9473`), and the optional launcher (`127.0.0.1:9471`) require a
+local capability token for sensitive operations. Chrome/Edge and VS Code are
+untrusted clients. The default planner makes no model network request.
 
-1. Download **Cortex.dmg** from [Releases](https://github.com/StevenWang-CY/cortex/releases/latest)
-2. Drag **Cortex.app** to `/Applications`, then strip quarantine:
-   ```bash
-   xattr -cr /Applications/Cortex.app
-   ```
-3. Open Cortex and follow the setup wizard
-
-The app includes the daemon, dashboard, and system tray. Use the in-app **Connect Chrome/Edge** button to set up the browser extension.
-
-### Alternative: Developer Setup
-
-```bash
-# 1. Clone and install
-git clone https://github.com/StevenWang-CY/cortex.git
-cd cortex
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e "./cortex[dev]"
-
-# 2. Configure LLM
-cp cortex/.env.example .env
-# Edit .env — set CORTEX_LLM__PROVIDER to one of:
-#   bedrock (default, AWS Bedrock bearer token)
-#   vertex  (GCP Vertex AI application-default credentials)
-#   direct  (Anthropic API key)
-
-# 3. Start daemon
-cortex-dev
-
-# 4. Load browser extension
-cd cortex/apps/browser_extension
-pnpm install && npx plasmo build
-# Load build/chrome-mv3-prod/ in chrome://extensions
-```
-
-See [Setup](Setup) for the full guide including native messaging, permissions, and calibration.
-
----
-
-## How Cortex Helps
-
-Cortex watches you through your webcam (no video stored) while you work. It reads your pulse and breathing from subtle color changes in your face, combines those signals with mouse/keyboard patterns and workspace state, and classifies you into one of four cognitive states every 500ms:
-
-| State | Meaning |
-|-------|---------|
-| **FLOW** | Focused and productive |
-| **HYPER** | Overwhelmed, thrashing, stuck |
-| **HYPO** | Disengaged, drifting |
-| **RECOVERY** | Returning to focus |
-
-When it detects HYPER, it sends your **workspace context** (tab titles, error messages, file paths — never biometrics) to an LLM, which returns specific executable actions: close distraction tabs, surface the error fix you need, break your task into micro-steps, or suggest a biology-driven break.
-
-Everything is opt-in and reversible. Cortex earns autonomy through a 5-level progressive consent system.
+See [README.md](README.md) for developer commands and
+[IMPLEMENTATION.md](IMPLEMENTATION.md) for the complete audit, design,
+research basis, work packages, risks, and definition of done.

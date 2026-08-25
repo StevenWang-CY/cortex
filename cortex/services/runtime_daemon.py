@@ -175,8 +175,8 @@ from cortex.services.handover.briefing import MorningBriefing
 from cortex.services.handover.detector import ShutdownDetector
 from cortex.services.handover.snapshot import HandoverSnapshot
 from cortex.services.intervention_engine.break_overlay import (
-    BiologyBreakController,
     BreakUIHandler,
+    GuidedBreakController,
 )
 from cortex.services.intervention_engine.executor import InterventionExecutor
 from cortex.services.intervention_engine.leetcode_interventions import InterventionMatrix
@@ -1197,16 +1197,16 @@ class CortexDaemon:
         # Flipped by ``_set_break_suppression`` for the duration of a
         # break overlay so the state loop skips trigger evaluation.
         self._break_active: bool = False
-        # The biology break controller is instantiated after
+        # The guided-break controller is instantiated after
         # ``_session_report`` is created (a few lines below); keep a
         # forward-declared attribute so type checkers don't trip.
-        self._break_controller: BiologyBreakController | None = None
-        # P0 §3.7 audit fix (mic_active audio gate, spec line 643):
+        self._break_controller: GuidedBreakController | None = None
+        # Audio gate: ``last_mic_active_at`` is the monotonic timestamp of the
         # ``last_mic_active_at`` is the monotonic timestamp of the
         # most-recent positive ``receptivity.is_microphone_in_use``
         # reading. The break controller flips ``audio_cue=False`` for
         # any break whose start falls within
-        # ``InterventionConfig.biology_break_audio_mute_after_mic_seconds``
+        # ``InterventionConfig.guided_break_audio_mute_after_mic_seconds``
         # of this timestamp so users on a call don't get blindsided
         # by a chime.
         self._last_mic_active_at: float = 0.0
@@ -1323,11 +1323,9 @@ class CortexDaemon:
         # the opt-in elapsed-focus reminder above; no HRV tracker is bound.
         # The desktop shell binds its full-screen
         # overlay handler via :meth:`set_break_overlay_ui_handler`.
-        self._break_controller = BiologyBreakController(
-            hrv_sampler=lambda: None,
+        self._break_controller = GuidedBreakController(
             session_report=self._session_report,
             suppress_interventions=self._set_break_suppression,
-            stress_tracker=None,
         )
 
         # P0 §3.9: serve WHY_DETAIL_REQUEST from the per-intervention
@@ -4976,7 +4974,7 @@ class CortexDaemon:
     def _set_break_suppression(self, active: bool) -> None:
         """Toggle the global break-suppression flag.
 
-        Called by :class:`BiologyBreakController` around the overlay
+        Called by :class:`GuidedBreakController` around the overlay
         lifecycle so peer adapters skip trigger evaluation while the
         breathing session runs.
         """
@@ -5500,7 +5498,7 @@ class CortexDaemon:
             mute_window = float(
                 getattr(
                     self.config.intervention,
-                    "biology_break_audio_mute_after_mic_seconds",
+                    "guided_break_audio_mute_after_mic_seconds",
                     300.0,
                 )
             )
@@ -5510,7 +5508,7 @@ class CortexDaemon:
                 and monotonic_seconds(self._clock) - self._last_mic_active_at < mute_window
             ):
                 logger.info(
-                    "Biology break: muting audio_cue — microphone was active in the last %.0fs",
+                    "Guided break: muting audio cue — microphone was active in the last %.0fs",
                     mute_window,
                 )
                 audio_cue = False

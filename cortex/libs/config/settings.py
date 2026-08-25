@@ -394,20 +394,7 @@ class StateConfig(BaseModel):
     hypo_dwell_seconds: int = 60
     flow_dwell_seconds: int = 120
     ema_alpha: float = 0.3
-    # Decode-only migration fields. The optional classifier never had a valid
-    # state-label dataset or registered calibration artifact, so production
-    # cannot enable it through configuration. The research utility remains in
-    # ``state_engine.ml_classifier`` for offline protocol work.
-    ml_enabled: bool = False
-    ml_min_labeled_episodes: int = 30
-    ml_alpha_max: float = 0.7
-    ml_alpha_full_at_episodes: int = 150
     weights: StateWeights = Field(default_factory=StateWeights)
-
-    @field_validator("ml_enabled", mode="before")
-    @classmethod
-    def _disable_unregistered_state_classifier(cls, _value: object) -> bool:
-        return False
 
     @model_validator(mode="after")
     def _estimate_hysteresis_is_ordered(self) -> StateConfig:
@@ -500,18 +487,6 @@ class InterventionConfig(BaseModel):
     # leaving the default false avoids silently expanding its reviewed catalog.
     enable_hypo_recovery_interventions: bool = False
 
-    # Decode-only compatibility field. The HRV-derived stress algorithm has
-    # not met reference-sensor validation gates, so even a legacy ``true``
-    # value is coerced to False and cannot restore the retired trigger path.
-    enable_biology_break: bool = False
-
-    @field_validator("enable_biology_break", mode="before")
-    @classmethod
-    def _disable_unvalidated_biology_break(cls, _value: object) -> bool:
-        """Contain the unsupported HRV/stress action until validation exists."""
-
-        return False
-
     # Transparent replacement for the retired HRV integral. Reminders are
     # driven only by observed active-work duration and explicit preference,
     # and default off to avoid surprising existing users.
@@ -525,7 +500,7 @@ class InterventionConfig(BaseModel):
     # last 5 minutes (user is on a call). The runtime daemon honours
     # this window by tracking the most recent mic_active timestamp;
     # the controller flips ``audio_cue=False`` for the duration.
-    biology_break_audio_mute_after_mic_seconds: float = 300.0
+    guided_break_audio_mute_after_mic_seconds: float = 300.0
 
     # P0 §3.10: auto-armed distraction blocking on HYPER. Defaults OFF —
     # the principle of least surprise wins for any autonomous action
@@ -547,9 +522,6 @@ class InterventionConfig(BaseModel):
     # owns this gate so the user is never silently kept in focus
     # mode after they've genuinely recovered.
     auto_distraction_block_exit_seconds: float = 300.0
-    # Default session duration the daemon proposes when arming. 20 min
-    # matches the typical Pomodoro upper bound + the spec example.
-    auto_distraction_block_session_minutes: int = 20
     # Default preset for the merged blocklist. Browser extension owns
     # the per-preset domain map. ``custom`` reads ``custom_domains``.
     auto_distraction_block_preset: Literal[
@@ -616,7 +588,6 @@ class TelemetryConfig(BaseModel):
     """Telemetry engine configuration."""
 
     mouse_sample_hz: int = 60
-    downsample_hz: int = 10
     window_seconds: int = 15
 
 
@@ -714,8 +685,6 @@ class BlinkSignalConfig(BaseModel):
     min_valid_exposure_seconds: float = Field(15.0, gt=0.0)
     history_window_seconds: float = Field(60.0, gt=0.0)
     max_valid_gap_ms: float = Field(250.0, gt=0.0)
-    perclos_threshold: float = Field(0.2, ge=0.0, le=1.0)
-    personalize_ear_percentile: float = Field(0.15, ge=0.05, le=0.45)
 
     @model_validator(mode="after")
     def _blink_thresholds_are_coherent(self) -> BlinkSignalConfig:
@@ -1083,59 +1052,6 @@ def load_yaml_defaults() -> dict[str, Any]:
     return {}
 
 
-# Phase-4a Debt-1: env toggles that gate user-visible features. The
-# values are read by Pydantic from the environment / .env file; if
-# neither source carries them the field defaults apply. That is
-# semantically correct but operationally silent — a power user who
-# meant to flip ``ENABLE_AUTO_DISTRACTION_BLOCK=true`` and mistyped the
-# key would never know. We surface a one-line WARN at config load to
-# bound mis-configuration surprise.
-_REQUIRED_FEATURE_TOGGLES: tuple[str, ...] = (
-    "CORTEX_INTERVENTION__ENABLE_AUTO_DISTRACTION_BLOCK",
-    "CORTEX_INTERVENTION__ENABLE_OS_NOTIFICATIONS",
-)
-
-
-def _check_required_feature_toggles() -> None:
-    """Warn (once per process) when documented feature toggles are
-    absent from both the environment and the .env files.
-
-    The defaults remain authoritative; this only surfaces mis-typed
-    or forgotten overrides so operations is never silent.
-
-    I5: ``CORTEX_SUPPRESS_FEATURE_TOGGLE_WARNINGS`` is honoured ONLY when
-    ``CORTEX_ENV=test``. Production deployments that inadvertently set
-    the suppression flag still emit warnings — we'd rather log-flood than
-    silently ship with a wedged feature flag. Tests that need to suppress
-    must explicitly set ``CORTEX_ENV=test`` as well.
-    """
-    if (
-        os.environ.get("CORTEX_SUPPRESS_FEATURE_TOGGLE_WARNINGS") == "1"
-        and os.environ.get("CORTEX_ENV") == "test"
-    ):
-        return
-    log = __import__("logging").getLogger(__name__)
-    env_files = _bundled_env_files()
-    env_contents = ""
-    for env_path in env_files:
-        try:
-            with open(env_path) as fp:
-                env_contents += fp.read() + "\n"
-        except OSError:
-            continue
-    for key in _REQUIRED_FEATURE_TOGGLES:
-        if key in os.environ:
-            continue
-        if env_contents and key in env_contents:
-            continue
-        log.warning(
-            "Documented feature toggle %s is not set in environment or "
-            ".env; falling back to compiled default. Set it explicitly "
-            "to silence this warning.",
-            key,
-        )
-
-
 @lru_cache
 def get_config() -> CortexConfig:
     """
@@ -1153,7 +1069,6 @@ def get_config() -> CortexConfig:
         CortexConfig: The global configuration instance.
     """
     config = CortexConfig()
-    _check_required_feature_toggles()
 
     if _is_bundled():
         storage_path = Path(config.storage.path).expanduser()

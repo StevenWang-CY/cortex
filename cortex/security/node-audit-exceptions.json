@@ -6,20 +6,28 @@
       "advisory_id": "GHSA-5p2g-fcmc-qvqq",
       "package": "image-size",
       "max_severity": "high",
-      "path_prefixes": [".>vite>less>image-size"],
+      "path_prefixes": [
+        ".>plasmo>@plasmohq/parcel-config>@parcel/transformer-less>less>image-size",
+        ".>vite>less>image-size",
+        ".>vitest"
+      ],
       "expires_on": "2026-09-30",
-      "reason": "No patched release is published; the package is reachable only through Vitest's optional Less toolchain.",
-      "mitigation": "Cortex does not process user-supplied Less and never starts the Vitest API server in production or CI. Recheck upstream monthly."
+      "reason": "No patched release is published; the package is reachable only through dormant Plasmo/Vitest Less build tooling.",
+      "mitigation": "Cortex compiles reviewed repository source only, accepts no user-supplied Less or image buffers, and ships no build tooling. Recheck upstream monthly."
     },
     {
       "ecosystem": "pnpm",
       "advisory_id": "GHSA-w3rx-r6r6-pgpr",
       "package": "image-size",
       "max_severity": "high",
-      "path_prefixes": [".>vite>less>image-size"],
+      "path_prefixes": [
+        ".>plasmo>@plasmohq/parcel-config>@parcel/transformer-less>less>image-size",
+        ".>vite>less>image-size",
+        ".>vitest"
+      ],
       "expires_on": "2026-09-30",
-      "reason": "No patched release is published; the package is reachable only through Vitest's optional Less toolchain.",
-      "mitigation": "Cortex does not process user-supplied Less and never starts the Vitest API server in production or CI. Recheck upstream monthly."
+      "reason": "No patched release is published; the package is reachable only through dormant Plasmo/Vitest Less build tooling.",
+      "mitigation": "Cortex compiles reviewed repository source only, accepts no user-supplied Less or image buffers, and ships no build tooling. Recheck upstream monthly."
     },
     {
       "ecosystem": "pnpm",

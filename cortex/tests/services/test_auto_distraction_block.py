@@ -44,7 +44,6 @@ class _FakeIntervention:
     auto_distraction_block_dwell_seconds: float = 30.0
     auto_distraction_block_exit_seconds: float = 300.0
     auto_distraction_block_preset: str = "developer"
-    auto_distraction_block_session_minutes: int = 20
     auto_distraction_block_custom_domains: list[str] = []
 
 

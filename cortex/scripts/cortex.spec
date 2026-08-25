@@ -211,7 +211,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,
-    target_arch=None,
+    target_arch=os.environ.get("CORTEX_ARTIFACT_ARCH") or None,
     codesign_identity=None,
     entitlements_file=None,  # Signing handled by build_macos_app.sh
 )

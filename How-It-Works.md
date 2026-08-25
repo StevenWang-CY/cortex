@@ -1,118 +1,71 @@
-# How It Works
+# How Cortex works
 
-Cortex is a five-layer local loop that observes available signals, forms an
-abstaining workspace-support hypothesis, decides whether a suggestion is
-eligible, and presents reversible workspace proposals.
+## 1. Observe locally
 
-## Pipeline
+Camera and activity collectors emit typed observation envelopes. Every
+scheduled interval is `valid`, `missing`, `rejected`, or `stale`, with a
+reason, quality, source identity, algorithm version, wall time, same-boot
+monotonic time, and sequence. Missing intervals do not preserve a stale value.
 
+- Camera frames, landmarks, and color traces stay in process memory.
+- Input telemetry records timing/rate aggregates, never key text.
+- Browser/editor content is a separate, explicit context permission.
+- Camera denial or poor quality degrades to unavailable; it is not fabricated.
+
+## 2. Derive bounded signals
+
+The v2 pulse pipeline uses measured sample time, quality/motion/face-loss
+gates, and a unique chronological beat timeline. Pulse is experimental. HRV,
+LF/HF, nonlinear HRV, respiration, “screen apnea,” and the old stress integral
+are unavailable in product mode. Blink and head/neck measurements are comfort
+proxies only.
+
+## 3. Estimate a support hypothesis
+
+The production model is deterministic and has no training data. It combines
+mouse, keyboard, tab, reread, and focus-transition features with fixed
+denominators and explicit evidence coverage. Insufficient, weak, warming, or
+ambiguous evidence returns `unknown`. Camera values cannot change a production
+support score. Scores are not probabilities and state names are not diagnoses.
+
+## 4. Apply eligibility and policy gates
+
+Dwell/hysteresis, evidence coverage, receptivity, cooldown, quiet mode,
+dismissal burden, and user settings determine whether Cortex may present a
+suggestion. Production policy is deterministic and does not learn online. A
+separately consented, fixed two-arm micro-randomized path exists for research;
+its presence is not evidence of efficacy.
+
+## 5. Build a proposal
+
+The default local rule planner makes no network request. External planning is
+off unless the user enables `external_redacted`, selects each source, reviews
+the exact minimized/redacted payload and prompt, and confirms a short-lived
+handle once. The handle is burned before provider I/O. Model output is parsed
+as untrusted proposal data.
+
+## 6. Preserve user authority
+
+Presentation is side-effect free. If optional mutation is enabled, the flow is:
+
+```text
+PROPOSED → PRESENTED → AUTHORIZED → APPLYING → APPLIED
+         → VERIFIED → RESTORING → RESTORED
 ```
-Webcam + Input Telemetry
-        │
-        ▼
-L1 Observation extraction
-  rPPG (POS/CHROM/green or optional ONNX TSCAN)
-  Respiration (BVP + motion proxy fusion)
-  Blink/EAR/PERCLOS + head pose + posture
-        │
-        ▼
-SQI Gate (NSQI + SNR + motion + face-loss)
-        │
-        ▼
-L2 State Engine
-  Named, availability-aware deterministic support rules
-  EMA smoothing + Schmitt hysteresis + dwell
-  UNKNOWN while evidence is warming, missing, or ambiguous
-        │
-        ▼
-L3 Trigger Policy
-  Receptivity gate + adaptive threshold + dismissal model
-  AMIP policy (default) / greedy / uniform
-        │
-        ▼
-L4 LLM Engine
-  Structured JSON output + schema validation
-  Grounded causal explanation verifier
-  Destructive-action self-critique
-        │
-        ▼
-L5 Intervention Execution
-  Consent ladder + preview/confirm/execute + undo
-  Reward logging + policy WAL + causal reporting
-```
 
-## L1: Bio-Extraction
+Authority binds the exact manifest digest, effect capability, target, consent
+revision, expiry, and one-time nonce. Each effect returns a minimal typed
+receipt. Duplicate/reordered/replayed commands are idempotent; partial failure
+is compensated or reported truthfully. A downgrade creates a new lower-
+authority proposal and never executes the original.
 
-- rPPG backends: `pos` (default), `chrom`, `green`, `tscan` (ONNX, auto-fallback to POS on failure).
-- Adaptive ROI fusion: forehead/cheeks weighted by luminance/chroma stability and head-jitter penalties.
-- Composite SQI is computed and propagated as `physio_sqi` with components; low-quality windows are marked invalid.
-- HRV and respiration prototypes remain research-only and are unavailable in
-  production pending metric-specific reference validation.
-- Blink features include `perclos_60s`, mean blink duration, EAR variance, and personalized EAR threshold support.
-- Telemetry adds correction rate and scroll-back rate alongside keystroke/mouse variability features.
+## 7. Persist and recover
 
-## L2: State Engine
+A single-owner SQLite database with checksummed migrations and full
+synchronization stores intervention and policy lifecycles atomically. On
+restart Cortex reconciles unresolved intent/receipts before claiming success.
+Redis/in-memory and legacy JSON are compatibility or diagnostic surfaces only.
 
-- Production support rules use only behavior aggregates with named validity,
-  quality, age, source exposure, and missing reasons.
-- Fixed denominators ensure missing/lower-quality evidence cannot increase a
-  score. Scores are evidence strengths, never normalized probabilities.
-- Steady activity requires affirmative recent interaction. Quiet activity
-  requires observed inactivity and another corroborating channel.
-- Camera pulse, blink, and head/neck values are excluded from support scoring.
-- The engine starts `UNKNOWN` and exposes `warming_up` or
-  `insufficient_evidence` rather than defaulting to a state.
-- Dwell defaults:
-  - `HYPER = 30s`
-  - `HYPO = 60s`
-  - `FLOW = 120s`
-- Recovery is temporal and can only follow a confirmed support-likely episode.
-- No learned classifier or physiology-driven break policy ships. The optional
-  break reminder is user-enabled and based only on elapsed active-work time.
-- Model identity, feature-schema digest, contribution details, and a
-  `safety_null` rollback are present on the production path.
-
-## L3: Trigger Policy + AMIP
-
-- Receptivity gate suppresses interventions when:
-  - mic/call active,
-  - fullscreen active,
-  - typing burst is active,
-  - outside configured work hours.
-- Dismissal predictor can suppress high-probability dismiss contexts after warm-up.
-- Confidence threshold is adaptively bounded per user.
-- AMIP (`eval.policy=amip`, default):
-  - contextual Thompson sampling over fixed intervention arms,
-  - temperature softmax,
-  - deterministic safety floor,
-  - propensity logging and write-ahead log before updates.
-- Artifacts:
-  - `storage/policy_log/YYYY-MM-DD.jsonl`
-  - `storage/reports/causal_YYYY-MM-DD.md`
-
-## L4: LLM Grounding/Safety
-
-- Cortex talks to Claude exclusively through the Anthropic SDK; transport is selected per-deployment via `CORTEX_LLM__PROVIDER` (`bedrock` default, `vertex`, or `direct`). When every transport is unavailable, the engine falls back to a deterministic rule-based plan (`CORTEX_LLM__FALLBACK_MODE=rule_based`, the default). See [Setup](Setup) for credentials.
-- Structured output is required (JSON mode + parser/schema validation).
-- Invalid actions are dropped individually (graceful degradation), not full-plan hard-fail.
-- Causal explanation is verified against observable context values; fallback text is injected if ungrounded.
-- Prompt inputs are sanitized (control stripping, brace escaping, bounded length).
-
-## L5: Execution + Consent
-
-- Consent ladder remains 5 levels, now with recency/decay logic and rejection-aware escalation safeguards.
-- LeetCode high-impact actions are consent-gated consistently (`required_consent_level` in payloads).
-- Execution stays reversible via snapshot + undo stack.
-- Helpfulness tracking stores decision metadata (`decision_id`, `policy_arm`, `propensity`) for off-policy analysis.
-
-## Validation Harness
-
-- AMIP regret smoke: `cortex/tests/eval/test_amip_regret.py`
-- IPS unbiasedness: `cortex/tests/eval/test_ips_unbiased.py`
-- Safety floor invariants: `cortex/tests/eval/test_safety_floor.py`
-- Evidence/missingness/replay/rollback gates:
-  `cortex/tests/unit/test_evidence_aware_support.py`
-- Participant-held-out research scaffolding:
-  `cortex/services/state_engine/evaluation_protocol.py`
-- LLM graceful degradation: `cortex/tests/unit/test_llm_safety_refinements.py`
-- Dataset-gated UBFC/PURE replay: `cortex/tests/physio/test_rppg_ubfc.py`
+Detailed evidence: [model card](docs/model-cards/deterministic-support-v2.md),
+[architecture](cortex/docs/architecture.md), [data flow](docs/data-flow.md), and
+[limitations](docs/limitations.md).

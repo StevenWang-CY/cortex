@@ -473,8 +473,8 @@ It is side-effect free and always reports unavailable.
 
 #### `GET /api/helpfulness/summary`
 
-Summary of intervention helpfulness from the contextual-bandit feedback
-loop.
+Legacy descriptive engagement/dismissal summary. It does not update the
+production policy and is not causal evidence.
 
 **Response:**
 ```json
@@ -605,7 +605,7 @@ The full list below is the canonical message-type catalog (Python source of trut
 decode-only compatibility entries and product clients intentionally ignore
 them.
 
-**LeetCode cues (daemon → chrome, `target_client_types=["chrome"]`):** `LEETCODE_SHOW_SCRATCHPAD`, `LEETCODE_SHOW_PATTERN_LADDER`, `LEETCODE_SHOW_LOCKOUT`, `LEETCODE_SHOW_CONSOLIDATION`, `LEETCODE_SHOW_SUBMISSION_GATE`, `LEETCODE_SHOW_SOLUTION_FRICTION`, `LEETCODE_SHOW_SESSION_BRIEFING`, `LEETCODE_LOCK_EDITOR`, `LEETCODE_INTERCEPT_SUBMIT`, `LEETCODE_GATE_SOLUTIONS`, `LEETCODE_AI_RESTATEMENT_CHECK`, `LEETCODE_AI_COMPREHENSION_CHECK`, `LEETCODE_AI_HYPOTHESIS_CHECK`, `LEETCODE_AI_STUCK_ANALYSIS`, `LEETCODE_AI_SESSION_BRIEFING`.
+**LeetCode cues (daemon → chrome, `target_client_types=["chrome"]`):** `LEETCODE_SHOW_SCRATCHPAD`, `LEETCODE_SHOW_PATTERN_LADDER`, `LEETCODE_SHOW_LOCKOUT`, `LEETCODE_SHOW_CONSOLIDATION`, `LEETCODE_SHOW_SUBMISSION_GATE`, and `LEETCODE_SHOW_SOLUTION_FRICTION`. The catalogue contains only messages with a production producer or consumer; proposed capabilities do not reserve wire literals.
 
 Selected payload shapes follow.
 

@@ -616,6 +616,16 @@ def emit_vscode_ts(data: dict[str, Any]) -> str:
 # Check / apply helpers
 # ---------------------------------------------------------------------------
 
+def expected_outputs(data: dict[str, Any] | None = None) -> dict[Path, str]:
+    """Return every generated token surface without touching the filesystem."""
+
+    source = data if data is not None else _load()
+    return {
+        _PY_OUT: emit_python(source),
+        _BROWSER_OUT: emit_browser_ts(source),
+        _VSCODE_OUT: emit_vscode_ts(source),
+    }
+
 def _check_in_sync() -> int:
     """Regenerate all three token files in memory; diff against committed copies.
 
@@ -628,11 +638,7 @@ def _check_in_sync() -> int:
     import difflib
 
     data = _load()
-    targets = [
-        (_PY_OUT, emit_python(data)),
-        (_BROWSER_OUT, emit_browser_ts(data)),
-        (_VSCODE_OUT, emit_vscode_ts(data)),
-    ]
+    targets = list(expected_outputs(data).items())
 
     drift_found = False
     for path, regenerated in targets:

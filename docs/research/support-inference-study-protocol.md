@@ -32,7 +32,7 @@ Participants must be able to pause capture, inspect collected fields, withdraw,
 and request deletion without losing ordinary product functionality.
 
 Report development and evaluation transparently using the principles and
-checklist in [TRIPOD+AI](https://www.bmj.com/content/385/bmj-2023-078378),
+checklist in [TRIPOD+AI](https://pmc.ncbi.nlm.nih.gov/articles/PMC11019967/),
 including participant flow, missing data, full model specification, evaluation
 data distinction, subgroup results, protocol deviations, and open-science
 artifacts. Use [NIST AI RMF 1.0](https://doi.org/10.6028/NIST.AI.100-1) to
@@ -136,7 +136,7 @@ participants. Missingness indicators remain explicit. Compare against simple
 prespecified baselines: always abstain, prevalence-only, the deterministic
 rules, and a small regularized model. Complexity must earn its inclusion.
 
-The existing `ml_classifier.py` is research-only. It cannot be enabled merely
+Any future learned classifier is research-only. It cannot be enabled merely
 because it trains successfully; a production candidate needs a versioned model
 artifact, feature-schema digest, immutable model card, evaluation report,
 separate calibration artifact, registry entry, and safe rollback.
@@ -223,4 +223,3 @@ source commit, analysis scripts, seeds, evaluation output, subgroup tables,
 model card, known-failure cases, and signed release decision. Publish code and
 appropriately de-identified aggregate artifacts where consent and privacy allow;
 document why any artifact cannot be shared.
-

@@ -1,49 +1,48 @@
 # Privacy
 
-## Data Boundary
+Cortex is local-first and model-network-off by default.
 
-Cortex keeps biometric processing local by design.
+## Always local
 
-- Webcam frames, landmarks, pulse/HRV, blink, posture, and SQI are processed in-memory.
-- Biometric signals are not sent to LLM providers.
-- Intervention LLM calls only include workspace context (tabs, editor/terminal context, complexity/state labels).
+- Raw camera frames, landmarks, waveforms, IBIs, and raw physiological
+  observations are not fields in the planner contract and are not ordinarily
+  persisted.
+- Mouse/keyboard collection uses aggregate timing/rates and does not capture
+  key text.
+- FastAPI, WebSocket, and launcher endpoints bind to `127.0.0.1` and sensitive
+  operations require a capability token.
+- Credentials belong in macOS Keychain or the provider's supported credential
+  store; they are not bundled in the app.
 
-## What Is Stored Locally
+## Optional external planning
 
-- Baselines and calibration artifacts (`storage/baselines/`)
-- Session and evaluation artifacts (`storage/sessions/`, `storage/policy_log/`, `storage/reports/`)
-- Optional learning metadata (tab relevance, helpfulness, consent state)
+`external_redacted` requires all of the following for each send:
 
-Redis is optional; in-memory fallback is available.
+1. revision-bound external mode;
+2. explicit selection of each context source;
+3. deterministic normalization, minimization, redaction, and size caps;
+4. an exact preview of payload, prompt, destination, model, byte count, field
+   dispositions, redactions, and retention caveat;
+5. one-time confirmation before the handle expires.
 
-## Prompt/LLM Safety Guarantees
+Previewing does not contact a provider. The handle is memory-only and burned
+before network I/O. Page-body extraction additionally requires an exact active
+HTTP(S) origin grant and is disabled in incognito. Revocation clears the
+snapshot and scrubs stored content fields.
 
-0.2.0 adds prompt hardening:
+Redaction is defense in depth, not a guarantee. Do not select credentials,
+private keys, regulated records, or third-party confidential material. Cortex
+cannot verify an account's provider retention contract, region, logging,
+caching, or abuse-monitoring settings.
 
-- User and learned strings are sanitized before prompt interpolation.
-- Control characters and suspicious prompt-injection markers are stripped.
-- Lengths are bounded and braces escaped to prevent template breakouts.
-- LLM plans are schema-validated and unsafe actions are degraded/dropped before execution.
+## Local retention and deletion
 
-## Microrandomization / AMIP Policy Logging
+SQLite stores bounded operational, intervention, and policy lifecycle data.
+Browser resume metadata is capped at 200 records. Export/delete is scoped and
+authenticated; destructive deletion requires `DELETE CORTEX DATA` and refuses
+to erase unresolved restore evidence. Uninstalling the app alone does not
+remove browser/editor storage, native-host manifests, Keychain credentials, or
+the configured storage root.
 
-When `eval.policy=amip`, Cortex logs decision tuples for causal evaluation:
-
-- context features (numeric)
-- action propensity distribution
-- chosen arm
-- linked reward
-
-These records are written locally to `storage/policy_log/YYYY-MM-DD.jsonl` and summarized in local causal reports.
-
-If you do not want exploration-style policy learning, set:
-
-```bash
-CORTEX_EVAL__POLICY=greedy
-```
-
-(Or `uniform` for research-style randomized mode.)
-
-## Consent and Autonomy
-
-All impactful workspace mutations are consent-gated. Consent escalation is recency-aware and reversible; high-impact actions (including LeetCode lockout-style interventions) are not executed autonomously without earned trust.
+Read the exact [privacy disclosure](cortex/docs/privacy.md) and
+[data-flow/deletion map](docs/data-flow.md) before enabling external context.

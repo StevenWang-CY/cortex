@@ -17,7 +17,7 @@
   </a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg" /></a>
   <img alt="Platform: macOS" src="https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey?logo=apple" />
-  <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white" />
+  <img alt="Python 3.11 or 3.12" src="https://img.shields.io/badge/python-3.11%20%7C%203.12-3776AB?logo=python&logoColor=white" />
   <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white" />
   <img alt="mypy" src="https://img.shields.io/badge/mypy-checked-2A6DB2" />
   <img alt="ruff" src="https://img.shields.io/badge/lint-ruff-D7FF64" />
@@ -79,14 +79,14 @@
 - **Multi-layer kill chain.** Stopping the daemon executes
   WebSocket `SHUTDOWN` → HTTP `/shutdown` → Chrome native-messaging
   `stop` → SIGTERM-by-port-and-name → SIGKILL survivors, with
-  bounded waits between each layer. Documented in
-  [`CLAUDE.md`](CLAUDE.md) rule #13.
+  bounded waits between each layer. The lifecycle invariants are documented in
+  [`AGENTS.md`](AGENTS.md) and tested on the shutdown paths.
 - **Hard CI gates.** Python lint/type/tests, schema and version drift,
   browser type/tests/build, VS Code compile/tests/package, regression
   replay, and dependency-policy artifacts run on changes before release.
 - **Cross-language stack** with intent: Python (FastAPI + PySide6) ·
   TypeScript (Plasmo MV3 + VS Code) · C (`.cortex_launcher.c` for
-  macOS TCC identity) · ONNX Runtime (TS-CAN inference).
+  the legacy macOS TCC wrapper).
 - **Tracked redesign.** [`IMPLEMENTATION.md`](IMPLEMENTATION.md) records
   the current algorithm/architecture audit, evidence limits, invariants,
   work packages, risk register, and objective exit gates.
@@ -102,7 +102,7 @@
 - **Preview-gated LLM proposals** — model networking is off by default. In
   external mode, the user inspects one exact redacted payload and provider
   caveat, confirms it once, and receives a locally validated proposal.
-- **LeetCode mode** — DOM observer, stage inference (READ / PLAN / IMPLEMENT / DEBUG / REFLECT), amygdala-hijack lockout, pattern-ladder hints, submission-discipline guard.
+- **LeetCode mode** — DOM observer, stage inference (READ / PLAN / IMPLEMENT / DEBUG / REFLECT), user-controlled stuck-state support, pattern-ladder hints, and submission review.
 - **Suggestion-only authority** — fresh and migrated installs cannot mutate tabs, editors, windows, or files from a proposal. Higher modes remain explicit and guarded while transactional authorization is completed.
 - **Exact consent outcomes** — permit, downgrade, and deny are distinct; a downgraded request cannot execute its original plan.
 - **Ambient workspace feedback** — restrained, reduced-motion-aware color and
@@ -133,7 +133,7 @@ L4: LLM Engine ──────── Anthropic SDK (Bedrock / Vertex / direct
 L5: Intervention ────── Proposal-only default · exact consent · restore planning
      │
      ▼
-Store (Redis / in-memory + legacy policy diagnostics)
+Store (single-owner SQLite authority + bounded compatibility caches)
 ```
 
 All layers communicate via FastAPI (`:9472`) and WebSocket (`:9473`),
@@ -152,13 +152,13 @@ Deep dives: [How It Works](https://github.com/StevenWang-CY/cortex/wiki/How-It-W
 
 | Layer | Technologies |
 |-------|-------------|
-| **Backend** | Python 3.11+, FastAPI, MediaPipe, OpenCV, ONNX Runtime, pynput, PySide6 |
+| **Backend** | Python 3.11/3.12, FastAPI, MediaPipe, OpenCV, ONNX Runtime, pynput, PySide6 |
 | **Browser extension** | TypeScript, React, Plasmo (Manifest V3) — Chrome + Edge |
 | **VS Code extension** | TypeScript, VS Code Extension API |
 | **LLM** | Anthropic SDK over AWS Bedrock (default), GCP Vertex, or direct Anthropic API; deterministic rule-based fallback |
-| **Storage** | Redis 7+ with automatic in-memory fallback |
-| **Testing** | pytest (124 test files, 1,334 test functions) + vitest (17 specs); mypy `--strict`; ruff |
-| **CI gates** | schema-codegen drift · python (ruff + mypy + pytest) · eval-regression baseline · all required for merge |
+| **Storage** | Transactional SQLite authority; Redis/in-memory only for compatibility or ephemeral caches |
+| **Testing** | pytest + Vitest + Jest; strict mypy; Ruff; contract/replay/fault gates |
+| **CI gates** | locked dual-architecture install · schema/config/link/version drift · Python/browser/editor gates · dependency policy |
 
 ---
 
@@ -186,10 +186,10 @@ code audits. The version-control history is the project, not the binary.
 
 ## Install
 
-1. Download the versioned **Cortex-&lt;version&gt;.dmg** from the [latest release](https://github.com/StevenWang-CY/cortex/releases/latest).
+1. Download the correct **Cortex-&lt;version&gt;-macos-&lt;arch&gt;.dmg** and its evidence from the [latest release](https://github.com/StevenWang-CY/cortex/releases/latest).
 2. Drag **Cortex.app** to `/Applications`.
-3. Strip quarantine: `xattr -cr /Applications/Cortex.app`.
-4. Open Cortex — follow the 4-step setup wizard (Camera, Accessibility, API key, Extensions).
+3. Verify the checksum/attestation and open Cortex. A notarized release should not require stripping quarantine.
+4. Follow the setup wizard (Camera, Accessibility, optional BYOK, Extensions).
 
 That's it — no terminal, no Python, no Node.js required. The daemon
 runs in-process inside Cortex.app; the browser extension's
@@ -208,11 +208,11 @@ runs in-process inside Cortex.app; the browser extension's
 | Requirement | How to install |
 |-------------|----------------|
 | **macOS 13+** | required (Ventura or later) |
-| **Python 3.11 or 3.12** | `brew install python@3.11` |
-| **Node.js 18+** | `brew install node` |
-| **pnpm** | `npm install -g pnpm` |
+| **Python 3.11.15** | primary `.python-version`; CI also validates 3.12.13 |
+| **uv 0.10.12** | `brew install uv` |
+| **Node.js 22.23.2** | match `.node-version` with your version manager |
+| **pnpm 9.15.9** | `corepack prepare pnpm@9.15.9 --activate` |
 | **LLM backend** | one of: AWS Bedrock bearer token (default), GCP Vertex application-default credentials, or direct Anthropic API key. Falls back to a deterministic rule-based plan if every provider is unavailable. |
-| **Redis** (optional) | `brew install redis && brew services start redis` — falls back to in-memory automatically |
 
 > **Apple Silicon:** use native ARM Python, not Rosetta. Verify with `python3 -c "import platform; print(platform.machine())"` — should print `arm64`.
 
@@ -222,10 +222,10 @@ runs in-process inside Cortex.app; the browser extension's
 git clone https://github.com/StevenWang-CY/cortex.git
 cd cortex
 
-make setup            # creates .venv, installs Python + pnpm deps, seeds storage
+make setup            # consumes uv/pnpm/npm locks and seeds storage
 make precommit        # installs pre-commit hook (schema-codegen drift gate)
 
-cp cortex/.env.example .env   # then set CORTEX_LLM__PROVIDER and credentials
+cp cortex/.env.example .env   # optional overrides; all generated lines are commented
 make dev              # start the daemon
 ```
 
@@ -278,7 +278,7 @@ make codegen-check    # schema drift gate
 ### Build a DMG
 
 ```bash
-make dmg              # produces dist/Cortex-<version>.dmg
+make dmg              # produces dist/Cortex-<version>-macos-<arch>.dmg
 ```
 
 For production distribution, set `CORTEX_SIGN_IDENTITY` to your

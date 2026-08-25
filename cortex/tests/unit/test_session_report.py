@@ -113,58 +113,6 @@ class TestSessionReportGenerator:
         assert report.time_in_hyper_seconds == pytest.approx(100.0, abs=1.0)
 
 
-class TestStressIntegralWarning:
-    """Tests for pre-break warning at 80% threshold."""
-
-    def test_warning_at_80_percent(self):
-        from cortex.services.state_engine.stress_integral import StressIntegralTracker
-
-        # P1 Pipeline F: sigma floor is now 5 ms. With suppression=5 ms and
-        # sigma=5 the integrand is 1.0/s, so 81 samples still reach 80% of a
-        # threshold of 100 (~80 ms*s of standardized deficit).
-        tracker = StressIntegralTracker(hrv_baseline=50.0, hrv_sigma=5.0, threshold=100.0)
-
-        # Push to 80%: 5 ms suppression / sigma=5 = 1.0/s, ~81 samples → 80.
-        for i in range(82):
-            tracker.update(hrv_rmssd=45.0, timestamp=float(i))
-
-        assert tracker.should_warn() is True
-        assert tracker.should_break() is False
-
-    def test_no_warning_below_80(self):
-        from cortex.services.state_engine.stress_integral import StressIntegralTracker
-
-        tracker = StressIntegralTracker(hrv_baseline=50.0, hrv_sigma=5.0, threshold=1000.0)
-        tracker.update(hrv_rmssd=49.0, timestamp=0.0)
-        tracker.update(hrv_rmssd=49.0, timestamp=1.0)
-
-        assert tracker.should_warn() is False
-
-    def test_warning_fires_only_once(self):
-        from cortex.services.state_engine.stress_integral import StressIntegralTracker
-
-        tracker = StressIntegralTracker(hrv_baseline=50.0, hrv_sigma=5.0, threshold=100.0)
-        for i in range(82):
-            tracker.update(hrv_rmssd=45.0, timestamp=float(i))
-
-        assert tracker.should_warn() is True
-        assert tracker.should_warn() is False  # Second call returns False
-
-    def test_reset_clears_warning(self):
-        from cortex.services.state_engine.stress_integral import StressIntegralTracker
-
-        tracker = StressIntegralTracker(hrv_baseline=50.0, hrv_sigma=5.0, threshold=100.0)
-        for i in range(82):
-            tracker.update(hrv_rmssd=45.0, timestamp=float(i))
-        tracker.should_warn()
-        tracker.reset()
-
-        # After reset, warning should fire again when threshold approached
-        for i in range(82):
-            tracker.update(hrv_rmssd=45.0, timestamp=float(200 + i))
-        assert tracker.should_warn() is True
-
-
 class TestTopicCalibration:
     """Tests for subject-specific difficulty calibration."""
 

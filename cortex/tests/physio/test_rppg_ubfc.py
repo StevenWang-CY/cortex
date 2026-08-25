@@ -16,7 +16,7 @@ PURE_ENV = "CORTEX_PURE_DATASET_MANIFEST"
 def _manifest_from_env(variable: str) -> Path:
     configured = os.getenv(variable)
     if not configured:
-        pytest.skip(f"Set {variable} to a v1 checksum-bearing replay manifest")
+        pytest.skip(f"Set {variable} to a v1.1 checksum-bearing replay manifest")
     path = Path(configured)
     if not path.is_file():
         pytest.skip(f"{variable} manifest does not exist: {path}")

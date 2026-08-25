@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections import defaultdict
 from datetime import UTC, date, datetime
@@ -12,6 +13,21 @@ from typing import Any
 
 _SEVERITY = {"unknown": 0, "info": 1, "low": 2, "moderate": 3, "high": 4, "critical": 5}
 _MAX_REVIEW_DAYS = {"low": 120, "moderate": 90, "high": 45, "critical": 0}
+
+
+def _normalize_pnpm_path(path: object) -> str:
+    """Compare package chains, not pnpm formatting or resolved versions."""
+    compact = re.sub(r"\s*>\s*", ">", str(path).strip())
+    normalized: list[str] = []
+    for segment in compact.split(">"):
+        if segment.startswith("@"):
+            package, separator, _version = segment.rpartition("@")
+            if separator and "/" in package:
+                segment = package
+        elif "@" in segment:
+            segment = segment.split("@", 1)[0]
+        normalized.append(segment)
+    return ">".join(normalized)
 
 
 def _read_json(path: Path) -> Any:
@@ -25,7 +41,7 @@ def _pnpm_findings(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
         advisory = dict(raw)
         advisory_id = str(advisory.get("github_advisory_id") or key)
         paths = sorted({
-            str(path)
+            _normalize_pnpm_path(path)
             for item in advisory.get("findings", [])
             for path in item.get("paths", [])
         })
@@ -164,7 +180,10 @@ def main() -> int:
                 f"package drift for {advisory_id}: {finding['package']} != "
                 f"{exception.get('package')}"
             )
-        prefixes = [str(prefix) for prefix in exception.get("path_prefixes", [])]
+        prefixes = [
+            _normalize_pnpm_path(prefix)
+            for prefix in exception.get("path_prefixes", [])
+        ]
         if not prefixes:
             problems.append(f"exception {advisory_id} lacks dependency path prefixes")
         unmatched = [

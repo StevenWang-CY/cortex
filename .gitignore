@@ -22,6 +22,7 @@ node_modules/
 .ralph/
 .claude/
 .ralphrc
+.lycheecache
 .vscode/
 CLAUDE.md
 # CHANGELOG.md is tracked starting at Phase J — it's the user-facing

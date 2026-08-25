@@ -654,7 +654,8 @@ export class CortexWSClient {
      * populated ``action.metadata`` block mirroring the popup CTA
      * shape. The daemon's ``_handle_user_action`` matches on
      * ``action_type == "take_biology_break"`` and routes to the
-     * ``BiologyBreakController`` regardless of source client.
+     * compatibility action is decoded by the daemon. The supported reminder
+     * path is elapsed-focus/user-requested and never physiology-triggered.
      */
     sendBiologyBreakRequest(
         interventionId: string,

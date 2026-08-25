@@ -194,6 +194,5 @@ weights, coverage, thresholds, or dwell requires:
 5. a migration/rollback note and the retained `safety_null` entry.
 
 Set `state.inference_mode: safety_null` to disable inference on restart. The
-safe-null model emits only insufficient-evidence `UNKNOWN`; it cannot fall back
-to the retired unregistered classifier.
-
+safe-null model emits only insufficient-evidence `UNKNOWN`; there is no hidden
+learned-classifier fallback.
