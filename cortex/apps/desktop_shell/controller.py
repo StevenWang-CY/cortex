@@ -1085,8 +1085,10 @@ class CortexAppController:
             self._dashboard.update_state(payload)
         if self._tray is not None:
             self._tray.update_state(
-                payload.get("state", "FLOW"),
+                payload.get("state", "UNKNOWN"),
                 payload.get("confidence", 0.0),
+                payload.get("status", "insufficient_evidence"),
+                payload.get("evidence_coverage", 0.0),
             )
 
     @Slot(dict)

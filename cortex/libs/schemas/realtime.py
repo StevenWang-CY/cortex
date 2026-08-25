@@ -28,7 +28,15 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from cortex.application.clock import SYSTEM_CLOCK, utc_datetime
 from cortex.libs.schemas.intervention import CausalSignal, InterventionPlan
 from cortex.libs.schemas.session_report import SessionReport
-from cortex.libs.schemas.state import SignalQuality, StateScores
+from cortex.libs.schemas.state import (
+    EstimateStatus,
+    FeatureContribution,
+    InferenceModelIdentity,
+    SignalQuality,
+    StateScores,
+    SupportScores,
+    SupportState,
+)
 from cortex.libs.schemas.temporal import DualClockModel
 
 # ─── Shared Literal vocabularies ──────────────────────────────────────
@@ -62,16 +70,11 @@ DistractionBlockPreset = Literal["developer", "student", "writer", "custom"]
 
 
 class BreakRecommendation(BaseModel):
-    """P0 §3.7: BREAK_RECOMMENDATION wire payload.
+    """Opt-in elapsed-focus BREAK_RECOMMENDATION wire payload.
 
-    Emitted exactly once per ``StressIntegralTracker.should_break``
-    False → True transition. The popup / desktop overlay surfaces a
-    soft pill with a single CTA that fires ``take_biology_break`` via
-    ``ACTION_EXECUTE``.
-
-    The ``urgency`` literal mirrors what the daemon's
-    ``_classify_break_urgency`` actually emits (``"low" | "medium" |
-    "high"``); see ``cortex.services.runtime_daemon.CortexDaemon._classify_break_urgency``.
+    The old HRV-integral fields remain optional decode aliases for one release;
+    production recommendations use ``basis``, elapsed time, and the user's
+    preferred interval.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -86,21 +89,22 @@ class BreakRecommendation(BaseModel):
     )
     urgency: Literal["low", "medium", "high"] = Field(
         "low",
-        description=(
-            "Daemon-classified urgency derived from "
-            "``StressIntegralTracker.load_ratio``. The UI uses this to "
-            "decide pill colour / tone, never to gate the action."
-        ),
+        description="Presentation tone only; elapsed-time reminders use low.",
     )
-    stress_load: float = Field(
-        ...,
+    basis: Literal["elapsed_focus", "legacy_stress_integral"] = "elapsed_focus"
+    focus_elapsed_seconds: float | None = Field(None, ge=0.0)
+    preferred_interval_seconds: float | None = Field(None, gt=0.0)
+    stress_load: float | None = Field(
+        None,
         ge=0.0,
-        description="Current cumulative stress-integral load",
+        deprecated=True,
+        description="Legacy compatibility field; never populated in production.",
     )
-    threshold: float = Field(
-        ...,
+    threshold: float | None = Field(
+        None,
         ge=0.0,
-        description="Threshold the tracker crossed to fire this recommendation",
+        deprecated=True,
+        description="Legacy compatibility field; never populated in production.",
     )
     duration_seconds: int = Field(
         ...,
@@ -113,11 +117,10 @@ class BreakRecommendation(BaseModel):
         ),
     )
     breathing_pattern: Literal["4-7-8", "box", "coherent"] = Field(
-        "4-7-8",
+        "box",
         description=(
-            "Pacer cadence variant. Picked by the daemon based on the "
-            "user's recent HRV (4-7-8 = relaxation / parasympathetic; "
-            "box = balanced; coherent = 5.5 BPM resonance breathing)."
+            "Optional user-facing pacer cadence; it is not selected from "
+            "biometrics."
         ),
     )
 
@@ -680,16 +683,30 @@ class StateUpdatePayload(BaseModel):
 
     model_config = ConfigDict(extra="ignore", use_enum_values=True)
 
-    state: Literal["FLOW", "HYPO", "HYPER", "RECOVERY"] = Field(
+    state: Literal["UNKNOWN", "FLOW", "HYPO", "HYPER", "RECOVERY"] = Field(
         ...,
-        description="Classified user state (mirrors ``StateEstimate.state``)",
+        description="Deprecated uppercase compatibility state",
     )
+    support_state: SupportState | None = None
+    status: EstimateStatus = EstimateStatus.ESTIMATED
     confidence: float = Field(
-        ..., ge=0.0, le=1.0, description="Confidence in state classification"
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Compatibility name for evidence strength; not a probability.",
     )
     scores: StateScores = Field(
         ...,
-        description="Raw scores for each state",
+        description="Deprecated uppercase projection of heuristic scores",
+    )
+    support_scores: SupportScores | None = None
+    evidence_coverage: float = Field(1.0, ge=0.0, le=1.0)
+    contributing_features: list[FeatureContribution] = Field(default_factory=list)
+    exclusions: list[str] = Field(default_factory=list)
+    model: InferenceModelIdentity | None = None
+    probabilities: SupportScores | None = Field(
+        None,
+        description="Absent unless a registered calibrated model produced them.",
     )
     signal_quality: SignalQuality = Field(
         ...,
@@ -709,7 +726,8 @@ class StateUpdatePayload(BaseModel):
     )
     calibrated_probabilities: StateScores | None = Field(
         None,
-        description="Calibrated class probabilities (optional ML/rule ensemble output)",
+        deprecated=True,
+        description="Deprecated; deterministic support rules never populate it.",
     )
     classifier_source: Literal["rule", "ml", "ensemble"] | None = Field(
         None,
@@ -721,20 +739,19 @@ class StateUpdatePayload(BaseModel):
         le=1.0,
         description="Ensemble weight on ML branch when used",
     )
-    source: Literal["classifier", "fallback"] = Field(
-        "classifier",
+    source: Literal["rules", "classifier", "fallback"] = Field(
+        "rules",
         description=(
-            "Envelope-level source (mirrors ``StateInferResponse.source``). "
-            "``fallback`` when no real classifier ran; the dashboard's "
-            "'classifier unavailable' banner reads this."
+            "Inference source. ``rules`` is the production Level-A engine, "
+            "``classifier`` is a decode-only legacy value, and ``fallback`` "
+            "means no inference engine ran."
         ),
     )
     degraded: bool = Field(
         False,
         description=(
-            "True when no real classifier ran (``classifier_source is "
-            "None``) — same condition the ``/state/infer`` fallback "
-            "branch uses to flag synthetic confidence."
+            "True when the estimate is warming, insufficient, or produced "
+            "by the explicit API fallback."
         ),
     )
     timestamp: float | str | None = Field(
@@ -758,6 +775,17 @@ class StateUpdatePayload(BaseModel):
         )
         if any(supplied) and not all(supplied):
             raise ValueError("state update v2 time fields must be supplied together")
+        if self.status != EstimateStatus.ESTIMATED and self.state != "UNKNOWN":
+            raise ValueError("non-estimated state updates must use UNKNOWN")
+        legacy_probabilities = self.__dict__.get("calibrated_probabilities")
+        if self.probabilities is not None or legacy_probabilities is not None:
+            if (
+                self.model is None
+                or self.model.probability_calibration_artifact_id is None
+            ):
+                raise ValueError(
+                    "probability output requires a registered calibration artifact"
+                )
         return self
     connected_clients: list[str] = Field(
         default_factory=list,

@@ -15,64 +15,66 @@ from cortex.services.state_engine.causal_attribution import (
 def _make_features(**overrides: object) -> FeatureVector:
     base: dict[str, object] = {
         "timestamp": 0.0,
-        "hr": 72.0,
-        "hrv_rmssd": 50.0,
-        "blink_rate": 17.0,
+        "mouse_velocity_variance": 10_000.0,
         "tab_switch_frequency": 2.0,
-        "forward_lean_angle": 4.0,
+        "correction_rate_per_100_keys": 5.0,
+        "scroll_back_rate_per_min": 0.5,
+        "thrashing_score": 0.0,
     }
     base.update(overrides)
     return FeatureVector(**base)
 
 
-def test_hrv_drop_attributed_as_primary() -> None:
+def test_mouse_variability_attributed_as_primary() -> None:
     baselines = UserBaselines(
-        hrv_baseline=50.0,
-        metric_distributions={"hrv_rmssd": {"mu": 50.0, "sigma": 5.0}},
+        mouse_variance_baseline=10_000.0,
+        metric_distributions={
+            "mouse_velocity_variance": {"mu": 10_000.0, "sigma": 5_000.0}
+        },
     )
-    # Strong HRV drop (z = -4 → 4 after direction flip), everything else baseline.
-    features = _make_features(hrv_rmssd=30.0)
+    features = _make_features(mouse_velocity_variance=50_000.0)
     signals = attribute_top_signals(features, baselines, max_signals=3)
-    assert signals, "expected non-empty causal signals for an HRV deficit"
+    assert signals
     primary = signals[0]
-    assert primary.name == "HRV"
+    assert primary.name == "Mouse variability"
     assert primary.severity == "primary"
-    assert primary.current_value == pytest.approx(30.0)
-    assert primary.baseline_value == pytest.approx(50.0)
+    assert primary.current_value == pytest.approx(50_000.0)
+    assert primary.baseline_value == pytest.approx(10_000.0)
     assert primary.delta_pct is not None
-    assert primary.delta_pct < 0  # HRV dropped
+    assert primary.delta_pct > 0
 
 
 def test_sparkline_buffers_propagate_to_output() -> None:
     attributor = CausalAttributor()
-    # Feed three increasing HRV readings — last is the "current".
-    for hrv in (30.0, 32.0, 34.0):
-        attributor.record_feature_vector(_make_features(hrv_rmssd=hrv))
+    for variance in (30_000.0, 32_000.0, 34_000.0):
+        attributor.record_feature_vector(
+            _make_features(mouse_velocity_variance=variance)
+        )
     signals = attributor.attribute_top_signals(
-        _make_features(hrv_rmssd=34.0),
-        UserBaselines(hrv_baseline=50.0),
+        _make_features(mouse_velocity_variance=34_000.0),
+        UserBaselines(mouse_variance_baseline=10_000.0),
     )
-    hrv_signal = next((s for s in signals if s.name == "HRV"), None)
-    assert hrv_signal is not None
+    mouse_signal = next((s for s in signals if s.name == "Mouse variability"), None)
+    assert mouse_signal is not None
     # The buffer captured 3 frames of recordings, plus the live current is
     # re-extracted at attribute time so the list length is 3.
-    assert len(hrv_signal.samples_60s) == 3
-    assert hrv_signal.samples_60s == pytest.approx([30.0, 32.0, 34.0])
+    assert len(mouse_signal.samples_60s) == 3
+    assert mouse_signal.samples_60s == pytest.approx(
+        [30_000.0, 32_000.0, 34_000.0]
+    )
 
 
 def test_top_three_signals_capped_with_severity_tiers() -> None:
     baselines = UserBaselines(
-        hrv_baseline=50.0,
-        hr_baseline=72.0,
-        blink_rate_baseline=17.0,
+        mouse_variance_baseline=10_000.0,
     )
     # Push every signal into anomalous territory; expect top-3 ordering.
     features = _make_features(
-        hrv_rmssd=28.0,            # HRV deficit (primary candidate)
-        hr=98.0,                   # heart rate spike
+        mouse_velocity_variance=80_000.0,
         tab_switch_frequency=10.0,  # thrashing
-        forward_lean_angle=18.0,   # leaning in
-        perclos_60s=0.4,           # eyes closing
+        correction_rate_per_100_keys=30.0,
+        scroll_back_rate_per_min=12.0,
+        thrashing_score=1.0,
     )
     signals = attribute_top_signals(features, baselines, max_signals=3)
     assert 0 < len(signals) <= 3
@@ -101,16 +103,16 @@ def test_within_baseline_returns_empty_list() -> None:
     on. The UI's empty-state ("explanation pending") communicates the
     healthy baseline more honestly.
     """
-    baselines = UserBaselines(hrv_baseline=50.0)
+    baselines = UserBaselines(mouse_variance_baseline=10_000.0)
     # All signals at baseline — every z-score is 0, nothing exceeds
     # the floor, so we get an empty list.
     features = FeatureVector(
         timestamp=0.0,
-        hr=72.0,
-        hrv_rmssd=50.0,
-        blink_rate=17.0,
+        mouse_velocity_variance=10_000.0,
         tab_switch_frequency=2.0,
-        forward_lean_angle=4.0,
+        correction_rate_per_100_keys=5.0,
+        scroll_back_rate_per_min=0.5,
+        thrashing_score=0.0,
     )
     signals = attribute_top_signals(features, baselines)
     assert signals == []
@@ -122,15 +124,15 @@ def test_real_signal_never_mixes_with_synthetic_fallback() -> None:
     placeholder is appended.
     """
     baselines = UserBaselines(
-        hrv_baseline=50.0,
-        hr_baseline=72.0,
-        metric_distributions={"hrv_rmssd": {"mu": 50.0, "sigma": 5.0}},
+        mouse_variance_baseline=10_000.0,
+        metric_distributions={
+            "mouse_velocity_variance": {"mu": 10_000.0, "sigma": 5_000.0}
+        },
     )
-    # Only HRV deviates; HR is at baseline so it should not appear.
-    features = _make_features(hrv_rmssd=28.0)
+    features = _make_features(mouse_velocity_variance=50_000.0)
     signals = attribute_top_signals(features, baselines, max_signals=3)
     assert len(signals) == 1
-    assert signals[0].name == "HRV"
+    assert signals[0].name == "Mouse variability"
     # No baseline-style synthetic label anywhere in the result.
     assert not any("baseline" in s.name.lower() for s in signals)
 
@@ -138,15 +140,17 @@ def test_real_signal_never_mixes_with_synthetic_fallback() -> None:
 def test_attributor_reset_clears_buffers() -> None:
     attributor = CausalAttributor()
     for _ in range(5):
-        attributor.record_feature_vector(_make_features(hrv_rmssd=30.0))
+        attributor.record_feature_vector(
+            _make_features(mouse_velocity_variance=50_000.0)
+        )
     attributor.reset()
     signals = attributor.attribute_top_signals(
-        _make_features(hrv_rmssd=30.0), UserBaselines(),
+        _make_features(mouse_velocity_variance=50_000.0), UserBaselines(),
     )
     # After reset the live current is the only sample for any signal.
-    hrv_signal = next((s for s in signals if s.name == "HRV"), None)
-    assert hrv_signal is not None
+    mouse_signal = next((s for s in signals if s.name == "Mouse variability"), None)
+    assert mouse_signal is not None
     # The buffer was cleared, then ``attribute_top_signals`` reads the
     # current value once → list is empty (live current is not appended
     # by attribution itself, only by record_feature_vector).
-    assert hrv_signal.samples_60s == []
+    assert mouse_signal.samples_60s == []

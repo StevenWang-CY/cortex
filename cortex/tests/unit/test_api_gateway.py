@@ -293,7 +293,7 @@ class TestStateInferEndpoint:
     """Test /state/infer endpoint."""
 
     def test_infer_without_engine_returns_default(self, client: TestClient):
-        """Without registered engines, should return default FLOW state."""
+        """Without registered engines, inference fails closed to UNKNOWN."""
         payload = {
             "feature_vector": _make_feature_vector(),
             "signal_quality": _make_signal_quality(),
@@ -301,8 +301,12 @@ class TestStateInferEndpoint:
         resp = client.post("/state/infer", json=payload)
         assert resp.status_code == 200
         data = resp.json()
-        assert data["estimate"]["state"] == "FLOW"
-        assert "No state engine registered" in data["estimate"]["reasons"][0]
+        assert data["estimate"]["state"] == "UNKNOWN"
+        assert data["estimate"]["support_state"] == "unknown"
+        assert data["estimate"]["status"] == "insufficient_evidence"
+        assert data["estimate"]["evidence_coverage"] == 0.0
+        assert data["degraded"] is True
+        assert "unavailable" in data["estimate"]["reasons"][0].lower()
 
     def test_infer_with_engines(self, client: TestClient):
         """With registered engines, should use them."""
@@ -319,9 +323,16 @@ class TestStateInferEndpoint:
         resp = client.post("/state/infer", json=payload)
         assert resp.status_code == 200
         data = resp.json()
-        # Should use real engines, not fallback
+        # A fresh engine exposes warm-up rather than fabricating an
+        # actionable state from one sample.
+        assert data["source"] == "rules"
         est = data["estimate"]
-        assert est["state"] in ("FLOW", "HYPO", "HYPER", "RECOVERY")
+        assert est["status"] in (
+            "warming_up", "insufficient_evidence", "estimated"
+        )
+        if est["status"] != "estimated":
+            assert est["state"] == "UNKNOWN"
+            assert est["support_state"] == "unknown"
         assert 0.0 <= est["confidence"] <= 1.0
 
 

@@ -19,7 +19,10 @@
 
 export interface CortexStateShape {
     state: string;
+    support_state?: string;
+    status?: "estimated" | "insufficient_evidence" | "warming_up";
     confidence: number;
+    evidence_coverage?: number;
     scores: Record<string, number>;
     signal_quality: Record<string, number>;
     dwell_seconds: number;
@@ -55,9 +58,24 @@ export function isCortexState(obj: unknown): obj is CortexStateShape {
     if (typeof obj !== "object" || obj === null) return false;
     const o = obj as Record<string, unknown>;
     if (typeof o.state !== "string") return false;
+    if (
+        o.status !== undefined
+        && o.status !== "estimated"
+        && o.status !== "insufficient_evidence"
+        && o.status !== "warming_up"
+    ) return false;
     if (typeof o.confidence !== "number" || !Number.isFinite(o.confidence)) {
         return false;
     }
+    if (
+        o.evidence_coverage !== undefined
+        && (
+            typeof o.evidence_coverage !== "number"
+            || !Number.isFinite(o.evidence_coverage)
+            || o.evidence_coverage < 0
+            || o.evidence_coverage > 1
+        )
+    ) return false;
     if (typeof o.scores !== "object" || o.scores === null) return false;
     if (typeof o.signal_quality !== "object" || o.signal_quality === null) {
         return false;

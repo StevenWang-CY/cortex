@@ -91,7 +91,10 @@ type SuggestedAction = Omit<
 
 interface CortexState {
     state: string;
+    support_state?: string;
+    status?: "estimated" | "insufficient_evidence" | "warming_up";
     confidence: number;
+    evidence_coverage?: number;
     scores: Record<string, number>;
     signal_quality: Record<string, number>;
     dwell_seconds: number;
@@ -544,8 +547,6 @@ const HEAD_NECK_ALERT_THRESHOLD = 180_000; // 3 min beyond calibrated neutral ra
 const BLINK_ALERT_THRESHOLD = 180_000;  // 3 min low blink rate
 
 // Break recommendation state
-let lastBreakSuggestion = 0;
-let consecutiveStressUpdates = 0;
 
 // --- Activity Tracking State ---
 
@@ -1310,7 +1311,10 @@ async function handleMessage(raw: string): Promise<void> {
             // from the guard's interface only in optional fields.
             currentState = {
                 state: msg.payload.state,
+                support_state: msg.payload.support_state,
+                status: msg.payload.status,
                 confidence: msg.payload.confidence,
+                evidence_coverage: msg.payload.evidence_coverage,
                 scores: msg.payload.scores,
                 signal_quality: msg.payload.signal_quality,
                 dwell_seconds: msg.payload.dwell_seconds,
@@ -1318,7 +1322,6 @@ async function handleMessage(raw: string): Promise<void> {
             };
             updateFocusSession(msg.payload);
             checkHealthAlerts(msg.payload);
-            checkBreakNeeded(msg.payload);
             broadcastToPopup({
                 type: "STATE_UPDATE",
                 payload: msg.payload,
@@ -1666,7 +1669,14 @@ async function handleMessage(raw: string): Promise<void> {
         }
 
         case "BREAK_RECOMMENDATION": {
-            // Fail closed even if an older or compromised daemon emits it.
+            // Only explicit elapsed-focus reminders are product-eligible.
+            // Legacy stress-integral messages remain a silent decode sink.
+            if (msg.payload.basis !== "elapsed_focus") break;
+            const reason = typeof msg.payload.reason === "string"
+                ? msg.payload.reason
+                : "You've reached your preferred focus interval.";
+            injectToast("Break reminder", reason);
+            broadcastToPopup({ type: "BREAK_SUGGESTED", reason });
             break;
         }
 
@@ -2906,7 +2916,8 @@ function updateFocusSession(payload: Record<string, unknown>): void {
     const now = Date.now();
     const elapsed = now - focusSession.lastFocusCheck;
     const state = payload.state as string;
-    const isFocused = state === "FLOW" || state === "RECOVERY";
+    const isFocused = payload.status === "estimated"
+        && (state === "FLOW" || state === "RECOVERY");
 
     if (isFocused) {
         focusSession.totalFocusMs += elapsed;
@@ -3989,43 +4000,6 @@ async function injectToast(title: string, body: string): Promise<void> {
         }
     } catch {
         // Injection failed
-    }
-}
-
-// --- Smart Break Recommendations ---
-
-function checkBreakNeeded(payload: Record<string, unknown>): void {
-    if (!focusSession) return;
-    const now = Date.now();
-    const state = payload.state as string;
-    const bio = payload.biometrics as Record<string, number | null> | undefined;
-
-    // Track consecutive stress signals
-    if (state === "HYPER") {
-        consecutiveStressUpdates++;
-    } else {
-        consecutiveStressUpdates = Math.max(0, consecutiveStressUpdates - 1);
-    }
-
-    // Suggest break if: stressed for 2+ min OR session > 50 min without break
-    const sessionMin = (now - focusSession.startTime) / 60000;
-    const shouldSuggestBreak =
-        (consecutiveStressUpdates > 12 && now - lastBreakSuggestion > 600_000) || // Stressed 2+ min, max every 10 min
-        (sessionMin > 50 && now - lastBreakSuggestion > 1800_000); // 50+ min, max every 30 min
-
-    if (shouldSuggestBreak) {
-        lastBreakSuggestion = now;
-        consecutiveStressUpdates = 0;
-
-        let reason = "You've been working for a while.";
-        if (state === "HYPER" && bio?.heart_rate && bio.heart_rate > 85) {
-            reason = `Your heart rate is elevated (${Math.round(bio.heart_rate)} BPM). Your body needs a reset.`;
-        } else if (sessionMin > 50) {
-            reason = `You've been in this session for ${Math.round(sessionMin)} minutes. A short break boosts retention.`;
-        }
-
-        injectToast("Time for a break", reason + " Step away for 5 minutes.");
-        broadcastToPopup({ type: "BREAK_SUGGESTED", reason });
     }
 }
 

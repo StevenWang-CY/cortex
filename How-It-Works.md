@@ -1,6 +1,8 @@
 # How It Works
 
-Cortex is a five-layer real-time loop that senses physiology/behavior, estimates cognitive state, decides whether to intervene, and executes one-click workspace actions.
+Cortex is a five-layer local loop that observes available signals, forms an
+abstaining workspace-support hypothesis, decides whether a suggestion is
+eligible, and presents reversible workspace proposals.
 
 ## Pipeline
 
@@ -8,7 +10,7 @@ Cortex is a five-layer real-time loop that senses physiology/behavior, estimates
 Webcam + Input Telemetry
         │
         ▼
-L1 Bio-Extraction
+L1 Observation extraction
   rPPG (POS/CHROM/green or optional ONNX TSCAN)
   Respiration (BVP + motion proxy fusion)
   Blink/EAR/PERCLOS + head pose + posture
@@ -18,9 +20,9 @@ SQI Gate (NSQI + SNR + motion + face-loss)
         │
         ▼
 L2 State Engine
-  Personalized rule scoring + optional ML classifier
+  Named, availability-aware deterministic support rules
   EMA smoothing + Schmitt hysteresis + dwell
-  Stress integral + specialized detectors
+  UNKNOWN while evidence is warming, missing, or ambiguous
         │
         ▼
 L3 Trigger Policy
@@ -44,23 +46,31 @@ L5 Intervention Execution
 - rPPG backends: `pos` (default), `chrom`, `green`, `tscan` (ONNX, auto-fallback to POS on failure).
 - Adaptive ROI fusion: forehead/cheeks weighted by luminance/chroma stability and head-jitter penalties.
 - Composite SQI is computed and propagated as `physio_sqi` with components; low-quality windows are marked invalid.
-- HRV metrics from rolling IBI buffer: `RMSSD`, `SDNN`, `pNN50`, `SD1`, `SD2`, `LF/HF` (Lomb-Scargle), sample entropy.
-- HRV requires sustained window readiness (60s gate) before emission.
-- Respiration uses BVP modulation plus motion proxy, confidence-weighted.
+- HRV and respiration prototypes remain research-only and are unavailable in
+  production pending metric-specific reference validation.
 - Blink features include `perclos_60s`, mean blink duration, EAR variance, and personalized EAR threshold support.
 - Telemetry adds correction rate and scroll-back rate alongside keystroke/mouse variability features.
 
 ## L2: State Engine
 
-- FLOW signature was corrected to near-baseline HR/HRV bands plus behavioral stability.
-- Thresholding is personalized via baseline distributions when available (fallbacks remain conservative).
-- Confidence output is calibrated from probability normalization; Schmitt hysteresis is retained.
+- Production support rules use only behavior aggregates with named validity,
+  quality, age, source exposure, and missing reasons.
+- Fixed denominators ensure missing/lower-quality evidence cannot increase a
+  score. Scores are evidence strengths, never normalized probabilities.
+- Steady activity requires affirmative recent interaction. Quiet activity
+  requires observed inactivity and another corroborating channel.
+- Camera pulse, blink, and head/neck values are excluded from support scoring.
+- The engine starts `UNKNOWN` and exposes `warming_up` or
+  `insufficient_evidence` rather than defaulting to a state.
 - Dwell defaults:
   - `HYPER = 30s`
   - `HYPO = 60s`
   - `FLOW = 120s`
-- Stress integral now uses standardized HRV deficit and supports explicit recovery credit.
-- Optional per-user logistic classifier (`ml_classifier.py`) is available for labeled-session calibration.
+- Recovery is temporal and can only follow a confirmed support-likely episode.
+- No learned classifier or physiology-driven break policy ships. The optional
+  break reminder is user-enabled and based only on elapsed active-work time.
+- Model identity, feature-schema digest, contribution details, and a
+  `safety_null` rollback are present on the production path.
 
 ## L3: Trigger Policy + AMIP
 
@@ -100,6 +110,9 @@ L5 Intervention Execution
 - AMIP regret smoke: `cortex/tests/eval/test_amip_regret.py`
 - IPS unbiasedness: `cortex/tests/eval/test_ips_unbiased.py`
 - Safety floor invariants: `cortex/tests/eval/test_safety_floor.py`
-- ML calibration/Brier: `cortex/tests/state_engine/test_calibration.py`
+- Evidence/missingness/replay/rollback gates:
+  `cortex/tests/unit/test_evidence_aware_support.py`
+- Participant-held-out research scaffolding:
+  `cortex/services/state_engine/evaluation_protocol.py`
 - LLM graceful degradation: `cortex/tests/unit/test_llm_safety_refinements.py`
 - Dataset-gated UBFC/PURE replay: `cortex/tests/physio/test_rppg_ubfc.py`

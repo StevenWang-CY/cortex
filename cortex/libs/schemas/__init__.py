@@ -91,6 +91,8 @@ from cortex.libs.schemas.eval import (
     InterventionSnapshot,
 )
 from cortex.libs.schemas.features import (
+    FeatureName,
+    FeatureValue,
     FeatureVector,
     FrameMeta,
     KinematicFeatures,
@@ -170,10 +172,16 @@ from cortex.libs.schemas.session_report import (
     SessionReport,
 )
 from cortex.libs.schemas.state import (
+    EstimateStatus,
+    FeatureContribution,
+    InferenceModelIdentity,
+    RuleEvaluation,
     SignalQuality,
     StateEstimate,
     StateScores,
     StateTransition,
+    SupportScores,
+    SupportState,
     UserBaselines,
     UserState,
 )
@@ -235,6 +243,8 @@ __all__ = [
     "PhysioFeatures",
     "KinematicFeatures",
     "TelemetryFeatures",
+    "FeatureName",
+    "FeatureValue",
     "FeatureVector",
     # Physiology evidence
     "EvidenceStatus",
@@ -258,8 +268,14 @@ __all__ = [
     "ObservationEnvelope",
     # State
     "UserState",
+    "SupportState",
+    "EstimateStatus",
     "SignalQuality",
     "StateScores",
+    "SupportScores",
+    "FeatureContribution",
+    "InferenceModelIdentity",
+    "RuleEvaluation",
     "StateEstimate",
     "UserBaselines",
     "StateTransition",

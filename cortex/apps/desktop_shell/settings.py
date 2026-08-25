@@ -543,16 +543,17 @@ class SettingsDialog(QWidget):
         fp_inner.setSpacing(SP3)
 
         self._auto_distraction_block = QCheckBox(
-            "Auto-arm focus session when overwhelmed",
+            "Auto-arm a focus session when support may help",
         )
         self._auto_distraction_block.setChecked(False)
         self._auto_distraction_block.setStyleSheet(_CHECKBOX_QSS)
         fp_inner.addWidget(self._auto_distraction_block)
 
         fp_help = QLabel(
-            "When Cortex detects sustained overwhelm (HYPER state), "
-            "block known-distracting sites for a focus session. You "
-            "can disarm at any time."
+            "When sustained behavior-only evidence reaches your support "
+            "threshold, block known-distracting sites for a focus session. "
+            "Camera and biometric signals are not used. You can disarm at "
+            "any time."
         )
         fp_help.setFont(mac_native.system_font(FS_CAPTION, "regular"))
         fp_help.setStyleSheet(
@@ -1037,12 +1038,13 @@ class SettingsDialog(QWidget):
         # them by purpose rather than "checkbox" / "combo box".
         set_accessible_name(
             self._auto_distraction_block,
-            "Auto-arm focus session when overwhelmed",
+            "Auto-arm a focus session when support may help",
         )
         set_accessible_description(
             self._auto_distraction_block,
-            "When Cortex detects sustained overwhelm (HYPER state), "
-            "block known-distracting sites for a focus session.",
+            "When sustained behavior-only evidence reaches the support "
+            "threshold, block known-distracting sites. Camera and biometric "
+            "signals are not used.",
         )
         set_accessible_name(self._distraction_preset, "Blocklist preset")
         set_accessible_name(

@@ -100,11 +100,21 @@ describe("CortexPanelProvider – P0-4 subscription resilience", () => {
         // First fire — postMessage throws internally; the try/catch must
         // swallow the error and keep the subscription alive.
         expect(() => {
-            client.fireState({ state: "HYPER", confidence: 0.9 });
+            client.fireState({
+                state: "HYPER",
+                status: "estimated",
+                confidence: 0.9,
+                evidence_coverage: 0.8,
+            });
         }).not.toThrow();
 
         // Second fire — postMessage no longer throws; the message must land.
-        client.fireState({ state: "FLOW", confidence: 0.7 });
+        client.fireState({
+            state: "FLOW",
+            status: "estimated",
+            confidence: 0.7,
+            evidence_coverage: 0.8,
+        });
 
         // The second postMessage (callCount===2) must have reached the stub.
         expect(capturedMessages.length).toBe(1);

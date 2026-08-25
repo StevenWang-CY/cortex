@@ -63,11 +63,21 @@ def _flow_telemetry() -> TelemetryFeatures:
         mouse_jerk_score=0.1,
         click_burst_score=0.1,
         click_frequency=0.5,
+        keypress_rate_per_min=60.0,
         keyboard_burst_score=0.2,
         keystroke_interval_variance=500.0,
         backspace_density=0.05,
+        correction_rate_per_100_keys=5.0,
         inactivity_seconds=2.0,
-        window_switch_rate=5.0,  # moderate switching
+        window_switch_rate=3.0,
+        scroll_back_rate_per_min=1.0,
+        observation_window_seconds=15.0,
+        mouse_move_count=50,
+        click_press_count=8,
+        key_press_count=30,
+        scroll_event_count=10,
+        window_focus_event_count=2,
+        window_focus_source_available=True,
     )
 
 
@@ -106,11 +116,21 @@ def _hyper_telemetry() -> TelemetryFeatures:
         mouse_jerk_score=0.8,
         click_burst_score=0.7,
         click_frequency=3.0,
+        keypress_rate_per_min=90.0,
         keyboard_burst_score=0.6,
         keystroke_interval_variance=8000.0,
         backspace_density=0.3,
+        correction_rate_per_100_keys=25.0,
         inactivity_seconds=0.5,
         window_switch_rate=25.0,  # rapid switching
+        scroll_back_rate_per_min=40.0,
+        observation_window_seconds=15.0,
+        mouse_move_count=80,
+        click_press_count=45,
+        key_press_count=35,
+        scroll_event_count=50,
+        window_focus_event_count=7,
+        window_focus_source_available=True,
     )
 
 
@@ -149,11 +169,21 @@ def _hypo_telemetry() -> TelemetryFeatures:
         mouse_jerk_score=0.0,
         click_burst_score=0.0,
         click_frequency=0.1,
+        keypress_rate_per_min=0.0,
         keyboard_burst_score=0.0,
         keystroke_interval_variance=100.0,
         backspace_density=0.0,
-        inactivity_seconds=25.0,
+        correction_rate_per_100_keys=None,
+        inactivity_seconds=300.0,
         window_switch_rate=1.0,  # minimal switching
+        scroll_back_rate_per_min=0.0,
+        observation_window_seconds=15.0,
+        mouse_move_count=2,
+        click_press_count=0,
+        key_press_count=0,
+        scroll_event_count=0,
+        window_focus_event_count=1,
+        window_focus_source_available=True,
     )
 
 
@@ -176,7 +206,7 @@ class TestCaptureToStateFlow:
         fusion.update_telemetry(_flow_telemetry(), ts)
 
         vector, quality = fusion.fuse(ts)
-        scores = scorer.compute_scores(vector)
+        scores = scorer.evaluate(vector).scores.to_legacy()
 
         assert scores.flow > scores.hyper, (
             f"FLOW ({scores.flow:.2f}) should dominate HYPER ({scores.hyper:.2f})"
@@ -189,7 +219,9 @@ class TestCaptureToStateFlow:
         """Smoother should confirm FLOW after dwell time (starts in FLOW)."""
         fusion = FeatureFusion()
         scorer = RuleScorer()
-        smoother = ScoreSmoother()
+        smoother = ScoreSmoother(
+            StateConfig(flow_dwell_seconds=2, ema_alpha=0.5)
+        )
 
         ts = 1000.0
         for i in range(20):
@@ -199,8 +231,8 @@ class TestCaptureToStateFlow:
             fusion.update_telemetry(_flow_telemetry(), t)
 
             vector, quality = fusion.fuse(t)
-            scores = scorer.compute_scores(vector)
-            estimate = smoother.update(scores, quality, t)
+            evaluation = scorer.evaluate(vector)
+            estimate = smoother.update(evaluation, quality, t)
 
         assert estimate.state == "FLOW"
         assert estimate.confidence > 0.3
@@ -220,7 +252,7 @@ class TestCaptureToStateHyper:
         fusion.update_telemetry(_hyper_telemetry(), ts)
 
         vector, quality = fusion.fuse(ts)
-        scores = scorer.compute_scores(vector)
+        scores = scorer.evaluate(vector).scores.to_legacy()
 
         assert scores.hyper > 0.5, f"Hyper score should be significant: {scores.hyper:.2f}"
         assert scores.hyper > scores.flow, "Hyper should dominate flow"
@@ -234,6 +266,9 @@ class TestCaptureToStateHyper:
             hyper_dwell_seconds=2,  # 2s dwell for faster test
             entry_threshold=0.5,   # lower threshold
             exit_threshold=0.3,
+            estimate_entry_threshold=0.35,
+            estimate_exit_threshold=0.2,
+            ema_alpha=0.5,
         )
         smoother = ScoreSmoother(config=config)
 
@@ -248,8 +283,8 @@ class TestCaptureToStateHyper:
             fusion.update_telemetry(_hyper_telemetry(), t)
 
             vector, quality = fusion.fuse(t)
-            scores = scorer.compute_scores(vector)
-            estimate = smoother.update(scores, quality, t)
+            evaluation = scorer.evaluate(vector)
+            estimate = smoother.update(evaluation, quality, t)
             latest_state = estimate.state
 
         assert latest_state == "HYPER", f"Expected HYPER state, got {latest_state}"
@@ -269,7 +304,7 @@ class TestCaptureToStateHypo:
         fusion.update_telemetry(_hypo_telemetry(), ts)
 
         vector, quality = fusion.fuse(ts)
-        scores = scorer.compute_scores(vector)
+        scores = scorer.evaluate(vector).scores.to_legacy()
 
         assert scores.hypo > 0.3, f"Hypo score should be notable: {scores.hypo:.2f}"
 
@@ -322,8 +357,12 @@ class TestStateTransitions:
         scorer = RuleScorer()
         config = StateConfig(
             hyper_dwell_seconds=1,
+            flow_dwell_seconds=1,
             entry_threshold=0.5,
             exit_threshold=0.3,
+            estimate_entry_threshold=0.35,
+            estimate_exit_threshold=0.2,
+            ema_alpha=0.5,
         )
         smoother = ScoreSmoother(config=config)
 
@@ -336,8 +375,8 @@ class TestStateTransitions:
             fusion.update_kinematics(_flow_kinematics(), t)
             fusion.update_telemetry(_flow_telemetry(), t)
             vector, quality = fusion.fuse(t)
-            scores = scorer.compute_scores(vector)
-            smoother.update(scores, quality, t)
+            evaluation = scorer.evaluate(vector)
+            smoother.update(evaluation, quality, t)
 
         # Switch to HYPER signals
         for i in range(30):
@@ -346,8 +385,8 @@ class TestStateTransitions:
             fusion.update_kinematics(_hyper_kinematics(), t)
             fusion.update_telemetry(_hyper_telemetry(), t)
             vector, quality = fusion.fuse(t)
-            scores = scorer.compute_scores(vector)
-            estimate = smoother.update(scores, quality, t)
+            evaluation = scorer.evaluate(vector)
+            estimate = smoother.update(evaluation, quality, t)
 
         # Check that at least one transition was recorded
         transitions = smoother.transitions

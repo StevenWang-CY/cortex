@@ -7,12 +7,65 @@ webcam, face tracking, and telemetry sources.
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from cortex.libs.schemas.observations import MissingReason
 from cortex.libs.schemas.physiology import SignalEstimate
+
+
+class FeatureName(StrEnum):
+    """Stable names for measurements that may reach support inference.
+
+    The names describe measurements, not interpretations. Whether a feature
+    is eligible for a production rule or a research model is owned by the
+    versioned catalog in ``state_engine.feature_schema``.
+    """
+
+    HEART_RATE_BPM = "heart_rate_bpm"
+    BLINK_RATE_PER_MIN = "blink_rate_per_min"
+    HEAD_NECK_FLEXION_SCORE = "head_neck_flexion_score"
+    MOUSE_VELOCITY_MEAN = "mouse_velocity_mean"
+    MOUSE_VELOCITY_VARIANCE = "mouse_velocity_variance"
+    CLICK_FREQUENCY = "click_frequency"
+    KEYPRESS_RATE_PER_MIN = "keypress_rate_per_min"
+    KEYSTROKE_INTERVAL_VARIANCE = "keystroke_interval_variance"
+    CORRECTION_RATE_PER_100_KEYS = "correction_rate_per_100_keys"
+    INACTIVITY_SECONDS = "inactivity_seconds"
+    TAB_SWITCH_RATE_PER_MIN = "tab_switch_rate_per_min"
+    SCROLL_BACK_RATE_PER_MIN = "scroll_back_rate_per_min"
+    THRASHING_SCORE = "thrashing_score"
+
+
+class FeatureValue(BaseModel):
+    """One named, provenance-bearing input to the support engine."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, use_enum_values=True)
+
+    value: float | None = None
+    valid: bool = False
+    quality: float = Field(0.0, ge=0.0, le=1.0)
+    age_ms: int = Field(0, ge=0)
+    source_window_ms: int = Field(..., ge=0)
+    algorithm_version: str = Field(..., min_length=1)
+    missing_reason: MissingReason | None = None
+
+    @model_validator(mode="after")
+    def _validity_is_coherent(self) -> FeatureValue:
+        if self.valid:
+            if self.value is None:
+                raise ValueError("valid feature values must contain a value")
+            if self.missing_reason is not None:
+                raise ValueError("valid feature values cannot have a missing_reason")
+        else:
+            if self.value is not None:
+                raise ValueError("invalid feature values cannot contain a value")
+            if self.missing_reason is None:
+                raise ValueError("invalid feature values require a missing_reason")
+        return self
 
 
 class FrameMeta(BaseModel):
@@ -268,6 +321,11 @@ class TelemetryFeatures(BaseModel):
         ..., ge=0.0, le=1.0, description="Rapid clicking burst score"
     )
     click_frequency: float = Field(..., ge=0.0, description="Clicks per second")
+    keypress_rate_per_min: float | None = Field(
+        None,
+        ge=0.0,
+        description="Observed typing-key presses per minute over the source window",
+    )
     keyboard_burst_score: float = Field(
         ..., ge=0.0, le=1.0, description="Typing intensity burst score"
     )
@@ -293,14 +351,33 @@ class TelemetryFeatures(BaseModel):
     scroll_back_rate_per_min: float | None = Field(
         None, ge=0.0, description="Upward reread scroll bursts per minute"
     )
+    observation_window_seconds: float | None = Field(
+        None,
+        gt=0.0,
+        description="Actual telemetry aggregation window; required by v2 inference",
+    )
+    mouse_move_count: int | None = Field(None, ge=0)
+    click_press_count: int | None = Field(None, ge=0)
+    key_press_count: int | None = Field(None, ge=0)
+    scroll_event_count: int | None = Field(None, ge=0)
+    window_focus_event_count: int | None = Field(None, ge=0)
+    window_focus_source_available: bool = Field(
+        False,
+        description=(
+            "Whether window tracking was running or produced an observed event; "
+            "false means zero switch rate is not an observation."
+        ),
+    )
 
 
 class FeatureVector(BaseModel):
     """
-    Unified 14-dimensional feature vector produced every 500ms.
+    Unified feature snapshot produced every 500ms.
 
-    Combines physiological, kinematic, and telemetry features into a single
-    vector for state classification.
+    ``features`` is the canonical v2 contract. The flat fields remain for one
+    compatibility cycle while non-inference consumers migrate. A missing
+    source is represented by an invalid :class:`FeatureValue`, never by a
+    fabricated numeric zero.
     """
 
     timestamp: float = Field(
@@ -325,6 +402,10 @@ class FeatureVector(BaseModel):
     boot_id: UUID | None = Field(
         None,
         description="Clock domain for observed_at_mono_ns.",
+    )
+    features: dict[FeatureName, FeatureValue] = Field(
+        default_factory=dict,
+        description="Named measurements with validity, quality, age, and provenance.",
     )
 
     # Physiological features (1-3)
@@ -386,11 +467,22 @@ class FeatureVector(BaseModel):
         0.0, ge=0.0, description="Mouse velocity variance"
     )
     click_frequency: float = Field(0.0, ge=0.0, description="Clicks per second")
+    keypress_rate_per_min: float = Field(
+        0.0, ge=0.0, description="Typing-key presses per minute"
+    )
     keystroke_interval_variance: float = Field(
         0.0, ge=0.0, description="Keystroke interval variance (ms^2)"
     )
     correction_rate_per_100_keys: float | None = Field(
         None, ge=0.0, description="Backspace + undo corrections per 100 keys"
+    )
+    inactivity_seconds: float = Field(
+        0.0,
+        ge=0.0,
+        description=(
+            "Seconds since the last input event. The value is evidence only "
+            "when the named telemetry feature is valid."
+        ),
     )
     tab_switch_frequency: float = Field(
         0.0, ge=0.0, description="Tab/window switches per minute"
@@ -440,7 +532,11 @@ class FeatureVector(BaseModel):
         return self
 
     def to_array(self) -> list[float | None]:
-        """Convert feature vector to a list for ML inference."""
+        """Legacy array projection; production inference does not use it.
+
+        New model code must use ``FeatureSchema.to_ordered_array`` so input
+        order, transformations, missingness, and exact dimension are versioned.
+        """
         return [
             self.hr,
             self.hrv_rmssd,
@@ -475,9 +571,9 @@ class FeatureVector(BaseModel):
 
     @property
     def has_telemetry(self) -> bool:
-        """Check if telemetry features are non-zero."""
-        return (
-            self.mouse_velocity_mean > 0
-            or self.click_frequency > 0
-            or self.keystroke_interval_variance > 0
-        )
+        """Whether a real telemetry snapshot has been observed.
+
+        Zero activity is a legitimate observation, so value-based truthiness
+        would incorrectly call an idle but connected input stream missing.
+        """
+        return self.telemetry_seen_count > 0

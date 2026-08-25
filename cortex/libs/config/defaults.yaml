@@ -41,6 +41,10 @@ state:
   # Hysteresis thresholds
   entry_threshold: 0.85
   exit_threshold: 0.70
+  estimate_entry_threshold: 0.40
+  estimate_exit_threshold: 0.25
+  # Set to safety_null for an operational fail-closed rollback.
+  inference_mode: deterministic
 
   # Dwell times (seconds before state transition)
   hyper_dwell_seconds: 30
@@ -103,6 +107,13 @@ intervention:
   # Compatibility-only. Runtime coercion keeps this false until the
   # underlying physiology is reference-validated.
   enable_biology_break: false
+
+  # Opt-in, preference-based reminder. Active time pauses while input is idle;
+  # camera, pulse, HRV, and support labels are never inputs to this policy.
+  enable_focus_break_reminders: false
+  focus_break_interval_minutes: 50
+  focus_break_duration_seconds: 300
+  focus_break_inactivity_pause_seconds: 60.0
 
   # P0 §3.10 — Auto-armed distraction blocking on sustained HYPER.
   # Defaults OFF (principle of least surprise; users opt in from Settings).

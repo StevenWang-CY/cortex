@@ -2546,39 +2546,20 @@ class WebSocketServer:
     ) -> WSMessage:
         """Create a STATE_UPDATE message.
 
-        Surfaces every v0.2.0 transparency field consumers may want to
-        display: ``stress_integral`` for break-readiness UI,
-        ``calibrated_probabilities`` for confidence bars,
-        ``classifier_source``/``classifier_alpha`` for debug overlays,
-        and ``timestamp`` so clients can detect stale broadcasts.
+        Surfaces the canonical support state, evidence status/coverage,
+        deterministic scores, exclusions, and model identity. Probability
+        fields remain absent unless a future registered calibrated model runs.
         """
         self._sequence += 1
-        # F18 (audit Wave-2): mirror the ``StateInferResponse`` envelope
-        # onto the WS broadcast. The dashboard's "classifier unavailable"
-        # banner reads ``payload.get("degraded")`` / ``payload.get("source")``
-        # off the STATE_UPDATE payload; before this stamp the banner could
-        # never fire through the WS path because the producer omitted the
-        # fields. ``source`` is the literal pair ``classifier`` /
-        # ``fallback`` so the reader can branch without conflating with
-        # the debug-overlay ``classifier_source`` field (``rule`` / ``ml`` /
-        # ``ensemble``).
-        #
-        # P1 fix (finding #3): ``degraded`` must reflect a REAL degradation
-        # condition, not a flag that is always False in production. The
-        # live smoother always stamps ``classifier_source`` ("rule" /
-        # "ml" / "ensemble") so ``classifier_source is None`` alone never
-        # fired for a genuinely poor signal. We now degrade when EITHER:
-        #   (a) no real classifier ran (``classifier_source is None`` —
-        #       the synthetic ``/state/infer`` fallback path), OR
-        #   (b) the fused signal quality fell below the acceptability
-        #       floor (``SignalQuality.acceptable`` → ``overall >= 0.3``),
-        #       meaning the estimate is being produced on noise the UI
-        #       should not present as authoritative.
+        # Mirror availability onto the WS envelope. ``rules`` means the
+        # registered deterministic engine ran; ``fallback`` is fail-closed.
+        # A rules frame can still be degraded while evidence warms or is
+        # insufficient, and clients render that status explicitly.
         no_classifier = estimate.classifier_source is None
-        signal_too_low = not estimate.signal_quality.acceptable
-        degraded = no_classifier or signal_too_low
-        envelope_source: Literal["classifier", "fallback"] = (
-            "fallback" if degraded else "classifier"
+        evidence_unavailable = estimate.status != "estimated"
+        degraded = no_classifier or evidence_unavailable
+        envelope_source: Literal["rules", "classifier", "fallback"] = (
+            "fallback" if no_classifier else "rules"
         )
 
         # ── Capture status sub-payload ─────────────────────────────────
@@ -2671,18 +2652,30 @@ class WebSocketServer:
         # ── Build typed payload model ───────────────────────────────────
         payload_model = StateUpdatePayload(
             state=estimate.state,
+            support_state=estimate.support_state,
+            status=estimate.status,
             confidence=estimate.confidence,
             scores=estimate.scores,
+            support_scores=estimate.support_scores,
+            evidence_coverage=estimate.evidence_coverage,
+            contributing_features=estimate.contributing_features,
+            exclusions=estimate.exclusions,
+            model=estimate.model,
+            probabilities=estimate.probabilities,
             signal_quality=estimate.signal_quality,
             dwell_seconds=estimate.dwell_seconds,
             reasons=list(estimate.reasons),
             stress_integral=estimate.stress_integral,
-            calibrated_probabilities=estimate.calibrated_probabilities,
+            calibrated_probabilities=estimate.__dict__.get(
+                "calibrated_probabilities"
+            ),
             classifier_source=estimate.classifier_source,
             classifier_alpha=estimate.classifier_alpha,
             source=envelope_source,
             degraded=degraded,
-            timestamp=_serialize_timestamp(estimate.timestamp),
+            timestamp=_serialize_timestamp(
+                estimate.__dict__.get("timestamp")
+            ),
             observed_at_unix_ms=estimate.observed_at_unix_ms,
             observed_at_mono_ns=estimate.observed_at_mono_ns,
             boot_id=estimate.boot_id,

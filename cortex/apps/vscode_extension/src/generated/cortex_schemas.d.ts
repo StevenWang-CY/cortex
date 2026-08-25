@@ -3,7 +3,7 @@
 //
 // Source of truth: cortex/libs/schemas/*.py (Pydantic v2 models).
 // Schema package: cortex-wire/2.0
-// Source SHA-256: 3d67721d3d0dd1462da5aa256a42899fe5c5fa92b12b543a58c68c00d8c892aa
+// Source SHA-256: 422a2b265f6e0f1862dc1a4adf4d967a4a6d68084cabf295a1c7caf557ebd43c
 // Drift-gate: a pre-commit hook and the GitHub Actions CI run
 //   `python -m cortex.scripts.generate_ts_schemas --check`
 // and fail if this file is out of sync with the Python models.
@@ -71,9 +71,17 @@ export type MissingReason =
   | "ARTIFACT"
   | "UNKNOWN";
 /**
- * Classified user state
+ * Decision-support target names that avoid diagnostic claims.
  */
-export type UserState = "FLOW" | "HYPO" | "HYPER" | "RECOVERY";
+export type SupportState = "support_likely" | "under_engaged" | "flow_like" | "recovering" | "unknown";
+/**
+ * Deprecated uppercase compatibility alias
+ */
+export type UserState = "UNKNOWN" | "FLOW" | "HYPO" | "HYPER" | "RECOVERY";
+/**
+ * Whether the current support estimate is actionable.
+ */
+export type EstimateStatus = "estimated" | "insufficient_evidence" | "warming_up";
 /**
  * Closed metric catalog; unsupported metrics remain explicit.
  */
@@ -91,6 +99,10 @@ export type PhysiologyMetric =
  * Publication/readiness state of a physiological estimate.
  */
 export type EvidenceStatus = "supported" | "experimental" | "unavailable" | "rejected";
+/**
+ * Whether the current support estimate is actionable.
+ */
+export type EstimateStatus1 = "estimated" | "insufficient_evidence" | "warming_up";
 /**
  * Wire-level message type; see ``MessageType``.
  */
@@ -195,6 +207,10 @@ export type LeetCodeMode =
  * Current problem-solving stage
  */
 export type LeetCodeStage1 = "READ" | "PLAN" | "IMPLEMENT" | "DEBUG" | "REFLECT";
+/**
+ * Whether the current support estimate is actionable.
+ */
+export type EstimateStatus2 = "estimated" | "insufficient_evidence" | "warming_up";
 
 export interface AckResponse {
   schema_version?: "1.0" | "2.0";
@@ -1064,10 +1080,36 @@ export interface EventTime {
   boot_id: string;
 }
 /**
- * Unified 14-dimensional feature vector produced every 500ms.
+ * Auditable contribution of one observed or missing feature.
+ */
+export interface FeatureContribution {
+  feature: string;
+  support_state: SupportState;
+  direction: "positive" | "negative" | "missing";
+  contribution: number;
+  quality: number;
+  observed: boolean;
+  note: string;
+}
+/**
+ * One named, provenance-bearing input to the support engine.
+ */
+export interface FeatureValue {
+  value?: number | null;
+  valid?: boolean;
+  quality?: number;
+  age_ms?: number;
+  source_window_ms: number;
+  algorithm_version: string;
+  missing_reason?: MissingReason | null;
+}
+/**
+ * Unified feature snapshot produced every 500ms.
  *
- * Combines physiological, kinematic, and telemetry features into a single
- * vector for state classification.
+ * ``features`` is the canonical v2 contract. The flat fields remain for one
+ * compatibility cycle while non-inference consumers migrate. A missing
+ * source is represented by an invalid :class:`FeatureValue`, never by a
+ * fabricated numeric zero.
  */
 export interface FeatureVector {
   /**
@@ -1088,6 +1130,12 @@ export interface FeatureVector {
    * Clock domain for observed_at_mono_ns.
    */
   boot_id?: string | null;
+  /**
+   * Named measurements with validity, quality, age, and provenance.
+   */
+  features?: {
+    [k: string]: FeatureValue;
+  };
   /**
    * Instantaneous heart rate (BPM)
    */
@@ -1153,6 +1201,10 @@ export interface FeatureVector {
    */
   click_frequency?: number;
   /**
+   * Typing-key presses per minute
+   */
+  keypress_rate_per_min?: number;
+  /**
    * Keystroke interval variance (ms^2)
    */
   keystroke_interval_variance?: number;
@@ -1160,6 +1212,10 @@ export interface FeatureVector {
    * Backspace + undo corrections per 100 keys
    */
   correction_rate_per_100_keys?: number | null;
+  /**
+   * Seconds since the last input event. The value is evidence only when the named telemetry feature is valid.
+   */
+  inactivity_seconds?: number;
   /**
    * Tab/window switches per minute
    */
@@ -1491,6 +1547,17 @@ export interface HelpfulnessSummaryResponse {
   engagement_rate?: number;
   positive_rate?: number;
   recent_rewards?: number[];
+}
+/**
+ * Identity and evidence maturity of a support inference implementation.
+ */
+export interface InferenceModelIdentity {
+  name: string;
+  version: string;
+  feature_schema_version: string;
+  implementation_sha256?: string | null;
+  validation_status: "deterministic_rules" | "research_only" | "validated" | "unregistered";
+  probability_calibration_artifact_id?: string | null;
 }
 /**
  * Interval derived only from two named canonical beats.
@@ -2121,12 +2188,27 @@ export interface LLMPlanRequest {
  * Produced every 500ms from fused feature vectors.
  */
 export interface StateEstimate {
+  estimate_id?: string;
   state: UserState;
   /**
-   * Confidence in state classification
+   * Canonical decision-support state
+   */
+  support_state?: SupportState | null;
+  status?: EstimateStatus;
+  /**
+   * Deprecated compatibility name for bounded evidence strength; not a probability or diagnostic confidence.
    */
   confidence: number;
   scores: StateScores;
+  support_scores?: SupportScores | null;
+  evidence_coverage?: number;
+  contributing_features?: FeatureContribution[];
+  exclusions?: string[];
+  model?: InferenceModelIdentity;
+  /**
+   * Only present for a registered model with a calibration artifact.
+   */
+  probabilities?: SupportScores | null;
   /**
    * Human-readable reasons for current state
    */
@@ -2150,7 +2232,8 @@ export interface StateEstimate {
    */
   stress_integral?: number | null;
   /**
-   * Calibrated class probabilities (optional ML/rule ensemble output)
+   * @deprecated
+   * Deprecated compatibility field; absent for deterministic rules.
    */
   calibrated_probabilities?: StateScores1 | null;
   /**
@@ -2163,25 +2246,34 @@ export interface StateEstimate {
   classifier_alpha?: number | null;
 }
 /**
- * Raw scores for each state
+ * Deprecated uppercase projection of heuristic scores
  */
 export interface StateScores {
   /**
-   * Flow state score
+   * Legacy flow-like score
    */
   flow?: number;
   /**
-   * Hypo-arousal score
+   * Legacy under-engaged score
    */
   hypo?: number;
   /**
-   * Hyper-arousal score
+   * Legacy support-likely score
    */
   hyper?: number;
   /**
-   * Recovery state score
+   * Legacy recovering score
    */
   recovery?: number;
+}
+/**
+ * Bounded deterministic support scores; these are not probabilities.
+ */
+export interface SupportScores {
+  support_likely?: number;
+  under_engaged?: number;
+  flow_like?: number;
+  recovering?: number;
 }
 /**
  * Signal quality per channel
@@ -2213,19 +2305,19 @@ export interface SignalQuality {
  */
 export interface StateScores1 {
   /**
-   * Flow state score
+   * Legacy flow-like score
    */
   flow?: number;
   /**
-   * Hypo-arousal score
+   * Legacy under-engaged score
    */
   hypo?: number;
   /**
-   * Hyper-arousal score
+   * Legacy support-likely score
    */
   hyper?: number;
   /**
-   * Recovery state score
+   * Legacy recovering score
    */
   recovery?: number;
 }
@@ -2446,6 +2538,20 @@ export interface RaiseDashboardResponse {
   command: "raise_dashboard";
   status: "ok";
   http_status: number;
+}
+/**
+ * Stateless Level-A rule output consumed by the temporal smoother.
+ */
+export interface RuleEvaluation {
+  status: EstimateStatus1;
+  scores: SupportScores;
+  evidence_coverage: number;
+  state_coverage?: {
+    [k: string]: number;
+  };
+  contributing_features?: FeatureContribution[];
+  exclusions?: string[];
+  model: InferenceModelIdentity;
 }
 /**
  * Reply envelope for ``REQUEST_SESSION_DETAIL`` / ``REQUEST_SESSION_RECAP``.
@@ -2709,7 +2815,7 @@ export interface StateInferResponse {
    */
   timestamp?: number | null;
   estimate: StateEstimate;
-  source?: "classifier" | "fallback";
+  source?: "rules" | "classifier" | "fallback";
   degraded?: boolean;
 }
 /**
@@ -2728,11 +2834,11 @@ export interface StateTransition1 {
   /**
    * Previous state
    */
-  from_state: "FLOW" | "HYPO" | "HYPER" | "RECOVERY";
+  from_state: "UNKNOWN" | "FLOW" | "HYPO" | "HYPER" | "RECOVERY";
   /**
    * New state
    */
-  to_state: "FLOW" | "HYPO" | "HYPER" | "RECOVERY";
+  to_state: "UNKNOWN" | "FLOW" | "HYPO" | "HYPER" | "RECOVERY";
   /**
    * Confidence before transition
    */
@@ -2765,7 +2871,12 @@ export interface StatusResponse {
   timestamp?: number | null;
   status?: "initializing" | "ready" | "degraded";
   state?: string | null;
+  support_state?: SupportState | null;
+  estimate_status?: EstimateStatus1 | null;
   confidence?: number | null;
+  evidence_strength?: number | null;
+  evidence_coverage?: number | null;
+  model?: InferenceModelIdentity | null;
   signal_quality?: SignalQuality1 | null;
   features?: FeatureVector | null;
 }
@@ -2819,6 +2930,10 @@ export interface TelemetryFeatures {
    */
   click_frequency: number;
   /**
+   * Observed typing-key presses per minute over the source window
+   */
+  keypress_rate_per_min?: number | null;
+  /**
    * Typing intensity burst score
    */
   keyboard_burst_score: number;
@@ -2854,6 +2969,19 @@ export interface TelemetryFeatures {
    * Upward reread scroll bursts per minute
    */
   scroll_back_rate_per_min?: number | null;
+  /**
+   * Actual telemetry aggregation window; required by v2 inference
+   */
+  observation_window_seconds?: number | null;
+  mouse_move_count?: number | null;
+  click_press_count?: number | null;
+  key_press_count?: number | null;
+  scroll_event_count?: number | null;
+  window_focus_event_count?: number | null;
+  /**
+   * Whether window tracking was running or produced an observed event; false means zero switch rate is not an observation.
+   */
+  window_focus_source_available?: boolean;
 }
 /**
  * Documented envelope for ``REQUEST_TRENDS`` payloads.
@@ -3507,16 +3635,11 @@ export interface BiometricsSummary {
   stress_integral?: number | null;
 }
 /**
- * P0 §3.7: BREAK_RECOMMENDATION wire payload.
+ * Opt-in elapsed-focus BREAK_RECOMMENDATION wire payload.
  *
- * Emitted exactly once per ``StressIntegralTracker.should_break``
- * False → True transition. The popup / desktop overlay surfaces a
- * soft pill with a single CTA that fires ``take_biology_break`` via
- * ``ACTION_EXECUTE``.
- *
- * The ``urgency`` literal mirrors what the daemon's
- * ``_classify_break_urgency`` actually emits (``"low" | "medium" |
- * "high"``); see ``cortex.services.runtime_daemon.CortexDaemon._classify_break_urgency``.
+ * The old HRV-integral fields remain optional decode aliases for one release;
+ * production recommendations use ``basis``, elapsed time, and the user's
+ * preferred interval.
  */
 export interface BreakRecommendation {
   /**
@@ -3524,23 +3647,28 @@ export interface BreakRecommendation {
    */
   reason: string;
   /**
-   * Daemon-classified urgency derived from ``StressIntegralTracker.load_ratio``. The UI uses this to decide pill colour / tone, never to gate the action.
+   * Presentation tone only; elapsed-time reminders use low.
    */
   urgency?: "low" | "medium" | "high";
+  basis?: "elapsed_focus" | "legacy_stress_integral";
+  focus_elapsed_seconds?: number | null;
+  preferred_interval_seconds?: number | null;
   /**
-   * Current cumulative stress-integral load
+   * @deprecated
+   * Legacy compatibility field; never populated in production.
    */
-  stress_load: number;
+  stress_load?: number | null;
   /**
-   * Threshold the tracker crossed to fire this recommendation
+   * @deprecated
+   * Legacy compatibility field; never populated in production.
    */
-  threshold: number;
+  threshold?: number | null;
   /**
    * Suggested length of the guided breathing session, in seconds. The overlay's ``BreathingPacer`` paces ``pattern`` across this duration.
    */
   duration_seconds: number;
   /**
-   * Pacer cadence variant. Picked by the daemon based on the user's recent HRV (4-7-8 = relaxation / parasympathetic; box = balanced; coherent = 5.5 BPM resonance breathing).
+   * Optional user-facing pacer cadence; it is not selected from biometrics.
    */
   breathing_pattern?: "4-7-8" | "box" | "coherent";
 }
@@ -3958,14 +4086,25 @@ export interface StartFocusAutoPayload {
  */
 export interface StateUpdatePayload {
   /**
-   * Classified user state (mirrors ``StateEstimate.state``)
+   * Deprecated uppercase compatibility state
    */
-  state: "FLOW" | "HYPO" | "HYPER" | "RECOVERY";
+  state: "UNKNOWN" | "FLOW" | "HYPO" | "HYPER" | "RECOVERY";
+  support_state?: SupportState | null;
+  status?: EstimateStatus2;
   /**
-   * Confidence in state classification
+   * Compatibility name for evidence strength; not a probability.
    */
   confidence: number;
   scores: StateScores2;
+  support_scores?: SupportScores | null;
+  evidence_coverage?: number;
+  contributing_features?: FeatureContribution[];
+  exclusions?: string[];
+  model?: InferenceModelIdentity | null;
+  /**
+   * Absent unless a registered calibrated model produced them.
+   */
+  probabilities?: SupportScores | null;
   signal_quality: SignalQuality2;
   /**
    * Seconds in current state
@@ -3980,7 +4119,8 @@ export interface StateUpdatePayload {
    */
   stress_integral?: number | null;
   /**
-   * Calibrated class probabilities (optional ML/rule ensemble output)
+   * @deprecated
+   * Deprecated; deterministic support rules never populate it.
    */
   calibrated_probabilities?: StateScores1 | null;
   /**
@@ -3992,11 +4132,11 @@ export interface StateUpdatePayload {
    */
   classifier_alpha?: number | null;
   /**
-   * Envelope-level source (mirrors ``StateInferResponse.source``). ``fallback`` when no real classifier ran; the dashboard's 'classifier unavailable' banner reads this.
+   * Inference source. ``rules`` is the production Level-A engine, ``classifier`` is a decode-only legacy value, and ``fallback`` means no inference engine ran.
    */
-  source?: "classifier" | "fallback";
+  source?: "rules" | "classifier" | "fallback";
   /**
-   * True when no real classifier ran (``classifier_source is None``) — same condition the ``/state/infer`` fallback branch uses to flag synthetic confidence.
+   * True when the estimate is warming, insufficient, or produced by the explicit API fallback.
    */
   degraded?: boolean;
   /**
@@ -4027,19 +4167,19 @@ export interface StateUpdatePayload {
  */
 export interface StateScores2 {
   /**
-   * Flow state score
+   * Legacy flow-like score
    */
   flow?: number;
   /**
-   * Hypo-arousal score
+   * Legacy under-engaged score
    */
   hypo?: number;
   /**
-   * Hyper-arousal score
+   * Legacy support-likely score
    */
   hyper?: number;
   /**
-   * Recovery state score
+   * Legacy recovering score
    */
   recovery?: number;
 }

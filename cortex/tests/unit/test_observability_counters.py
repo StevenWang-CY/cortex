@@ -64,7 +64,7 @@ class _MockAdapter:
 
 
 def test_state_transition_increments_counter() -> None:
-    """A confirmed FLOW→HYPER transition bumps the transition counter."""
+    """A confirmed UNKNOWN→HYPER transition bumps the transition counter."""
     config = StateConfig(
         entry_threshold=0.85,
         exit_threshold=0.70,
@@ -76,7 +76,7 @@ def test_state_transition_increments_counter() -> None:
     hyper_scores = StateScores(flow=0.05, hypo=0.0, hyper=0.99, recovery=0.0)
 
     before = _labeled_value(
-        STATE_TRANSITIONS_TOTAL, from_state="FLOW", to_state="HYPER",
+        STATE_TRANSITIONS_TOTAL, from_state="UNKNOWN", to_state="HYPER",
     )
 
     for i in range(30):
@@ -86,10 +86,10 @@ def test_state_transition_increments_counter() -> None:
     assert smoother.current_state == UserState.HYPER
 
     after = _labeled_value(
-        STATE_TRANSITIONS_TOTAL, from_state="FLOW", to_state="HYPER",
+        STATE_TRANSITIONS_TOTAL, from_state="UNKNOWN", to_state="HYPER",
     )
     assert after == before + 1.0, (
-        f"expected exactly one flow→hyper increment; before={before} after={after}"
+        f"expected exactly one unknown→hyper increment; before={before} after={after}"
     )
 
 

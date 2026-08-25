@@ -2,7 +2,7 @@
 State Engine — Feature Fusion
 
 Consumes PhysioFeatures, KinematicFeatures, and TelemetryFeatures,
-producing a unified 12-dimensional FeatureVector every 500ms.
+producing a unified named FeatureVector every 500ms.
 
 Handles missing channels (None values) with confidence weighting and
 tracks per-channel signal quality for downstream state classification.
@@ -14,11 +14,14 @@ import logging
 
 from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 from cortex.libs.schemas.features import (
+    FeatureName,
+    FeatureValue,
     FeatureVector,
     KinematicFeatures,
     PhysioFeatures,
     TelemetryFeatures,
 )
+from cortex.libs.schemas.observations import MissingReason
 from cortex.libs.schemas.state import SignalQuality
 from cortex.libs.schemas.temporal import EventTime
 
@@ -31,7 +34,7 @@ class FeatureFusion:
 
     Accepts PhysioFeatures, KinematicFeatures, and TelemetryFeatures
     independently (any may be None if the channel is unavailable),
-    and produces a unified 12-dimensional FeatureVector with associated
+    and produces a unified named FeatureVector with associated
     signal quality metrics.
 
     Usage:
@@ -191,22 +194,181 @@ class FeatureFusion:
             # shoulder value is fabricated.
             forward_lean_angle = head_neck_flexion_angle
 
-        # Telemetry features (dimensions 8-12)
+        # Telemetry features (compatibility projection)
         mouse_velocity_mean = 0.0
         mouse_velocity_variance = 0.0
         click_frequency = 0.0
+        keypress_rate_per_min = 0.0
         keystroke_interval_variance = 0.0
         correction_rate_per_100_keys = None
+        inactivity_seconds = 0.0
         tab_switch_frequency = 0.0
         scroll_back_rate_per_min = None
         if self._telemetry is not None:
             mouse_velocity_mean = self._telemetry.mouse_velocity_mean
             mouse_velocity_variance = self._telemetry.mouse_velocity_variance
             click_frequency = self._telemetry.click_frequency
+            keypress_rate_per_min = self._telemetry.keypress_rate_per_min or 0.0
             keystroke_interval_variance = self._telemetry.keystroke_interval_variance
             correction_rate_per_100_keys = self._telemetry.correction_rate_per_100_keys
+            inactivity_seconds = self._telemetry.inactivity_seconds
             tab_switch_frequency = self._telemetry.window_switch_rate
             scroll_back_rate_per_min = self._telemetry.scroll_back_rate_per_min
+
+        quality = self._compute_signal_quality(now)
+
+        physio_age = self._source_age_ms(now, self._physio_timestamp)
+        kinematics_age = self._source_age_ms(now, self._kinematics_timestamp)
+        telemetry_age = self._source_age_ms(now, self._telemetry_timestamp)
+        telemetry_window_ready = bool(
+            self._telemetry is not None
+            and self._telemetry.observation_window_seconds is not None
+        )
+        mouse_metrics_ready = bool(
+            telemetry_window_ready
+            and self._telemetry is not None
+            and self._telemetry.mouse_move_count is not None
+            and self._telemetry.mouse_move_count >= 2
+        )
+        typing_interval_ready = bool(
+            telemetry_window_ready
+            and self._telemetry is not None
+            and self._telemetry.key_press_count is not None
+            and self._telemetry.key_press_count >= 2
+        )
+        correction_ready = bool(
+            telemetry_window_ready
+            and self._telemetry is not None
+            and self._telemetry.key_press_count is not None
+            and self._telemetry.key_press_count > 0
+        )
+        window_metrics_ready = bool(
+            telemetry_window_ready
+            and self._telemetry is not None
+            and self._telemetry.window_focus_source_available
+        )
+        named_features: dict[FeatureName, FeatureValue] = {
+            FeatureName.HEART_RATE_BPM: self._feature_value(
+                hr,
+                source_present=not physio_missing,
+                quality=quality.physio,
+                age_ms=physio_age,
+                source_window_ms=10_000,
+                algorithm_version="webcam-pulse-display-v2",
+            ),
+            FeatureName.BLINK_RATE_PER_MIN: self._feature_value(
+                blink_rate,
+                source_present=self._kinematics is not None,
+                quality=quality.kinematics,
+                age_ms=kinematics_age,
+                source_window_ms=60_000,
+                algorithm_version="elapsed-blink-v2",
+            ),
+            FeatureName.HEAD_NECK_FLEXION_SCORE: self._feature_value(
+                head_neck_flexion_score,
+                source_present=(
+                    self._kinematics is not None and head_neck_proxy_available
+                ),
+                quality=quality.kinematics,
+                age_ms=kinematics_age,
+                source_window_ms=5_000,
+                algorithm_version="camera-relative-head-neck-v2",
+            ),
+            FeatureName.MOUSE_VELOCITY_MEAN: self._feature_value(
+                mouse_velocity_mean,
+                source_present=self._telemetry is not None,
+                quality=quality.telemetry,
+                age_ms=telemetry_age,
+                source_window_ms=15_000,
+                algorithm_version="input-aggregation-v2",
+                measurement_ready=mouse_metrics_ready,
+            ),
+            FeatureName.MOUSE_VELOCITY_VARIANCE: self._feature_value(
+                mouse_velocity_variance,
+                source_present=self._telemetry is not None,
+                quality=quality.telemetry,
+                age_ms=telemetry_age,
+                source_window_ms=15_000,
+                algorithm_version="input-aggregation-v2",
+                measurement_ready=mouse_metrics_ready,
+            ),
+            FeatureName.CLICK_FREQUENCY: self._feature_value(
+                click_frequency,
+                source_present=self._telemetry is not None,
+                quality=quality.telemetry,
+                age_ms=telemetry_age,
+                source_window_ms=15_000,
+                algorithm_version="input-aggregation-v2",
+                measurement_ready=telemetry_window_ready,
+            ),
+            FeatureName.KEYPRESS_RATE_PER_MIN: self._feature_value(
+                keypress_rate_per_min,
+                source_present=self._telemetry is not None,
+                quality=quality.telemetry,
+                age_ms=telemetry_age,
+                source_window_ms=15_000,
+                algorithm_version="input-aggregation-v2",
+                measurement_ready=telemetry_window_ready,
+            ),
+            FeatureName.KEYSTROKE_INTERVAL_VARIANCE: self._feature_value(
+                keystroke_interval_variance,
+                source_present=self._telemetry is not None,
+                quality=quality.telemetry,
+                age_ms=telemetry_age,
+                source_window_ms=15_000,
+                algorithm_version="input-aggregation-v2",
+                measurement_ready=typing_interval_ready,
+            ),
+            FeatureName.CORRECTION_RATE_PER_100_KEYS: self._feature_value(
+                correction_rate_per_100_keys,
+                source_present=self._telemetry is not None,
+                quality=quality.telemetry,
+                age_ms=telemetry_age,
+                source_window_ms=15_000,
+                algorithm_version="input-aggregation-v2",
+                measurement_ready=correction_ready,
+            ),
+            FeatureName.INACTIVITY_SECONDS: self._feature_value(
+                inactivity_seconds,
+                source_present=self._telemetry is not None,
+                quality=quality.telemetry,
+                age_ms=telemetry_age,
+                source_window_ms=15_000,
+                algorithm_version="input-aggregation-v2",
+                measurement_ready=telemetry_window_ready,
+            ),
+            FeatureName.TAB_SWITCH_RATE_PER_MIN: self._feature_value(
+                tab_switch_frequency,
+                source_present=self._telemetry is not None,
+                quality=quality.telemetry,
+                age_ms=telemetry_age,
+                source_window_ms=60_000,
+                algorithm_version="window-aggregation-v2",
+                measurement_ready=window_metrics_ready,
+            ),
+            FeatureName.SCROLL_BACK_RATE_PER_MIN: self._feature_value(
+                scroll_back_rate_per_min,
+                source_present=self._telemetry is not None,
+                quality=quality.telemetry,
+                age_ms=telemetry_age,
+                source_window_ms=60_000,
+                algorithm_version="input-aggregation-v2",
+                measurement_ready=telemetry_window_ready,
+            ),
+            # Focus-graph aggregation is injected by the runtime after fusion.
+            FeatureName.THRASHING_SCORE: FeatureValue(
+                valid=False,
+                quality=0.0,
+                age_ms=0,
+                source_window_ms=60_000,
+                algorithm_version="focus-transition-graph-v2",
+                missing_reason=(
+                    MissingReason.INSUFFICIENT_WINDOW
+                    if window_metrics_ready
+                    else MissingReason.SOURCE_DISCONNECTED
+                ),
+            ),
+        }
 
         vector = FeatureVector(
             timestamp=now,
@@ -217,6 +379,7 @@ class FeatureFusion:
                 event_time.observed_at_mono_ns if event_time is not None else None
             ),
             boot_id=event_time.boot_id if event_time is not None else None,
+            features=named_features,
             hr=hr,
             hrv_rmssd=hrv_rmssd,
             hrv_sdnn=hrv_sdnn,
@@ -239,8 +402,10 @@ class FeatureFusion:
             mouse_velocity_mean=mouse_velocity_mean,
             mouse_velocity_variance=mouse_velocity_variance,
             click_frequency=click_frequency,
+            keypress_rate_per_min=keypress_rate_per_min,
             keystroke_interval_variance=keystroke_interval_variance,
             correction_rate_per_100_keys=correction_rate_per_100_keys,
+            inactivity_seconds=inactivity_seconds,
             tab_switch_frequency=tab_switch_frequency,
             scroll_back_rate_per_min=scroll_back_rate_per_min,
             respiration_rate=respiration_rate,
@@ -248,9 +413,59 @@ class FeatureFusion:
             telemetry_seen_count=self._telemetry_seen_count,
         )
 
-        quality = self._compute_signal_quality(now)
-
         return vector, quality
+
+    @staticmethod
+    def _source_age_ms(now: float, observed_at: float) -> int:
+        return int(round(max(0.0, now - observed_at) * 1000.0))
+
+    @staticmethod
+    def _feature_value(
+        value: float | None,
+        *,
+        source_present: bool,
+        quality: float,
+        age_ms: int,
+        source_window_ms: int,
+        algorithm_version: str,
+        measurement_ready: bool = True,
+    ) -> FeatureValue:
+        """Build a truthful named value from source presence and freshness."""
+
+        fresh = age_ms <= 13_000
+        valid = (
+            source_present
+            and measurement_ready
+            and value is not None
+            and fresh
+            and quality > 0.0
+        )
+        if valid:
+            assert value is not None  # narrowed by the validity predicate above
+            return FeatureValue(
+                value=float(value),
+                valid=True,
+                quality=quality,
+                age_ms=age_ms,
+                source_window_ms=source_window_ms,
+                algorithm_version=algorithm_version,
+            )
+        if not source_present:
+            reason = MissingReason.SOURCE_DISCONNECTED
+        elif not fresh:
+            reason = MissingReason.FRAME_DROPPED
+        elif not measurement_ready:
+            reason = MissingReason.INSUFFICIENT_WINDOW
+        else:
+            reason = MissingReason.INSUFFICIENT_WINDOW
+        return FeatureValue(
+            valid=False,
+            quality=0.0,
+            age_ms=age_ms,
+            source_window_ms=source_window_ms,
+            algorithm_version=algorithm_version,
+            missing_reason=reason,
+        )
 
     def _compute_signal_quality(self, now: float) -> SignalQuality:
         """
@@ -288,9 +503,9 @@ class FeatureFusion:
             staleness = now - self._telemetry_timestamp
             if staleness > stale_threshold:
                 telemetry_q *= max(0.0, 1.0 - (staleness - stale_threshold) / 10.0)
-            # Reduce quality if no input activity
-            if self._telemetry.inactivity_seconds > 30.0:
-                telemetry_q *= 0.5
+            # Inactivity is a valid observation, not a transport-quality
+            # defect. It may inform an explicitly gated rule, but must not
+            # make the telemetry channel appear disconnected or noisy.
 
         return SignalQuality(
             physio=min(1.0, max(0.0, physio_q)),

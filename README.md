@@ -96,12 +96,16 @@
 ## Key features
 
 - **Local sensing** — quality-gated pulse plus blink, head-pose, and input/window telemetry. Missing or poor-quality camera data degrades explicitly.
-- **Heuristic support estimates** — current labels are rule scores with smoothing and hysteresis, not calibrated probabilities or diagnoses.
+- **Evidence-aware support estimates** — fixed-denominator behavior scores,
+  explicit unknown/warm-up states, provenance, coverage, and a fail-closed
+  rollback; never calibrated probabilities or diagnoses.
 - **LLM-generated proposals** — selected workspace context can be sent to Claude; structured output is schema-validated and presented as suggestions by default.
 - **LeetCode mode** — DOM observer, stage inference (READ / PLAN / IMPLEMENT / DEBUG / REFLECT), amygdala-hijack lockout, pattern-ladder hints, submission-discipline guard.
 - **Suggestion-only authority** — fresh and migrated installs cannot mutate tabs, editors, windows, or files from a proposal. Higher modes remain explicit and guarded while transactional authorization is completed.
 - **Exact consent outcomes** — permit, downgrade, and deny are distinct; a downgraded request cannot execute its original plan.
-- **Ambient somatic feedback** — sub-threshold color vignettes, weather particles, flow shield that fades distractions during sustained focus.
+- **Ambient workspace feedback** — restrained, reduced-motion-aware color and
+  particle cues shown only while a support estimate is available; missing
+  evidence renders neutrally.
 - **Chrome + Edge extension** — Plasmo / React MV3 with popup, intervention overlay, Pulse Room new tab, focus sessions, activity tracker, resume cards.
 
 ---

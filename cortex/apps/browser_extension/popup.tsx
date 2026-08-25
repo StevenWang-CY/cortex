@@ -173,7 +173,10 @@ interface Biometrics {
 
 interface CortexState {
     state: string;
+    support_state?: string;
+    status?: "estimated" | "insufficient_evidence" | "warming_up";
     confidence: number;
+    evidence_coverage?: number;
     scores: Record<string, number>;
     signal_quality: Record<string, number>;
     dwell_seconds: number;
@@ -1619,7 +1622,8 @@ function CortexPopup(): React.ReactElement {
     }, []);
 
     // Derived
-    const stateStr = state?.state ?? "";
+    const estimateReady = state?.status === undefined || state.status === "estimated";
+    const stateStr = estimateReady ? (state?.state ?? "") : "UNKNOWN";
     const stateColor = STATE_COLORS[stateStr] || CX.textTertiary;
     // ``Idle`` only when we've actually received a STATE_UPDATE whose
     // ``state`` field is missing/unknown. Pre-first-frame (the WS has
@@ -1627,10 +1631,14 @@ function CortexPopup(): React.ReactElement {
     // round-tripping the native host) shows ``Connecting…`` instead —
     // ``Idle`` would mis-attribute the wait to the user being inactive.
     const stateLabel = state
-        ? STATE_LABELS[stateStr] || "Idle"
+        ? state.status === "warming_up"
+            ? "Still gathering"
+            : state.status === "insufficient_evidence"
+                ? "Not enough evidence"
+                : STATE_LABELS[stateStr] || "Status unavailable"
         : connected
             ? "Connecting…"
-            : "Idle";
+            : "Disconnected";
     const hr = state?.biometrics?.heart_rate;
     const blink = state?.biometrics?.blink_rate;
     // Capture-pipeline status mirrored from the daemon (set in
@@ -1738,7 +1746,12 @@ function CortexPopup(): React.ReactElement {
                 ) : (
                     <div style={S.statusRow} aria-live="polite">
                         <div style={getStateDotStyle(stateStr, stateColor)} />
-                        <span style={{ ...S.statusLabel, color: stateColor }}>{stateLabel}</span>
+                        <span
+                            style={{ ...S.statusLabel, color: stateColor }}
+                            title={estimateReady && state?.evidence_coverage !== undefined
+                                ? `Evidence coverage ${Math.round(state.evidence_coverage * 100)}%`
+                                : "No actionable estimate yet"}
+                        >{stateLabel}</span>
                     </div>
                 )}
             </div>
@@ -2058,7 +2071,7 @@ function CortexPopup(): React.ReactElement {
                         <span style={{ ...S.bigNum, color: stateColor }}>{focusMin}</span>
                         <span style={S.bigPct}>{focus.focusPct}%</span>
                     </div>
-                    <div style={S.bigLabel}>min focused</div>
+                    <div style={S.bigLabel}>min steady activity</div>
 
                     {/* Progress bar — 6px tall */}
                     <div style={S.trackOuter}>
@@ -2714,7 +2727,7 @@ function CortexPopup(): React.ReactElement {
                 <div style={S.todayFooter}>
                     <div style={S.todayCol}>
                         <span style={S.todayVal}>{Math.round(dailyStats.totalFocusMin)}m</span>
-                        <span style={S.todayLabel}>FOCUS</span>
+                        <span style={S.todayLabel}>STEADY</span>
                     </div>
                     <div style={S.todayCol}>
                         <span style={S.todayVal}>{dailyStats.sessions}</span>

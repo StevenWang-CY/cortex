@@ -19,7 +19,7 @@ capture / telemetry / client context
       versioned observations + quality
                  |
                  v
-    legacy heuristic support estimates
+ evidence-aware deterministic support estimates
                  |
                  v
  deterministic eligibility / safety gates
@@ -42,11 +42,12 @@ The complete target design, migration order, and definition of done are in
    breath-pause, and stress-integral fields are forced unavailable before
    state scoring and publication.
 2. **Support inference.** `state_engine` currently applies deterministic
-   weighted rules, smoothing, and hysteresis. Outputs are heuristic scores,
-   not probabilities or diagnostic states.
+   fixed-denominator behavior rules, explicit abstention, smoothing, and
+   hysteresis. Outputs are heuristic evidence strengths, not probabilities or
+   diagnostic states. Camera signals are diagnostic-only for this decision.
 3. **Eligibility and context.** trigger gates decide whether to assemble
    browser/editor/terminal context. Missing evidence should suppress or
-   abstain; WP-2/WP-5 complete that invariant.
+   abstain; named validity and coverage gates enforce that invariant.
 4. **Planning.** `llm_engine` calls a configured Anthropic transport or a
    deterministic fallback, then parses and validates the returned plan.
 5. **Presentation/experimental execution.** `intervention_engine` and the
@@ -94,6 +95,8 @@ The following modules remain in the tree for compatibility or research:
 - action adapters and undo helpers.
 
 Their existence is not evidence that their output is valid or release-ready.
+The classifier and stress-integral modules are not exported, instantiated, or
+registered on the production daemon path.
 Product promotion requires the metric-, policy-, privacy-, and transaction
 gates in the implementation plan. Legacy “causal report” files are diagnostic
 summaries and must be labeled as such.

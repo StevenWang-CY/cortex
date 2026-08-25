@@ -44,9 +44,12 @@ async def test_b1_capture_unavailable_emits_stale_broadcast() -> None:
     server._broadcast = _capture_send  # type: ignore[assignment]
 
     estimate = StateEstimate(
-        state="FLOW",
+        state="UNKNOWN",
+        support_state="unknown",
+        status="insufficient_evidence",
         confidence=0.0,
         scores=StateScores(flow=0.0, hypo=0.0, hyper=0.0, recovery=0.0),
+        evidence_coverage=0.0,
         signal_quality=SignalQuality(physio=0.0, kinematics=0.0, telemetry=0.0),
         timestamp=0.0,
         reasons=["capture_unavailable"],
@@ -61,6 +64,9 @@ async def test_b1_capture_unavailable_emits_stale_broadcast() -> None:
 
     assert sent, "broadcast_state did not emit"
     payload = sent[0]
+    assert payload["state"] == "UNKNOWN"
+    assert payload["support_state"] == "unknown"
+    assert payload["status"] == "insufficient_evidence"
     assert "capture" in payload
     assert payload["capture"].get("stale") is True, (
         f"expected capture.stale=True, got {payload['capture']}"

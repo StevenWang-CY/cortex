@@ -55,13 +55,15 @@ SEMANTIC_DARK: Final[dict[str, str]] = {
 
 # --- State palette mapping (FLOW/HYPER/HYPO/RECOVERY) ---
 STATE_LABELS: Final[dict[str, str]] = {
-    "FLOW": "Focused",
-    "HYPER": "Elevated",
-    "HYPO": "Idle",
-    "RECOVERY": "Recovering",
+    "UNKNOWN": "Still gathering",
+    "FLOW": "Steady activity",
+    "HYPER": "Support may help",
+    "HYPO": "Quiet activity",
+    "RECOVERY": "Settling",
 }
 
 STATE_ACCENT_ROLES: Final[dict[str, str]] = {
+    "UNKNOWN": "label_tertiary",
     "FLOW": "brand",
     "HYPER": "danger",
     "HYPO": "label_tertiary",
@@ -70,6 +72,7 @@ STATE_ACCENT_ROLES: Final[dict[str, str]] = {
 
 # Hex fallbacks for non-mac / pre-resolution callers.
 STATE_COLORS: Final[dict[str, str]] = {
+    "UNKNOWN": "#3C3C432E",
     "FLOW": "#D97757",
     "HYPER": "#D70015",
     "HYPO": "#3C3C432E",
@@ -155,24 +158,28 @@ HUD_HALO: Final[tuple[int, int, int, int]] = (217, 119, 87, 24)
 # Maps palette name -> {state_name: hex} for STATE_COLORS swap.
 PALETTE_VARIANTS: Final[dict[str, dict[str, str]]] = {
     "default": {
+        "UNKNOWN": "#3C3C432E",
         "FLOW": "#D97757",
         "HYPER": "#D70015",
         "HYPO": "#3C3C432E",
         "RECOVERY": "#0A84FF",
     },
     "deuteranopia": {
+        "UNKNOWN": "#999999",
         "FLOW": "#0072B2",
         "HYPER": "#E69F00",
         "HYPO": "#999999",
         "RECOVERY": "#009E73",
     },
     "protanopia": {
+        "UNKNOWN": "#999999",
         "FLOW": "#0072B2",
         "HYPER": "#E69F00",
         "HYPO": "#999999",
         "RECOVERY": "#56B4E9",
     },
     "tritanopia": {
+        "UNKNOWN": "#999999",
         "FLOW": "#D55E00",
         "HYPER": "#CC79A7",
         "HYPO": "#999999",

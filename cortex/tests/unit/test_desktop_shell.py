@@ -685,7 +685,7 @@ class TestTrayIcon:
         from PySide6.QtWidgets import QApplication
         app = QApplication()
         tray = CortexTrayIcon(app)
-        assert tray._state == "FLOW"
+        assert tray._state == "UNKNOWN"
         assert tray._confidence == 0.0
         assert not tray._connected
         assert not tray._paused

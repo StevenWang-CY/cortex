@@ -1572,6 +1572,22 @@ build; and 12 VS Code tests, TypeScript compile, and VSIX packaging.
 
 ### WP-5 — Evidence-aware support inference (`XL`)
 
+**Implementation status (2026-08-24): complete.** Shipped as
+`deterministic-support@2.1.0` with `support-features-v2.1.0` and an operational
+`safety_null` rollback. The production path is behavior-only, fixed-denominator,
+quality/availability bounded, explicitly abstaining, and probability-free.
+Research HRV stress and the unregistered classifier are not instantiated or
+registered. Model cards, participant-held-out/calibration split scaffolding,
+the preregisterable study protocol, cross-surface unknown-state rendering, and
+adversarial missingness/monotonicity/replay tests are tracked in-repo. Window
+tracking has explicit source availability and a bounded event-identity ledger,
+so repeated reads of its sliding window cannot inflate tab-switch or thrashing
+evidence. Completion evidence: 2,079 non-Qt Python tests with five declared
+dataset/platform skips; all 41 Qt-boundary files passed in isolated processes;
+strict mypy across 467 source files; Ruff, schema/design/version drift gates;
+178 browser tests plus Chrome and Edge builds; and 12 VS Code tests plus VSIX
+packaging.
+
 **Files:**
 
 - `cortex/services/state_engine/feature_fusion.py`
@@ -1932,7 +1948,7 @@ Move one cohesive flow at a time behind the kernel after characterization tests.
 - [x] P1-03 unique beat/IBI stream
 - [x] P1-04 respiration redesign or feature removal
 - [x] P1-05 calibrated profile provenance and live reload
-- [ ] P1-06 evidence-normalized inference with unknown state
+- [x] P1-06 evidence-normalized inference with unknown state
 - [ ] P1-07 manifest/authorization/receipt intervention protocol
 - [ ] P1-08 event store and restart recovery
 - [ ] P1-09 deterministic production policy and one finalized reward

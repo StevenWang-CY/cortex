@@ -31,15 +31,15 @@ const STEPS = [
             ["Storage", "Persist your focus sessions, daily stats, and preferences locally on your machine."],
             ["Webcam (optional)", "Estimate blink timing and a camera-relative head/neck position proxy. Cortex does not measure shoulders or diagnose posture; video is processed locally and is not stored."],
         ],
-        hint: "All data stays on your machine. Nothing is sent to external servers.",
+        hint: "Camera frames stay on your machine and are never stored. If you enable an external LLM, selected workspace context is sent to that provider under its retention policy.",
     },
     {
         title: "Calibrate your baseline",
         body: "Cortex learns your personal focus patterns over the first few sessions. For the best experience:",
         items: [
             ["Start a focus session", "Click the Cortex icon in your toolbar, enter what you are working on, and press Start Session."],
-            ["Work normally", "Cortex observes your heart rate, blink rate, and browsing patterns to build your baseline."],
-            ["Review interventions", "When Cortex detects overwhelm, it will suggest tab cleanups and breaks. Accept or dismiss to teach it your preferences."],
+            ["Work normally", "Cortex builds local behavior baselines. Optional camera signals remain experimental and do not trigger support actions."],
+            ["Review proposals", "When sustained behavior suggests support may help, Cortex can offer workspace proposals. Break reminders are opt-in and time-based."],
         ],
         hint: "After 2-3 sessions, Cortex adapts to your rhythm.",
     },

@@ -51,7 +51,12 @@ from cortex.libs.schemas.calibration import (
     CalibrationProvenance,
     CalibrationUpdated,
 )
-from cortex.libs.schemas.features import KinematicFeatures, PhysioFeatures
+from cortex.libs.schemas.features import (
+    FeatureName,
+    FeatureValue,
+    KinematicFeatures,
+    PhysioFeatures,
+)
 from cortex.libs.schemas.intervention import (
     InterventionApplyResult,
     InterventionPlan,
@@ -149,12 +154,13 @@ from cortex.services.state_engine import FeatureFusion, RuleScorer, ScoreSmoothe
 from cortex.services.state_engine.amygdala_hijack import AmygdalaHijackDetector
 from cortex.services.state_engine.causal_attribution import CausalAttributor
 from cortex.services.state_engine.destructive_struggle import DestructiveStruggleDetector
+from cortex.services.state_engine.focus_break_policy import FocusBreakPolicy
 from cortex.services.state_engine.leetcode_mode_resolver import LeetCodeModeResolver
 from cortex.services.state_engine.longitudinal import LongitudinalTracker
-from cortex.services.state_engine.ml_classifier import PerUserLogisticClassifier
+from cortex.services.state_engine.model_registry import SupportModelRegistry
 from cortex.services.state_engine.parasympathetic_rebound import ParasympatheticReboundDetector
 from cortex.services.state_engine.rabbit_hole import RabbitHoleDetector
-from cortex.services.state_engine.stress_integral import StressIntegralTracker
+from cortex.services.state_engine.support_inference import SupportInferenceEngine
 from cortex.services.state_engine.trigger_policy import TriggerPolicy
 from cortex.services.state_engine.zombie_detector import ZombieReadingDetector
 from cortex.services.telemetry_engine.feature_aggregator import FeatureAggregator
@@ -177,7 +183,6 @@ class _PreparedCalibrationGraph:
     feature_fusion: FeatureFusion
     scorer: RuleScorer
     smoother: ScoreSmoother
-    stress_tracker: StressIntegralTracker
     zombie_detector: ZombieReadingDetector
     shutdown_detector: ShutdownDetector
     causal_attributor: CausalAttributor
@@ -763,34 +768,19 @@ class CortexDaemon:
             config=self.config.state,
             baselines=self._baseline_snapshot,
         )
+        self._support_model_registry = SupportModelRegistry()
+        if self.config.state.inference_mode == "safety_null":
+            self._support_model_registry.rollback_to_safe_null()
+        self._support_inference = SupportInferenceEngine(
+            self._scorer,
+            self._support_model_registry,
+        )
         self._smoother = ScoreSmoother(self.config.state, clock=self._clock)
 
-        # C.2: optional per-user ML classifier. If a previously-trained
-        # model file exists in storage/baselines/classifier.json AND
-        # ml_enabled is set, load it and blend its HYPER probability into
-        # the smoothed score (see ScoreSmoother.update + state_loop below).
-        self._ml_classifier: PerUserLogisticClassifier | None = None
-        if self.config.state.ml_enabled:
-            classifier_path = (
-                Path(self.config.storage.path).expanduser()
-                / "baselines"
-                / "classifier.json"
-            )
-            try:
-                if classifier_path.exists():
-                    self._ml_classifier = PerUserLogisticClassifier.load(classifier_path)
-                    logger.info(
-                        "Loaded per-user ML classifier from %s (fitted=%s)",
-                        classifier_path,
-                        self._ml_classifier.is_fitted,
-                    )
-            except Exception:
-                logger.warning(
-                    "Failed to load ML classifier; falling back to rule-only",
-                    exc_info=True,
-                )
-                self._ml_classifier = None
-        self._ml_labeled_episodes: int = 0  # incremented by feedback ingest
+        # The former per-user logistic branch used intervention feedback as a
+        # pseudo-label for cognitive state and had no participant-held-out
+        # validation lifecycle. It remains a research utility module only;
+        # production always runs the registered deterministic support rules.
         self._trigger_policy = TriggerPolicy(
             self.config.intervention,
             state_config=self.config.state,
@@ -1039,23 +1029,13 @@ class CortexDaemon:
             getattr(self._store, "degraded", False)
         )
 
-        # Stress integral tracker (biological pomodoros). The standardized
-        # deficit math requires the user-specific HRV sigma so the integral
-        # is in z-score units, not raw ms·s. Without sigma the AMIP safety
-        # floor (keyed off stress_ratio ≥ 1.0) effectively never tripped.
-        _baselines_for_stress = self._baseline_snapshot
-        _hrv_sigma = 1.0
-        try:
-            _hrv_sigma = float(
-                _baselines_for_stress.metric_distributions.get(
-                    "hrv_rmssd", {}
-                ).get("std", 1.0)
-            )
-        except Exception:
-            _hrv_sigma = 1.0
-        self._stress_tracker = StressIntegralTracker(
-            hrv_baseline=_baselines_for_stress.hrv_baseline,
-            hrv_sigma=max(1.0, _hrv_sigma),
+        self._focus_break_policy = FocusBreakPolicy(
+            enabled=self.config.intervention.enable_focus_break_reminders,
+            interval_minutes=self.config.intervention.focus_break_interval_minutes,
+            suggested_duration_seconds=(
+                self.config.intervention.focus_break_duration_seconds
+            ),
+            clock=self._clock,
         )
 
         # Cache the most recent state estimate + biometric payload for the
@@ -1115,16 +1095,6 @@ class CortexDaemon:
         # resolve without re-running attribution against stale features.
         self._causal_signals_by_intervention: dict[str, list[dict[str, Any]]] = {}
 
-        # P0 §3.7: latched so each ``should_break`` False→True
-        # transition broadcasts exactly one BREAK_RECOMMENDATION pulse.
-        # Reset to False on every ``StressIntegralTracker.reset``.
-        self._break_recommendation_sent: bool = False
-        # B21 (Phase 4.1): timestamp of the most recent HRV reading
-        # used by the recommendation-latch re-arm gate. When HRV has
-        # been None for > 30 s the latch can re-arm even without a
-        # fresh HRV sample so the user is not permanently silenced if
-        # the camera ROI degrades after a recommendation fires.
-        self._last_hrv_seen_at: float = 0.0
         # Flipped by ``_set_break_suppression`` for the duration of a
         # break overlay so the state loop skips trigger evaluation.
         self._break_active: bool = False
@@ -1245,15 +1215,15 @@ class CortexDaemon:
             self.acknowledge_session_recap,
         )
 
-        # P0 §3.7: biology-driven break controller. Built after
-        # ``_session_report`` and ``_stress_tracker`` so we can pass
-        # them directly. The desktop shell binds its full-screen
+        # Compatibility break-overlay controller. The policy feeding it is
+        # the opt-in elapsed-focus reminder above; no HRV tracker is bound.
+        # The desktop shell binds its full-screen
         # overlay handler via :meth:`set_break_overlay_ui_handler`.
         self._break_controller = BiologyBreakController(
-            hrv_sampler=self._sample_hrv_for_break,
+            hrv_sampler=lambda: None,
             session_report=self._session_report,
             suppress_interventions=self._set_break_suppression,
-            stress_tracker=self._stress_tracker,
+            stress_tracker=None,
         )
 
         # P0 §3.9: serve WHY_DETAIL_REQUEST from the per-intervention
@@ -1458,9 +1428,12 @@ class CortexDaemon:
 
             event_time = EventTime.from_clock(self._clock)
             estimate = _StateEstimate(
-                state="FLOW",
+                state="UNKNOWN",
+                support_state="unknown",
+                status="insufficient_evidence",
                 confidence=0.0,
                 scores=_StateScores(flow=0.0, hypo=0.0, hyper=0.0, recovery=0.0),
+                evidence_coverage=0.0,
                 signal_quality=_SQ(physio=0.0, kinematics=0.0, telemetry=0.0),
                 timestamp=event_time.observed_at_mono_ns / 1_000_000_000.0,
                 observed_at_unix_ms=event_time.observed_at_unix_ms,
@@ -2076,6 +2049,8 @@ class CortexDaemon:
         for name, service in {
             "feature_fusion": self._feature_fusion,
             "rule_scorer": self._scorer,
+            "support_inference": self._support_inference,
+            "support_model_registry": self._support_model_registry,
             "score_smoother": self._smoother,
             "context_engine": self._context_engine,
             "llm_client": self._llm_client,
@@ -2091,7 +2066,6 @@ class CortexDaemon:
             "daemon": self,
             # v2.0 services
             "store": self._store,
-            "stress_integral_tracker": self._stress_tracker,
             "longitudinal_tracker": self._longitudinal,
             "zombie_detector": self._zombie_detector,
             "rabbit_hole_detector": self._rabbit_hole,
@@ -2312,16 +2286,6 @@ class CortexDaemon:
         new_fusion = FeatureFusion(clock=self._clock)
         new_scorer = RuleScorer(config=self.config.state, baselines=new_baselines)
         new_smoother = ScoreSmoother(self.config.state, clock=self._clock)
-        hrv_sigma = float(
-            new_baselines.metric_distributions.get("hrv_rmssd", {}).get(
-                "std",
-                1.0,
-            )
-        )
-        new_stress = StressIntegralTracker(
-            hrv_baseline=new_baselines.hrv_baseline,
-            hrv_sigma=max(1.0, hrv_sigma),
-        )
         new_zombie = ZombieReadingDetector(
             blink_baseline=new_baselines.blink_rate_baseline
         )
@@ -2339,7 +2303,6 @@ class CortexDaemon:
             feature_fusion=new_fusion,
             scorer=new_scorer,
             smoother=new_smoother,
-            stress_tracker=new_stress,
             zombie_detector=new_zombie,
             shutdown_detector=new_shutdown,
             causal_attributor=CausalAttributor(),
@@ -2369,8 +2332,8 @@ class CortexDaemon:
             self._posture = prepared.camera_features.head_neck_proxy
             self._feature_fusion = prepared.feature_fusion
             self._scorer = prepared.scorer
+            self._support_inference.replace_scorer(prepared.scorer)
             self._smoother = prepared.smoother
-            self._stress_tracker = prepared.stress_tracker
             self._zombie_detector = prepared.zombie_detector
             self._shutdown_detector = prepared.shutdown_detector
             self._causal_attributor = prepared.causal_attributor
@@ -3342,6 +3305,23 @@ class CortexDaemon:
                     # a property returning float (0.0 when no events have
                     # accumulated yet) so we can read it unconditionally.
                     vector.thrashing_score = self._aggregator.thrashing_score
+                    window_switch_value = vector.features.get(
+                        FeatureName.TAB_SWITCH_RATE_PER_MIN
+                    )
+                    if (
+                        vector.telemetry_seen_count >= 5
+                        and quality.telemetry > 0.0
+                        and window_switch_value is not None
+                        and window_switch_value.valid
+                    ):
+                        vector.features[FeatureName.THRASHING_SCORE] = FeatureValue(
+                            value=vector.thrashing_score,
+                            valid=True,
+                            quality=quality.telemetry,
+                            age_ms=0,
+                            source_window_ms=60_000,
+                            algorithm_version="focus-transition-graph-v2",
+                        )
 
                     # Product containment: the current webcam pipeline has
                     # not met the validation duration/reference gates for
@@ -3352,38 +3332,11 @@ class CortexDaemon:
                     vector.hrv_sdnn = None
                     vector.respiration_rate = None
 
-                    scores = self._scorer.compute_scores(vector)
-                    # C.2: blend ML classifier into smoother HYPER score
-                    # once we have enough labeled episodes for a useful ramp.
-                    ml_p_hyper: float | None = None
-                    ml_alpha = 0.0
-                    if (
-                        self._ml_classifier is not None
-                        and self._ml_classifier.is_fitted
-                        and self._ml_labeled_episodes
-                        >= self.config.state.ml_min_labeled_episodes
-                    ):
-                        try:
-                            x = np.asarray(vector.to_array(), dtype=np.float64).reshape(1, -1)
-                            # audit P0 (mypy): the real classifier API is
-                            # ``predict_proba`` returning calibrated
-                            # P(HYPER); ``predict`` never existed, so this
-                            # branch raised AttributeError and the ML blend
-                            # was silently skipped on every tick.
-                            ml_p_hyper = float(self._ml_classifier.predict_proba(x)[0])
-                            full_at = max(1, self.config.state.ml_alpha_full_at_episodes)
-                            ramp = min(1.0, self._ml_labeled_episodes / full_at)
-                            ml_alpha = self.config.state.ml_alpha_max * ramp
-                        except Exception:
-                            logger.debug("ML classifier predict failed", exc_info=True)
-                            ml_p_hyper = None
-                            ml_alpha = 0.0
+                    evaluation = self._support_inference.evaluate(vector)
                     estimate = self._smoother.update(
-                        scores,
+                        evaluation,
                         quality,
                         event_time=event_time,
-                        ml_p_hyper=ml_p_hyper,
-                        ml_alpha=ml_alpha,
                     )
 
                     # B22 (Phase 4.1): mark the kinematics channel signal-
@@ -3427,6 +3380,63 @@ class CortexDaemon:
                     # reference validation lands. Never carry an old tracker
                     # value into a public state estimate.
                     estimate.stress_integral = None
+
+                    # Opt-in break reminders use only elapsed active-work time
+                    # and the user's declared interval. They do not consume
+                    # pulse, HRV, state labels, or the retired stress integral.
+                    inactivity_feature = vector.features.get(
+                        FeatureName.INACTIVITY_SECONDS
+                    )
+                    input_is_active = bool(
+                        inactivity_feature is not None
+                        and inactivity_feature.valid
+                        and inactivity_feature.value is not None
+                        and inactivity_feature.value
+                        < self.config.intervention.focus_break_inactivity_pause_seconds
+                    )
+                    self._focus_break_policy.update_preferences(
+                        enabled=(
+                            self.config.intervention.enable_focus_break_reminders
+                        ),
+                        interval_minutes=(
+                            self.config.intervention.focus_break_interval_minutes
+                        ),
+                        suggested_duration_seconds=(
+                            self.config.intervention.focus_break_duration_seconds
+                        ),
+                    )
+                    break_decision = self._focus_break_policy.evaluate(
+                        active=input_is_active,
+                        timestamp=timestamp,
+                    )
+                    registry.register("latest_focus_break_decision", break_decision)
+                    if (
+                        break_decision.should_recommend
+                        and self._interventions_enabled
+                    ):
+                        from cortex.libs.schemas.realtime import BreakRecommendation
+
+                        recommendation = BreakRecommendation(
+                            reason="You've reached your preferred focus interval.",
+                            urgency="low",
+                            basis="elapsed_focus",
+                            focus_elapsed_seconds=(
+                                break_decision.active_elapsed_seconds
+                            ),
+                            preferred_interval_seconds=(
+                                break_decision.preferred_interval_seconds
+                            ),
+                            stress_load=None,
+                            threshold=None,
+                            duration_seconds=(
+                                break_decision.suggested_duration_seconds
+                            ),
+                            breathing_pattern="box",
+                        )
+                        await self._ws_server.send_message(
+                            MessageType.BREAK_RECOMMENDATION.value,
+                            recommendation.model_dump(mode="json"),
+                        )
 
                     # P0 §3.9: feed the causal attributor at the same
                     # cadence so the per-signal sparkline buffers fill
@@ -3535,17 +3545,34 @@ class CortexDaemon:
                         _payload: dict[str, Any] = {
                             "_seq": self._state_callback_seq,
                             "state": estimate.state,
+                            "support_state": estimate.support_state,
+                            "status": estimate.status,
                             "confidence": estimate.confidence,
                             "scores": _scores_dump,
+                            "support_scores": (
+                                estimate.support_scores.model_dump()
+                                if estimate.support_scores is not None
+                                else None
+                            ),
+                            "evidence_coverage": estimate.evidence_coverage,
+                            "contributing_features": [
+                                item.model_dump(mode="json")
+                                for item in estimate.contributing_features
+                            ],
+                            "exclusions": list(estimate.exclusions),
+                            "model": estimate.model.model_dump(mode="json"),
+                            "probabilities": None,
                             "signal_quality": estimate.signal_quality.model_dump(),
                             "dwell_seconds": estimate.dwell_seconds,
                             "reasons": estimate.reasons,
                             "biometrics": biometrics,
                             "timestamp": float(getattr(estimate, "timestamp", timestamp) or timestamp),
                             "stress_integral": getattr(estimate, "stress_integral", None),
-                            "source": getattr(estimate, "source", "classifier"),
-                            "degraded": bool(getattr(estimate, "degraded", False)),
-                            "calibrated_probabilities": getattr(estimate, "calibrated_probabilities", None),
+                            "source": "rules",
+                            "degraded": estimate.status != "estimated",
+                            "calibrated_probabilities": estimate.__dict__.get(
+                                "calibrated_probabilities"
+                            ),
                             "classifier_source": getattr(estimate, "classifier_source", None),
                             "classifier_alpha": getattr(estimate, "classifier_alpha", None),
                             # G1 (audit-prod): forward the WS server's view of
@@ -3637,7 +3664,10 @@ class CortexDaemon:
                         # fired a spurious active-recall / goal-drift overlay.
                         # Apply the same floor here so all HYPER-derived
                         # interventions share one quality gate.
-                        signal_ok = estimate.signal_quality.acceptable
+                        signal_ok = bool(
+                            estimate.status == "estimated"
+                            and estimate.evidence_coverage >= 0.45
+                        )
                         # Advance the detector's dwell state on every tick so
                         # its timers stay continuous, but only FIRE the
                         # intervention when the signal is trustworthy.
@@ -3703,7 +3733,9 @@ class CortexDaemon:
                                     bandit_features,
                                     confidence=decision.confidence,
                                     receptive=not decision.receptivity_blocked,
-                                    stress_ratio=self._stress_tracker.load_ratio,
+                                    # Research-only HRV load cannot influence
+                                    # production action selection.
+                                    stress_ratio=0.0,
                                 )
                                 self._last_policy_decision_id = amip_decision.decision_id
                                 self._last_policy_arm = amip_decision.action
@@ -4097,7 +4129,8 @@ class CortexDaemon:
                     else 0
                 ),
                 thrashing_score=float(getattr(self._aggregator, "thrashing_score", 0.0)),
-                stress_integral=float(getattr(self._stress_tracker, "current_load", 0.0)),
+                # Compatibility outcome field only; unavailable in product.
+                stress_integral=0.0,
                 decision_id=decision_id,
                 propensity=self._last_policy_propensity,
                 policy_arm=self._last_policy_arm,
@@ -4334,16 +4367,6 @@ class CortexDaemon:
         for outcome in outcomes:
             self._active_intervention_id = None
             self._recorder.append("intervention_outcome", outcome.model_dump(mode="json"))
-            # C.3: credit the stress integral when FLOW recovery confirms
-            # the intervention was restorative. apply_recovery_credit
-            # subtracts a window of sustained-low-deficit equivalent from
-            # the running integral so the AMIP safety floor doesn't keep
-            # firing across recovered sessions.
-            if getattr(outcome, "recovery_detected", False):
-                try:
-                    self._stress_tracker.apply_recovery_credit(seconds=120.0)
-                except Exception:
-                    logger.debug("apply_recovery_credit failed", exc_info=True)
             await self._ws_server.send_restore(
                 outcome.intervention_id,
                 user_action=outcome.user_action,
@@ -4422,38 +4445,6 @@ class CortexDaemon:
         return sent
 
     # ─── P0 §3.7: biology-driven break orchestration ─────────────────
-
-    @staticmethod
-    def _suggest_break_pattern(hrv_rmssd: float | None) -> str:
-        """Map HRV → breathing pattern name (matches break_overlay.select_pattern)."""
-        from cortex.services.intervention_engine.break_overlay import select_pattern
-
-        return select_pattern(hrv_rmssd)
-
-    def _classify_break_urgency(self) -> str:
-        """Map load_ratio → BREAK_RECOMMENDATION urgency string."""
-        ratio = float(self._stress_tracker.load_ratio)
-        if ratio >= 1.3:
-            return "high"
-        if ratio >= 1.05:
-            return "medium"
-        return "low"
-
-    def _sample_hrv_for_break(self) -> float | None:
-        """Return the most recent HRV reading for the break controller."""
-        physio = getattr(self, "_latest_physio", None)
-        if physio is None:
-            return None
-        # Prefer the explicit RMSSD proxy when populated; fall back to
-        # the variability proxy field used in some legacy code paths.
-        for attr in ("hrv_rmssd", "pulse_variability_proxy"):
-            v = getattr(physio, attr, None)
-            if v is not None:
-                try:
-                    return float(v)
-                except (TypeError, ValueError):
-                    continue
-        return None
 
     def _set_break_suppression(self, active: bool) -> None:
         """Toggle the global break-suppression flag.
@@ -4567,7 +4558,7 @@ class CortexDaemon:
         duration_seconds: int = 240,
         breathing_pattern: str | None = None,
         audio_cue: bool = True,
-        reason: str = "stress_integral_crossed_threshold",
+        reason: str = "preferred_focus_interval_reached",
     ) -> dict[str, Any] | None:
         """Run one guided breathing session and return a BreakRecord dict."""
         if self._break_controller is None:
@@ -4576,7 +4567,9 @@ class CortexDaemon:
         if breathing_pattern in ("box", "4-7-8", "coherent"):
             pattern_arg = breathing_pattern  # type: ignore[assignment]
         else:
-            pattern_arg = None
+            # No biometric auto-selection: a missing preference uses the
+            # neutral product default.
+            pattern_arg = "box"
         # P0 §3.7 audit fix (spec line 643): default audio off when the
         # microphone was active recently. ``last_mic_active_at`` is the
         # most-recent positive ``receptivity.is_microphone_in_use``
@@ -4628,9 +4621,10 @@ class CortexDaemon:
         # legacy code only reset after a successful record — a
         # cancelled or no-handler break left the flag latched and
         # silently suppressed every subsequent threshold crossing.
-        self._break_recommendation_sent = False
         if record is None:
             return None
+        if record.completed:
+            self._focus_break_policy.record_break_taken()
         # Phase-4b TASK G: structured BIOLOGY_BREAK_COMPLETED event.
         try:
             logger.info(
@@ -5138,8 +5132,8 @@ class CortexDaemon:
           3. The user has approved the ``distraction_block`` consent
              class at ``AUTONOMOUS_ACT`` (default ``REVERSIBLE_ACT``;
              the upshift is explicit, from Settings → Focus protection).
-          4. State is HYPER, confidence ≥ confidence_gate, and the
-             HYPER dwell has met dwell_gate.
+          4. Support is likely, evidence strength ≥ the gate, and the
+             confirmed dwell has met ``dwell_gate``.
           5. Symmetric exit on sustained FLOW/RECOVERY for exit_gate.
           6. When the flag flips OFF / consent downgrades while
              ``_auto_focus_armed`` is True, broadcast STOP_FOCUS_AUTO
@@ -5179,6 +5173,15 @@ class CortexDaemon:
 
         state = getattr(estimate, "state", "")
         confidence = float(getattr(estimate, "confidence", 0.0) or 0.0)
+        if (
+            getattr(estimate, "status", "insufficient_evidence") != "estimated"
+            or float(getattr(estimate, "evidence_coverage", 0.0) or 0.0) < 0.45
+        ):
+            if self._auto_focus_armed:
+                self._auto_focus_armed = False
+                await self._emit_stop_focus_auto(reason="evidence_unavailable")
+            self._reset_auto_focus_timers()
+            return
         confidence_gate = float(
             getattr(cfg, "auto_distraction_block_confidence", 0.85)
         )
@@ -5220,7 +5223,7 @@ class CortexDaemon:
                     # after the broadcast lands. ``_emit_start_focus_auto``
                     # returns True on success.
                     ok = await self._emit_start_focus_auto(
-                        reason="biometric_hyper",
+                        reason="behavior_support_likely",
                     )
                     if ok:
                         self._auto_focus_armed = True
@@ -5232,7 +5235,7 @@ class CortexDaemon:
                         # with the disarm path.
                         try:
                             logger.info(
-                                "%s phase=arm reason=biometric_hyper dwell_s=%.1f",
+                                "%s phase=arm reason=behavior_support_likely dwell_s=%.1f",
                                 EventType.DISTRACTION_BLOCKED.value,
                                 dwelled,
                             )
@@ -6225,11 +6228,10 @@ class CortexDaemon:
 
             baselines = self._scorer.baselines
             telemetry = registry.get("latest_telemetry")
+            # Biology-derived mode inputs are contained until their separate
+            # reference/label validation gates pass. Domain behavior (typing,
+            # submissions, rereads) remains available.
             blink_delta = 0.0
-            if vector.blink_rate_delta is not None:
-                blink_delta = float(vector.blink_rate_delta)
-            elif vector.blink_rate is not None:
-                blink_delta = float(vector.blink_rate - baselines.blink_rate_baseline)
 
             key_velocity = min(max(float(context.chars_per_min) / 240.0, 0.0), 1.0)
             if telemetry is not None:
@@ -6249,14 +6251,14 @@ class CortexDaemon:
                 else None
             )
             aai_score = self._amygdala_detector.update(
-                hr_delta=float(vector.hr_delta or 0.0),
+                hr_delta=0.0,
                 blink_delta=blink_delta,
                 key_velocity=key_velocity,
                 wa_timestamp=wa_timestamp,
                 current_time=timestamp,
             )
 
-            current_load = float(estimate.stress_integral or self._stress_tracker.current_load)
+            current_load = 0.0
             hrv_current = (
                 float(vector.hrv_rmssd)
                 if vector.hrv_rmssd is not None
@@ -6282,10 +6284,10 @@ class CortexDaemon:
             accepted = bool(context.accepted or last_result == "Accepted")
             rebound = self._rebound_detector.update(
                 accepted=accepted,
-                hr=vector.hr,
+                hr=None,
                 hr_baseline=float(baselines.hr_baseline),
-                hrv_current=vector.hrv_rmssd,
-                hrv_prev=self._last_leetcode_hrv_rmssd,
+                hrv_current=None,
+                hrv_prev=None,
                 last_submission_ts=submission_epoch if accepted else None,
             )
 
@@ -6407,7 +6409,7 @@ class CortexDaemon:
             float(context.total_errors if hasattr(context, 'total_errors') else 0) / 10.0,
             hour / 24.0,
             self._aggregator.thrashing_score if hasattr(self._aggregator, 'thrashing_score') else 0.0,
-            self._stress_tracker.current_load / 500.0,
+            0.0,  # retired HRV stress-integral feature
             0.5,  # consent level placeholder
         ]
 
@@ -6499,10 +6501,10 @@ class CortexDaemon:
                 try:
                     # Snapshot daily data to store
                     await self._longitudinal.snapshot_daily()
-                    # Compute trend and update sensitivity
+                    # Compute the longitudinal trend for reporting only. It
+                    # no longer tunes the unvalidated HRV stress prototype.
                     trend = await self._longitudinal.compute_trend()
                     multiplier = trend.get("sensitivity_multiplier", 1.0)
-                    self._stress_tracker.update_sensitivity(multiplier)
                     logger.debug("Longitudinal snapshot: multiplier=%.2f", multiplier)
                 except Exception:
                     logger.exception("Longitudinal loop error")

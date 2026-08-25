@@ -108,7 +108,9 @@ CORTEX_LLM__FALLBACK_MODE=rule_based   # default — deterministic plan keeps da
 # CORTEX_LLM__FALLBACK_MODE=direct_anthropic  # retry via direct API instead
 ```
 
-Cortex only sends workspace text context, current state label/confidence, and allowed intervention constraints to the LLM. Raw camera frames and biometrics stay local.
+Cortex sends only the workspace text categories the user has enabled, the
+current support status/evidence strength, and allowed proposal constraints to
+the configured LLM transport. Raw camera frames and biometrics stay local.
 
 #### Camera Configuration
 

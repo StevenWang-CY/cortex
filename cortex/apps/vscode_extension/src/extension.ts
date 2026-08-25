@@ -11,6 +11,7 @@ import { CortexWSClient } from "./ws-client";
 import { ContextProvider } from "./context-provider";
 import { FoldController } from "./fold-controller";
 import { CortexPanelProvider } from "./panel-provider";
+import { PANEL_STATE_LABELS } from "./design-tokens";
 
 let wsClient: CortexWSClient | undefined;
 let contextProvider: ContextProvider | undefined;
@@ -20,9 +21,21 @@ let statusBarItem: vscode.StatusBarItem | undefined;
 type ExecutionMode = "suggest_only" | "authorized" | "research_autonomous";
 let currentExecutionMode: ExecutionMode = "suggest_only";
 
-function handleLegacyBreakRecommendation(_payload: unknown): void {
-    // Decode-only compatibility sink. The underlying HRV/stress algorithm
-    // has not passed reference validation, so product UI must stay silent.
+function handleLegacyBreakRecommendation(payload: unknown): void {
+    // Only the explicit elapsed-focus reminder is product-eligible. Legacy
+    // HRV/stress payloads remain a silent decode sink.
+    if (typeof payload !== "object" || payload === null) return;
+    const p = payload as Record<string, unknown>;
+    if (p.basis !== "elapsed_focus") return;
+    const reason = typeof p.reason === "string"
+        ? p.reason
+        : "You've reached your preferred focus interval.";
+    void vscode.window.showInformationMessage(
+        `Cortex · ${reason}`,
+        "Open Cortex",
+    ).then((choice) => {
+        if (choice === "Open Cortex") panelProvider?.showPanel();
+    });
 }
 
 function parseExecutionMode(value: unknown): ExecutionMode {
@@ -512,26 +525,43 @@ function updateStatusBar(payload: Record<string, unknown>): void {
         return;
     }
 
-    const state = payload.state as string | undefined;
+    const estimateReady = payload.status === "estimated";
+    const state = estimateReady
+        ? payload.state as string | undefined
+        : "UNKNOWN";
     const confidence = payload.confidence as number | undefined;
+    const coverage = payload.evidence_coverage as number | undefined;
 
     const stateIcons: Record<string, string> = {
         FLOW: "$(check)",
         HYPER: "$(flame)",
         HYPO: "$(eye-closed)",
         RECOVERY: "$(sync)",
+        UNKNOWN: "$(ellipsis)",
     };
 
     const icon = stateIcons[state ?? ""] ?? "$(pulse)";
     const confPct = confidence !== undefined ? Math.round(confidence * 100) : 0;
 
-    statusBarItem.text = `${icon} Cortex: ${state ?? "—"} ${confPct}%`;
-    statusBarItem.tooltip = `Cortex — ${state ?? "Unknown"} (${confPct}% confidence)`;
+    const label = payload.status === "warming_up"
+        ? "Still gathering"
+        : payload.status === "insufficient_evidence"
+        ? "Not enough evidence"
+        : PANEL_STATE_LABELS[state ?? ""] ?? "Status unavailable";
+    statusBarItem.text = estimateReady
+        ? `${icon} Cortex: ${label} ${confPct}%`
+        : `${icon} Cortex: ${label}`;
+    const coveragePct = typeof coverage === "number"
+        ? Math.round(coverage * 100)
+        : 0;
+    statusBarItem.tooltip = estimateReady
+        ? `Cortex — ${label} (${confPct}% evidence strength; ${coveragePct}% coverage)`
+        : `Cortex — ${label}. No actionable estimate.`;
 
     // Color coding
     if (state === "HYPER") {
         statusBarItem.backgroundColor = new vscode.ThemeColor(
-            "statusBarItem.errorBackground",
+            "statusBarItem.warningBackground",
         );
     } else if (state === "HYPO") {
         statusBarItem.backgroundColor = new vscode.ThemeColor(

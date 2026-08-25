@@ -447,6 +447,33 @@ class TriggerPolicy:
             else now < self._quiet_mode_until
         )
 
+        # Evidence eligibility precedes every interruption/receptivity gate.
+        # UNKNOWN, warm-up, and insufficient-evidence frames are observable
+        # product states, never weak versions of an actionable estimate.
+        if estimate.status != "estimated":
+            return TriggerDecision(
+                should_trigger=False,
+                reason=f"evidence_status_{estimate.status}",
+                confidence=0.0,
+                cooldown_remaining=cooldown_remaining,
+                quiet_mode_active=quiet_active,
+                effective_threshold=effective_threshold,
+                context_complexity=context_complexity,
+            )
+        if estimate.evidence_coverage < 0.45:
+            return TriggerDecision(
+                should_trigger=False,
+                reason=(
+                    "evidence_coverage_below_floor_"
+                    f"{estimate.evidence_coverage:.2f}"
+                ),
+                confidence=confidence,
+                cooldown_remaining=cooldown_remaining,
+                quiet_mode_active=quiet_active,
+                effective_threshold=effective_threshold,
+                context_complexity=context_complexity,
+            )
+
         # F25: drop intervention timestamps that fell out of the
         # trailing-hour window so the count below reflects only the
         # last 3600 s. ``deque`` is bounded by ``maxlen``, but we still
@@ -671,40 +698,9 @@ class TriggerPolicy:
                 context_complexity=context_complexity,
             )
 
-        # P1 Pipeline A: HYPER-specific signal-quality floor. Overall
-        # ``acceptable`` is a 0.3 weighted blend that can pass even when
-        # physio and kinematics are both near zero (e.g. webcam blocked
-        # at night). HYPER requires either a usable physio channel
-        # (physio >= 0.3) or at least mid-quality kinematics (>= 0.5)
-        # before we let the trigger fire — otherwise the overwhelm
-        # estimate is driven entirely by telemetry and is too noisy to
-        # justify interrupting the user.
-        sq = estimate.signal_quality
-        if not (sq.physio >= 0.3 or sq.kinematics >= 0.5):
-            logger.info(
-                "HYPER trigger deferred — insufficient physio signal quality "
-                "(physio=%.2f, kinematics=%.2f, telemetry=%.2f)",
-                sq.physio,
-                sq.kinematics,
-                sq.telemetry,
-            )
-            return TriggerDecision(
-                should_trigger=False,
-                reason=(
-                    f"Insufficient physio signal quality "
-                    f"(physio={sq.physio:.2f}, kinematics={sq.kinematics:.2f})"
-                ),
-                confidence=confidence,
-                cooldown_remaining=0.0,
-                quiet_mode_active=False,
-                effective_threshold=effective_threshold,
-                context_complexity=context_complexity,
-            )
-
-        # Check signal quality — with telemetry-only fallback
-        # In poor lighting (dorm rooms at night), webcam signals degrade but
-        # behavioral telemetry (mouse, keyboard, tab switching) remains reliable.
-        # Allow interventions when telemetry is strong, with stricter confidence.
+        # Compatibility channel-quality floor. Production Level-A inference is
+        # behavior-only; camera absence neither supports nor blocks a label.
+        # Evidence coverage above is the authoritative inference gate.
         if not estimate.signal_quality.acceptable:
             telemetry_fallback = (
                 estimate.signal_quality.telemetry >= 0.7

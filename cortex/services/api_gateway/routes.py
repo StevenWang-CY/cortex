@@ -442,7 +442,12 @@ async def get_current_status(request: Request) -> StatusResponse:
                 _get_clock(request),
                 status="ready",
                 state=est.state,
+                support_state=est.support_state,
+                estimate_status=est.status,
                 confidence=est.confidence,
+                evidence_strength=est.confidence,
+                evidence_coverage=est.evidence_coverage,
+                model=est.model,
                 signal_quality=est.signal_quality,
             )
 
@@ -453,7 +458,12 @@ async def get_current_status(request: Request) -> StatusResponse:
             _get_clock(request),
             status="ready",
             state=latest_state.state,
+            support_state=latest_state.support_state,
+            estimate_status=latest_state.status,
             confidence=latest_state.confidence,
+            evidence_strength=latest_state.confidence,
+            evidence_coverage=latest_state.evidence_coverage,
+            model=latest_state.model,
             signal_quality=latest_state.signal_quality,
         )
 
@@ -543,8 +553,8 @@ async def infer_state(
 ) -> StateInferResponse:
     """Compute state from fused features.
 
-    F18 (audit): two paths now report distinct envelope shapes. The
-    happy path stamps ``source="classifier"`` (the default); the
+    Two paths report distinct envelope shapes. The deterministic
+    happy path stamps ``source="rules"``; the
     fallback path stamps ``source="fallback"`` and ``degraded=True`` and
     emits :data:`EventType.STATE_INFER_DEGRADED` with the bound
     correlation id. A scorer/smoother exception is treated identically
@@ -554,12 +564,21 @@ async def infer_state(
     reg = _get_registry(request)
 
     # Try to use registered scorer + smoother
+    inference = reg.get("support_inference")
     scorer = reg.get("rule_scorer")
     smoother = reg.get("score_smoother")
 
-    if scorer is not None and smoother is not None:
+    if (inference is not None or scorer is not None) and smoother is not None:
         try:
-            scores = scorer.compute_scores(body.feature_vector)
+            evaluation = (
+                inference.evaluate(body.feature_vector)
+                if inference is not None
+                else (
+                    scorer.evaluate(body.feature_vector)
+                    if hasattr(scorer, "evaluate")
+                    else scorer.compute_scores(body.feature_vector)
+                )
+            )
             feature = body.feature_vector
             event_time = (
                 EventTime(
@@ -573,7 +592,7 @@ async def infer_state(
                 else EventTime.from_clock(_get_clock(request))
             )
             estimate = smoother.update(
-                scores,
+                evaluation,
                 body.signal_quality,
                 event_time=event_time,
             )
@@ -586,7 +605,10 @@ async def infer_state(
         else:
             reg.register("latest_state_estimate", estimate)
             return StateInferResponse.from_clock(
-                _get_clock(request), estimate=estimate,
+                _get_clock(request),
+                estimate=estimate,
+                source="rules",
+                degraded=estimate.status != "estimated",
             )
 
     # Fallback: produce a basic estimate without engines. Emit the
@@ -595,16 +617,21 @@ async def infer_state(
     logger.warning(
         "%s reason=%s cid=%s",
         EventType.STATE_INFER_DEGRADED.value,
-        "scorer_or_smoother_missing" if (scorer is None or smoother is None) else "scorer_raised",
+        "scorer_or_smoother_missing"
+        if (inference is None and scorer is None) or smoother is None
+        else "scorer_raised",
         get_correlation_id() or "-",
     )
     estimate = StateEstimate(
-        state="FLOW",
-        confidence=0.5,
-        scores=StateScores(flow=0.5, hypo=0.0, hyper=0.0, recovery=0.0),
-        reasons=["No state engine registered, using default"],
+        state="UNKNOWN",
+        support_state="unknown",
+        status="insufficient_evidence",
+        confidence=0.0,
+        scores=StateScores(),
+        evidence_coverage=0.0,
+        reasons=["State engine unavailable; no support estimate was produced"],
         signal_quality=body.signal_quality,
-        timestamp=body.feature_vector.timestamp,
+        timestamp=float(body.feature_vector.__dict__.get("timestamp", 0.0)),
         observed_at_unix_ms=body.feature_vector.observed_at_unix_ms,
         observed_at_mono_ns=body.feature_vector.observed_at_mono_ns,
         boot_id=body.feature_vector.boot_id,

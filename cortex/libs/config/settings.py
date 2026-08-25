@@ -330,19 +330,42 @@ class StateWeights(BaseModel):
 
 
 class StateConfig(BaseModel):
-    """State engine configuration."""
+    """Temporal configuration for deterministic support inference."""
 
     entry_threshold: float = 0.85
     exit_threshold: float = 0.70
+    # State-label hysteresis is distinct from the higher intervention gate.
+    # Fixed-denominator Level-A scores are deliberately conservative, so a
+    # label may stabilize before an interruption becomes eligible.
+    estimate_entry_threshold: float = Field(0.40, ge=0.0, le=1.0)
+    estimate_exit_threshold: float = Field(0.25, ge=0.0, le=1.0)
+    inference_mode: Literal["deterministic", "safety_null"] = "deterministic"
     hyper_dwell_seconds: int = 30
     hypo_dwell_seconds: int = 60
     flow_dwell_seconds: int = 120
     ema_alpha: float = 0.3
+    # Decode-only migration fields. The optional classifier never had a valid
+    # state-label dataset or registered calibration artifact, so production
+    # cannot enable it through configuration. The research utility remains in
+    # ``state_engine.ml_classifier`` for offline protocol work.
     ml_enabled: bool = False
     ml_min_labeled_episodes: int = 30
     ml_alpha_max: float = 0.7
     ml_alpha_full_at_episodes: int = 150
     weights: StateWeights = Field(default_factory=StateWeights)
+
+    @field_validator("ml_enabled", mode="before")
+    @classmethod
+    def _disable_unregistered_state_classifier(cls, _value: object) -> bool:
+        return False
+
+    @model_validator(mode="after")
+    def _estimate_hysteresis_is_ordered(self) -> StateConfig:
+        if self.estimate_exit_threshold >= self.estimate_entry_threshold:
+            raise ValueError(
+                "estimate_exit_threshold must be below estimate_entry_threshold"
+            )
+        return self
 
 
 class InterventionConfig(BaseModel):
@@ -438,6 +461,14 @@ class InterventionConfig(BaseModel):
         """Contain the unsupported HRV/stress action until validation exists."""
 
         return False
+
+    # Transparent replacement for the retired HRV integral. Reminders are
+    # driven only by observed active-work duration and explicit preference,
+    # and default off to avoid surprising existing users.
+    enable_focus_break_reminders: bool = False
+    focus_break_interval_minutes: int = Field(50, ge=15, le=180)
+    focus_break_duration_seconds: int = Field(300, ge=60, le=1800)
+    focus_break_inactivity_pause_seconds: float = Field(60.0, ge=5.0, le=900.0)
 
     # P0 §3.7 risk mitigation (spec line 643): the spec calls for
     # audio to default off when ``mic_active`` was detected in the

@@ -17,12 +17,12 @@ All three bind to `127.0.0.1` only.
 ## Layered Design
 
 ```
-L1 Bio/Telemetry Extraction
+L1 Observation Extraction
   capture_service + physio_engine + kinematics_engine + telemetry_engine
         │
         ▼
 L2 State Engine
-  feature_fusion + rule_scorer + smoother + detectors + stress_integral
+  named feature schema + support_inference + rule_scorer + smoother
         │
         ▼
 L3 Trigger/Policy
@@ -40,10 +40,13 @@ L5 Intervention Execution
 
 ## Core Data Contracts
 
-- `PhysioFeatures` now includes expanded HRV + SQI fields.
-- `KinematicFeatures` includes `perclos_60s`, blink duration, EAR variance.
-- `TelemetryFeatures` includes correction/scroll-back rates.
-- `StateEstimate` includes calibrated probabilities and classifier metadata.
+- `FeatureValue` carries validity, quality, age, source exposure, algorithm
+  version, and explicit missingness for each named input.
+- `TelemetryFeatures` includes observation counts/exposure plus keypress,
+  correction, and scroll-back rates.
+- `StateEstimate` carries an explicit estimate status, support scores, evidence
+  coverage, contributions, exclusions, and model identity. Scores are not
+  probabilities.
 - `InterventionPlan` includes non-fatal `plan_warnings`.
 
 All additions are backward-compatible (additive fields only).
@@ -58,22 +61,30 @@ All additions are backward-compatible (additive fields only).
 
 ## L2 Details
 
-- Rule scorer uses personalized baseline distributions where present.
-- FLOW rule aligns with near-baseline engagement signatures and long dwell.
-- Smoother outputs calibrated probabilities while retaining hysteresis behavior.
-- Stress integral tracks standardized HRV deficit and supports recovery credit.
-- Optional per-user logistic model exists in `state_engine/ml_classifier.py`.
+- Production rules use fixed-denominator, quality-bounded behavior evidence;
+  missing or lower-quality evidence cannot increase a score.
+- Steady activity requires affirmative recent interaction; a connected stream
+  of zeros cannot imply it. Quiet activity requires sustained inactivity plus
+  corroboration.
+- Camera pulse, blink, and head/neck proxies are diagnostic-only and excluded
+  from production support rules.
+- The smoother starts `UNKNOWN`, retains hysteresis/dwell, uses monotonic time,
+  and creates recovery only as a temporal relation.
+- No probabilistic model ships. `ml_classifier.py` and `stress_integral.py` are
+  research-only and are not exported or registered by the production daemon.
+- `state.inference_mode: safety_null` is the fail-closed rollback.
 
 ## L3 Details
 
 - Trigger policy adds receptivity gates and learned dismissal suppression.
 - Dwell defaults are evidence-updated: HYPER 30s, HYPO 60s, FLOW 120s.
-- AMIP policy (`services/eval/amip.py`) performs contextual Thompson sampling with:
+- The repository contains a research AMIP policy (`services/eval/amip.py`) with:
   - temperature softmax,
   - deterministic safety floor,
   - propensity logging,
   - write-ahead decision logging.
-- Nightly causal report generation: `services/eval/causal_report.py`.
+- Nightly diagnostic report generation remains research instrumentation; it is
+  not causal evidence.
 
 ## L4/L5 Safety
 
@@ -98,7 +109,9 @@ All additions are backward-compatible (additive fields only).
   head pose, and a calibrated camera-relative head/neck flexion proxy. Cortex
   does not infer shoulder or upper-body posture from face landmarks.
 - `cortex/services/telemetry_engine/*`: keyboard / mouse / scroll variability + correction/scroll-back rates.
-- `cortex/services/state_engine/*`: scoring, smoothing, trigger, detectors, ML classifier, persisted dismissal model (F21) and quiet-mode escalation memory (F26).
+- `cortex/services/state_engine/*`: named feature schema, deterministic support
+  scoring, operational model registry/safe rollback, temporal smoothing,
+  trigger policy, and explicitly research-only prototypes.
 - `cortex/services/context_engine/*`: workspace context fusion (editor / terminal / browser tab snapshots) used to build the prompt envelope.
 - `cortex/services/eval/*`: legacy bandit + AMIP + causal report + replay.
 - `cortex/services/llm_engine/*`: backend clients, prompt construction (with F09 prompt-injection wrappers and F29 truncation telemetry), parsing, parser-side action allowlist (F10), cost tracker (F20).

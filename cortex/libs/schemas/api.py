@@ -19,7 +19,13 @@ from cortex.libs.schemas.intervention import (
     InterventionPlan,
     WorkspaceSnapshot,
 )
-from cortex.libs.schemas.state import SignalQuality, StateEstimate
+from cortex.libs.schemas.state import (
+    EstimateStatus,
+    InferenceModelIdentity,
+    SignalQuality,
+    StateEstimate,
+    SupportState,
+)
 from cortex.libs.schemas.temporal import DualClockModel
 
 
@@ -54,7 +60,12 @@ class HealthResponse(DualClockModel):
 class StatusResponse(DualClockModel):
     status: Literal["initializing", "ready", "degraded"] = "initializing"
     state: str | None = None
+    support_state: SupportState | None = None
+    estimate_status: EstimateStatus | None = None
     confidence: float | None = None
+    evidence_strength: float | None = None
+    evidence_coverage: float | None = None
+    model: InferenceModelIdentity | None = None
     signal_quality: SignalQuality | None = None
     features: FeatureVector | None = None
 
@@ -66,7 +77,7 @@ class StateInferRequest(BaseModel):
 
 class StateInferResponse(DualClockModel):
     estimate: StateEstimate
-    source: Literal["classifier", "fallback"] = "classifier"
+    source: Literal["rules", "classifier", "fallback"] = "rules"
     degraded: bool = False
 
 

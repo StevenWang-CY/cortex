@@ -57,7 +57,7 @@ class TestStateEstimateEnumSerialization:
         assert est.state == "FLOW"
 
     def test_all_states_serialize_correctly(self) -> None:
-        for state in (UserState.FLOW, UserState.HYPO, UserState.HYPER, UserState.RECOVERY):
+        for state in UserState:
             est = _make_estimate(state)
             dumped = json.loads(est.model_dump_json())
             assert dumped["state"] == state.value
@@ -66,20 +66,22 @@ class TestStateEstimateEnumSerialization:
         """model_json_schema() must emit a literal-string-union for 'state'.
 
         This is required for TS codegen to produce
-        ``"FLOW" | "HYPO" | "HYPER" | "RECOVERY"`` unions.
+        ``"UNKNOWN" | "FLOW" | "HYPO" | "HYPER" | "RECOVERY"`` unions.
         """
         schema = StateEstimate.model_json_schema()
         state_schema = schema["properties"]["state"]
         # With use_enum_values=True on a StrEnum, Pydantic emits
         # {"enum": ["FLOW", ...]} or {"$ref": "..."} — either way the
-        # resolved schema must contain the four string literals.
+        # resolved schema must contain the five string literals.
         # Resolve $ref if present.
         if "$ref" in state_schema:
             ref_name = state_schema["$ref"].split("/")[-1]
             state_schema = schema["$defs"][ref_name]
 
         enum_values = state_schema.get("enum") or []
-        assert set(enum_values) == {"FLOW", "HYPO", "HYPER", "RECOVERY"}, (
+        assert set(enum_values) == {
+            "UNKNOWN", "FLOW", "HYPO", "HYPER", "RECOVERY"
+        }, (
             f"Expected literal union, got schema: {state_schema}"
         )
         # All values must be plain strings (not e.g. {"value": "FLOW"}).

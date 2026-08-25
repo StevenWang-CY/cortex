@@ -53,12 +53,23 @@ Optional-auth liveness probe. Returns service status without requiring a capabil
 
 #### `GET /status/current`
 
-Current cognitive state and signal quality.
+Current support estimate and signal quality. `confidence` is a deprecated wire
+alias of `evidence_strength`; neither is a probability.
 
 ```json
 {
   "state": "FLOW",
-  "confidence": 0.87,
+  "support_state": "flow_like",
+  "estimate_status": "estimated",
+  "confidence": 0.64,
+  "evidence_strength": 0.64,
+  "evidence_coverage": 0.83,
+  "model": {
+    "name": "deterministic-support",
+    "version": "2.1.0",
+    "feature_schema_version": "support-features-v2.1.0",
+    "validation_status": "deterministic_rules"
+  },
   "signal_quality": {
     "physio": 0.92,
     "kinematics": 0.88,
@@ -127,15 +138,18 @@ All feature endpoints return `{ "status": "ok", "timestamp": <float> }`.
 // Request
 {
   "feature_vector": {
-    "pulse_norm": 0.3,
-    "hrv_norm": 0.6,
-    "blink_norm": 0.5,
-    "posture_norm": 0.2,
-    "mouse_velocity_norm": 0.4,
-    "mouse_jerk_norm": 0.1,
-    "window_switch_norm": 0.3,
-    "complexity_norm": 0.4,
-    "timestamp": 1000.5
+    "timestamp": 1000.5,
+    "telemetry_seen_count": 5,
+    "features": {
+      "keypress_rate_per_min": {
+        "value": 60.0, "valid": true, "quality": 1.0, "age_ms": 0,
+        "source_window_ms": 15000, "algorithm_version": "input-aggregation-v2"
+      },
+      "inactivity_seconds": {
+        "value": 2.0, "valid": true, "quality": 1.0, "age_ms": 0,
+        "source_window_ms": 15000, "algorithm_version": "input-aggregation-v2"
+      }
+    }
   },
   "signal_quality": { "physio": 0.9, "kinematics": 0.85, "telemetry": 0.95, "overall": 0.9 }
 }
@@ -143,13 +157,23 @@ All feature endpoints return `{ "status": "ok", "timestamp": <float> }`.
 // Response
 {
   "estimate": {
-    "state": "FLOW",
-    "confidence": 0.87,
-    "scores": { "flow": 0.87, "hypo": 0.05, "hyper": 0.08, "recovery": 0.0 },
-    "reasons": ["Good HRV", "Normal blink rate", "Steady input"],
-    "dwell_seconds": 45.2,
+    "state": "UNKNOWN",
+    "support_state": "unknown",
+    "status": "insufficient_evidence",
+    "confidence": 0.0,
+    "scores": { "flow": 0.0, "hypo": 0.0, "hyper": 0.0, "recovery": 0.0 },
+    "support_scores": {
+      "support_likely": 0.0, "under_engaged": 0.0,
+      "flow_like": 0.0, "recovering": 0.0
+    },
+    "evidence_coverage": 0.0,
+    "probabilities": null,
+    "reasons": ["Not enough current evidence for a support estimate"],
+    "dwell_seconds": 0.0,
     "timestamp": 1000.5
-  }
+  },
+  "source": "rules",
+  "degraded": true
 }
 ```
 
@@ -234,14 +258,16 @@ Valid `user_action` values: `dismissed` · `engaged` · `snoozed` · `timed_out`
 
 ---
 
-### Stress & Learning
+### Research compatibility & learning
 
 #### `GET /api/stress-integral`
 
 ```json
 {
-  "current_value": 12.5,
-  "threshold": 500.0,
+  "status": "unavailable",
+  "unavailable_reason": "validation_required",
+  "current_value": 0.0,
+  "threshold": 0.0,
   "should_break": false,
   "sensitivity_multiplier": 1.0,
   "timestamp": 12345.6

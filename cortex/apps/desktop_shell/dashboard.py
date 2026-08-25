@@ -268,19 +268,19 @@ _CONCEPTS_GLOSSARY: dict[str, str] = {
         "or psychological assessment."
     ),
     "flow": (
-        "FLOW: a legacy heuristic label for sustained activity patterns. "
-        "It does not measure a nervous-system state."
+        "Steady activity: a heuristic label for sustained interaction "
+        "patterns. It does not measure a nervous-system state."
     ),
     "hyper": (
-        "HYPER: a legacy heuristic label for activity patterns that may "
-        "benefit from a suggestion. It is not a diagnosis of arousal."
+        "Support may help: a heuristic label for behavior patterns that may "
+        "benefit from a workspace suggestion. It is not an arousal diagnosis."
     ),
     "hypo": (
-        "HYPO: a legacy heuristic label for quieter activity patterns. "
+        "Quiet activity: a heuristic label for quieter interaction patterns. "
         "It does not establish disengagement or low arousal."
     ),
     "recovery": (
-        "RECOVERY: a legacy transition label after another heuristic state; "
+        "Settling: a temporal transition label after support was indicated; "
         "it is not a physiological recovery measurement."
     ),
     "hr": (
@@ -905,13 +905,9 @@ class _ConsumerTab(QWidget):
         self._cost_last_value: float = -1.0
         self._cost_budget_warned: bool = False
 
-        # P0 §3.7 desktop dispatch: "Take a break?" soft pill. Hidden by
-        # default; surfaced via :meth:`apply_break_recommendation` when
-        # the daemon emits BREAK_RECOMMENDATION (stress integral
-        # threshold reached). Click → emits ``break_pill_clicked`` which
-        # the controller routes to the BiologyBreakOverlay; right-click
-        # snoozes the pill for 5 minutes. The pill auto-clears after a
-        # break completes or 10 minutes of no engagement.
+        # Opt-in elapsed-focus reminder. Hidden unless the user's preferred
+        # interval is reached; no biometric or inferred-stress input can
+        # surface this control.
         self._break_pill = QPushButton("Take a break?")
         try:
             self._break_pill.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1356,7 +1352,7 @@ class _ConsumerTab(QWidget):
         self._today_blocked = QLabel("--")
 
         for val_widget, title in [
-            (self._today_focus, "Focus"),
+            (self._today_focus, "Steady"),
             (self._today_sessions, "Sessions"),
             (self._today_best, "Best"),
             (self._today_blocked, "Blocked"),
@@ -1779,10 +1775,23 @@ class _ConsumerTab(QWidget):
             logger.debug("focus protection pill update failed", exc_info=True)
 
     def apply_break_recommendation(self, payload: dict) -> None:
-        """Reject the legacy unvalidated HRV/stress recommendation."""
+        """Render only the opt-in elapsed-focus reminder contract."""
 
-        del payload
-        self._clear_break_pill()
+        if payload.get("basis") != "elapsed_focus":
+            self._clear_break_pill()
+            return
+        self._break_recommendation_payload = dict(payload)
+        try:
+            elapsed = float(payload.get("elapsed_focus_seconds", 0.0))
+            minutes = max(1, round(elapsed / 60.0))
+            self._break_pill.setText(f"Take a break? · {minutes} min")
+            self._break_pill.setToolTip(
+                "Your preferred active-work interval was reached. "
+                "This reminder does not use camera or biometric estimates."
+            )
+            self._break_pill.setVisible(True)
+        except Exception:
+            logger.debug("break pill update failed", exc_info=True)
 
     def _on_break_pill_clicked(self) -> None:
         """Bubble the cached BREAK_RECOMMENDATION payload up to the host."""
@@ -2086,9 +2095,16 @@ class _ConsumerTab(QWidget):
             # setText; the visibility flag isn't load-bearing.
             pass
 
-        state = payload.get("state", "FLOW")
+        status = str(payload.get("status", "insufficient_evidence"))
+        raw_state = str(payload.get("state", "UNKNOWN"))
+        state = raw_state if status == "estimated" else "UNKNOWN"
         color = STATE_COLORS.get(state, _LABEL_TERTIARY)
-        label = STATE_LABELS.get(state, state)
+        if status == "warming_up":
+            label = "Still gathering"
+        elif status == "insufficient_evidence":
+            label = "Not enough evidence"
+        else:
+            label = STATE_LABELS.get(state, state)
         self._set_style_if_changed(
             self._state_dot, f"background: {color}; border-radius: 3px;"
         )
@@ -2145,8 +2161,8 @@ class _ConsumerTab(QWidget):
 
         # Audit-2 fix: drive the Today panel from accumulated session
         # stats instead of leaving the placeholder "--" labels. We
-        # accumulate FLOW seconds, count interventions seen, and track
-        # the longest contiguous FLOW streak. Approximation is
+        # accumulate steady-activity seconds, count interventions seen, and
+        # track the longest contiguous steady streak. Approximation is
         # acceptable here — these are at-a-glance numerics, not
         # research data — and is better than dead UI.
         try:
@@ -2232,7 +2248,7 @@ class _ConsumerTab(QWidget):
                 self._today_best_streak = self._today_current_streak
         else:
             self._today_current_streak = 0.0
-        # Format Focus (h:mm) and Best (m:ss / h:mm) compactly.
+        # Format steady activity (h:mm) and Best (m:ss / h:mm) compactly.
         focus_m = int(self._today_flow_seconds // 60)
         focus_h, focus_m = divmod(focus_m, 60)
         focus_text = f"{focus_h}h{focus_m:02d}" if focus_h else f"{focus_m}m"
@@ -2637,7 +2653,7 @@ class _AdvancedTab(QWidget):
         # as "Cortex is broken". Hidden once update_state arrives.
         self._empty_state = QLabel(
             "Start a session to populate signal quality, heart-rate "
-            "trace, and state scores."
+            "trace, and support scores."
         )
         self._empty_state.setObjectName("CortexAdvancedEmptyState")
         self._empty_state.setWordWrap(True)
@@ -2655,12 +2671,8 @@ class _AdvancedTab(QWidget):
         _set_accessible_name(self._empty_state, "Advanced tab empty state")
         layout.addWidget(self._empty_state)
 
-        # F18 (audit): a small badge that surfaces when the daemon falls
-        # back to synthetic state inference. Hidden by default so the
-        # happy path remains visually unchanged.
-        self._degraded_badge = QLabel(
-            "Cortex degraded — classifier unavailable"
-        )
+        # Explicitly describe unavailable evidence or a safety fallback.
+        self._degraded_badge = QLabel("No actionable estimate yet")
         self._degraded_badge.setObjectName("CortexDegradedBadge")
         self._degraded_badge.setFont(
             mac_native.system_font(FS_FOOTNOTE, "semibold")
@@ -2702,7 +2714,7 @@ class _AdvancedTab(QWidget):
         self._hr_plot = HRTracePlot()
         layout.addWidget(self._hr_plot)
 
-        scores_label = QLabel("State scores")
+        scores_label = QLabel("Support scores")
         scores_label.setFont(mac_native.system_font(FS_FOOTNOTE, "semibold"))
         scores_label.setStyleSheet(
             f"color: {_LABEL_SECONDARY}; background: transparent;"
@@ -2713,13 +2725,13 @@ class _AdvancedTab(QWidget):
         scores_grid.setVerticalSpacing(6)
         self._score_bars: dict[str, QProgressBar] = {}
         self._score_labels: dict[str, QLabel] = {}
-        for i, (name, color) in enumerate([
-            ("flow", STATE_COLORS["FLOW"]),
-            ("hyper", STATE_COLORS["HYPER"]),
-            ("hypo", STATE_COLORS["HYPO"]),
-            ("recovery", STATE_COLORS["RECOVERY"]),
+        for i, (name, display_name, color) in enumerate([
+            ("flow", "Steady", STATE_COLORS["FLOW"]),
+            ("hyper", "Support", STATE_COLORS["HYPER"]),
+            ("hypo", "Quiet", STATE_COLORS["HYPO"]),
+            ("recovery", "Settling", STATE_COLORS["RECOVERY"]),
         ]):
-            lbl = QLabel(name.capitalize())
+            lbl = QLabel(display_name)
             lbl.setFixedWidth(72)
             lbl.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
             lbl.setStyleSheet(
@@ -2751,7 +2763,7 @@ class _AdvancedTab(QWidget):
         layout.addLayout(scores_grid)
 
         meta_row = QHBoxLayout()
-        self._confidence_lbl = QLabel("Confidence: --")
+        self._confidence_lbl = QLabel("Evidence strength: --")
         self._confidence_lbl.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
         self._confidence_lbl.setStyleSheet(
             f"color: {_LABEL_TERTIARY}; background: transparent;"
@@ -2808,27 +2820,40 @@ class _AdvancedTab(QWidget):
             except Exception:
                 pass
 
-        scores = payload.get("scores", {})
+        canonical_scores = payload.get("support_scores") or {}
+        scores = {
+            "flow": canonical_scores.get(
+                "flow_like", (payload.get("scores") or {}).get("flow", 0.0)
+            ),
+            "hyper": canonical_scores.get(
+                "support_likely", (payload.get("scores") or {}).get("hyper", 0.0)
+            ),
+            "hypo": canonical_scores.get(
+                "under_engaged", (payload.get("scores") or {}).get("hypo", 0.0)
+            ),
+            "recovery": canonical_scores.get(
+                "recovering", (payload.get("scores") or {}).get("recovery", 0.0)
+            ),
+        }
         sig_q = payload.get("signal_quality", {})
-        confidence = payload.get("confidence", 0.0)
+        evidence_strength = float(payload.get("confidence", 0.0))
+        coverage = float(payload.get("evidence_coverage", 0.0))
         dwell = payload.get("dwell_seconds", 0.0)
-        state = payload.get("state", "FLOW")
+        status = str(payload.get("status", "insufficient_evidence"))
+        state = str(payload.get("state", "UNKNOWN"))
         bio = payload.get("biometrics", {})
 
-        # F18 (audit): surface the daemon's degraded state. ``degraded``
-        # and ``source`` are mirrored from the ``StateInferResponse``
-        # envelope onto every WS STATE_UPDATE payload by
-        # ``WebSocketServer._make_state_update`` (audit Wave-2 fix), so
-        # the same reader works for both the /state/infer round-trip and
-        # the live WS stream. The literal ``fallback`` is the only value
-        # ``source`` takes when the classifier is unavailable; treating
-        # it as the trigger keeps the badge from flipping on a healthy
-        # ``classifier_source="rule"`` debug field (which lives on the
-        # same payload but is unrelated to envelope-level degradation).
-        is_degraded = bool(payload.get("degraded", False)) or (
-            payload.get("source") == "fallback"
-        )
-        self._degraded_badge.setVisible(is_degraded)
+        source = payload.get("source")
+        if source == "fallback":
+            badge_text = "Inference unavailable — safety fallback active"
+        elif status == "warming_up":
+            badge_text = "Gathering enough activity evidence"
+        elif status == "insufficient_evidence":
+            badge_text = "Not enough evidence for an estimate"
+        else:
+            badge_text = ""
+        self._set_text_if_changed(self._degraded_badge, badge_text)
+        self._degraded_badge.setVisible(bool(badge_text))
 
         self._physio_q.set_value(sig_q.get("physio", 0.0))
         self._kine_q.set_value(sig_q.get("kinematics", 0.0))
@@ -2861,13 +2886,21 @@ class _AdvancedTab(QWidget):
                 self._set_value_if_changed(self._score_bars[name], int(val * 100))
                 self._set_text_if_changed(self._score_labels[name], f"{val:.2f}")
 
-        self._set_text_if_changed(self._confidence_lbl, f"Confidence: {confidence:.0%}")
-        self._set_text_if_changed(self._dwell_lbl, f"Dwell: {dwell:.1f}s")
+        self._set_text_if_changed(
+            self._confidence_lbl,
+            f"Evidence strength: {evidence_strength:.0%}",
+        )
+        self._set_text_if_changed(
+            self._dwell_lbl,
+            f"Coverage: {coverage:.0%} · Dwell: {dwell:.1f}s",
+        )
 
         if not self._timeline_events or self._timeline_events[-1]["state"] != state:
             elapsed = time.monotonic() - self._session_start
             self._timeline_events.append({
-                "time": elapsed, "state": state, "confidence": confidence,
+                "time": elapsed,
+                "state": state,
+                "evidence_strength": evidence_strength,
             })
             if len(self._timeline_events) > _MAX_TIMELINE_EVENTS:
                 self._timeline_events = self._timeline_events[-_MAX_TIMELINE_EVENTS:]
@@ -2875,7 +2908,10 @@ class _AdvancedTab(QWidget):
             for ev in reversed(self._timeline_events[-8:]):
                 t = ev["time"]
                 m, s = int(t // 60), t % 60
-                lines.append(f"{m:02d}:{s:04.1f}  {ev['state']:<10} {ev['confidence']:.0%}")
+                lines.append(
+                    f"{m:02d}:{s:04.1f}  {ev['state']:<10} "
+                    f"{ev['evidence_strength']:.0%} evidence"
+                )
             self._timeline_text.setText("\n".join(lines) if lines else "No events yet")
 
 

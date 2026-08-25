@@ -11,7 +11,7 @@
 
 import * as vscode from "vscode";
 import { CortexWSClient } from "./ws-client";
-import { PANEL_STATE_HEX_LIGHT } from "./design-tokens";
+import { PANEL_STATE_HEX_LIGHT, PANEL_STATE_LABELS } from "./design-tokens";
 
 /**
  * Webview provider for the Cortex intervention side panel.
@@ -299,12 +299,20 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             return;
         }
         const state = this._currentState;
-        const stateStr = (state.state as string) ?? "—";
+        const ready = state.status === "estimated";
+        const stateStr = ready ? ((state.state as string) ?? "UNKNOWN") : "UNKNOWN";
+        const label = state.status === "warming_up"
+            ? "Still gathering"
+            : state.status === "insufficient_evidence"
+            ? "Not enough evidence"
+            : PANEL_STATE_LABELS[stateStr] ?? "Status unavailable";
         const confidence = state.confidence as number | undefined;
         try {
             this._view.webview.postMessage({
                 type: "state",
                 state: stateStr,
+                label,
+                status: state.status,
                 color: PANEL_STATE_HEX_LIGHT[stateStr] ?? "#888",
                 confidence: confidence ?? 0,
             });
@@ -323,7 +331,13 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
         const state = this._currentState;
         const payload = this._currentPayload;
 
-        const stateStr = (state.state as string) ?? "—";
+        const ready = state.status === "estimated";
+        const stateStr = ready ? ((state.state as string) ?? "UNKNOWN") : "UNKNOWN";
+        const stateLabel = state.status === "warming_up"
+            ? "Still gathering"
+            : state.status === "insufficient_evidence"
+            ? "Not enough evidence"
+            : PANEL_STATE_LABELS[stateStr] ?? "Status unavailable";
         const confidence = state.confidence as number | undefined;
         const confPct =
             confidence !== undefined ? Math.round(confidence * 100) : 0;
@@ -608,9 +622,8 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             color: var(--cx-text-secondary);
         }
 
-        /* P1 (audit Phase 4d, Task B): explicit empty-state for the
-           daemon-offline case so the user can tell "no overwhelm yet"
-           apart from "client can't reach the daemon". */
+        /* Explicit empty state: daemon offline is distinct from an
+           evidence-aware UNKNOWN/quiet support state. */
         .daemon-offline {
             text-align: center;
             padding: 20px 12px;
@@ -731,8 +744,8 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
 <body>
     <div class="state-bar">
         <div class="state-dot" id="cx-state-dot" style="background: ${stateColor};"></div>
-        <span class="state-label" id="cx-state-label">${stateStr}</span>
-        <span class="state-conf" id="cx-state-conf">${confPct}%</span>
+        <span class="state-label" id="cx-state-label">${stateLabel}</span>
+        <span class="state-conf" id="cx-state-conf">${ready ? `Evidence ${confPct}%` : "No estimate"}</span>
     </div>
 
     ${interventionHtml || this._getEmptyStateHtml()}
@@ -750,11 +763,13 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                 const label = document.getElementById('cx-state-label');
                 const dot = document.getElementById('cx-state-dot');
                 const conf = document.getElementById('cx-state-conf');
-                if (label) label.textContent = msg.state;
+                if (label) label.textContent = msg.label || msg.state;
                 if (dot) dot.style.background = msg.color;
                 if (conf) {
                     const pct = Math.round((Number(msg.confidence) || 0) * 100);
-                    conf.textContent = pct + '%';
+                    conf.textContent = msg.status === 'estimated'
+                        ? 'Evidence ' + pct + '%'
+                        : 'No estimate';
                 }
             }
         });

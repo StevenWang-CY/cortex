@@ -135,6 +135,7 @@ export const CX = {
 } as const;
 
 export const STATE_COLORS: Record<string, string> = {
+    UNKNOWN: "#3C3C432E",
     FLOW: "#D97757",
     HYPER: "#D70015",
     HYPO: "#3C3C432E",
@@ -142,13 +143,15 @@ export const STATE_COLORS: Record<string, string> = {
 };
 
 export const STATE_LABELS: Record<string, string> = {
-    FLOW: "Focused",
-    HYPER: "Elevated",
-    HYPO: "Idle",
-    RECOVERY: "Recovering",
+    UNKNOWN: "Still gathering",
+    FLOW: "Steady activity",
+    HYPER: "Support may help",
+    HYPO: "Quiet activity",
+    RECOVERY: "Settling",
 };
 
 export const STATE_COLORS_RGB: Record<string, { r: number; g: number; b: number }> = {
+    UNKNOWN: { r: 60, g: 60, b: 67 },
     FLOW: { r: 217, g: 119, b: 87 },
     HYPER: { r: 215, g: 0, b: 21 },
     HYPO: { r: 60, g: 60, b: 67 },

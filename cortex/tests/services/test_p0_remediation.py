@@ -143,11 +143,23 @@ class _MinimalDaemon:
 
 
 def _hyper(confidence: float = 0.9) -> SimpleNamespace:
-    return SimpleNamespace(state="HYPER", confidence=confidence)
+    return SimpleNamespace(
+        state="HYPER",
+        support_state="support_likely",
+        status="estimated",
+        confidence=confidence,
+        evidence_coverage=1.0,
+    )
 
 
 def _flow() -> SimpleNamespace:
-    return SimpleNamespace(state="FLOW", confidence=0.95)
+    return SimpleNamespace(
+        state="FLOW",
+        support_state="flow_like",
+        status="estimated",
+        confidence=0.95,
+        evidence_coverage=1.0,
+    )
 
 
 # ======================================================================

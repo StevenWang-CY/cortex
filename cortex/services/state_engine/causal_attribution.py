@@ -1,13 +1,11 @@
-"""
-State Engine — Causal Attribution (P0 §3.9).
+"""Observed-evidence attribution for support estimates.
 
-Maps a live :class:`FeatureVector` into the structured causal rationale
+Maps a live :class:`FeatureVector` into the legacy ``CausalSignal`` wire shape
 (:class:`CausalSignal`) the UI renders inside the "Why?" drilldown.
 
 The algorithm is pure surfacing — no new computation:
 
-1. For each tracked signal (HRV, HR, blink rate, tab switches, forward
-   lean, PERCLOS, scroll-back) the attributor computes a z-score
+1. For each production-eligible behavior signal the attributor computes a z-score
    against the user's baseline using the personal ``metric_distributions``
    when available and conservative defaults otherwise.
 2. The 60-sample 1-Hz sparkline buffer is the most recent N seconds of
@@ -29,6 +27,7 @@ from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from cortex.libs.schemas.features import FeatureName, FeatureValue
 from cortex.libs.schemas.intervention import CausalSignal
 from cortex.libs.schemas.state import UserBaselines
 
@@ -55,6 +54,7 @@ class _SignalConfig:
 
     label: str
     unit: str
+    feature_name: FeatureName
     feature_attr: str  # FeatureVector field name
     baseline_attr: str  # UserBaselines field name (or "" for fixed default)
     baseline_default: float
@@ -64,39 +64,21 @@ class _SignalConfig:
 
 
 _SIGNAL_CONFIG: dict[str, _SignalConfig] = {
-    "hrv": _SignalConfig(
-        label="HRV",
-        unit="ms",
-        feature_attr="hrv_rmssd",
-        baseline_attr="hrv_baseline",
-        baseline_default=50.0,
-        sigma_default=8.0,
-        metric_key="hrv_rmssd",
-        direction="below",
-    ),
-    "hr": _SignalConfig(
-        label="Heart rate",
-        unit="bpm",
-        feature_attr="hr",
-        baseline_attr="hr_baseline",
-        baseline_default=72.0,
-        sigma_default=6.0,
-        metric_key="hr",
+    "mouse_variance": _SignalConfig(
+        label="Mouse variability",
+        unit="px²/s²",
+        feature_name=FeatureName.MOUSE_VELOCITY_VARIANCE,
+        feature_attr="mouse_velocity_variance",
+        baseline_attr="mouse_variance_baseline",
+        baseline_default=10_000.0,
+        sigma_default=5_000.0,
+        metric_key="mouse_velocity_variance",
         direction="above",
-    ),
-    "blink": _SignalConfig(
-        label="Blink rate",
-        unit="/min",
-        feature_attr="blink_rate",
-        baseline_attr="blink_rate_baseline",
-        baseline_default=17.0,
-        sigma_default=4.0,
-        metric_key="blink_rate",
-        direction="abs",
     ),
     "tab_switches": _SignalConfig(
         label="Tab switches",
         unit="/min",
+        feature_name=FeatureName.TAB_SWITCH_RATE_PER_MIN,
         feature_attr="tab_switch_frequency",
         baseline_attr="",
         baseline_default=2.0,
@@ -104,34 +86,37 @@ _SIGNAL_CONFIG: dict[str, _SignalConfig] = {
         metric_key="tab_switch_frequency",
         direction="above",
     ),
-    "forward_lean": _SignalConfig(
-        label="Forward lean",
-        unit="°",
-        feature_attr="forward_lean_angle",
+    "corrections": _SignalConfig(
+        label="Corrections",
+        unit="/100 keys",
+        feature_name=FeatureName.CORRECTION_RATE_PER_100_KEYS,
+        feature_attr="correction_rate_per_100_keys",
         baseline_attr="",
-        baseline_default=4.0,
-        sigma_default=6.0,
-        metric_key="forward_lean_angle",
-        direction="above",
-    ),
-    "perclos": _SignalConfig(
-        label="Eye closure",
-        unit="",
-        feature_attr="perclos_60s",
-        baseline_attr="",
-        baseline_default=0.10,
-        sigma_default=0.08,
-        metric_key="perclos_60s",
+        baseline_default=5.0,
+        sigma_default=5.0,
+        metric_key="correction_rate_per_100_keys",
         direction="above",
     ),
     "scroll_back": _SignalConfig(
         label="Re-read bursts",
         unit="/min",
+        feature_name=FeatureName.SCROLL_BACK_RATE_PER_MIN,
         feature_attr="scroll_back_rate_per_min",
         baseline_attr="",
         baseline_default=0.5,
         sigma_default=1.0,
         metric_key="scroll_back_rate_per_min",
+        direction="above",
+    ),
+    "thrashing": _SignalConfig(
+        label="Focus switching",
+        unit="",
+        feature_name=FeatureName.THRASHING_SCORE,
+        feature_attr="thrashing_score",
+        baseline_attr="",
+        baseline_default=0.0,
+        sigma_default=0.25,
+        metric_key="thrashing_score",
         direction="above",
     ),
 }
@@ -155,7 +140,7 @@ class CausalAttributor:
     def record_feature_vector(self, features: object) -> None:
         """Append the current value of every tracked signal."""
         for key, cfg in _SIGNAL_CONFIG.items():
-            value = self._extract(features, cfg.feature_attr)
+            value = self._extract(features, cfg)
             if value is None:
                 continue
             self._buffers[key].append(float(value))
@@ -182,15 +167,12 @@ class CausalAttributor:
         ``causal_signals`` payload — see ``popup.tsx``'s
         ``causalSignals.length === 0`` branch.
 
-        Returning a synthetic placeholder (e.g. "HRV (baseline)") here
-        was misleading: it showed a real biometric value next to a
-        label the user couldn't act on, making a healthy baseline read
-        look like a half-broken explanation. The empty-state branch
-        in the UI now communicates "explanation pending" clearly.
+        Returning a synthetic placeholder is misleading; the empty-state
+        branch communicates that no strong observed contributor is available.
         """
         scored: list[tuple[float, CausalSignal]] = []
         for key, cfg in _SIGNAL_CONFIG.items():
-            value = self._extract(features, cfg.feature_attr)
+            value = self._extract(features, cfg)
             if value is None:
                 continue
             baseline, sigma = self._baseline_for(cfg, baselines)
@@ -228,8 +210,17 @@ class CausalAttributor:
         return ranked
 
     @staticmethod
-    def _extract(features: object, attr: str) -> float | None:
-        value = getattr(features, attr, None)
+    def _extract(features: object, cfg: _SignalConfig) -> float | None:
+        named = getattr(features, "features", None)
+        value: object
+        if isinstance(named, dict) and named:
+            item = named.get(cfg.feature_name) or named.get(cfg.feature_name.value)
+            if not isinstance(item, FeatureValue) or not item.valid:
+                return None
+            value = item.value
+        else:
+            # One-cycle compatibility for stored/replayed v1 vectors.
+            value = getattr(features, cfg.feature_attr, None)
         if value is None:
             return None
         try:

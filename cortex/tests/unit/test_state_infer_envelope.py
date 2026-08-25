@@ -1,4 +1,4 @@
-"""Audit F18 — ``/state/infer`` envelope distinguishes classifier from fallback.
+"""``/state/infer`` distinguishes deterministic rules from fail-closed fallback.
 
 Pre-fix, the fallback path returned a synthetic ``confidence=0.5`` that
 was structurally identical to a real rule-scorer confidence of 0.5. The
@@ -9,8 +9,8 @@ bug.
 
 The fix adds two envelope fields:
 
-* ``source: Literal["classifier", "fallback"]`` — defaults to
-  ``classifier`` for backwards compat.
+* ``source: Literal["rules", "classifier", "fallback"]`` — production
+  emits ``rules``; classifier is decode-only.
 * ``degraded: bool`` — True when the daemon could not run real
   inference.
 
@@ -19,8 +19,7 @@ aggregator sees the degradation without inspecting the response body.
 
 Test plan:
 
-1. Classifier path → envelope shows ``source="classifier"`` and
-   ``degraded=False``.
+1. Rule path → envelope shows ``source="rules"``.
 2. Missing scorer/smoother → envelope shows ``source="fallback"`` and
    ``degraded=True``; a STATE_INFER_DEGRADED log line is emitted with
    the bound cid.
@@ -103,11 +102,11 @@ def _make_feature_vector() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 1. Classifier path stamps source=classifier (the default)
+# 1. Deterministic path stamps source=rules
 # ---------------------------------------------------------------------------
 
 
-def test_classifier_path_marks_source_classifier(
+def test_rule_path_marks_source_rules(
     tmp_path, monkeypatch,
 ) -> None:
     from cortex.libs.auth.local_token import load_or_create_token
@@ -134,8 +133,11 @@ def test_classifier_path_marks_source_classifier(
         )
     assert resp.status_code == 200
     body = resp.json()
-    assert body["source"] == "classifier"
-    assert body["degraded"] is False
+    assert body["source"] == "rules"
+    # This minimal legacy-shaped request carries no named production
+    # evidence, so the engine truthfully reports warm-up rather than a label.
+    assert body["degraded"] is True
+    assert body["estimate"]["state"] == "UNKNOWN"
 
 
 # ---------------------------------------------------------------------------
@@ -219,16 +221,18 @@ def test_advanced_tab_shows_degraded_banner_when_payload_flagged(qt_app) -> None
     # an unrealised widget.
     assert tab._degraded_badge.isHidden() is True
 
-    # Healthy classifier payload: still hidden.
+    # Healthy rules payload: still hidden.
     tab.update_state({
         "scores": {"flow": 0.7, "hypo": 0.0, "hyper": 0.2, "recovery": 0.1},
         "signal_quality": {"physio": 0.8, "kinematics": 0.7, "telemetry": 0.6},
         "confidence": 0.7,
         "dwell_seconds": 2.0,
         "state": "FLOW",
+        "status": "estimated",
+        "evidence_coverage": 0.8,
         "biometrics": {},
         "degraded": False,
-        "source": "classifier",
+        "source": "rules",
     })
     assert tab._degraded_badge.isHidden() is True
 
@@ -236,9 +240,11 @@ def test_advanced_tab_shows_degraded_banner_when_payload_flagged(qt_app) -> None
     tab.update_state({
         "scores": {"flow": 0.5, "hypo": 0.0, "hyper": 0.0, "recovery": 0.0},
         "signal_quality": {"physio": 0.0, "kinematics": 0.0, "telemetry": 0.0},
-        "confidence": 0.5,
+        "confidence": 0.0,
         "dwell_seconds": 0.0,
-        "state": "FLOW",
+        "state": "UNKNOWN",
+        "status": "insufficient_evidence",
+        "evidence_coverage": 0.0,
         "biometrics": {},
         "degraded": True,
         "source": "fallback",
@@ -253,9 +259,11 @@ def test_advanced_tab_shows_degraded_banner_when_payload_flagged(qt_app) -> None
         "confidence": 0.6,
         "dwell_seconds": 3.0,
         "state": "FLOW",
+        "status": "estimated",
+        "evidence_coverage": 0.7,
         "biometrics": {},
         "degraded": False,
-        "source": "classifier",
+        "source": "rules",
     })
     assert tab._degraded_badge.isHidden() is True
 
@@ -273,10 +281,12 @@ def test_state_infer_response_pydantic_round_trip() -> None:
     )
 
     estimate = StateEstimate(
-        state="FLOW",
-        confidence=0.5,
-        scores=StateScores(flow=0.5, hypo=0.0, hyper=0.0, recovery=0.0),
-        reasons=["synthetic"],
+        state="UNKNOWN",
+        status="insufficient_evidence",
+        confidence=0.0,
+        scores=StateScores(),
+        evidence_coverage=0.0,
+        reasons=["engine unavailable"],
         signal_quality=SignalQuality(physio=0.0, kinematics=0.0, telemetry=0.0),
         timestamp=1.0,
         dwell_seconds=0.0,
@@ -294,5 +304,5 @@ def test_state_infer_response_pydantic_round_trip() -> None:
 
     # Defaults match the audit prescription.
     default = StateInferResponse(estimate=estimate)
-    assert default.source == "classifier"
+    assert default.source == "rules"
     assert default.degraded is False

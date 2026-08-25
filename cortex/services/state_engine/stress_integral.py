@@ -1,24 +1,23 @@
-"""
-State Engine — Stress Integral Tracker (Biological Pomodoros)
+"""Research-only numerical HRV-integral prototype.
 
-Replaces static 25-minute timers with biology-driven break detection.
-Calculates cumulative stress load L by integrating HRV suppression:
+Calculates an unvalidated cumulative quantity L by integrating a standardized
+HRV deficit in controlled simulations:
 
     L = integral(max(0, HRV_base - HRV(t)) dt)
 
-When L crosses a dynamic personal threshold, a break intervention is emitted.
-The user can ride deep FLOW indefinitely until their actual biology flags fatigue.
-
-The threshold is dynamically adjusted by the longitudinal tracker's
-sensitivity_multiplier based on multi-day trends.
+This module is not production-eligible: webcam HRV has not passed the
+reference-sensor gate, the quantity is not established as stress or fatigue,
+and its threshold has no validated decision meaning.
+The runtime does not call it for inference, policy, or break recommendations.
 """
 
 from __future__ import annotations
 
 import logging
-import time
 from collections import deque
 from typing import Any
+
+from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +35,8 @@ class StressIntegralTracker:
     The integral L accumulates whenever HRV drops below baseline:
         dL = max(0, hrv_baseline - hrv_current) * dt
 
-    Break is recommended when L exceeds a threshold that adapts
-    based on the longitudinal model's sensitivity multiplier.
+    Threshold helpers exist only to reproduce historical simulations; they
+    are not eligible to recommend product actions.
 
     Usage:
         tracker = StressIntegralTracker(hrv_baseline=50.0)
@@ -47,13 +46,17 @@ class StressIntegralTracker:
         tracker.reset()  # After break taken
     """
 
+    production_eligible = False
+
     def __init__(
         self,
         hrv_baseline: float = 50.0,
         hrv_sigma: float = 1.0,
         threshold: float = _DEFAULT_THRESHOLD,
         sensitivity_multiplier: float = 1.0,
+        clock: Clock | None = None,
     ) -> None:
+        self._clock = clock or SYSTEM_CLOCK
         self._hrv_baseline = hrv_baseline
         # P1 Pipeline F: 5ms floor instead of 1ms. With sigma=1ms an RMSSD
         # baseline of 50 ms drove the integral to ``threshold`` within ~25 s
@@ -107,7 +110,7 @@ class StressIntegralTracker:
 
         Args:
             hrv_rmssd: Current HRV (RMSSD) in milliseconds. None = skip.
-            timestamp: Monotonic timestamp. None = use time.monotonic().
+            timestamp: Monotonic timestamp. None = use the injected clock.
 
         Returns:
             Current cumulative stress load L.
@@ -116,7 +119,7 @@ class StressIntegralTracker:
             return self._integral
 
         if timestamp is None:
-            timestamp = time.monotonic()
+            timestamp = monotonic_seconds(self._clock)
 
         if self._last_timestamp is not None and self._last_hrv is not None:
             dt = timestamp - self._last_timestamp
@@ -216,13 +219,19 @@ class StressIntegralTracker:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> StressIntegralTracker:
+    def from_dict(
+        cls,
+        data: dict[str, Any],
+        *,
+        clock: Clock | None = None,
+    ) -> StressIntegralTracker:
         """Restore from serialized state."""
         tracker = cls(
             hrv_baseline=data.get("hrv_baseline", 50.0),
             hrv_sigma=data.get("hrv_sigma", 10.0),
             threshold=data.get("base_threshold", _DEFAULT_THRESHOLD),
             sensitivity_multiplier=data.get("sensitivity_multiplier", 1.0),
+            clock=clock,
         )
         tracker._integral = data.get("integral", 0.0)
         tracker._break_emitted = data.get("break_emitted", False)

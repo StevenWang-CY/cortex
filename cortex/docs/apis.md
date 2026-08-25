@@ -49,7 +49,11 @@ probability.
 ```json
 {
   "state": "FLOW",
+  "support_state": "flow_like",
+  "estimate_status": "estimated",
   "confidence": 0.87,
+  "evidence_strength": 0.87,
+  "evidence_coverage": 0.82,
   "signal_quality": {
     "physio": 0.92,
     "kinematics": 0.88,
@@ -154,27 +158,27 @@ All feature endpoints return `{ "status": "ok", "timestamp": <float> }`.
 
 #### `POST /state/infer`
 
-Compute the legacy heuristic support label from a fused feature vector.
-Compatibility inputs such as `hrv_norm` are accepted but product runtime
-does not populate unsupported HRV/respiration evidence.
+Compute an evidence-aware deterministic support estimate. Named
+`FeatureValue` entries are canonical; flat fields are decode-only. Every named
+entry carries validity, quality, age, source-window exposure, algorithm
+version, and a missing reason when invalid.
 
 **Request body:**
 ```json
 {
   "feature_vector": {
-    "pulse_norm": 0.3,
-    "hrv_norm": 0.6,
-    "blink_norm": 0.5,
-    "posture_norm": 0.2,
-    "mouse_velocity_norm": 0.4,
-    "mouse_jerk_norm": 0.1,
-    "click_burst_norm": 0.1,
-    "keyboard_burst_norm": 0.2,
-    "inactivity_norm": 0.05,
-    "window_switch_norm": 0.3,
-    "backspace_norm": 0.05,
-    "complexity_norm": 0.4,
-    "timestamp": 1000.5
+    "timestamp": 1000.5,
+    "telemetry_seen_count": 5,
+    "features": {
+      "keypress_rate_per_min": {
+        "value": 60.0,
+        "valid": true,
+        "quality": 1.0,
+        "age_ms": 0,
+        "source_window_ms": 15000,
+        "algorithm_version": "input-aggregation-v2"
+      }
+    }
   },
   "signal_quality": {
     "physio": 0.9,
@@ -189,19 +193,31 @@ does not populate unsupported HRV/respiration evidence.
 ```json
 {
   "estimate": {
-    "state": "FLOW",
-    "confidence": 0.87,
+    "state": "UNKNOWN",
+    "support_state": "unknown",
+    "status": "insufficient_evidence",
+    "confidence": 0.0,
     "scores": {
-      "flow": 0.87,
-      "hypo": 0.05,
-      "hyper": 0.08,
+      "flow": 0.0,
+      "hypo": 0.0,
+      "hyper": 0.0,
       "recovery": 0.0
     },
-    "reasons": ["Stable visible-eye activity", "Steady input"],
+    "support_scores": {
+      "support_likely": 0.0,
+      "under_engaged": 0.0,
+      "flow_like": 0.0,
+      "recovering": 0.0
+    },
+    "evidence_coverage": 0.0,
+    "probabilities": null,
+    "reasons": ["Not enough current evidence for a support estimate"],
     "signal_quality": { "physio": 0.9, "kinematics": 0.85, "telemetry": 0.95, "overall": 0.9 },
     "timestamp": 1000.5,
-    "dwell_seconds": 45.2
+    "dwell_seconds": 0.0
   },
+  "source": "rules",
+  "degraded": true,
   "timestamp": 1000.52
 }
 ```

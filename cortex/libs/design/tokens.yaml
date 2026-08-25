@@ -80,10 +80,11 @@ semantic:
 # colors. Used on the state badge (capsule), tray icon tint, panel-provider
 # state pill, browser ext popup header.
 state:
-  FLOW:     { label: "Focused",    accent_role: "brand" }
-  HYPER:    { label: "Elevated",   accent_role: "danger" }
-  HYPO:     { label: "Idle",       accent_role: "label_tertiary" }
-  RECOVERY: { label: "Recovering", accent_role: "info" }
+  UNKNOWN:  { label: "Still gathering",  accent_role: "label_tertiary" }
+  FLOW:     { label: "Steady activity",   accent_role: "brand" }
+  HYPER:    { label: "Support may help",  accent_role: "danger" }
+  HYPO:     { label: "Quiet activity",    accent_role: "label_tertiary" }
+  RECOVERY: { label: "Settling",          accent_role: "info" }
 
 # Biometric channel tints. Used in the biometrics card + HR trace plot + browser
 # popup biometrics row. Kept as fixed hues (not semantic) because they encode
@@ -182,6 +183,7 @@ hud:
 # distinguishable under the named color-vision deficiency.
 palette_variants:
   default:
+    UNKNOWN: "label_tertiary"
     FLOW: "brand"
     HYPER: "danger"
     HYPO: "label_tertiary"
@@ -189,16 +191,19 @@ palette_variants:
   # Deuteranopia — ~6% of men, red/green confusion. We anchor on blue+orange
   # (high luminance contrast) and pick a warm yellow for HYPER instead of red.
   deuteranopia:
+    UNKNOWN: { hex: "#999999" }
     FLOW: { hex: "#0072B2" }      # blue
     HYPER: { hex: "#E69F00" }     # orange
     HYPO: { hex: "#999999" }      # neutral grey
     RECOVERY: { hex: "#009E73" }  # teal-green (safe under deutan)
   protanopia:
+    UNKNOWN: { hex: "#999999" }
     FLOW: { hex: "#0072B2" }
     HYPER: { hex: "#E69F00" }
     HYPO: { hex: "#999999" }
     RECOVERY: { hex: "#56B4E9" }  # sky blue
   tritanopia:
+    UNKNOWN: { hex: "#999999" }
     FLOW: { hex: "#D55E00" }      # vermillion (FLOW=warm brand)
     HYPER: { hex: "#CC79A7" }     # rose
     HYPO: { hex: "#999999" }
