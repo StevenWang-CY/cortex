@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -27,7 +28,12 @@ from cortex.libs.schemas.state import (
     StateScores,
 )
 from cortex.services.api_gateway.app import ServiceRegistry, create_app, registry
-from cortex.services.api_gateway.websocket_server import WebSocketClient, WebSocketServer, WSMessage
+from cortex.services.api_gateway.websocket_server import (
+    WebSocketClient,
+    WebSocketServer,
+    WSMessage,
+    _receipt_has_restorable_effect,
+)
 from cortex.services.intervention_engine.executor import InterventionExecutor
 from cortex.services.intervention_engine.restore import RestoreManager
 
@@ -78,6 +84,28 @@ def _make_physio_features() -> dict:
         "hr_delta_5s": 1.0,
         "valid": True,
     }
+
+
+@pytest.mark.parametrize(
+    ("status", "verification", "inverse", "expected"),
+    [
+        ("succeeded", "verified", '{"tabId":9}', True),
+        ("failed", "failed", '{"cortexEffectMayExist":true}', False),
+        ("already_complete", "verified", '{"noEffect":true}', False),
+    ],
+)
+def test_receipt_projection_only_marks_verified_effects_restorable(
+    status: str,
+    verification: str,
+    inverse: str,
+    expected: bool,
+) -> None:
+    receipt = SimpleNamespace(
+        status=status,
+        verification=verification,
+        inverse_payload_json=inverse,
+    )
+    assert _receipt_has_restorable_effect(receipt) is expected
 
 
 def _make_kinematic_features() -> dict:
@@ -548,7 +576,9 @@ class TestInterventionEndpoints:
         data = resp.json()
         assert data["restored"] is False
 
-    def test_apply_with_executor_and_restore_manager(self, client: TestClient):
+    def test_legacy_apply_cannot_bypass_transaction_authority(
+        self, client: TestClient,
+    ):
         class OverlayAdapter:
             async def execute(self, action: str, params: dict) -> bool:
                 return action in {"show_overlay", "hide_overlay"}
@@ -579,11 +609,13 @@ class TestInterventionEndpoints:
         resp = client.post("/intervention/apply", json=payload)
         assert resp.status_code == 200
         data = resp.json()
-        assert data["applied"] is True
-        assert data["snapshot"]["intervention_id"] == "int_apply_123"
-        assert restore_manager.active_count == 1
+        assert data["applied"] is False
+        assert data["snapshot"] is None
+        assert restore_manager.active_count == 0
 
-    def test_restore_with_restore_manager(self, client: TestClient):
+    def test_legacy_restore_manager_cannot_bypass_daemon_transactions(
+        self, client: TestClient,
+    ):
         class OverlayAdapter:
             async def execute(self, action: str, params: dict) -> bool:
                 return action in {"show_overlay", "hide_overlay"}
@@ -620,9 +652,65 @@ class TestInterventionEndpoints:
         )
         assert restore_resp.status_code == 200
         data = restore_resp.json()
-        assert data["restored"] is True
-        assert data["outcome"]["intervention_id"] == "int_restore_123"
+        assert data["restored"] is False
+        assert data["outcome"] is None
         assert restore_manager.active_count == 0
+
+    def test_restore_prefers_daemon_transaction_boundary(
+        self, client: TestClient,
+    ) -> None:
+        calls: list[tuple[str, str]] = []
+
+        class _Daemon:
+            async def restore_intervention(
+                self, intervention_id: str, user_action: str,
+            ) -> None:
+                calls.append((intervention_id, user_action))
+                return None
+
+        registry.register("daemon", _Daemon())
+        response = client.post(
+            "/intervention/restore",
+            json={"intervention_id": "int_exact", "user_action": "dismissed"},
+        )
+        assert response.status_code == 200
+        assert response.json()["restored"] is False
+        assert calls == [("int_exact", "dismissed")]
+
+    def test_emergency_restore_all_reports_verified_summary(
+        self, client: TestClient,
+    ) -> None:
+        calls: list[tuple[str, float]] = []
+
+        class _Daemon:
+            async def restore_all_transactional_effects(
+                self, *, reason: str, timeout_seconds: float,
+            ) -> dict[str, int]:
+                calls.append((reason, timeout_seconds))
+                return {
+                    "requested": 2,
+                    "dispatched": 2,
+                    "restored": 1,
+                    "failed": 0,
+                    "pending": 1,
+                }
+
+        registry.register("daemon", _Daemon())
+        response = client.post("/intervention/restore-all")
+        assert response.status_code == 200
+        assert response.json()["available"] is True
+        assert response.json()["complete"] is False
+        assert response.json()["restored"] == 1
+        assert response.json()["pending"] == 1
+        assert calls == [("emergency_restore", 3.0)]
+
+    def test_emergency_restore_all_fails_closed_without_daemon(
+        self, client: TestClient,
+    ) -> None:
+        response = client.post("/intervention/restore-all")
+        assert response.status_code == 200
+        assert response.json()["available"] is False
+        assert response.json()["complete"] is False
 
 
 # =============================================================================
@@ -880,6 +968,37 @@ class TestConsentEndpoints:
         data = resp.json()
         assert data["reset"] is True
         assert data["levels"] == {}  # All states cleared after reset
+
+    def test_reset_consent_requests_exact_global_restore(
+        self, client: TestClient,
+    ) -> None:
+        from cortex.services.consent.ladder import ConsentLadder
+        from cortex.services.consent.policy import ConsentPolicy
+
+        calls: list[tuple[str, float]] = []
+
+        class _Daemon:
+            async def restore_all_transactional_effects(
+                self, *, reason: str, timeout_seconds: float,
+            ) -> dict[str, int]:
+                calls.append((reason, timeout_seconds))
+                return {
+                    "requested": 0,
+                    "dispatched": 0,
+                    "restored": 0,
+                    "failed": 0,
+                    "pending": 0,
+                }
+
+        registry.register(
+            "consent_ladder",
+            ConsentLadder(policy=ConsentPolicy(), store=None),
+        )
+        registry.register("daemon", _Daemon())
+        response = client.post("/consent/reset")
+        assert response.status_code == 200
+        assert response.json()["reset"] is True
+        assert calls == [("system_cancelled", 3.0)]
 
 
 # =============================================================================

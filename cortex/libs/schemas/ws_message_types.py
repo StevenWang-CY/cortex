@@ -116,6 +116,12 @@ class MessageType(str, Enum):  # noqa: UP042 — pydantic-to-typescript requires
     INTERVENTION_APPLIED = "INTERVENTION_APPLIED"
     """Extension confirms it applied (or failed to apply) a plan."""
 
+    INTERVENTION_AUTHORIZE = "INTERVENTION_AUTHORIZE"
+    """User gesture requests one-time authority for an exact manifest subset."""
+
+    INTERVENTION_RECEIPT = "INTERVENTION_RECEIPT"
+    """Adapter reports typed per-action apply/compensation/restore receipts."""
+
     SHUTDOWN = "SHUTDOWN"
     """Request the daemon shut itself down (gated by capability token)."""
 
@@ -255,6 +261,15 @@ class MessageType(str, Enum):  # noqa: UP042 — pydantic-to-typescript requires
 
     INTERVENTION_TRIGGER = "INTERVENTION_TRIGGER"
     """Plan + UI hints for a new intervention."""
+
+    INTERVENTION_APPLY = "INTERVENTION_APPLY"
+    """Exact manifest command backed by a consumed one-time authorization."""
+
+    INTERVENTION_AUTHORIZATION_DENIED = "INTERVENTION_AUTHORIZATION_DENIED"
+    """Typed denial for an exact authorization request; never executable."""
+
+    INTERVENTION_TRANSACTION_STATE = "INTERVENTION_TRANSACTION_STATE"
+    """Lifecycle update for pending/applied/partial/restore UI feedback."""
 
     INTERVENTION_RESTORE = "INTERVENTION_RESTORE"
     """Explicit cue for clients to undo their workspace mutations."""

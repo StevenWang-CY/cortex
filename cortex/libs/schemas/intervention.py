@@ -60,6 +60,18 @@ class ValidationResult:
 # when the extension hands the URL to ``chrome.tabs.create``.
 _ALLOWED_URL_SCHEMES: frozenset[str] = frozenset({"http", "https"})
 
+# These proposal actions currently have an exact apply verifier plus an
+# ownership-safe inverse in the WP-6 transaction adapters. This presentation
+# hint is normalised from the catalog; it is never used as execution authority.
+_EXACTLY_REVERSIBLE_ACTION_TYPES: frozenset[str] = frozenset(
+    {
+        "open_url",
+        "search_error",
+        "highlight_tab",
+        "resume_last_active_file",
+    }
+)
+
 # F10: per-action_type maximum length of the ``target`` string. The
 # overall ``max_length=500`` on the field remains as an outer bound;
 # these tighter caps catch obvious shape misuse (e.g. a search query
@@ -87,7 +99,7 @@ def _generate_action_id() -> str:
 
 
 class SuggestedAction(BaseModel):
-    """A single executable action the user can approve with one click."""
+    """A proposed action; only the transaction manifest can make it executable."""
 
     action_id: str = Field(
         default_factory=_generate_action_id,
@@ -131,7 +143,13 @@ class SuggestedAction(BaseModel):
         "recommended",
         description="How strongly recommended",
     )
-    reversible: bool = Field(True, description="Whether this action can be undone")
+    reversible: bool = Field(
+        False,
+        description=(
+            "Presentation hint normalised from the transactional capability "
+            "catalog; never execution authority"
+        ),
+    )
     group_id: str | None = Field(
         None, description="Groups related actions together"
     )
@@ -204,6 +222,7 @@ class SuggestedAction(BaseModel):
                 raise ValueError(
                     "open_url target must include a hostname"
                 )
+        self.reversible = self.action_type in _EXACTLY_REVERSIBLE_ACTION_TYPES
         return self
 
 
@@ -520,19 +539,26 @@ class InterventionPlan(BaseModel):
 
     @property
     def is_destructive(self) -> bool:
-        """Check if plan contains destructive workspace actions (should always be False).
+        """Check whether a proposal can discard unreconstructable user state.
 
         Uses action_type checking instead of substring matching on labels,
         which avoids false positives on benign labels like 'Close New Tab'.
-        close_tab is NOT inherently destructive (it's reversible via undo).
+        Closing a browser tab is destructive for Cortex: reopening its URL does
+        not reconstruct browser-owned session identity, history, form state,
+        scroll position, or live media state. Bookmarking the URL first does
+        not change that classification.
         """
         destructive_action_types = {
-            "delete_file", "delete_project", "close_application", "discard_changes",
+            "delete_file",
+            "delete_project",
+            "close_application",
+            "discard_changes",
+            "close_tab",
+            "bookmark_and_close",
         }
         for action in self.suggested_actions:
             if action.action_type in destructive_action_types:
                 return True
-        # close_tab is NOT inherently destructive (it's reversible via undo)
         return False
 
 

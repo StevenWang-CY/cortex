@@ -3,13 +3,23 @@
 //
 // Source of truth: cortex/libs/schemas/*.py (Pydantic v2 models).
 // Schema package: cortex-wire/2.0
-// Source SHA-256: 422a2b265f6e0f1862dc1a4adf4d967a4a6d68084cabf295a1c7caf557ebd43c
+// Source SHA-256: 825d9450d537b2a95dae213d854466b1d84f166ce8ed572957d022d0b626800a
 // Drift-gate: a pre-commit hook and the GitHub Actions CI run
 //   `python -m cortex.scripts.generate_ts_schemas --check`
 // and fail if this file is out of sync with the Python models.
 //
 // Debt-1 closure (audit/findings.md) — closes F42, F43, F44, F45.
 
+export type ReceiptPhase = "apply" | "compensate" | "restore";
+export type ReceiptStatus = "succeeded" | "failed" | "already_complete";
+export type VerificationStatus = "verified" | "failed" | "not_applicable";
+/**
+ * One-time authorization ledger state.
+ */
+export type AuthorizationState = "issued" | "consumed" | "revoked" | "expired";
+/**
+ * Lifecycle of a candidate in the overlap-reconciled beat ledger.
+ */
 export type BeatStatus = "provisional" | "accepted" | "rejected";
 /**
  * Closed reasons for excluding a beat or derived interval.
@@ -75,6 +85,36 @@ export type MissingReason =
  */
 export type SupportState = "support_likely" | "under_engaged" | "flow_like" | "recovering" | "unknown";
 /**
+ * Persisted state of one intervention transaction.
+ */
+export type InterventionLifecycleState =
+  | "proposed"
+  | "delivered"
+  | "authorized"
+  | "applying"
+  | "applied"
+  | "partial"
+  | "failed"
+  | "restoring"
+  | "restored"
+  | "restore_failed"
+  | "abandoned";
+/**
+ * Persisted state of one intervention transaction.
+ */
+export type InterventionLifecycleState1 =
+  | "proposed"
+  | "delivered"
+  | "authorized"
+  | "applying"
+  | "applied"
+  | "partial"
+  | "failed"
+  | "restoring"
+  | "restored"
+  | "restore_failed"
+  | "abandoned";
+/**
  * Deprecated uppercase compatibility alias
  */
 export type UserState = "UNKNOWN" | "FLOW" | "HYPO" | "HYPER" | "RECOVERY";
@@ -119,6 +159,8 @@ export type MessageType =
   | "TAB_RELEVANCE_FEEDBACK"
   | "LEETCODE_CONTEXT_UPDATE"
   | "INTERVENTION_APPLIED"
+  | "INTERVENTION_AUTHORIZE"
+  | "INTERVENTION_RECEIPT"
   | "SHUTDOWN"
   | "REQUEST_SESSION_LIST"
   | "REQUEST_SESSION_DETAIL"
@@ -140,6 +182,9 @@ export type MessageType =
   | "CALIBRATION_UPDATED"
   | "CALIBRATION_UPDATE_FAILED"
   | "INTERVENTION_TRIGGER"
+  | "INTERVENTION_APPLY"
+  | "INTERVENTION_AUTHORIZATION_DENIED"
+  | "INTERVENTION_TRANSACTION_STATE"
   | "INTERVENTION_RESTORE"
   | "CONTEXT_REQUEST"
   | "ACTIVE_RECALL"
@@ -225,6 +270,31 @@ export interface AckResponse {
   status?: string;
 }
 /**
+ * One-time authority for an exact action subset and consent revision.
+ */
+export interface ActionAuthorization {
+  authorization_id?: string;
+  authorization_request_id: string;
+  intervention_id: string;
+  manifest_sha256: string;
+  /**
+   * @minItems 1
+   * @maxItems 32
+   */
+  authorized_action_ids: [string, ...string[]];
+  consent_revision: number;
+  authorization_kind: "user_confirmed" | "research_autonomous";
+  source_surface: "browser" | "vscode" | "desktop" | "http" | "daemon";
+  source_client_id?: string | null;
+  requester_boot_id: string;
+  issued_at_unix_ms: number;
+  issued_at_mono_ns: number;
+  expires_at_unix_ms: number;
+  ttl_ms: number;
+  boot_id: string;
+  nonce?: string;
+}
+/**
  * Consent state for a specific action type.
  */
 export interface ActionConsentState {
@@ -256,6 +326,80 @@ export interface ActionConsentState {
    * When last rejected
    */
   last_rejection?: string | null;
+}
+/**
+ * Immutable, content-addressed action manifest delivered with a proposal.
+ */
+export interface ActionManifest {
+  schema_version?: "1";
+  intervention_id: string;
+  canonical_json: string;
+  manifest_sha256: string;
+  action_count: number;
+  created_at_unix_ms: number;
+  created_at_mono_ns: number;
+  expires_at_unix_ms: number;
+  ttl_ms: number;
+  boot_id: string;
+}
+/**
+ * The exact object serialized into :attr:`ActionManifest.canonical_json`.
+ */
+export interface ActionManifestBody {
+  schema_version?: "1";
+  intervention_id: string;
+  /**
+   * @maxItems 32
+   */
+  actions?: ManifestAction[];
+}
+/**
+ * One exact, adapter-routable effect in a canonical manifest.
+ *
+ * Parameters and inverse data are JSON *strings*, not mutable dictionaries.
+ * This prevents a caller from mutating a nested object after the manifest
+ * digest was checked.  Validators require the strings themselves to already
+ * be canonical.
+ */
+export interface ManifestAction {
+  action_id: string;
+  ordinal: number;
+  executor: "browser" | "editor" | "terminal" | "desktop" | "daemon";
+  capability: string;
+  parameters_json?: string;
+  reverse_capability?: string | null;
+  workspace_mutation?: boolean;
+  required_consent_level: number;
+  source: "planner_command" | "suggested_action" | "system";
+}
+/**
+ * Typed result for one apply, compensation, or restore attempt.
+ */
+export interface ActionReceipt {
+  receipt_id?: string;
+  intervention_id: string;
+  authorization_id: string;
+  manifest_sha256: string;
+  action_id: string;
+  phase: ReceiptPhase;
+  attempt?: number;
+  idempotency_key: string;
+  status: ReceiptStatus;
+  started_at_unix_ms: number;
+  ended_at_unix_ms: number;
+  started_at_mono_ns: number;
+  ended_at_mono_ns: number;
+  duration_ms: number;
+  boot_id: string;
+  inverse_payload_json?: string | null;
+  verification: VerificationStatus;
+  verification_detail?: string;
+  after_fingerprint?: string | null;
+  error_code?: string | null;
+  error_message?: string | null;
+  retryable?: boolean;
+  source_client_type?: string | null;
+  source_client_id?: string | null;
 }
 /**
  * Atomic pointer to the one active immutable measured profile.
@@ -310,6 +454,35 @@ export interface AuthRequestPayload {
     | [string, string, string, string, string, string]
     | [string, string, string, string, string, string, string]
     | [string, string, string, string, string, string, string, string];
+}
+/**
+ * Typed, non-authoritative response to a rejected authorization request.
+ */
+export interface AuthorizationDenied {
+  authorization_request_id: string;
+  intervention_id: string;
+  manifest_sha256?: string | null;
+  reason_code:
+    | "unknown_intervention"
+    | "manifest_mismatch"
+    | "action_mismatch"
+    | "consent_denied"
+    | "consent_changed"
+    | "execution_mode_denied"
+    | "transaction_closed"
+    | "invalid_request"
+    | "no_executor";
+  detail?: string;
+}
+/**
+ * Persisted mutable wrapper around a frozen authorization.
+ */
+export interface AuthorizationLedgerEntry {
+  authorization: ActionAuthorization;
+  state?: AuthorizationState;
+  consumed_at_unix_ms?: number | null;
+  consumed_at_mono_ns?: number | null;
+  state_reason?: string | null;
 }
 /**
  * Persisted weights for the LinUCB contextual bandit.
@@ -1080,6 +1253,23 @@ export interface EventTime {
   boot_id: string;
 }
 /**
+ * Durable record of the exact client selected for each executor.
+ *
+ * WebSocket transaction-state broadcasts intentionally expose transaction
+ * identifiers to every first-party surface.  A receipt therefore cannot be
+ * authenticated by an authorization id alone: it must also come from the
+ * precise client id selected before dispatch.
+ */
+export interface ExecutorDispatchBinding {
+  command_id: string;
+  action_client_instance_ids: {
+    [k: string]: string;
+  };
+  bound_at_unix_ms: number;
+  bound_at_mono_ns: number;
+  boot_id: string;
+}
+/**
  * Auditable contribution of one observed or missing feature.
  */
 export interface FeatureContribution {
@@ -1574,6 +1764,18 @@ export interface InterBeatInterval {
   correction?: "none";
   quality: number;
 }
+/**
+ * Daemon-to-adapter command emitted only after atomic auth consumption.
+ */
+export interface InterventionApplyCommand {
+  manifest: ActionManifest;
+  authorization: ActionAuthorization;
+  /**
+   * @minItems 1
+   * @maxItems 32
+   */
+  actions: [ManifestAction, ...ManifestAction[]];
+}
 export interface InterventionApplyRequest {
   plan: InterventionPlan;
 }
@@ -1712,7 +1914,7 @@ export interface UIPlan {
   max_visible_lines?: number;
 }
 /**
- * A single executable action the user can approve with one click.
+ * A proposed action; only the transaction manifest can make it executable.
  */
 export interface SuggestedAction {
   /**
@@ -1757,7 +1959,7 @@ export interface SuggestedAction {
    */
   category?: "recommended" | "optional" | "informational";
   /**
-   * Whether this action can be undone
+   * Presentation hint normalised from the transactional capability catalog; never execution authority
    */
   reversible?: boolean;
   /**
@@ -2031,6 +2233,23 @@ export interface InterventionApplyResult {
   phase?: "apply" | "restore" | "execute_action";
 }
 /**
+ * Client request produced by one explicit, user-visible gesture.
+ */
+export interface InterventionAuthorizationRequest {
+  authorization_request_id: string;
+  intervention_id: string;
+  manifest_sha256: string;
+  /**
+   * @minItems 1
+   * @maxItems 32
+   */
+  approved_action_ids: [string, ...string[]];
+  source_surface: "browser" | "vscode" | "desktop" | "http";
+  requested_at_unix_ms: number;
+  requested_at_mono_ns: number;
+  boot_id: string;
+}
+/**
  * Outcome tracking for an intervention.
  *
  * Records what happened after intervention was applied.
@@ -2081,6 +2300,56 @@ export interface InterventionOutcome {
    */
   user_rating?: "thumbs_up" | "thumbs_down" | null;
 }
+/**
+ * Client-to-daemon receipt envelope for one authorization or restore.
+ */
+export interface InterventionReceiptBatch {
+  intervention_id: string;
+  manifest_sha256: string;
+  authorization_id: string;
+  /**
+   * @minItems 1
+   * @maxItems 96
+   */
+  receipts: [ActionReceipt, ...ActionReceipt[]];
+}
+/**
+ * Local deterministic restore command; never grants a forward effect.
+ */
+export interface InterventionRestoreCommand {
+  restore_id?: string;
+  intervention_id: string;
+  manifest_sha256: string;
+  reason:
+    | "user_undo"
+    | "dismissed"
+    | "snoozed"
+    | "timed_out"
+    | "natural_recovery"
+    | "system_cancelled"
+    | "partial_compensation"
+    | "startup_recovery"
+    | "emergency_restore";
+  requested_at_unix_ms: number;
+  requested_at_mono_ns: number;
+  boot_id: string;
+  /**
+   * @maxItems 32
+   */
+  actions?: RestoreAction[];
+}
+/**
+ * Exact inverse operation derived from a successful apply receipt.
+ */
+export interface RestoreAction {
+  action_id: string;
+  executor: "browser" | "editor" | "terminal" | "desktop" | "daemon";
+  reverse_capability: string;
+  inverse_payload_json: string;
+  original_authorization_id: string;
+  inverse_receipt_id?: string | null;
+  owner_client_instance_id: string;
+}
 export interface InterventionRestoreRequest {
   intervention_id: string;
   user_action?: string;
@@ -2097,6 +2366,41 @@ export interface InterventionRestoreResponse {
   timestamp?: number | null;
   restored?: boolean;
   outcome?: InterventionOutcome | null;
+}
+/**
+ * Durable aggregate for one intervention and all adapter attempts.
+ */
+export interface InterventionTransaction {
+  intervention_id: string;
+  manifest: ActionManifest;
+  state?: InterventionLifecycleState;
+  revision?: number;
+  authorizations?: AuthorizationLedgerEntry[];
+  receipts?: ActionReceipt[];
+  consent_evidence_receipt_ids?: string[];
+  transitions?: LifecycleTransition[];
+  dispatch_history?: ExecutorDispatchBinding[];
+  active_restore?: InterventionRestoreCommand | null;
+  restore_history?: InterventionRestoreCommand[];
+  created_at_unix_ms: number;
+  updated_at_unix_ms: number;
+}
+export interface LifecycleTransition {
+  from_state: InterventionLifecycleState1 | null;
+  to_state: InterventionLifecycleState1;
+  reason: string;
+  at_unix_ms: number;
+  at_mono_ns: number;
+  boot_id: string;
+}
+/**
+ * Versioned root written atomically by the WP6 JSON store.
+ */
+export interface InterventionTransactionJournal {
+  schema_version?: "1";
+  transactions?: {
+    [k: string]: InterventionTransaction;
+  };
 }
 /**
  * Kinematic features from face mesh and pose estimation.
@@ -3293,6 +3597,24 @@ export interface ActivitySummary1 {
    */
   context_snapshot?: string;
 }
+export interface EmergencyRestoreResponse {
+  schema_version?: "1.0" | "2.0";
+  observed_at_unix_ms?: number;
+  observed_at_mono_ns?: number;
+  boot_id?: string;
+  /**
+   * @deprecated
+   * Deprecated v1 compatibility mirror in UTC Unix seconds; never use it for elapsed-time decisions.
+   */
+  timestamp?: number | null;
+  available?: boolean;
+  complete?: boolean;
+  requested?: number;
+  dispatched?: number;
+  restored?: number;
+  failed?: number;
+  pending?: number;
+}
 /**
  * P0 audit / Phase-4a: client → daemon ack of an intervention apply.
  *
@@ -3861,6 +4183,10 @@ export interface InterventionTriggerPayload {
    * Daemon-owned workspace authority mode. Missing or legacy values decode to suggest_only so protocol downgrade cannot increase authority.
    */
   execution_mode?: "suggest_only" | "authorized" | "research_autonomous";
+  /**
+   * Daemon-authored immutable effect manifest. The trigger remains a non-mutating proposal; clients must request a separate one-time authorization against this exact digest before executing actions.
+   */
+  action_manifest?: ActionManifest | null;
   /**
    * P0 §3.12: True when the daemon observed that the desktop shell isn't focused (user on a different Space / fullscreen app). Receivers surface OS-level notification cues. None means 'focus state unknown' (default — only stamped when explicitly observed unfocused).
    */

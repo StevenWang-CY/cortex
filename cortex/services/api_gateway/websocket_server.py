@@ -35,6 +35,16 @@ from cortex.libs.config.settings import APIConfig
 from cortex.libs.logging.correlation import correlation_scope, get_correlation_id
 from cortex.libs.logging.structured import EventType
 from cortex.libs.schemas.intervention import InterventionPlan
+from cortex.libs.schemas.intervention_transaction import (
+    ActionManifest,
+    AuthorizationDenied,
+    InterventionApplyCommand,
+    InterventionAuthorizationRequest,
+    InterventionLifecycleState,
+    InterventionReceiptBatch,
+    InterventionRestoreCommand,
+    ReceiptPhase,
+)
 from cortex.libs.schemas.protocol import (
     AuthOkPayload,
     AuthRequestPayload,
@@ -58,6 +68,34 @@ from cortex.libs.schemas.ws_message import WSMessage as _PydanticWSMessage
 from cortex.libs.schemas.ws_message_types import MessageType
 
 logger = logging.getLogger(__name__)
+
+
+def _receipt_has_restorable_effect(receipt: Any) -> bool:
+    """Project only verified, non-empty effects as user-restorable.
+
+    Merely carrying an inverse JSON object is insufficient: failed adapters
+    deliberately return ``{}`` or conservative recovery evidence, and a
+    verified no-op carries ``{"noEffect": true}``. Neither may light an Undo
+    control. The transaction coordinator has already authenticated provenance
+    before this privacy-minimal UI projection is built.
+    """
+
+    status = str(getattr(receipt.status, "value", receipt.status))
+    verification = str(
+        getattr(receipt.verification, "value", receipt.verification)
+    )
+    inverse_json = receipt.inverse_payload_json
+    if (
+        status not in {"succeeded", "already_complete"}
+        or verification != "verified"
+        or inverse_json is None
+    ):
+        return False
+    try:
+        inverse = json.loads(inverse_json)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(inverse, dict) and inverse.get("noEffect") is not True
 
 
 def _auth_ok_frame(clock: Clock, selected_protocol_version: str) -> str:
@@ -125,6 +163,9 @@ class WebSocketClient:
     websocket: Any  # websockets.WebSocketServerProtocol
     connected_at: float = 0.0
     client_type: str = "unknown"  # "vscode", "chrome", "desktop", "unknown"
+    # Stable per extension installation/profile. Socket ``client_id`` values
+    # are connection-local and cannot safely own a crash-recoverable effect.
+    client_instance_id: str | None = None
     last_message_at: float = 0.0
     authenticated: bool = False
     protocol_version: str = "1.0"
@@ -135,6 +176,21 @@ class WebSocketClient:
         repr=False,
     )
     seen_event_id_set: set[str] = field(default_factory=set, repr=False)
+
+
+@dataclass(frozen=True)
+class ExactDispatchReport:
+    """Observed transport boundary for one exact apply command.
+
+    A failed socket write is delivery-ambiguous: the peer may have received
+    the frame before the local exception. Keeping ``attempted`` separate from
+    ``delivered`` lets the coordinator compensate instead of falsely treating
+    every zero-success send as a preflight-safe failure.
+    """
+
+    expected_targets: int
+    attempted_targets: int
+    delivered_targets: int
 
 
 # ─── WSMessage: Pydantic source of truth (Debt-1 closure, Commit 2) ───
@@ -259,8 +315,14 @@ class WebSocketServer:
         self._tab_relevance_feedback_callback: Any = None
         self._leetcode_context_callback: Any = None
         self._intervention_applied_callback: Any = None
+        self._intervention_authorize_callback: Any = None
+        self._intervention_receipt_callback: Any = None
+        self._intervention_dispatch_failure_callback: Any = None
+        self._intervention_partial_dispatch_callback: Any = None
+        self._intervention_dispatch_binding_callback: Any = None
         # G1 (audit-prod): fired on IDENTIFY + on identified-client disconnect.
         self._client_identified_callback: Any = None
+        self._published_client_connectivity: dict[str, bool] = {}
         # P0 §3.1 / §3.2 / §3.3: handlers for the new history / trends /
         # recap request types. Each callback returns a Pydantic envelope
         # (or a plain dict / None) that the dispatcher serialises and
@@ -328,10 +390,29 @@ class WebSocketServer:
         # (the active plan was superseded on the extension side) and is
         # logged + ignored rather than poisoning the dismissal model.
         self._active_intervention_cid: dict[str, str] = {}
+        # A successful socket write is not an application receipt. Keep one
+        # bounded watchdog per consumed authorization so a client crash after
+        # delivery enters exact compensation instead of stranding APPLYING.
+        self._intervention_receipt_watchdogs: dict[
+            str, asyncio.Task[None]
+        ] = {}
+        # Serialize forward command writes against exact inverse writes. A
+        # consent reset/emergency restore may race an authorization after its
+        # durable consumption but before socket delivery. Binding revalidates
+        # the consent revision; once binding succeeds, this barrier guarantees
+        # the forward write finishes before a concurrently requested inverse
+        # can reach the same owner.
+        self._intervention_wire_dispatch_lock = asyncio.Lock()
 
     @property
     def client_count(self) -> int:
         return len(self._clients)
+
+    @property
+    def authenticated_client_count(self) -> int:
+        """Number of peers eligible to receive protected broadcasts."""
+
+        return sum(1 for client in self._clients.values() if client.authenticated)
 
     @property
     def is_running(self) -> bool:
@@ -396,6 +477,48 @@ class WebSocketServer:
         """
         self._intervention_applied_callback = callback
 
+    def set_intervention_authorize_callback(self, callback: Any) -> None:
+        """Bind exact manifest authorization handling.
+
+        Signature: ``async (request, client_id, client_type) ->
+        InterventionApplyCommand | AuthorizationDenied``.
+        """
+
+        self._intervention_authorize_callback = callback
+
+    def set_intervention_receipt_callback(self, callback: Any) -> None:
+        """Bind typed action receipt handling.
+
+        Signature: ``async (batch, client_id, client_type) ->
+        tuple[state, optional_restore_command]``.
+        """
+
+        self._intervention_receipt_callback = callback
+
+    def set_intervention_dispatch_failure_callback(self, callback: Any) -> None:
+        """Bind fail-closed handling for a consumed but undispatchable grant."""
+
+        self._intervention_dispatch_failure_callback = callback
+
+    def set_intervention_partial_dispatch_callback(self, callback: Any) -> None:
+        """Bind compensation for a command that reached only some targets.
+
+        Signature: ``async (authorization_id, reason) ->
+        InterventionRestoreCommand | None``.
+        """
+
+        self._intervention_partial_dispatch_callback = callback
+
+    def set_intervention_dispatch_binding_callback(self, callback: Any) -> None:
+        """Bind durable action→client-instance ownership before dispatch.
+
+        Signature: ``async (command_id, action_client_instance_ids) -> None``.
+        Exact transaction commands fail closed when this callback is absent
+        or its persistence step raises.
+        """
+
+        self._intervention_dispatch_binding_callback = callback
+
     def set_client_identified_callback(self, callback: Any) -> None:
         """Audit-prod fix (G1): callback fired when a client IDENTIFY frame
         is received OR when a previously-identified client disconnects.
@@ -410,6 +533,41 @@ class WebSocketServer:
         dot so the user can see when the extension goes away.
         """
         self._client_identified_callback = callback
+        self._published_client_connectivity.clear()
+
+    async def _notify_client_type_connectivity(self, client_type: str) -> None:
+        """Publish aggregate connectivity for one surface type.
+
+        Reconnects briefly overlap old and new sockets. Reporting the raw
+        disconnect event would gray the UI even though the replacement is
+        already live, so callbacks always receive the current aggregate
+        truth after registry mutation.
+        """
+
+        if client_type in {"", "unknown"}:
+            return
+        callback = self._client_identified_callback
+        if callback is None:
+            return
+        connected = any(
+            peer.client_type == client_type
+            for peer in self._clients.values()
+        )
+        if self._published_client_connectivity.get(client_type) == connected:
+            return
+        try:
+            if asyncio.iscoroutinefunction(callback):
+                await callback(client_type, connected)
+            else:
+                callback(client_type, connected)
+            self._published_client_connectivity[client_type] = connected
+        except Exception:
+            logger.debug(
+                "client_identified callback raised for %s=%s",
+                client_type,
+                connected,
+                exc_info=True,
+            )
 
     # ── P0 §3.1 / §3.2 / §3.3: history / trends / recap callbacks ────
 
@@ -623,6 +781,13 @@ class WebSocketServer:
         """Stop the WebSocket server and disconnect all clients."""
         self._running = False
 
+        if self._intervention_receipt_watchdogs:
+            watchdogs = list(self._intervention_receipt_watchdogs.values())
+            for task in watchdogs:
+                task.cancel()
+            await asyncio.gather(*watchdogs, return_exceptions=True)
+            self._intervention_receipt_watchdogs.clear()
+
         # Close all client connections
         for client in list(self._clients.values()):
             # Phase-4b TASK I: cancel the per-client coalesce drain task
@@ -656,6 +821,7 @@ class WebSocketServer:
                 )
 
         self._clients.clear()
+        self._published_client_connectivity.clear()
 
         if self._server is not None:
             self._server.close()
@@ -709,22 +875,10 @@ class WebSocketServer:
             self._cancel_pending_for_client(client_id)
             # G1 (audit-prod): if this client previously IDENTIFY-ed, tell
             # the listener it's gone so the dashboard dot re-grays.
-            cb = self._client_identified_callback
-            if (
-                cb is not None
-                and client.client_type
-                and client.client_type != "unknown"
-            ):
-                try:
-                    if asyncio.iscoroutinefunction(cb):
-                        await cb(client.client_type, False)
-                    else:
-                        cb(client.client_type, False)
-                except Exception:
-                    logger.debug(
-                        "client_identified callback raised (disconnect)",
-                        exc_info=True,
-                    )
+            if client.client_type and client.client_type != "unknown":
+                await self._notify_client_type_connectivity(
+                    client.client_type
+                )
             logger.info(f"Client disconnected: {client_id}")
 
     async def _process_message(
@@ -829,12 +983,59 @@ class WebSocketServer:
             # client types is small and stable; an unknown literal becomes
             # ``"unknown"`` so it is filtered from ``connected_client_types``
             # and never reaches the dashboard's dot map.
+            prior_client_type = client.client_type
             _ALLOWED_CLIENT_TYPES = frozenset({
                 "chrome", "edge", "vscode", "desktop",
             })
             requested = msg.payload.get("client_type")
+            requested_instance = msg.payload.get("client_instance_id")
+            valid_instance = (
+                isinstance(requested_instance, str)
+                and 8 <= len(requested_instance) <= 128
+                and all(
+                    character.isalnum() or character in "._:-"
+                    for character in requested_instance
+                )
+            )
             if isinstance(requested, str) and requested in _ALLOWED_CLIENT_TYPES:
                 client.client_type = requested
+                client.client_instance_id = (
+                    requested_instance if valid_instance else None
+                )
+                if client.client_instance_id is not None:
+                    # A reconnect supersedes an older socket for the same
+                    # durable extension instance. Remove and de-authenticate
+                    # the stale socket before its close handshake so it can
+                    # receive neither proposals nor exact commands during the
+                    # overlap window.
+                    superseded: list[WebSocketClient] = []
+                    for peer in list(self._clients.values()):
+                        if (
+                            peer is not client
+                            and peer.client_instance_id
+                            == client.client_instance_id
+                        ):
+                            peer.client_instance_id = None
+                            peer.authenticated = False
+                            self._clients.pop(peer.client_id, None)
+                            self._cancel_pending_for_client(peer.client_id)
+                            if peer.coalesce_task is not None:
+                                peer.coalesce_task.cancel()
+                                peer.coalesce_task = None
+                            peer.coalesce_queue = None
+                            superseded.append(peer)
+                    for peer in superseded:
+                        try:
+                            await peer.websocket.close(
+                                code=1000,
+                                reason="superseded by stable-instance reconnect",
+                            )
+                        except Exception:
+                            logger.debug(
+                                "superseded socket close failed for %s",
+                                peer.client_id,
+                                exc_info=True,
+                            )
             else:
                 logger.warning(
                     "IDENTIFY: rejecting unknown client_type=%r from %s",
@@ -842,23 +1043,30 @@ class WebSocketServer:
                     client.client_id,
                 )
                 client.client_type = "unknown"
+                client.client_instance_id = None
+            if client.client_type != "unknown" and not valid_instance:
+                logger.warning(
+                    "IDENTIFY from %s lacks a durable client_instance_id; "
+                    "exact workspace commands are disabled for this socket",
+                    client.client_id,
+                )
             logger.info(
                 f"Client {client.client_id} identified as {client.client_type}"
             )
-            # G1 (audit-prod): notify any registered listener (the desktop
-            # shell uses this to update the Chrome / Edge / Editor dots).
-            cb = self._client_identified_callback
-            if cb is not None and client.client_type and client.client_type != "unknown":
-                try:
-                    if asyncio.iscoroutinefunction(cb):
-                        await cb(client.client_type, True)
-                    else:
-                        cb(client.client_type, True)
-                except Exception:
-                    logger.debug(
-                        "client_identified callback raised (connect)",
-                        exc_info=True,
-                    )
+            # G1 (audit-prod): publish aggregate type connectivity. This
+            # remains true when a reconnect replaces an older socket.
+            if (
+                prior_client_type
+                and prior_client_type != "unknown"
+                and prior_client_type != client.client_type
+            ):
+                await self._notify_client_type_connectivity(
+                    prior_client_type
+                )
+            if client.client_type and client.client_type != "unknown":
+                await self._notify_client_type_connectivity(
+                    client.client_type
+                )
         elif msg.type == MessageType.CONTEXT_RESPONSE.value:
             self._handle_context_response(msg)
         elif msg.type == MessageType.SETTINGS_SYNC.value:
@@ -873,6 +1081,10 @@ class WebSocketServer:
             await self._handle_leetcode_context_update(client, msg)
         elif msg.type == MessageType.INTERVENTION_APPLIED.value:
             await self._handle_intervention_applied(client, msg)
+        elif msg.type == MessageType.INTERVENTION_AUTHORIZE.value:
+            await self._handle_intervention_authorize(client, msg)
+        elif msg.type == MessageType.INTERVENTION_RECEIPT.value:
+            await self._handle_intervention_receipt(client, msg)
         elif msg.type == MessageType.SHUTDOWN.value:
             # F07: require the capability token before honouring a remote
             # SHUTDOWN. Without this gate any localhost origin (malicious
@@ -1613,6 +1825,386 @@ class WebSocketServer:
                 exc,
             )
 
+    async def _handle_intervention_authorize(
+        self,
+        client: WebSocketClient,
+        msg: WSMessage,
+    ) -> None:
+        """Validate a user gesture and dispatch only the consumed command."""
+
+        surface = {
+            "chrome": "browser",
+            "edge": "browser",
+            "vscode": "vscode",
+            "desktop": "desktop",
+        }.get(client.client_type)
+        raw = dict(msg.payload or {})
+        if surface is None:
+            logger.warning(
+                "INTERVENTION_AUTHORIZE rejected from unknown client type %s",
+                client.client_type,
+            )
+            return
+        # Source identity is transport-owned; never trust the wire value.
+        raw["source_surface"] = surface
+        try:
+            request = InterventionAuthorizationRequest.model_validate(raw)
+        except ValidationError as exc:
+            logger.warning(
+                "Invalid INTERVENTION_AUTHORIZE from %s: %s",
+                client.client_id,
+                exc,
+            )
+            request_id = str(raw.get("authorization_request_id") or "invalid")
+            intervention_id = str(raw.get("intervention_id") or "invalid")
+            denial = AuthorizationDenied(
+                authorization_request_id=request_id[:128] or "invalid",
+                intervention_id=intervention_id[:128] or "invalid",
+                reason_code="invalid_request",
+                detail="authorization request failed schema validation",
+            )
+            await self._send_to(
+                client,
+                MessageType.INTERVENTION_AUTHORIZATION_DENIED.value,
+                denial.model_dump(mode="json"),
+                correlation_id=msg.correlation_id,
+                causation_id=str(msg.event_id),
+            )
+            return
+        callback = self._intervention_authorize_callback
+        if callback is None:
+            denial = AuthorizationDenied(
+                authorization_request_id=request.authorization_request_id,
+                intervention_id=request.intervention_id,
+                manifest_sha256=request.manifest_sha256,
+                reason_code="execution_mode_denied",
+                detail="transaction coordinator is not available",
+            )
+            await self._send_to(
+                client,
+                MessageType.INTERVENTION_AUTHORIZATION_DENIED.value,
+                denial.model_dump(mode="json"),
+                correlation_id=msg.correlation_id,
+                causation_id=str(msg.event_id),
+            )
+            return
+        try:
+            result = callback(
+                request,
+                client.client_instance_id or client.client_id,
+                client.client_type,
+            )
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception:
+            logger.exception(
+                "INTERVENTION_AUTHORIZE callback failed for %s",
+                request.intervention_id,
+            )
+            result = AuthorizationDenied(
+                authorization_request_id=request.authorization_request_id,
+                intervention_id=request.intervention_id,
+                manifest_sha256=request.manifest_sha256,
+                reason_code="invalid_request",
+                detail="authorization service failed closed",
+            )
+
+        if isinstance(result, AuthorizationDenied):
+            await self._send_to(
+                client,
+                MessageType.INTERVENTION_AUTHORIZATION_DENIED.value,
+                result.model_dump(mode="json"),
+                correlation_id=msg.correlation_id,
+                causation_id=str(msg.event_id),
+            )
+            return
+        if not isinstance(result, InterventionApplyCommand):
+            logger.error("authorization callback returned unsupported result")
+            return
+
+        dispatch = await self.dispatch_apply_command(
+            result,
+            requesting_client=client,
+            correlation_id=msg.correlation_id,
+            causation_id=str(msg.event_id),
+        )
+        sent = dispatch.delivered_targets
+        expected_targets = dispatch.expected_targets
+        dispatch_complete = sent == expected_targets
+        compensation: InterventionRestoreCommand | None = None
+        if (
+            dispatch.attempted_targets == 0
+            and self._intervention_dispatch_failure_callback is not None
+        ):
+            try:
+                dispatch_failed = self._intervention_dispatch_failure_callback(
+                    result.authorization.authorization_id,
+                    reason="no_complete_executor_route",
+                )
+                if inspect.isawaitable(dispatch_failed):
+                    await dispatch_failed
+            except Exception:
+                logger.exception(
+                    "Failed to persist dispatch failure for %s",
+                    result.authorization.authorization_id,
+                )
+        elif not dispatch_complete:
+            callback = self._intervention_partial_dispatch_callback
+            if callback is None:
+                logger.critical(
+                    "Partially dispatched %s without compensation callback",
+                    result.authorization.authorization_id,
+                )
+            else:
+                try:
+                    compensation_result = callback(
+                        result.authorization.authorization_id,
+                        reason="partial_executor_dispatch",
+                    )
+                    if inspect.isawaitable(compensation_result):
+                        compensation_result = await compensation_result
+                    if isinstance(
+                        compensation_result,
+                        InterventionRestoreCommand,
+                    ):
+                        compensation = compensation_result
+                        await self.send_restore_command(
+                            compensation,
+                            correlation_id=msg.correlation_id,
+                            causation_id=str(msg.event_id),
+                        )
+                except Exception:
+                    logger.exception(
+                        "Failed to compensate partial dispatch for %s",
+                        result.authorization.authorization_id,
+                    )
+        else:
+            self._schedule_intervention_receipt_watchdog(result)
+        await self._send_to(
+            client,
+            MessageType.INTERVENTION_TRANSACTION_STATE.value,
+            {
+                "intervention_id": result.authorization.intervention_id,
+                "authorization_request_id": (
+                    result.authorization.authorization_request_id
+                ),
+                "authorization_id": result.authorization.authorization_id,
+                "manifest_sha256": result.authorization.manifest_sha256,
+                "state": (
+                    "applying"
+                    if dispatch_complete
+                    else "restoring"
+                    if compensation is not None
+                    else "failed"
+                ),
+                "target_count": sent,
+                "expected_target_count": expected_targets,
+                "compensation_restore_id": (
+                    compensation.restore_id if compensation is not None else None
+                ),
+            },
+            correlation_id=msg.correlation_id,
+            causation_id=str(msg.event_id),
+        )
+        if not dispatch_complete:
+            denial = AuthorizationDenied(
+                authorization_request_id=request.authorization_request_id,
+                intervention_id=request.intervention_id,
+                manifest_sha256=request.manifest_sha256,
+                reason_code="no_executor",
+                detail=(
+                    "no connected client owns the authorized capability"
+                    if dispatch.attempted_targets == 0
+                    else "delivery reached only part of the executor set; "
+                    "the outcome is ambiguous and compensation was started"
+                ),
+            )
+            await self._send_to(
+                client,
+                MessageType.INTERVENTION_AUTHORIZATION_DENIED.value,
+                denial.model_dump(mode="json"),
+                correlation_id=msg.correlation_id,
+                causation_id=str(msg.event_id),
+            )
+
+    def _schedule_intervention_receipt_watchdog(
+        self,
+        command: InterventionApplyCommand,
+    ) -> None:
+        authorization_id = command.authorization.authorization_id
+        prior = self._intervention_receipt_watchdogs.pop(
+            authorization_id,
+            None,
+        )
+        if prior is not None:
+            prior.cancel()
+        task = asyncio.create_task(
+            self._watch_intervention_receipt_deadline(command),
+            name=f"intervention-receipt-{authorization_id}",
+        )
+        self._intervention_receipt_watchdogs[authorization_id] = task
+
+    async def _watch_intervention_receipt_deadline(
+        self,
+        command: InterventionApplyCommand,
+    ) -> None:
+        authorization_id = command.authorization.authorization_id
+        try:
+            wall_remaining_ms = max(
+                0,
+                command.authorization.expires_at_unix_ms
+                - self._clock.unix_ms(),
+            )
+            remaining_ms = min(
+                command.authorization.ttl_ms,
+                wall_remaining_ms,
+            )
+            if command.authorization.boot_id == self._clock.boot_id:
+                elapsed_ms = max(
+                    0,
+                    self._clock.monotonic_ns()
+                    - command.authorization.issued_at_mono_ns,
+                ) // 1_000_000
+                remaining_ms = min(
+                    remaining_ms,
+                    max(0, command.authorization.ttl_ms - elapsed_ms),
+                )
+            await asyncio.sleep(remaining_ms / 1_000)
+            callback = self._intervention_partial_dispatch_callback
+            if callback is None:
+                logger.critical(
+                    "Authorization %s reached its receipt deadline without "
+                    "a compensation callback",
+                    authorization_id,
+                )
+                return
+            compensation = callback(
+                authorization_id,
+                reason="adapter_receipt_deadline_elapsed",
+            )
+            if inspect.isawaitable(compensation):
+                compensation = await compensation
+            if isinstance(compensation, InterventionRestoreCommand):
+                await self.send_restore_command(compensation)
+                await self.send_message(
+                    MessageType.INTERVENTION_TRANSACTION_STATE.value,
+                    {
+                        "intervention_id": (
+                            command.authorization.intervention_id
+                        ),
+                        "authorization_id": authorization_id,
+                        "manifest_sha256": (
+                            command.authorization.manifest_sha256
+                        ),
+                        "state": "restoring",
+                        "reason": "adapter_receipt_deadline_elapsed",
+                        "compensation_restore_id": compensation.restore_id,
+                    },
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Receipt-deadline compensation failed for %s",
+                authorization_id,
+            )
+        finally:
+            current = self._intervention_receipt_watchdogs.get(
+                authorization_id
+            )
+            if current is asyncio.current_task():
+                self._intervention_receipt_watchdogs.pop(
+                    authorization_id,
+                    None,
+                )
+
+    async def _handle_intervention_receipt(
+        self,
+        client: WebSocketClient,
+        msg: WSMessage,
+    ) -> None:
+        """Validate typed per-action receipts and advance the transaction."""
+
+        try:
+            batch = InterventionReceiptBatch.model_validate(msg.payload)
+        except ValidationError as exc:
+            logger.warning(
+                "Invalid INTERVENTION_RECEIPT from %s: %s",
+                client.client_id,
+                exc,
+            )
+            return
+        callback = self._intervention_receipt_callback
+        if callback is None:
+            logger.warning("Dropping receipt: transaction callback not configured")
+            return
+        if client.client_instance_id is None:
+            logger.warning(
+                "Dropping exact receipt from %s without durable client identity",
+                client.client_id,
+            )
+            return
+        try:
+            result = callback(
+                batch,
+                client.client_instance_id,
+                client.client_type,
+            )
+            if inspect.isawaitable(result):
+                result = await result
+            state, compensation = result
+        except Exception:
+            logger.exception(
+                "INTERVENTION_RECEIPT callback failed for %s",
+                batch.intervention_id,
+            )
+            return
+        state_value = getattr(state, "value", state)
+        if (
+            batch.receipts[0].phase == ReceiptPhase.APPLY.value
+            and str(state_value) != InterventionLifecycleState.APPLYING.value
+        ):
+            watchdog = self._intervention_receipt_watchdogs.pop(
+                batch.authorization_id,
+                None,
+            )
+            if watchdog is not None and watchdog is not asyncio.current_task():
+                watchdog.cancel()
+        await self.send_message(
+            MessageType.INTERVENTION_TRANSACTION_STATE.value,
+            {
+                "intervention_id": batch.intervention_id,
+                "authorization_id": batch.authorization_id,
+                "manifest_sha256": batch.manifest_sha256,
+                "state": str(state_value),
+                # A requesting surface may authorize a capability owned by a
+                # different adapter. Broadcast the typed, privacy-minimal
+                # receipt projection so its pending user gesture resolves to
+                # the real per-action outcome rather than an optimistic ACK.
+                "receipt_results": [
+                    {
+                        "action_id": receipt.action_id,
+                        "status": getattr(receipt.status, "value", receipt.status),
+                        "detail": (
+                            receipt.verification_detail
+                            or receipt.error_message
+                            or receipt.error_code
+                            or ""
+                        ),
+                        "reversible": _receipt_has_restorable_effect(receipt),
+                    }
+                    for receipt in batch.receipts
+                ],
+            },
+            correlation_id=msg.correlation_id,
+        )
+        if isinstance(compensation, InterventionRestoreCommand):
+            await self.send_restore_command(
+                compensation,
+                correlation_id=msg.correlation_id,
+                causation_id=str(msg.event_id),
+            )
+
     # ── P0 §3.1 / §3.2 / §3.3: history / trends / recap dispatch ─────
 
     async def _handle_request_session_list(
@@ -2024,7 +2616,7 @@ class WebSocketServer:
         *,
         correlation_id: str | None = None,
         causation_id: str | None = None,
-    ) -> None:
+    ) -> bool:
         """Send a single typed frame to a single client.
 
         Used by ``COST_REQUEST`` / ``TEST_PROVIDER`` handlers because the
@@ -2042,6 +2634,7 @@ class WebSocketServer:
         )
         try:
             await client.websocket.send(message.to_json())
+            return True
         except Exception:
             logger.debug(
                 "unicast send %s → %s failed",
@@ -2049,6 +2642,7 @@ class WebSocketServer:
                 client.client_id,
                 exc_info=True,
             )
+            return False
 
     async def broadcast_state(
         self,
@@ -2073,6 +2667,7 @@ class WebSocketServer:
         self,
         plan: InterventionPlan,
         *,
+        action_manifest: ActionManifest | None = None,
         desktop_focused: bool | None = None,
         execution_mode: Literal[
             "suggest_only", "authorized", "research_autonomous"
@@ -2096,13 +2691,312 @@ class WebSocketServer:
         """
         msg = self._make_intervention_trigger(
             plan,
+            action_manifest=action_manifest,
             desktop_focused=desktop_focused,
             execution_mode=execution_mode,
         )
         return await self._broadcast(msg)
 
-    async def send_restore(self, intervention_id: str, *, user_action: str) -> int:
-        """Broadcast an explicit restore event to all clients."""
+    def _first_authenticated_client(
+        self,
+        client_types: set[str],
+        *,
+        require_instance_id: bool = False,
+    ) -> WebSocketClient | None:
+        return next(
+            (
+                client
+                for client in self._clients.values()
+                if client.authenticated
+                and client.client_type in client_types
+                and (
+                    not require_instance_id
+                    or client.client_instance_id is not None
+                )
+            ),
+            None,
+        )
+
+    async def _bind_dispatch_targets(
+        self,
+        command_id: str,
+        targets_by_action: dict[str, WebSocketClient],
+    ) -> bool:
+        callback = self._intervention_dispatch_binding_callback
+        if callback is None:
+            logger.error(
+                "Exact command %s has no dispatch-binding callback; refusing send",
+                command_id,
+            )
+            return False
+        bindings = {
+            action_id: client.client_instance_id
+            for action_id, client in targets_by_action.items()
+            if client.client_instance_id is not None
+        }
+        if len(bindings) != len(targets_by_action):
+            logger.error(
+                "Exact command %s selected a client without durable identity",
+                command_id,
+            )
+            return False
+        try:
+            result = callback(command_id, bindings)
+            if inspect.isawaitable(result):
+                await result
+            return True
+        except Exception:
+            logger.exception(
+                "Could not durably bind exact command %s before dispatch",
+                command_id,
+            )
+            return False
+
+    async def dispatch_apply_command(
+        self,
+        command: InterventionApplyCommand,
+        *,
+        requesting_client: WebSocketClient | None = None,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
+    ) -> ExactDispatchReport:
+        """Serialize one exact forward dispatch against inverse dispatches."""
+
+        async with self._intervention_wire_dispatch_lock:
+            return await self._dispatch_apply_command_unlocked(
+                command,
+                requesting_client=requesting_client,
+                correlation_id=correlation_id,
+                causation_id=causation_id,
+            )
+
+    async def _dispatch_apply_command_unlocked(
+        self,
+        command: InterventionApplyCommand,
+        *,
+        requesting_client: WebSocketClient | None = None,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
+    ) -> ExactDispatchReport:
+        """Route one consumed command to exactly one client per executor.
+
+        The full command is sent to each selected executor; each client must
+        execute only actions whose ``executor`` it owns. Selecting one client
+        per executor prevents two Chrome windows from applying the same tab
+        operation concurrently.
+        """
+
+        needed = {action.executor for action in command.actions}
+        expected_targets = len(needed)
+        now_unix_ms = self._clock.unix_ms()
+        authorization_expired = (
+            now_unix_ms >= command.authorization.expires_at_unix_ms
+        )
+        if command.authorization.boot_id == self._clock.boot_id:
+            authorization_expired = authorization_expired or (
+                max(
+                    0,
+                    self._clock.monotonic_ns()
+                    - command.authorization.issued_at_mono_ns,
+                )
+                // 1_000_000
+                >= command.authorization.ttl_ms
+            )
+        manifest_expired = now_unix_ms >= command.manifest.expires_at_unix_ms
+        if command.manifest.boot_id == self._clock.boot_id:
+            manifest_expired = manifest_expired or (
+                max(
+                    0,
+                    self._clock.monotonic_ns()
+                    - command.manifest.created_at_mono_ns,
+                )
+                // 1_000_000
+                >= command.manifest.ttl_ms
+            )
+        if authorization_expired or manifest_expired:
+            return ExactDispatchReport(expected_targets, 0, 0)
+        targets_by_executor: dict[str, WebSocketClient] = {}
+        if "browser" in needed:
+            browser = (
+                requesting_client
+                if requesting_client is not None
+                and requesting_client.authenticated
+                and requesting_client.client_type in {"chrome", "edge"}
+                and requesting_client.client_instance_id is not None
+                else self._first_authenticated_client(
+                    {"chrome", "edge"},
+                    require_instance_id=True,
+                )
+            )
+            if browser is not None:
+                targets_by_executor["browser"] = browser
+        if "editor" in needed:
+            editor = (
+                requesting_client
+                if requesting_client is not None
+                and requesting_client.authenticated
+                and requesting_client.client_type == "vscode"
+                and requesting_client.client_instance_id is not None
+                else self._first_authenticated_client(
+                    {"vscode"},
+                    require_instance_id=True,
+                )
+            )
+            if editor is not None:
+                targets_by_executor["editor"] = editor
+        if "desktop" in needed:
+            desktop = (
+                requesting_client
+                if requesting_client is not None
+                and requesting_client.authenticated
+                and requesting_client.client_type == "desktop"
+                and requesting_client.client_instance_id is not None
+                else self._first_authenticated_client(
+                    {"desktop"},
+                    require_instance_id=True,
+                )
+            )
+            if desktop is not None:
+                targets_by_executor["desktop"] = desktop
+        # No command is partially routed merely because one required surface
+        # is disconnected. A later authorization can be requested after the
+        # missing capability reconnects.
+        if set(targets_by_executor) != needed:
+            return ExactDispatchReport(expected_targets, 0, 0)
+        targets_by_action = {
+            action.action_id: targets_by_executor[action.executor]
+            for action in command.actions
+        }
+        if not await self._bind_dispatch_targets(
+            command.authorization.authorization_id,
+            targets_by_action,
+        ):
+            return ExactDispatchReport(expected_targets, 0, 0)
+        targets: list[WebSocketClient] = []
+        seen_client_ids: set[str] = set()
+        for target in targets_by_action.values():
+            if target.client_id not in seen_client_ids:
+                seen_client_ids.add(target.client_id)
+                targets.append(target)
+        sent = 0
+        payload = command.model_dump(mode="json")
+        for target in targets:
+            if await self._send_to(
+                target,
+                MessageType.INTERVENTION_APPLY.value,
+                payload,
+                correlation_id=correlation_id,
+                causation_id=causation_id,
+            ):
+                sent += 1
+        return ExactDispatchReport(expected_targets, len(targets), sent)
+
+    async def send_apply_command(
+        self,
+        command: InterventionApplyCommand,
+        *,
+        requesting_client: WebSocketClient | None = None,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
+    ) -> int:
+        """Compatibility projection returning verified send completions."""
+
+        report = await self.dispatch_apply_command(
+            command,
+            requesting_client=requesting_client,
+            correlation_id=correlation_id,
+            causation_id=causation_id,
+        )
+        return report.delivered_targets
+
+    async def send_restore_command(
+        self,
+        command: InterventionRestoreCommand,
+        *,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
+    ) -> int:
+        """Serialize an exact inverse behind any in-flight forward write."""
+
+        async with self._intervention_wire_dispatch_lock:
+            return await self._send_restore_command_unlocked(
+                command,
+                correlation_id=correlation_id,
+                causation_id=causation_id,
+            )
+
+    async def _send_restore_command_unlocked(
+        self,
+        command: InterventionRestoreCommand,
+        *,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
+    ) -> int:
+        """Route exact inverse actions to one client per owning executor."""
+
+        client_types_by_executor = {
+            "browser": {"chrome", "edge"},
+            "editor": {"vscode"},
+            "desktop": {"desktop"},
+        }
+        targets_by_action: dict[str, WebSocketClient] = {}
+        for action in command.actions:
+            client_types = client_types_by_executor.get(action.executor, set())
+            target = next(
+                (
+                    client
+                    for client in self._clients.values()
+                    if client.authenticated
+                    and client.client_type in client_types
+                    and client.client_instance_id
+                    == action.owner_client_instance_id
+                ),
+                None,
+            )
+            if target is not None:
+                targets_by_action[action.action_id] = target
+        # Restoration is idempotent and ownership-scoped. Route to every
+        # reachable owner now; missing owners remain pending and receive the
+        # same restore_id when they reconnect. Requiring all owners at once
+        # would strand an already-mutated online surface behind an offline
+        # peer.
+        if not targets_by_action:
+            return 0
+        if not await self._bind_dispatch_targets(
+            command.restore_id,
+            targets_by_action,
+        ):
+            return 0
+        targets: list[WebSocketClient] = []
+        seen_client_ids: set[str] = set()
+        for target in targets_by_action.values():
+            if target.client_id not in seen_client_ids:
+                seen_client_ids.add(target.client_id)
+                targets.append(target)
+        sent = 0
+        payload = command.model_dump(mode="json")
+        for target in targets:
+            if await self._send_to(
+                target,
+                MessageType.INTERVENTION_RESTORE.value,
+                payload,
+                correlation_id=correlation_id,
+                causation_id=causation_id,
+            ):
+                sent += 1
+        return sent
+
+    async def send_restore(
+        self,
+        intervention_id: str,
+        *,
+        user_action: str,
+        command: InterventionRestoreCommand | None = None,
+    ) -> int:
+        """Send an exact restore, or a presentation-only legacy close cue."""
+
+        if command is not None:
+            return await self.send_restore_command(command)
         self._sequence += 1
         return await self._broadcast(
             WSMessage.from_clock(
@@ -2703,6 +3597,7 @@ class WebSocketServer:
         self,
         plan: InterventionPlan,
         *,
+        action_manifest: ActionManifest | None = None,
         desktop_focused: bool | None = None,
         execution_mode: Literal[
             "suggest_only", "authorized", "research_autonomous"
@@ -2747,6 +3642,11 @@ class WebSocketServer:
         # ``payload.plan.intervention_id`` indirection — so the existing
         # browser-extension consumers don't need changes.
         plan_dict = plan.model_dump(mode="json")
+        plan_dict["action_manifest"] = (
+            action_manifest.model_dump(mode="json")
+            if action_manifest is not None
+            else None
+        )
         plan_dict["desktop_not_focused"] = desktop_not_focused
         plan_dict["connected_clients"] = connected
         plan_dict["execution_mode"] = execution_mode

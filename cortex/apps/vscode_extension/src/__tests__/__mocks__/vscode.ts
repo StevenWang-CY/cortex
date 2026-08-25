@@ -11,6 +11,24 @@ export const Uri = {
     parse: (u: string) => ({ fsPath: u, scheme: "vscode-resource", toString: () => u }),
 };
 
+export class Position {
+    constructor(public line: number, public character: number) {}
+}
+
+export class Range {
+    start: Position;
+    end: Position;
+    constructor(
+        startLine: number,
+        startCharacter: number,
+        endLine: number,
+        endCharacter: number,
+    ) {
+        this.start = new Position(startLine, startCharacter);
+        this.end = new Position(endLine, endCharacter);
+    }
+}
+
 export class EventEmitter<T> {
     private _listeners: Array<(e: T) => void> = [];
     event = (listener: (e: T) => void) => {
@@ -24,6 +42,8 @@ export class EventEmitter<T> {
 }
 
 export const window = {
+    activeTextEditor: undefined as unknown,
+    visibleTextEditors: [] as unknown[],
     createStatusBarItem: () => ({
         text: "",
         tooltip: "",
@@ -34,12 +54,22 @@ export const window = {
     }),
     showErrorMessage: jest.fn(),
     showInformationMessage: jest.fn(),
+    showWarningMessage: jest.fn(),
+    showTextDocument: jest.fn(),
+    setStatusBarMessage: jest.fn(),
+    createOutputChannel: jest.fn(() => ({
+        appendLine: jest.fn(),
+        dispose: jest.fn(),
+    })),
+    registerWebviewViewProvider: jest.fn(() => ({ dispose: () => {} })),
 };
 
 export const workspace = {
     getConfiguration: (_section?: string) => ({
         get: (_key: string, defaultValue?: unknown) => defaultValue,
+        update: jest.fn(),
     }),
+    getWorkspaceFolder: jest.fn(),
 };
 
 export const commands = {
@@ -60,6 +90,8 @@ export const CancellationTokenSource = class {
 
 export default {
     Uri,
+    Position,
+    Range,
     EventEmitter,
     window,
     workspace,

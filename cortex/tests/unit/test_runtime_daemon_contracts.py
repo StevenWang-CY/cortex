@@ -334,6 +334,40 @@ async def test_copilot_force_enabled_on_stop(daemon) -> None:  # type: ignore[no
     daemon._copilot_throttle.force_enable.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_global_restore_reports_only_verified_completion(daemon) -> None:  # type: ignore[no-untyped-def]
+    command = SimpleNamespace(restore_id="restore-global-contract")
+
+    class _Coordinator:
+        async def request_restore_all(self, *, reason: str) -> list[Any]:
+            assert reason == "emergency_restore"
+            return [command]
+
+    class _WS:
+        async def send_restore_command(self, candidate: Any) -> int:
+            assert candidate is command
+            daemon._pending_restore_results[candidate.restore_id].set_result(
+                True
+            )
+            return 1
+
+    daemon._transaction_coordinator = _Coordinator()
+    daemon._ws_server = _WS()
+    daemon._pending_restore_results = {}
+    daemon._pending_startup_restores = {}
+
+    summary = await daemon.restore_all_transactional_effects(
+        timeout_seconds=0.1,
+    )
+    assert summary == {
+        "requested": 1,
+        "dispatched": 1,
+        "restored": 1,
+        "failed": 0,
+        "pending": 0,
+    }
+
+
 # ─── fix #2: MorningBriefing constructor + await ─────────────────────────
 
 
@@ -439,15 +473,56 @@ async def test_dismissal_uses_cached_trigger_time_features(daemon) -> None:  # t
 
 
 # ---------------------------------------------------------------------------
-# P1 — consent escalation: the daemon must record approvals/rejections under
-# the CANONICAL action-types the executor's per-action gate checks, not the
-# literal "intervention" (which is disjoint from every gated key, so the
-# ladder never escalated the gate on an approved action).
+# WP6 — proposal engagement is not execution evidence. Positive consent is
+# recorded only after a verified typed action receipt; dismissal can still be
+# useful negative evidence under the canonical action key.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_engage_records_consent_under_canonical_action_types(daemon) -> None:  # type: ignore[no-untyped-def]
+async def test_unpresented_proposal_cleanup_unwinds_every_local_tracker(
+    daemon,
+) -> None:  # type: ignore[no-untyped-def]
+    iid = "iv-unpresented"
+    daemon._active_intervention_id = iid
+    daemon._active_plan = SimpleNamespace(intervention_id=iid)
+    daemon._micro_step_recovery_fired = True
+    daemon._amip_decision_ids_by_intervention[iid] = "decision"
+    daemon._bandit_decisions_by_intervention[iid] = ([1.0], 0)
+    daemon._dismissal_features_by_intervention[iid] = (0.8, 0.2)
+    daemon._consent_actions_by_intervention[iid] = ["open_url"]
+    daemon._causal_signals_by_intervention[iid] = [{"signal": "synthetic"}]
+    daemon._transaction_coordinator.abandon = AsyncMock(return_value=True)
+    daemon._transaction_coordinator.request_restore = AsyncMock(return_value=None)
+    daemon._helpfulness.cancel_tracking = MagicMock(return_value=True)
+
+    with patch("cortex.services.runtime_daemon.registry") as registry_mock:
+        await daemon._close_unpresented_transaction(
+            iid,
+            reason="presentation_delivery_race",
+        )
+
+    assert daemon._active_intervention_id is None
+    assert daemon._active_plan is None
+    assert daemon._micro_step_recovery_fired is False
+    for mapping in (
+        daemon._amip_decision_ids_by_intervention,
+        daemon._bandit_decisions_by_intervention,
+        daemon._dismissal_features_by_intervention,
+        daemon._consent_actions_by_intervention,
+        daemon._causal_signals_by_intervention,
+    ):
+        assert iid not in mapping
+    daemon._helpfulness.cancel_tracking.assert_called_once_with(iid)
+    daemon._transaction_coordinator.request_restore.assert_not_awaited()
+    registry_mock.register.assert_called_once_with(
+        f"workspace_snapshot:{iid}",
+        None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_engage_without_receipt_never_escalates_consent(daemon) -> None:  # type: ignore[no-untyped-def]
     iid = "iv-consent-engage"
     daemon._consent_actions_by_intervention[iid] = ["group_tabs", "fold_code"]
     daemon._restore_manager.engage = AsyncMock(return_value=None)
@@ -456,9 +531,7 @@ async def test_engage_records_consent_under_canonical_action_types(daemon) -> No
 
     await daemon._handle_user_action({"intervention_id": iid, "action": "engaged"})
 
-    approved = {c.args[0] for c in daemon._consent_ladder.record_approval.call_args_list}
-    assert approved == {"group_tabs", "fold_code"}
-    assert "intervention" not in approved
+    daemon._consent_ladder.record_approval.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -478,7 +551,7 @@ async def test_dismiss_records_consent_rejection_under_canonical_action_types(da
 
 
 @pytest.mark.asyncio
-async def test_engage_falls_back_to_intervention_key_when_no_actions_cached(daemon) -> None:  # type: ignore[no-untyped-def]
+async def test_engage_without_manifest_never_creates_generic_approval(daemon) -> None:  # type: ignore[no-untyped-def]
     iid = "iv-consent-none"  # nothing cached for this id
     daemon._restore_manager.engage = AsyncMock(return_value=None)
     daemon._consent_ladder.record_approval = AsyncMock()
@@ -486,4 +559,4 @@ async def test_engage_falls_back_to_intervention_key_when_no_actions_cached(daem
 
     await daemon._handle_user_action({"intervention_id": iid, "action": "engaged"})
 
-    daemon._consent_ladder.record_approval.assert_awaited_once_with("intervention")
+    daemon._consent_ladder.record_approval.assert_not_awaited()

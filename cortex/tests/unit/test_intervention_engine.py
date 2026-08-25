@@ -893,8 +893,8 @@ class TestMutation(unittest.TestCase):
 class TestIsDestructive(unittest.TestCase):
     """Test is_destructive uses action_type checking, not label substring matching."""
 
-    def test_close_tab_is_not_destructive(self):
-        """close_tab action is reversible, not destructive."""
+    def test_close_tab_is_destructive(self):
+        """Reopening a URL cannot reconstruct a closed browser session."""
         from cortex.libs.schemas.intervention import SuggestedAction
         plan = _make_plan()
         plan.suggested_actions = [
@@ -905,16 +905,16 @@ class TestIsDestructive(unittest.TestCase):
                 reason="Unrelated",
             ),
         ]
-        assert plan.is_destructive is False
+        assert plan.is_destructive is True
 
     def test_new_tab_label_not_destructive(self):
-        """A tab titled 'New Tab' with close_tab action should NOT trigger is_destructive."""
+        """Destructive-looking label copy does not override the action type."""
         from cortex.libs.schemas.intervention import SuggestedAction
         plan = _make_plan(headline="Simplify your workspace")
         plan.suggested_actions = [
             SuggestedAction(
-                action_type="close_tab",
-                tab_index=2,
+                action_type="open_url",
+                target="https://example.com/new-tab-guide",
                 label="Close New Tab",
                 reason="Empty tab",
                 metadata={"tab_title": "New Tab"},
@@ -941,15 +941,15 @@ class TestIsDestructive(unittest.TestCase):
         plan.suggested_actions = []
         assert plan.is_destructive is False
 
-    def test_close_tab_reversible_tracked(self):
-        """close_tab action should have reversible=True by default."""
+    def test_close_tab_not_claimed_reversible(self):
+        """A proposal cannot claim URL reopening is an exact inverse."""
         from cortex.libs.schemas.intervention import SuggestedAction
         action = SuggestedAction(
             action_type="close_tab",
             tab_index=1,
             label="Close Stack Overflow",
         )
-        assert action.reversible is True
+        assert action.reversible is False
 
 
 # ===========================================================================

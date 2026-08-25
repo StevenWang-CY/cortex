@@ -61,6 +61,19 @@ from cortex.libs.schemas.intervention import (
     InterventionApplyResult,
     InterventionPlan,
 )
+from cortex.libs.schemas.intervention_transaction import (
+    ActionReceipt,
+    AuthorizationDenied,
+    InterventionApplyCommand,
+    InterventionAuthorizationRequest,
+    InterventionLifecycleState,
+    InterventionReceiptBatch,
+    InterventionRestoreCommand,
+    ReceiptPhase,
+    ReceiptStatus,
+    VerificationStatus,
+    manifest_suggestion_matches,
+)
 from cortex.libs.schemas.leetcode import LeetCodeContext
 from cortex.libs.schemas.observations import (
     CameraFrameObservation,
@@ -136,6 +149,13 @@ from cortex.services.intervention_engine.planner import (
 )
 from cortex.services.intervention_engine.restore import RestoreManager
 from cortex.services.intervention_engine.snapshot import capture_snapshot
+from cortex.services.intervention_engine.transaction import (
+    InterventionTransactionCoordinator,
+    build_action_manifest,
+)
+from cortex.services.intervention_engine.transaction_store import (
+    JsonInterventionTransactionStore,
+)
 from cortex.services.janitor.retention import (
     enforce_chronotype_retention,
 )
@@ -796,8 +816,6 @@ class CortexDaemon:
             timeout_seconds=float(self.config.intervention.timeout_minutes * 60),
             clock=self._clock,
         )
-        for adapter_name in ("browser", "editor", "overlay", "terminal"):
-            self._executor.register_adapter(adapter_name, _PassiveWorkspaceAdapter())
 
         # Phase-4b TASK M: bind the per-action consent gate + the two
         # special-action hooks on the executor. The hooks run inside
@@ -1072,7 +1090,11 @@ class CortexDaemon:
 
         # Consent ladder
         self._consent_policy = ConsentPolicy()
-        self._consent_ladder = ConsentLadder(store=self._store, policy=self._consent_policy)
+        self._consent_ladder = ConsentLadder(
+            store=self._store,
+            policy=self._consent_policy,
+            clock=self._clock,
+        )
         # Phase-3 P0 + Audit-1.1 P0-1: consent policy overrides must
         # survive a daemon restart. Without persistence, the user's
         # opt-in to ``distraction_block`` at AUTONOMOUS_ACT silently
@@ -1082,6 +1104,38 @@ class CortexDaemon:
             Path(self.config.storage.path).expanduser() / "consent_overrides.json"
         )
         self._load_consent_overrides()
+        self._transaction_coordinator = InterventionTransactionCoordinator(
+            self._consent_ladder,
+            store=JsonInterventionTransactionStore(
+                Path(self.config.storage.path).expanduser()
+                / "intervention_transactions.json"
+            ),
+            clock=self._clock,
+            execution_mode=self.intervention_execution_mode,
+        )
+        self._executor.set_authorization_verifier(
+            self._transaction_coordinator.validate_consumed
+        )
+        self._restore_manager.set_restore_callback(
+            self._restore_transaction_and_wait
+        )
+        self._ws_server.set_intervention_authorize_callback(
+            self._authorize_intervention
+        )
+        self._ws_server.set_intervention_receipt_callback(
+            self._record_intervention_receipts
+        )
+        self._ws_server.set_intervention_dispatch_failure_callback(
+            self._record_intervention_dispatch_failure
+        )
+        self._ws_server.set_intervention_partial_dispatch_callback(
+            self._compensate_partial_intervention_dispatch
+        )
+        self._ws_server.set_intervention_dispatch_binding_callback(
+            self._transaction_coordinator.bind_dispatch_targets
+        )
+        self._pending_restore_results: dict[str, asyncio.Future[bool]] = {}
+        self._pending_startup_restores: dict[str, InterventionRestoreCommand] = {}
 
         # Helpfulness tracker
         self._helpfulness = HelpfulnessTracker(store=self._store, clock=self._clock)
@@ -1607,6 +1661,20 @@ class CortexDaemon:
             raise RuntimeError(
                 f"WebSocket server failed to bind {self.config.api.host}:{self.config.api.ws_port}"
             )
+        # Recover crash-interrupted transactions before accepting new
+        # intervention work. With no extension connected yet, exact restore
+        # commands remain queued and are retried when their executor identifies.
+        startup_restores = (
+            await self._transaction_coordinator.recover_unfinished()
+        )
+        for restore_command in startup_restores:
+            # Retain until the coordinator observes every inverse receipt.
+            # A partial restore send is expected when only one owning surface
+            # has reconnected during startup.
+            self._pending_startup_restores[
+                restore_command.restore_id
+            ] = restore_command
+            await self._ws_server.send_restore_command(restore_command)
         self._start_api_server()
 
         # B1 (Phase 4.1): if the capture pipeline never came up, broadcast
@@ -1746,6 +1814,11 @@ class CortexDaemon:
     async def stop(self) -> None:
         """Gracefully stop all runtime services."""
         self._shutdown.set()
+        # Revoke the production path before cancelling proposal producers.
+        # Already-consumed effects are handled by the exact restore barrier
+        # below; no new authorization may be minted during teardown.
+        self._interventions_enabled = False
+        self._transaction_coordinator.set_execution_mode("suggest_only")
         # Audit P1: tell the macOS notification delegate to refuse new
         # callback dispatches BEFORE we cancel asyncio tasks. A user
         # click arriving mid-shutdown would otherwise reach a half-
@@ -1789,6 +1862,24 @@ class CortexDaemon:
                 *list(self._background_tasks), return_exceptions=True
             )
             self._background_tasks.clear()
+        # WP6: while authenticated clients and receipt handlers are still
+        # alive, request every exact inverse and wait a bounded interval for
+        # verified completion. Offline/unresponsive owners remain durable and
+        # are retried on next startup rather than being reported restored.
+        try:
+            restore_summary = await self.restore_all_transactional_effects(
+                reason="system_cancelled",
+                timeout_seconds=3.0,
+            )
+            if restore_summary["pending"] or restore_summary["failed"]:
+                logger.warning(
+                    "Shutdown retained unresolved exact restores: %s",
+                    restore_summary,
+                )
+        except Exception:
+            logger.exception(
+                "Shutdown exact-restore barrier failed; journal retained for startup"
+            )
         # F05 / B18 (Phase 4.1): any apply-confirmation future still
         # pending at shutdown is treated as a missed ack — resolve to
         # confirmed=False so awaiters don't hang.
@@ -2055,6 +2146,7 @@ class CortexDaemon:
             "context_engine": self._context_engine,
             "llm_client": self._llm_client,
             "intervention_executor": self._executor,
+            "intervention_transactions": self._transaction_coordinator,
             "restore_manager": self._restore_manager,
             "ws_server": self._ws_server,
             "trigger_policy": self._trigger_policy,
@@ -3823,6 +3915,98 @@ class CortexDaemon:
             return url
         return None
 
+    async def _close_unpresented_transaction(
+        self,
+        intervention_id: str,
+        *,
+        reason: str,
+        clear_snapshot: bool = True,
+    ) -> None:
+        """Close a registered proposal that never became presentable.
+
+        Delivery and cancellation can race an approval arriving from a
+        surface that received the final bytes before a transport error. The
+        coordinator therefore abandons only pre-effect states; if authority
+        was already consumed this helper asks for the exact owner-bound
+        inverse and keeps it queued until receipt verification succeeds.
+        Local UI/evaluation state is unwound in either case.
+        """
+
+        restore_command: InterventionRestoreCommand | None = None
+        try:
+            abandoned = await self._transaction_coordinator.abandon(
+                intervention_id,
+                reason,
+            )
+            if not abandoned:
+                restore_command = (
+                    await self._transaction_coordinator.request_restore(
+                        intervention_id,
+                        reason="system_cancelled",
+                    )
+                )
+        except Exception:
+            # The durable journal remains authoritative. Startup recovery
+            # will retry any APPLYING/APPLIED transaction we could not close.
+            logger.exception(
+                "Could not close unpresented transaction %s",
+                intervention_id,
+            )
+
+        if restore_command is not None:
+            pending = getattr(self, "_pending_startup_restores", None)
+            if isinstance(pending, dict):
+                pending[restore_command.restore_id] = restore_command
+            sender = getattr(self._ws_server, "send_restore_command", None)
+            if callable(sender):
+                try:
+                    await sender(restore_command)
+                except Exception:
+                    logger.exception(
+                        "Immediate recovery dispatch failed for %s; queued",
+                        intervention_id,
+                    )
+
+        if self._active_intervention_id == intervention_id:
+            self._active_intervention_id = None
+        async with self._micro_step_lock:
+            if (
+                self._active_plan is not None
+                and self._active_plan.intervention_id == intervention_id
+            ):
+                self._active_plan = None
+                self._micro_step_recovery_fired = False
+
+        helpfulness = getattr(self, "_helpfulness", None)
+        cancel_tracking = getattr(helpfulness, "cancel_tracking", None)
+        if callable(cancel_tracking):
+            cancel_tracking(intervention_id)
+        for attribute in (
+            "_amip_decision_ids_by_intervention",
+            "_bandit_decisions_by_intervention",
+            "_dismissal_features_by_intervention",
+            "_consent_actions_by_intervention",
+            "_causal_signals_by_intervention",
+        ):
+            mapping = getattr(self, attribute, None)
+            if isinstance(mapping, dict):
+                mapping.pop(intervention_id, None)
+
+        pending_applies = getattr(self, "_pending_apply_results", None)
+        if isinstance(pending_applies, dict):
+            future = pending_applies.pop(intervention_id, None)
+            if future is not None and not future.done():
+                future.set_result(
+                    InterventionApplyResult(
+                        intervention_id=intervention_id,
+                        confirmed=False,
+                        timed_out=False,
+                        errors=[reason[:200]],
+                    )
+                )
+        if clear_snapshot:
+            registry.register(f"workspace_snapshot:{intervention_id}", None)
+
     async def _trigger_intervention(
         self,
         context: Any,
@@ -3841,6 +4025,8 @@ class CortexDaemon:
         # explicit id was supplied (test rigs / legacy callers).
         if decision_id is None:
             decision_id = self._last_policy_decision_id
+        registered_intervention_id: str | None = None
+        presentation_committed = False
         try:
             # Inject learned tab relevance into context for LLM
             goal = getattr(context, "current_goal_hint", "") or ""
@@ -3936,150 +4122,51 @@ class CortexDaemon:
                 plan.metadata["execution_mode"] = execution_mode
                 plan.metadata["workspace_mutation_allowed"] = True
 
-            # v2.0: Check consent ladder
-            consent_level_map = {
-                "observe": 0, "suggest": 1, "preview": 2,
-                "reversible_act": 3, "autonomous_act": 4,
-            }
-            # Phase-4b TASK B: an unknown ``consent_level`` literal used to
-            # silently default to PREVIEW (2) — that masked planner bugs
-            # AND let the bandit learn from outcomes attributed to the
-            # wrong consent gate. Reject the plan and log so AMIP /
-            # ops can see the failure.
-            if plan.consent_level not in consent_level_map:
-                logger.warning(
-                    "rejecting plan %s with unknown consent_level=%r",
-                    plan.intervention_id,
-                    plan.consent_level,
-                )
-                # Record the failed plan so AMIP/helpfulness don't lose
-                # the decision. ``record_failed_plan`` is best-effort —
-                # older helpfulness store may not expose it, in which
-                # case the warning above is sufficient observability.
-                failed_recorder = getattr(
-                    self._helpfulness, "record_failed_plan", None,
-                )
-                if failed_recorder is not None:
-                    try:
-                        result = failed_recorder(
-                            intervention_id=plan.intervention_id,
-                            reason="unknown_consent_level",
-                        )
-                        if asyncio.iscoroutine(result):
-                            await result
-                    except Exception:
-                        logger.debug(
-                            "record_failed_plan raised", exc_info=True,
-                        )
-                self._active_intervention_id = None
-                return
-            requested_level = consent_level_map[plan.consent_level]
-            consent = await self._consent_ladder.check(
-                action_type=(
-                    "show_overlay"
-                    if execution_mode == "suggest_only"
-                    else plan.level
-                ),
-                requested_level=requested_level,
+            # WP6: the plan is a proposal, never authority. Lower every
+            # possible effect into an immutable digest and persist it before
+            # any surface sees the proposal. Suggest-only carries an empty
+            # manifest even though descriptive SuggestedAction cards remain.
+            action_manifest = build_action_manifest(
+                plan,
+                commands,
+                consent_policy=self._consent_policy,
+                clock=self._clock,
+                include_suggested_actions=(execution_mode != "suggest_only"),
             )
-            if not consent.allowed:
-                logger.info(
-                    "Consent ladder blocked intervention %s "
-                    "(level=%s outcome=%s effective=%s)",
-                    plan.intervention_id,
-                    plan.consent_level,
-                    consent.outcome,
-                    consent.effective_level,
-                )
-                return
-
+            await self._transaction_coordinator.register_proposal(
+                action_manifest
+            )
+            registered_intervention_id = plan.intervention_id
             snapshot = (
                 capture_snapshot(
                     context,
                     intervention_id=plan.intervention_id,
                     clock=self._clock,
                 )
-                if commands
+                if action_manifest.action_count > 0
                 else None
             )
-            mutations = (
-                await self._executor.apply(plan, commands)
-                if commands and self.workspace_mutation_allowed
-                else []
+            authenticated_count = getattr(
+                self._ws_server,
+                "authenticated_client_count",
+                None,
             )
-            # Phase-4b TASK C: compute the actual applied count so the
-            # downstream broadcast knows whether the workspace mutated.
-            # ``commands`` may legitimately be empty (suggested-action-
-            # only plan) — in that case both ``len(commands) == 0`` and
-            # ``applied == 0``; we still broadcast INTERVENTION_TRIGGER.
-            applied = sum(1 for m in mutations if m.success)
-            expected_mutations = len(commands)
-            if expected_mutations > 0 and applied == 0:
-                # The plan expected to mutate the workspace and every
-                # mutation failed. Skip the restore-manager registration
-                # (nothing to roll back) and broadcast INTERVENTION_FAILED
-                # so the UI can surface the failure mode instead of a
-                # silently-broken intervention.
-                failed_types = sorted({m.action for m in mutations})
-                reasons = sorted({
-                    m.reason for m in mutations if m.reason is not None
-                })
-                error_reason = (
-                    reasons[0] if reasons else "all_mutations_failed"
-                )
-                logger.warning(
-                    "Intervention %s: all %d mutations failed (types=%s reason=%s)",
+            if (
+                isinstance(authenticated_count, int)
+                and authenticated_count == 0
+                and self._intervention_callback is None
+            ):
+                await self._close_unpresented_transaction(
                     plan.intervention_id,
-                    expected_mutations,
-                    failed_types,
-                    error_reason,
+                    reason="no_authenticated_presentation_surface",
                 )
-                try:
-                    await self._ws_server.send_message(
-                        MessageType.INTERVENTION_FAILED.value,
-                        {
-                            "intervention_id": plan.intervention_id,
-                            "error_reason": error_reason,
-                            "failed_action_types": failed_types,
-                        },
-                    )
-                except Exception:
-                    logger.debug(
-                        "INTERVENTION_FAILED broadcast failed", exc_info=True,
-                    )
-                self._active_intervention_id = None
+                logger.info(
+                    "Suppressed proposal %s: no authenticated presentation "
+                    "surface is connected",
+                    plan.intervention_id,
+                )
                 return
-            if snapshot is not None and applied > 0:
-                self._restore_manager.start_intervention(
-                    plan.intervention_id, snapshot,
-                )
-            self._trigger_policy.record_intervention()
-            # P1-PIPE-REPORT: a plan was approved by the trigger policy AND
-            # delivered to the user (mutations applied, restore session
-            # started). Count it on the session report so the persisted
-            # SessionReport.interventions_triggered reflects real deliveries
-            # rather than the constant 0 that fed the longitudinal HYPER
-            # proxy. Mirrors record_intervention()'s placement so the two
-            # counters move together.
-            try:
-                self._session_report.increment_interventions_triggered()
-            except Exception:
-                logger.debug(
-                    "session_report increment_interventions_triggered failed",
-                    exc_info=True,
-                )
             self._active_intervention_id = plan.intervention_id
-            # Phase-4b TASK C: stamp the applied count onto the trigger
-            # payload so the overlay can show "2 of 3 actions applied"
-            # without rebroadcasting from the executor side.
-            if applied > 0:
-                try:
-                    plan.metadata = dict(plan.metadata or {})
-                    plan.metadata["mutations_applied_count"] = applied
-                except Exception:
-                    logger.debug(
-                        "stamping mutations_applied_count failed", exc_info=True,
-                    )
             # P0 §3.6: cache the live plan so MICRO_STEP_TOGGLED can
             # mutate its ``micro_steps`` and rebroadcast the trigger.
             # If a previous intervention shares this id (F16 swap),
@@ -4101,7 +4188,7 @@ class CortexDaemon:
                     )
                 self._active_plan = plan
                 self._micro_step_recovery_fired = False
-            if snapshot is not None and applied > 0:
+            if snapshot is not None:
                 registry.register(
                     f"workspace_snapshot:{plan.intervention_id}", snapshot,
                 )
@@ -4201,26 +4288,16 @@ class CortexDaemon:
                 desktop_focused = self._desktop_is_focused()
             else:
                 desktop_focused = None
-            await self._ws_server.send_intervention(
+            await self._transaction_coordinator.mark_delivered(
+                plan.intervention_id
+            )
+            sent = await self._ws_server.send_intervention(
                 plan,
+                action_manifest=action_manifest,
                 desktop_focused=desktop_focused,
                 execution_mode=execution_mode,
             )
-            # P0 §3.15: plan-finalised event — push COST_RESPONSE so the
-            # UI cost meter updates without polling lag. Best-effort; a
-            # cost-tracker error must not bubble up here.
-            await self._broadcast_cost_response()
-            # Fire the macOS UNUserNotification path when the desktop
-            # dashboard isn't focused — the WS broadcast covers Chrome /
-            # VS Code; the helper covers Spaces-other-than-the-desktop.
-            if os_notifications_enabled and desktop_focused is False:
-                try:
-                    await self._dispatch_os_notification(plan)
-                except Exception:
-                    logger.debug(
-                        "OS notification dispatch failed", exc_info=True,
-                    )
-
+            callback_delivered = False
             if self._intervention_callback is not None:
                 # F17: stamp a monotonic sequence so the in-process bridge
                 # can drop reordered intervention triggers. The plan dict
@@ -4230,6 +4307,9 @@ class CortexDaemon:
                 _payload = copy.deepcopy(plan.model_dump(mode="json"))
                 _payload["_seq"] = self._intervention_callback_seq
                 _payload["execution_mode"] = execution_mode
+                _payload["action_manifest"] = action_manifest.model_dump(
+                    mode="json"
+                )
                 # Audit-prod fix (G4 P0): the overlay's action-buttons gate
                 # browser-bound actions on ``payload.connected_clients``;
                 # without this field every browser button renders disabled
@@ -4250,9 +4330,62 @@ class CortexDaemon:
                 # path is taking over (dual-fire de-dup).
                 if desktop_focused is False:
                     _payload["desktop_not_focused"] = True
-                self._intervention_callback(_payload)
+                try:
+                    self._intervention_callback(_payload)
+                    callback_delivered = True
+                except Exception:
+                    logger.exception(
+                        "In-process intervention presentation failed"
+                    )
+
+            if sent == 0 and not callback_delivered:
+                # A surface can disconnect between the preflight count and
+                # the actual broadcast. Close the durable proposal and unwind
+                # every local tracker instead of leaving a delivered-looking
+                # active intervention that no user could ever see.
+                await self._close_unpresented_transaction(
+                    plan.intervention_id,
+                    reason="presentation_delivery_race",
+                )
+                logger.info(
+                    "Abandoned proposal %s after every presentation "
+                    "surface disconnected",
+                    plan.intervention_id,
+                )
+                return
+
+            presentation_committed = True
+
+            self._trigger_policy.record_intervention()
+            try:
+                self._session_report.increment_interventions_triggered()
+            except Exception:
+                logger.debug(
+                    "session_report increment_interventions_triggered failed",
+                    exc_info=True,
+                )
+
+            # P0 §3.15: plan-finalised event — push COST_RESPONSE so the
+            # UI cost meter updates without polling lag. Best-effort; a
+            # cost-tracker error must not bubble up here.
+            await self._broadcast_cost_response()
+            # Fire the macOS UNUserNotification path when the desktop
+            # dashboard isn't focused — the WS broadcast covers Chrome /
+            # VS Code; the helper covers Spaces-other-than-the-desktop.
+            if os_notifications_enabled and desktop_focused is False:
+                try:
+                    await self._dispatch_os_notification(plan)
+                except Exception:
+                    logger.debug(
+                        "OS notification dispatch failed", exc_info=True,
+                    )
         except TimeoutError:
             logger.warning("Intervention LLM call timed out")
+            if registered_intervention_id is not None and not presentation_committed:
+                await self._close_unpresented_transaction(
+                    registered_intervention_id,
+                    reason="presentation_pipeline_timed_out",
+                )
             # Phase-4b TASK D: explicitly clear pending state. Leaving
             # the pending decision_id slot occupied would let the next
             # trigger inherit a now-stale id, double-attributing the
@@ -4262,9 +4395,21 @@ class CortexDaemon:
                 self._last_policy_arm = None
                 self._last_policy_propensity = None
         except asyncio.CancelledError:
+            if registered_intervention_id is not None and not presentation_committed:
+                await asyncio.shield(
+                    self._close_unpresented_transaction(
+                        registered_intervention_id,
+                        reason="presentation_task_cancelled",
+                    )
+                )
             raise
         except Exception:
             logger.exception("Failed to trigger intervention")
+            if registered_intervention_id is not None and not presentation_committed:
+                await self._close_unpresented_transaction(
+                    registered_intervention_id,
+                    reason="presentation_pipeline_failed",
+                )
         finally:
             # Clear __pending__ sentinel if intervention didn't complete
             if self._active_intervention_id == "__pending__":
@@ -4305,6 +4450,8 @@ class CortexDaemon:
             self._last_policy_arm = None
             self._last_policy_propensity = None
 
+        registered_intervention_id: str | None = None
+        presentation_committed = False
         try:
             plan = await self._llm_client.generate_intervention_plan(
                 context,
@@ -4314,6 +4461,60 @@ class CortexDaemon:
             plan = enrich_plan_with_context(plan, context)
             # C3 (audit): scope special interventions to the active tab too.
             plan.trigger_url = self._active_trigger_url(context)
+            tab_count = None
+            if (
+                hasattr(context, "browser_context")
+                and context.browser_context is not None
+            ):
+                tab_count = len(context.browser_context.all_tabs)
+            validation, _commands = prepare_plan(plan, tab_count=tab_count)
+            if not validation.is_valid:
+                logger.warning(
+                    "Rejected special intervention %s: %s",
+                    plan.intervention_id,
+                    validation.errors,
+                )
+                return
+            if validation.warnings:
+                plan.plan_warnings.extend(validation.warnings)
+            # Special detector surfaces are presentation-only until each
+            # detector and capability has its own validated transaction
+            # protocol. A custom message type must never be a second mutation
+            # command hidden beside INTERVENTION_APPLY.
+            plan = materialize_suggestion_only(plan)
+            action_manifest = build_action_manifest(
+                plan,
+                [],
+                consent_policy=self._consent_policy,
+                clock=self._clock,
+                include_suggested_actions=False,
+            )
+            await self._transaction_coordinator.register_proposal(
+                action_manifest
+            )
+            registered_intervention_id = plan.intervention_id
+            authenticated_count = getattr(
+                self._ws_server,
+                "authenticated_client_count",
+                None,
+            )
+            if (
+                isinstance(authenticated_count, int)
+                and authenticated_count == 0
+            ):
+                await self._close_unpresented_transaction(
+                    plan.intervention_id,
+                    reason="no_authenticated_presentation_surface",
+                )
+                logger.info(
+                    "Suppressed special proposal %s: no authenticated "
+                    "WebSocket surface is connected",
+                    plan.intervention_id,
+                )
+                return
+            await self._transaction_coordinator.mark_delivered(
+                plan.intervention_id
+            )
             self._active_intervention_id = plan.intervention_id
             # P0 §3.6: cache the live plan + merge prior step state on F16 swap.
             # Wave-2 P1: serialise against ``toggle_micro_step`` (same
@@ -4332,9 +4533,47 @@ class CortexDaemon:
                 self._active_plan = plan
                 self._micro_step_recovery_fired = False
             self._recorder.append("intervention_plan", plan.model_dump(mode="json"))
-            await self._ws_server.send_message(ws_type, plan.model_dump(mode="json"))
+            if ws_type == MessageType.INTERVENTION_TRIGGER.value:
+                sent = await self._ws_server.send_intervention(
+                    plan,
+                    action_manifest=action_manifest,
+                    execution_mode="suggest_only",
+                )
+            else:
+                payload = plan.model_dump(mode="json")
+                payload["action_manifest"] = action_manifest.model_dump(
+                    mode="json"
+                )
+                payload["execution_mode"] = "suggest_only"
+                sent = await self._ws_server.send_message(ws_type, payload)
+            if not sent:
+                await self._close_unpresented_transaction(
+                    plan.intervention_id,
+                    reason="presentation_delivery_race",
+                )
+                logger.info(
+                    "Abandoned special proposal %s after presentation "
+                    "delivery failed",
+                    plan.intervention_id,
+                )
+                return
+            presentation_committed = True
+        except asyncio.CancelledError:
+            if registered_intervention_id is not None and not presentation_committed:
+                await asyncio.shield(
+                    self._close_unpresented_transaction(
+                        registered_intervention_id,
+                        reason="special_presentation_task_cancelled",
+                    )
+                )
+            raise
         except Exception:
             logger.exception("Failed to trigger special intervention (%s)", template_name)
+            if registered_intervention_id is not None and not presentation_committed:
+                await self._close_unpresented_transaction(
+                    registered_intervention_id,
+                    reason="special_presentation_pipeline_failed",
+                )
         finally:
             # Clear the sentinel if the call failed before assigning the
             # real id; on success the real id stays.
@@ -4365,22 +4604,39 @@ class CortexDaemon:
     async def _handle_restore_updates(self, estimate: Any, timestamp: float) -> None:
         outcomes = await self._restore_manager.update(estimate, current_time=timestamp)
         for outcome in outcomes:
-            self._active_intervention_id = None
             self._recorder.append("intervention_outcome", outcome.model_dump(mode="json"))
+            if not outcome.workspace_restored:
+                logger.warning(
+                    "Automatic close for %s could not verify restoration; "
+                    "keeping the transaction active for retry",
+                    outcome.intervention_id,
+                )
+                continue
+            if self._active_intervention_id == outcome.intervention_id:
+                self._active_intervention_id = None
+            if (
+                self._active_plan is not None
+                and self._active_plan.intervention_id == outcome.intervention_id
+            ):
+                self._active_plan = None
+            self._micro_step_recovery_fired = False
             await self._ws_server.send_restore(
                 outcome.intervention_id,
                 user_action=outcome.user_action,
             )
 
-    async def dispatch_action_to_browser(
+    async def dispatch_intervention_action(
         self,
         intervention_id: str,
         action: dict[str, Any],
     ) -> int:
-        """G4 (audit-prod): forward a desktop-overlay action click to the
-        browser extension(s) so they actually execute it. Returns the
-        count of clients the dispatch reached (0 = no browser client
-        connected, or validation failed).
+        """Authorize one desktop gesture through the exact remote adapter.
+
+        The in-process shell is a presentation/request surface, not an
+        executor. It may request any action present in the immutable manifest;
+        the WebSocket gateway then routes the consumed command to the exact
+        browser or editor owner and binds receipts to that client identity.
+        Returns the count of executor clients reached.
 
         Audit-prod fix: validate ``intervention_id`` against the active
         plan so a stale overlay click (timer race against dismiss) is
@@ -4414,8 +4670,9 @@ class CortexDaemon:
             )
             return 0
         # Validate the action shape against the Pydantic source of truth.
-        # SuggestedAction's validators enforce the action_type Literal,
-        # url scheme allowlist, tab_index bounds, etc.
+        # SuggestedAction's validators enforce the action_type Literal, URL
+        # scheme allowlist, tab_index bounds, etc. The manifest comparison
+        # below remains authoritative for the digest-covered parameters.
         try:
             from cortex.libs.schemas.intervention import SuggestedAction
 
@@ -4426,23 +4683,114 @@ class CortexDaemon:
                 exc,
             )
             return 0
-        try:
-            sent = await self._ws_server.send_message(
-                MessageType.ACTION_DISPATCH.value,
-                {"intervention_id": intervention_id, "action": validated},
-                target_client_types=["chrome", "edge"],
+        transaction = await self._transaction_coordinator.get_transaction(
+            intervention_id
+        )
+        if transaction is None:
+            logger.warning("Desktop action request has no transaction")
+            return 0
+        action_id = str(validated.get("action_id") or "")
+        manifest_action = next(
+            (
+                item
+                for item in transaction.manifest.body.actions
+                if item.action_id == action_id
+                and item.executor in {"browser", "editor"}
+            ),
+            None,
+        )
+        if manifest_action is None:
+            logger.warning(
+                "Desktop action %s is absent from the executable manifest",
+                action_id,
             )
+            return 0
+        if not manifest_suggestion_matches(transaction.manifest, validated):
+            logger.warning(
+                "Desktop action presentation differs from exact manifest "
+                "(intervention_id=%s action_id=%s)",
+                intervention_id,
+                action_id,
+            )
+            return 0
+        request = InterventionAuthorizationRequest(
+            authorization_request_id=f"desktop_{uuid4().hex}",
+            intervention_id=intervention_id,
+            manifest_sha256=transaction.manifest.manifest_sha256,
+            approved_action_ids=(action_id,),
+            source_surface="desktop",
+            requested_at_unix_ms=self._clock.unix_ms(),
+            requested_at_mono_ns=self._clock.monotonic_ns(),
+            boot_id=self._clock.boot_id,
+        )
+        authorized = await self._authorize_intervention(
+            request,
+            "desktop_shell",
+            "desktop",
+        )
+        if isinstance(authorized, AuthorizationDenied):
+            logger.info(
+                "Desktop action authorization denied: %s",
+                authorized.reason_code,
+            )
+            return 0
+        try:
+            dispatch = await self._ws_server.dispatch_apply_command(authorized)
+            sent = dispatch.delivered_targets
+            if dispatch.attempted_targets == 0:
+                await self._transaction_coordinator.record_dispatch_failure(
+                    authorized.authorization.authorization_id,
+                    reason="desktop_action_no_executor",
+                )
+            elif sent != dispatch.expected_targets:
+                compensation = (
+                    await self._compensate_partial_intervention_dispatch(
+                        authorized.authorization.authorization_id,
+                        "desktop_action_delivery_ambiguous",
+                    )
+                )
+                if compensation is not None:
+                    await self._ws_server.send_restore_command(compensation)
         except Exception:
-            logger.exception("ACTION_DISPATCH send failed")
+            logger.exception("Transactional desktop action dispatch failed")
+            try:
+                compensation = (
+                    await self._compensate_partial_intervention_dispatch(
+                        authorized.authorization.authorization_id,
+                        "desktop_action_dispatch_exception",
+                    )
+                )
+                if compensation is not None:
+                    await self._ws_server.send_restore_command(compensation)
+            except Exception:
+                logger.exception(
+                    "Transactional desktop action compensation failed"
+                )
             return 0
         if sent == 0:
             logger.info(
-                "ACTION_DISPATCH dropped: no chrome/edge client connected "
+                "Desktop exact action has no connected executor "
                 "(intervention_id=%s action_id=%s)",
                 intervention_id,
                 validated.get("action_id"),
             )
         return sent
+
+    async def dispatch_action_to_browser(
+        self,
+        intervention_id: str,
+        action: dict[str, Any],
+    ) -> int:
+        """Compatibility facade for old desktop controller/test callers.
+
+        It no longer emits ``ACTION_DISPATCH``. The request is authorized and
+        executed through :meth:`dispatch_intervention_action`.
+        """
+
+        return await self.dispatch_intervention_action(
+            intervention_id,
+            action,
+        )
 
     # ─── P0 §3.7: biology-driven break orchestration ─────────────────
 
@@ -4470,6 +4818,431 @@ class CortexDaemon:
         self._break_controller.set_ui_handler(handler)
 
     # ─── Phase-4b TASK M: executor-bound hooks ─────────────────────
+
+    async def _authorize_intervention(
+        self,
+        request: InterventionAuthorizationRequest,
+        source_client_id: str,
+        source_client_type: str,
+    ) -> InterventionApplyCommand | AuthorizationDenied:
+        """Turn one exact user gesture into a consumed authorization."""
+
+        active = self._active_intervention_id
+        if (
+            active is None
+            or active == "__pending__"
+            or active != request.intervention_id
+        ):
+            return AuthorizationDenied(
+                authorization_request_id=request.authorization_request_id,
+                intervention_id=request.intervention_id,
+                manifest_sha256=request.manifest_sha256,
+                reason_code="transaction_closed",
+                detail=f"intervention is no longer active (active={active})"[:500],
+            )
+        result = await self._transaction_coordinator.authorize_and_consume(
+            request,
+            source_client_id=source_client_id,
+        )
+        try:
+            if isinstance(result, AuthorizationDenied):
+                self._recorder.append(
+                    "intervention_authorization_denied",
+                    result.model_dump(mode="json"),
+                )
+            else:
+                self._recorder.append(
+                    "intervention_authorized",
+                    {
+                        "intervention_id": result.authorization.intervention_id,
+                        "authorization_id": result.authorization.authorization_id,
+                        "manifest_sha256": result.authorization.manifest_sha256,
+                        "action_ids": list(
+                            result.authorization.authorized_action_ids
+                        ),
+                        "consent_revision": result.authorization.consent_revision,
+                        "source_client_type": source_client_type,
+                    },
+                )
+        except Exception:
+            logger.debug("authorization recorder append failed", exc_info=True)
+        return result
+
+    async def _record_intervention_receipts(
+        self,
+        batch: InterventionReceiptBatch,
+        source_client_id: str,
+        source_client_type: str,
+    ) -> tuple[
+        InterventionLifecycleState,
+        InterventionRestoreCommand | None,
+    ]:
+        """Persist receipts, update consent evidence, and resolve waiters."""
+
+        state, compensation = (
+            await self._transaction_coordinator.record_receipts(
+                batch,
+                source_client_type=source_client_type,
+                source_client_id=source_client_id,
+            )
+        )
+        if compensation is not None:
+            # Keep compensation retryable across an offline executor. The WS
+            # server preflights the complete route; this queue is retried as
+            # each required surface identifies and is removed only after
+            # verified inverse receipts reach RESTORED.
+            self._pending_startup_restores[
+                compensation.restore_id
+            ] = compensation
+        transaction = await self._transaction_coordinator.get_transaction(
+            batch.intervention_id
+        )
+        if transaction is not None:
+            actions = {
+                action.action_id: action
+                for action in transaction.manifest.body.actions
+            }
+            for receipt in batch.receipts:
+                action = actions.get(receipt.action_id)
+                if (
+                    action is not None
+                    and receipt.phase == "apply"
+                    and receipt.status
+                    in {
+                        ReceiptStatus.SUCCEEDED.value,
+                        ReceiptStatus.ALREADY_COMPLETE.value,
+                    }
+                    and receipt.verification
+                    == VerificationStatus.VERIFIED.value
+                    and await self._transaction_coordinator.claim_consent_evidence(
+                        receipt.receipt_id
+                    )
+                ):
+                    await self._consent_ladder.record_approval(
+                        canonical_action_type(action.capability)
+                    )
+
+            # Register the timed restore session only after a verified
+            # workspace effect exists. Proposal delivery never creates a
+            # theatrical "active mutation".
+            if state == InterventionLifecycleState.APPLIED:
+                has_workspace_effect = any(
+                    receipt.authorization_id == batch.authorization_id
+                    and receipt.phase == "apply"
+                    and receipt.status == ReceiptStatus.SUCCEEDED.value
+                    and actions.get(receipt.action_id) is not None
+                    and actions[receipt.action_id].workspace_mutation
+                    for receipt in transaction.receipts
+                )
+                if (
+                    has_workspace_effect
+                    and self._restore_manager.get_active(batch.intervention_id)
+                    is None
+                ):
+                    snapshot = registry.get(
+                        f"workspace_snapshot:{batch.intervention_id}"
+                    )
+                    if snapshot is not None:
+                        self._restore_manager.start_intervention(
+                            batch.intervention_id,
+                            snapshot,
+                        )
+
+        try:
+            self._recorder.append(
+                "intervention_receipts",
+                {
+                    **batch.model_dump(mode="json"),
+                    "source_client_id": source_client_id,
+                    "source_client_type": source_client_type,
+                    "transaction_state": state.value,
+                },
+            )
+        except Exception:
+            logger.debug("receipt recorder append failed", exc_info=True)
+
+        # Bridge the old HTTP confirmation response onto the new truthful
+        # receipt result during the one-release compatibility window.
+        if (
+            state
+            in {
+                InterventionLifecycleState.APPLIED,
+                InterventionLifecycleState.PARTIAL,
+                InterventionLifecycleState.FAILED,
+            }
+            and any(receipt.phase == "apply" for receipt in batch.receipts)
+        ):
+            future = self._pending_apply_results.pop(batch.intervention_id, None)
+            if future is not None and not future.done():
+                # The lifecycle state is an aggregate across every one-time
+                # authorization in the intervention. Derive this legacy HTTP
+                # acknowledgement from the *current authorization's* complete
+                # receipt set; otherwise a prior active effect could make a
+                # later all-failed grant look confirmed, and the last of
+                # several executor batches could hide earlier results.
+                ledger = (
+                    next(
+                        (
+                            entry
+                            for entry in transaction.authorizations
+                            if entry.authorization.authorization_id
+                            == batch.authorization_id
+                        ),
+                        None,
+                    )
+                    if transaction is not None
+                    else None
+                )
+                expected_ids = (
+                    set(ledger.authorization.authorized_action_ids)
+                    if ledger is not None
+                    else set()
+                )
+                latest: dict[str, ActionReceipt] = {}
+                if transaction is not None:
+                    for receipt in transaction.receipts:
+                        if (
+                            receipt.authorization_id != batch.authorization_id
+                            or receipt.phase != ReceiptPhase.APPLY.value
+                        ):
+                            continue
+                        prior = latest.get(receipt.action_id)
+                        if prior is None or receipt.attempt >= prior.attempt:
+                            latest[receipt.action_id] = receipt
+                successful = sorted(
+                    action_id
+                    for action_id, receipt in latest.items()
+                    if receipt.status
+                    in {
+                        ReceiptStatus.SUCCEEDED.value,
+                        ReceiptStatus.ALREADY_COMPLETE.value,
+                    }
+                    and receipt.verification
+                    == VerificationStatus.VERIFIED.value
+                )
+                confirmed = bool(expected_ids) and set(successful) == expected_ids
+                errors = [
+                    (
+                        latest[action_id].error_message
+                        or latest[action_id].error_code
+                        or "action_failed"
+                    )
+                    if action_id in latest
+                    else f"missing_receipt:{action_id}"
+                    for action_id in sorted(expected_ids - set(successful))
+                ]
+                future.set_result(
+                    InterventionApplyResult(
+                        intervention_id=batch.intervention_id,
+                        confirmed=confirmed,
+                        timed_out=False,
+                        applied_actions=successful,
+                        errors=errors,
+                        phase="apply",
+                    )
+                )
+
+        inverse_batch = all(
+            receipt.phase in {"compensate", "restore"}
+            for receipt in batch.receipts
+        )
+        if state in {
+            InterventionLifecycleState.RESTORED,
+            InterventionLifecycleState.RESTORE_FAILED,
+        }:
+            restore_future = self._pending_restore_results.pop(
+                batch.authorization_id,
+                None,
+            )
+            if restore_future is not None and not restore_future.done():
+                restore_future.set_result(
+                    state == InterventionLifecycleState.RESTORED
+                )
+            if state == InterventionLifecycleState.RESTORED:
+                self._pending_startup_restores.pop(batch.authorization_id, None)
+        elif (
+            inverse_batch
+            and state == InterventionLifecycleState.APPLIED
+        ):
+            # A partial compensation can complete while effects from an
+            # earlier, distinct authorization remain active. The aggregate
+            # correctly returns to APPLIED; this restore command itself is
+            # terminal and must not be replayed on every reconnect.
+            self._pending_startup_restores.pop(batch.authorization_id, None)
+            restore_future = self._pending_restore_results.pop(
+                batch.authorization_id,
+                None,
+            )
+            if restore_future is not None and not restore_future.done():
+                restore_future.set_result(True)
+        return state, compensation
+
+    async def _record_intervention_dispatch_failure(
+        self,
+        authorization_id: str,
+        reason: str,
+    ) -> None:
+        """Persist a preflight routing failure for a consumed authorization."""
+
+        await self._transaction_coordinator.record_dispatch_failure(
+            authorization_id,
+            reason=reason,
+        )
+
+    async def _compensate_partial_intervention_dispatch(
+        self,
+        authorization_id: str,
+        reason: str,
+    ) -> InterventionRestoreCommand | None:
+        """Durably enter recovery after a cross-surface send race."""
+
+        command = (
+            await self._transaction_coordinator.compensate_partial_dispatch(
+                authorization_id,
+                reason=reason,
+            )
+        )
+        if command is not None:
+            self._pending_startup_restores[command.restore_id] = command
+        return command
+
+    async def _restore_transaction_and_wait(
+        self,
+        intervention_id: str,
+        user_action: str,
+    ) -> bool:
+        """Dispatch exact inverse actions and await verified receipts."""
+
+        reason_map: dict[str, Literal[
+            "user_undo",
+            "dismissed",
+            "snoozed",
+            "timed_out",
+            "natural_recovery",
+            "system_cancelled",
+            "partial_compensation",
+            "startup_recovery",
+            "emergency_restore",
+        ]] = {
+            "restore": "user_undo",
+            "dismissed": "dismissed",
+            "snoozed": "snoozed",
+            "timed_out": "timed_out",
+            "natural_recovery": "natural_recovery",
+            "engaged": "natural_recovery",
+            "system_cancelled": "system_cancelled",
+        }
+        reason = reason_map.get(user_action, "system_cancelled")
+        command = await self._transaction_coordinator.request_restore(
+            intervention_id,
+            reason=reason,
+        )
+        if command is None:
+            transaction = await self._transaction_coordinator.get_transaction(
+                intervention_id
+            )
+            return bool(
+                transaction is not None
+                and transaction.state
+                in {
+                    InterventionLifecycleState.RESTORED.value,
+                    InterventionLifecycleState.ABANDONED.value,
+                }
+            )
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[bool] = loop.create_future()
+        prior = self._pending_restore_results.get(command.restore_id)
+        if prior is not None and not prior.done():
+            prior.set_result(False)
+        self._pending_restore_results[command.restore_id] = future
+        self._pending_startup_restores[command.restore_id] = command
+        sent = await self._ws_server.send_restore_command(command)
+        if sent == 0:
+            self._pending_restore_results.pop(command.restore_id, None)
+            logger.warning(
+                "Restore %s has no connected executor; retaining for retry",
+                command.restore_id,
+            )
+            return False
+        try:
+            return await asyncio.wait_for(future, timeout=10.0)
+        except TimeoutError:
+            logger.warning(
+                "Restore %s receipt timed out; retaining for retry",
+                command.restore_id,
+            )
+            return False
+        finally:
+            current = self._pending_restore_results.get(command.restore_id)
+            if current is future:
+                self._pending_restore_results.pop(command.restore_id, None)
+
+    async def restore_all_transactional_effects(
+        self,
+        *,
+        reason: Literal["system_cancelled", "emergency_restore"] = (
+            "emergency_restore"
+        ),
+        timeout_seconds: float = 3.0,
+    ) -> dict[str, int]:
+        """Dispatch every exact inverse and wait for bounded verification.
+
+        Offline owners remain in ``_pending_startup_restores`` and are retried
+        on their next stable-identity reconnect. The returned counts never
+        claim those effects were restored merely because a frame was sent.
+        """
+
+        commands = await self._transaction_coordinator.request_restore_all(
+            reason=reason,
+        )
+        loop = asyncio.get_running_loop()
+        waiters: dict[str, asyncio.Future[bool]] = {}
+        dispatched = 0
+        for command in commands:
+            self._pending_startup_restores[command.restore_id] = command
+            future = self._pending_restore_results.get(command.restore_id)
+            if future is None or future.done():
+                future = loop.create_future()
+                self._pending_restore_results[command.restore_id] = future
+            waiters[command.restore_id] = future
+            try:
+                if await self._ws_server.send_restore_command(command) > 0:
+                    dispatched += 1
+            except Exception:
+                logger.exception(
+                    "Global restore dispatch failed for %s",
+                    command.restore_id,
+                )
+
+        bounded_timeout = max(0.0, min(float(timeout_seconds), 10.0))
+        if waiters and bounded_timeout > 0:
+            await asyncio.wait(
+                set(waiters.values()),
+                timeout=bounded_timeout,
+            )
+
+        restored = 0
+        failed = 0
+        for restore_id, future in waiters.items():
+            if future.done() and not future.cancelled():
+                try:
+                    if future.result():
+                        restored += 1
+                    else:
+                        failed += 1
+                except Exception:
+                    failed += 1
+            current = self._pending_restore_results.get(restore_id)
+            if current is future:
+                self._pending_restore_results.pop(restore_id, None)
+        pending = len(commands) - restored - failed
+        return {
+            "requested": len(commands),
+            "dispatched": dispatched,
+            "restored": restored,
+            "failed": failed,
+            "pending": pending,
+        }
 
     async def _check_action_consent(
         self, action_type: str, requested_level: int,
@@ -5288,47 +6061,20 @@ class CortexDaemon:
                 self._auto_focus_recovery_started = False
 
     async def _emit_start_focus_auto(self, *, reason: str) -> bool:
-        """Broadcast ``START_FOCUS_AUTO`` to the browser extension.
+        """Fail closed until autonomous focus has a WP-6 transaction.
 
-        Returns True only when the WS send succeeded so the caller can
-        defer flipping ``_auto_focus_armed`` until the wire confirms
-        (Phase-3 P1-2 / Audit-1.1 P1-2).
+        A persisted settings toggle and a state estimate are policy inputs,
+        not a one-time manifest-bound authorization. Manual focus sessions and
+        STOP_FOCUS_AUTO remain available, but this forward effect must not be
+        emitted through the legacy command channel.
         """
-        if not self.workspace_mutation_allowed:
-            logger.info(
-                "START_FOCUS_AUTO suppressed: execution_mode=%s",
-                self.intervention_execution_mode,
-            )
-            return False
-        cfg = self.config.intervention
-        preset = str(getattr(
-            cfg, "auto_distraction_block_preset", "developer",
-        ))
-        duration_minutes = int(getattr(
-            cfg, "auto_distraction_block_session_minutes", 20,
-        ))
-        custom_domains = list(getattr(
-            cfg, "auto_distraction_block_custom_domains", [],
-        ))
-        try:
-            await self._ws_server.send_message(
-                MessageType.START_FOCUS_AUTO.value,
-                {
-                    "duration_minutes": duration_minutes,
-                    "reason": reason,
-                    "preset": preset,
-                    "custom_domains": custom_domains,
-                },
-                target_client_types=["chrome", "edge"],
-            )
-            logger.info(
-                "START_FOCUS_AUTO emitted (preset=%s, %d min, reason=%s)",
-                preset, duration_minutes, reason,
-            )
-            return True
-        except Exception:
-            logger.exception("START_FOCUS_AUTO broadcast failed")
-            return False
+        logger.info(
+            "START_FOCUS_AUTO suppressed pending exact transaction support "
+            "(mode=%s reason=%s)",
+            getattr(self, "intervention_execution_mode", "suggest_only"),
+            reason,
+        )
+        return False
 
     async def _emit_stop_focus_auto(self, *, reason: str) -> bool:
         """Broadcast ``STOP_FOCUS_AUTO`` to the browser extension.
@@ -5474,9 +6220,20 @@ class CortexDaemon:
 
             # ---- rebroadcast the updated trigger ----------------------
             try:
-                await self._ws_server.send_message(
-                    MessageType.INTERVENTION_TRIGGER.value,
-                    plan.model_dump(mode="json"),
+                transaction = await self._transaction_coordinator.get_transaction(
+                    intervention_id
+                )
+                await self._ws_server.send_intervention(
+                    plan,
+                    action_manifest=(
+                        transaction.manifest if transaction is not None else None
+                    ),
+                    execution_mode=(
+                        self.intervention_execution_mode
+                        if transaction is not None
+                        and transaction.manifest.action_count > 0
+                        else "suggest_only"
+                    ),
                 )
             except Exception:
                 logger.debug(
@@ -5515,8 +6272,6 @@ class CortexDaemon:
                     # Mirror the bookkeeping path that ``_handle_user_action``
                     # performs for the explicit engage/dismiss flow so the
                     # bandit / helpfulness ledger sees a consistent close.
-                    self._active_intervention_id = None
-                    self._active_plan = None
                     try:
                         self._recorder.append(
                             "intervention_outcome", outcome.model_dump(mode="json"),
@@ -5525,24 +6280,32 @@ class CortexDaemon:
                         logger.debug(
                             "intervention_outcome append failed", exc_info=True
                         )
-                    try:
-                        await self._ws_server.send_restore(
-                            intervention_id, user_action="natural_recovery",
-                        )
-                    except Exception:
-                        logger.debug(
-                            "send_restore on natural_recovery failed",
-                            exc_info=True,
-                        )
-                    try:
-                        self._helpfulness.record_user_action(
-                            intervention_id, "natural_recovery",
-                        )
-                    except Exception:
-                        logger.debug(
-                            "record_user_action(natural_recovery) failed",
-                            exc_info=True,
-                        )
+                    if outcome.workspace_restored:
+                        self._active_intervention_id = None
+                        self._active_plan = None
+                        try:
+                            await self._ws_server.send_restore(
+                                intervention_id, user_action="natural_recovery",
+                            )
+                        except Exception:
+                            logger.debug(
+                                "send_restore on natural_recovery failed",
+                                exc_info=True,
+                            )
+                        try:
+                            self._helpfulness.record_user_action(
+                                intervention_id, "natural_recovery",
+                            )
+                        except Exception:
+                            logger.debug(
+                                "record_user_action(natural_recovery) failed",
+                                exc_info=True,
+                            )
+                    else:
+                        # The plan remains active and the exact restore is
+                        # retryable. Re-open the all-done latch so a later
+                        # toggle or explicit Undo can retry safely.
+                        self._micro_step_recovery_fired = False
 
     async def _handle_user_action(self, payload: dict[str, Any]) -> None:
         # Phase-4b TASK F: a dismissed auto-focus interstitial routes
@@ -5645,7 +6408,7 @@ class CortexDaemon:
                         "target": payload.get("target"),
                         "tab_index": payload.get("tab_index"),
                     }
-                await self.dispatch_action_to_browser(
+                await self.dispatch_intervention_action(
                     str(payload.get("intervention_id") or ""),
                     action_dict,
                 )
@@ -5805,9 +6568,9 @@ class CortexDaemon:
 
         if action == "engaged":
             outcome = await self._restore_manager.engage(intervention_id)
-            # v2.0: Record consent approval under each gated action-type.
-            for consent_key in consent_keys:
-                await self._consent_ladder.record_approval(consent_key)
+            # Consent approval is evidence only after a verified action
+            # receipt. Merely clicking a micro-step or proposal CTA must not
+            # silently escalate workspace authority.
             self._trigger_policy.record_outcome(
                 dismissed=False,
                 confidence=trigger_conf,
@@ -5856,6 +6619,18 @@ class CortexDaemon:
             self._bandit_decisions_by_intervention.pop(intervention_id, None)
             return
 
+        self._recorder.append("intervention_outcome", outcome.model_dump(mode="json"))
+        if not outcome.workspace_restored:
+            # Closing presentation is not evidence that adapter-owned state
+            # was reversed. Keep the plan and RestoreManager record alive so
+            # Undo/startup recovery can retry the same exact inverses.
+            logger.warning(
+                "User close for %s did not verify restoration; retaining "
+                "active state and retry authority",
+                intervention_id,
+            )
+            return
+
         self._active_intervention_id = None
         # P0 §3.6: clear the cached plan + recovery latch when the
         # intervention closes through the user_action path. Trailing
@@ -5864,7 +6639,6 @@ class CortexDaemon:
         if self._active_plan is not None and self._active_plan.intervention_id == intervention_id:
             self._active_plan = None
         self._micro_step_recovery_fired = False
-        self._recorder.append("intervention_outcome", outcome.model_dump(mode="json"))
         await self._ws_server.send_restore(intervention_id, user_action=action)
 
         # v2.0: End helpfulness tracking and update bandit
@@ -6525,7 +7299,7 @@ class CortexDaemon:
         if listener not in self._client_identified_listeners:
             self._client_identified_listeners.append(listener)
 
-    def _on_client_identified(self, client_type: str, connected: bool) -> None:
+    async def _on_client_identified(self, client_type: str, connected: bool) -> None:
         """Fan-out helper bound to ``WebSocketServer._client_identified_callback``.
 
         Runs on the daemon's asyncio loop thread. Each listener is
@@ -6537,6 +7311,26 @@ class CortexDaemon:
             except Exception:
                 logger.debug(
                     "client_identified listener raised", exc_info=True
+                )
+        if not connected or not self._pending_startup_restores:
+            return
+        executor = {
+            "chrome": "browser",
+            "edge": "browser",
+            "vscode": "editor",
+            "desktop": "desktop",
+        }.get(client_type)
+        if executor is None:
+            return
+        for command in list(self._pending_startup_restores.values()):
+            if not any(action.executor == executor for action in command.actions):
+                continue
+            try:
+                await self._ws_server.send_restore_command(command)
+            except Exception:
+                logger.exception(
+                    "Startup restore retry failed for %s",
+                    command.restore_id,
                 )
 
     async def reload_llm_credentials(self) -> bool:
@@ -6994,7 +7788,7 @@ class CortexDaemon:
             # ``REVERSIBLE_ACT`` so the user can still manually arm a
             # focus session without daemon involvement.
             try:
-                self._consent_policy.set_level(
+                await self._consent_ladder.set_policy_level(
                     "distraction_block",
                     AUTONOMOUS_ACT if new_value else REVERSIBLE_ACT,
                 )
@@ -7094,7 +7888,9 @@ class CortexDaemon:
         )
 
     async def restore_intervention(
-        self, intervention_id: str,
+        self,
+        intervention_id: str,
+        user_action: str = "system_cancelled",
     ) -> Any | None:
         """Public Undo entry point for the desktop "Undo" pill.
 
@@ -7106,6 +7902,12 @@ class CortexDaemon:
         controller) does not need to depend on RestoreManager
         internals — this method is the stable contract.
         """
+        if user_action == "engaged":
+            return await self._restore_manager.engage(intervention_id)
+        if user_action == "snoozed":
+            return await self._restore_manager.snooze(intervention_id)
+        if user_action == "dismissed":
+            return await self._restore_manager.dismiss(intervention_id)
         return await self._restore_manager.cancel(intervention_id)
 
     async def get_trends(

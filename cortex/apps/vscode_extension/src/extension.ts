@@ -7,19 +7,34 @@
  */
 
 import * as vscode from "vscode";
+import { randomUUID } from "crypto";
 import { CortexWSClient } from "./ws-client";
 import { ContextProvider } from "./context-provider";
 import { FoldController } from "./fold-controller";
 import { CortexPanelProvider } from "./panel-provider";
 import { PANEL_STATE_LABELS } from "./design-tokens";
+import { EditorTransactionAdapter } from "./editor-transaction-adapter";
 
 let wsClient: CortexWSClient | undefined;
 let contextProvider: ContextProvider | undefined;
 let foldController: FoldController | undefined;
+let editorTransactionAdapter: EditorTransactionAdapter | undefined;
 let panelProvider: CortexPanelProvider | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
 type ExecutionMode = "suggest_only" | "authorized" | "research_autonomous";
 let currentExecutionMode: ExecutionMode = "suggest_only";
+let editorTransactionChain: Promise<void> = Promise.resolve();
+
+function enqueueEditorTransaction(operation: () => Promise<void>): void {
+    // Node's EventEmitter does not await async message listeners. Serialize
+    // exact apply/restore operations so restore cannot race ahead of the
+    // durable editor operation it is meant to reverse.
+    editorTransactionChain = editorTransactionChain
+        .then(operation)
+        .catch((error: unknown) => {
+            _logDebug(`transaction command failed closed: ${String(error)}`);
+        });
+}
 
 function handleLegacyBreakRecommendation(payload: unknown): void {
     // Only the explicit elapsed-focus reminder is product-eligible. Legacy
@@ -74,7 +89,8 @@ function _logDebug(message: string): void {
 /**
  * Extension activation — called once on startup.
  */
-export function activate(context: vscode.ExtensionContext): void {
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
+    editorTransactionChain = Promise.resolve();
     const config = vscode.workspace.getConfiguration("cortex");
     const daemonUrl = config.get<string>("daemonUrl", "ws://127.0.0.1:9473");
 
@@ -96,7 +112,27 @@ export function activate(context: vscode.ExtensionContext): void {
     foldController = new FoldController();
 
     // --- WebSocket client ---
-    wsClient = new CortexWSClient(daemonUrl);
+    const instanceKey = "cortex.clientInstanceId.v1";
+    const storedInstanceId = context.globalState.get<string>(instanceKey);
+    const clientInstanceId = (
+        typeof storedInstanceId === "string"
+        && /^[A-Za-z0-9._:-]{8,128}$/.test(storedInstanceId)
+    )
+        ? storedInstanceId
+        : `vscode_${randomUUID()}`;
+    if (clientInstanceId !== storedInstanceId) {
+        // Exact restore routing depends on this surviving extension-host
+        // restarts, so complete the durable write before opening the socket.
+        await context.globalState.update(instanceKey, clientInstanceId);
+    }
+    wsClient = new CortexWSClient(daemonUrl, clientInstanceId);
+    editorTransactionAdapter = new EditorTransactionAdapter(
+        context.globalState,
+        wsClient.clientBootId,
+        (batch) => wsClient?.sendInterventionReceipt(batch),
+        workspaceMutationAllowed,
+        clientInstanceId,
+    );
 
     wsClient.onStateUpdate((payload) => {
         updateStatusBar(payload);
@@ -107,6 +143,9 @@ export function activate(context: vscode.ExtensionContext): void {
     });
 
     wsClient.onConnectionChange((connected) => {
+        if (connected) {
+            void editorTransactionAdapter?.flushPendingReceipts();
+        }
         if (statusBarItem) {
             if (connected) {
                 statusBarItem.text = "$(pulse) Cortex";
@@ -123,38 +162,24 @@ export function activate(context: vscode.ExtensionContext): void {
     });
 
     wsClient.onRestore((payload) => {
-        const applied: string[] = [];
-        const errors: string[] = [];
-        let restoreOk = true;
-        if (foldController?.hasPendingFolds) {
-            try {
-                void foldController.restoreFoldState();
-                applied.push("restoreFoldState");
-            } catch (e) {
-                restoreOk = false;
-                errors.push(`restoreFoldState: ${(e as Error)?.message ?? String(e)}`);
-            }
-        }
-        panelProvider?.showPanel();
-        vscode.window.setStatusBarMessage(
-            `Cortex restored workspace (${String(payload.user_action ?? "done")})`,
-            3000,
-        );
-        // B.2 (restore-side ack): tell the daemon the unfold completed so
-        // InterventionOutcome.workspace_restored reflects reality.
-        const interventionId = payload?.intervention_id;
-        if (typeof interventionId === "string") {
-            try {
-                wsClient?.sendInterventionApplied(
-                    interventionId,
-                    "restore",
-                    restoreOk,
-                    applied,
-                    errors,
-                );
-            } catch {
-                // ws may be closing — never crash the handler
-            }
+        // Legacy restore frames close presentation only. Exact commands are
+        // validated against the durable editor journal and emit typed
+        // receipts; neither path calls unfoldAll or steals editor focus.
+        enqueueEditorTransaction(async () => {
+            await editorTransactionAdapter?.handleRestore(payload);
+            panelProvider?.clearIntervention();
+        });
+    });
+
+    wsClient.onMessage((msg) => {
+        if (msg.type === "INTERVENTION_APPLY") {
+            enqueueEditorTransaction(async () => {
+                await editorTransactionAdapter?.handleApply(msg.payload);
+            });
+        } else if (msg.type === "INTERVENTION_TRANSACTION_STATE") {
+            void editorTransactionAdapter?.acknowledgeTransactionState(
+                msg.payload,
+            );
         }
     });
 
@@ -295,87 +320,11 @@ export function activate(context: vscode.ExtensionContext): void {
         }
     });
 
-    // --- P0 §3.5: EXECUTE_ACTION (HYPO / RECOVERY catalog) ---
-    // The daemon dispatches discrete executable actions to the editor
-    // via an ``EXECUTE_ACTION`` message. Today we only need to handle
-    // ``resume_last_active_file`` (re-engagement nudge). The browser
-    // extension handles the other two (suggest_movement_break and
-    // prompt_micro_commit) natively.
+    // Legacy EXECUTE_ACTION is never editor authority. The exact equivalent
+    // arrives only as a manifest-bound INTERVENTION_APPLY above.
     wsClient.onMessage((msg) => {
         if (msg.type !== 'EXECUTE_ACTION') return;
-        const payload = msg.payload || {};
-        const actionType = (payload.action_type as string | undefined) || '';
-        if (actionType !== 'resume_last_active_file') return;
-
-        const target = String(payload.target || '').trim();
-        const actionId = (payload.action_id as string | undefined) || '';
-        const interventionId = (payload.intervention_id as string | undefined) || '';
-
-        if (!workspaceMutationAllowed()) {
-            try {
-                wsClient?.sendInterventionApplied(
-                    interventionId,
-                    'execute_action',
-                    false,
-                    [],
-                    [`${actionType}: action unavailable in suggest-only mode`],
-                );
-            } catch { /* ws may not be ready */ }
-            return;
-        }
-
-        // Parse "file_path:line"; the line is optional and falls back to 1.
-        const lastColon = target.lastIndexOf(':');
-        let filePath = target;
-        let line = 1;
-        if (lastColon > 0) {
-            const maybeLine = parseInt(target.slice(lastColon + 1), 10);
-            if (!Number.isNaN(maybeLine) && maybeLine > 0) {
-                filePath = target.slice(0, lastColon);
-                line = maybeLine;
-            }
-        }
-
-        if (!filePath) {
-            try {
-                wsClient?.sendInterventionApplied(
-                    interventionId,
-                    'execute_action',
-                    false,
-                    [],
-                    [`resume_last_active_file: empty target`],
-                );
-            } catch { /* ws may not be ready */ }
-            return;
-        }
-
-        // Best-effort open with a 0-based selection on the requested line.
-        const uri = vscode.Uri.file(filePath);
-        const sel = new vscode.Range(line - 1, 0, line - 1, 0);
-        vscode.window.showTextDocument(uri, { selection: sel }).then(
-            () => {
-                try {
-                    wsClient?.sendInterventionApplied(
-                        interventionId,
-                        'execute_action',
-                        true,
-                        [`resume_last_active_file:${actionId}`],
-                        [],
-                    );
-                } catch { /* ws may not be ready */ }
-            },
-            (err: unknown) => {
-                try {
-                    wsClient?.sendInterventionApplied(
-                        interventionId,
-                        'execute_action',
-                        false,
-                        [],
-                        [`resume_last_active_file: ${String(err)}`],
-                    );
-                } catch { /* ws may not be ready */ }
-            },
-        );
+        _logDebug("Rejected legacy EXECUTE_ACTION without exact authorization");
     });
 
     // B1 (audit-prod): explicit COPILOT_THROTTLE registration.
@@ -383,25 +332,8 @@ export function activate(context: vscode.ExtensionContext): void {
     // command runs even if generic-handler registration order ever
     // changes; the prior implementation depended on onMessage being
     // bound before the first daemon-pushed throttle frame.
-    wsClient.onCopilotThrottle((payload) => {
-        if (!workspaceMutationAllowed()) {
-            _logDebug("COPILOT_THROTTLE rejected in suggest-only mode");
-            return;
-        }
-        const action = payload?.action;
-        // P2 (audit Phase 4d, Task D): gate the dev-time tracer lines
-        // behind ``cortex.debug``. Defaults to off so a production
-        // install no longer floods the user's Output panel.
-        // F9 (Phase-4 audit): route through the shared OutputChannel
-        // rather than console.log so messages surface in the user-
-        // visible Output panel.
-        if (action === 'disable') {
-            vscode.commands.executeCommand('cortex.disableInlineSuggestions');
-            _logDebug('COPILOT_THROTTLE: disabling inline suggestions');
-        } else if (action === 'enable') {
-            vscode.commands.executeCommand('cortex.enableInlineSuggestions');
-            _logDebug('COPILOT_THROTTLE: re-enabling inline suggestions');
-        }
+    wsClient.onCopilotThrottle((_payload) => {
+        _logDebug("Rejected COPILOT_THROTTLE without exact authorization");
     });
 
     // --- Panel provider ---
@@ -509,6 +441,7 @@ export function deactivate(): void {
     wsClient = undefined;
     contextProvider = undefined;
     foldController = undefined;
+    editorTransactionAdapter = undefined;
     panelProvider = undefined;
     // F9: dispose the shared OutputChannel.
     outputChannel?.dispose();

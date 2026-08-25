@@ -51,6 +51,7 @@ const FAKE_INTERVENTION = {
     tab_recommendations: null,
     error_analysis: null,
     level: "guided_mode",
+    execution_mode: "authorized",
 };
 
 function defaultResponder(msg: Record<string, unknown>, cb?: (resp: unknown) => void) {
@@ -107,6 +108,34 @@ describe("popup INTERVENTION_FAILED / INTERVENTION_PROMPT consumers", () => {
 
     afterEach(() => {
         vi.useRealTimers();
+    });
+
+    it("renders an unmanifested close recommendation as manual review only", async () => {
+        const { container, cleanup } = await renderPopup();
+        try {
+            await act(async () => {
+                await new Promise((r) => setTimeout(r, 0));
+            });
+            const cta = container.querySelector(
+                '[data-testid="intervention-primary-action"]',
+            ) as HTMLButtonElement | null;
+            expect(cta).not.toBeNull();
+            expect(cta!.textContent).toBe("Manual review only");
+            expect(cta!.disabled).toBe(true);
+            expect(container.querySelector(
+                '[data-testid="manual-action-review-note"]',
+            )?.textContent).toContain("no workspace change will run");
+
+            cta!.click();
+            const sentExecution = globalThis.__cortexChrome.runtime.sendMessage
+                .mock.calls.some(([message]) =>
+                    (message as { type?: unknown } | undefined)?.type
+                        === "EXECUTE_ALL_RECOMMENDED"
+                );
+            expect(sentExecution).toBe(false);
+        } finally {
+            await cleanup();
+        }
     });
 
     it("renders an error banner and disables the CTA on INTERVENTION_FAILED", async () => {

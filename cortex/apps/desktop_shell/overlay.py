@@ -94,6 +94,10 @@ from cortex.apps.desktop_shell.tokens import (
     TEXT_HUD_SECONDARY,
     TEXT_HUD_TERTIARY,
 )
+from cortex.libs.schemas.intervention_transaction import (
+    ActionManifest,
+    manifest_suggestion_matches,
+)
 
 # Phase J-4: tween constants. Chosen to be "perceptible but never
 # distracting" — the headline scale-in is fast enough to feel
@@ -332,9 +336,8 @@ class OverlayWindow(QWidget):
     dismissed = Signal(str)
     # G4 (audit-prod): emitted when the user clicks a suggested-action
     # button. Payload is ``(intervention_id, action_dict)`` matching the
-    # ``SuggestedAction`` schema; the controller / main routes it to
-    # either a native handler (clipboard, timer) or the WS
-    # ``ACTION_EXECUTE`` channel for browser-bound actions.
+    # ``SuggestedAction`` schema; the controller submits it to the daemon's
+    # manifest-bound authorization path.
     action_invoked = Signal(str, dict)
     # P0 §3.6: emitted when the user toggles a micro-step checkbox.
     # Payload is ``(intervention_id, step_index, new_status)`` where
@@ -549,10 +552,8 @@ class OverlayWindow(QWidget):
 
         # G4 (audit-prod): suggested-action buttons. Rendered in
         # ``show_intervention`` whenever the plan carries a non-empty
-        # ``suggested_actions`` list. Each click emits ``action_invoked``;
-        # the controller routes browser-bound actions through the WS
-        # ACTION_EXECUTE channel and handles ``copy_to_clipboard`` /
-        # ``start_timer`` natively in the desktop shell.
+        # ``suggested_actions`` list. Each click emits ``action_invoked`` and
+        # only a manifest-listed, reversible remote executor may act on it.
         self._actions_container = QVBoxLayout()
         self._actions_container.setSpacing(SP2)
         self._action_buttons: list[QPushButton] = []
@@ -1006,6 +1007,7 @@ class OverlayWindow(QWidget):
                 payload.get("suggested_actions") or [],
                 connected_clients=payload.get("connected_clients") or [],
                 execution_mode=self._execution_mode,
+                action_manifest=payload.get("action_manifest"),
             )
         except Exception:
             logger.debug("Action rendering failed", exc_info=True)
@@ -1325,23 +1327,10 @@ class OverlayWindow(QWidget):
     # G4 (audit-prod): suggested-action rendering + dispatch
     # ------------------------------------------------------------------
 
-    # Action types that the desktop shell can execute natively without
-    # routing through the browser extension. Everything else needs an
-    # IDENTIFY-ed Chrome / Edge / VS Code client to receive the
-    # ACTION_EXECUTE frame.
-    _NATIVE_ACTION_TYPES = frozenset({
-        "copy_to_clipboard",
-        "start_timer",
-        # P0 §3.5 extensions — native actions for HYPO / RECOVERY plans.
-        # ``resume_last_active_file`` is forwarded to the editor adapter
-        # via the controller; ``prompt_micro_commit`` and
-        # ``suggest_movement_break`` render inline widgets (text input +
-        # countdown card respectively) below the action buttons.
-        "resume_last_active_file",
-        "prompt_micro_commit",
-        "suggest_movement_break",
-        "take_biology_break",
-    })
+    # The desktop is a proposal/authorization surface, never a capability
+    # executor. These catalogs describe the remote owner used only for
+    # availability copy; the immutable manifest remains authoritative.
+    _NATIVE_ACTION_TYPES: frozenset[str] = frozenset()
     _BROWSER_ACTION_TYPES = frozenset({
         "close_tab",
         "bookmark_and_close",
@@ -1349,8 +1338,8 @@ class OverlayWindow(QWidget):
         "open_url",
         "search_error",
         "highlight_tab",
-        "save_session",
     })
+    _EDITOR_ACTION_TYPES = frozenset({"resume_last_active_file"})
 
     # Action types that render an inline widget below the button row
     # rather than executing on click (the click reveals the widget; a
@@ -1537,6 +1526,7 @@ class OverlayWindow(QWidget):
         actions: list[dict],
         connected_clients: list[str] | None = None,
         execution_mode: str = "suggest_only",
+        action_manifest: object | None = None,
     ) -> None:
         """Re-render the suggested_action button list.
 
@@ -1559,13 +1549,21 @@ class OverlayWindow(QWidget):
             return
 
         connected = {str(c).lower() for c in (connected_clients or [])}
-        # The desktop shell can drive any browser-side action if either
-        # Chrome OR Edge is identified; VS Code is the executor for
-        # editor-bound actions but none of the 7 browser-bound types
-        # require it. The map of "which client_type executes which
-        # action_type" lives implicitly here.
         has_browser_executor = bool(connected & {"chrome", "edge"})
-        any_browser_bound = False
+        has_editor_executor = "vscode" in connected
+        executable_by_id: dict[str, str] = {}
+        manifest: ActionManifest | None = None
+        try:
+            manifest = ActionManifest.model_validate(action_manifest)
+            executable_by_id = {
+                manifest_action.action_id: str(manifest_action.executor)
+                for manifest_action in manifest.body.actions
+            }
+        except Exception:
+            # Missing/corrupt authority disables every button. Presentation
+            # remains readable and the daemon can issue a fresh proposal.
+            executable_by_id = {}
+        unavailable_reasons: set[str] = set()
         suggestion_only = execution_mode not in (
             "authorized", "research_autonomous",
         )
@@ -1574,10 +1572,14 @@ class OverlayWindow(QWidget):
             if not isinstance(action, dict):
                 continue
             action_type = str(action.get("action_type") or "")
+            action_id = str(action.get("action_id") or "")
             label = str(action.get("label") or action_type or "Action")
             reason = str(action.get("reason") or "")
-            is_browser = action_type in self._BROWSER_ACTION_TYPES
-            is_native = action_type in self._NATIVE_ACTION_TYPES
+            executor = executable_by_id.get(action_id)
+            presentation_matches = bool(
+                manifest is not None
+                and manifest_suggestion_matches(manifest, action)
+            )
 
             btn = QPushButton(label)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1609,13 +1611,21 @@ class OverlayWindow(QWidget):
                 btn.setToolTip(
                     "Suggestion only — switch to an authorized mode to apply actions."
                 )
-            elif is_browser and not has_browser_executor:
+            elif executor is None or not presentation_matches:
                 btn.setEnabled(False)
-                any_browser_bound = True
-            elif not is_browser and not is_native:
-                # Unknown action_type: disable rather than silently fail.
+                btn.setToolTip(
+                    "This suggestion is unavailable because its displayed "
+                    "details do not match Cortex's exact reversible manifest."
+                )
+                unavailable_reasons.add("unsupported")
+            elif executor == "browser" and not has_browser_executor:
                 btn.setEnabled(False)
-                btn.setToolTip(f"Unsupported action type: {action_type}")
+                btn.setToolTip("Connect Chrome or Edge to apply this action.")
+                unavailable_reasons.add("browser")
+            elif executor == "editor" and not has_editor_executor:
+                btn.setEnabled(False)
+                btn.setToolTip("Connect VS Code to apply this action.")
+                unavailable_reasons.add("editor")
 
             # Capture-by-default to bind the action dict to this button.
             action_snapshot = dict(action)
@@ -1640,9 +1650,20 @@ class OverlayWindow(QWidget):
                 "Suggestions only — Cortex will not change your workspace."
             )
             self._actions_caption.show()
-        elif any_browser_bound and not has_browser_executor:
+        elif unavailable_reasons == {"browser"}:
             self._actions_caption.setText(
                 "Open Cortex in Chrome or Edge to enable these actions."
+            )
+            self._actions_caption.show()
+        elif unavailable_reasons == {"editor"}:
+            self._actions_caption.setText(
+                "Connect the Cortex VS Code extension to enable this action."
+            )
+            self._actions_caption.show()
+        elif unavailable_reasons:
+            self._actions_caption.setText(
+                "Some suggestions are unavailable until their reversible "
+                "executor is connected and verified."
             )
             self._actions_caption.show()
         else:

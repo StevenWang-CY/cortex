@@ -1,15 +1,10 @@
 /**
- * Phase 4d Task A — ``cortex_auto_focus_state`` mirrored to
- * chrome.storage.local survives MV3 SW restart even when session
- * storage clears.
+ * WP6 containment and migration of legacy ``cortex_auto_focus_state``.
  *
  * Invariants:
- *   1. Arming an auto-focus session writes the state under
- *      ``cortex_auto_focus_state`` in storage.local.
- *   2. After a SW restart where session storage is wiped (browser
- *      restart) but local storage retains the blob, the freshly-booted
- *      worker still treats matching domains as distractions.
- *   3. When local storage claims ``autoFocusArmed=true`` but the focus
+ *   1. A legacy START_FOCUS_AUTO frame never writes blocker ownership.
+ *   2. STOP_FOCUS_AUTO cannot fabricate cleanup work after a rejected start.
+ *   3. When old local storage claims ``autoFocusArmed=true`` but the focus
  *      session was lost in the restart, the boot path clears the bit
  *      and emits a ``auto_focus_inconsistent_state_recovered``
  *      USER_ACTION.
@@ -60,12 +55,12 @@ function deliverFrame(payload: Record<string, unknown>): void {
     });
 }
 
-describe("Phase 4d Task A — auto-focus state.local persistence", () => {
+describe("WP6 — legacy auto-focus state containment", () => {
     beforeEach(() => {
         vi.resetModules();
     });
 
-    it("mirrors auto-focus state to chrome.storage.local on arm", async () => {
+    it("does not persist auto-focus state from a legacy start frame", async () => {
         await bootBackground();
         authenticate();
         const fake = globalThis.__cortexChrome;
@@ -90,14 +85,10 @@ describe("Phase 4d Task A — auto-focus state.local persistence", () => {
                   activeFocusPresetPatterns: string[];
               }
             | undefined;
-        expect(blob).toBeDefined();
-        expect(blob!.autoFocusArmed).toBe(true);
-        expect(blob!._activeFocusPresetName).toBe("developer");
-        expect(Array.isArray(blob!.activeFocusPresetPatterns)).toBe(true);
-        expect(blob!.activeFocusPresetPatterns.length).toBeGreaterThan(0);
+        expect(blob).toBeUndefined();
     });
 
-    it("clears local mirror when auto-focus stops", async () => {
+    it("start then stop leaves no local auto-focus ownership", async () => {
         await bootBackground();
         authenticate();
         const fake = globalThis.__cortexChrome;
@@ -113,10 +104,8 @@ describe("Phase 4d Task A — auto-focus state.local persistence", () => {
         });
         await new Promise((r) => setTimeout(r, 250));
         expect(
-            (fake.storage.local.__peek().cortex_auto_focus_state as {
-                autoFocusArmed: boolean;
-            }).autoFocusArmed,
-        ).toBe(true);
+            fake.storage.local.__peek().cortex_auto_focus_state,
+        ).toBeUndefined();
 
         deliverFrame({
             type: "STOP_FOCUS_AUTO",
@@ -124,10 +113,9 @@ describe("Phase 4d Task A — auto-focus state.local persistence", () => {
         });
         await new Promise((r) => setTimeout(r, 250));
 
-        const blob = fake.storage.local.__peek().cortex_auto_focus_state as
-            | { autoFocusArmed: boolean }
-            | undefined;
-        expect(blob!.autoFocusArmed).toBe(false);
+        expect(
+            fake.storage.local.__peek().cortex_auto_focus_state,
+        ).toBeUndefined();
     });
 
     it(

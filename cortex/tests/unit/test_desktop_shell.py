@@ -755,6 +755,40 @@ class TestDashboard:
         dash.set_connected(True)
         assert dash._connected
 
+    def test_undo_surface_requires_verified_transaction_receipts(self):
+        dash = DashboardWindow()
+        consumer = dash._consumer
+
+        # A legacy optimistic payload cannot mint an Undo affordance even if
+        # it names an action that older builds treated as reversible.
+        dash.apply_intervention_applied({
+            "intervention_id": "legacy-close",
+            "action_type": "close_tab",
+            "mutations_applied_count": 1,
+            "is_reversible": True,
+        })
+        assert consumer._reversible_actions == []
+
+        dash.apply_intervention_transaction_state({
+            "intervention_id": "exact-open",
+            "state": "applied",
+            "receipt_results": [{
+                "action_id": "open-1",
+                "status": "succeeded",
+                "reversible": True,
+            }],
+        })
+        assert [entry[1] for entry in consumer._reversible_actions] == [
+            "exact-open"
+        ]
+
+        dash.apply_intervention_transaction_state({
+            "intervention_id": "exact-open",
+            "state": "restored",
+            "receipt_results": [],
+        })
+        assert consumer._reversible_actions == []
+
 
 class TestHRTracePlot:
 
@@ -965,6 +999,25 @@ class TestWebSocketBridge:
         assert len(received) == 1
         assert received[0]["intervention_id"] == "int_123"
 
+    def test_handle_intervention_transaction_state(self):
+        bridge = WebSocketBridge()
+        received = []
+        bridge.intervention_transaction_state.connect(lambda p: received.append(p))
+
+        bridge._handle_message(json.dumps({
+            "type": "INTERVENTION_TRANSACTION_STATE",
+            "payload": {
+                "intervention_id": "int_exact",
+                "state": "applied",
+                "receipt_results": [],
+            },
+        }))
+        assert received == [{
+            "intervention_id": "int_exact",
+            "state": "applied",
+            "receipt_results": [],
+        }]
+
     def test_handle_invalid_json(self):
         bridge = WebSocketBridge()
         received = []
@@ -1088,6 +1141,12 @@ class _RecordingDaemon:
         )
         return 1
 
+    async def dispatch_intervention_action(self, intervention_id, action):
+        self.calls.append(
+            ("dispatch_intervention_action", (intervention_id, action), {})
+        )
+        return 1
+
     async def _handle_user_action(self, payload):
         self.calls.append(("_handle_user_action", (payload,), {}))
 
@@ -1133,7 +1192,7 @@ def _run_action_invoked(action_type: str, *, extra: dict | None = None):
     return daemon
 
 
-class TestControllerNativeActionRouting:
+class TestControllerExactActionRouting:
 
     def test_take_biology_break_is_compatibility_only(self):
         daemon = _run_action_invoked(
@@ -1143,53 +1202,51 @@ class TestControllerNativeActionRouting:
         names = daemon.names()
         assert "start_biology_break" not in names
         assert "dispatch_action_to_browser" not in names
+        assert "dispatch_intervention_action" in names
 
     def test_resume_last_active_file_routes_to_editor_adapter(self):
         daemon = _run_action_invoked("resume_last_active_file")
         names = daemon.names()
-        assert "_resume_last_active_file" in names
+        assert "_resume_last_active_file" not in names
         assert "dispatch_action_to_browser" not in names
+        assert "dispatch_intervention_action" in names
 
     def test_prompt_micro_commit_is_native_log_only(self):
         daemon = _run_action_invoked(
             "prompt_micro_commit", extra={"prompt": "ship X", "text": "ship X"}
         )
         names = daemon.names()
-        assert "_broadcast_prompt" in names
+        assert "_broadcast_prompt" not in names
         assert "dispatch_action_to_browser" not in names
+        assert "dispatch_intervention_action" in names
 
     def test_suggest_movement_break_is_native_log_only(self):
         daemon = _run_action_invoked(
             "suggest_movement_break", extra={"duration_seconds": 60}
         )
         names = daemon.names()
-        assert "_broadcast_prompt" in names
+        assert "_broadcast_prompt" not in names
         assert "dispatch_action_to_browser" not in names
+        assert "dispatch_intervention_action" in names
 
     def test_browser_action_still_dispatches_to_browser(self):
         # A genuine browser action_type MUST reach the browser dispatch.
         assert "close_tab" in OverlayWindow._BROWSER_ACTION_TYPES
         daemon = _run_action_invoked("close_tab", extra={"tab_index": 2})
         names = daemon.names()
-        assert "dispatch_action_to_browser" in names
+        assert "dispatch_action_to_browser" not in names
+        assert "dispatch_intervention_action" in names
         assert "start_biology_break" not in names
 
     def test_routing_sets_are_unambiguous(self):
-        # Native + browser sets must be disjoint so the controller's
-        # ``in _BROWSER_ACTION_TYPES`` routing decision is unambiguous.
-        overlap = (
-            OverlayWindow._NATIVE_ACTION_TYPES
+        assert OverlayWindow._NATIVE_ACTION_TYPES == frozenset()
+        assert OverlayWindow._EDITOR_ACTION_TYPES == frozenset(
+            {"resume_last_active_file"}
+        )
+        assert not (
+            OverlayWindow._EDITOR_ACTION_TYPES
             & OverlayWindow._BROWSER_ACTION_TYPES
         )
-        assert overlap == frozenset()
-        # The native action types the controller handles natively.
-        for at in (
-            "take_biology_break",
-            "resume_last_active_file",
-            "prompt_micro_commit",
-            "suggest_movement_break",
-        ):
-            assert at not in OverlayWindow._BROWSER_ACTION_TYPES
 
 
 class TestControllerOnboardingDashboard:

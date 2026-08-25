@@ -1612,6 +1612,27 @@ packaging.
 
 ### WP-6 — Transactional interventions and exact consent (`XL`)
 
+**Implementation status (2026-08-25): complete at the WP-6 boundary.** The
+production path now separates inert presentation from authority and enforces a
+content-addressed `ActionManifest → ActionAuthorization → ActionReceipt`
+chain. Authorization is one-time, exact-subset, consent-revision-bound,
+wall/monotonic-expiring, and durably bound to the selected stable browser or
+editor client before transport. Browser and VS Code adapters use bounded
+write-ahead journals and receipt outboxes, verify postconditions, compensate
+ambiguous partial effects, preserve user supersession, and recover idempotently
+after process/service-worker restart. The executable catalog is deliberately
+limited to ownership-safe `open_url`, `search_error`, `highlight_tab`, and
+`resume_last_active_file`; destructive close/group/fold proposals remain
+visible but inert. Desktop Undo is derived only from verified transaction
+state, while shutdown, reset, and emergency restore share the exact inverse
+path. The daemon journal remains the explicitly temporary atomic-JSON store
+that WP-7 replaces with SQLite. Completion evidence: 2,472 non-Qt Python tests
+with five declared dataset/platform skips; 62 Qt desktop-shell tests; strict
+mypy across 472 source files; Ruff and schema drift gates; 208 browser tests,
+Chrome/Edge builds, and a measured 234 KB gzip production file sum after
+removing unused font assets; plus 30 VS Code tests, TypeScript compile, and
+VSIX packaging.
+
 **Files:**
 
 - `cortex/services/consent/ladder.py`, `policy.py`
@@ -1949,7 +1970,7 @@ Move one cohesive flow at a time behind the kernel after characterization tests.
 - [x] P1-04 respiration redesign or feature removal
 - [x] P1-05 calibrated profile provenance and live reload
 - [x] P1-06 evidence-normalized inference with unknown state
-- [ ] P1-07 manifest/authorization/receipt intervention protocol
+- [x] P1-07 manifest/authorization/receipt intervention protocol
 - [ ] P1-08 event store and restart recovery
 - [ ] P1-09 deterministic production policy and one finalized reward
 - [ ] P1-10 privacy context preview/redaction and optional browser permissions

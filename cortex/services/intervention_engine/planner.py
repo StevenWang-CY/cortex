@@ -125,9 +125,10 @@ def validate_plan(plan: InterventionPlan) -> ValidationResult:
     elif step_count > 3:
         errors.append(f"has {step_count} micro_steps (max 3)")
 
-    # Check for destructive actions (keep as warning; dropped during sanitization).
+    # Destructive-looking suggestions remain inert presentation copy unless
+    # the transaction catalog can mint an exact reversible capability.
     if plan.is_destructive:
-        warnings.append("plan contains destructive actions (dropped)")
+        warnings.append("plan contains destructive actions (presentation-only)")
 
     # Check required fields are non-empty
     if not plan.situation_summary.strip():
@@ -140,13 +141,11 @@ def validate_plan(plan: InterventionPlan) -> ValidationResult:
     if plan.level not in valid_levels:
         errors.append(f"invalid level '{plan.level}'")
 
-    # Validate suggested_actions
+    # SuggestedAction.reversible is a catalog-derived presentation hint, not
+    # authority and not a prerequisite for showing a proposal. Unsupported
+    # close/group actions are intentionally visible but omitted from the exact
+    # action manifest by build_action_manifest().
     for action in plan.suggested_actions:
-        if action.action_type in ("close_tab", "group_tabs", "bookmark_and_close"):
-            if not action.reversible:
-                errors.append(
-                    f"action {action.action_id} ({action.action_type}) must be reversible"
-                )
         if not action.label:
             warnings.append(f"action {action.action_id} has empty label")
     if len(plan.suggested_actions) > 10:
@@ -210,11 +209,6 @@ def sanitize_plan_actions(
                     f"dropped action {action.action_id}: tab_index {action.tab_index} out of range"
                 )
                 continue
-        if action.action_type in {"close_tab", "bookmark_and_close"} and not action.reversible:
-            warnings.append(
-                f"dropped action {action.action_id}: close action must be reversible"
-            )
-            continue
         if any(tok in action.label.lower() for tok in ("discard", "delete project", "delete file")):
             warnings.append(
                 f"dropped action {action.action_id}: destructive label content"

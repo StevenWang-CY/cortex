@@ -13,7 +13,11 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { randomUUID } from "crypto";
-import type { WSMessage as WSMessageSchema } from "./generated/cortex_schemas";
+import type {
+    InterventionAuthorizationRequest,
+    InterventionReceiptBatch,
+    WSMessage as WSMessageSchema,
+} from "./generated/cortex_schemas";
 
 /**
  * Audit Debt-2: read the local capability token the daemon mints at
@@ -200,7 +204,10 @@ export class CortexWSClient {
         }
     > = new Map();
 
-    constructor(url: string) {
+    constructor(
+        url: string,
+        private readonly _clientInstanceId = `vscode_${CLIENT_BOOT_ID}`,
+    ) {
         this._url = url;
     }
 
@@ -216,6 +223,11 @@ export class CortexWSClient {
      */
     get isConnected(): boolean {
         return this._connected;
+    }
+
+    /** Per-process identity used to bind editor-origin authorizations. */
+    get clientBootId(): string {
+        return CLIENT_BOOT_ID;
     }
 
     /** Register a handler for STATE_UPDATE messages. */
@@ -320,7 +332,10 @@ export class CortexWSClient {
                 // Identify as VS Code extension
                 this._send({
                     type: "IDENTIFY",
-                    payload: { client_type: "vscode" },
+                    payload: {
+                        client_type: "vscode",
+                        client_instance_id: this._clientInstanceId,
+                    },
                     timestamp: Date.now() / 1000,
                     sequence: ++this._sequence,
                 });
@@ -477,6 +492,28 @@ export class CortexWSClient {
                 intervention_id: interventionId,
                 timestamp: Date.now() / 1000,
             },
+            timestamp: Date.now() / 1000,
+            sequence: ++this._sequence,
+        });
+    }
+
+    /** Send one explicit editor-surface authorization request. */
+    sendInterventionAuthorization(
+        request: InterventionAuthorizationRequest,
+    ): void {
+        this._send({
+            type: "INTERVENTION_AUTHORIZE",
+            payload: request as unknown as Record<string, unknown>,
+            timestamp: Date.now() / 1000,
+            sequence: ++this._sequence,
+        });
+    }
+
+    /** Send typed per-action apply/compensation/restore receipts. */
+    sendInterventionReceipt(batch: InterventionReceiptBatch): void {
+        this._send({
+            type: "INTERVENTION_RECEIPT",
+            payload: batch as unknown as Record<string, unknown>,
             timestamp: Date.now() / 1000,
             sequence: ++this._sequence,
         });

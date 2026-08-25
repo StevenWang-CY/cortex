@@ -1818,30 +1818,17 @@ class _ConsumerTab(QWidget):
 
     # ── P0 §3.16: undo toast + restore pill ─────────────────────────
 
-    # Mirror of cortex/services/intervention_engine/executor.py::_REVERSE_ACTIONS.
-    # Membership controls when the Undo toast + Restore pill surface.
-    # We could ship the daemon-side `is_reversible: bool` on every
-    # INTERVENTION_APPLIED payload (Phase 4b), but pre-empting that with
-    # a local mirror keeps the desktop UX functional in isolation.
-    _DESKTOP_REVERSIBLE_ACTIONS: frozenset[str] = frozenset({
-        "hide_tabs_except_active",
-        "collapse_before_error",
-        "fold_except_current",
-        "dim_background",
-        "show_overlay",
-        "close_tab",
-        "group_tabs",
-        "bookmark_and_close",
-    })
+    # Compatibility symbol retained for downstream imports. It is deliberately
+    # empty: an action name is not restoration evidence. Only a verified exact
+    # transaction receipt may surface Undo/Restore.
+    _DESKTOP_REVERSIBLE_ACTIONS: frozenset[str] = frozenset()
 
     def apply_intervention_applied(self, payload: dict) -> None:
         """Render the Undo toast on a reversible INTERVENTION_APPLIED.
 
-        Payload keys (matches the daemon's contract):
-        ``intervention_id``, ``action_type``, ``mutations_applied_count``,
-        and optional ``is_reversible`` (Phase 4b will start stamping
-        this; until then we fall back to ``action_type`` membership in
-        :data:`_DESKTOP_REVERSIBLE_ACTIONS`).
+        This compatibility entry point requires ``transaction_verified=True``
+        plus ``is_reversible=True``. Callers may not infer reversibility from
+        action names or optimistic adapter acknowledgements.
         """
         if not isinstance(payload, dict):
             return
@@ -1852,12 +1839,20 @@ class _ConsumerTab(QWidget):
         except (TypeError, ValueError):
             applied = 0
         is_reversible = payload.get("is_reversible")
-        if not isinstance(is_reversible, bool):
-            is_reversible = action_type in self._DESKTOP_REVERSIBLE_ACTIONS
-        if not is_reversible or applied <= 0 or not intervention_id:
+        if (
+            payload.get("transaction_verified") is not True
+            or is_reversible is not True
+            or applied <= 0
+            or not intervention_id
+        ):
             return
         import time as _time
         now = _time.monotonic()
+        if any(
+            entry[1] == intervention_id
+            for entry in self._reversible_actions
+        ):
+            return
         self._reversible_actions.append(
             (now, intervention_id, action_type, applied)
         )
@@ -1870,6 +1865,54 @@ class _ConsumerTab(QWidget):
         ]
         self._show_undo_toast(intervention_id, action_type, applied)
         self._refresh_restore_pill()
+
+    def apply_intervention_transaction_state(self, payload: dict) -> None:
+        """Project verified transaction outcomes into the Undo affordance."""
+
+        if not isinstance(payload, dict):
+            return
+        intervention_id = str(payload.get("intervention_id") or "")
+        state = str(payload.get("state") or "")
+        if not intervention_id:
+            return
+        if state in {"restored", "failed", "restore_failed"}:
+            self._reversible_actions = [
+                entry for entry in self._reversible_actions
+                if entry[1] != intervention_id
+            ]
+            if self._undo_toast_timer is not None:
+                try:
+                    self._undo_toast_timer.stop()
+                except Exception:
+                    pass
+                self._undo_toast_timer = None
+            if self._undo_toast is not None:
+                try:
+                    self._undo_toast.deleteLater()
+                except Exception:
+                    pass
+                self._undo_toast = None
+            self._refresh_restore_pill()
+            return
+        if state != "applied":
+            return
+        raw_results = payload.get("receipt_results")
+        results = raw_results if isinstance(raw_results, list) else []
+        restorable = [
+            item for item in results
+            if isinstance(item, dict)
+            and item.get("reversible") is True
+            and item.get("status") in {"succeeded", "already_complete"}
+        ]
+        if not restorable:
+            return
+        self.apply_intervention_applied({
+            "intervention_id": intervention_id,
+            "action_type": "workspace_change",
+            "mutations_applied_count": len(restorable),
+            "is_reversible": True,
+            "transaction_verified": True,
+        })
 
     def _show_undo_toast(
         self,
@@ -3415,7 +3458,7 @@ class DashboardWindow(QWidget):
                 )
 
     def apply_intervention_applied(self, payload: dict) -> None:
-        """P0 §3.16: forward INTERVENTION_APPLIED to consumer tab's undo toast."""
+        """Forward a verified compatibility projection to the consumer tab."""
         if self._consumer is not None and hasattr(
             self._consumer, "apply_intervention_applied",
         ):
@@ -3424,6 +3467,20 @@ class DashboardWindow(QWidget):
             except Exception:
                 logger.debug(
                     "consumer apply_intervention_applied failed",
+                    exc_info=True,
+                )
+
+    def apply_intervention_transaction_state(self, payload: dict) -> None:
+        """Forward exact transaction outcomes to the Undo/Restore surface."""
+
+        if self._consumer is not None and hasattr(
+            self._consumer, "apply_intervention_transaction_state",
+        ):
+            try:
+                self._consumer.apply_intervention_transaction_state(payload)
+            except Exception:
+                logger.debug(
+                    "consumer transaction-state projection failed",
                     exc_info=True,
                 )
 

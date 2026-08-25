@@ -1,8 +1,8 @@
-"""P1-7: InterventionExecutor must default-deny mutation plans when consent_check is not wired.
+"""InterventionExecutor fail-closed authority boundary tests.
 
-overlay_only plans pass through (no mutation required). Any other plan
-level (simplified_workspace, guided_mode) must be blocked with
-reason="consent_handler_not_wired" unless the escape hatch
+Presentation-only commands pass through. Any workspace effect must first be
+blocked for lack of an exact authorization; the older consent-handler check is
+still defence in depth after that gate. Unit-only legacy execution requires
 ``_allow_unwired_consent=True`` is set.
 """
 
@@ -56,7 +56,7 @@ class TestExecutorUnwiredConsent:
 
     @pytest.mark.asyncio
     async def test_mutation_plan_blocked_without_consent_check(self) -> None:
-        """simplified_workspace without consent_check → all mutations refused."""
+        """A plan is not itself workspace authority."""
         executor = InterventionExecutor(execution_mode="authorized")
         plan = _make_plan("simplified_workspace")
         commands = [_make_command("close_tab"), _make_command("focus_tab")]
@@ -66,8 +66,8 @@ class TestExecutorUnwiredConsent:
         assert len(mutations) == 2
         for m in mutations:
             assert m.success is False
-            assert m.reason == "consent_handler_not_wired", (
-                f"expected consent_handler_not_wired, got {m.reason!r}"
+            assert m.reason == "exact_authorization_required", (
+                f"expected exact_authorization_required, got {m.reason!r}"
             )
 
     @pytest.mark.asyncio
@@ -79,7 +79,7 @@ class TestExecutorUnwiredConsent:
 
         mutations = await executor.apply(plan, commands)
 
-        assert all(m.reason == "consent_handler_not_wired" for m in mutations)
+        assert all(m.reason == "exact_authorization_required" for m in mutations)
 
     @pytest.mark.asyncio
     async def test_overlay_only_plan_passes_without_consent_check(self) -> None:

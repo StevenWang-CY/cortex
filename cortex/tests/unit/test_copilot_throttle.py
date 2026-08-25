@@ -1,4 +1,4 @@
-"""Tests for CopilotThrottle — AI assistant throttling on cognitive overload."""
+"""Tests for fail-closed containment of legacy Copilot throttling."""
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -22,22 +22,18 @@ class TestCopilotThrottle:
 
     @pytest.mark.asyncio
     async def test_throttle_on_hyper(self):
-        """HYPER with high confidence → throttle."""
+        """A state estimate is not authority to edit VS Code settings."""
         changed = await self.throttle.on_state_change("HYPER", 0.9)
-        assert changed is True
-        assert self.throttle.is_throttled is True
-        self.ws_server.send_message.assert_called_once()
-        args, kwargs = self.ws_server.send_message.call_args
-        assert args[0] == "COPILOT_THROTTLE"
-        assert args[1] == {"action": "disable"}
-        assert kwargs.get("target_client_types") == ["vscode"]
+        assert changed is False
+        assert self.throttle.is_throttled is False
+        self.ws_server.send_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_unthrottle_on_flow(self):
-        """FLOW after HYPER → unthrottle."""
+        """No synthetic release is needed when no mutation was owned."""
         await self.throttle.on_state_change("HYPER", 0.9)
         changed = await self.throttle.on_state_change("FLOW", 0.8)
-        assert changed is True
+        assert changed is False
         assert self.throttle.is_throttled is False
 
     @pytest.mark.asyncio
@@ -65,7 +61,7 @@ class TestCopilotThrottle:
     @pytest.mark.asyncio
     async def test_disable_while_throttled_reenables(self):
         await self.throttle.on_state_change("HYPER", 0.9)
-        assert self.throttle.is_throttled is True
+        assert self.throttle.is_throttled is False
         self.throttle.enabled = False
         assert self.throttle.is_throttled is False
 
@@ -80,49 +76,35 @@ class TestCopilotThrottle:
         """Without ws_server, methods should not raise."""
         throttle = CopilotThrottle(ws_server=None)
         changed = await throttle.on_state_change("HYPER", 0.9)
-        assert changed is True
-        assert throttle.is_throttled is True
+        assert changed is False
+        assert throttle.is_throttled is False
 
     @pytest.mark.asyncio
     async def test_flow_below_threshold_no_unthrottle(self):
         await self.throttle.on_state_change("HYPER", 0.9)
         changed = await self.throttle.on_state_change("FLOW", 0.3)
         assert changed is False
-        assert self.throttle.is_throttled is True
+        assert self.throttle.is_throttled is False
 
     @pytest.mark.asyncio
     async def test_unthrottle_on_hyper_to_recovery(self):
-        """P1: HYPER → RECOVERY must re-enable suggestions.
-
-        The previous code only un-throttled on a clean FLOW recovery,
-        so the common HYPER → RECOVERY exit left Copilot silenced
-        forever. Leaving HYPER at all is the correct release edge.
-        """
+        """HYPER → RECOVERY remains mutation-free end to end."""
         await self.throttle.on_state_change("HYPER", 0.9)
-        assert self.throttle.is_throttled is True
+        assert self.throttle.is_throttled is False
 
         changed = await self.throttle.on_state_change("RECOVERY", 0.6)
-        assert changed is True
+        assert changed is False
         assert self.throttle.is_throttled is False
-        # The release sent an "enable" command to the VS Code client.
-        args, kwargs = self.ws_server.send_message.call_args
-        assert args[0] == "COPILOT_THROTTLE"
-        assert args[1] == {"action": "enable"}
-        assert kwargs.get("target_client_types") == ["vscode"]
+        self.ws_server.send_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_unthrottle_on_hyper_to_hypo(self):
-        """P1: FLOW → HYPER → HYPO must re-enable suggestions.
-
-        Regression for the "left disabled forever" path: the user never
-        passes back through FLOW, so the old FLOW-only release never
-        fired. Any transition out of HYPER releases the throttle.
-        """
+        """FLOW → HYPER → HYPO cannot change editor configuration."""
         await self.throttle.on_state_change("HYPER", 0.9)
-        assert self.throttle.is_throttled is True
+        assert self.throttle.is_throttled is False
 
         changed = await self.throttle.on_state_change("HYPO", 0.4)
-        assert changed is True
+        assert changed is False
         assert self.throttle.is_throttled is False
 
     @pytest.mark.asyncio

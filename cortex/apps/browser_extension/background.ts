@@ -11,10 +11,13 @@ import {
     classifyTabType as classifyBrowserTabType,
     classifyTabTypeWithGoal,
     groupSpecificTabs,
+    hideNonActiveTabs,
+    getSnapshot as getTabManagerSnapshot,
     restoreAllTabs,
     restoreHiddenTabs as restoreTabsForIntervention,
     saveTabSession,
     restoreTabSession,
+    IndeterminateBrowserMutationError,
 } from "./tab-manager";
 import { getAuthToken } from "./lib/auth";
 import { detectBrowser } from "./lib/browser";
@@ -24,6 +27,14 @@ import {
     normaliseInterventionPayload,
     truncatePayloadForLog,
 } from "./lib/state-guards";
+import {
+    canonicalJson,
+    sha256Hex,
+    verifyActionManifest,
+    verifyApplyCommand,
+    verifiedPresentedActionIds,
+    verifyRestoreCommand,
+} from "./lib/intervention-transaction";
 import {
     DAEMON_WS_URL,
     DAEMON_HTTP_URL,
@@ -47,6 +58,14 @@ import type {
     InterventionTriggerPayload,
     SessionRecap as SessionRecapSchema,
     CostResponse as CostResponseSchema,
+    ActionManifest,
+    ActionReceipt,
+    InterventionApplyCommand,
+    InterventionAuthorizationRequest,
+    InterventionReceiptBatch,
+    InterventionRestoreCommand,
+    ManifestAction,
+    RestoreAction,
 } from "./types/generated/cortex_schemas";
 
 // The Pydantic JSON Schema marks default-having fields as optional
@@ -163,6 +182,23 @@ let reconnectDelay = INITIAL_RECONNECT_DELAY;
 const MAX_RECONNECT_DELAY = 30000;
 let intentionalDisconnect = false;
 let sequence = 0;
+// Browser WebSocket callbacks do not await an async `onmessage` handler. The
+// envelope is still parsed and sequence-checked synchronously, while exact
+// APPLY/RESTORE capability work is serialized on this dedicated chain.
+let transactionCommandChain: Promise<void> = Promise.resolve();
+
+function enqueueTransactionCommand(
+    operation: () => Promise<void>,
+): Promise<void> {
+    const scheduled = transactionCommandChain.then(operation);
+    transactionCommandChain = scheduled.catch((error: unknown) => {
+        console.warn(
+            "[cortex.bg] transaction command failed closed:",
+            String(error),
+        );
+    });
+    return transactionCommandChain;
+}
 const WIRE_SCHEMA_VERSION = "2.0";
 const PROTOCOL_VERSION = "2.0";
 const SUPPORTED_PROTOCOL_VERSIONS = ["2.0", "1.0"] as const;
@@ -185,6 +221,37 @@ function newWireId(): string {
 }
 
 const CLIENT_BOOT_ID = newWireId();
+const CLIENT_INSTANCE_STORAGE_KEY = "cortex_client_instance_id_v1";
+let clientInstanceIdPromise: Promise<string> | null = null;
+
+function validClientInstanceId(value: unknown): value is string {
+    return typeof value === "string"
+        && value.length >= 8
+        && value.length <= 128
+        && /^[A-Za-z0-9._:-]+$/.test(value);
+}
+
+async function getClientInstanceId(): Promise<string> {
+    if (clientInstanceIdPromise) return clientInstanceIdPromise;
+    clientInstanceIdPromise = (async () => {
+        const stored = await chrome.storage.local.get(
+            CLIENT_INSTANCE_STORAGE_KEY,
+        );
+        const existing = stored[CLIENT_INSTANCE_STORAGE_KEY];
+        if (validClientInstanceId(existing)) return existing;
+        const created = `browser_${newWireId()}`;
+        await chrome.storage.local.set({
+            [CLIENT_INSTANCE_STORAGE_KEY]: created,
+        });
+        return created;
+    })();
+    try {
+        return await clientInstanceIdPromise;
+    } catch (error) {
+        clientInstanceIdPromise = null;
+        throw error;
+    }
+}
 
 function withWireMetadata(msg: WSMessage): WSMessage {
     const sentAtUnixMs = Date.now();
@@ -237,6 +304,271 @@ function parseExecutionMode(value: unknown): ExecutionMode {
 function workspaceMutationAllowed(): boolean {
     return currentExecutionMode !== "suggest_only";
 }
+
+interface BrowserOperationRecord {
+    intervention_id: string;
+    manifest_sha256: string;
+    action_id: string;
+    authorization_id: string;
+    capability: string;
+    state: "applying" | "applied" | "failed" | "restored";
+    inverse_payload_json: string;
+    after_fingerprint: string | null;
+    updated_at_unix_ms: number;
+}
+
+interface ConsumedAuthorizationRecord {
+    manifest_sha256: string;
+    nonce: string;
+    consumed_at_unix_ms: number;
+}
+
+interface BrowserTransactionJournal {
+    schema_version: "1";
+    consumed_authorizations: Record<string, ConsumedAuthorizationRecord>;
+    operations: Record<string, BrowserOperationRecord>;
+    attempt_counters: Record<string, number>;
+    receipt_outbox: InterventionReceiptBatch[];
+}
+
+const TRANSACTION_JOURNAL_KEY = "cortex_intervention_transaction_journal_v1";
+const MAX_TRANSACTION_OPERATIONS = 512;
+const MAX_TRANSACTION_COUNTERS = 2_048;
+const MAX_RECEIPT_OUTBOX = 256;
+const MAX_INVERSE_JSON_BYTES = 65_536;
+const CREATED_TAB_STAGE_PREFIX = "about:blank#cortex-created-tab=";
+let transactionJournalLock: Promise<void> = Promise.resolve();
+
+function emptyTransactionJournal(): BrowserTransactionJournal {
+    return {
+        schema_version: "1",
+        consumed_authorizations: {},
+        operations: {},
+        attempt_counters: {},
+        receipt_outbox: [],
+    };
+}
+
+function isJournalRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isBoundedJournalString(
+    value: unknown,
+    maximum = 256,
+): value is string {
+    return typeof value === "string" && value.length > 0 && value.length <= maximum;
+}
+
+function isCanonicalObjectJson(value: unknown): value is string {
+    if (
+        typeof value !== "string"
+        || value.length === 0
+        || value.length > MAX_INVERSE_JSON_BYTES
+    ) return false;
+    try {
+        const parsed = JSON.parse(value) as unknown;
+        return isJournalRecord(parsed) && canonicalJson(parsed) === value;
+    } catch {
+        return false;
+    }
+}
+
+function validateJournalReceiptBatch(value: unknown): InterventionReceiptBatch {
+    if (!isJournalRecord(value)) throw new Error("receipt outbox batch is malformed");
+    const interventionId = value.intervention_id;
+    const authorizationId = value.authorization_id;
+    const manifestSha256 = value.manifest_sha256;
+    if (
+        !isBoundedJournalString(interventionId)
+        || !isBoundedJournalString(authorizationId)
+        || typeof manifestSha256 !== "string"
+        || !/^[0-9a-f]{64}$/.test(manifestSha256)
+        || !Array.isArray(value.receipts)
+        || value.receipts.length < 1
+        || value.receipts.length > 96
+    ) {
+        throw new Error("receipt outbox batch fields are invalid");
+    }
+    for (const receipt of value.receipts) {
+        if (!isJournalRecord(receipt)) throw new Error("receipt outbox entry is malformed");
+        const numericFields = [
+            receipt.started_at_unix_ms,
+            receipt.ended_at_unix_ms,
+            receipt.started_at_mono_ns,
+            receipt.ended_at_mono_ns,
+            receipt.duration_ms,
+        ];
+        if (
+            !isBoundedJournalString(receipt.receipt_id, 128)
+            || receipt.intervention_id !== interventionId
+            || receipt.authorization_id !== authorizationId
+            || receipt.manifest_sha256 !== manifestSha256
+            || !isBoundedJournalString(receipt.action_id, 128)
+            || !new Set(["apply", "compensate", "restore"]).has(String(receipt.phase))
+            || !Number.isInteger(receipt.attempt)
+            || Number(receipt.attempt) < 1
+            || Number(receipt.attempt) > 100
+            || !isBoundedJournalString(receipt.idempotency_key, 512)
+            || !new Set(["succeeded", "failed", "already_complete"]).has(String(receipt.status))
+            || numericFields.some((item) => typeof item !== "number" || !Number.isFinite(item) || item < 0)
+            || Number(receipt.ended_at_unix_ms) < Number(receipt.started_at_unix_ms)
+            || Number(receipt.ended_at_mono_ns) < Number(receipt.started_at_mono_ns)
+            || !isBoundedJournalString(receipt.boot_id, 128)
+            || !new Set(["verified", "failed", "not_applicable"]).has(String(receipt.verification))
+            || (
+                receipt.inverse_payload_json !== null
+                && receipt.inverse_payload_json !== undefined
+                && !isCanonicalObjectJson(receipt.inverse_payload_json)
+            )
+            || (
+                receipt.after_fingerprint !== null
+                && receipt.after_fingerprint !== undefined
+                && (
+                    typeof receipt.after_fingerprint !== "string"
+                    || !/^[0-9a-f]{64}$/.test(receipt.after_fingerprint)
+                )
+            )
+            || (receipt.source_client_type !== null && receipt.source_client_type !== undefined)
+            || (receipt.source_client_id !== null && receipt.source_client_id !== undefined)
+        ) {
+            throw new Error("receipt outbox entry fields are invalid");
+        }
+    }
+    return value as unknown as InterventionReceiptBatch;
+}
+
+function validateBrowserTransactionJournal(raw: unknown): BrowserTransactionJournal {
+    if (!isJournalRecord(raw) || raw.schema_version !== "1") {
+        throw new Error("Cortex transaction journal is corrupt");
+    }
+    const consumed = raw.consumed_authorizations;
+    const operations = raw.operations;
+    const counters = raw.attempt_counters ?? {};
+    const outbox = raw.receipt_outbox ?? [];
+    if (
+        !isJournalRecord(consumed)
+        || !isJournalRecord(operations)
+        || !isJournalRecord(counters)
+        || !Array.isArray(outbox)
+        || Object.keys(consumed).length > 256
+        || Object.keys(operations).length > MAX_TRANSACTION_OPERATIONS
+        || Object.keys(counters).length > MAX_TRANSACTION_COUNTERS
+        || outbox.length > MAX_RECEIPT_OUTBOX
+    ) {
+        throw new Error("Cortex transaction journal is corrupt");
+    }
+    const validatedConsumed: Record<string, ConsumedAuthorizationRecord> = {};
+    for (const [authorizationId, candidate] of Object.entries(consumed)) {
+        if (
+            !isBoundedJournalString(authorizationId)
+            || !isJournalRecord(candidate)
+            || typeof candidate.manifest_sha256 !== "string"
+            || !/^[0-9a-f]{64}$/.test(candidate.manifest_sha256)
+            || !isBoundedJournalString(candidate.nonce, 256)
+            || typeof candidate.consumed_at_unix_ms !== "number"
+            || !Number.isFinite(candidate.consumed_at_unix_ms)
+            || candidate.consumed_at_unix_ms < 0
+        ) throw new Error("consumed authorization journal entry is invalid");
+        validatedConsumed[authorizationId] = candidate as unknown as ConsumedAuthorizationRecord;
+    }
+    const knownCapabilities = new Set([
+        "open_url", "search_error", "highlight_tab",
+    ]);
+    const validatedOperations: Record<string, BrowserOperationRecord> = {};
+    for (const [key, candidate] of Object.entries(operations)) {
+        if (
+            !isBoundedJournalString(key, 300)
+            || !isJournalRecord(candidate)
+            || !isBoundedJournalString(candidate.intervention_id)
+            || !isBoundedJournalString(candidate.action_id, 128)
+            || key !== operationKey(candidate.intervention_id, candidate.action_id)
+            || typeof candidate.manifest_sha256 !== "string"
+            || !/^[0-9a-f]{64}$/.test(candidate.manifest_sha256)
+            || !isBoundedJournalString(candidate.authorization_id)
+            || typeof candidate.capability !== "string"
+            || !knownCapabilities.has(candidate.capability)
+            || !new Set(["applying", "applied", "failed", "restored"]).has(String(candidate.state))
+            || !isCanonicalObjectJson(candidate.inverse_payload_json)
+            || (
+                candidate.after_fingerprint !== null
+                && (
+                    typeof candidate.after_fingerprint !== "string"
+                    || !/^[0-9a-f]{64}$/.test(candidate.after_fingerprint)
+                )
+            )
+            || typeof candidate.updated_at_unix_ms !== "number"
+            || !Number.isFinite(candidate.updated_at_unix_ms)
+            || candidate.updated_at_unix_ms < 0
+        ) throw new Error("browser operation journal entry is invalid");
+        validatedOperations[key] = candidate as unknown as BrowserOperationRecord;
+    }
+    const validatedCounters: Record<string, number> = {};
+    for (const [key, value] of Object.entries(counters)) {
+        if (
+            !isBoundedJournalString(key, 512)
+            || !Number.isInteger(value)
+            || Number(value) < 0
+            || Number(value) > 100
+        ) throw new Error("receipt attempt counter is invalid");
+        validatedCounters[key] = Number(value);
+    }
+    const validatedOutbox = outbox.map(validateJournalReceiptBatch);
+    const receiptIds = new Set<string>();
+    for (const batch of validatedOutbox) {
+        for (const receipt of batch.receipts) {
+            const receiptId = String(receipt.receipt_id);
+            if (receiptIds.has(receiptId)) {
+                throw new Error("duplicate receipt id in transaction outbox");
+            }
+            receiptIds.add(receiptId);
+        }
+    }
+    return {
+        schema_version: "1",
+        consumed_authorizations: validatedConsumed,
+        operations: validatedOperations,
+        attempt_counters: validatedCounters,
+        receipt_outbox: validatedOutbox,
+    };
+}
+
+async function readTransactionJournal(): Promise<BrowserTransactionJournal> {
+    const data = await chrome.storage.local.get(TRANSACTION_JOURNAL_KEY);
+    const raw = data[TRANSACTION_JOURNAL_KEY] as unknown;
+    if (raw === undefined) return emptyTransactionJournal();
+    return validateBrowserTransactionJournal(raw);
+}
+
+async function mutateTransactionJournal<T>(
+    mutate: (journal: BrowserTransactionJournal) => T | Promise<T>,
+): Promise<T> {
+    let resolveTurn: (() => void) | undefined;
+    const prior = transactionJournalLock;
+    transactionJournalLock = new Promise<void>((resolve) => {
+        resolveTurn = resolve;
+    });
+    await prior;
+    try {
+        const journal = await readTransactionJournal();
+        const result = await mutate(journal);
+        await chrome.storage.local.set({ [TRANSACTION_JOURNAL_KEY]: journal });
+        return result;
+    } finally {
+        resolveTurn?.();
+    }
+}
+
+interface PendingAuthorization {
+    interventionId: string;
+    actionIds: string[];
+    authorizationId?: string;
+    localResults: Map<string, ActionExecuteResult>;
+    resolve: (results: ActionExecuteResult[]) => void;
+    timeout: ReturnType<typeof setTimeout>;
+}
+
+const pendingAuthorizations = new Map<string, PendingAuthorization>();
 
 /** Test-only witness for the fail-closed client authority state. */
 export function _getExecutionMode(): ExecutionMode {
@@ -842,9 +1174,13 @@ function connect(): void {
                     // and downstream broadcasts that target a specific
                     // browser ("send only to Edge") work as advertised.
                     const browserClientType = detectBrowser();
+                    const clientInstanceId = await getClientInstanceId();
                     send({
                         type: "IDENTIFY",
-                        payload: { client_type: browserClientType },
+                        payload: {
+                            client_type: browserClientType,
+                            client_instance_id: clientInstanceId,
+                        },
                         timestamp: Date.now() / 1000,
                         sequence: ++sequence,
                     });
@@ -884,7 +1220,7 @@ function connect(): void {
         };
 
         ws.onmessage = (event) => {
-            handleMessage(event.data as string);
+            void handleMessage(event.data as string);
         };
 
         ws.onclose = () => {
@@ -1275,6 +1611,11 @@ async function handleMessage(raw: string): Promise<void> {
             if (selected === "1.0" || selected === "2.0") {
                 negotiatedProtocolVersion = selected;
             }
+            // Receipts are persisted before their first send. Replaying the
+            // bounded outbox after authentication closes the socket-drop
+            // window between a workspace effect and daemon acknowledgement;
+            // server-side receipt/idempotency keys make this safe.
+            void flushReceiptOutbox();
             break;
         }
 
@@ -1456,33 +1797,10 @@ async function handleMessage(raw: string): Promise<void> {
         }
 
         case "START_FOCUS_AUTO": {
-            // P0 §3.10: daemon detected sustained HYPER + user opted
-            // in. Arm a focus session with the daemon-provided preset
-            // and duration. The session is marked auto-armed so the
-            // symmetric STOP_FOCUS_AUTO can tear down only when WE
-            // armed (never tear down a manually-started session).
-            if (!workspaceMutationAllowed()) {
-                console.warn(
-                    "[cortex.bg] START_FOCUS_AUTO rejected in suggest-only mode",
-                );
-                break;
-            }
-            const preset = (msg.payload.preset as string | undefined) || "developer";
-            const customDomains = (msg.payload.custom_domains as string[] | undefined) || [];
-            const durationMinutes = typeof msg.payload.duration_minutes === "number"
-                ? msg.payload.duration_minutes
-                : 20;
-            const reason = (msg.payload.reason as string | undefined) || "biometric_hyper";
-            try {
-                startAutoFocusSession({
-                    preset,
-                    customDomains,
-                    durationMinutes,
-                    reason,
-                });
-            } catch (e) {
-                console.warn("Cortex: failed to arm auto focus session", e);
-            }
+            // A daemon state transition is not a one-time workspace grant.
+            // Manual START_FOCUS remains available; autonomous arming stays
+            // contained until it is expressed as a manifest-bound capability.
+            console.warn("[cortex.bg] rejected legacy START_FOCUS_AUTO");
             break;
         }
 
@@ -1526,8 +1844,27 @@ async function handleMessage(raw: string): Promise<void> {
             handleContextRequest(msg);
             break;
 
+        case "INTERVENTION_APPLY":
+            await enqueueTransactionCommand(
+                () => handleInterventionApplyCommand(msg.payload),
+            );
+            break;
+
+        case "INTERVENTION_AUTHORIZATION_DENIED":
+            settleDeniedAuthorization(msg.payload);
+            break;
+
+        case "INTERVENTION_TRANSACTION_STATE":
+            void acknowledgeReceiptOutbox(msg.payload);
+            settleAuthorizationFromState(msg.payload);
+            broadcastToPopup({
+                type: "INTERVENTION_TRANSACTION_STATE",
+                payload: msg.payload,
+            });
+            break;
+
         case "INTERVENTION_RESTORE":
-            handleRestore(msg.payload);
+            await enqueueTransactionCommand(() => handleRestore(msg.payload));
             break;
 
         case "SETTINGS_SYNC":
@@ -1547,54 +1884,10 @@ async function handleMessage(raw: string): Promise<void> {
             break;
 
         case "ACTION_DISPATCH": {
-            // G4 (audit-prod): daemon-forwarded request to execute a
-            // suggested action that the desktop-shell overlay's button
-            // initiated. The extension runs the action via the existing
-            // ``executeAction`` helper and reports back the standard
-            // ACTION_EXECUTE log so the daemon can record success.
-            if (!workspaceMutationAllowed()) {
-                console.warn(
-                    "[cortex.bg] ACTION_DISPATCH rejected in suggest-only mode",
-                );
-                break;
-            }
-            const dispatchPayload = msg.payload;
-            const interventionId = String(dispatchPayload.intervention_id || "");
-            // P1-13: use isSuggestedAction runtime guard instead of a bare cast
-            // so a malformed daemon frame cannot reach executeAction unchecked.
-            const rawAction = dispatchPayload.action;
-            const action = isSuggestedAction(rawAction) ? rawAction : undefined;
-            if (action && action.action_id && action.action_type) {
-                executeAction(action as SuggestedAction)
-                    .then((result) => {
-                        send({
-                            type: "ACTION_EXECUTE",
-                            payload: {
-                                intervention_id: interventionId,
-                                action_id: action.action_id,
-                                action_type: action.action_type,
-                                result,
-                                source: "desktop_overlay_dispatch",
-                            },
-                            timestamp: Date.now() / 1000,
-                            sequence: ++sequence,
-                        });
-                    })
-                    .catch(() => {
-                        send({
-                            type: "ACTION_EXECUTE",
-                            payload: {
-                                intervention_id: interventionId,
-                                action_id: action.action_id,
-                                action_type: action.action_type,
-                                result: { success: false, error: "executeAction threw" },
-                                source: "desktop_overlay_dispatch",
-                            },
-                            timestamp: Date.now() / 1000,
-                            sequence: ++sequence,
-                        });
-                    });
-            }
+            // Compatibility frames are presentation-only. Since WP-6, the
+            // sole mutation entry point is an exact INTERVENTION_APPLY whose
+            // authorization and immutable manifest both validate locally.
+            console.warn("[cortex.bg] rejected legacy ACTION_DISPATCH");
             break;
         }
 
@@ -1624,19 +1917,9 @@ async function handleMessage(raw: string): Promise<void> {
 
 
         case "LEETCODE_SHOW_LOCKOUT": {
-            // Inject lockout overlay into the active tab
-            try {
-                const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-                if (tab?.id) {
-                    await chrome.scripting.executeScript({
-                        target: { tabId: tab.id },
-                        func: injectLockoutOverlay,
-                        args: [msg.payload],
-                    });
-                }
-            } catch (e) {
-                if (DEBUG) console.error("Cortex: failed to inject lockout overlay", e);
-            }
+            // A lockout changes what the user can do on the page. Keep this
+            // compatibility message inert until it has an exact authorization
+            // and receipt-backed escape/restore path.
             break;
         }
 
@@ -1881,7 +2164,10 @@ async function handleMessage(raw: string): Promise<void> {
  * Design: dark, high-end tech (Linear/Raycast-inspired).
  * Consistent with popup and all other Cortex UI.
  */
-function injectOverlay(payload: Record<string, unknown>): void {
+function injectOverlay(
+    payload: Record<string, unknown>,
+    executableActionIds: string[] = [],
+): void {
     const OID = "cortex-somatic-overlay";
     document.getElementById(OID)?.remove();
 
@@ -1891,47 +2177,22 @@ function injectOverlay(payload: Record<string, unknown>): void {
     const esc = (s: string) =>
         s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
-    const actions: Array<Record<string, unknown>> = [...((payload.suggested_actions as Array<Record<string, unknown>>) || [])];
+    const actions: Array<Record<string, unknown>> = [
+        ...((payload.suggested_actions as Array<Record<string, unknown>>) || []),
+    ];
     const tabRecs = payload.tab_recommendations as { tabs: Array<Record<string, unknown>>; summary: string } | undefined;
     const errA = payload.error_analysis as Record<string, string> | undefined;
-
-    // F52: synthesise close actions from tab_recommendations only for
-    // tab_index values NOT already covered by suggested_actions. The
-    // tab card carries the close button when an existing action covers
-    // the same tab, so we avoid duplicate close affordances.
-    if (tabRecs && tabRecs.tabs && tabRecs.tabs.length > 0) {
-        const coveredIndices = new Set<number>();
-        for (const a of actions) {
-            const at = a.action_type;
-            if (at !== "close_tab" && at !== "bookmark_and_close") continue;
-            const ti = typeof a.tab_index === "number" ? a.tab_index : Number(a.tab_index);
-            if (Number.isFinite(ti)) coveredIndices.add(ti);
-        }
-        const closeable = tabRecs.tabs.filter(t => t.action === "close" || t.action === "bookmark_and_close");
-        for (let ci = 0; ci < closeable.length; ci++) {
-            const t = closeable[ci];
-            const ti = typeof t.tab_index === "number" ? t.tab_index : Number(t.tab_index);
-            if (!Number.isFinite(ti)) continue;
-            if (coveredIndices.has(ti)) continue;
-            actions.push({
-                action_id: `synth_${Date.now()}_${ci}`,
-                action_type: t.action === "bookmark_and_close" ? "bookmark_and_close" : "close_tab",
-                tab_index: ti,
-                target: "",
-                label: `Close ${t.tab_title || "tab"}`,
-                reason: t.reason || "",
-                category: "recommended",
-                reversible: true,
-                metadata: {
-                    expected_title: t.tab_title || "",
-                    expected_url: t.url || "",
-                },
-            });
-            coveredIndices.add(ti);
-        }
-    }
-
-    const recommended = actions.filter(a => a.category === "recommended");
+    // The background worker verified these IDs against the digest-covered
+    // manifest immediately before injection. Recommendations absent from
+    // that set remain readable guidance; they never acquire an affordance.
+    const executableIdSet = new Set(executableActionIds);
+    const executableRecommended = actions.filter((action) =>
+        action.category === "recommended"
+        && typeof action.action_id === "string"
+        && executableIdSet.has(action.action_id)
+    );
+    const canExecute = payload.execution_mode === "authorized"
+        || payload.execution_mode === "research_autonomous";
 
     // --- Build tab list with per-tab Keep buttons (LAYER 5) ---
     let closingHtml = "";
@@ -1954,7 +2215,7 @@ function injectOverlay(payload: Record<string, unknown>): void {
                 const rawReason = String(t.reason || "");
                 const cleanReason = genericReasonPhrases.some(p => rawReason.toLowerCase().includes(p)) ? "" : rawReason;
                 const tabReason = cleanReason ? `<div class="trr">${esc(cleanReason)}</div>` : "";
-                closingHtml += `<div class="tr" id="tr-${ti}" data-tab-idx="${ti}"><span class="tx">\u00d7</span><div class="tc"><span class="tn">${tabTitle}</span>${tabReason}</div><button class="kb" data-keep-idx="${ti}">Keep</button></div>`;
+                closingHtml += `<div class="tr"><span class="tx">\u00b7</span><div class="tc"><span class="tn">${tabTitle}</span>${tabReason}</div></div>`;
             }
             closingHtml += `</div>`;
         }
@@ -1988,14 +2249,24 @@ function injectOverlay(payload: Record<string, unknown>): void {
     }
 
     // --- CTA label ---
-    let ctaLabel = "Clean up";
-    if (closeCount > 0) {
-        ctaLabel = `Close ${closeCount} tab${closeCount !== 1 ? "s" : ""}`;
-    } else if (hasRealError) {
-        ctaLabel = "Help me fix this";
-    } else if (recommended.length > 0) {
-        ctaLabel = `Apply ${recommended.length} change${recommended.length !== 1 ? "s" : ""}`;
+    let ctaLabel = `Apply ${executableRecommended.length} change${executableRecommended.length !== 1 ? "s" : ""}`;
+    if (executableRecommended.length === 1) {
+        const actionType = String(executableRecommended[0].action_type || "");
+        if (actionType === "search_error") ctaLabel = "Search this error";
+        if (actionType === "open_url") ctaLabel = "Open recommended page";
+        if (actionType === "highlight_tab") ctaLabel = "Switch to recommended tab";
     }
+    const hasManualSuggestions = closeCount > 0
+        || actions.some((action) =>
+            action.category === "recommended"
+            && typeof action.action_id === "string"
+            && !executableIdSet.has(action.action_id)
+        );
+    const actionNote = !canExecute && executableRecommended.length > 0
+        ? "Suggestions only — workspace changes are off."
+        : hasManualSuggestions
+            ? "Manual review — Cortex won’t close or regroup existing tabs automatically."
+            : "";
 
     const host = document.createElement("div");
     host.id = OID;
@@ -2043,6 +2314,7 @@ function injectOverlay(payload: Record<string, unknown>): void {
 .trr{font-size:10px;color:#3f3f46;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .kn{font-size:11px;color:#3f3f46;margin-bottom:12px}
 .kc{color:#10b981}
+.nt{font-size:10px;color:#71717a;line-height:1.45;margin:0 0 12px;padding:8px 10px;background:rgba(255,255,255,.025);border-radius:6px}
 
 /* Error */
 .eb{padding:10px 12px;background:rgba(239,68,68,.08);border-radius:8px;border:1px solid rgba(239,68,68,.06);margin-bottom:12px}
@@ -2065,13 +2337,6 @@ function injectOverlay(payload: Record<string, unknown>): void {
 .ul{color:#3b82f6;cursor:pointer;font-weight:500;text-decoration:none;border:none;background:none;font-size:11px;font-family:inherit;padding:0}
 .ul:hover{text-decoration:underline}
 
-/* Keep button (per-tab) */
-.kb{margin-left:auto;padding:2px 8px;border:1px solid rgba(255,255,255,.08);border-radius:4px;background:none;color:#71717a;font-size:10px;cursor:pointer;font-family:inherit;flex-shrink:0;transition:all .12s}
-.kb:hover{color:#10b981;border-color:rgba(16,185,129,.3)}
-.tr.kept{opacity:.35;text-decoration:line-through}
-.tr.kept .kb{color:#10b981;border-color:#10b981}
-.tr.kept .tx{color:#3f3f46}
-
 /* Dismiss */
 .dm{display:block;width:100%;padding:6px;margin-top:6px;border:none;border-radius:6px;background:none;color:#3f3f46;cursor:pointer;font-size:11px;font-family:inherit;transition:color .12s}
 .dm:hover{color:#71717a}
@@ -2083,11 +2348,12 @@ function injectOverlay(payload: Record<string, unknown>): void {
   <div class="hd">${esc(headline)}</div>
   <div class="ds">${esc(summary)}</div>
   <div class="dv"></div>
-  ${closingHtml ? `<div class="sh">Closing ${closeCount} tab${closeCount !== 1 ? "s" : ""}</div>${closingHtml}` : ""}
+  ${closingHtml ? `<div class="sh">Review ${closeCount} tab suggestion${closeCount !== 1 ? "s" : ""}</div>${closingHtml}` : ""}
   ${keepCount > 0 ? `<div class="kn">Keeping <span class="kc">${keepCount}</span> you need</div>` : ""}
+  ${actionNote ? `<div class="nt">${esc(actionNote)}</div>` : ""}
   ${errHtml}
   ${stepsHtml ? `<div class="dv"></div>${stepsHtml}` : ""}
-  ${recommended.length > 0 ? `<button class="btn" id="cta">${esc(ctaLabel)}</button><div class="ur" id="undo-bar" style="display:none"><span>Done.</span><button class="ul" id="undo-btn">Undo</button></div>` : ""}
+  ${canExecute && executableRecommended.length > 0 ? `<button class="btn" id="cta">${esc(ctaLabel)}</button><div class="ur" id="undo-bar" style="display:none"><span>Done.</span><button class="ul" id="undo-btn">Undo</button></div>` : ""}
   <button class="dm" id="dm">Dismiss</button>
 </div>`;
 
@@ -2123,80 +2389,20 @@ function injectOverlay(payload: Record<string, unknown>): void {
         if (e.key === "Escape") dismiss();
     }, { once: true });
 
-    // LAYER 5: Per-tab Keep buttons — remove individual tabs from pending closes
-    const keptIndices = new Set<number>();
-    const keepBtns = shadow.querySelectorAll(".kb");
-    const updateCtaLabel = () => {
-        const remaining = closeCount - keptIndices.size;
-        if (ctaEl) {
-            if (remaining <= 0) {
-                (ctaEl as HTMLButtonElement).disabled = true;
-                ctaEl.textContent = "All tabs kept";
-                ctaEl.style.opacity = "0.4";
-            } else {
-                (ctaEl as HTMLButtonElement).disabled = false;
-                ctaEl.textContent = `Close ${remaining} tab${remaining !== 1 ? "s" : ""}`;
-                ctaEl.style.opacity = "1";
-            }
-        }
-    };
-    keepBtns.forEach(btn => {
-        btn.addEventListener("click", (e) => {
-            const idx = Number((e.currentTarget as HTMLElement).dataset.keepIdx);
-            const row = shadow.getElementById(`tr-${idx}`);
-            if (keptIndices.has(idx)) {
-                keptIndices.delete(idx);
-                row?.classList.remove("kept");
-                (e.currentTarget as HTMLElement).textContent = "Keep";
-            } else {
-                keptIndices.add(idx);
-                row?.classList.add("kept");
-                (e.currentTarget as HTMLElement).textContent = "Kept";
-            }
-            updateCtaLabel();
-        });
-    });
-
     // CTA
     const ctaEl = shadow.getElementById("cta");
     if (ctaEl) {
         ctaEl.addEventListener("click", () => {
-            // Filter out actions for tabs the user chose to keep
-            const toExecute = actions.filter((a) => {
-                if (a.category !== "recommended") return false;
-                // Match kept indices to close actions by their position among recommended close actions
-                const closeActions = actions.filter(x =>
-                    x.category === "recommended" && (x.action_type === "close_tab" || x.action_type === "bookmark_and_close"));
-                const closeIdx = closeActions.indexOf(a);
-                if (closeIdx >= 0 && keptIndices.has(closeIdx)) return false;
-                return true;
-            });
+            const toExecute = executableRecommended;
             if (toExecute.length === 0) return;
             (ctaEl as HTMLButtonElement).disabled = true;
             ctaEl.textContent = "Working\u2026";
             ctaEl.style.opacity = "0.5";
 
-            // Build per-tab feedback: which tabs were kept vs closed
-            const closeTabs = tabRecs?.tabs?.filter(
-                t => t.action === "close" || t.action === "bookmark_and_close"
-            ) || [];
-            const keptTabData = Array.from(keptIndices).map(i => ({
-                url: String(closeTabs[i]?.url || ""),
-                title: String(closeTabs[i]?.tab_title || ""),
-            })).filter(t => t.url);
-            const closedTabData = closeTabs
-                .filter((_, i) => !keptIndices.has(i))
-                .map(t => ({
-                    url: String(t.url || ""),
-                    title: String(t.tab_title || ""),
-                })).filter(t => t.url);
-
             chrome.runtime.sendMessage({
                 type: "EXECUTE_ALL_RECOMMENDED",
                 actions: toExecute,
                 intervention_id: payload.intervention_id,
-                kept_tabs: keptTabData,
-                closed_tabs: closedTabData,
             }, (results: Array<Record<string, unknown>>) => {
                 const failCount = Array.isArray(results) ? results.filter(r => !r.success).length : 0;
                 const successCount = (Array.isArray(results) ? results.length : 0) - failCount;
@@ -2205,7 +2411,7 @@ function injectOverlay(payload: Record<string, unknown>): void {
                 ctaEl.classList.add("ok");
                 ctaEl.textContent = failCount > 0
                     ? `Done (${failCount} skipped)`
-                    : `${successCount} tab${successCount !== 1 ? "s" : ""} closed`;
+                    : `${successCount} change${successCount !== 1 ? "s" : ""} applied`;
 
                 const undoBar = shadow.getElementById("undo-bar");
                 if (undoBar) undoBar.style.display = "flex";
@@ -2394,6 +2600,22 @@ async function handleIntervention(
     payload: Record<string, unknown>,
 ): Promise<void> {
     const uiPlan = payload.ui_plan as Record<string, boolean> | undefined;
+    let executableActionIds: string[] = [];
+    try {
+        executableActionIds = await verifiedPresentedActionIds(
+            payload,
+            "browser",
+        );
+    } catch (error) {
+        // A proposal may still contain useful manual guidance, but an invalid,
+        // stale, or absent manifest must never produce an enabled affordance.
+        if (DEBUG) {
+            console.debug(
+                "[cortex.bg] intervention has no valid executable manifest:",
+                String(error),
+            );
+        }
+    }
 
     // INTERVENTION_TRIGGER is a proposal event, never an apply command.
     // Presentation is allowed; tab grouping/hiding and action execution require
@@ -2409,7 +2631,7 @@ async function handleIntervention(
                 await chrome.scripting.executeScript({
                     target: { tabId: tab.id },
                     func: injectOverlay,
-                    args: [payload],
+                    args: [payload, executableActionIds],
                 });
             }
         } catch (e) {
@@ -2481,25 +2703,10 @@ async function handleContextRequest(msg: WSMessage): Promise<void> {
 }
 
 async function handleRestore(payload: Record<string, unknown>): Promise<void> {
-    // B.2: track real restore outcome so the daemon's
-    // InterventionOutcome.workspace_restored reflects truth, not
-    // optimistic defaults. Each effect either appends an applied descriptor
-    // or pushes an error.
-    const appliedActions: string[] = [];
-    const errors: string[] = [];
-
-    const interventionId = payload.intervention_id;
-    try {
-        if (typeof interventionId === "string") {
-            await restoreTabsForIntervention(interventionId);
-            appliedActions.push("restore_tabs_for_intervention");
-        } else {
-            await restoreAllTabs();
-            appliedActions.push("restore_all_tabs");
-        }
-    } catch (e) {
-        errors.push(`restore_tabs: ${(e as Error)?.message ?? String(e)}`);
-    }
+    // A legacy restore frame closes presentation only. Workspace restoration
+    // requires an exact restore_id plus receipt-derived inverse actions and is
+    // handled by the fail-closed transaction adapter below.
+    const exactRestore = await handleExactRestoreCommand(payload);
     try {
         const tabs = await chrome.tabs.query({});
         await Promise.all(
@@ -2513,10 +2720,7 @@ async function handleRestore(payload: Record<string, unknown>): Promise<void> {
                     }),
                 ),
         );
-        appliedActions.push("remove_overlay");
-    } catch {
-        errors.push("remove_overlay");
-    }
+    } catch { /* best-effort presentation cleanup */ }
     // F4 (Phase-4 audit): the in-memory latch MUST be nulled even if
     // session-storage clearing throws. The earlier ``try { ... } catch {}``
     // both swallowed the failure and worked correctly, but a noisy
@@ -2529,8 +2733,9 @@ async function handleRestore(payload: Record<string, unknown>): Promise<void> {
             "cortex_active_intervention",
             "cortex_active_intervention_cid",
             "cortex_active_intervention_mounted_at",
-            "cortex_tab_snapshot",
-            "cortex_tab_mgr_snapshots",
+            ...(exactRestore
+                ? ["cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]
+                : []),
         ]);
     } catch (err) {
         console.warn(
@@ -2539,16 +2744,6 @@ async function handleRestore(payload: Record<string, unknown>): Promise<void> {
         );
     }
     broadcastToPopup({ type: "INTERVENTION_RESTORE", payload });
-
-    if (typeof interventionId === "string") {
-        sendInterventionApplied(
-            interventionId,
-            "restore",
-            errors.length === 0,
-            appliedActions,
-            errors,
-        );
-    }
 }
 
 // --- Tab Management ---
@@ -3264,7 +3459,1783 @@ function pushUndo(entry: UndoEntry): void {
     schedulePersist();
 }
 
-async function executeAction(action: SuggestedAction): Promise<ActionExecuteResult> {
+interface BrowserCapabilityResult {
+    result: ActionExecuteResult;
+    inverse: Record<string, unknown>;
+    status: "succeeded" | "failed" | "already_complete";
+}
+
+interface BrowserEffectVerification {
+    verified: boolean;
+    detail: string;
+    fingerprint: Record<string, unknown>;
+}
+
+function urlsMatch(left: unknown, right: unknown): boolean {
+    if (typeof left !== "string" || typeof right !== "string") return false;
+    try {
+        return new URL(left).href === new URL(right).href;
+    } catch {
+        return left === right;
+    }
+}
+
+async function verifyBrowserEffect(
+    action: ManifestAction,
+    inverse: Record<string, unknown>,
+): Promise<BrowserEffectVerification> {
+    if (inverse.noEffect === true) {
+        return {
+            verified: true,
+            detail: "No eligible workspace object required a change",
+            fingerprint: { capability: action.capability, noEffect: true },
+        };
+    }
+    if (action.capability === "hide_tabs_except_active") {
+        const groupId = typeof inverse.groupId === "number" ? inverse.groupId : null;
+        const tabIds = Array.isArray(inverse.hiddenTabIds)
+            ? inverse.hiddenTabIds.filter((id): id is number => typeof id === "number")
+            : [];
+        const tabs = await chrome.tabs.query({});
+        const grouped = tabs.filter(
+            (tab) => typeof tab.id === "number" && tabIds.includes(tab.id),
+        );
+        let collapsed = false;
+        if (groupId !== null) {
+            try {
+                collapsed = (await chrome.tabGroups.get(groupId)).collapsed === true;
+            } catch {
+                collapsed = false;
+            }
+        }
+        const verified = groupId !== null
+            && tabIds.length > 0
+            && grouped.length === tabIds.length
+            && grouped.every((tab) => tab.groupId === groupId)
+            && collapsed;
+        return {
+            verified,
+            detail: verified
+                ? "Exact Cortex tab group verified"
+                : "Tab group postcondition could not be verified",
+            fingerprint: {
+                groupId,
+                tabIds: [...tabIds].sort((a, b) => a - b),
+                collapsed,
+            },
+        };
+    }
+    const originalTabId = typeof inverse.originalTabId === "number"
+        ? inverse.originalTabId
+        : null;
+    if (action.capability === "close_tab" || action.capability === "bookmark_and_close") {
+        let originalAbsent = originalTabId !== null;
+        if (originalTabId !== null) {
+            try {
+                await chrome.tabs.get(originalTabId);
+                originalAbsent = false;
+            } catch {
+                originalAbsent = true;
+            }
+        }
+        let bookmarkVerified = true;
+        const bookmarkId = typeof inverse.bookmarkId === "string"
+            ? inverse.bookmarkId
+            : "";
+        if (action.capability === "bookmark_and_close") {
+            bookmarkVerified = false;
+            if (bookmarkId) {
+                try {
+                    const [bookmark] = await chrome.bookmarks.get(bookmarkId);
+                    bookmarkVerified = Boolean(
+                        bookmark && urlsMatch(bookmark.url, inverse.url),
+                    );
+                } catch {
+                    bookmarkVerified = false;
+                }
+            }
+        }
+        const verified = originalAbsent && bookmarkVerified;
+        return {
+            verified,
+            detail: verified
+                ? "Exact closed-tab postcondition verified"
+                : "Closed-tab postcondition could not be verified",
+            fingerprint: { originalTabId, originalAbsent, bookmarkId, bookmarkVerified },
+        };
+    }
+    if (action.capability === "group_tabs") {
+        const groupId = typeof inverse.groupId === "number" ? inverse.groupId : null;
+        const tabIds = Array.isArray(inverse.tabIds)
+            ? inverse.tabIds.filter((id): id is number => typeof id === "number")
+            : [];
+        const tabs = await chrome.tabs.query({});
+        const grouped = tabs.filter(
+            (tab) => typeof tab.id === "number" && tabIds.includes(tab.id),
+        );
+        let collapsed = false;
+        if (groupId !== null) {
+            try {
+                collapsed = (await chrome.tabGroups.get(groupId)).collapsed === true;
+            } catch {
+                collapsed = false;
+            }
+        }
+        const verified = groupId !== null
+            && tabIds.length > 0
+            && grouped.length === tabIds.length
+            && grouped.every((tab) => tab.groupId === groupId)
+            && collapsed;
+        return {
+            verified,
+            detail: verified
+                ? "Exact grouped tabs verified"
+                : "Grouped-tab postcondition could not be verified",
+            fingerprint: {
+                groupId,
+                tabIds: [...tabIds].sort((a, b) => a - b),
+                collapsed,
+            },
+        };
+    }
+    if (action.capability === "open_url" || action.capability === "search_error") {
+        const tabId = typeof inverse.tabId === "number" ? inverse.tabId : null;
+        let actualUrl: string | null = null;
+        let pendingUrl: string | null = null;
+        if (tabId !== null) {
+            try {
+                const tab = await chrome.tabs.get(tabId);
+                actualUrl = tab.url ?? null;
+                pendingUrl = tab.pendingUrl ?? null;
+            } catch {
+                actualUrl = null;
+                pendingUrl = null;
+            }
+        }
+        const verified = tabId !== null && (
+            urlsMatch(actualUrl, inverse.url)
+            || urlsMatch(pendingUrl, inverse.url)
+        );
+        return {
+            verified,
+            detail: verified
+                ? "Exact Cortex-created tab verified"
+                : "Created-tab postcondition could not be verified",
+            fingerprint: { tabId, actualUrl, pendingUrl },
+        };
+    }
+    if (action.capability === "highlight_tab") {
+        const targetTabId = typeof inverse.targetTabId === "number"
+            ? inverse.targetTabId
+            : null;
+        const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+        const verified = targetTabId !== null && active?.id === targetTabId;
+        return {
+            verified,
+            detail: verified
+                ? "Exact active tab verified"
+                : "Active-tab postcondition could not be verified",
+            fingerprint: { targetTabId, activeTabId: active?.id ?? null },
+        };
+    }
+    return {
+        verified: false,
+        detail: `No verifier exists for ${action.capability}`,
+        fingerprint: { capability: action.capability },
+    };
+}
+
+function monotonicNowNs(): number {
+    const milliseconds = typeof globalThis.performance?.now === "function"
+        ? globalThis.performance.now()
+        : 0;
+    return Math.max(0, Math.round(milliseconds * 1_000_000));
+}
+
+function operationKey(interventionId: string, actionId: string): string {
+    return `${interventionId}:${actionId}`;
+}
+
+function newCreatedTabStageUrl(): string {
+    return `${CREATED_TAB_STAGE_PREFIX}${newWireId()}`;
+}
+
+function validCreatedTabStageUrl(value: unknown): value is string {
+    if (typeof value !== "string" || !value.startsWith(CREATED_TAB_STAGE_PREFIX)) {
+        return false;
+    }
+    const token = value.slice(CREATED_TAB_STAGE_PREFIX.length);
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+        .test(token);
+}
+
+/**
+ * Recover the identity of a tab created immediately before an MV3 worker
+ * termination. A created tab receives a unique, inert staging URL before
+ * Cortex checkpoints its Chrome tab id; navigation to the requested URL only
+ * happens after that checkpoint is durable. Therefore zero marker matches
+ * proves that no created-tab effect remains, while one match is the exact
+ * Cortex-owned object that compensation may remove.
+ */
+async function reconcileCreatedTabInverse(
+    inverse: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+    if (typeof inverse.tabId === "number") return { ...inverse };
+    if (!validCreatedTabStageUrl(inverse.stagingUrl)) return { ...inverse };
+
+    const tabs = await chrome.tabs.query({});
+    const matches = tabs.filter((tab) =>
+        typeof tab.id === "number"
+        && (
+            urlsMatch(tab.url, inverse.stagingUrl)
+            || urlsMatch(tab.pendingUrl, inverse.stagingUrl)
+        )
+    );
+    if (matches.length === 0) {
+        const recovered: Record<string, unknown> = { ...inverse, noEffect: true };
+        delete recovered.tabId;
+        delete recovered.cortexEffectMayExist;
+        return recovered;
+    }
+    if (matches.length === 1) {
+        const recovered: Record<string, unknown> = {
+            ...inverse,
+            tabId: matches[0].id,
+            cortexEffectMayExist: true,
+        };
+        delete recovered.noEffect;
+        return recovered;
+    }
+    throw new IndeterminateBrowserMutationError(
+        "Multiple tabs share a Cortex recovery marker; automatic ownership is ambiguous",
+        {
+            ...inverse,
+            cortexEffectMayExist: true,
+            recoveryConflictCount: matches.length,
+        },
+    );
+}
+
+function suggestedActionFromManifest(action: ManifestAction): SuggestedAction {
+    const parameters = JSON.parse(action.parameters_json || "{}") as Record<string, unknown>;
+    const raw = parameters.suggested_action;
+    if (!isSuggestedAction(raw)) {
+        throw new Error("manifest suggested action failed runtime validation");
+    }
+    if (raw.action_id !== action.action_id || raw.action_type !== action.capability) {
+        throw new Error("suggested action differs from manifest capability");
+    }
+    const candidate = raw as unknown as Record<string, unknown>;
+    const target = candidate.target;
+    const label = candidate.label;
+    const reason = candidate.reason;
+    const tabIndex = candidate.tab_index;
+    const metadata = candidate.metadata;
+    if (
+        (target !== undefined && (typeof target !== "string" || target.length > 500))
+        || typeof label !== "string"
+        || label.length === 0
+        || label.length > 200
+        || (reason !== undefined && (typeof reason !== "string" || reason.length > 300))
+        || (
+            tabIndex !== undefined
+            && tabIndex !== null
+            && (
+                typeof tabIndex !== "number"
+                || !Number.isInteger(tabIndex)
+                || tabIndex < 0
+            )
+        )
+        || (
+            metadata !== undefined
+            && (
+                typeof metadata !== "object"
+                || metadata === null
+                || Array.isArray(metadata)
+            )
+        )
+    ) {
+        throw new Error("suggested action fields are invalid");
+    }
+    if (
+        new Set(["close_tab", "bookmark_and_close", "highlight_tab"])
+            .has(action.capability)
+        && (typeof tabIndex !== "number" || !Number.isInteger(tabIndex))
+    ) {
+        throw new Error("tab action lacks an exact non-negative index");
+    }
+    const metadataRecord = (metadata ?? {}) as Record<string, unknown>;
+    if (action.capability === "group_tabs") {
+        const rawIndices = metadataRecord.tab_indices;
+        const indices = Array.isArray(rawIndices) ? [...rawIndices] : [];
+        if (typeof tabIndex === "number" && Number.isInteger(tabIndex)) {
+            indices.push(tabIndex);
+        }
+        if (
+            indices.length === 0
+            || indices.length > 32
+            || indices.some((value) =>
+                typeof value !== "number"
+                || !Number.isInteger(value)
+                || value < 0
+            )
+        ) {
+            throw new Error("group_tabs lacks bounded exact tab indices");
+        }
+    }
+    if (action.capability === "open_url") {
+        try {
+            const parsed = new URL(String(target ?? ""));
+            if (!new Set(["http:", "https:"]).has(parsed.protocol) || !parsed.hostname) {
+                throw new Error("unsafe URL");
+            }
+        } catch {
+            throw new Error("open_url target must be an absolute HTTP(S) URL");
+        }
+    }
+    if (action.capability === "search_error") {
+        const query = String(metadataRecord.search_query ?? target ?? "");
+        if (!query || query.length > 200 || /[\r\n]/.test(query)) {
+            throw new Error("search_error query is invalid");
+        }
+    }
+    if (action.capability === "start_timer") {
+        const minutes = metadataRecord.minutes ?? 5;
+        if (
+            typeof minutes !== "number"
+            || !Number.isInteger(minutes)
+            || minutes < 1
+            || minutes > 240
+        ) {
+            throw new Error("timer duration must be 1..240 minutes");
+        }
+    }
+    return raw as SuggestedAction;
+}
+
+function normalizedSuggestionForConsent(
+    value: unknown,
+): Record<string, unknown> | null {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        return null;
+    }
+    const candidate = value as Record<string, unknown>;
+    if (
+        typeof candidate.action_id !== "string"
+        || !candidate.action_id
+        || typeof candidate.action_type !== "string"
+        || !candidate.action_type
+        || typeof candidate.label !== "string"
+        || !candidate.label
+    ) {
+        return null;
+    }
+    const tabIndex = candidate.tab_index ?? null;
+    const target = candidate.target ?? "";
+    const reason = candidate.reason ?? "";
+    const category = candidate.category ?? "recommended";
+    const reversible = candidate.reversible ?? false;
+    const groupId = candidate.group_id ?? null;
+    const metadata = candidate.metadata ?? {};
+    const catalogId = candidate.catalog_id ?? null;
+    if (
+        (tabIndex !== null && (
+            typeof tabIndex !== "number"
+            || !Number.isInteger(tabIndex)
+            || tabIndex < 0
+        ))
+        || typeof target !== "string"
+        || typeof reason !== "string"
+        || !new Set(["recommended", "optional", "informational"]).has(
+            String(category),
+        )
+        || typeof reversible !== "boolean"
+        || (groupId !== null && typeof groupId !== "string")
+        || typeof metadata !== "object"
+        || metadata === null
+        || Array.isArray(metadata)
+        || (catalogId !== null && typeof catalogId !== "string")
+    ) {
+        return null;
+    }
+    return {
+        action_id: candidate.action_id,
+        action_type: candidate.action_type,
+        tab_index: tabIndex,
+        target,
+        label: candidate.label,
+        reason,
+        category,
+        reversible,
+        group_id: groupId,
+        metadata,
+        catalog_id: catalogId,
+    };
+}
+
+function presentationMatchesManifestAction(
+    action: ManifestAction,
+    candidate: unknown,
+): boolean {
+    if (action.source !== "suggested_action") return false;
+    try {
+        const expected = normalizedSuggestionForConsent(
+            suggestedActionFromManifest(action),
+        );
+        const displayed = normalizedSuggestionForConsent(candidate);
+        return expected !== null
+            && displayed !== null
+            && canonicalJson(expected) === canonicalJson(displayed);
+    } catch {
+        return false;
+    }
+}
+
+async function prepareBrowserInverse(
+    interventionId: string,
+    action: ManifestAction,
+): Promise<Record<string, unknown>> {
+    if (action.capability === "hide_tabs_except_active") {
+        const tabs = await chrome.tabs.query({ currentWindow: true });
+        return {
+            interventionId,
+            activeTabId: tabs.find((tab) => tab.active)?.id ?? null,
+            candidateTabIds: tabs
+                .filter((tab) => !tab.active && typeof tab.id === "number")
+                .map((tab) => tab.id),
+        };
+    }
+    if (action.source !== "suggested_action") return {};
+    const suggested = suggestedActionFromManifest(action);
+    if (
+        suggested.action_type === "close_tab"
+        || suggested.action_type === "bookmark_and_close"
+    ) {
+        await loadSnapshotFromStorage();
+        const index = suggested.tab_index;
+        const snapshot = typeof index === "number"
+            ? interventionTabSnapshot.get(index)
+            : undefined;
+        let live: chrome.tabs.Tab | null = null;
+        if (typeof snapshot?.chromeTabId === "number") {
+            try {
+                live = await chrome.tabs.get(snapshot.chromeTabId);
+            } catch {
+                live = null;
+            }
+        }
+        return {
+            url: snapshot?.url || "",
+            title: snapshot?.title || "",
+            originalTabId: snapshot?.chromeTabId ?? null,
+            windowId: live?.windowId ?? null,
+            index: live?.index ?? null,
+            pinned: live?.pinned ?? false,
+        };
+    }
+    if (suggested.action_type === "group_tabs") {
+        await loadSnapshotFromStorage();
+        const metadata = suggested.metadata || {};
+        const indices = Array.isArray(metadata.tab_indices)
+            ? metadata.tab_indices.filter(
+                (value): value is number => Number.isInteger(value),
+            )
+            : [];
+        if (typeof suggested.tab_index === "number") indices.push(suggested.tab_index);
+        return {
+            tabIds: indices
+                .map((index) => interventionTabSnapshot.get(index)?.chromeTabId)
+                .filter((value): value is number => typeof value === "number"),
+        };
+    }
+    if (
+        suggested.action_type === "open_url"
+        || suggested.action_type === "search_error"
+    ) {
+        const query = String((suggested.metadata || {}).search_query || suggested.target || "");
+        return {
+            url: suggested.action_type === "search_error"
+                ? `https://www.google.com/search?q=${encodeURIComponent(query)}`
+                : suggested.target,
+            stagingUrl: newCreatedTabStageUrl(),
+            createdAfterUnixMs: Date.now(),
+        };
+    }
+    if (suggested.action_type === "highlight_tab") {
+        const [prior] = await chrome.tabs.query({ active: true, currentWindow: true });
+        const target = typeof suggested.tab_index === "number"
+            ? interventionTabSnapshot.get(suggested.tab_index)
+            : undefined;
+        return {
+            priorActiveTabId: prior?.id ?? null,
+            targetTabId: target?.chromeTabId ?? null,
+            noEffect: typeof prior?.id === "number"
+                && prior.id === target?.chromeTabId,
+        };
+    }
+    return {};
+}
+
+function latestUndoData(actionId: string): Record<string, unknown> | null {
+    for (let index = undoStack.length - 1; index >= 0; index--) {
+        if (undoStack[index]?.action_id === actionId) {
+            return { ...undoStack[index].undo_data };
+        }
+    }
+    return null;
+}
+
+async function executeBrowserManifestAction(
+    interventionId: string,
+    action: ManifestAction,
+    preparedInverse: Record<string, unknown>,
+    checkpointInverse: (inverse: Record<string, unknown>) => Promise<void>,
+): Promise<BrowserCapabilityResult> {
+    if (action.capability === "hide_tabs_except_active") {
+        const existing = getTabManagerSnapshot(interventionId);
+        if (existing) {
+            return {
+                result: {
+                    action_id: action.action_id,
+                    success: true,
+                    message: "Tabs were already simplified by Cortex",
+                    reversible: true,
+                },
+                inverse: { ...existing },
+                status: "already_complete",
+            };
+        }
+        const snapshot = await hideNonActiveTabs(
+            interventionId,
+            undefined,
+            async (grouped) => checkpointInverse({
+                ...preparedInverse,
+                ...grouped,
+            }),
+        );
+        if (snapshot === null) {
+            const candidates = Array.isArray(preparedInverse.candidateTabIds)
+                ? preparedInverse.candidateTabIds
+                : [];
+            if (candidates.length > 0) {
+                return {
+                    result: {
+                        action_id: action.action_id,
+                        success: false,
+                        message: "Could not create the exact Cortex tab group",
+                        reversible: false,
+                    },
+                    inverse: { ...preparedInverse },
+                    status: "failed",
+                };
+            }
+            return {
+                result: {
+                    action_id: action.action_id,
+                    success: true,
+                    message: "No eligible tabs needed hiding",
+                    reversible: true,
+                },
+                inverse: { ...preparedInverse, noEffect: true },
+                status: "already_complete",
+            };
+        }
+        return {
+            result: {
+                action_id: action.action_id,
+                success: true,
+                message: `${snapshot.hiddenTabIds.length} tabs simplified`,
+                reversible: true,
+            },
+            inverse: { ...snapshot },
+            status: "succeeded",
+        };
+    }
+    if (action.source !== "suggested_action") {
+        throw new Error(`unsupported browser capability ${action.capability}`);
+    }
+    const suggested = suggestedActionFromManifest(action);
+    if (action.capability === "highlight_tab" && preparedInverse.noEffect === true) {
+        return {
+            result: {
+                action_id: action.action_id,
+                success: true,
+                message: "The exact target tab was already active",
+                reversible: false,
+            },
+            inverse: { ...preparedInverse },
+            status: "already_complete",
+        };
+    }
+    const result = await executeAction(
+        suggested,
+        preparedInverse,
+        checkpointInverse,
+    );
+    const inverse = {
+        ...preparedInverse,
+        ...(latestUndoData(action.action_id) || {}),
+    };
+    if (
+        (suggested.action_type === "open_url"
+            || suggested.action_type === "search_error")
+        && typeof inverse.tabId === "number"
+    ) {
+        inverse.url = preparedInverse.url;
+    }
+    return {
+        result: {
+            ...result,
+            reversible: result.success && Boolean(action.reverse_capability),
+        },
+        inverse,
+        status: result.success ? "succeeded" : "failed",
+    };
+}
+
+async function makeActionReceipt(args: {
+    interventionId: string;
+    authorizationId: string;
+    manifestSha256: string;
+    actionId: string;
+    phase: "apply" | "compensate" | "restore";
+    status: "succeeded" | "failed" | "already_complete";
+    startedWallMs: number;
+    startedMonoNs: number;
+    inverse: Record<string, unknown>;
+    verification: "verified" | "failed" | "not_applicable";
+    verificationDetail: string;
+    afterFingerprint: string | null;
+    errorCode?: string;
+    errorMessage?: string;
+    retryable?: boolean;
+}): Promise<ActionReceipt> {
+    const counterKey = [
+        args.authorizationId,
+        args.actionId,
+        args.phase,
+    ].join(":");
+    const attempt = await mutateTransactionJournal((journal) => {
+        const next = (journal.attempt_counters[counterKey] ?? 0) + 1;
+        if (next > 100) {
+            throw new Error("receipt retry limit exceeded");
+        }
+        journal.attempt_counters[counterKey] = next;
+        return next;
+    });
+    const endedMonoNs = Math.max(args.startedMonoNs, monotonicNowNs());
+    const endedWallMs = Math.max(args.startedWallMs, Date.now());
+    return {
+        receipt_id: `rcpt_${newWireId().replace(/-/g, "")}`,
+        intervention_id: args.interventionId,
+        authorization_id: args.authorizationId,
+        manifest_sha256: args.manifestSha256,
+        action_id: args.actionId,
+        phase: args.phase,
+        attempt,
+        idempotency_key: `${args.authorizationId}:${args.actionId}:${args.phase}:${attempt}`,
+        status: args.status,
+        started_at_unix_ms: args.startedWallMs,
+        ended_at_unix_ms: endedWallMs,
+        started_at_mono_ns: args.startedMonoNs,
+        ended_at_mono_ns: endedMonoNs,
+        duration_ms: Math.floor((endedMonoNs - args.startedMonoNs) / 1_000_000),
+        boot_id: CLIENT_BOOT_ID,
+        inverse_payload_json: canonicalJson(args.inverse),
+        verification: args.verification,
+        verification_detail: args.verificationDetail.slice(0, 500),
+        after_fingerprint: args.afterFingerprint,
+        error_code: args.errorCode,
+        error_message: args.errorMessage?.slice(0, 500),
+        retryable: args.retryable ?? false,
+        source_client_type: null,
+        source_client_id: null,
+    };
+}
+
+async function sendReceiptBatch(batch: InterventionReceiptBatch): Promise<void> {
+    await mutateTransactionJournal((journal) => {
+        const receiptIds = new Set(batch.receipts.map((receipt) => receipt.receipt_id));
+        const alreadyQueued = journal.receipt_outbox.some((queued) =>
+            queued.receipts.some((receipt) => receiptIds.has(receipt.receipt_id))
+        );
+        if (!alreadyQueued) {
+            if (journal.receipt_outbox.length >= MAX_RECEIPT_OUTBOX) {
+                throw new Error("transaction receipt outbox is full");
+            }
+            journal.receipt_outbox.push(batch);
+        }
+    });
+    send({
+        type: "INTERVENTION_RECEIPT",
+        payload: batch as unknown as Record<string, unknown>,
+        timestamp: Date.now() / 1000,
+        sequence: ++sequence,
+    });
+}
+
+async function flushReceiptOutbox(): Promise<void> {
+    let journal: BrowserTransactionJournal;
+    try {
+        journal = await readTransactionJournal();
+    } catch (error) {
+        console.warn("[cortex.bg] cannot flush corrupt receipt outbox:", String(error));
+        return;
+    }
+    for (const batch of journal.receipt_outbox) {
+        send({
+            type: "INTERVENTION_RECEIPT",
+            payload: batch as unknown as Record<string, unknown>,
+            timestamp: Date.now() / 1000,
+            sequence: ++sequence,
+        });
+    }
+}
+
+async function acknowledgeReceiptOutbox(payload: Record<string, unknown>): Promise<void> {
+    const authorizationId = typeof payload.authorization_id === "string"
+        ? payload.authorization_id
+        : "";
+    const interventionId = typeof payload.intervention_id === "string"
+        ? payload.intervention_id
+        : "";
+    const state = typeof payload.state === "string" ? payload.state : "";
+    if (
+        !authorizationId
+        || !new Set([
+            "applied", "partial", "failed", "restored", "restore_failed",
+        ]).has(state)
+    ) {
+        return;
+    }
+    try {
+        await mutateTransactionJournal((journal) => {
+            journal.receipt_outbox = journal.receipt_outbox.filter(
+                (batch) => batch.authorization_id !== authorizationId,
+            );
+            if (
+                state === "restored"
+                && interventionId
+                && !journal.receipt_outbox.some(
+                    (batch) => batch.intervention_id === interventionId,
+                )
+            ) {
+                const retired: BrowserOperationRecord[] = [];
+                for (const [key, operation] of Object.entries(journal.operations)) {
+                    if (
+                        operation.intervention_id === interventionId
+                        && operation.state === "restored"
+                    ) {
+                        retired.push(operation);
+                        delete journal.operations[key];
+                        delete journal.consumed_authorizations[
+                            operation.authorization_id
+                        ];
+                    }
+                }
+                for (const counterKey of Object.keys(journal.attempt_counters)) {
+                    if (retired.some((operation) =>
+                        counterKey === [
+                            operation.authorization_id,
+                            operation.action_id,
+                            "apply",
+                        ].join(":")
+                        || counterKey.endsWith(`:${operation.action_id}:restore`)
+                        || counterKey.endsWith(`:${operation.action_id}:compensate`)
+                    )) {
+                        delete journal.attempt_counters[counterKey];
+                    }
+                }
+            }
+        });
+    } catch (error) {
+        console.warn("[cortex.bg] receipt acknowledgement persistence failed:", String(error));
+    }
+}
+
+function pendingAuthorizationForPayload(
+    payload: Record<string, unknown>,
+): [string, PendingAuthorization] | null {
+    const requestId = typeof payload.authorization_request_id === "string"
+        ? payload.authorization_request_id
+        : null;
+    if (requestId) {
+        const pending = pendingAuthorizations.get(requestId);
+        if (pending) return [requestId, pending];
+    }
+    const authorizationId = typeof payload.authorization_id === "string"
+        ? payload.authorization_id
+        : null;
+    if (!authorizationId) return null;
+    for (const [candidateRequestId, pending] of pendingAuthorizations) {
+        if (pending.authorizationId === authorizationId) {
+            return [candidateRequestId, pending];
+        }
+    }
+    return null;
+}
+
+function settleDeniedAuthorization(payload: Record<string, unknown>): void {
+    const match = pendingAuthorizationForPayload(payload);
+    if (!match) return;
+    const [requestId, pending] = match;
+    clearTimeout(pending.timeout);
+    pendingAuthorizations.delete(requestId);
+    const detail = typeof payload.detail === "string" && payload.detail.length > 0
+        ? payload.detail
+        : "The action was not authorized";
+    pending.resolve(pending.actionIds.map((actionId) => ({
+        action_id: actionId,
+        success: false,
+        message: detail,
+        reversible: false,
+    })));
+}
+
+function settleAuthorizationFromState(payload: Record<string, unknown>): void {
+    const match = pendingAuthorizationForPayload(payload);
+    if (!match) return;
+    const [requestId, pending] = match;
+    if (typeof payload.authorization_id === "string") {
+        pending.authorizationId = payload.authorization_id;
+    }
+
+    const rawResults = Array.isArray(payload.receipt_results)
+        ? payload.receipt_results
+        : [];
+    for (const raw of rawResults) {
+        if (typeof raw !== "object" || raw === null || Array.isArray(raw)) continue;
+        const result = raw as Record<string, unknown>;
+        const actionId = typeof result.action_id === "string"
+            ? result.action_id
+            : "";
+        if (!pending.actionIds.includes(actionId)) continue;
+        const status = typeof result.status === "string" ? result.status : "failed";
+        pending.localResults.set(actionId, {
+            action_id: actionId,
+            success: status === "succeeded" || status === "already_complete",
+            message: typeof result.detail === "string" && result.detail.length > 0
+                ? result.detail
+                : status === "succeeded" || status === "already_complete"
+                    ? "Action verified"
+                    : "Action failed verification",
+            reversible: Boolean(result.reversible),
+        });
+    }
+
+    const state = typeof payload.state === "string" ? payload.state : "";
+    if (!new Set([
+        "applied", "partial", "failed", "restored", "restore_failed",
+    ]).has(state)) return;
+    clearTimeout(pending.timeout);
+    pendingAuthorizations.delete(requestId);
+    if (state === "restored" || state === "restore_failed") {
+        pending.resolve(pending.actionIds.map((actionId) => ({
+            action_id: actionId,
+            success: false,
+            message: state === "restored"
+                ? "The apply acknowledgement was lost, so Cortex safely restored the action"
+                : "Cortex could not verify recovery after the apply acknowledgement was lost",
+            reversible: state === "restore_failed",
+        })));
+        return;
+    }
+    pending.resolve(pending.actionIds.map((actionId) => {
+        const exact = pending.localResults.get(actionId);
+        if (exact) return exact;
+        if (state === "applied") {
+            return {
+                action_id: actionId,
+                success: true,
+                message: "Action was applied and verified",
+                reversible: true,
+            };
+        }
+        return {
+            action_id: actionId,
+            success: false,
+            message: state === "partial"
+                ? "The transaction only partially completed"
+                : "The transaction failed",
+            reversible: false,
+        };
+    }));
+}
+
+async function authorizeActionIds(
+    interventionId: string,
+    actionIds: string[],
+    presentedActions?: unknown[],
+): Promise<ActionExecuteResult[]> {
+    if (!workspaceMutationAllowed()) {
+        throw new Error("Action unavailable in suggest-only mode");
+    }
+    if (
+        !activeIntervention
+        || activeIntervention.plan.intervention_id !== interventionId
+    ) {
+        throw new Error("Intervention is no longer active");
+    }
+    const verified = await verifyActionManifest(
+        activeIntervention.plan.action_manifest,
+    );
+    const approved = [...new Set(actionIds)].sort();
+    if (
+        approved.length === 0
+        || approved.some((actionId) => !verified.actionsById.has(actionId))
+    ) {
+        throw new Error("Requested action is absent from the manifest");
+    }
+    const mountedSuggestions = Array.isArray(
+        activeIntervention.plan.suggested_actions,
+    )
+        ? activeIntervention.plan.suggested_actions
+        : [];
+    for (const actionId of approved) {
+        const immutable = verified.actionsById.get(actionId);
+        const mounted = mountedSuggestions.find((candidate) =>
+            typeof candidate === "object"
+            && candidate !== null
+            && !Array.isArray(candidate)
+            && (candidate as Record<string, unknown>).action_id === actionId
+        );
+        const supplied = presentedActions?.find((candidate) =>
+            typeof candidate === "object"
+            && candidate !== null
+            && !Array.isArray(candidate)
+            && (candidate as Record<string, unknown>).action_id === actionId
+        );
+        if (
+            !immutable
+            || !presentationMatchesManifestAction(immutable, mounted)
+            || (
+                presentedActions !== undefined
+                && !presentationMatchesManifestAction(immutable, supplied)
+            )
+        ) {
+            throw new Error(
+                "Displayed action differs from the immutable manifest",
+            );
+        }
+    }
+    const requestId = `req_browser_${newWireId().replace(/-/g, "")}`;
+    const nowMono = monotonicNowNs();
+    const request: InterventionAuthorizationRequest = {
+        authorization_request_id: requestId,
+        intervention_id: interventionId,
+        manifest_sha256: verified.manifest.manifest_sha256,
+        approved_action_ids: approved as [string, ...string[]],
+        source_surface: "browser",
+        requested_at_unix_ms: Date.now(),
+        requested_at_mono_ns: nowMono,
+        boot_id: CLIENT_BOOT_ID,
+    };
+    return await new Promise<ActionExecuteResult[]>((resolve) => {
+        const timeout = setTimeout(() => {
+            pendingAuthorizations.delete(requestId);
+            resolve(approved.map((actionId) => ({
+                action_id: actionId,
+                success: false,
+                message: "Authorization timed out before execution",
+                reversible: false,
+            })));
+        }, 35_000);
+        pendingAuthorizations.set(requestId, {
+            interventionId,
+            actionIds: approved,
+            localResults: new Map(),
+            resolve,
+            timeout,
+        });
+        send({
+            type: "INTERVENTION_AUTHORIZE",
+            payload: request as unknown as Record<string, unknown>,
+            timestamp: Date.now() / 1000,
+            sequence: ++sequence,
+            correlation_id: activeIntervention?.correlation_id,
+        });
+    });
+}
+
+async function handleInterventionApplyCommand(payload: unknown): Promise<void> {
+    let verified: Awaited<ReturnType<typeof verifyApplyCommand>>;
+    try {
+        const stableClientInstanceId = await getClientInstanceId();
+        verified = await verifyApplyCommand(
+            payload,
+            "browser",
+            CLIENT_BOOT_ID,
+            Date.now(),
+            stableClientInstanceId,
+        );
+    } catch (error) {
+        console.warn("[cortex.bg] rejected INTERVENTION_APPLY:", String(error));
+        return;
+    }
+    const authorization = verified.command.authorization;
+    const authorizationId = String(authorization.authorization_id || "");
+    const nonce = String(authorization.nonce || "");
+    if (!authorizationId || !nonce) return;
+    if (!workspaceMutationAllowed()) {
+        const receipts = await Promise.all(verified.ownActions.map((action) => {
+            const startedWallMs = Date.now();
+            const startedMonoNs = monotonicNowNs();
+            return makeActionReceipt({
+                interventionId: verified.manifest.intervention_id,
+                authorizationId,
+                manifestSha256: verified.manifest.manifest_sha256,
+                actionId: action.action_id,
+                phase: "apply",
+                status: "failed",
+                startedWallMs,
+                startedMonoNs,
+                inverse: {},
+                verification: "failed",
+                verificationDetail: "Local execution mode denies workspace mutation",
+                afterFingerprint: null,
+                errorCode: "execution_mode_denied",
+                errorMessage: "Local execution mode denies workspace mutation",
+                retryable: false,
+            });
+        }));
+        await sendReceiptBatch({
+            intervention_id: verified.manifest.intervention_id,
+            manifest_sha256: verified.manifest.manifest_sha256,
+            authorization_id: authorizationId,
+            receipts: receipts as [ActionReceipt, ...ActionReceipt[]],
+        });
+        return;
+    }
+
+    try {
+        await mutateTransactionJournal((journal) => {
+            if (journal.receipt_outbox.length >= MAX_RECEIPT_OUTBOX) {
+                throw new Error("transaction receipt outbox is full");
+            }
+            const newOperationCount = verified.ownActions.filter((action) =>
+                journal.operations[
+                    operationKey(verified.manifest.intervention_id, action.action_id)
+                ] === undefined
+            ).length;
+            if (
+                Object.keys(journal.operations).length + newOperationCount
+                > MAX_TRANSACTION_OPERATIONS
+            ) {
+                throw new Error("transaction operation journal is full");
+            }
+            for (const action of verified.ownActions) {
+                const counterKey = [
+                    authorizationId,
+                    action.action_id,
+                    "apply",
+                ].join(":");
+                if ((journal.attempt_counters[counterKey] ?? 0) >= 100) {
+                    throw new Error("receipt retry limit reached before apply");
+                }
+            }
+            const prior = journal.consumed_authorizations[authorizationId];
+            if (
+                prior
+                && (
+                    prior.manifest_sha256 !== verified.manifest.manifest_sha256
+                    || prior.nonce !== nonce
+                )
+            ) {
+                throw new Error("authorization replayed with different content");
+            }
+            if (!prior) {
+                journal.consumed_authorizations[authorizationId] = {
+                    manifest_sha256: verified.manifest.manifest_sha256,
+                    nonce,
+                    consumed_at_unix_ms: Date.now(),
+                };
+            }
+            const authorizationIds = Object.keys(journal.consumed_authorizations);
+            if (authorizationIds.length > 256) {
+                authorizationIds
+                    .sort((left, right) =>
+                        journal.consumed_authorizations[left].consumed_at_unix_ms
+                        - journal.consumed_authorizations[right].consumed_at_unix_ms
+                    )
+                    .slice(0, authorizationIds.length - 256)
+                    .forEach((id) => delete journal.consumed_authorizations[id]);
+            }
+        });
+    } catch (error) {
+        console.warn("[cortex.bg] authorization consumption failed:", String(error));
+        return;
+    }
+
+    if (verified.ownActions.some((action) => action.source === "suggested_action")) {
+        await snapshotTabsForIntervention();
+    }
+
+    const receipts: ActionReceipt[] = [];
+    const localResults: ActionExecuteResult[] = [];
+    for (const action of verified.ownActions) {
+        const startedWallMs = Date.now();
+        const startedMonoNs = monotonicNowNs();
+        const key = operationKey(verified.manifest.intervention_id, action.action_id);
+        const existing = await readTransactionJournal().then(
+            (journal) => journal.operations[key],
+        );
+        let existingInverse: Record<string, unknown> = {};
+        if (existing) {
+            let durableRecordValid = true;
+            try {
+                const parsed = JSON.parse(existing.inverse_payload_json) as unknown;
+                durableRecordValid = (
+                    typeof parsed === "object"
+                    && parsed !== null
+                    && !Array.isArray(parsed)
+                    && canonicalJson(parsed) === existing.inverse_payload_json
+                );
+                if (durableRecordValid) {
+                    existingInverse = parsed as Record<string, unknown>;
+                }
+            } catch {
+                durableRecordValid = false;
+            }
+            durableRecordValid = durableRecordValid
+                && existing.intervention_id === verified.manifest.intervention_id
+                && existing.manifest_sha256 === verified.manifest.manifest_sha256
+                && existing.action_id === action.action_id
+                && existing.authorization_id === authorizationId
+                && existing.capability === action.capability;
+            if (!durableRecordValid) {
+                const message = "Durable Cortex operation does not match this authorization";
+                localResults.push({
+                    action_id: action.action_id,
+                    success: false,
+                    message,
+                    reversible: Boolean(action.reverse_capability),
+                });
+                receipts.push(await makeActionReceipt({
+                    interventionId: verified.manifest.intervention_id,
+                    authorizationId,
+                    manifestSha256: verified.manifest.manifest_sha256,
+                    actionId: action.action_id,
+                    phase: "apply",
+                    status: "failed",
+                    startedWallMs,
+                    startedMonoNs,
+                    inverse: {},
+                    verification: "failed",
+                    verificationDetail: message,
+                    afterFingerprint: null,
+                    errorCode: "durable_operation_mismatch",
+                    errorMessage: message,
+                    retryable: false,
+                }));
+                continue;
+            }
+        }
+        if (existing?.state === "applied") {
+            const result: ActionExecuteResult = {
+                action_id: action.action_id,
+                success: true,
+                message: "Action was already applied by Cortex",
+                reversible: Boolean(action.reverse_capability),
+            };
+            localResults.push(result);
+            receipts.push(await makeActionReceipt({
+                interventionId: verified.manifest.intervention_id,
+                authorizationId,
+                manifestSha256: verified.manifest.manifest_sha256,
+                actionId: action.action_id,
+                phase: "apply",
+                status: "already_complete",
+                startedWallMs,
+                startedMonoNs,
+                inverse: existingInverse,
+                verification: action.workspace_mutation === false
+                    ? "not_applicable"
+                    : "verified",
+                verificationDetail: "durable Cortex operation already active",
+                afterFingerprint: existing.after_fingerprint,
+            }));
+            continue;
+        }
+        if (existing?.state === "applying" && (
+            action.capability === "open_url"
+            || action.capability === "search_error"
+        )) {
+            try {
+                existingInverse = await reconcileCreatedTabInverse(existingInverse);
+            } catch (error) {
+                existingInverse = error instanceof IndeterminateBrowserMutationError
+                    ? { ...existingInverse, ...error.inverse }
+                    : {
+                        ...existingInverse,
+                        cortexEffectMayExist: true,
+                        recoveryError: String(error).slice(0, 300),
+                    };
+            }
+            await mutateTransactionJournal((journal) => {
+                const operation = journal.operations[key];
+                if (
+                    operation
+                    && operation.state === "applying"
+                    && operation.authorization_id === authorizationId
+                    && operation.manifest_sha256 === verified.manifest.manifest_sha256
+                ) {
+                    operation.inverse_payload_json = canonicalJson(existingInverse);
+                    if (existingInverse.noEffect === true) operation.state = "failed";
+                    operation.updated_at_unix_ms = Date.now();
+                }
+            });
+        }
+        if (
+            existing?.state === "applying"
+            || existing?.state === "failed"
+            || existing?.state === "restored"
+        ) {
+            const message = existing.state === "applying"
+                ? "Prior apply attempt is indeterminate; recovery required"
+                : existing.state === "restored"
+                    ? "Authorization replay rejected after restoration"
+                    : "Authorization replay rejected after a failed attempt";
+            const result: ActionExecuteResult = {
+                action_id: action.action_id,
+                success: false,
+                message,
+                reversible: Boolean(action.reverse_capability),
+            };
+            localResults.push(result);
+            receipts.push(await makeActionReceipt({
+                interventionId: verified.manifest.intervention_id,
+                authorizationId,
+                manifestSha256: verified.manifest.manifest_sha256,
+                actionId: action.action_id,
+                phase: "apply",
+                status: "failed",
+                startedWallMs,
+                startedMonoNs,
+                inverse: existingInverse,
+                verification: "failed",
+                verificationDetail: message,
+                afterFingerprint: existing.after_fingerprint,
+                errorCode: existing.state === "applying"
+                    ? "indeterminate_prior_attempt"
+                    : "authorization_replay",
+                errorMessage: message,
+                retryable: existing.state === "applying"
+                    && existingInverse.noEffect !== true,
+            }));
+            continue;
+        }
+
+        let preparedInverse: Record<string, unknown> = {};
+        try {
+            preparedInverse = await prepareBrowserInverse(
+                verified.manifest.intervention_id,
+                action,
+            );
+            await mutateTransactionJournal((journal) => {
+                journal.operations[key] = {
+                    intervention_id: verified.manifest.intervention_id,
+                    manifest_sha256: verified.manifest.manifest_sha256,
+                    action_id: action.action_id,
+                    authorization_id: authorizationId,
+                    capability: action.capability,
+                    state: "applying",
+                    inverse_payload_json: canonicalJson(preparedInverse),
+                    after_fingerprint: null,
+                    updated_at_unix_ms: Date.now(),
+                };
+            });
+            const executed = await executeBrowserManifestAction(
+                verified.manifest.intervention_id,
+                action,
+                preparedInverse,
+                async (inverse) => {
+                    await mutateTransactionJournal((journal) => {
+                        const operation = journal.operations[key];
+                        if (
+                            !operation
+                            || operation.state !== "applying"
+                            || operation.authorization_id !== authorizationId
+                            || operation.manifest_sha256 !== verified.manifest.manifest_sha256
+                        ) {
+                            throw new Error("durable operation changed before inverse checkpoint");
+                        }
+                        operation.inverse_payload_json = canonicalJson(inverse);
+                        operation.updated_at_unix_ms = Date.now();
+                    });
+                },
+            );
+            let effectVerification: BrowserEffectVerification = {
+                verified: false,
+                detail: executed.result.message,
+                fingerprint: { capability: action.capability },
+            };
+            if (executed.result.success) {
+                try {
+                    effectVerification = await verifyBrowserEffect(
+                        action,
+                        executed.inverse,
+                    );
+                } catch (error) {
+                    effectVerification = {
+                        verified: false,
+                        detail: `Postcondition verification failed: ${String(error)}`,
+                        fingerprint: { capability: action.capability },
+                    };
+                }
+            }
+            const effectMayExist = executed.result.success
+                && !effectVerification.verified;
+            const receiptInverse = effectMayExist
+                ? { ...executed.inverse, cortexEffectMayExist: true }
+                : executed.inverse;
+            const inverseJson = canonicalJson(receiptInverse);
+            const fingerprint = executed.result.success
+                ? await sha256Hex(canonicalJson(effectVerification.fingerprint))
+                : null;
+            await mutateTransactionJournal((journal) => {
+                journal.operations[key] = {
+                    intervention_id: verified.manifest.intervention_id,
+                    manifest_sha256: verified.manifest.manifest_sha256,
+                    action_id: action.action_id,
+                    authorization_id: authorizationId,
+                    capability: action.capability,
+                    state: executed.result.success && effectVerification.verified
+                        ? "applied"
+                        : executed.result.success
+                            ? "applying"
+                            : "failed",
+                    inverse_payload_json: inverseJson,
+                    after_fingerprint: fingerprint,
+                    updated_at_unix_ms: Date.now(),
+                };
+            });
+            const truthfulResult = executed.result.success
+                && effectVerification.verified
+                ? executed.result
+                : {
+                    ...executed.result,
+                    success: false,
+                    message: executed.result.success
+                        ? effectVerification.detail
+                        : executed.result.message,
+                };
+            localResults.push(truthfulResult);
+            receipts.push(await makeActionReceipt({
+                interventionId: verified.manifest.intervention_id,
+                authorizationId,
+                manifestSha256: verified.manifest.manifest_sha256,
+                actionId: action.action_id,
+                phase: "apply",
+                status: truthfulResult.success ? executed.status : "failed",
+                startedWallMs,
+                startedMonoNs,
+                inverse: receiptInverse,
+                verification: truthfulResult.success ? "verified" : "failed",
+                verificationDetail: truthfulResult.success
+                    ? effectVerification.detail
+                    : truthfulResult.message,
+                afterFingerprint: fingerprint,
+                errorCode: truthfulResult.success
+                    ? undefined
+                    : effectMayExist
+                        ? "postcondition_unverified"
+                        : "capability_failed",
+                errorMessage: truthfulResult.success
+                    ? undefined
+                    : truthfulResult.message,
+                retryable: effectMayExist,
+            }));
+        } catch (error) {
+            const message = String(error);
+            let latestInverse = preparedInverse;
+            try {
+                const journal = await readTransactionJournal();
+                const operation = journal.operations[key];
+                if (operation?.inverse_payload_json) {
+                    latestInverse = JSON.parse(
+                        operation.inverse_payload_json,
+                    ) as Record<string, unknown>;
+                }
+            } catch {
+                // The pre-effect inverse remains the safest available proof.
+            }
+            if (error instanceof IndeterminateBrowserMutationError) {
+                latestInverse = { ...latestInverse, ...error.inverse };
+            }
+            const uncertainInverse = {
+                ...latestInverse,
+                cortexEffectMayExist: true,
+            };
+            await mutateTransactionJournal((journal) => {
+                const operation = journal.operations[key];
+                if (operation) {
+                    operation.state = "applying";
+                    operation.inverse_payload_json = canonicalJson(
+                        uncertainInverse,
+                    );
+                    operation.updated_at_unix_ms = Date.now();
+                }
+            });
+            const result: ActionExecuteResult = {
+                action_id: action.action_id,
+                success: false,
+                message,
+                reversible: Boolean(action.reverse_capability),
+            };
+            localResults.push(result);
+            receipts.push(await makeActionReceipt({
+                interventionId: verified.manifest.intervention_id,
+                authorizationId,
+                manifestSha256: verified.manifest.manifest_sha256,
+                actionId: action.action_id,
+                phase: "apply",
+                status: "failed",
+                startedWallMs,
+                startedMonoNs,
+                inverse: uncertainInverse,
+                verification: "failed",
+                verificationDetail: message,
+                afterFingerprint: null,
+                errorCode: "capability_exception",
+                errorMessage: message,
+                retryable: true,
+            }));
+        }
+    }
+    const pending = pendingAuthorizations.get(
+        authorization.authorization_request_id,
+    );
+    if (pending) {
+        pending.authorizationId = authorizationId;
+        for (const result of localResults) {
+            pending.localResults.set(result.action_id, result);
+        }
+    }
+    if (receipts.length > 0) {
+        await sendReceiptBatch({
+            intervention_id: verified.manifest.intervention_id,
+            manifest_sha256: verified.manifest.manifest_sha256,
+            authorization_id: authorizationId,
+            receipts: receipts as [ActionReceipt, ...ActionReceipt[]],
+        });
+    }
+}
+
+async function verifyBrowserRestoreEffect(
+    action: RestoreAction,
+    inverse: Record<string, unknown>,
+): Promise<BrowserEffectVerification> {
+    if (inverse.noEffect === true) {
+        return {
+            verified: true,
+            detail: "No Cortex-owned effect exists",
+            fingerprint: { reverseCapability: action.reverse_capability, noEffect: true },
+        };
+    }
+    if (action.reverse_capability === "close_created_tab") {
+        const tabId = typeof inverse.tabId === "number" ? inverse.tabId : null;
+        let absent = tabId !== null;
+        if (tabId !== null) {
+            try {
+                await chrome.tabs.get(tabId);
+                absent = false;
+            } catch {
+                absent = true;
+            }
+        }
+        return {
+            verified: absent,
+            detail: absent
+                ? "Exact Cortex-created tab is absent"
+                : "Cortex-created tab still exists",
+            fingerprint: { tabId, absent },
+        };
+    }
+    if (action.reverse_capability === "restore_active_tab") {
+        const targetId = typeof inverse.targetTabId === "number"
+            ? inverse.targetTabId
+            : null;
+        const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+        const verified = targetId !== null && active?.id !== targetId;
+        return {
+            verified,
+            detail: verified
+                ? "Cortex-selected tab no longer owns focus"
+                : "Cortex-selected tab still owns focus",
+            fingerprint: { targetId, activeTabId: active?.id ?? null },
+        };
+    }
+    return {
+        verified: false,
+        detail: `No restore verifier exists for ${action.reverse_capability}`,
+        fingerprint: { reverseCapability: action.reverse_capability },
+    };
+}
+
+async function performBrowserRestore(
+    action: RestoreAction,
+    inverse: Record<string, unknown>,
+): Promise<{ status: "succeeded" | "failed" | "already_complete"; detail: string }> {
+    if (inverse.noEffect === true) {
+        return {
+            status: "already_complete",
+            detail: "No Cortex-owned workspace effect was created",
+        };
+    }
+    switch (action.reverse_capability) {
+        case "close_created_tab": {
+            const tabId = typeof inverse.tabId === "number" ? inverse.tabId : null;
+            if (tabId === null) {
+                return { status: "failed", detail: "Missing Cortex-created tab id" };
+            }
+            let tab: chrome.tabs.Tab;
+            try {
+                tab = await chrome.tabs.get(tabId);
+            } catch {
+                return { status: "already_complete", detail: "Created tab already closed" };
+            }
+            const expectedUrl = typeof inverse.url === "string" ? inverse.url : "";
+            const expectedStagingUrl = validCreatedTabStageUrl(inverse.stagingUrl)
+                ? inverse.stagingUrl
+                : "";
+            const ownsCurrentUrl = (
+                (Boolean(expectedUrl) && (
+                    urlsMatch(tab.url, expectedUrl)
+                    || urlsMatch(tab.pendingUrl, expectedUrl)
+                ))
+                || (Boolean(expectedStagingUrl) && (
+                    urlsMatch(tab.url, expectedStagingUrl)
+                    || urlsMatch(tab.pendingUrl, expectedStagingUrl)
+                ))
+            );
+            if (!ownsCurrentUrl) {
+                return { status: "failed", detail: "Created tab was reused or navigated" };
+            }
+            try {
+                await chrome.tabs.remove(tabId);
+            } catch {
+                return { status: "failed", detail: "Could not close the Cortex-created tab" };
+            }
+            return { status: "succeeded", detail: "Cortex-created tab closed" };
+        }
+        case "restore_active_tab": {
+            const priorId = typeof inverse.priorActiveTabId === "number"
+                ? inverse.priorActiveTabId
+                : null;
+            if (priorId === null) return { status: "failed", detail: "Prior active tab missing" };
+            const targetId = typeof inverse.targetTabId === "number"
+                ? inverse.targetTabId
+                : null;
+            const [current] = await chrome.tabs.query({ active: true, currentWindow: true });
+            if (targetId !== null && current?.id !== targetId) {
+                return {
+                    status: "already_complete",
+                    detail: "User focus superseded the Cortex tab focus",
+                };
+            }
+            const tab = await chrome.tabs.get(priorId);
+            if (tab.active) return { status: "already_complete", detail: "Prior tab already active" };
+            await chrome.tabs.update(priorId, { active: true });
+            return { status: "succeeded", detail: "Prior active tab restored" };
+        }
+        default:
+            return {
+                status: "failed",
+                detail: `Unsupported reverse capability ${action.reverse_capability}`,
+            };
+    }
+}
+
+async function handleExactRestoreCommand(payload: unknown): Promise<boolean> {
+    let verified: ReturnType<typeof verifyRestoreCommand>;
+    try {
+        verified = verifyRestoreCommand(
+            payload,
+            "browser",
+            await getClientInstanceId(),
+        );
+    } catch {
+        return false;
+    }
+    const phase = verified.command.reason === "partial_compensation"
+        ? "compensate"
+        : "restore";
+    const receipts: ActionReceipt[] = [];
+    for (const action of verified.ownActions) {
+        const startedWallMs = Date.now();
+        const startedMonoNs = monotonicNowNs();
+        const key = operationKey(verified.command.intervention_id, action.action_id);
+        const journal = await readTransactionJournal();
+        const operation = journal.operations[key];
+        let inverse: Record<string, unknown>;
+        try {
+            inverse = JSON.parse(action.inverse_payload_json) as Record<string, unknown>;
+        } catch {
+            inverse = {};
+        }
+        const expectedReverse: Record<string, string | undefined> = {
+            open_url: "close_created_tab",
+            search_error: "close_created_tab",
+            highlight_tab: "restore_active_tab",
+        };
+        let restored: Awaited<ReturnType<typeof performBrowserRestore>>;
+        let restoreVerification: BrowserEffectVerification = {
+            verified: false,
+            detail: "Restore did not run",
+            fingerprint: { actionId: action.action_id, state: "not_run" },
+        };
+        try {
+            if (!operation) {
+                restored = {
+                    status: "already_complete",
+                    detail: "No Cortex-owned effect was durably started on this client",
+                };
+                inverse = { noEffect: true };
+                restoreVerification = {
+                    verified: true,
+                    detail: "The write-ahead journal contains no Cortex-owned effect",
+                    fingerprint: {
+                        actionId: action.action_id,
+                        state: "never_started",
+                    },
+                };
+            } else {
+                const durableInverseBeforeRecovery = operation.inverse_payload_json;
+                if (
+                    operation.state === "applying"
+                    && (
+                        operation.capability === "open_url"
+                        || operation.capability === "search_error"
+                    )
+                ) {
+                    let localInverse = JSON.parse(
+                        durableInverseBeforeRecovery,
+                    ) as Record<string, unknown>;
+                    localInverse = await reconcileCreatedTabInverse(localInverse);
+                    const reconciledJson = canonicalJson(localInverse);
+                    if (reconciledJson !== operation.inverse_payload_json) {
+                        await mutateTransactionJournal((mutable) => {
+                            const record = mutable.operations[key];
+                            if (
+                                !record
+                                || record.state !== "applying"
+                                || record.authorization_id !== action.original_authorization_id
+                                || record.inverse_payload_json !== durableInverseBeforeRecovery
+                            ) {
+                                throw new Error(
+                                    "durable operation changed during created-tab recovery",
+                                );
+                            }
+                            record.inverse_payload_json = reconciledJson;
+                            record.updated_at_unix_ms = Date.now();
+                        });
+                        operation.inverse_payload_json = reconciledJson;
+                    }
+                }
+                const commandAcceptsLocalRecovery =
+                    action.inverse_payload_json === "{}"
+                    || action.inverse_payload_json === durableInverseBeforeRecovery;
+                const effectiveInverseJson = commandAcceptsLocalRecovery
+                    && operation.state === "applying"
+                    ? operation.inverse_payload_json
+                    : action.inverse_payload_json;
+                inverse = JSON.parse(effectiveInverseJson) as Record<string, unknown>;
+                if (
+                operation.intervention_id !== verified.command.intervention_id
+                || operation.manifest_sha256 !== verified.command.manifest_sha256
+                || operation.authorization_id !== action.original_authorization_id
+                || expectedReverse[operation.capability] !== action.reverse_capability
+                || operation.inverse_payload_json !== effectiveInverseJson
+                ) {
+                    restored = {
+                        status: "failed",
+                        detail: "Restore action does not match the durable Cortex operation",
+                    };
+                } else if (operation.state === "restored") {
+                    restored = {
+                        status: "already_complete",
+                        detail: "Cortex operation was already restored",
+                    };
+                    restoreVerification = {
+                        verified: true,
+                        detail: "Durable restore completion was already recorded",
+                        fingerprint: {
+                            actionId: action.action_id,
+                            state: "restored",
+                            priorFingerprint: operation.after_fingerprint,
+                        },
+                    };
+                } else {
+                    restored = await performBrowserRestore(
+                        action,
+                        inverse,
+                    );
+                    if (restored.status !== "failed") {
+                        restoreVerification = await verifyBrowserRestoreEffect(
+                            action,
+                            inverse,
+                        );
+                        if (!restoreVerification.verified) {
+                            restored = {
+                                status: "failed",
+                                detail: restoreVerification.detail,
+                            };
+                        }
+                    }
+                }
+            }
+        } catch (error) {
+            restored = { status: "failed", detail: String(error) };
+        }
+        if (restored.status !== "failed") {
+            const restoreFingerprint = await sha256Hex(canonicalJson(
+                restoreVerification.fingerprint,
+            ));
+            await mutateTransactionJournal((mutable) => {
+                const record = mutable.operations[key];
+                if (record) {
+                    record.state = "restored";
+                    record.after_fingerprint = restoreFingerprint;
+                    record.updated_at_unix_ms = Date.now();
+                }
+            });
+        }
+        receipts.push(await makeActionReceipt({
+            interventionId: verified.command.intervention_id,
+            authorizationId: verified.command.restore_id,
+            manifestSha256: verified.command.manifest_sha256,
+            actionId: action.action_id,
+            phase,
+            status: restored.status,
+            startedWallMs,
+            startedMonoNs,
+            inverse,
+            verification: restored.status === "failed" ? "failed" : "verified",
+            verificationDetail: restored.status === "failed"
+                ? restored.detail
+                : restoreVerification.detail,
+            afterFingerprint: restored.status === "failed"
+                ? null
+                : await sha256Hex(canonicalJson(restoreVerification.fingerprint)),
+            errorCode: restored.status === "failed" ? "restore_failed" : undefined,
+            errorMessage: restored.status === "failed" ? restored.detail : undefined,
+            retryable: restored.status === "failed",
+        }));
+    }
+    await sendReceiptBatch({
+        intervention_id: verified.command.intervention_id,
+        manifest_sha256: verified.command.manifest_sha256,
+        authorization_id: verified.command.restore_id,
+        receipts: receipts as [ActionReceipt, ...ActionReceipt[]],
+    });
+    return true;
+}
+
+async function executeAction(
+    action: SuggestedAction,
+    preparedInverse: Record<string, unknown>,
+    checkpointInverse: (inverse: Record<string, unknown>) => Promise<void>,
+): Promise<ActionExecuteResult> {
     try {
         // F42 closure: ``action.action_type`` is the generated
         // ``Literal`` union from the Pydantic ``SuggestedAction``.
@@ -3276,13 +5247,29 @@ async function executeAction(action: SuggestedAction): Promise<ActionExecuteResu
             case "close_tab":
                 return await executeCloseTab(action);
             case "group_tabs":
-                return await executeGroupTabs(action);
+                return await executeGroupTabs(
+                    action,
+                    preparedInverse,
+                    checkpointInverse,
+                );
             case "bookmark_and_close":
-                return await executeBookmarkAndClose(action);
+                return await executeBookmarkAndClose(
+                    action,
+                    preparedInverse,
+                    checkpointInverse,
+                );
             case "open_url":
-                return await executeOpenUrl(action);
+                return await executeOpenUrl(
+                    action,
+                    preparedInverse,
+                    checkpointInverse,
+                );
             case "search_error":
-                return await executeSearchError(action);
+                return await executeSearchError(
+                    action,
+                    preparedInverse,
+                    checkpointInverse,
+                );
             case "highlight_tab":
                 return await executeHighlightTab(action);
             case "save_session":
@@ -3326,6 +5313,7 @@ async function executeAction(action: SuggestedAction): Promise<ActionExecuteResu
             }
         }
     } catch (e) {
+        if (e instanceof IndeterminateBrowserMutationError) throw e;
         return {
             action_id: action.action_id,
             success: false,
@@ -3366,37 +5354,22 @@ async function executeCloseTab(action: SuggestedAction): Promise<ActionExecuteRe
     }
     const tabIndex = action.tab_index;
 
-    // Primary path: use snapshot
+    // Exact target ownership: a missing/stale snapshot fails closed. Title
+    // matching can select a different tab and is therefore never an
+    // acceptable fallback for an authorized transaction.
     const v = await validateTab(tabIndex);
-    let tabId = v.valid ? v.tabId : -1;
-    let tabUrl = "";
-    let tabTitle = "";
-
-    if (v.valid) {
-        const snap = interventionTabSnapshot.get(tabIndex);
-        tabUrl = snap?.url || "";
-        tabTitle = snap?.title || "";
-    } else {
-        // Fallback: find the tab by matching title from the action label.
-        // This handles cases where the snapshot was lost (SW restart) or stale.
-        const targetTitle = action.label?.replace(/^Close\s+/i, "") || "";
-        if (targetTitle) {
-            try {
-                const allTabs = await chrome.tabs.query({});
-                const match = allTabs.find(t => t.title?.includes(targetTitle));
-                if (match?.id) {
-                    tabId = match.id;
-                    tabUrl = match.url || "";
-                    tabTitle = match.title || "";
-                }
-            } catch {
-                // query failed
-            }
-        }
-        if (tabId === -1) {
-            return { action_id: aid, success: false, message: v.message || "Tab not found", reversible: false };
-        }
+    if (!v.valid) {
+        return {
+            action_id: aid,
+            success: false,
+            message: v.message || "Exact tab target is unavailable",
+            reversible: false,
+        };
     }
+    const tabId = v.tabId;
+    const snap = interventionTabSnapshot.get(tabIndex);
+    const tabUrl = snap?.url || "";
+    const tabTitle = snap?.title || "";
 
     // LAYER 0: Minimum tab count — never leave fewer than MIN_TABS_TO_KEEP tabs open
     try {
@@ -3444,22 +5417,62 @@ async function executeCloseTab(action: SuggestedAction): Promise<ActionExecuteRe
     return { action_id: aid, success: true, message: "Tab closed", reversible: true };
 }
 
-async function executeGroupTabs(action: SuggestedAction): Promise<ActionExecuteResult> {
+async function executeGroupTabs(
+    action: SuggestedAction,
+    preparedInverse: Record<string, unknown>,
+    checkpointInverse: (inverse: Record<string, unknown>) => Promise<void>,
+): Promise<ActionExecuteResult> {
     const meta = action.metadata || {};
-    const tabIndices = (meta.tab_indices as number[]) || [];
+    const tabIndices = Array.isArray(meta.tab_indices)
+        ? [...meta.tab_indices]
+        : [];
     if (action.tab_index !== null && action.tab_index !== undefined) {
         tabIndices.push(action.tab_index);
     }
+    const exactIndices = [...new Set(tabIndices)];
     const tabIds: number[] = [];
-    for (const idx of tabIndices) {
+    for (const idx of exactIndices) {
+        if (typeof idx !== "number" || !Number.isInteger(idx) || idx < 0) {
+            return {
+                action_id: action.action_id,
+                success: false,
+                message: "A requested tab index is invalid",
+                reversible: false,
+            };
+        }
         const v = await validateTab(idx);
-        if (v.valid) tabIds.push(v.tabId);
+        if (!v.valid) {
+            return {
+                action_id: action.action_id,
+                success: false,
+                message: v.message || "An exact tab target is unavailable",
+                reversible: false,
+            };
+        }
+        tabIds.push(v.tabId);
     }
     if (tabIds.length === 0) {
         return { action_id: action.action_id, success: false, message: "No valid tabs to group", reversible: false };
     }
     const groupName = ((action.metadata || {}).group_name as string) || action.label || "Grouped";
-    const groupId = await groupSpecificTabs(tabIds, groupName, "blue");
+    const groupId = await groupSpecificTabs(
+        tabIds,
+        groupName,
+        "blue",
+        async (createdGroupId) => checkpointInverse({
+            ...preparedInverse,
+            tabIds,
+            groupId: createdGroupId,
+        }),
+    );
+    if (groupId === null) {
+        return {
+            action_id: action.action_id,
+            success: false,
+            message: "Could not create the exact requested tab group",
+            reversible: false,
+        };
+    }
     pushUndo({
         action_id: action.action_id,
         action_type: "group_tabs",
@@ -3469,7 +5482,11 @@ async function executeGroupTabs(action: SuggestedAction): Promise<ActionExecuteR
     return { action_id: action.action_id, success: true, message: `${tabIds.length} tabs grouped`, reversible: true };
 }
 
-async function executeBookmarkAndClose(action: SuggestedAction): Promise<ActionExecuteResult> {
+async function executeBookmarkAndClose(
+    action: SuggestedAction,
+    preparedInverse: Record<string, unknown>,
+    checkpointInverse: (inverse: Record<string, unknown>) => Promise<void>,
+): Promise<ActionExecuteResult> {
     const aid = action.action_id || `bmc_${Date.now()}`;
 
     // Check if tab closing is disabled by user toggle
@@ -3498,31 +5515,18 @@ async function executeBookmarkAndClose(action: SuggestedAction): Promise<ActionE
     const tabIndex = action.tab_index;
 
     const v = await validateTab(tabIndex);
-    let tabId = v.valid ? v.tabId : -1;
-    let tabUrl = "";
-    let tabTitle = "";
-
-    if (v.valid) {
-        const snap = interventionTabSnapshot.get(tabIndex);
-        tabUrl = snap?.url || "";
-        tabTitle = snap?.title || "";
-    } else {
-        const targetTitle = action.label?.replace(/^Close\s+/i, "") || "";
-        if (targetTitle) {
-            try {
-                const allTabs = await chrome.tabs.query({});
-                const match = allTabs.find(t => t.title?.includes(targetTitle));
-                if (match?.id) {
-                    tabId = match.id;
-                    tabUrl = match.url || "";
-                    tabTitle = match.title || "";
-                }
-            } catch { /* query failed */ }
-        }
-        if (tabId === -1) {
-            return { action_id: aid, success: false, message: v.message || "Tab not found", reversible: false };
-        }
+    if (!v.valid) {
+        return {
+            action_id: aid,
+            success: false,
+            message: v.message || "Exact tab target is unavailable",
+            reversible: false,
+        };
     }
+    const tabId = v.tabId;
+    const snap = interventionTabSnapshot.get(tabIndex);
+    const tabUrl = snap?.url || "";
+    const tabTitle = snap?.title || "";
 
     // LAYER 1: Final active-tab guard
     try {
@@ -3534,30 +5538,135 @@ async function executeBookmarkAndClose(action: SuggestedAction): Promise<ActionE
         return { action_id: aid, success: false, message: "Tab already closed", reversible: false };
     }
 
+    if (!tabUrl) {
+        return {
+            action_id: aid,
+            success: false,
+            message: "Exact tab URL is unavailable",
+            reversible: false,
+        };
+    }
+    let bookmarkId: string;
+    let bookmark;
     try {
-        await chrome.bookmarks.create({ title: tabTitle || "Cortex bookmark", url: tabUrl });
+        bookmark = await chrome.bookmarks.create({
+            title: tabTitle || "Cortex bookmark",
+            url: tabUrl,
+        });
+        bookmarkId = bookmark.id;
     } catch {
-        // Bookmark permission may not be available
+        return {
+            action_id: aid,
+            success: false,
+            message: "Could not create the requested bookmark",
+            reversible: false,
+        };
+    }
+    try {
+        await checkpointInverse({
+            ...preparedInverse,
+            bookmarkId,
+        });
+    } catch (error) {
+        try {
+            await chrome.bookmarks.remove(bookmarkId);
+        } catch {
+            throw new IndeterminateBrowserMutationError(
+                "Bookmark exists but its inverse checkpoint failed",
+                { ...preparedInverse, bookmarkId },
+                error,
+            );
+        }
+        return {
+            action_id: aid,
+            success: false,
+            message: "Bookmark checkpoint failed; the bookmark was rolled back",
+            reversible: false,
+        };
     }
     try {
         await chrome.tabs.remove(tabId);
     } catch {
+        try {
+            await chrome.bookmarks.remove(bookmarkId);
+        } catch {
+            throw new IndeterminateBrowserMutationError(
+                "Tab close failed and the Cortex bookmark may still exist",
+                { ...preparedInverse, bookmarkId },
+            );
+        }
         return { action_id: aid, success: false, message: "Failed to close tab", reversible: false };
     }
     pushUndo({
         action_id: aid,
         action_type: "bookmark_and_close",
-        undo_data: { url: tabUrl, title: tabTitle },
+        undo_data: {
+            url: tabUrl,
+            title: tabTitle,
+            bookmarkId,
+        },
         timestamp: Date.now(),
     });
     return { action_id: aid, success: true, message: "Bookmarked & closed", reversible: true };
 }
 
-async function executeOpenUrl(action: SuggestedAction): Promise<ActionExecuteResult> {
+async function executeOpenUrl(
+    action: SuggestedAction,
+    preparedInverse: Record<string, unknown>,
+    checkpointInverse: (inverse: Record<string, unknown>) => Promise<void>,
+): Promise<ActionExecuteResult> {
     if (!action.target) {
         return { action_id: action.action_id, success: false, message: "No URL provided", reversible: false };
     }
-    const tab = await chrome.tabs.create({ url: action.target, active: false });
+    const stagingUrl = preparedInverse.stagingUrl;
+    if (!validCreatedTabStageUrl(stagingUrl)) {
+        throw new Error("Created-tab recovery marker is missing or invalid");
+    }
+    const tab = await chrome.tabs.create({ url: stagingUrl, active: false });
+    if (typeof tab.id !== "number") {
+        throw new IndeterminateBrowserMutationError(
+            "Chrome created a staged tab without returning its identity",
+            preparedInverse,
+        );
+    }
+    try {
+        await checkpointInverse({ ...preparedInverse, tabId: tab.id });
+    } catch (error) {
+        try {
+            await chrome.tabs.remove(tab.id);
+        } catch {
+            throw new IndeterminateBrowserMutationError(
+                "Created tab exists but its inverse checkpoint failed",
+                { ...preparedInverse, tabId: tab.id },
+                error,
+            );
+        }
+        return {
+            action_id: action.action_id,
+            success: false,
+            message: "Tab checkpoint failed; the created tab was rolled back",
+            reversible: false,
+        };
+    }
+    try {
+        await chrome.tabs.update(tab.id, { url: action.target });
+    } catch (error) {
+        try {
+            await chrome.tabs.remove(tab.id);
+        } catch {
+            throw new IndeterminateBrowserMutationError(
+                "Created tab could not navigate or be removed",
+                { ...preparedInverse, tabId: tab.id },
+                error,
+            );
+        }
+        return {
+            action_id: action.action_id,
+            success: false,
+            message: "Tab navigation failed; the staged tab was rolled back",
+            reversible: false,
+        };
+    }
     pushUndo({
         action_id: action.action_id,
         action_type: "open_url",
@@ -3567,13 +5676,65 @@ async function executeOpenUrl(action: SuggestedAction): Promise<ActionExecuteRes
     return { action_id: action.action_id, success: true, message: "Opened in background", reversible: true };
 }
 
-async function executeSearchError(action: SuggestedAction): Promise<ActionExecuteResult> {
+async function executeSearchError(
+    action: SuggestedAction,
+    preparedInverse: Record<string, unknown>,
+    checkpointInverse: (inverse: Record<string, unknown>) => Promise<void>,
+): Promise<ActionExecuteResult> {
     const query = ((action.metadata || {}).search_query as string) || action.target || "";
     if (!query) {
         return { action_id: action.action_id, success: false, message: "No search query", reversible: false };
     }
     const url = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
-    const tab = await chrome.tabs.create({ url, active: false });
+    const stagingUrl = preparedInverse.stagingUrl;
+    if (!validCreatedTabStageUrl(stagingUrl)) {
+        throw new Error("Created-tab recovery marker is missing or invalid");
+    }
+    const tab = await chrome.tabs.create({ url: stagingUrl, active: false });
+    if (typeof tab.id !== "number") {
+        throw new IndeterminateBrowserMutationError(
+            "Chrome created a staged search tab without returning its identity",
+            preparedInverse,
+        );
+    }
+    try {
+        await checkpointInverse({ ...preparedInverse, tabId: tab.id, url });
+    } catch (error) {
+        try {
+            await chrome.tabs.remove(tab.id);
+        } catch {
+            throw new IndeterminateBrowserMutationError(
+                "Created search tab exists but its inverse checkpoint failed",
+                { ...preparedInverse, tabId: tab.id, url },
+                error,
+            );
+        }
+        return {
+            action_id: action.action_id,
+            success: false,
+            message: "Search-tab checkpoint failed; the tab was rolled back",
+            reversible: false,
+        };
+    }
+    try {
+        await chrome.tabs.update(tab.id, { url });
+    } catch (error) {
+        try {
+            await chrome.tabs.remove(tab.id);
+        } catch {
+            throw new IndeterminateBrowserMutationError(
+                "Created search tab could not navigate or be removed",
+                { ...preparedInverse, tabId: tab.id, url },
+                error,
+            );
+        }
+        return {
+            action_id: action.action_id,
+            success: false,
+            message: "Search navigation failed; the staged tab was rolled back",
+            reversible: false,
+        };
+    }
     pushUndo({
         action_id: action.action_id,
         action_type: "search_error",
@@ -3849,18 +6010,32 @@ async function undoAction(actionId: string): Promise<boolean> {
 }
 
 async function executeAllRecommended(
-    actions: SuggestedAction[],
+    interventionId: string,
 ): Promise<ActionExecuteResult[]> {
-    const results: ActionExecuteResult[] = [];
-    for (const action of actions) {
-        if (action.category === "recommended") {
-            results.push(await executeAction(action));
-        }
+    if (
+        !activeIntervention
+        || activeIntervention.plan.intervention_id !== interventionId
+    ) {
+        throw new Error("Intervention is no longer active");
     }
+    const verified = await verifyActionManifest(
+        activeIntervention.plan.action_manifest,
+    );
+    const actionIds = [...verified.actionsById.values()]
+        .filter((action) => {
+            if (action.source !== "suggested_action") return false;
+            try {
+                return suggestedActionFromManifest(action).category === "recommended";
+            } catch {
+                return false;
+            }
+        })
+        .map((action) => action.action_id);
+    const results = await authorizeActionIds(interventionId, actionIds);
 
     // Clear the intervention after execution so popup doesn't show stale data
     const hadIntervention = activeIntervention !== null;
-    const interventionId =
+    const mountedInterventionId =
         typeof activeIntervention?.plan.intervention_id === "string"
             ? (activeIntervention.plan.intervention_id as string)
             : undefined;
@@ -3872,12 +6047,12 @@ async function executeAllRecommended(
     try { await chrome.storage.session.remove(["cortex_active_intervention", "cortex_active_intervention_cid", "cortex_active_intervention_mounted_at", "cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]); } catch {}
 
     // Notify daemon that user engaged with the intervention
-    if (hadIntervention && interventionId) {
+    if (hadIntervention && mountedInterventionId) {
         send({
             type: "USER_ACTION",
             payload: {
                 action: "engaged",
-                intervention_id: interventionId,
+                intervention_id: mountedInterventionId,
                 timestamp: Date.now() / 1000,
             },
             timestamp: Date.now() / 1000,
@@ -3887,7 +6062,10 @@ async function executeAllRecommended(
     }
 
     // Broadcast to popup so it clears the intervention card
-    broadcastToPopup({ type: "INTERVENTION_RESTORE", payload: { intervention_id: interventionId } });
+    broadcastToPopup({
+        type: "INTERVENTION_RESTORE",
+        payload: { intervention_id: mountedInterventionId },
+    });
 
     return results;
 }
@@ -4479,16 +6657,16 @@ chrome.runtime.onMessage.addListener(
                     schedulePersist();
 
                     activeIntervention = null;
-                    try { chrome.storage.session.remove(["cortex_active_intervention", "cortex_active_intervention_cid", "cortex_active_intervention_mounted_at", "cortex_tab_snapshot", "cortex_tab_mgr_snapshots"]); } catch {}
-                    if (interventionId) {
-                        void restoreTabsForIntervention(interventionId).catch((err: unknown) => {
-                            if (DEBUG) console.debug("[cortex.bg] restoreTabsForIntervention failed on dismiss: %o", err);
-                        });
-                    } else {
-                        void restoreAllTabs().catch((err: unknown) => {
-                            if (DEBUG) console.debug("[cortex.bg] restoreAllTabs failed on dismiss: %o", err);
-                        });
-                    }
+                    // Keep exact inverse snapshots until the daemon sends a
+                    // receipt-derived INTERVENTION_RESTORE. Dismissal itself
+                    // is never workspace authority.
+                    try {
+                        chrome.storage.session.remove([
+                            "cortex_active_intervention",
+                            "cortex_active_intervention_cid",
+                            "cortex_active_intervention_mounted_at",
+                        ]);
+                    } catch {}
                 }
                 sendResponse({ ok: true });
                 break;
@@ -4585,22 +6763,24 @@ chrome.runtime.onMessage.addListener(
                     });
                     break;
                 }
-                executeAction(message.action as SuggestedAction)
-                    .then((result) => {
-                        sendResponse(result);
-                        // Notify daemon
-                        send({
-                            type: "ACTION_EXECUTE",
-                            payload: {
-                                intervention_id: message.intervention_id,
-                                action_id: (message.action as SuggestedAction).action_id,
-                                action_type: (message.action as SuggestedAction).action_type,
-                                result,
-                            },
-                            timestamp: Date.now() / 1000,
-                            sequence: ++sequence,
-                        });
-                    });
+                authorizeActionIds(
+                    String(message.intervention_id || ""),
+                    [String(
+                        (message.action as Partial<SuggestedAction> | undefined)
+                            ?.action_id || "",
+                    )],
+                    [message.action],
+                )
+                    .then(([result]) => sendResponse(result))
+                    .catch((error: unknown) => sendResponse({
+                        action_id: String(
+                            (message.action as Partial<SuggestedAction> | undefined)
+                                ?.action_id || "",
+                        ),
+                        success: false,
+                        message: String(error),
+                        reversible: false,
+                    }));
                 return true; // async
 
             case "EXECUTE_ALL_RECOMMENDED":
@@ -4612,7 +6792,9 @@ chrome.runtime.onMessage.addListener(
                     });
                     break;
                 }
-                executeAllRecommended(message.actions as SuggestedAction[])
+                executeAllRecommended(
+                    String(message.intervention_id || ""),
+                )
                     .then((results) => {
                         sendResponse(results);
                         // Send per-tab relevance feedback to daemon
@@ -4630,7 +6812,12 @@ chrome.runtime.onMessage.addListener(
                                 sequence: ++sequence,
                             });
                         }
-                    });
+                    })
+                    .catch((error: unknown) => sendResponse({
+                        success: false,
+                        message: String(error),
+                        results: [],
+                    }));
                 return true; // async
 
             case "UNDO_ACTION":

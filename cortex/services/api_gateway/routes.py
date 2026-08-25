@@ -17,6 +17,7 @@ LLM & Intervention:
   POST /llm/plan              — Request intervention plan
   POST /intervention/apply    — Apply intervention to workspace
   POST /intervention/restore  — Restore workspace to pre-intervention state
+  POST /intervention/restore-all — Restore every Cortex-owned workspace effect
 
 Status & Health:
   GET  /status/current        — Current system state, confidence, signal quality
@@ -45,6 +46,7 @@ from cortex.libs.schemas.api import (
     ContextBuildResponse,
     DashboardRaiseRequest,
     DashboardRaiseResponse,
+    EmergencyRestoreResponse,
     FeedbackRequest,
     FeedbackResponse,
     HealthResponse,
@@ -869,101 +871,32 @@ async def apply_intervention(
         else "suggest_only"
     )
 
-    if execution_mode == "suggest_only":
-        validation, _ = prepare_plan(body.plan, request=request)
-        if not validation.is_valid:
-            logger.warning(
-                "Rejected intervention proposal %s: %s",
-                body.plan.intervention_id,
-                validation.errors,
-            )
-            return InterventionApplyResponse.from_clock(
-                _get_clock(request),
-                applied=False,
-                correlation_id=correlation_id,
-            )
-        proposal = materialize_suggestion_only(body.plan)
-        ws_server = reg.get("ws_server")
-        if ws_server is not None and hasattr(ws_server, "send_intervention"):
-            await ws_server.send_intervention(proposal)
+    # WP-6 containment: this legacy endpoint has no manifest digest, exact
+    # action subset, one-time nonce, or requester boot identity. It therefore
+    # cannot grant workspace authority in *any* execution mode. Keep it as a
+    # presentation compatibility endpoint; mutation-capable surfaces use the
+    # INTERVENTION_AUTHORIZE -> INTERVENTION_APPLY protocol instead.
+    validation, _ = prepare_plan(body.plan, request=request)
+    if not validation.is_valid:
+        logger.warning(
+            "Rejected intervention proposal %s: %s",
+            body.plan.intervention_id,
+            validation.errors,
+        )
         return InterventionApplyResponse.from_clock(
             _get_clock(request),
             applied=False,
             correlation_id=correlation_id,
         )
-
-    intervention_engine = reg.get("intervention_engine")
-    if intervention_engine is not None and hasattr(intervention_engine, "apply"):
-        snapshot = await intervention_engine.apply(body.plan)
-        return InterventionApplyResponse.from_clock(
-            _get_clock(request),
-            applied=True,
-            snapshot=snapshot,
-            correlation_id=correlation_id,
-        )
-
-    if executor is not None and hasattr(executor, "apply"):
-        validation, commands = prepare_plan(body.plan, request=request)
-        if not validation.is_valid:
-            logger.warning(
-                "Rejected intervention plan %s: %s",
-                body.plan.intervention_id,
-                validation.errors,
-            )
-            return InterventionApplyResponse.from_clock(
-                _get_clock(request),
-                applied=False,
-                correlation_id=correlation_id,
-            )
-
-        snapshot = await _build_snapshot_for_plan(reg, body.plan, request=request)
-        mutations = await executor.apply(body.plan, commands)
-        applied = bool(mutations) and all(m.success for m in mutations)
-
-        restore_manager = _get_first_service(reg, "restore_manager", "intervention_restore_manager")
-        if restore_manager is not None and hasattr(restore_manager, "start_intervention"):
-            restore_manager.start_intervention(
-                body.plan.intervention_id,
-                snapshot,
-            )
-
-        ws_server = reg.get("ws_server")
-        if ws_server is not None and hasattr(ws_server, "send_intervention"):
-            await ws_server.send_intervention(body.plan)
-
-        confirmation = await _maybe_await_confirmation(
-            reg,
-            body.plan.intervention_id,
-            correlation_id=correlation_id,
-            await_confirmation=await_confirmation,
-            timeout_seconds=confirmation_timeout_seconds,
-        )
-        return InterventionApplyResponse.from_clock(
-            _get_clock(request),
-            applied=applied,
-            snapshot=snapshot,
-            correlation_id=correlation_id,
-            confirmation=confirmation,
-        )
-
-    # No executor available — still broadcast to WS clients (Chrome overlay)
+    proposal = materialize_suggestion_only(body.plan)
     ws_server = reg.get("ws_server")
     if ws_server is not None and hasattr(ws_server, "send_intervention"):
-        await ws_server.send_intervention(body.plan)
-        confirmation = await _maybe_await_confirmation(
-            reg,
-            body.plan.intervention_id,
-            correlation_id=correlation_id,
-            await_confirmation=await_confirmation,
-            timeout_seconds=confirmation_timeout_seconds,
+        await ws_server.send_intervention(proposal)
+    if execution_mode != "suggest_only":
+        logger.info(
+            "Legacy HTTP apply contained to proposal-only in mode=%s",
+            execution_mode,
         )
-        return InterventionApplyResponse.from_clock(
-            _get_clock(request),
-            applied=True,
-            correlation_id=correlation_id,
-            confirmation=confirmation,
-        )
-
     return InterventionApplyResponse.from_clock(
         _get_clock(request),
         applied=False,
@@ -1022,39 +955,61 @@ async def restore_intervention(
     """Restore workspace to pre-intervention state."""
     reg = _get_registry(request)
 
-    intervention_engine = reg.get("intervention_engine")
-    if intervention_engine is not None and hasattr(intervention_engine, "restore"):
-        outcome = await intervention_engine.restore(
-            body.intervention_id, body.user_action,
+    # The daemon binds RestoreManager to the durable, receipt-verified
+    # transaction coordinator. Prefer that stable boundary whenever the live
+    # runtime is registered; calling a legacy engine/manager directly would
+    # bypass exact inverse dispatch and could report an optimistic restore.
+    daemon = reg.get("daemon") if hasattr(reg, "get") else None
+    if daemon is not None and hasattr(daemon, "restore_intervention"):
+        outcome = await daemon.restore_intervention(
+            body.intervention_id,
+            body.user_action,
         )
         return InterventionRestoreResponse.from_clock(
-            _get_clock(request), restored=True, outcome=outcome,
+            _get_clock(request),
+            restored=bool(
+                outcome is not None and outcome.workspace_restored
+            ),
+            outcome=outcome,
         )
 
-    restore_manager = _get_first_service(reg, "restore_manager", "intervention_restore_manager")
-    if restore_manager is not None:
-        if body.user_action == "engaged" and hasattr(restore_manager, "engage"):
-            outcome = await restore_manager.engage(body.intervention_id)
-        elif hasattr(restore_manager, "dismiss"):
-            outcome = await restore_manager.dismiss(body.intervention_id)
-        else:
-            outcome = None
-
-        if outcome is not None:
-            ws_server = reg.get("ws_server")
-            if ws_server is not None and hasattr(ws_server, "send_restore"):
-                await ws_server.send_restore(
-                    body.intervention_id,
-                    user_action=body.user_action,
-                )
-            return InterventionRestoreResponse.from_clock(
-                _get_clock(request),
-                restored=outcome.workspace_restored,
-                outcome=outcome,
-            )
-
+    # No daemon means no durable coordinator, no bound executor routing, and
+    # no receipt waiter. Fail closed instead of reviving the pre-WP6 direct
+    # executor/RestoreManager bypass.
     return InterventionRestoreResponse.from_clock(
         _get_clock(request), restored=False,
+    )
+
+
+@router.post(
+    "/intervention/restore-all",
+    response_model=EmergencyRestoreResponse,
+)
+async def restore_all_interventions(
+    request: Request,
+) -> EmergencyRestoreResponse:
+    """Restore every exact Cortex-owned effect without policy or LLM access."""
+
+    reg = _get_registry(request)
+    daemon = reg.get("daemon") if hasattr(reg, "get") else None
+    if daemon is None or not hasattr(
+        daemon,
+        "restore_all_transactional_effects",
+    ):
+        return EmergencyRestoreResponse.from_clock(
+            _get_clock(request),
+            available=False,
+            complete=False,
+        )
+    summary = await daemon.restore_all_transactional_effects(
+        reason="emergency_restore",
+        timeout_seconds=3.0,
+    )
+    return EmergencyRestoreResponse.from_clock(
+        _get_clock(request),
+        available=True,
+        complete=summary["pending"] == 0 and summary["failed"] == 0,
+        **summary,
     )
 
 
@@ -1124,6 +1079,29 @@ async def reset_consent(
     )
     if ladder is not None and hasattr(ladder, "reset"):
         await ladder.reset()
+        # A global consent reset lowers authority immediately. Exact effects
+        # that were already consumed may be in flight, so request their
+        # deterministic inverses before acknowledging the reset. Offline
+        # owners remain in the durable recovery queue.
+        daemon = reg.get("daemon") if hasattr(reg, "get") else None
+        if daemon is not None and hasattr(
+            daemon,
+            "restore_all_transactional_effects",
+        ):
+            try:
+                summary = await daemon.restore_all_transactional_effects(
+                    reason="system_cancelled",
+                    timeout_seconds=3.0,
+                )
+                if summary["pending"] or summary["failed"]:
+                    logger.warning(
+                        "Consent reset retained unresolved exact restores: %s",
+                        summary,
+                    )
+            except Exception:
+                logger.exception(
+                    "Consent reset restore barrier failed; recovery remains durable"
+                )
         states = await ladder.get_all_states()
         return ConsentResetResponse.from_clock(
             _get_clock(request), reset=True, levels=states,

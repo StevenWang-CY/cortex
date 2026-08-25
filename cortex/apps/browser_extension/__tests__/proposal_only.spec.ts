@@ -110,7 +110,15 @@ describe("proposal-only workspace authority", () => {
         await new Promise((resolve) => setTimeout(resolve, 0));
 
         expect(globalThis.__cortexChrome.tabs.query).not.toHaveBeenCalled();
-        expect(globalThis.__cortexChrome.runtime.sendMessage).not.toHaveBeenCalled();
+        const surfacedLegacyPrompt = globalThis.__cortexChrome.runtime.sendMessage
+            .mock.calls.some(([message]) => {
+                const type = (message as { type?: unknown } | undefined)?.type;
+                return type === "BREATHING_OVERLAY"
+                    || type === "PRE_BREAK_WARNING"
+                    || type === "BREAK_RECOMMENDATION"
+                    || type === "INTERVENTION_TRIGGER";
+            });
+        expect(surfacedLegacyPrompt).toBe(false);
         expect(globalThis.__cortexChrome.tabs.remove).not.toHaveBeenCalled();
         expect(globalThis.__cortexChrome.tabs.update).not.toHaveBeenCalled();
     });

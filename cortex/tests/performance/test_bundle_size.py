@@ -1,11 +1,12 @@
 """audit Phase-I: browser-extension bundle size regression guard.
 
-The Cortex Chrome extension ships as a Plasmo MV3 bundle. The most
-recent measurement on the parent repo's ``build/chrome-mv3-prod/``:
+The Cortex Chrome extension ships as a Plasmo MV3 bundle. The most recent
+measured production build (2026-08-25), after removing four unreferenced font
+files from ``assets/``, is:
 
-    Uncompressed total:  ~549 KB
-    Gzipped total:       ~175 KB  (target: < 250 KB)
-    Largest file:        popup.100f6462.js — 169 KB uncompressed
+    Uncompressed total:  ~717 KB
+    Gzipped file sum:    ~236 KB  (target: < 250 KB)
+    Largest file:        popup.100f6462.js — 217 KB uncompressed
 
 Because the build step is not available everywhere this test runs
 (plasmo + pnpm + a network install), we cannot drive ``pnpm plasmo build``
@@ -46,7 +47,11 @@ _SOURCE_BUDGETS: dict[str, int] = {
     # OS notification routing, quiet-mode kind picker). The budgets
     # below are sized for the *post-P0* footprint + ~10-15% headroom
     # so ordinary follow-up feature work does not need to bump them.
-    "background.ts": 240_000,
+    # WP-6 adds the exact authorization/receipt/recovery adapter. Its source
+    # is intentionally explicit and fail-closed; removing unused packaged
+    # fonts offsets the production-byte increase. 315.5 KB measured source,
+    # with ~11% regression headroom.
+    "background.ts": 350_000,
     # Bumped 160_000 -> 176_000 when the audit added the INTERVENTION_FAILED
     # error banner + INTERVENTION_PROMPT inline cross-surface sync consumers
     # (previously the daemon broadcast both with zero popup consumers). Keeps
@@ -71,10 +76,10 @@ _SOURCE_BUDGETS: dict[str, int] = {
     "tabs/onboarding.tsx": 80_000,
 }
 
-# Combined entry-point source budget. The compressed-bundle target is
-# 250 KB; sources compress ~2:1 → source budget < 500 KB keeps us
-# inside that envelope. Set conservatively at 600 KB for resilience.
-_TOTAL_SOURCE_BUDGET_BYTES = 600_000
+# Combined entry-point source proxy, calibrated against the measured 234 KB
+# gzip file sum above. The 680 KB ceiling retains roughly 10% source headroom;
+# any increase still requires a fresh production-build measurement.
+_TOTAL_SOURCE_BUDGET_BYTES = 680_000
 
 
 @pytest.fixture(scope="module")

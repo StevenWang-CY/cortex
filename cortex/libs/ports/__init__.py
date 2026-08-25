@@ -19,5 +19,8 @@ package and export it from this ``__init__``.
 from __future__ import annotations
 
 from cortex.libs.ports.intervention_port import InterventionPort
+from cortex.libs.ports.intervention_transaction_port import (
+    InterventionTransactionStore,
+)
 
-__all__ = ["InterventionPort"]
+__all__ = ["InterventionPort", "InterventionTransactionStore"]

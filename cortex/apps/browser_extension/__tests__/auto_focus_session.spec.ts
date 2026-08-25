@@ -1,22 +1,10 @@
 /**
- * P0 §3.10 — daemon-armed focus session in the browser extension.
+ * WP6 containment — legacy daemon-armed focus commands are inert.
  *
- * The daemon emits ``START_FOCUS_AUTO`` when sustained HYPER trips the
- * arm gate. The browser extension MUST:
- *   1. Open a focus session whose goal is auto-generated from the
- *      reason (so the popup pill reads "Auto-focus" rather than the
- *      manual placeholder).
- *   2. Register a ``chrome.alarm`` so the session auto-tears down after
- *      the configured duration if no STOP_FOCUS_AUTO arrives.
- *   3. Treat ``STOP_FOCUS_AUTO`` as a NO-OP when the session was
- *      manually armed (no daemon hand-over of a user-controlled
- *      session).
- *
- * Behaviour invariants in this spec:
- *   * The daemon's START → STOP → START pattern must round-trip without
- *     leaking stale alarms.
- *   * QUIET_MODE_STATE updates the quietMode flag without touching the
- *     focus session.
+ * A physiological state transition is neither explicit user consent nor an
+ * exact manifest-bound capability. START_FOCUS_AUTO therefore cannot arm a
+ * blocker or create an alarm. STOP_FOCUS_AUTO remains a cleanup-only no-op
+ * when Cortex owns no auto-armed session.
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -67,12 +55,12 @@ function deliverFrame(payload: Record<string, unknown>): void {
     });
 }
 
-describe("P0 §3.10 — auto-armed focus session", () => {
+describe("WP6 — legacy auto-focus containment", () => {
     beforeEach(() => {
         vi.resetModules();
     });
 
-    it("opens a focus session and registers an alarm on START_FOCUS_AUTO", async () => {
+    it("does not arm or register an alarm on START_FOCUS_AUTO", async () => {
         await bootBackground();
         authenticate();
 
@@ -90,23 +78,18 @@ describe("P0 §3.10 — auto-armed focus session", () => {
         });
         await new Promise((r) => setTimeout(r, 0));
 
-        // chrome.alarms.create was called with a name starting with
-        // ``cortex_auto_focus_``.
         const newAlarmCalls = fake.alarms.create.mock.calls.slice(alarmsBefore);
         const autoAlarm = newAlarmCalls.find(
             (c) => typeof c[0] === "string" && (c[0] as string).startsWith("cortex_auto_focus_"),
         );
-        expect(autoAlarm).toBeDefined();
-        const opts = autoAlarm![1] as { when?: number };
-        expect(opts.when).toBeGreaterThan(Date.now());
+        expect(autoAlarm).toBeUndefined();
     });
 
-    it("STOP_FOCUS_AUTO tears down only auto-armed sessions", async () => {
+    it("START then STOP cannot manufacture auto-focus ownership", async () => {
         await bootBackground();
         authenticate();
         const fake = globalThis.__cortexChrome;
 
-        // Arm auto-focus → STOP_FOCUS_AUTO clears it.
         deliverFrame({
             type: "START_FOCUS_AUTO",
             payload: {
@@ -125,8 +108,7 @@ describe("P0 §3.10 — auto-armed focus session", () => {
         });
         await new Promise((r) => setTimeout(r, 0));
 
-        // The auto-focus alarm should have been cleared.
-        expect(fake.alarms.clear.mock.calls.length).toBeGreaterThan(clearsBefore);
+        expect(fake.alarms.clear.mock.calls.length).toBe(clearsBefore);
     });
 
     it("QUIET_MODE_STATE broadcasts update the popup pill", async () => {

@@ -174,6 +174,15 @@ class HelpfulnessTracker:
             policy_arm=policy_arm,
         )
 
+    def cancel_tracking(self, intervention_id: str) -> bool:
+        """Discard a proposal that never reached any presentation surface.
+
+        Cancellation records no reward or engagement observation; it is a
+        transport non-delivery, not a user outcome.
+        """
+
+        return self._active.pop(intervention_id, None) is not None
+
     def record_user_action(
         self,
         intervention_id: str,

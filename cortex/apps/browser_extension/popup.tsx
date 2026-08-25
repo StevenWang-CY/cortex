@@ -12,6 +12,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import { CX, STATE_COLORS, STATE_LABELS, CX_KEYFRAMES } from "./design-tokens";
 import { newCorrelationId } from "./lib/correlation";
 import { getLastRuntimeError } from "./lib/chrome-runtime";
+import { verifiedPresentedActionIds } from "./lib/intervention-transaction";
 import { DAEMON_HTTP_URL } from "./config";
 import { getAuthToken } from "./lib/auth";
 import type {
@@ -121,8 +122,6 @@ import type {
     DailyBaseline,
     SessionReport,
     SessionRecap,
-    SuggestedAction,
-    TabRecommendation,
     TabRecommendations,
     TrendsResponse,
 } from "./types/generated/cortex_schemas";
@@ -236,27 +235,6 @@ interface MorningBriefing {
 }
 
 /**
- * F52: synthesize close_tab actions from tab_recommendations *only*
- * for tab_index values not already covered by suggested_actions, and
- * type the action with the generated ``SuggestedAction["action_type"]``
- * literal union so a future Pydantic-side rename surfaces as a
- * compile error here (Debt-1).
- *
- * Previously two bugs:
- *   - If any suggested_action with a close intent existed, we skipped
- *     synthesis entirely — dropping the close affordance for any
- *     *other* recommended tab.
- *   - When no suggested_action close existed, we synthesised one per
- *     closeable rec, which could duplicate the close button when the
- *     LLM emitted a partial suggested_action AND a tab_recommendation
- *     for the same tab.
- *
- * The rule: if a suggested_action with the same `tab_index` already
- * exists, drop the synthesised action so the tab card alone carries
- * the close button.
- */
-
-/**
  * P0 §3.6: normalise the wire-format ``micro_steps`` payload into the
  * popup's controlled-list shape. The daemon currently emits the dict
  * form on every INTERVENTION_TRIGGER (a backwards-compat coercer
@@ -284,54 +262,6 @@ export function normaliseMicroSteps(
         }
     }
     return out;
-}
-
-export function synthesizeActions(
-    actions: Record<string, unknown>[],
-    tabRecs: TabRecommendations | null,
-): Record<string, unknown>[] {
-    if (!tabRecs || !tabRecs.tabs || tabRecs.tabs.length === 0) return actions;
-    const closeable = tabRecs.tabs.filter(
-        (t: TabRecommendation) =>
-            t.action === "close" || t.action === "bookmark_and_close"
-    );
-    if (closeable.length === 0) return actions;
-
-    // Collect tab_index values already represented by an existing
-    // close-style suggested_action.
-    const coveredIndices = new Set<number>();
-    for (const a of actions) {
-        const at = a.action_type;
-        if (at !== "close_tab" && at !== "bookmark_and_close") continue;
-        const ti = typeof a.tab_index === "number" ? a.tab_index : Number(a.tab_index);
-        if (Number.isFinite(ti)) coveredIndices.add(ti);
-    }
-
-    const synthesised: Record<string, unknown>[] = [];
-    for (let i = 0; i < closeable.length; i++) {
-        const t = closeable[i];
-        const ti = typeof t.tab_index === "number" ? t.tab_index : Number(t.tab_index);
-        if (!Number.isFinite(ti)) continue;
-        if (coveredIndices.has(ti)) continue; // dedup: card already has close
-        // Narrow the inferred action_type to the generated literal union
-        // so a future rename in the Pydantic catalog surfaces here at
-        // compile time (Debt-1).
-        const action_type: SuggestedAction["action_type"] =
-            t.action === "bookmark_and_close" ? "bookmark_and_close" : "close_tab";
-        synthesised.push({
-            action_id: `synth_${Date.now()}_${i}`,
-            action_type,
-            tab_index: ti,
-            target: "",
-            label: `Close ${t.tab_title || "tab"}`,
-            reason: t.reason || "",
-            category: "recommended" as SuggestedAction["category"],
-            reversible: true,
-            metadata: {},
-        });
-    }
-    if (synthesised.length === 0) return actions;
-    return [...actions, ...synthesised];
 }
 
 // --- State dot animation helper ---
@@ -712,6 +642,11 @@ function CortexPopup(): React.ReactElement {
     const [goalInput, setGoalInput] = useState("");
     const [alert, setAlert] = useState<{ title: string; body: string } | null>(null);
     const [activeActions, setActiveActions] = useState<Record<string, unknown>[]>([]);
+    const [presentedManifest, setPresentedManifest] = useState<{
+        interventionId: string;
+        status: "pending" | "verified" | "invalid";
+        executableActionIds: string[];
+    } | null>(null);
     const [tabRecs, setTabRecs] = useState<TabRecommendations | null>(null);
     const [errAnalysis, setErrAnalysis] = useState<Record<string, string> | null>(null);
     const [interventionId, setInterventionId] = useState<string>("");
@@ -1048,10 +983,27 @@ function CortexPopup(): React.ReactElement {
                 setExecutionMode(parseExecutionMode(p.execution_mode));
                 const rawActions = (p.suggested_actions as Record<string, unknown>[]) || [];
                 const recs = (p.tab_recommendations as TabRecommendations | undefined) ?? null;
-                setActiveActions(synthesizeActions(rawActions, recs));
+                setActiveActions(rawActions);
                 setTabRecs(recs);
                 setErrAnalysis((p.error_analysis as Record<string, string>) || null);
-                setInterventionId(String(p.intervention_id || ""));
+                const incomingInterventionId = String(p.intervention_id || "");
+                setInterventionId(incomingInterventionId);
+                setPresentedManifest({
+                    interventionId: incomingInterventionId,
+                    status: "pending",
+                    executableActionIds: [],
+                });
+                void verifiedPresentedActionIds(p, "browser")
+                    .then((ids) => setPresentedManifest({
+                        interventionId: incomingInterventionId,
+                        status: "verified",
+                        executableActionIds: ids,
+                    }))
+                    .catch(() => setPresentedManifest({
+                        interventionId: incomingInterventionId,
+                        status: "invalid",
+                        executableActionIds: [],
+                    }));
                 setMicroSteps(normaliseMicroSteps(p.micro_steps));
                 setApplied(false);
             }
@@ -1150,10 +1102,27 @@ function CortexPopup(): React.ReactElement {
                 setExecutionMode(parseExecutionMode(p.execution_mode));
                 const rawActions = (p.suggested_actions as Record<string, unknown>[]) || [];
                 const recs = (p.tab_recommendations as TabRecommendations | undefined) ?? null;
-                setActiveActions(synthesizeActions(rawActions, recs));
+                setActiveActions(rawActions);
                 setTabRecs(recs);
                 setErrAnalysis((p.error_analysis as Record<string, string>) || null);
-                setInterventionId(String(p.intervention_id || ""));
+                const incomingInterventionId = String(p.intervention_id || "");
+                setInterventionId(incomingInterventionId);
+                setPresentedManifest({
+                    interventionId: incomingInterventionId,
+                    status: "pending",
+                    executableActionIds: [],
+                });
+                void verifiedPresentedActionIds(p, "browser")
+                    .then((ids) => setPresentedManifest({
+                        interventionId: incomingInterventionId,
+                        status: "verified",
+                        executableActionIds: ids,
+                    }))
+                    .catch(() => setPresentedManifest({
+                        interventionId: incomingInterventionId,
+                        status: "invalid",
+                        executableActionIds: [],
+                    }));
                 setCausalExplanation(String(p.causal_explanation || ""));
                 // P0 §3.8 audit fix (spec line 710): only show the
                 // rating row on guided_mode + simplified_workspace
@@ -1217,6 +1186,7 @@ function CortexPopup(): React.ReactElement {
             }
             case "INTERVENTION_RESTORE":
                 setActiveActions([]);
+                setPresentedManifest(null);
                 setTabRecs(null);
                 setErrAnalysis(null);
                 setCausalExplanation("");
@@ -1678,6 +1648,25 @@ function CortexPopup(): React.ReactElement {
     const closeTabs = tabRecs?.tabs?.filter(t => t.action === "close" || t.action === "bookmark_and_close") || [];
     const keepTabs = tabRecs?.tabs?.filter(t => t.action === "keep") || [];
     const rec = activeActions.filter(a => a.category === "recommended");
+    const manifestForCurrent = presentedManifest?.interventionId === interventionId
+        ? presentedManifest
+        : null;
+    const executableIdSet = new Set(
+        manifestForCurrent?.status === "verified"
+            ? manifestForCurrent.executableActionIds
+            : [],
+    );
+    const executableRec = rec.filter((action) =>
+        typeof action.action_id === "string"
+        && executableIdSet.has(action.action_id)
+    );
+    const manualRec = rec.filter((action) =>
+        typeof action.action_id !== "string"
+        || !executableIdSet.has(action.action_id)
+    );
+    const canExecutePresented = executionMode !== "suggest_only"
+        && manifestForCurrent?.status === "verified"
+        && executableRec.length > 0;
 
     const visibleCloseTabs = tabsExpanded ? closeTabs : closeTabs.slice(0, 5);
     const overflowCount = tabsExpanded ? 0 : closeTabs.length - visibleCloseTabs.length;
@@ -2313,13 +2302,25 @@ function CortexPopup(): React.ReactElement {
 
                     {visibleCloseTabs.length > 0 && (
                         <div style={{ marginBottom: 12 }}>
+                            <div
+                                style={{
+                                    color: CX.textSecondary,
+                                    fontFamily: CX.font,
+                                    fontSize: 10,
+                                    fontWeight: 600,
+                                    letterSpacing: "0.02em",
+                                    marginBottom: 6,
+                                }}
+                            >
+                                Manual tab review
+                            </div>
                             {visibleCloseTabs.map((t, i) => {
                                 const title = String(t.tab_title || "Untitled");
                                 const rawReason = String(t.reason || "");
                                 const reason = genericReasonPhrases.some(p => rawReason.toLowerCase().includes(p)) ? "" : rawReason;
                                 return (
                                     <div key={`c${i}`} style={S.tabRow}>
-                                        <span style={S.tabXMark}>{"\u2715"}</span>
+                                        <span style={{ ...S.tabXMark, color: CX.textTertiary }}>{"\u00b7"}</span>
                                         <span style={S.tabName}>{title}</span>
                                     </div>
                                 );
@@ -2333,6 +2334,18 @@ function CortexPopup(): React.ReactElement {
                             {keepTabs.length > 0 && (
                                 <div style={S.keepLine}>Keeping {keepTabs.length} you need</div>
                             )}
+                            <div
+                                data-testid="manual-tab-review-note"
+                                style={{
+                                    color: CX.textTertiary,
+                                    fontFamily: CX.font,
+                                    fontSize: 10,
+                                    lineHeight: 1.45,
+                                    marginTop: 7,
+                                }}
+                            >
+                                Cortex won’t close or regroup existing tabs automatically.
+                            </div>
                         </div>
                     )}
 
@@ -2353,6 +2366,22 @@ function CortexPopup(): React.ReactElement {
                                     <span style={{ ...S.tabName, color: CX.text }}>{String(a.label || "")}</span>
                                 </div>
                             ))}
+                            {manualRec.length > 0 && (
+                                <div
+                                    data-testid="manual-action-review-note"
+                                    style={{
+                                        color: CX.textTertiary,
+                                        fontFamily: CX.font,
+                                        fontSize: 10,
+                                        lineHeight: 1.45,
+                                        marginTop: 7,
+                                    }}
+                                >
+                                    {executableRec.length > 0
+                                        ? "Other items are guidance for manual review."
+                                        : "Manual review only — no workspace change will run."}
+                                </div>
+                            )}
                         </div>
                     )}
 
@@ -2360,28 +2389,29 @@ function CortexPopup(): React.ReactElement {
                     {rec.length > 0 && (
                         <>
                             <button
+                                data-testid="intervention-primary-action"
                                 className="cortex-primary-btn"
                                 style={
-                                    applied || interventionError
+                                    applied || interventionError || !canExecutePresented
                                         ? { ...S.primaryBtn, ...S.doneBtnStyle }
                                         : S.primaryBtn
                                 }
                                 aria-disabled={
                                     applied
                                     || interventionError !== null
-                                    || executionMode === "suggest_only"
+                                    || !canExecutePresented
                                 }
                                 disabled={
                                     applied
                                     || interventionError !== null
-                                    || executionMode === "suggest_only"
+                                    || !canExecutePresented
                                 }
                                 onClick={() => {
-                                    if (executionMode === "suggest_only") return;
+                                    if (!canExecutePresented) return;
                                     sendWithCid(
                                         {
                                             type: "EXECUTE_ALL_RECOMMENDED",
-                                            actions: rec,
+                                            actions: executableRec,
                                             intervention_id: interventionId,
                                         },
                                         (raw: unknown) => {
@@ -2391,6 +2421,7 @@ function CortexPopup(): React.ReactElement {
                                                 setApplied(true);
                                                 setTimeout(() => {
                                                     setActiveActions([]);
+                                                    setPresentedManifest(null);
                                                     setTabRecs(null);
                                                     setErrAnalysis(null);
                                                     setApplied(false);
@@ -2406,13 +2437,21 @@ function CortexPopup(): React.ReactElement {
                                     ? "Couldn't apply"
                                     : executionMode === "suggest_only"
                                     ? "Suggestions only"
+                                    : manifestForCurrent?.status === "pending"
+                                    ? "Checking actions…"
+                                    : !canExecutePresented
+                                    ? "Manual review only"
                                     : applied
                                     ? "Done"
-                                    : closeTabs.length > 0
-                                        ? `Close ${closeTabs.length} tab${closeTabs.length !== 1 ? "s" : ""}`
-                                        : errAnalysis
-                                            ? "Help me fix this"
-                                            : `Apply ${rec.length} change${rec.length !== 1 ? "s" : ""}`}
+                                    : executableRec.length === 1
+                                        ? String(executableRec[0].action_type || "") === "search_error"
+                                            ? "Search this error"
+                                            : String(executableRec[0].action_type || "") === "open_url"
+                                                ? "Open recommended page"
+                                                : String(executableRec[0].action_type || "") === "highlight_tab"
+                                                    ? "Switch to recommended tab"
+                                                    : "Apply change"
+                                        : `Apply ${executableRec.length} changes`}
                             </button>
                             {applied && (
                                 <div style={S.undoRow}>

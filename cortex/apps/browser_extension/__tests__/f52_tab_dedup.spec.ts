@@ -1,104 +1,120 @@
 /**
- * F52: synthesise close actions per-tab_index dedup.
+ * WYSIWYG regression coverage for the former F52 synthesis path.
  *
- * - When suggested_actions already covers a tab_index, do not synthesise.
- * - Synthesise only for tab indices not yet covered.
- * - Empty tab recs short-circuit.
+ * Tab recommendations are presentation-only. They must never be promoted to
+ * executable close actions, and a visible action only receives authority when
+ * its exact JSON presentation is committed by the verified manifest.
  */
 
 import { describe, expect, it } from "vitest";
-import { synthesizeActions } from "../popup";
-import type { TabRecommendations } from "../types/generated/cortex_schemas";
+import {
+    canonicalJson,
+    sha256Hex,
+    verifiedPresentedActionIds,
+} from "../lib/intervention-transaction";
 
-describe("F52 synthesizeActions dedup", () => {
-    it("drops the synthesised action when tab_index is already covered", () => {
-        const existing = [
-            {
-                action_id: "real_1",
-                action_type: "close_tab",
-                tab_index: 3,
-                category: "recommended",
-                label: "Close existing",
+const NOW = 1_800_000_000_000;
+
+async function planFor(suggestion: Record<string, unknown>) {
+    const manifestAction = {
+        action_id: suggestion.action_id,
+        ordinal: 0,
+        executor: "browser",
+        capability: suggestion.action_type,
+        parameters_json: canonicalJson({ suggested_action: suggestion }),
+        reverse_capability: "close_created_tab",
+        workspace_mutation: true,
+        required_consent_level: 3,
+        source: "suggested_action",
+    };
+    const body = canonicalJson({
+        actions: [manifestAction],
+        intervention_id: "iv-wysiwyg",
+        schema_version: "1",
+    });
+    return {
+        intervention_id: "iv-wysiwyg",
+        suggested_actions: [suggestion],
+        tab_recommendations: null,
+        action_manifest: {
+            schema_version: "1",
+            intervention_id: "iv-wysiwyg",
+            canonical_json: body,
+            manifest_sha256: await sha256Hex(body),
+            action_count: 1,
+            created_at_unix_ms: NOW - 1_000,
+            created_at_mono_ns: 1_000_000,
+            expires_at_unix_ms: NOW + 299_000,
+            ttl_ms: 300_000,
+            boot_id: "11111111-1111-4111-8111-111111111111",
+        },
+    };
+}
+
+describe("verified intervention presentation", () => {
+    it("enables an exact manifest-bound safe action", async () => {
+        const suggestion = {
+            action_id: "action-open",
+            action_type: "open_url",
+            target: "https://example.com/reference",
+            label: "Open reference",
+            reason: "Directly relevant",
+            category: "recommended",
+            reversible: true,
+            metadata: {},
+        };
+        const plan = await planFor(suggestion);
+        await expect(
+            verifiedPresentedActionIds(plan, "browser", NOW),
+        ).resolves.toEqual(["action-open"]);
+    });
+
+    it("does not synthesize authority from tab recommendations", async () => {
+        const canonical = canonicalJson({
+            actions: [],
+            intervention_id: "iv-manual-tabs",
+            schema_version: "1",
+        });
+        const plan = {
+            intervention_id: "iv-manual-tabs",
+            suggested_actions: [],
+            tab_recommendations: {
+                tabs: [{ tab_index: 2, action: "close", tab_title: "Noise" }],
+                summary: "Review one tab",
             },
-        ];
-        const tabRecs: TabRecommendations = {
-            tabs: [
-                { tab_index: 3, action: "close", tab_title: "Dup tab" },
-            ],
-            summary: "",
-        };
-        const out = synthesizeActions(existing, tabRecs);
-        const closeCount = out.filter(
-            (a) =>
-                (a.action_type === "close_tab" || a.action_type === "bookmark_and_close") &&
-                a.tab_index === 3,
-        ).length;
-        expect(closeCount).toBe(1);
-        expect(out).toEqual(existing);
-    });
-
-    it("synthesises only for uncovered tab indices", () => {
-        const existing = [
-            {
-                action_id: "real_1",
-                action_type: "close_tab",
-                tab_index: 1,
-                category: "recommended",
-                label: "Close 1",
+            action_manifest: {
+                schema_version: "1",
+                intervention_id: "iv-manual-tabs",
+                canonical_json: canonical,
+                action_count: 0,
+                created_at_unix_ms: NOW - 1_000,
+                created_at_mono_ns: 1_000_000,
+                expires_at_unix_ms: NOW + 299_000,
+                ttl_ms: 300_000,
+                boot_id: "11111111-1111-4111-8111-111111111111",
+                manifest_sha256: await sha256Hex(canonical),
             },
-        ];
-        const tabRecs: TabRecommendations = {
-            tabs: [
-                { tab_index: 1, action: "close", tab_title: "Already covered" },
-                { tab_index: 2, action: "close", tab_title: "Uncovered" },
-                { tab_index: 5, action: "bookmark_and_close", tab_title: "Also new" },
-            ],
-            summary: "",
         };
-        const out = synthesizeActions(existing, tabRecs);
-        const tabsRepresented = new Set<number>();
-        for (const a of out) {
-            if (
-                a.action_type === "close_tab" ||
-                a.action_type === "bookmark_and_close"
-            ) {
-                tabsRepresented.add(a.tab_index as number);
-            }
-        }
-        expect(tabsRepresented.has(1)).toBe(true);
-        expect(tabsRepresented.has(2)).toBe(true);
-        expect(tabsRepresented.has(5)).toBe(true);
-        // Each tab_index represented exactly once.
-        const closeActionsForOne = out.filter(
-            (a) =>
-                (a.action_type === "close_tab" || a.action_type === "bookmark_and_close") &&
-                a.tab_index === 1,
-        );
-        expect(closeActionsForOne.length).toBe(1);
-        expect(closeActionsForOne[0].action_id).toBe("real_1");
+        await expect(
+            verifiedPresentedActionIds(plan, "browser", NOW),
+        ).resolves.toEqual([]);
     });
 
-    it("returns input unchanged when tab recs are empty", () => {
-        const existing = [{ action_id: "a", action_type: "open_url", category: "recommended" }];
-        expect(synthesizeActions(existing, null)).toBe(existing);
-        expect(synthesizeActions(existing, { tabs: [], summary: "" })).toBe(existing);
-    });
-
-    it("synthesises full set when no close-style suggested_action exists", () => {
-        const existing = [
-            { action_id: "a", action_type: "open_url", category: "recommended" },
-        ];
-        const tabRecs: TabRecommendations = {
-            tabs: [
-                { tab_index: 7, action: "close", tab_title: "X" },
-                { tab_index: 8, action: "close", tab_title: "Y" },
-            ],
-            summary: "",
+    it("withholds the affordance when visible copy differs from the manifest", async () => {
+        const committed = {
+            action_id: "action-open",
+            action_type: "open_url",
+            target: "https://example.com/reference",
+            label: "Open reference",
+            reason: "Directly relevant",
+            category: "recommended",
+            reversible: true,
+            metadata: {},
         };
-        const out = synthesizeActions(existing, tabRecs);
-        const synthIndices = out
-            .filter((a) => a.action_type === "close_tab")
-            .map((a) => a.tab_index);
-        expect(synthIndices).toEqual([7, 8]);
+        const plan = await planFor(committed);
+        plan.suggested_actions = [{ ...committed, label: "Open something else" }];
+        await expect(
+            verifiedPresentedActionIds(plan, "browser", NOW),
+        ).resolves.toEqual([]);
     });
 });

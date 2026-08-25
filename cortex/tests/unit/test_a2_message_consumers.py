@@ -273,6 +273,7 @@ class _BreakRecordingDaemon:
         self.workspace_mutation_allowed = True
         self.break_calls: list[dict[str, Any]] = []
         self.user_actions: list[dict[str, Any]] = []
+        self.exact_actions: list[tuple[str, dict[str, Any]]] = []
 
     async def start_biology_break(self, **kwargs: Any) -> dict[str, Any]:
         self.break_calls.append(dict(kwargs))
@@ -281,11 +282,17 @@ class _BreakRecordingDaemon:
     async def _handle_user_action(self, payload: dict) -> None:
         self.user_actions.append(payload)
 
+    async def dispatch_intervention_action(
+        self,
+        intervention_id: str,
+        action: dict[str, Any],
+    ) -> int:
+        self.exact_actions.append((intervention_id, dict(action)))
+        return 0
 
-def test_start_timer_invokes_break_countdown(qapp) -> None:
-    """P2-FE-START-TIMER: clicking 'start timer' must invoke the
-    daemon's break/countdown overlay with the metadata duration and a
-    plain (no-pattern, no-audio) countdown — not a silent no-op."""
+
+def test_start_timer_cannot_bypass_exact_action_boundary(qapp) -> None:
+    """An irreversible timer suggestion is requested, never run in Qt."""
     from cortex.apps.desktop_shell.controller import CortexAppController
 
     ctrl = CortexAppController.__new__(CortexAppController)
@@ -309,19 +316,26 @@ def test_start_timer_invokes_break_countdown(qapp) -> None:
         )
 
         deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline and not daemon.break_calls:
+        while time.monotonic() < deadline and not daemon.exact_actions:
             time.sleep(0.01)
     finally:
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=2.0)
         loop.close()
 
-    assert daemon.break_calls, "start_timer did not start a break/countdown"
-    call = daemon.break_calls[0]
-    assert call["duration_seconds"] == 600
-    assert call["breathing_pattern"] is None
-    assert call["audio_cue"] is False
-    assert call["intervention_id"] == "iv-timer"
+    assert daemon.break_calls == []
+    assert daemon.user_actions == []
+    assert daemon.exact_actions == [
+        (
+            "iv-timer",
+            {
+                "action_id": "act-timer",
+                "action_type": "start_timer",
+                "label": "Start a 10-minute timer",
+                "metadata": {"duration_seconds": 600},
+            },
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------

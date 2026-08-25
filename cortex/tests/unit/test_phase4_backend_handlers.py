@@ -622,6 +622,9 @@ async def test_b17_executor_adapter_missing_counter() -> None:
     from cortex.services.intervention_engine.executor import InterventionExecutor
 
     executor = InterventionExecutor(execution_mode="authorized")
+    # This test isolates the missing-adapter counter rather than the WP6
+    # manifest gate; production callers never enable this escape hatch.
+    executor._allow_unwired_consent = True
     assert executor._adapter_missing_total == 0
     # Skip the 500ms retry sleep so the test runs fast.
     with patch("asyncio.sleep", return_value=None):

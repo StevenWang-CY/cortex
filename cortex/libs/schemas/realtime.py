@@ -27,6 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from cortex.application.clock import SYSTEM_CLOCK, utc_datetime
 from cortex.libs.schemas.intervention import CausalSignal, InterventionPlan
+from cortex.libs.schemas.intervention_transaction import ActionManifest
 from cortex.libs.schemas.session_report import SessionReport
 from cortex.libs.schemas.state import (
     EstimateStatus,
@@ -865,6 +866,15 @@ class InterventionTriggerPayload(InterventionPlan):
         description=(
             "Daemon-owned workspace authority mode. Missing or legacy values "
             "decode to suggest_only so protocol downgrade cannot increase authority."
+        ),
+    )
+
+    action_manifest: ActionManifest | None = Field(
+        None,
+        description=(
+            "Daemon-authored immutable effect manifest. The trigger remains a "
+            "non-mutating proposal; clients must request a separate one-time "
+            "authorization against this exact digest before executing actions."
         ),
     )
 

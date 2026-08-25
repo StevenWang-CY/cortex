@@ -19,6 +19,7 @@ import logging
 import signal
 import sys
 import threading
+import time
 from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
@@ -35,6 +36,10 @@ from cortex.apps.desktop_shell.tray import CortexTrayIcon
 from cortex.libs.auth import load_or_create_token
 from cortex.libs.config.settings import APIConfig, get_config
 from cortex.libs.logging import configure_logging
+from cortex.libs.schemas.intervention_transaction import (
+    ActionManifest,
+    manifest_suggestion_matches,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +54,7 @@ class WebSocketBridge(QObject):
     state_updated = Signal(dict)
     intervention_triggered = Signal(dict)
     intervention_restored = Signal(dict)
+    intervention_transaction_state = Signal(dict)
     settings_synced = Signal(dict)
     connection_changed = Signal(bool)
     # P1-FC-INTERVENTION-FAILED: daemon broadcast of a total mutation
@@ -92,6 +98,7 @@ class WebSocketBridge(QObject):
         # type. Reset to {} on every fresh connect so a daemon restart
         # always wins.
         self._last_seq_by_type: dict[str, int] = {}
+        self._boot_id = uuid4()
         self._reconnect_delay_max = 30.0
         # Debt-2 (audit): cache the capability token at startup so we can
         # AUTH on every (re)connect without re-reading the file. The
@@ -190,6 +197,35 @@ class WebSocketBridge(QObject):
             "sequence": 0,
         })
         asyncio.run_coroutine_threadsafe(self._send(msg), self._loop)
+
+    def send_intervention_authorization(
+        self,
+        intervention_id: str,
+        manifest_sha256: str,
+        action_id: str,
+    ) -> bool:
+        """Send one manifest-bound desktop user gesture to the daemon."""
+
+        if self._loop is None or self._ws is None:
+            return False
+        now_unix_ms = time.time_ns() // 1_000_000
+        msg = json.dumps({
+            "type": "INTERVENTION_AUTHORIZE",
+            "payload": {
+                "authorization_request_id": f"desktop_{uuid4().hex}",
+                "intervention_id": intervention_id,
+                "manifest_sha256": manifest_sha256,
+                "approved_action_ids": [action_id],
+                "source_surface": "desktop",
+                "requested_at_unix_ms": now_unix_ms,
+                "requested_at_mono_ns": time.monotonic_ns(),
+                "boot_id": str(self._boot_id),
+            },
+            "timestamp": now_unix_ms / 1_000,
+            "sequence": 0,
+        })
+        asyncio.run_coroutine_threadsafe(self._send(msg), self._loop)
+        return True
 
     def send_shutdown(self) -> None:
         """E.1 (WS-mode Stop button): send a top-level SHUTDOWN message.
@@ -505,6 +541,10 @@ class WebSocketBridge(QObject):
             self.intervention_triggered.emit(payload)
         elif msg_type == "INTERVENTION_RESTORE":
             self.intervention_restored.emit(payload)
+        elif msg_type == "INTERVENTION_TRANSACTION_STATE":
+            self.intervention_transaction_state.emit(
+                payload if isinstance(payload, dict) else {}
+            )
         # P1-FC-INTERVENTION-FAILED / -PROMPT: surface the daemon's
         # total-failure broadcast (toast) and the cross-surface prompt
         # (informational) in WS mode as well.
@@ -562,6 +602,7 @@ class CortexApp:
         self._bridge: WebSocketBridge | None = None
         self._paused = False
         self._active_intervention_id: str | None = None
+        self._active_action_manifest: ActionManifest | None = None
         # P0 §3.4: in-flight CalibrationRunner. None when idle.
         self._calibration_runner: Any = None
         self._pending_calibration_profile_id: str | None = None
@@ -670,6 +711,12 @@ class CortexApp:
         self._bridge.state_updated.connect(self._on_state_update)
         self._bridge.intervention_triggered.connect(self._on_intervention)
         self._bridge.intervention_restored.connect(self._on_restore)
+        if self._dashboard is not None and hasattr(
+            self._dashboard, "apply_intervention_transaction_state",
+        ):
+            self._bridge.intervention_transaction_state.connect(
+                self._dashboard.apply_intervention_transaction_state,
+            )
         # P1-FC-INTERVENTION-FAILED / -PROMPT: route to the toast + log.
         self._bridge.intervention_failed.connect(self._on_intervention_failed)
         self._bridge.intervention_prompt.connect(self._on_intervention_prompt)
@@ -852,6 +899,17 @@ class CortexApp:
         if self._paused:
             return
         self._active_intervention_id = payload.get("intervention_id")
+        try:
+            manifest = ActionManifest.model_validate(
+                payload.get("action_manifest")
+            )
+            self._active_action_manifest = (
+                manifest
+                if manifest.intervention_id == self._active_intervention_id
+                else None
+            )
+        except Exception:
+            self._active_action_manifest = None
         if self._overlay is not None:
             self._overlay.show_intervention(payload)
         # Audit-2 fix: bump the Today/Blocked counter so the dashboard
@@ -924,14 +982,7 @@ class CortexApp:
 
     @Slot(str, dict)
     def _on_action_invoked(self, intervention_id: str, action: dict) -> None:
-        """G4 (audit-prod): handle a desktop overlay action button click
-        in WS mode.
-
-        Native action types (clipboard, timer) execute in the shell
-        directly. Everything else goes to the daemon as ACTION_EXECUTE
-        with ``request_dispatch=True`` so the daemon broadcasts an
-        ACTION_DISPATCH frame to the connected chrome / edge client.
-        """
+        """Submit one WS-mode desktop gesture for exact authorization."""
         if self._bridge is None:
             return
         if (
@@ -944,41 +995,29 @@ class CortexApp:
                 intervention_id,
             )
             return
-        action_type = str(action.get("action_type") or "")
-        executed_natively = False
-        if action_type == "copy_to_clipboard":
-            try:
-                from PySide6.QtGui import QGuiApplication
-
-                clip = QGuiApplication.clipboard()
-                target = str(action.get("target") or "")
-                if clip is not None and target:
-                    clip.setText(target)
-                    executed_natively = True
-            except Exception:
-                logger.debug("Clipboard copy failed", exc_info=True)
-        # P2-FE-START-TIMER: 'start_timer' is a real LLM-emitted native
-        # action that previously set executed_natively=True here, which
-        # made the ACTION_EXECUTE a pure log (request_dispatch=False) — so
-        # the button did nothing in WS mode. WS mode has no in-process
-        # break overlay, so we mirror the take_biology_break path: leave
-        # executed_natively False and let send_action_execute reach the
-        # daemon with request_dispatch=True. The daemon drives its
-        # break/countdown overlay (a plain countdown for start_timer).
-
-        # Audit-prod fix: ACTION_EXECUTE (with request_dispatch) must
-        # arrive at the daemon BEFORE the engaged USER_ACTION. The
-        # daemon's engage handler clears ``_active_intervention_id`` to
-        # None as part of recording the outcome; ``dispatch_action_to_browser``
-        # gates on that id being live, so the prior order silently
-        # rejected every legitimate browser-action click.
-        self._bridge.send_action_execute(
+        manifest = getattr(self, "_active_action_manifest", None)
+        action_id = str(action.get("action_id") or "")
+        if (
+            manifest is None
+            or manifest.intervention_id != intervention_id
+            or not any(
+                item.action_id == action_id
+                for item in manifest.body.actions
+            )
+            or not manifest_suggestion_matches(manifest, action)
+        ):
+            logger.warning(
+                "Desktop action is absent from the active exact manifest "
+                "(intervention_id=%s action_id=%s)",
+                intervention_id,
+                action_id,
+            )
+            return
+        self._bridge.send_intervention_authorization(
             intervention_id,
-            dict(action),
-            request_dispatch=not executed_natively,
+            manifest.manifest_sha256,
+            action_id,
         )
-        # Then record engagement on the daemon (engaged USER_ACTION).
-        self._bridge.send_user_action("engaged", intervention_id)
 
     @Slot(dict)
     def _on_settings_changed(self, settings: dict) -> None:
@@ -991,6 +1030,7 @@ class CortexApp:
     def _on_restore(self, payload: dict) -> None:
         """Handle explicit restore events from the daemon."""
         self._active_intervention_id = None
+        self._active_action_manifest = None
         if self._overlay is not None:
             self._overlay.hide()
 

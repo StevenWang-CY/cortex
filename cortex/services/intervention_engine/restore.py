@@ -8,6 +8,7 @@ Manages intervention lifecycle: auto-timeout (5 min), recovery detection
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -26,6 +27,8 @@ from cortex.libs.schemas.state import StateEstimate
 from cortex.services.intervention_engine.executor import InterventionExecutor
 
 logger = logging.getLogger(__name__)
+
+TransactionRestoreCallback = Callable[[str, str], Awaitable[bool]]
 
 
 def merge_micro_steps(
@@ -138,14 +141,24 @@ class RestoreManager:
         recovery_threshold: float = 0.70,
         recovery_dwell_seconds: float = 15.0,
         clock: Clock | None = None,
+        restore_callback: TransactionRestoreCallback | None = None,
     ) -> None:
         self._clock = clock or SYSTEM_CLOCK
         self._executor = executor
         self._timeout = timeout_seconds
         self._recovery_threshold = recovery_threshold
         self._recovery_dwell = recovery_dwell_seconds
+        self._restore_callback = restore_callback
         self._active: dict[str, ActiveIntervention] = {}
         self._outcomes: list[InterventionOutcome] = []
+
+    def set_restore_callback(
+        self,
+        callback: TransactionRestoreCallback | None,
+    ) -> None:
+        """Bind the durable transactional restore path."""
+
+        self._restore_callback = callback
 
     def start_intervention(
         self,
@@ -317,7 +330,22 @@ class RestoreManager:
         workspace_restored = False
         restore_errors: list[str] = []
 
-        if self._executor is None:
+        if self._restore_callback is not None:
+            try:
+                workspace_restored = await self._restore_callback(
+                    iid,
+                    user_action,
+                )
+                if not workspace_restored:
+                    restore_errors.append("transaction_restore_unverified")
+            except Exception as exc:
+                logger.exception(
+                    "Transactional restore failed for %s",
+                    iid,
+                )
+                restore_errors.append(str(exc))
+                workspace_restored = False
+        elif self._executor is None:
             # No executor wired: we genuinely cannot have mutated the
             # workspace, so it is trivially in its original state.
             workspace_restored = True
@@ -362,7 +390,12 @@ class RestoreManager:
         )
 
         self._outcomes.append(outcome)
-        self._active.pop(iid, None)
+        # A failed restore remains active and retryable. The previous code
+        # discarded both ActiveIntervention and executor mutations after the
+        # first failure, making the Undo control lie and eliminating every
+        # recovery path except a process restart.
+        if workspace_restored:
+            self._active.pop(iid, None)
 
         logger.info(
             "Intervention %s ended: action=%s, duration=%.1fs, restored=%s",

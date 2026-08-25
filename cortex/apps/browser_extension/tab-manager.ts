@@ -30,6 +30,18 @@ export interface TabSnapshot {
     activeTabId: number | null;
 }
 
+/** A Chrome-owned object may exist even though its durable checkpoint failed. */
+export class IndeterminateBrowserMutationError extends Error {
+    constructor(
+        message: string,
+        public readonly inverse: Record<string, unknown>,
+        public readonly cause?: unknown,
+    ) {
+        super(message);
+        this.name = "IndeterminateBrowserMutationError";
+    }
+}
+
 /**
  * The set of tab-group colors accepted by `chrome.tabGroups.update`.
  *
@@ -277,6 +289,7 @@ restoreSnapshots();
 export async function hideNonActiveTabs(
     interventionId: string,
     protectedTabIds?: Set<number>,
+    onGrouped?: (snapshot: TabSnapshot) => Promise<void>,
 ): Promise<TabSnapshot | null> {
     try {
         const tabs = await collectCurrentWindowTabs();
@@ -305,13 +318,48 @@ export async function hideNonActiveTabs(
         let groupId: number | null = null;
         try {
             groupId = await chrome.tabs.group({ tabIds: asNonEmptyTabIds(toHide) });
+        } catch {
+            return null;
+        }
+        const checkpoint: TabSnapshot = {
+            interventionId,
+            timestamp: Date.now(),
+            hiddenTabIds: toHide,
+            groupId,
+            activeTabId: activeTab.tabId,
+        };
+        if (onGrouped) {
+            try {
+                await onGrouped(checkpoint);
+            } catch (error) {
+                try {
+                    await chrome.tabs.ungroup(asNonEmptyTabIds(toHide));
+                } catch {
+                    // The caller will retain its pre-effect intent record and
+                    // report an indeterminate failure if rollback also fails.
+                }
+                throw new IndeterminateBrowserMutationError(
+                    "Tab group checkpoint failed after group creation",
+                    {
+                        interventionId,
+                        hiddenTabIds: toHide,
+                        groupId,
+                        activeTabId: activeTab.tabId,
+                    },
+                    error,
+                );
+            }
+        }
+        try {
             await chrome.tabGroups.update(groupId, {
                 collapsed: true,
                 title: "Cortex: Hidden",
                 color: "grey",
             });
         } catch {
-            // tabGroups API may not be available
+            // Keep the exact group id. The transaction-level postcondition
+            // verifier will treat an uncollapsed group as indeterminate and
+            // use this identity to compensate safely.
         }
 
         const snapshot: TabSnapshot = {
@@ -325,7 +373,8 @@ export async function hideNonActiveTabs(
         snapshots.set(interventionId, snapshot);
         scheduleSnapshotPersist();
         return snapshot;
-    } catch {
+    } catch (error) {
+        if (error instanceof IndeterminateBrowserMutationError) throw error;
         return null;
     }
 }
@@ -343,12 +392,20 @@ export async function restoreHiddenTabs(
     if (!snapshot) return false;
 
     try {
-        // Ungroup the tabs (restores them to normal state)
-        if (snapshot.hiddenTabIds.length > 0) {
-            try {
-                await chrome.tabs.ungroup(asNonEmptyTabIds(snapshot.hiddenTabIds));
-            } catch {
-                // Some tabs may have been closed by the user
+        // Restore only tabs that still belong to the exact group Cortex
+        // created. If the user moved a tab to another group after apply, that
+        // newer user state wins and must not be overwritten by restoration.
+        if (snapshot.hiddenTabIds.length > 0 && snapshot.groupId !== null) {
+            const liveTabs = await chrome.tabs.query({});
+            const cortexOwned = liveTabs
+                .filter((tab) =>
+                    typeof tab.id === "number"
+                    && snapshot.hiddenTabIds.includes(tab.id)
+                    && tab.groupId === snapshot.groupId
+                )
+                .map((tab) => tab.id as number);
+            if (cortexOwned.length > 0) {
+                await chrome.tabs.ungroup(asNonEmptyTabIds(cortexOwned));
             }
         }
 
@@ -356,8 +413,8 @@ export async function restoreHiddenTabs(
         scheduleSnapshotPersist();
         return true;
     } catch {
-        snapshots.delete(interventionId);
-        scheduleSnapshotPersist();
+        // Retain the ownership record for a later retry. Deleting it here
+        // would turn a transient Chrome API error into an unrecoverable leak.
         return false;
     }
 }
@@ -394,19 +451,46 @@ export async function groupSpecificTabs(
     tabIds: number[],
     groupName: string,
     color: TabGroupColor = "blue",
+    onGrouped?: (groupId: number) => Promise<void>,
 ): Promise<number | null> {
     if (tabIds.length === 0) return null;
+    let groupId: number;
     try {
-        const groupId = await chrome.tabs.group({ tabIds: asNonEmptyTabIds(tabIds) });
+        groupId = await chrome.tabs.group({ tabIds: asNonEmptyTabIds(tabIds) });
+    } catch {
+        return null;
+    }
+    if (onGrouped) {
+        try {
+            await onGrouped(groupId);
+        } catch (error) {
+            try {
+                await chrome.tabs.ungroup(asNonEmptyTabIds(tabIds));
+            } catch {
+                // Preserve the original checkpoint failure. The transaction
+                // layer treats the operation as indeterminate and retries
+                // recovery from its durable pre-effect inverse.
+            }
+            throw new IndeterminateBrowserMutationError(
+                "Tab group checkpoint failed after group creation",
+                { tabIds, groupId },
+                error,
+            );
+        }
+    }
+    try {
         await chrome.tabGroups.update(groupId, {
             collapsed: true,
             title: groupName,
             color,
         });
-        return groupId;
     } catch {
-        return null;
+        // Preserve the exact group identity when grouping succeeded but its
+        // presentation update failed. The transaction verifier will reject
+        // the incomplete postcondition and can still compensate by ungrouping
+        // only this Cortex-created group.
     }
+    return groupId;
 }
 
 // --- Session management ---

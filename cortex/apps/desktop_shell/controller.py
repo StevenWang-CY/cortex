@@ -67,6 +67,7 @@ class DaemonBridge(QObject):
 
     state_updated = Signal(dict)
     intervention_triggered = Signal(dict)
+    intervention_transaction_state = Signal(dict)
     connection_changed = Signal(bool)
     # F34: emitted on the Qt main thread when the daemon's ``stop()`` future
     # resolves (or the safety timer fires). UI surfaces (dashboard, tray)
@@ -156,6 +157,19 @@ class DaemonBridge(QObject):
                 return
             self._last_intervention_seq = seq
         self.intervention_triggered.emit(payload)
+
+    def on_intervention_transaction_state(self, payload: dict) -> None:
+        """Queue an exact transaction outcome onto the Qt main thread."""
+
+        try:
+            self.intervention_transaction_state.emit(
+                dict(payload) if payload else {}
+            )
+        except Exception:
+            logger.debug(
+                "intervention transaction state emit failed",
+                exc_info=True,
+            )
 
     def reset_sequence_counters(self) -> None:
         """F17: reset both sequence counters. Called when the underlying
@@ -400,6 +414,10 @@ class CortexAppController:
         # -- Wire bridge signals to UI ----------------------------------------
         self._bridge.state_updated.connect(self._on_state_update)
         self._bridge.intervention_triggered.connect(self._on_intervention)
+        if hasattr(self._dashboard, "apply_intervention_transaction_state"):
+            self._bridge.intervention_transaction_state.connect(
+                self._dashboard.apply_intervention_transaction_state,
+            )
         self._bridge.connection_changed.connect(self._on_connection_changed)
         # F34: re-enable dashboard + tray Stop affordances when the daemon
         # actually reports stopped (or the dashboard/tray's own safety-timer
@@ -434,10 +452,9 @@ class CortexAppController:
         # unsupported HRV/stress claims are never connected to product UI.
 
         self._overlay.dismissed.connect(self._on_overlay_dismissed)
-        # G4 (audit-prod): overlay action buttons emit ``action_invoked``;
-        # the in-process controller has a direct daemon reference so it
-        # can route native actions (clipboard, timer) directly and call
-        # ``dispatch_action_to_browser`` for everything else.
+        # Overlay buttons are proposal gestures. The controller forwards the
+        # exact action id to the daemon transaction boundary; it never calls a
+        # browser/editor/clipboard capability itself.
         if hasattr(self._overlay, "action_invoked"):
             self._overlay.action_invoked.connect(self._on_action_invoked)
         # P0 §3.6: micro-step checkbox round-trip. The overlay emits
@@ -826,6 +843,9 @@ class CortexAppController:
                 MessageType.STOP_FOCUS_AUTO.value: bridge.on_stop_focus_auto,
                 # P1-FC-INTERVENTION-FAILED: total mutation failure → toast.
                 MessageType.INTERVENTION_FAILED.value: bridge.on_intervention_failed,
+                MessageType.INTERVENTION_TRANSACTION_STATE.value: (
+                    bridge.on_intervention_transaction_state
+                ),
                 # P1-FC-INTERVENTION-PROMPT: cross-surface prompt sync. The
                 # desktop overlay renders the prompt inline already; this
                 # entry only completes the dispatch map (informational).
@@ -1174,14 +1194,12 @@ class CortexAppController:
 
     @Slot(str, dict)
     def _on_action_invoked(self, intervention_id: str, action: dict) -> None:
-        """G4 (audit-prod): handle a desktop overlay action button click.
+        """Route one desktop gesture through the exact transaction boundary.
 
-        Native action types execute in the desktop shell directly so the
-        user gets immediate feedback without a WS roundtrip; browser-bound
-        actions are forwarded to chrome/edge via the daemon's
-        ``dispatch_action_to_browser`` helper. Either way we record an
-        engaged USER_ACTION on the daemon so the dismissal/engagement
-        ledger reflects what happened.
+        The Qt shell never executes a workspace capability directly. The
+        daemon validates the action against the immutable manifest, consumes
+        one authorization, durably binds the owning browser/editor client,
+        and waits for that adapter's typed receipt.
         """
         if self._daemon is None or self._daemon_loop is None:
             return
@@ -1192,129 +1210,32 @@ class CortexAppController:
                 intervention_id,
             )
             return
-        action_type = str(action.get("action_type") or "")
-        action_id = str(action.get("action_id") or "")
-        # Native vs browser routing is authoritative on the overlay's
-        # frozensets so a single source of truth governs which clicks
-        # reach ``dispatch_action_to_browser``. Anything NOT in
-        # ``OverlayWindow._BROWSER_ACTION_TYPES`` must execute natively
-        # (or via a daemon-local helper) — previously every native type
-        # except copy/timer fell through to the browser dispatch path
-        # and was dropped (the SuggestedAction-bound extension never
-        # recognised ``take_biology_break`` / ``resume_last_active_file``
-        # / ``prompt_micro_commit`` / ``suggest_movement_break``).
-        is_browser_action = action_type in OverlayWindow._BROWSER_ACTION_TYPES
-        executed_natively = not is_browser_action
-        # A daemon-local coroutine to run for the native action types
-        # that need real daemon-side work (a break session, an editor
-        # focus, or a prompt broadcast). ``None`` means "log only".
-        native_coro: Any = None
-        try:
-            if action_type == "copy_to_clipboard":
-                self._copy_to_clipboard(str(action.get("target") or ""))
-            elif action_type == "start_timer":
-                # P2-FE-START-TIMER: a real LLM-emitted native action.
-                # Reuse the existing break/countdown overlay
-                # (BreakOverlayWindow, driven by the daemon's break
-                # controller) as a plain countdown — no breathing pattern
-                # and no audio cue. The duration comes from the action
-                # metadata; absent that we fall back to a 5-minute timer.
-                meta = action.get("metadata")
-                meta = meta if isinstance(meta, dict) else {}
-                duration = int(meta.get("duration_seconds", 300) or 300)
-                native_coro = self._daemon.start_biology_break(
-                    intervention_id=str(intervention_id or ""),
-                    duration_seconds=duration,
-                    breathing_pattern=None,
-                    audio_cue=False,
-                    reason=str(meta.get("reason", "user_requested_timer"))[:120],
-                )
-            elif action_type == "take_biology_break":
-                # Decode-only compatibility action. Camera-derived HRV/stress
-                # cannot justify a product break in any execution mode.
-                logger.info(
-                    "Ignoring unsupported take_biology_break action "
-                    "(intervention_id=%s)",
-                    intervention_id,
-                )
-            elif action_type == "resume_last_active_file":
-                # Editor/native adapter — focus the last active file in
-                # the connected VS Code / editor adapter.
-                native_coro = self._daemon._resume_last_active_file(dict(action))
-            elif action_type in ("prompt_micro_commit", "suggest_movement_break"):
-                # Native inline widgets (confirmed in the overlay). Mirror
-                # the engagement to peer surfaces via a prompt broadcast,
-                # then record natively. Nothing is dispatched to chrome.
-                params = {
-                    k: v for k, v in action.items()
-                    if k not in ("action_type", "action_id", "label", "reason")
-                }
-                native_coro = self._daemon._broadcast_prompt(action_type, params)
-        except Exception:
-            logger.debug("Native action execution failed", exc_info=True)
-
-        # Audit-prod fix: dispatch + engage + log are composed into a
-        # single coroutine so the ordering invariant ("dispatch BEFORE
-        # engage") is enforced lexically by ``await``, not implicitly by
-        # FIFO scheduling of three separate ``run_coroutine_threadsafe``
-        # calls. The engage handler invokes ``_restore_manager.engage``
-        # which clears ``_active_intervention_id``; the dispatch
-        # liveness gate reads that same field. If the gate ran after
-        # engage, every legitimate browser-action click would be
-        # rejected as stale.
         action_copy = dict(action)
-        log_payload = {
-            "action_id": action_id,
-            "action_type": action_type,
-            "intervention_id": intervention_id,
-            "result": {"native": executed_natively, "source": "desktop_overlay"},
-        }
-        engage_payload = {
-            "action": "engaged",
-            "intervention_id": intervention_id,
-        }
-
-        async def _dispatch_then_record() -> None:
-            if executed_natively:
-                # Native action types run a daemon-local coroutine (break
-                # session / countdown timer / editor focus / prompt
-                # broadcast) when one was prepared; copy_to_clipboard is
-                # log-only (handled synchronously above).
-                if native_coro is not None:
-                    try:
-                        await native_coro
-                    except Exception:
-                        logger.debug(
-                            "native action coroutine failed", exc_info=True,
-                        )
-            else:
-                try:
-                    await self._daemon.dispatch_action_to_browser(
-                        intervention_id, action_copy,
-                    )
-                except Exception:
-                    logger.debug(
-                        "dispatch_action_to_browser failed", exc_info=True,
-                    )
+        async def _authorize_and_dispatch() -> None:
             try:
-                await self._daemon._handle_user_action(engage_payload)
-            except Exception:
-                logger.debug(
-                    "Engaged USER_ACTION submission failed", exc_info=True,
+                sent = await self._daemon.dispatch_intervention_action(
+                    intervention_id,
+                    action_copy,
                 )
-            try:
-                await self._daemon._handle_user_action(log_payload)
+                if sent == 0:
+                    logger.info(
+                        "Desktop exact action was not dispatched "
+                        "(intervention_id=%s action_id=%s)",
+                        intervention_id,
+                        action_copy.get("action_id"),
+                    )
             except Exception:
                 logger.debug(
-                    "action_executed log submission failed", exc_info=True,
+                    "desktop exact action dispatch failed",
+                    exc_info=True,
                 )
 
         try:
             asyncio.run_coroutine_threadsafe(
-                _dispatch_then_record(), self._daemon_loop,
+                _authorize_and_dispatch(), self._daemon_loop,
             )
         except Exception:
-            logger.debug("dispatch/engage scheduling failed", exc_info=True)
+            logger.debug("exact action scheduling failed", exc_info=True)
 
     @Slot(str, int, str)
     def _on_micro_step_toggled(

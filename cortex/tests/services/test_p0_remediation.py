@@ -176,10 +176,10 @@ async def test_opt_out_while_armed_disarms_focus_session() -> None:
     d = _MinimalDaemon()
     d.config.intervention.enable_auto_distraction_block = True
     d._consent_policy.set_level("distraction_block", AUTONOMOUS_ACT)
-    # Arm.
-    await d._evaluate_auto_distraction_block(_hyper(), timestamp=0.0)
-    await d._evaluate_auto_distraction_block(_hyper(), timestamp=40.0)
-    assert d._auto_focus_armed is True
+    # Simulate legacy ownership restored from an older release. New WP6 code
+    # never enters this state through START_FOCUS_AUTO, but must still clean
+    # it up when the user opts out.
+    d._auto_focus_armed = True
 
     # User toggles off mid-session.
     d.config.intervention.enable_auto_distraction_block = False
@@ -200,9 +200,8 @@ async def test_consent_downgrade_while_armed_disarms_focus_session() -> None:
     d = _MinimalDaemon()
     d.config.intervention.enable_auto_distraction_block = True
     d._consent_policy.set_level("distraction_block", AUTONOMOUS_ACT)
-    await d._evaluate_auto_distraction_block(_hyper(), timestamp=0.0)
-    await d._evaluate_auto_distraction_block(_hyper(), timestamp=40.0)
-    assert d._auto_focus_armed
+    # Migration cleanup for an already-armed legacy session.
+    d._auto_focus_armed = True
 
     # Downgrade consent.
     d._consent_policy.set_level("distraction_block", REVERSIBLE_ACT)

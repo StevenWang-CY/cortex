@@ -123,6 +123,16 @@ class InterventionRestoreResponse(DualClockModel):
     outcome: InterventionOutcome | None = None
 
 
+class EmergencyRestoreResponse(DualClockModel):
+    available: bool = False
+    complete: bool = False
+    requested: int = Field(0, ge=0)
+    dispatched: int = Field(0, ge=0)
+    restored: int = Field(0, ge=0)
+    failed: int = Field(0, ge=0)
+    pending: int = Field(0, ge=0)
+
+
 class StressIntegralResponse(DualClockModel):
     status: Literal["unavailable"] = "unavailable"
     unavailable_reason: Literal["validation_required"] = "validation_required"
