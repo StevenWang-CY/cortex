@@ -94,6 +94,7 @@ def emit_python(data: dict[str, Any]) -> str:
     out.append(_py_const("BRAND_ACCENT_HOVER", brand["accent_hover"]["hex"]))
     if "accent_pressed" in brand:
         out.append(_py_const("BRAND_ACCENT_PRESSED", brand["accent_pressed"]["hex"]))
+    out.append(_py_const("BRAND_ACCENT_TEXT", brand["accent_text"]["hex"]))
     out.append(_py_const("BRAND_ACCENT_DARK", brand["accent_dark"]["hex"]))
     out.append(_py_const("BRAND_ACCENT_DIM", brand["accent_dim"]["rgba"]))
     out.append(_py_const("BRAND_ACCENT_SUBTLE", brand["accent_subtle"]["rgba"]))
@@ -131,6 +132,17 @@ def emit_python(data: dict[str, Any]) -> str:
         else:
             hex_value = "#999999"
         out.append(f'    "{k}": "{hex_value}",\n')
+    out.append("}\n\n")
+
+    out.append("# Foreground-safe state colors for small text on light surfaces.\n")
+    out.append("STATE_TEXT_COLORS: Final[dict[str, str]] = {\n")
+    out.append('    "UNKNOWN": "#5C5854",\n')
+    out.append('    "FLOW": BRAND_ACCENT_TEXT,\n')
+    out.append(
+        f'    "HYPER": "{data["semantic"]["light"]["danger"]["hex"]}",\n'
+    )
+    out.append('    "HYPO": "#5C5854",\n')
+    out.append('    "RECOVERY": "#0062CC",\n')
     out.append("}\n\n")
 
     out.append("# --- Biometric channel tints ---\n")
@@ -244,6 +256,7 @@ def emit_python(data: dict[str, Any]) -> str:
     out.append('CX_TEXT_INVERSE: Final[str] = "#FFFFFF"\n')
     out.append("CX_ACCENT: Final[str] = BRAND_ACCENT\n")
     out.append("CX_ACCENT_HOVER: Final[str] = BRAND_ACCENT_HOVER\n")
+    out.append("CX_ACCENT_TEXT: Final[str] = BRAND_ACCENT_TEXT\n")
     out.append("CX_ACCENT_DIM: Final[str] = BRAND_ACCENT_DIM\n")
     out.append("CX_ACCENT_SUBTLE: Final[str] = BRAND_ACCENT_SUBTLE\n")
     out.append('CX_SUCCESS: Final[str] = SEMANTIC_LIGHT["success"]\n')
@@ -278,11 +291,11 @@ def emit_python(data: dict[str, Any]) -> str:
     out.append("RADIUS_LG: Final[int] = RADIUS_WINDOW\n")
     out.append("RADIUS_XL: Final[int] = 24\n")
     out.append("RADIUS_FULL: Final[int] = RADIUS_PILL\n")
-    out.append("DURATION_MICRO: Final[int] = 100\n")
-    out.append("DURATION_FAST: Final[int] = 150\n")
-    out.append("DURATION_NORMAL: Final[int] = 200\n")
-    out.append("DURATION_SLOW: Final[int] = 400\n")
-    out.append("DURATION_AMBIENT: Final[int] = 3000\n")
+    out.append(f'DURATION_MICRO: Final[int] = {data["motion"]["micro"]}\n')
+    out.append(f'DURATION_FAST: Final[int] = {data["motion"]["fast"]}\n')
+    out.append(f'DURATION_NORMAL: Final[int] = {data["motion"]["normal"]}\n')
+    out.append(f'DURATION_SLOW: Final[int] = {data["motion"]["slow"]}\n')
+    out.append(f'DURATION_AMBIENT: Final[int] = {data["motion"]["ambient"]}\n')
     out.append("HEADER_HEIGHT: Final[int] = 52\n")
     out.append("GOAL_INPUT_HEIGHT: Final[int] = 36\n")
     out.append("TOGGLE_TRACK_W: Final[int] = 40\n")
@@ -321,13 +334,18 @@ def emit_python(data: dict[str, Any]) -> str:
     out.append('    f"  padding: 6px 14px;"\n')
     out.append('    f"  border-radius: {RADIUS_BUTTON}px;"\n')
     out.append('    f"  background: {BRAND_ACCENT};"\n')
-    out.append('    "  color: #FFF;"\n')
+    out.append('    f"  color: {SEMANTIC_LIGHT[\'label_primary\']};"\n')
     out.append('    f"  font-family: {FONT_SYSTEM};"\n')
     out.append('    f"  font-size: {FS_FOOTNOTE}px;"\n')
     out.append('    f"  font-weight: {FW_SEMIBOLD};"\n')
     out.append('    "  border: none;"\n')
     out.append('    "}"\n')
-    out.append('    f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"\n')
+    # Each interaction fill has its own contrast-safe foreground.  The normal
+    # terracotta clears AA with the standard dark label, the hover fill needs
+    # a slightly darker ink, and the pressed fill clears AA with white.
+    out.append('    f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"\n')
+    out.append('    f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"\n')
+    out.append('    f"QPushButton:disabled {{ background: {SEMANTIC_LIGHT[\'grouped_bg\']}; color: #6B6661; }}"\n')
     out.append(")\n\n")
 
     out.append("BTN_GHOST_QSS: Final[str] = (\n")
@@ -342,6 +360,8 @@ def emit_python(data: dict[str, Any]) -> str:
     out.append('    f"  border: 1px solid {SEMANTIC_LIGHT[\'separator\']};"\n')
     out.append('    "}"\n')
     out.append('    "QPushButton:hover { background: rgba(0,0,0,0.03); color: #1A1A1A; }"\n')
+    out.append('    "QPushButton:pressed { background: rgba(0,0,0,0.07); color: #1A1A1A; }"\n')
+    out.append('    "QPushButton:disabled { color: #827D77; border-color: rgba(0,0,0,0.08); }"\n')
     out.append(")\n\n")
 
     # Sentence-case secondary text (HIG) — replaces the old uppercase
@@ -397,22 +417,23 @@ def emit_browser_ts(data: dict[str, Any]) -> str:
     out.append("export const CX = {\n")
     # Backwards-compatible names so existing popup.tsx / newtab.tsx callsites
     # keep working with no other change.
-    out.append(f'    bg: "{light["window_bg"]["hex"]}",\n')
-    out.append(f'    surface: "{light["control_bg"]["hex"]}",\n')
-    out.append(f'    tertiary: "{light["grouped_bg"]["hex"]}",\n')
+    out.append(f'    bg: "var(--cx-window-bg, {light["window_bg"]["hex"]})",\n')
+    out.append(f'    surface: "var(--cx-control-bg, {light["control_bg"]["hex"]})",\n')
+    out.append(f'    tertiary: "var(--cx-grouped-bg, {light["grouped_bg"]["hex"]})",\n')
     out.append('    overlay: "rgba(236, 236, 236, 0.88)",\n')
-    out.append('    border: "rgba(0, 0, 0, 0.06)",\n')
-    out.append(f'    borderDefault: "{light["separator"]["hex"]}",\n')
-    out.append('    borderEmphasis: "rgba(0, 0, 0, 0.20)",\n')
-    out.append('    shadowFloat: "0 8px 32px rgba(0, 0, 0, 0.08), 0 0 0 1px rgba(0,0,0,0.04)",\n')
-    out.append(f'    text: "{light["label_primary"]["hex"]}",\n')
-    out.append('    textSecondary: "#5C5854",\n')
-    out.append('    textTertiary: "#6B6661",\n')
+    out.append('    border: "var(--cx-border-subtle, rgba(0, 0, 0, 0.06))",\n')
+    out.append(f'    borderDefault: "var(--cx-separator, {light["separator"]["hex"]})",\n')
+    out.append('    borderEmphasis: "var(--cx-border-emphasis, rgba(0, 0, 0, 0.20))",\n')
+    out.append('    shadowFloat: "var(--cx-shadow-float, 0 8px 32px rgba(0, 0, 0, 0.08), 0 0 0 1px rgba(0,0,0,0.04))",\n')
+    out.append(f'    text: "var(--cx-label-primary, {light["label_primary"]["hex"]})",\n')
+    out.append('    textSecondary: "var(--cx-label-secondary, #5C5854)",\n')
+    out.append('    textTertiary: "var(--cx-label-tertiary, #6B6661)",\n')
     out.append('    textInverse: "#FFFFFF",\n')
-    out.append(f'    accent: "{brand["accent"]["hex"]}",\n')
-    out.append(f'    accentHover: "{brand["accent_hover"]["hex"]}",\n')
+    out.append(f'    accent: "var(--cx-accent, {brand["accent"]["hex"]})",\n')
+    out.append(f'    accentHover: "var(--cx-accent-hover, {brand["accent_hover"]["hex"]})",\n')
+    out.append(f'    accentText: "var(--cx-accent-text, {brand["accent_text"]["hex"]})",\n')
     out.append(f'    accentDim: "{brand["accent_dim"]["rgba"]}",\n')
-    out.append('    danger: "#D70015",\n')
+    out.append('    danger: "var(--cx-danger, #D70015)",\n')
     out.append('    dangerDim: "rgba(215, 0, 21, 0.10)",\n')
     out.append(f'    bioHr: "{bio["hr"]["hex"]}",\n')
     out.append(f'    bioHrv: "{bio["hrv"]["hex"]}",\n')
@@ -479,9 +500,10 @@ def emit_browser_ts(data: dict[str, Any]) -> str:
     out.append(f'    durationNormal: "{motion["normal"]}ms",\n')
     out.append(f'    durationSlow: "{motion["slow"]}ms",\n')
     out.append(f'    durationAmbient: "{motion["ambient"]}ms",\n')
-    out.append('    easeDefault: "cubic-bezier(0.4, 0, 0.2, 1)",\n')
-    out.append('    easeOut: "cubic-bezier(0, 0, 0.2, 1)",\n')
-    out.append('    easeIn: "cubic-bezier(0.4, 0, 1, 1)",\n')
+    out.append('    easeDefault: "cubic-bezier(0.23, 1, 0.32, 1)",\n')
+    out.append('    easeOut: "cubic-bezier(0.23, 1, 0.32, 1)",\n')
+    out.append('    easeInOut: "cubic-bezier(0.77, 0, 0.175, 1)",\n')
+    out.append('    easeDrawer: "cubic-bezier(0.32, 0.72, 0, 1)",\n')
     out.append("} as const;\n\n")
 
     out.append("export const STATE_COLORS: Record<string, string> = {\n")
@@ -494,6 +516,18 @@ def emit_browser_ts(data: dict[str, Any]) -> str:
         else:
             hex_value = "#999999"
         out.append(f'    {k}: "{hex_value}",\n')
+    out.append("};\n\n")
+
+    out.append("export const STATE_TEXT_COLORS: Record<string, string> = {\n")
+    out.append('    UNKNOWN: "var(--cx-label-secondary, #5C5854)",\n')
+    out.append(
+        f'    FLOW: "var(--cx-accent-text, {brand["accent_text"]["hex"]})",\n'
+    )
+    out.append(
+        f'    HYPER: "var(--cx-danger, {light["danger"]["hex"]})",\n'
+    )
+    out.append('    HYPO: "var(--cx-label-secondary, #5C5854)",\n')
+    out.append('    RECOVERY: "var(--cx-info, #0062CC)",\n')
     out.append("};\n\n")
 
     out.append("export const STATE_LABELS: Record<string, string> = {\n")
@@ -530,7 +564,19 @@ def emit_browser_ts(data: dict[str, Any]) -> str:
     out.append("@keyframes cx-spin { to { transform: rotate(360deg) } }\n")
     out.append("@keyframes cx-rise { from { transform: translateY(8px); opacity: 0 } to { transform: translateY(0); opacity: 1 } }\n")
     out.append("@media (prefers-reduced-motion: reduce) {\n")
-    out.append("  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }\n")
+    out.append("  *, *::before, *::after {\n")
+    out.append("    animation-delay: 0ms !important;\n")
+    out.append("    animation-duration: 1ms !important;\n")
+    out.append("    animation-iteration-count: 1 !important;\n")
+    out.append("    scroll-behavior: auto !important;\n")
+    out.append("    transition-delay: 0ms !important;\n")
+    out.append("  }\n")
+    out.append("  .cortex-motion-enter,\n")
+    out.append("  .cortex-motion-ambient { animation: none !important; transform: none !important; }\n")
+    out.append("  .cortex-motion-enter {\n")
+    out.append("    opacity: 1 !important;\n")
+    out.append("    transition: opacity 160ms cubic-bezier(0.23, 1, 0.32, 1) !important;\n")
+    out.append("  }\n")
     out.append("}\n")
     out.append("`;\n")
 

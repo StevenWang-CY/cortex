@@ -276,9 +276,80 @@ Build task context from workspace adapters.
 
 ### LLM Planning
 
+External planning is network-off by default. The privacy routes below require
+the same local bearer capability as other sensitive routes. Preview creation
+does not call a provider; confirmation burns the handle before the external
+await. See [`privacy.md`](privacy.md) for the field catalog and retention
+contract.
+
+#### `GET /privacy/context/status`
+
+Returns `planner_mode`, whether configuration permits an external transport,
+the number of live prepared previews, provider, and conservative retention
+disclosure. It never probes the provider.
+
+#### `POST /privacy/context/preview/current`
+
+Creates an exact redacted preview from the daemon's current in-memory
+`TaskContext` and `StateEstimate`. The caller supplies only `selection`, an
+optional template/constraints object, and an optional user-authored note.
+
+```json
+{
+  "selection": {
+    "workspace_aggregates": true,
+    "support_estimate": false,
+    "user_goal": true,
+    "editor_metadata": true,
+    "editor_content": false,
+    "terminal_content": false,
+    "browser_metadata": true,
+    "browser_content": false,
+    "learned_preferences": false,
+    "extra_context": false
+  },
+  "extra_context": ""
+}
+```
+
+The response includes the exact outbound context/prompt, field disclosures,
+redaction/omission counts, encoded size, destination/model, provider caveat,
+expiry, and one-time `preview_id`. `raw_context_retained` is false; the exact
+prepared redacted payload is retained in memory until confirmation,
+cancellation, eviction, or expiry (maximum 60 seconds).
+
+#### `POST /privacy/context/preview`
+
+Developer equivalent of `/current` that accepts a caller-supplied local
+`state_estimate` and `task_context`. It has the same no-network semantics and
+is useful for contract tests or an explicitly constructed local client.
+
+#### `POST /privacy/context/confirm`
+
+```json
+{
+  "preview_id": "ctx_<opaque-random-handle>",
+  "confirmation_phrase": "SEND PREVIEWED CONTEXT ONCE"
+}
+```
+
+Both fields are required. The handle is consumed on every attempt. Missing,
+expired, cancelled, replayed, or wrongly confirmed handles return `409` and do
+not send. A successful response contains a schema-validated proposal and
+`authority_granted: false`; workspace actions require a separate transaction.
+
+#### `DELETE /privacy/context/preview/{preview_id}`
+
+Idempotently burns a prepared handle without contacting the provider. The
+response reports whether the handle was still live, always reports
+`sent: false`, and grants no authority.
+
 #### `POST /llm/plan`
 
-Request an intervention plan from the LLM engine.
+Request an intervention plan from the configured engine. In `no_llm` this is a
+local deterministic plan. In external mode, omitting a valid preview handle
+and confirmation yields a deterministic no-content fallback rather than an
+implicit model request.
 
 **Request body:**
 ```json

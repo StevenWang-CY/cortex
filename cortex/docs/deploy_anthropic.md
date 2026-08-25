@@ -16,6 +16,21 @@ python -m cortex.scripts.seed_config --root .
 
 Set the provider in `.env`. Pick one option below.
 
+Provider credentials alone do not enable network calls. Cortex defaults to the
+local deterministic planner. After reading [`privacy.md`](privacy.md), enable
+the external preview path explicitly:
+
+```bash
+CORTEX_LLM__PRIVACY__PLANNER_MODE=external_redacted
+CORTEX_LLM__PRIVACY__EXTERNAL_CONTEXT_ENABLED=true
+CORTEX_LLM__PRIVACY__CONSENT_REVISION=context-disclosure-v1
+CORTEX_LLM__PRIVACY__PROVIDER_RETENTION_MODE=unverified
+```
+
+Every provider request still needs a fresh source selection, exact redacted
+preview, and one-time confirmation. Cortex does not verify provider retention
+configuration or contractual terms.
+
 #### Option A — AWS Bedrock (default)
 
 ```bash

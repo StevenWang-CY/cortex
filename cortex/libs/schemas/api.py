@@ -17,8 +17,10 @@ from cortex.libs.schemas.intervention import (
     InterventionApplyResult,
     InterventionOutcome,
     InterventionPlan,
+    SimplificationConstraints,
     WorkspaceSnapshot,
 )
+from cortex.libs.schemas.privacy import CONTEXT_SEND_CONFIRMATION
 from cortex.libs.schemas.state import (
     EstimateStatus,
     InferenceModelIdentity,
@@ -97,6 +99,17 @@ class ContextBuildResponse(DualClockModel):
 class LLMPlanRequest(BaseModel):
     state_estimate: StateEstimate
     task_context: TaskContext
+    constraints: SimplificationConstraints | None = None
+    template_name: str | None = Field(default=None, max_length=80)
+    extra_context: str = Field(default="", max_length=20_000)
+    privacy_preview_id: str | None = Field(default=None, min_length=20, max_length=160)
+    privacy_confirmation: Literal["SEND PREVIEWED CONTEXT ONCE"] | None = Field(
+        default=None,
+        description=(
+            "One-time confirmation for an exact context preview; the literal "
+            f"phrase is {CONTEXT_SEND_CONFIRMATION!r}."
+        ),
+    )
 
 
 class LLMPlanResponse(DualClockModel):

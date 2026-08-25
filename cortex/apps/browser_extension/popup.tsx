@@ -8,13 +8,25 @@
  * the legacy thumbs-up / thumbs-down emoji for historical clarity.)
  */
 
-import React, { useCallback, useEffect, useState } from "react";
-import { CX, STATE_COLORS, STATE_LABELS, CX_KEYFRAMES } from "./design-tokens";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import "./page-reset.css";
+import {
+    CX,
+    CX_KEYFRAMES,
+    STATE_COLORS,
+    STATE_LABELS,
+    STATE_TEXT_COLORS,
+} from "./design-tokens";
 import { newCorrelationId } from "./lib/correlation";
 import { getLastRuntimeError } from "./lib/chrome-runtime";
 import { verifiedPresentedActionIds } from "./lib/intervention-transaction";
 import { DAEMON_HTTP_URL } from "./config";
 import { getAuthToken } from "./lib/auth";
+import {
+    getSiteAccessState,
+    requestSiteAccess,
+    revokeSiteAccess,
+} from "./lib/site-access";
 import type {
     CausalSignal as CausalSignalSchema,
     WhyDetail as WhyDetailSchema,
@@ -277,9 +289,9 @@ function getStateDotStyle(stateStr: string, stateColor: string): React.CSSProper
 
     switch (stateStr) {
         case "FLOW":
-            return { ...base, animation: "cxPulse 2s ease-in-out infinite" };
+            return { ...base, animation: `cxPulse 2s ${CX.easeInOut} infinite` };
         case "HYPO":
-            return { ...base, animation: "cxFadeSlow 4s ease-in-out infinite" };
+            return { ...base, animation: `cxFadeSlow 4s ${CX.easeInOut} infinite` };
         case "HYPER":
             // No animation, no glow — student is already overwhelmed
             return base;
@@ -689,6 +701,11 @@ function CortexPopup(): React.ReactElement {
     // ``useState`` only for the initial-paint value; the useEffect
     // below replaces it with a tick-on-every-second update.
     const [quietModeDurationMin, setQuietModeDurationMin] = useState<number | null>(null);
+    const [siteAccess, setSiteAccess] = useState<
+        "checking" | "granted" | "denied" | "unavailable" | "busy"
+    >("checking");
+    const [siteAccessOrigin, setSiteAccessOrigin] = useState<string | null>(null);
+    const [siteAccessError, setSiteAccessError] = useState("");
     useEffect(() => {
         // F8 (Phase-4 audit): include ``quietMode`` in the dep array so
         // the interval restarts (and the tick re-evaluates) when the
@@ -762,6 +779,56 @@ function CortexPopup(): React.ReactElement {
         "idle" | "submitting" | "saved" | "queued" | "error"
     >("idle");
     const [bugReportError, setBugReportError] = useState<string>("");
+    const bugDialogRef = useRef<HTMLDivElement>(null);
+    const bugTextareaRef = useRef<HTMLTextAreaElement>(null);
+
+    const closeBugReport = useCallback(() => {
+        setBugReportOpen(false);
+        setBugReportStatus("idle");
+        setBugReportError("");
+    }, []);
+
+    // Keep the privacy-sensitive report sheet keyboard-contained. Escape
+    // dismisses, Tab wraps inside the sheet, and closing restores the control
+    // that opened it instead of dropping focus at the document root.
+    useEffect(() => {
+        if (!bugReportOpen) return;
+        const previousFocus = document.activeElement instanceof HTMLElement
+            ? document.activeElement
+            : null;
+        const focusFrame = window.requestAnimationFrame(() => {
+            bugTextareaRef.current?.focus({ preventScroll: true });
+        });
+        const handleKeydown = (event: KeyboardEvent) => {
+            if (event.key === "Escape") {
+                event.preventDefault();
+                closeBugReport();
+                return;
+            }
+            if (event.key !== "Tab" || !bugDialogRef.current) return;
+            const focusable = Array.from(
+                bugDialogRef.current.querySelectorAll<HTMLElement>(
+                    'button:not([disabled]), textarea:not([disabled]), input:not([disabled])',
+                ),
+            );
+            if (focusable.length === 0) return;
+            const first = focusable[0];
+            const last = focusable[focusable.length - 1];
+            if (event.shiftKey && document.activeElement === first) {
+                event.preventDefault();
+                last.focus();
+            } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault();
+                first.focus();
+            }
+        };
+        document.addEventListener("keydown", handleKeydown);
+        return () => {
+            window.cancelAnimationFrame(focusFrame);
+            document.removeEventListener("keydown", handleKeydown);
+            previousFocus?.focus({ preventScroll: true });
+        };
+    }, [bugReportOpen, closeBugReport]);
 
     // F21 (Phase-4 audit / §3.15 follow-up): poll the daemon's
     // /api/cost endpoint every 30s while the popup is open. The
@@ -822,35 +889,122 @@ function CortexPopup(): React.ReactElement {
                 outline: 2px solid ${CX.accent};
                 outline-offset: 2px;
             }
-            /* Primary button — hover / active / keyboard focus */
-            .cortex-primary-btn:hover:not(:disabled) {
-                opacity: 0.85;
+            button:not(:disabled) {
+                transition: transform 120ms ${CX.easeOut},
+                    background-color 120ms ${CX.easeOut},
+                    border-color 120ms ${CX.easeOut},
+                    color 120ms ${CX.easeOut},
+                    opacity 120ms ${CX.easeOut},
+                    box-shadow 120ms ${CX.easeOut} !important;
             }
+            button:active:not(:disabled) {
+                transform: scale(0.97);
+            }
+            button:focus-visible {
+                outline: 2px solid ${CX.accent};
+                outline-offset: 2px;
+            }
+            /* Primary button — active / keyboard focus */
             .cortex-primary-btn:active:not(:disabled) {
-                opacity: 0.72;
-                transform: scale(0.985);
+                box-shadow: inset 0 0 0 1px rgba(17, 17, 17, 0.24);
+                transform: scale(0.97);
             }
             .cortex-primary-btn:focus-visible {
                 outline: 2px solid ${CX.accent};
                 outline-offset: 2px;
             }
-            /* Ghost button — hover / active / keyboard focus */
-            .cortex-ghost-btn:hover:not(:disabled) {
-                background: ${CX.accentDim};
-                border-color: ${CX.borderEmphasis};
-            }
+            /* Ghost button — active / keyboard focus */
             .cortex-ghost-btn:active:not(:disabled) {
                 background: rgba(217, 119, 87, 0.20);
-                transform: scale(0.985);
+                transform: scale(0.97);
             }
             .cortex-ghost-btn:focus-visible {
                 outline: 2px solid ${CX.accent};
                 outline-offset: 2px;
             }
+            .cortex-progress-motion {
+                transform-origin: left center;
+            }
+            @media (hover: hover) and (pointer: fine) {
+                .cortex-primary-btn:hover:not(:disabled) {
+                    box-shadow: inset 0 0 0 1px rgba(17, 17, 17, 0.16),
+                        0 2px 8px rgba(17, 17, 17, 0.10);
+                }
+                .cortex-ghost-btn:hover:not(:disabled) {
+                    background: ${CX.accentDim};
+                    border-color: ${CX.borderEmphasis};
+                }
+            }
+            @media (prefers-reduced-motion: reduce) {
+                button:not(:disabled) {
+                    transition-property: background-color, border-color, color, opacity !important;
+                }
+                button:active:not(:disabled) {
+                    transform: none;
+                }
+                .cortex-progress-motion {
+                    transition: none !important;
+                }
+            }
         `;
         document.head.appendChild(style);
         return () => { style.remove(); };
     }, []);
+
+    useEffect(() => {
+        let active = true;
+        void getSiteAccessState().then((result) => {
+            if (!active) return;
+            setSiteAccessOrigin(result.origin);
+            setSiteAccess(
+                !result.available
+                    ? "unavailable"
+                    : result.granted
+                    ? "granted"
+                    : "denied",
+            );
+        });
+        return () => { active = false; };
+    }, []);
+
+    const handleSiteAccess = useCallback(async () => {
+        if (
+            siteAccess === "busy"
+            || siteAccess === "checking"
+            || siteAccess === "unavailable"
+            || !siteAccessOrigin
+        ) return;
+        const wasGranted = siteAccess === "granted";
+        setSiteAccess("busy");
+        setSiteAccessError("");
+        try {
+            const changed = wasGranted
+                ? await revokeSiteAccess(siteAccessOrigin)
+                : await requestSiteAccess(siteAccessOrigin);
+            const current = await getSiteAccessState();
+            setSiteAccessOrigin(current.origin);
+            setSiteAccess(
+                !current.available
+                    ? "unavailable"
+                    : current.granted
+                    ? "granted"
+                    : "denied",
+            );
+            if (!changed && current.granted === wasGranted) {
+                setSiteAccessError(
+                    wasGranted
+                        ? "Chrome could not revoke site access."
+                        : "Site access was not granted.",
+                );
+            }
+            if (wasGranted && !current.granted) {
+                safeSendMessage({ type: "SITE_ACCESS_REVOKED" });
+            }
+        } catch {
+            setSiteAccess(wasGranted ? "granted" : "denied");
+            setSiteAccessError("Chrome could not update site access.");
+        }
+    }, [siteAccess, siteAccessOrigin]);
 
     // Load tab-close and quiet-mode toggle states on mount
     useEffect(() => {
@@ -1595,6 +1749,7 @@ function CortexPopup(): React.ReactElement {
     const estimateReady = state?.status === undefined || state.status === "estimated";
     const stateStr = estimateReady ? (state?.state ?? "") : "UNKNOWN";
     const stateColor = STATE_COLORS[stateStr] || CX.textTertiary;
+    const stateTextColor = STATE_TEXT_COLORS[stateStr] || CX.textSecondary;
     // ``Idle`` only when we've actually received a STATE_UPDATE whose
     // ``state`` field is missing/unknown. Pre-first-frame (the WS has
     // opened but the daemon hasn't broadcast yet because AUTH is still
@@ -1712,11 +1867,12 @@ function CortexPopup(): React.ReactElement {
         <div style={S.root}>
             {/* Alert toast — top-right, auto-dismiss 10s */}
             {alert && (
-                <div style={S.alertBox}>
+                <div className="cortex-motion-enter" style={S.alertBox}>
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
                         <div style={S.alertTitle}>{alert.title}</div>
                         <button
-                            style={{ background: "none", border: "none", color: CX.textTertiary, cursor: "pointer", fontSize: 13, padding: 0, fontFamily: CX.font, lineHeight: 1 }}
+                            aria-label="Dismiss health notification"
+                            style={S.iconButton}
                             onClick={() => setAlert(null)}
                         >{"\u00d7"}</button>
                     </div>
@@ -1731,12 +1887,12 @@ function CortexPopup(): React.ReactElement {
                     <span style={{ ...S.logoText, fontFamily: CX.fontBrand, fontStyle: "italic", letterSpacing: "0.02em" }}>Cortex.</span>
                 </div>
                 {!connected ? (
-                    <button style={S.connectBtn} onClick={handleConnect}>CONNECT</button>
+                    <button style={S.connectBtn} onClick={handleConnect}>Connect</button>
                 ) : (
                     <div style={S.statusRow} aria-live="polite">
-                        <div style={getStateDotStyle(stateStr, stateColor)} />
+                        <div aria-hidden="true" style={getStateDotStyle(stateStr, stateColor)} />
                         <span
-                            style={{ ...S.statusLabel, color: stateColor }}
+                            style={{ ...S.statusLabel, color: stateTextColor }}
                             title={estimateReady && state?.evidence_coverage !== undefined
                                 ? `Evidence coverage ${Math.round(state.evidence_coverage * 100)}%`
                                 : "No actionable estimate yet"}
@@ -1863,7 +2019,8 @@ function CortexPopup(): React.ReactElement {
                             <div style={S.briefingBody}>{briefing.summary}</div>
                         </div>
                         <button
-                            style={{ background: "none", border: "none", color: CX.textTertiary, cursor: "pointer", fontSize: 13, padding: 0, fontFamily: CX.font, lineHeight: 1, flexShrink: 0, marginLeft: 8 }}
+                            aria-label="Dismiss briefing"
+                            style={{ ...S.iconButton, marginLeft: 8 }}
                             onClick={() => setBriefing(null)}
                         >{"\u00d7"}</button>
                     </div>
@@ -1902,7 +2059,7 @@ function CortexPopup(): React.ReactElement {
                                 height: 8,
                                 borderRadius: "50%",
                                 background: CX.accent,
-                                animation: "cxPulse 1.5s ease-in-out infinite",
+                                animation: `cxPulse 1.5s ${CX.easeInOut} infinite`,
                             }} />
                         ) : (
                             <div style={{
@@ -1999,6 +2156,7 @@ function CortexPopup(): React.ReactElement {
                         className="cortex-goal-input"
                         style={S.goalInput}
                         placeholder="What are you working on?"
+                        aria-label="Focus goal"
                         value={goalInput}
                         // F15 (Phase-4 audit): cap at 500 chars so the
                         // text never breaches the daemon's GoalSet
@@ -2018,7 +2176,7 @@ function CortexPopup(): React.ReactElement {
                 <div style={{ ...S.sessionCard, position: "sticky" as const, top: 0, zIndex: 10 }}>
                     {/* First row: "Study session · Xm" + End */}
                     <div style={S.focusHeader}>
-                        <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+                        <div style={{ display: "flex", alignItems: "baseline", gap: 6, minWidth: 0 }}>
                             <span style={S.focusTitle}>{focus.goal}</span>
                             <span style={S.focusDuration}>{"\u00b7"} {elapsedMin}m</span>
                         </div>
@@ -2037,7 +2195,7 @@ function CortexPopup(): React.ReactElement {
                                 fontSize: 11,
                                 fontFamily: CX.font,
                                 fontWeight: 500,
-                                color: CX.accent,
+                                color: CX.accentText,
                                 background: "rgba(217,119,87,0.16)",
                                 border: "1px solid rgba(217,119,87,0.36)",
                                 borderRadius: CX.radiusMd,
@@ -2064,10 +2222,9 @@ function CortexPopup(): React.ReactElement {
 
                     {/* Progress bar — 6px tall */}
                     <div style={S.trackOuter}>
-                        <div style={{
+                        <div className="cortex-progress-motion" style={{
                             ...S.trackFill,
-                            width: `${Math.max(Math.min(focus.focusPct, 100), 0)}%`,
-                            minWidth: 6,
+                            transform: `scaleX(${Math.max(Math.min(focus.focusPct, 100), 0) / 100})`,
                             background: stateColor,
                         }} />
                     </div>
@@ -2108,7 +2265,7 @@ function CortexPopup(): React.ReactElement {
                                 background: "rgba(228, 122, 110, 0.12)",
                                 border: "1px solid rgba(228, 122, 110, 0.4)",
                                 borderRadius: CX.radiusSm,
-                                color: "#E47A6E",
+                                color: CX.danger,
                                 fontSize: 12,
                                 fontFamily: CX.font,
                                 lineHeight: 1.4,
@@ -2128,7 +2285,7 @@ function CortexPopup(): React.ReactElement {
                             style={{
                                 marginBottom: 12,
                                 padding: "8px 10px",
-                                background: "rgba(255, 255, 255, 0.04)",
+                                background: CX.tertiary,
                                 borderRadius: CX.radiusSm,
                                 color: CX.textSecondary,
                                 fontSize: 12,
@@ -2185,7 +2342,7 @@ function CortexPopup(): React.ReactElement {
                                     style={{
                                         marginTop: 6,
                                         padding: "6px 10px",
-                                        background: "rgba(255, 255, 255, 0.03)",
+                                        background: CX.tertiary,
                                         borderRadius: CX.radiusSm,
                                         color: CX.textSecondary,
                                         fontSize: 10,
@@ -2201,7 +2358,7 @@ function CortexPopup(): React.ReactElement {
                                     style={{
                                         marginTop: 6,
                                         padding: "8px 10px",
-                                        background: "rgba(255, 255, 255, 0.03)",
+                                        background: CX.tertiary,
                                         borderRadius: CX.radiusSm,
                                     }}
                                     data-testid="why-rows"
@@ -2242,7 +2399,7 @@ function CortexPopup(): React.ReactElement {
                                                 {delta != null && (
                                                     <span
                                                         style={{
-                                                            color: delta < 0 ? "#E47A6E" : CX.accent,
+                                                            color: delta < 0 ? CX.danger : CX.accentText,
                                                             fontWeight: 600,
                                                             fontSize: 10,
                                                         }}
@@ -2327,7 +2484,7 @@ function CortexPopup(): React.ReactElement {
                             })}
                             {overflowCount > 0 && (
                                 <button
-                                    style={{ fontSize: 10, color: CX.accent, marginTop: 4, background: "none", border: "none", cursor: "pointer", padding: 0, fontFamily: CX.font }}
+                                    style={{ fontSize: 10, color: CX.accentText, marginTop: 4, background: "none", border: "none", cursor: "pointer", padding: 0, fontFamily: CX.font }}
                                     onClick={() => setTabsExpanded(true)}
                                 >+{overflowCount} more</button>
                             )}
@@ -2507,11 +2664,13 @@ function CortexPopup(): React.ReactElement {
                                 style={{
                                     background: rating === "thumbs_up"
                                         ? CX.accent
-                                        : "rgba(255,255,255,0.06)",
+                                        : CX.tertiary,
                                     color: rating === "thumbs_up"
-                                        ? "white"
+                                        ? CX.text
                                         : CX.textSecondary,
-                                    border: "none",
+                                    border: `1px solid ${rating === "thumbs_up"
+                                        ? CX.accent
+                                        : CX.borderDefault}`,
                                     borderRadius: CX.radiusSm,
                                     padding: "6px 12px",
                                     cursor: "pointer",
@@ -2536,12 +2695,14 @@ function CortexPopup(): React.ReactElement {
                                 }}
                                 style={{
                                     background: rating === "thumbs_down"
-                                        ? "#E47A6E"
-                                        : "rgba(255,255,255,0.06)",
+                                        ? CX.dangerDim
+                                        : CX.tertiary,
                                     color: rating === "thumbs_down"
-                                        ? "white"
+                                        ? CX.danger
                                         : CX.textSecondary,
-                                    border: "none",
+                                    border: `1px solid ${rating === "thumbs_down"
+                                        ? CX.danger
+                                        : CX.borderDefault}`,
                                     borderRadius: CX.radiusSm,
                                     padding: "6px 12px",
                                     cursor: "pointer",
@@ -2583,9 +2744,9 @@ function CortexPopup(): React.ReactElement {
                                 width: "100%",
                                 padding: "6px 10px",
                                 fontSize: 11,
-                                background: "rgba(255,255,255,0.04)",
+                                background: CX.tertiary,
                                 color: CX.text,
-                                border: `1px solid ${CX.accent}55`,
+                                border: `1px solid ${CX.accent}`,
                                 borderRadius: CX.radiusSm,
                                 fontFamily: CX.font,
                                 boxSizing: "border-box",
@@ -2625,9 +2786,13 @@ function CortexPopup(): React.ReactElement {
                     <button
                         style={{
                             ...S.toggleTrack,
-                            background: tabCloseDisabled ? "rgba(255, 255, 255, 0.04)" : CX.accent,
+                            background: tabCloseDisabled
+                                ? "rgba(60, 60, 67, 0.24)"
+                                : CX.accent,
                         }}
                         onClick={handleTabCloseToggle}
+                        role="switch"
+                        aria-checked={!tabCloseDisabled}
                         aria-label={tabCloseDisabled ? "Enable tab closing" : "Disable tab closing"}
                     >
                         <div style={{
@@ -2642,15 +2807,66 @@ function CortexPopup(): React.ReactElement {
                     <button
                         style={{
                             ...S.toggleTrack,
-                            background: quietMode ? CX.accent : "rgba(255, 255, 255, 0.04)",
+                            background: quietMode
+                                ? CX.accent
+                                : "rgba(60, 60, 67, 0.24)",
                         }}
                         onClick={handleQuietModeToggle}
+                        role="switch"
+                        aria-checked={quietMode}
                         aria-label={quietMode ? "Disable quiet mode" : "Enable quiet mode"}
                     >
                         <div style={{
                             ...S.toggleThumb,
                             transform: quietMode ? "translateX(16px)" : "translateX(0)",
                         }} />
+                    </button>
+                </div>
+
+                <div style={S.siteAccessRow}>
+                    <div style={{ minWidth: 0, paddingRight: 12 }}>
+                        <div style={S.toggleLabel}>Page context</div>
+                        <div style={S.siteAccessDetail}>
+                            {siteAccess === "granted"
+                                ? "Body text allowed for this site · never incognito"
+                                : siteAccess === "unavailable"
+                                ? "Unavailable on this page"
+                                : "Off for this site · page body stays out of context"}
+                        </div>
+                        {siteAccessError && (
+                            <div role="status" style={S.siteAccessError}>
+                                {siteAccessError}
+                            </div>
+                        )}
+                    </div>
+                    <button
+                        className="cortex-ghost-btn"
+                        data-testid="site-access-button"
+                        style={{
+                            ...S.siteAccessButton,
+                            opacity: siteAccess === "busy"
+                                || siteAccess === "checking"
+                                || siteAccess === "unavailable"
+                                ? 0.55
+                                : 1,
+                        }}
+                        disabled={siteAccess === "busy"
+                            || siteAccess === "checking"
+                            || siteAccess === "unavailable"}
+                        onClick={() => { void handleSiteAccess(); }}
+                        aria-label={siteAccess === "granted"
+                            ? "Revoke Cortex page context access"
+                            : "Allow Cortex page context access"}
+                    >
+                        {siteAccess === "checking"
+                            ? "Checking"
+                            : siteAccess === "busy"
+                            ? "Updating"
+                            : siteAccess === "unavailable"
+                            ? "Unavailable"
+                            : siteAccess === "granted"
+                            ? "Revoke"
+                            : "Allow"}
                     </button>
                 </div>
 
@@ -2685,13 +2901,13 @@ function CortexPopup(): React.ReactElement {
                                     fontSize: 11,
                                     fontFamily: CX.font,
                                     fontWeight: 500,
-                                    color: active ? CX.accent : "rgba(255,255,255,0.72)",
+                                    color: active ? CX.accentText : CX.textSecondary,
                                     background: active
-                                        ? "rgba(217,119,87,0.16)"
-                                        : "rgba(255,255,255,0.04)",
+                                        ? CX.accentDim
+                                        : CX.tertiary,
                                     border: active
                                         ? `1px solid ${CX.accent}`
-                                        : "1px solid rgba(255,255,255,0.06)",
+                                        : `1px solid ${CX.borderDefault}`,
                                     borderRadius: CX.radiusMd,
                                     cursor: "pointer",
                                     transition: `background ${CX.durationFast} ${CX.easeDefault}`,
@@ -2708,7 +2924,7 @@ function CortexPopup(): React.ReactElement {
                         style={{
                             marginTop: 8,
                             fontSize: 11,
-                            color: CX.accent,
+                            color: CX.accentText,
                             fontFamily: CX.font,
                         }}
                     >
@@ -2724,7 +2940,7 @@ function CortexPopup(): React.ReactElement {
                                 marginLeft: 10,
                                 background: "transparent",
                                 border: "none",
-                                color: CX.accent,
+                                color: CX.accentText,
                                 textDecoration: "underline",
                                 cursor: "pointer",
                                 fontSize: 11,
@@ -2796,27 +3012,25 @@ function CortexPopup(): React.ReactElement {
                 renders a one-line install hint if the native host is
                 unavailable. */}
             <div style={S.historyFooter}>
-                <button
-                    style={S.historyLink}
-                    onClick={handleOpenDashboardHistory}
-                    data-testid="view-history-link"
-                    aria-label="Open History tab in desktop dashboard"
-                >View history <span aria-hidden="true">{"→"}</span></button>
-                <span
-                    aria-hidden="true"
-                    style={{
-                        color: CX.textTertiary,
-                        margin: "0 8px",
-                        fontSize: 11,
-                    }}
-                >·</span>
-                {/* Phase 4d Task H / §3.24: in-app bug report. */}
-                <button
-                    style={S.historyLink}
-                    onClick={() => setBugReportOpen(true)}
-                    data-testid="report-bug-link"
-                    aria-label="Report a bug"
-                >Report bug</button>
+                <div style={S.historyLinkRow}>
+                    <button
+                        style={S.historyLink}
+                        onClick={handleOpenDashboardHistory}
+                        data-testid="view-history-link"
+                        aria-label="Open History tab in desktop dashboard"
+                    >View history <span aria-hidden="true">{"→"}</span></button>
+                    <span
+                        aria-hidden="true"
+                        style={{ color: CX.textTertiary, fontSize: 11 }}
+                    >·</span>
+                    {/* Phase 4d Task H / §3.24: in-app bug report. */}
+                    <button
+                        style={S.historyLink}
+                        onClick={() => setBugReportOpen(true)}
+                        data-testid="report-bug-link"
+                        aria-label="Report a bug"
+                    >Report bug</button>
+                </div>
                 {historyStatus !== "" && (
                     <div
                         style={S.historyStatusLine}
@@ -2859,7 +3073,7 @@ function CortexPopup(): React.ReactElement {
                         data-testid="bug-report-success"
                         style={{
                             ...S.historyStatusLine,
-                            color: CX.accent,
+                            color: CX.accentText,
                         }}
                     >Thanks — report sent.</div>
                 )}
@@ -2878,6 +3092,7 @@ function CortexPopup(): React.ReactElement {
                     role="dialog"
                     aria-modal="true"
                     aria-labelledby="cortex-bug-report-title"
+                    aria-describedby="cortex-bug-report-description"
                     data-testid="bug-report-modal"
                     style={{
                         position: "fixed",
@@ -2890,13 +3105,12 @@ function CortexPopup(): React.ReactElement {
                     }}
                     onClick={(e) => {
                         if (e.target === e.currentTarget) {
-                            setBugReportOpen(false);
-                            setBugReportStatus("idle");
-                            setBugReportError("");
+                            closeBugReport();
                         }
                     }}
                 >
                     <div
+                        ref={bugDialogRef}
                         style={{
                             background: CX.surface,
                             border: `1px solid ${CX.borderDefault}`,
@@ -2916,7 +3130,18 @@ function CortexPopup(): React.ReactElement {
                                 fontFamily: CX.fontSerif,
                             }}
                         >Report a bug</h2>
+                        <p
+                            id="cortex-bug-report-description"
+                            style={{
+                                margin: "0 0 12px",
+                                color: CX.textSecondary,
+                                fontSize: 12,
+                                lineHeight: 1.45,
+                                fontFamily: CX.font,
+                            }}
+                        >Describe what happened, then review whether to include recent diagnostic logs.</p>
                         <textarea
+                            ref={bugTextareaRef}
                             data-testid="bug-report-textarea"
                             value={bugReportText}
                             onChange={(e) => setBugReportText(e.target.value)}
@@ -2926,7 +3151,7 @@ function CortexPopup(): React.ReactElement {
                             aria-label="Bug description"
                             style={{
                                 width: "100%",
-                                background: "rgba(255,255,255,0.04)",
+                                background: CX.tertiary,
                                 color: CX.text,
                                 border: `1px solid ${CX.borderDefault}`,
                                 borderRadius: CX.radiusSm,
@@ -2965,7 +3190,7 @@ function CortexPopup(): React.ReactElement {
                                 role="alert"
                                 data-testid="bug-report-error"
                                 style={{
-                                    color: "#E47A6E",
+                                color: CX.danger,
                                     fontSize: 11,
                                     marginBottom: 10,
                                     fontFamily: CX.font,
@@ -2980,11 +3205,7 @@ function CortexPopup(): React.ReactElement {
                             }}
                         >
                             <button
-                                onClick={() => {
-                                    setBugReportOpen(false);
-                                    setBugReportStatus("idle");
-                                    setBugReportError("");
-                                }}
+                                onClick={closeBugReport}
                                 style={{
                                     padding: "6px 12px",
                                     background: "transparent",
@@ -3005,7 +3226,7 @@ function CortexPopup(): React.ReactElement {
                                     background: CX.accent,
                                     border: "none",
                                     borderRadius: CX.radiusSm,
-                                    color: "white",
+                                    color: CX.text,
                                     fontSize: 12,
                                     fontWeight: 600,
                                     cursor: bugReportStatus === "submitting"
@@ -3053,10 +3274,27 @@ const S: Record<string, React.CSSProperties> = {
         border: `1px solid ${CX.borderDefault}`,
         boxShadow: CX.shadowFloat,
         marginBottom: 16,
-        animation: "cxAlertIn 0.3s cubic-bezier(0.16, 1, 0.3, 1)",
+        animation: `cxAlertIn ${CX.durationNormal} ${CX.easeOut}`,
     },
     alertTitle: { fontSize: 14, fontWeight: 600, marginBottom: 4, color: CX.text, fontFamily: CX.fontSerif },
     alertBody: { fontSize: 13, color: CX.textSecondary, lineHeight: 1.5 },
+    iconButton: {
+        display: "grid",
+        placeItems: "center",
+        width: 32,
+        height: 32,
+        flexShrink: 0,
+        margin: "-8px -8px -8px 8px",
+        padding: 0,
+        border: "none",
+        borderRadius: CX.radiusSm,
+        background: "transparent",
+        color: CX.textSecondary,
+        cursor: "pointer",
+        fontSize: 16,
+        lineHeight: 1,
+        fontFamily: CX.font,
+    },
 
     // Header 
     header: {
@@ -3144,7 +3382,7 @@ const S: Record<string, React.CSSProperties> = {
         boxSizing: "border-box" as const,
         fontFamily: CX.font,
         marginBottom: 16,
-        transition: "border-color 0.2s",
+        transition: `border-color ${CX.durationNormal} ${CX.easeOut}`,
     },
     goalEnterIcon: {
         position: "absolute" as const,
@@ -3170,8 +3408,17 @@ const S: Record<string, React.CSSProperties> = {
         justifyContent: "space-between",
         marginBottom: 20,
     },
-    focusTitle: { fontSize: 18, fontWeight: 600, color: CX.text, fontFamily: CX.fontSerif },
-    focusDuration: { fontSize: 13, color: CX.textSecondary },
+    focusTitle: {
+        minWidth: 0,
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap" as const,
+        fontSize: 18,
+        fontWeight: 600,
+        color: CX.text,
+        fontFamily: CX.fontSerif,
+    },
+    focusDuration: { flexShrink: 0, fontSize: 13, color: CX.textSecondary },
     endBtn: {
         padding: "6px 14px",
         border: `1px solid ${CX.borderDefault}`,
@@ -3215,9 +3462,10 @@ const S: Record<string, React.CSSProperties> = {
         overflow: "hidden",
     },
     trackFill: {
+        width: "100%",
         height: "100%",
         borderRadius: CX.radiusFull,
-        transition: `width 1s ease`,
+        transition: `transform ${CX.durationNormal} ${CX.easeOut}`,
     },
 
     // Stats row
@@ -3260,7 +3508,7 @@ const S: Record<string, React.CSSProperties> = {
     },
     errBody: { fontSize: 13, color: CX.text, lineHeight: 1.5 },
     errCode: {
-        fontSize: 13, color: CX.accent, marginTop: 12, fontFamily: CX.mono,
+        fontSize: 13, color: CX.accentText, marginTop: 12, fontFamily: CX.mono,
         lineHeight: 1.5, whiteSpace: "pre-wrap" as const, margin: 0,
     },
 
@@ -3277,11 +3525,11 @@ const S: Record<string, React.CSSProperties> = {
         fontWeight: 500,
         cursor: "pointer",
         fontFamily: CX.font,
-        transition: "opacity 0.2s ease",
+        transition: `opacity ${CX.durationNormal} ${CX.easeOut}`,
     },
     doneBtnStyle: {
         background: STATE_COLORS.FLOW,
-        color: CX.textInverse,
+        color: CX.text,
         cursor: "default",
         pointerEvents: "none" as const,
     },
@@ -3359,6 +3607,40 @@ const S: Record<string, React.CSSProperties> = {
         padding: "8px 0",
     },
     toggleLabel: { fontSize: 14, color: CX.text },
+    siteAccessRow: {
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        marginTop: 12,
+        padding: "14px 0 8px",
+        borderTop: `1px solid ${CX.borderDefault}`,
+    },
+    siteAccessDetail: {
+        marginTop: 3,
+        color: CX.textTertiary,
+        fontSize: 11,
+        lineHeight: 1.4,
+    },
+    siteAccessError: {
+        marginTop: 4,
+        color: CX.danger,
+        fontSize: 11,
+        lineHeight: 1.35,
+    },
+    siteAccessButton: {
+        minWidth: 68,
+        minHeight: 32,
+        padding: "6px 12px",
+        borderRadius: CX.radiusMd,
+        border: `1px solid ${CX.borderEmphasis}`,
+        background: "transparent",
+        color: CX.textSecondary,
+        fontFamily: CX.font,
+        fontSize: 11,
+        fontWeight: 600,
+        cursor: "pointer",
+        transition: `background ${CX.durationFast} ${CX.easeDefault}, border-color ${CX.durationFast} ${CX.easeDefault}, opacity ${CX.durationFast} ${CX.easeDefault}`,
+    },
     toggleTrack: {
         position: "relative" as const,
         width: 40,
@@ -3461,15 +3743,21 @@ const S: Record<string, React.CSSProperties> = {
         lineHeight: 1.3,
     },
     recapDismissIcon: {
+        display: "grid",
+        placeItems: "center",
+        width: 32,
+        height: 32,
+        flexShrink: 0,
+        margin: "-8px -8px -8px 0",
         background: "none",
         border: "none",
-        color: CX.textTertiary,
+        borderRadius: CX.radiusSm,
+        color: CX.textSecondary,
         cursor: "pointer",
         fontSize: 16,
         padding: 0,
         fontFamily: CX.font,
         lineHeight: 1,
-        flexShrink: 0,
     },
     recapBody: {
         fontSize: 13,
@@ -3494,7 +3782,7 @@ const S: Record<string, React.CSSProperties> = {
         border: `1px solid ${CX.accent}`,
         borderRadius: CX.radiusFull,
         background: CX.accent,
-        color: CX.textInverse,
+        color: CX.text,
         fontSize: 12,
         fontWeight: 500,
         fontFamily: CX.font,
@@ -3522,10 +3810,16 @@ const S: Record<string, React.CSSProperties> = {
         gap: 4,
         padding: "16px 8px 4px 8px",
     },
+    historyLinkRow: {
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 8,
+    },
     historyLink: {
         background: "none",
         border: "none",
-        color: CX.accent,
+        color: CX.accentText,
         cursor: "pointer",
         fontSize: 12,
         fontWeight: 500,

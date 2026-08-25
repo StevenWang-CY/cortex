@@ -66,6 +66,8 @@ from cortex.apps.desktop_shell.tokens import (
     BRAND_ACCENT,
     BRAND_ACCENT_DIM,
     BRAND_ACCENT_HOVER,
+    BRAND_ACCENT_PRESSED,
+    BRAND_ACCENT_TEXT,
     BRAND_DISPLAY_FONT,
     CX_TEXT_SECONDARY,
     CX_TEXT_TERTIARY,
@@ -553,12 +555,12 @@ class _ProgressStrip(QWidget):
             if i == self._current:
                 dot.setStyleSheet(
                     f"background: {BRAND_ACCENT};"
-                    f" color: #FFF; border-radius: 11px;"
+                    f" color: {_LABEL}; border-radius: 11px;"
                 )
             elif i < self._current:
                 dot.setStyleSheet(
                     f"background: {BRAND_ACCENT_DIM};"
-                    f" color: {BRAND_ACCENT}; border-radius: 11px;"
+                    f" color: {BRAND_ACCENT_TEXT}; border-radius: 11px;"
                 )
             else:
                 dot.setStyleSheet(
@@ -730,7 +732,7 @@ class OnboardingWindow(QWidget):
             f"font-family: {BRAND_DISPLAY_FONT}, ui-serif, Georgia, serif;"
             f"font-style: italic; font-size: {FS_BODY}px;"
             f"font-weight: {FW_REGULAR};"
-            f"color: {BRAND_ACCENT}; background: transparent;"
+            f"color: {BRAND_ACCENT_TEXT}; background: transparent;"
         )
         layout.addWidget(brand)
         layout.addSpacing(SP2)
@@ -818,9 +820,10 @@ class OnboardingWindow(QWidget):
             "  padding: 6px 16px;"
             f"  border-radius: {RADIUS_BUTTON}px;"
             f"  background: {BRAND_ACCENT};"
-            "  color: #FFF; border: none;"
+            f"  color: {_LABEL}; border: none;"
             "}"
-            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
+            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
+            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
         )
         connect_btn.clicked.connect(self.extensions_requested.emit)
         # P1-20: log USER_ACTION so the extension-connect step is traceable.
@@ -865,9 +868,10 @@ class OnboardingWindow(QWidget):
             "  padding: 6px 16px;"
             f"  border-radius: {RADIUS_BUTTON}px;"
             f"  background: {BRAND_ACCENT};"
-            "  color: #FFF; border: none;"
+            f"  color: {_LABEL}; border: none;"
             "}"
-            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
+            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
+            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
         )
         notif_btn.clicked.connect(self._on_request_notifications)
         set_accessible_name(notif_btn, "Enable macOS notifications")
@@ -1127,7 +1131,7 @@ class OnboardingWindow(QWidget):
         num_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         num_label.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
         num_label.setStyleSheet(
-            f"color: {BRAND_ACCENT}; background: {BRAND_ACCENT_DIM};"
+            f"color: {BRAND_ACCENT_TEXT}; background: {BRAND_ACCENT_DIM};"
             f" border: none; border-radius: 11px;"
         )
         header.addWidget(num_label)
@@ -1154,10 +1158,10 @@ class OnboardingWindow(QWidget):
                 "  padding: 2px 8px;"
                 f"  border-radius: {RADIUS_BUTTON}px;"
                 "  background: transparent;"
-                f"  color: {BRAND_ACCENT};"
+                f"  color: {BRAND_ACCENT_TEXT};"
                 "  border: none;"
                 "}"
-                f"QPushButton:hover {{ color: {BRAND_ACCENT_HOVER}; }}"
+                f"QPushButton:hover {{ color: {BRAND_ACCENT_TEXT}; background: {BRAND_ACCENT_DIM}; }}"
             )
             set_accessible_name(why_btn, f"Why Cortex needs {title}")
             set_accessible_description(
@@ -1235,7 +1239,7 @@ class OnboardingWindow(QWidget):
             callout.setFont(mac_native.system_font(FS_CAPTION, "medium"))
             callout.setStyleSheet(
                 "QLabel#CortexContinuityCallout {"
-                f"  color: {BRAND_ACCENT};"
+                f"  color: {BRAND_ACCENT_TEXT};"
                 f"  background: {BRAND_ACCENT_DIM};"
                 f"  border-radius: {RADIUS_BUTTON}px;"
                 "  padding: 6px 10px;"
@@ -1262,9 +1266,10 @@ class OnboardingWindow(QWidget):
             "  padding: 4px 12px;"
             f"  border-radius: {RADIUS_BUTTON}px;"
             f"  background: {BRAND_ACCENT};"
-            "  color: #FFF; border: none;"
+            f"  color: {_LABEL}; border: none;"
             "}"
-            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
+            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
+            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
         )
         if callable(action):
             btn.clicked.connect(action)
@@ -1392,9 +1397,10 @@ class OnboardingWindow(QWidget):
             "  padding: 6px 20px;"
             f"  border-radius: {RADIUS_BUTTON}px;"
             f"  background: {BRAND_ACCENT};"
-            "  color: #FFF; border: none;"
+            f"  color: {_LABEL}; border: none;"
             "}"
-            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
+            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
+            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
             "QPushButton:disabled { background: rgba(0,0,0,0.10); color: rgba(0,0,0,0.30); }"
         )
         begin_btn.clicked.connect(self._on_begin_calibration)
@@ -1627,9 +1633,10 @@ class OnboardingWindow(QWidget):
             "  padding: 6px 16px;"
             f"  border-radius: {RADIUS_BUTTON}px;"
             f"  background: {BRAND_ACCENT};"
-            "  color: #FFF; border: none;"
+            f"  color: {_LABEL}; border: none;"
             "}"
-            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
+            f"QPushButton:hover {{ background: {BRAND_ACCENT_HOVER}; color: #111111; }}"
+            f"QPushButton:pressed {{ background: {BRAND_ACCENT_PRESSED}; color: #FFFFFF; }}"
         )
         save_key_btn.clicked.connect(self._save_api_key)
         set_accessible_name(save_key_btn, "Save Bedrock bearer token")

@@ -254,7 +254,16 @@ identities.
 
 All adapters must follow these rules:
 
-1. **No biometric data** in context sent to LLM — only workspace metadata
-2. **Content limits** — browser content excerpts must not exceed 2000 tokens
-3. **Minimal permissions** — request only what's needed (e.g., `activeTab` not `<all_urls>`)
-4. **No persistent storage** — adapter context is ephemeral, not logged to disk
+1. **No raw biometric stream** in the external context contract; an explicitly
+   selected heuristic support status remains a separate classified field.
+2. **Broker ownership** — adapters return local context; only the privacy
+   broker may classify, select, minimize, preview, and externally send it.
+3. **Content limits** — browser excerpts are capped at 2,000 characters before
+   the daemon repeats authoritative bounds/redaction.
+4. **Minimal permissions** — page-body access is exact-origin, explicitly
+   recorded, revocable, and excluded in incognito. Static learning telemetry
+   remains on a declared narrow allowlist.
+5. **Declared persistence** — raw adapter snapshots are ephemeral and absent
+   from logs. Separate sanitized browser resume metadata is locally persisted,
+   capped, scrubbed on content revocation, and documented in
+   [`privacy.md`](privacy.md).

@@ -24,6 +24,16 @@ import type {
   LeetCodeStage,
   SubmissionResult,
 } from "../types/generated/cortex_schemas";
+import type { PlasmoCSConfig } from "plasmo";
+
+export const config: PlasmoCSConfig = {
+  matches: [
+    "https://leetcode.com/problems/*",
+    "https://leetcode.cn/problems/*",
+  ],
+  run_at: "document_idle",
+  all_frames: false,
+};
 
 type Stage = LeetCodeStage;
 
@@ -335,7 +345,9 @@ export class LeetCodeObserver {
           title: this.title,
           difficulty: this.difficulty,
           tags: this.tags,
-          code_snapshot: this.lastCodeSnapshot,
+          // Never persist source text. The in-memory wire payload is separately
+          // gated and sanitized by the background's per-origin consent check.
+          code_snapshot: "",
           stage: this.currentStage,
           time_elapsed_s: elapsedS,
           wrong_answer_count: this.wrongAnswerCount,
@@ -776,7 +788,7 @@ export class LeetCodeObserver {
 // Auto-start
 // ---------------------------------------------------------------------------
 
-if (window.location.hostname.includes("leetcode.com") || window.location.hostname.includes("leetcode.cn")) {
+if (!chrome.extension?.inIncognitoContext && (window.location.hostname.includes("leetcode.com") || window.location.hostname.includes("leetcode.cn"))) {
   // Guard against duplicate injection (Plasmo may re-inject on HMR)
   const GUARD_KEY = "__cortex_leetcode_observer__";
   const guardedWindow = window as unknown as Record<string, unknown>;

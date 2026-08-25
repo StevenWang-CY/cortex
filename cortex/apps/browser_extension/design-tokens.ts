@@ -8,22 +8,23 @@
  */
 
 export const CX = {
-    bg: "#ECECEC",
-    surface: "#FFFFFF",
-    tertiary: "#F2F2F7",
+    bg: "var(--cx-window-bg, #ECECEC)",
+    surface: "var(--cx-control-bg, #FFFFFF)",
+    tertiary: "var(--cx-grouped-bg, #F2F2F7)",
     overlay: "rgba(236, 236, 236, 0.88)",
-    border: "rgba(0, 0, 0, 0.06)",
-    borderDefault: "#3C3C4326",
-    borderEmphasis: "rgba(0, 0, 0, 0.20)",
-    shadowFloat: "0 8px 32px rgba(0, 0, 0, 0.08), 0 0 0 1px rgba(0,0,0,0.04)",
-    text: "#1A1A1A",
-    textSecondary: "#5C5854",
-    textTertiary: "#6B6661",
+    border: "var(--cx-border-subtle, rgba(0, 0, 0, 0.06))",
+    borderDefault: "var(--cx-separator, #3C3C4326)",
+    borderEmphasis: "var(--cx-border-emphasis, rgba(0, 0, 0, 0.20))",
+    shadowFloat: "var(--cx-shadow-float, 0 8px 32px rgba(0, 0, 0, 0.08), 0 0 0 1px rgba(0,0,0,0.04))",
+    text: "var(--cx-label-primary, #1A1A1A)",
+    textSecondary: "var(--cx-label-secondary, #5C5854)",
+    textTertiary: "var(--cx-label-tertiary, #6B6661)",
     textInverse: "#FFFFFF",
-    accent: "#D97757",
-    accentHover: "#C46547",
+    accent: "var(--cx-accent, #D97757)",
+    accentHover: "var(--cx-accent-hover, #C46547)",
+    accentText: "var(--cx-accent-text, #A4472E)",
     accentDim: "rgba(217, 119, 87, 0.12)",
-    danger: "#D70015",
+    danger: "var(--cx-danger, #D70015)",
     dangerDim: "rgba(215, 0, 21, 0.10)",
     bioHr: "#D97757",
     bioHrv: "#57A0D9",
@@ -57,7 +58,7 @@ export const CX = {
         sidebar_bg: "#232326",
         label_primary: "#FFFFFF",
         label_secondary: "#EBEBF599",
-        label_tertiary: "#EBEBF54D",
+        label_tertiary: "#EBEBF58C",
         label_quaternary: "#EBEBF528",
         separator: "#5454584C",
         danger: "#FF453A",
@@ -101,10 +102,10 @@ export const CX = {
 
     // Motion durations (ms).
     motion: {
-        micro: 100,
-        fast: 150,
+        micro: 120,
+        fast: 160,
         normal: 200,
-        slow: 400,
+        slow: 280,
         ambient: 3000,
     },
 
@@ -124,14 +125,15 @@ export const CX = {
     radiusLg: 10,
     radiusXl: 24,
     radiusFull: 9999,
-    durationMicro: "100ms",
-    durationFast: "150ms",
+    durationMicro: "120ms",
+    durationFast: "160ms",
     durationNormal: "200ms",
-    durationSlow: "400ms",
+    durationSlow: "280ms",
     durationAmbient: "3000ms",
-    easeDefault: "cubic-bezier(0.4, 0, 0.2, 1)",
-    easeOut: "cubic-bezier(0, 0, 0.2, 1)",
-    easeIn: "cubic-bezier(0.4, 0, 1, 1)",
+    easeDefault: "cubic-bezier(0.23, 1, 0.32, 1)",
+    easeOut: "cubic-bezier(0.23, 1, 0.32, 1)",
+    easeInOut: "cubic-bezier(0.77, 0, 0.175, 1)",
+    easeDrawer: "cubic-bezier(0.32, 0.72, 0, 1)",
 } as const;
 
 export const STATE_COLORS: Record<string, string> = {
@@ -140,6 +142,14 @@ export const STATE_COLORS: Record<string, string> = {
     HYPER: "#D70015",
     HYPO: "#3C3C432E",
     RECOVERY: "#0A84FF",
+};
+
+export const STATE_TEXT_COLORS: Record<string, string> = {
+    UNKNOWN: "var(--cx-label-secondary, #5C5854)",
+    FLOW: "var(--cx-accent-text, #A4472E)",
+    HYPER: "var(--cx-danger, #D70015)",
+    HYPO: "var(--cx-label-secondary, #5C5854)",
+    RECOVERY: "var(--cx-info, #0062CC)",
 };
 
 export const STATE_LABELS: Record<string, string> = {
@@ -166,6 +176,18 @@ export const CX_KEYFRAMES = `
 @keyframes cx-spin { to { transform: rotate(360deg) } }
 @keyframes cx-rise { from { transform: translateY(8px); opacity: 0 } to { transform: translateY(0); opacity: 1 } }
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+  *, *::before, *::after {
+    animation-delay: 0ms !important;
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-delay: 0ms !important;
+  }
+  .cortex-motion-enter,
+  .cortex-motion-ambient { animation: none !important; transform: none !important; }
+  .cortex-motion-enter {
+    opacity: 1 !important;
+    transition: opacity 160ms cubic-bezier(0.23, 1, 0.32, 1) !important;
+  }
 }
 `;

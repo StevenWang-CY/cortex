@@ -3,7 +3,7 @@
 //
 // Source of truth: cortex/libs/schemas/*.py (Pydantic v2 models).
 // Schema package: cortex-wire/2.0
-// Source SHA-256: 5a2b61f5dc68e2037b273866c2c566c12b025cd0e9287d916fdea48a91a41af2
+// Source SHA-256: f8dbaed192c9edc9c86b343e49ff1c0cad2d7b886536c5da3e4cabaef2270c00
 // Drift-gate: a pre-commit hook and the GitHub Actions CI run
 //   `python -m cortex.scripts.generate_ts_schemas --check`
 // and fail if this file is out of sync with the Python models.
@@ -81,9 +81,17 @@ export type MissingReason =
   | "ARTIFACT"
   | "UNKNOWN";
 /**
+ * Deprecated uppercase compatibility alias
+ */
+export type UserState = "UNKNOWN" | "FLOW" | "HYPO" | "HYPER" | "RECOVERY";
+/**
  * Decision-support target names that avoid diagnostic claims.
  */
 export type SupportState = "support_likely" | "under_engaged" | "flow_like" | "recovering" | "unknown";
+/**
+ * Whether the current support estimate is actionable.
+ */
+export type EstimateStatus = "estimated" | "insufficient_evidence" | "warming_up";
 /**
  * Persisted state of one intervention transaction.
  */
@@ -114,14 +122,6 @@ export type InterventionLifecycleState1 =
   | "restored"
   | "restore_failed"
   | "abandoned";
-/**
- * Deprecated uppercase compatibility alias
- */
-export type UserState = "UNKNOWN" | "FLOW" | "HYPO" | "HYPER" | "RECOVERY";
-/**
- * Whether the current support estimate is actionable.
- */
-export type EstimateStatus = "estimated" | "insufficient_evidence" | "warming_up";
 /**
  * Closed metric catalog; unsupported metrics remain explicit.
  */
@@ -1152,6 +1152,699 @@ export interface TerminalContext {
    */
   running_command?: string | null;
 }
+/**
+ * How one catalogued field is handled in the outbound request.
+ */
+export interface ContextFieldDisclosure {
+  field_path: string;
+  classification:
+    | "operational_aggregate"
+    | "support_estimate"
+    | "user_goal"
+    | "workspace_metadata"
+    | "workspace_content"
+    | "behavioral_preference";
+  origin: "daemon" | "editor" | "terminal" | "browser" | "user";
+  disposition: "included" | "omitted" | "redacted";
+  redaction_count?: number;
+  value_preview?: string;
+}
+/**
+ * Result of explicitly burning a prepared preview without sending it.
+ */
+export interface ContextPreviewCancellationResponse {
+  schema_version?: "1.0" | "2.0";
+  observed_at_unix_ms?: number;
+  observed_at_mono_ns?: number;
+  boot_id?: string;
+  /**
+   * @deprecated
+   * Deprecated v1 compatibility mirror in UTC Unix seconds; never use it for elapsed-time decisions.
+   */
+  timestamp?: number | null;
+  preview_id: string;
+  cancelled: boolean;
+  sent?: boolean;
+  authority_granted?: boolean;
+  note?: string;
+}
+/**
+ * Consume one prepared preview; the handle is burned on every attempt.
+ */
+export interface ContextPreviewConfirmationRequest {
+  preview_id: string;
+  confirmation_phrase: "SEND PREVIEWED CONTEXT ONCE";
+}
+/**
+ * Validated planner response from one explicitly confirmed payload.
+ */
+export interface ContextPreviewConfirmationResponse {
+  schema_version?: "1.0" | "2.0";
+  observed_at_unix_ms?: number;
+  observed_at_mono_ns?: number;
+  boot_id?: string;
+  /**
+   * @deprecated
+   * Deprecated v1 compatibility mirror in UTC Unix seconds; never use it for elapsed-time decisions.
+   */
+  timestamp?: number | null;
+  preview_id: string;
+  sent?: boolean;
+  plan: InterventionPlan;
+  fallback_used?: boolean;
+  authority_granted?: boolean;
+  note?: string;
+}
+/**
+ * Complete intervention plan from LLM engine.
+ *
+ * This is the structured output the LLM produces, which is then
+ * validated and executed by the intervention engine.
+ */
+export interface InterventionPlan {
+  /**
+   * Unique intervention identifier
+   */
+  intervention_id?: string;
+  /**
+   * Intervention severity level
+   */
+  level: "overlay_only" | "simplified_workspace" | "guided_mode";
+  /**
+   * 1-2 sentence summary of situation
+   */
+  situation_summary: string;
+  /**
+   * Headline for overlay (< 15 words)
+   */
+  headline: string;
+  /**
+   * The one thing to focus on
+   */
+  primary_focus: string;
+  /**
+   * 1-3 concrete next steps
+   *
+   * @minItems 1
+   * @maxItems 3
+   */
+  micro_steps: [MicroStep] | [MicroStep, MicroStep] | [MicroStep, MicroStep, MicroStep];
+  /**
+   * Elements to hide/fold
+   */
+  hide_targets?: string[];
+  ui_plan: UIPlan;
+  /**
+   * Tone of intervention text
+   */
+  tone?: "direct" | "supportive" | "minimal";
+  /**
+   * Executable actions the user can approve
+   */
+  suggested_actions?: SuggestedAction[];
+  /**
+   * Detailed error analysis with suggested fixes
+   */
+  error_analysis?: ErrorAnalysis | null;
+  /**
+   * Per-tab keep/close/group recommendations
+   */
+  tab_recommendations?: TabRecommendations | null;
+  /**
+   * Why Cortex triggered this intervention, referencing specific signals
+   */
+  causal_explanation?: string;
+  /**
+   * URL of the active tab at trigger time, stamped by the daemon so surfaces can scope the intervention to its originating page. None when no active-tab URL was available.
+   */
+  trigger_url?: string | null;
+  /**
+   * 2-3 dominant signals behind the trigger; first is primary
+   *
+   * @maxItems 3
+   */
+  causal_signals?: [] | [CausalSignal] | [CausalSignal, CausalSignal] | [CausalSignal, CausalSignal, CausalSignal];
+  /**
+   * Consent ladder level for this intervention
+   */
+  consent_level?: "observe" | "suggest" | "preview" | "reversible_act" | "autonomous_act";
+  /**
+   * Non-fatal validation or grounding warnings to surface in debug UI
+   */
+  plan_warnings?: string[];
+  /**
+   * Daemon-stamped plan metadata (e.g. {'source': 'fallback'}) and prompt-budget telemetry (e.g. {'context_truncated_sections': ['terminal_errors']}). Never trust this field for executor decisions — it is purely an observability hint.
+   */
+  metadata?: {
+    [k: string]: unknown;
+  };
+}
+/**
+ * P0 §3.6: a single micro-step with toggleable completion status.
+ *
+ * Tracks the lifecycle of an intervention's individual next-actions so
+ * the daemon can persist progress across reconnects and the surfaces
+ * can render check/strike-through state idempotently.
+ */
+export interface MicroStep {
+  /**
+   * Human-readable step text shown to the user
+   */
+  text: string;
+  /**
+   * Current completion status
+   */
+  status?: "pending" | "done" | "skipped";
+  /**
+   * When the user first acted on this step (toggled non-pending)
+   */
+  started_at?: string | null;
+  /**
+   * When the user marked this step done or skipped
+   */
+  completed_at?: string | null;
+}
+/**
+ * UI manipulation instructions
+ */
+export interface UIPlan {
+  /**
+   * Whether to dim background windows
+   */
+  dim_background?: boolean;
+  /**
+   * Whether to show intervention overlay
+   */
+  show_overlay?: boolean;
+  /**
+   * Whether to fold unrelated code in editor
+   */
+  fold_unrelated_code?: boolean;
+  /**
+   * Type of intervention
+   */
+  intervention_type?: "overlay_only" | "simplified_workspace" | "guided_mode";
+  /**
+   * Half-window of source lines to keep visible around cursor
+   */
+  max_visible_lines?: number;
+}
+/**
+ * A proposed action; only the transaction manifest can make it executable.
+ */
+export interface SuggestedAction {
+  /**
+   * Unique action identifier
+   */
+  action_id?: string;
+  /**
+   * Type of executable action
+   */
+  action_type:
+    | "close_tab"
+    | "group_tabs"
+    | "bookmark_and_close"
+    | "open_url"
+    | "search_error"
+    | "highlight_tab"
+    | "save_session"
+    | "copy_to_clipboard"
+    | "start_timer"
+    | "resume_last_active_file"
+    | "prompt_micro_commit"
+    | "suggest_movement_break"
+    | "take_biology_break";
+  /**
+   * Integer index referencing the tab list from context (primary ID for tab actions)
+   */
+  tab_index?: number | null;
+  /**
+   * Search query, URL for open_url, session name, etc.
+   */
+  target?: string;
+  /**
+   * Human-readable button label
+   */
+  label: string;
+  /**
+   * Why this action helps
+   */
+  reason?: string;
+  /**
+   * How strongly recommended
+   */
+  category?: "recommended" | "optional" | "informational";
+  /**
+   * Presentation hint normalised from the transactional capability catalog; never execution authority
+   */
+  reversible?: boolean;
+  /**
+   * Groups related actions together
+   */
+  group_id?: string | null;
+  /**
+   * Action-specific metadata (tab_title, search_query, etc.)
+   */
+  metadata?: {
+    [k: string]: unknown;
+  };
+  /**
+   * Optional curated intervention catalog identifier
+   */
+  catalog_id?: string | null;
+}
+/**
+ * LLM analysis of the current error.
+ */
+export interface ErrorAnalysis {
+  /**
+   * Classified error type (syntax, import, type, runtime, etc.)
+   */
+  error_type: string;
+  /**
+   * Identified root cause
+   */
+  root_cause: string;
+  /**
+   * Suggested code fix or approach
+   */
+  suggested_fix?: string;
+  /**
+   * Pre-crafted search query for this error
+   */
+  search_query?: string;
+  /**
+   * URL to relevant documentation, if identifiable
+   */
+  relevant_doc_url?: string;
+  /**
+   * The specific abstraction or function that is failing
+   */
+  failing_abstraction?: string;
+  /**
+   * File:line location of the failing symbol
+   */
+  symbol_location?: string;
+  /**
+   * Classified root cause category
+   */
+  root_cause_category?:
+    | "type_mismatch"
+    | "null_reference"
+    | "missing_import"
+    | "logic_error"
+    | "api_misuse"
+    | "concurrency"
+    | "config"
+    | "other";
+  /**
+   * Smallest code change that fixes the issue
+   */
+  minimal_edit?: string;
+}
+/**
+ * Complete tab triage from LLM.
+ */
+export interface TabRecommendations {
+  tabs?: TabRecommendation[];
+  /**
+   * Summary of tab triage reasoning
+   */
+  summary?: string;
+}
+/**
+ * LLM recommendation for a single tab.
+ */
+export interface TabRecommendation {
+  /**
+   * Integer index into the context tab list
+   */
+  tab_index: number;
+  /**
+   * Tab title for display
+   */
+  tab_title?: string;
+  /**
+   * Recommended action for this tab
+   */
+  action: "keep" | "close" | "group" | "bookmark_and_close";
+  /**
+   * Why this recommendation
+   */
+  reason?: string;
+  /**
+   * Relevance to current task
+   */
+  relevance_score?: number;
+  /**
+   * Group name if action is 'group'
+   */
+  group_name?: string | null;
+}
+/**
+ * P0 §3.9: one ranked driver behind the current state transition.
+ *
+ * The daemon emits a list of these (top 2-3) alongside each
+ * :class:`InterventionPlan` so the UI can render a structured "Why?"
+ * drilldown — name, current value, baseline, percent change, and a
+ * 60-sample 1-Hz sparkline buffer. Unlike the legacy free-text
+ * ``causal_explanation`` string this payload is engine-computed, not
+ * LLM-composed, and is therefore safe to compare against observable
+ * values in the F09 verifier.
+ *
+ * Privacy: ``samples_60s`` is the most recent 60 seconds of 1-Hz
+ * aggregates only; raw frame data never enters this buffer.
+ */
+export interface CausalSignal {
+  /**
+   * Signal label (e.g. 'HRV', 'Tab switches')
+   */
+  name: string;
+  /**
+   * Latest 1-Hz aggregate observed by the daemon
+   */
+  current_value: number;
+  /**
+   * User's personal baseline for this signal (None if unknown)
+   */
+  baseline_value?: number | null;
+  /**
+   * Display unit (ms, bpm, /min, °, …)
+   */
+  unit: string;
+  /**
+   * Percent change vs baseline; sign carries direction
+   */
+  delta_pct?: number | null;
+  /**
+   * Last 60 1-Hz samples for sparkline rendering
+   *
+   * @maxItems 60
+   */
+  samples_60s?: number[];
+  /**
+   * Rank of this signal within the explanation (primary first)
+   */
+  severity?: "primary" | "secondary" | "tertiary";
+}
+/**
+ * Local request to prepare, but not send, an external-model payload.
+ */
+export interface ContextPreviewRequest {
+  state_estimate: StateEstimate;
+  task_context: TaskContext;
+  selection?: ContextSourceSelection;
+  constraints?: SimplificationConstraints | null;
+  template_name?: string | null;
+  extra_context?: string;
+}
+/**
+ * Complete state estimation output from the state engine.
+ *
+ * Produced every 500ms from fused feature vectors.
+ */
+export interface StateEstimate {
+  estimate_id?: string;
+  state: UserState;
+  /**
+   * Canonical decision-support state
+   */
+  support_state?: SupportState | null;
+  status?: EstimateStatus;
+  /**
+   * Deprecated compatibility name for bounded evidence strength; not a probability or diagnostic confidence.
+   */
+  confidence: number;
+  scores: StateScores;
+  support_scores?: SupportScores | null;
+  evidence_coverage?: number;
+  contributing_features?: FeatureContribution[];
+  exclusions?: string[];
+  model?: InferenceModelIdentity;
+  /**
+   * Only present for a registered model with a calibration artifact.
+   */
+  probabilities?: SupportScores | null;
+  /**
+   * Human-readable reasons for current state
+   */
+  reasons?: string[];
+  signal_quality: SignalQuality;
+  /**
+   * @deprecated
+   * Deprecated v1 state-pipeline monotonic seconds. Prefer the explicit observed_at_* fields.
+   */
+  timestamp: number;
+  schema_version?: "2.0";
+  observed_at_unix_ms?: number | null;
+  observed_at_mono_ns?: number | null;
+  boot_id?: string | null;
+  /**
+   * Seconds in current state
+   */
+  dwell_seconds?: number;
+  /**
+   * Compatibility field; unavailable pending reference validation
+   */
+  stress_integral?: number | null;
+  /**
+   * @deprecated
+   * Deprecated compatibility field; absent for deterministic rules.
+   */
+  calibrated_probabilities?: StateScores1 | null;
+  /**
+   * Classifier source used for this estimate
+   */
+  classifier_source?: ("rule" | "ml" | "ensemble") | null;
+  /**
+   * Ensemble weight on ML branch when used
+   */
+  classifier_alpha?: number | null;
+}
+/**
+ * Deprecated uppercase projection of heuristic scores
+ */
+export interface StateScores {
+  /**
+   * Legacy flow-like score
+   */
+  flow?: number;
+  /**
+   * Legacy under-engaged score
+   */
+  hypo?: number;
+  /**
+   * Legacy support-likely score
+   */
+  hyper?: number;
+  /**
+   * Legacy recovering score
+   */
+  recovery?: number;
+}
+/**
+ * Bounded deterministic support scores; these are not probabilities.
+ */
+export interface SupportScores {
+  support_likely?: number;
+  under_engaged?: number;
+  flow_like?: number;
+  recovering?: number;
+}
+/**
+ * Auditable contribution of one observed or missing feature.
+ */
+export interface FeatureContribution {
+  feature: string;
+  support_state: SupportState;
+  direction: "positive" | "negative" | "missing";
+  contribution: number;
+  quality: number;
+  observed: boolean;
+  note: string;
+}
+/**
+ * Identity and evidence maturity of a support inference implementation.
+ */
+export interface InferenceModelIdentity {
+  name: string;
+  version: string;
+  feature_schema_version: string;
+  implementation_sha256?: string | null;
+  validation_status: "deterministic_rules" | "research_only" | "validated" | "unregistered";
+  probability_calibration_artifact_id?: string | null;
+}
+/**
+ * Signal quality per channel
+ */
+export interface SignalQuality {
+  /**
+   * Physiological signal quality
+   */
+  physio?: number;
+  /**
+   * Kinematic signal quality
+   */
+  kinematics?: number;
+  /**
+   * Telemetry signal quality
+   */
+  telemetry?: number;
+  /**
+   * Compute overall signal quality as weighted average.
+   */
+  overall: number;
+  /**
+   * Check if signal quality is acceptable for intervention.
+   */
+  acceptable: boolean;
+}
+/**
+ * Scores for each possible user state.
+ */
+export interface StateScores1 {
+  /**
+   * Legacy flow-like score
+   */
+  flow?: number;
+  /**
+   * Legacy under-engaged score
+   */
+  hypo?: number;
+  /**
+   * Legacy support-likely score
+   */
+  hyper?: number;
+  /**
+   * Legacy recovering score
+   */
+  recovery?: number;
+}
+/**
+ * Per-request opt-ins; every potentially identifying source is off.
+ */
+export interface ContextSourceSelection {
+  workspace_aggregates?: boolean;
+  support_estimate?: boolean;
+  user_goal?: boolean;
+  editor_metadata?: boolean;
+  editor_content?: boolean;
+  terminal_content?: boolean;
+  browser_metadata?: boolean;
+  browser_content?: boolean;
+  learned_preferences?: boolean;
+  extra_context?: boolean;
+}
+/**
+ * Constraints for workspace simplification.
+ */
+export interface SimplificationConstraints {
+  /**
+   * Maximum visible browser tabs
+   */
+  max_visible_tabs?: number;
+  /**
+   * Maximum visible code lines
+   */
+  max_visible_lines?: number;
+  /**
+   * Fold all code except current function
+   */
+  fold_all_except_current?: boolean;
+  /**
+   * Hide terminal output except errors
+   */
+  hide_terminal_history?: boolean;
+  /**
+   * Always keep active tab visible
+   */
+  preserve_active_tab?: boolean;
+}
+/**
+ * Exact redacted context plus a one-time confirmation handle.
+ */
+export interface ContextPreviewResponse {
+  schema_version?: "1.0" | "2.0";
+  observed_at_unix_ms?: number;
+  observed_at_mono_ns?: number;
+  boot_id?: string;
+  /**
+   * @deprecated
+   * Deprecated v1 compatibility mirror in UTC Unix seconds; never use it for elapsed-time decisions.
+   */
+  timestamp?: number | null;
+  disclosure_revision?: "context-disclosure-v1";
+  preview_id: string;
+  request_digest: string;
+  expires_at_unix_ms: number;
+  confirmation_phrase?: "SEND PREVIEWED CONTEXT ONCE";
+  provider: "bedrock" | "vertex" | "direct";
+  model: string;
+  template_name: string;
+  retention: ProviderRetentionDisclosure;
+  selection: ContextSourceSelection;
+  outbound_context: TaskContext;
+  outbound_user_prompt: string;
+  /**
+   * @maxItems 128
+   */
+  field_disclosures: ContextFieldDisclosure[];
+  redaction_count?: number;
+  omitted_field_count?: number;
+  outbound_utf8_bytes: number;
+  raw_context_retained?: boolean;
+  prepared_payload_retained_in_memory?: boolean;
+  prepared_payload_cancellable?: boolean;
+  authority_granted?: boolean;
+  note?: string;
+}
+/**
+ * Provider-specific retention caveat shown before every external send.
+ */
+export interface ProviderRetentionDisclosure {
+  provider: "bedrock" | "vertex" | "direct";
+  destination: string;
+  configured_mode: "unverified" | "provider_default" | "zero_data_retention_contract";
+  summary: string;
+  documentation_url: string;
+  verified_on: string;
+  account_contract_must_be_verified?: boolean;
+  zero_retention_asserted_by_cortex?: boolean;
+}
+/**
+ * Current planner privacy posture for local settings surfaces.
+ */
+export interface ContextPrivacyStatusResponse {
+  schema_version?: "1.0" | "2.0";
+  observed_at_unix_ms?: number;
+  observed_at_mono_ns?: number;
+  boot_id?: string;
+  /**
+   * @deprecated
+   * Deprecated v1 compatibility mirror in UTC Unix seconds; never use it for elapsed-time decisions.
+   */
+  timestamp?: number | null;
+  planner_mode: "no_llm" | "no_content" | "external_redacted";
+  network_allowed_by_configuration?: boolean;
+  disclosure_revision?: "context-disclosure-v1";
+  pending_previews?: number;
+  provider: "bedrock" | "vertex" | "direct";
+  retention: ProviderRetentionDisclosure;
+}
+/**
+ * Prepare a preview from the daemon's current in-memory snapshot.
+ *
+ * Unlike :class:`ContextPreviewRequest`, this UI-oriented contract never
+ * asks a desktop client to copy raw workspace content across a second local
+ * boundary.  Only source choices and an optional user-authored note cross
+ * the authenticated loopback API.
+ */
+export interface CurrentContextPreviewRequest {
+  selection?: ContextSourceSelection;
+  constraints?: SimplificationConstraints | null;
+  template_name?: string | null;
+  extra_context?: string;
+}
 export interface DaemonStatusResponse {
   command: "status";
   status: "running" | "stopped";
@@ -1268,18 +1961,6 @@ export interface ExecutorDispatchBinding {
   bound_at_unix_ms: number;
   bound_at_mono_ns: number;
   boot_id: string;
-}
-/**
- * Auditable contribution of one observed or missing feature.
- */
-export interface FeatureContribution {
-  feature: string;
-  support_state: SupportState;
-  direction: "positive" | "negative" | "missing";
-  contribution: number;
-  quality: number;
-  observed: boolean;
-  note: string;
 }
 /**
  * One named, provenance-bearing input to the support engine.
@@ -1763,17 +2444,6 @@ export interface HelpfulnessSummaryResponse {
   recent_rewards?: number[];
 }
 /**
- * Identity and evidence maturity of a support inference implementation.
- */
-export interface InferenceModelIdentity {
-  name: string;
-  version: string;
-  feature_schema_version: string;
-  implementation_sha256?: string | null;
-  validation_status: "deterministic_rules" | "research_only" | "validated" | "unregistered";
-  probability_calibration_artifact_id?: string | null;
-}
-/**
  * Interval derived only from two named canonical beats.
  */
 export interface InterBeatInterval {
@@ -1802,338 +2472,6 @@ export interface InterventionApplyCommand {
 }
 export interface InterventionApplyRequest {
   plan: InterventionPlan;
-}
-/**
- * Complete intervention plan from LLM engine.
- *
- * This is the structured output the LLM produces, which is then
- * validated and executed by the intervention engine.
- */
-export interface InterventionPlan {
-  /**
-   * Unique intervention identifier
-   */
-  intervention_id?: string;
-  /**
-   * Intervention severity level
-   */
-  level: "overlay_only" | "simplified_workspace" | "guided_mode";
-  /**
-   * 1-2 sentence summary of situation
-   */
-  situation_summary: string;
-  /**
-   * Headline for overlay (< 15 words)
-   */
-  headline: string;
-  /**
-   * The one thing to focus on
-   */
-  primary_focus: string;
-  /**
-   * 1-3 concrete next steps
-   *
-   * @minItems 1
-   * @maxItems 3
-   */
-  micro_steps: [MicroStep] | [MicroStep, MicroStep] | [MicroStep, MicroStep, MicroStep];
-  /**
-   * Elements to hide/fold
-   */
-  hide_targets?: string[];
-  ui_plan: UIPlan;
-  /**
-   * Tone of intervention text
-   */
-  tone?: "direct" | "supportive" | "minimal";
-  /**
-   * Executable actions the user can approve
-   */
-  suggested_actions?: SuggestedAction[];
-  /**
-   * Detailed error analysis with suggested fixes
-   */
-  error_analysis?: ErrorAnalysis | null;
-  /**
-   * Per-tab keep/close/group recommendations
-   */
-  tab_recommendations?: TabRecommendations | null;
-  /**
-   * Why Cortex triggered this intervention, referencing specific signals
-   */
-  causal_explanation?: string;
-  /**
-   * URL of the active tab at trigger time, stamped by the daemon so surfaces can scope the intervention to its originating page. None when no active-tab URL was available.
-   */
-  trigger_url?: string | null;
-  /**
-   * 2-3 dominant signals behind the trigger; first is primary
-   *
-   * @maxItems 3
-   */
-  causal_signals?: [] | [CausalSignal] | [CausalSignal, CausalSignal] | [CausalSignal, CausalSignal, CausalSignal];
-  /**
-   * Consent ladder level for this intervention
-   */
-  consent_level?: "observe" | "suggest" | "preview" | "reversible_act" | "autonomous_act";
-  /**
-   * Non-fatal validation or grounding warnings to surface in debug UI
-   */
-  plan_warnings?: string[];
-  /**
-   * Daemon-stamped plan metadata (e.g. {'source': 'fallback'}) and prompt-budget telemetry (e.g. {'context_truncated_sections': ['terminal_errors']}). Never trust this field for executor decisions — it is purely an observability hint.
-   */
-  metadata?: {
-    [k: string]: unknown;
-  };
-}
-/**
- * P0 §3.6: a single micro-step with toggleable completion status.
- *
- * Tracks the lifecycle of an intervention's individual next-actions so
- * the daemon can persist progress across reconnects and the surfaces
- * can render check/strike-through state idempotently.
- */
-export interface MicroStep {
-  /**
-   * Human-readable step text shown to the user
-   */
-  text: string;
-  /**
-   * Current completion status
-   */
-  status?: "pending" | "done" | "skipped";
-  /**
-   * When the user first acted on this step (toggled non-pending)
-   */
-  started_at?: string | null;
-  /**
-   * When the user marked this step done or skipped
-   */
-  completed_at?: string | null;
-}
-/**
- * UI manipulation instructions
- */
-export interface UIPlan {
-  /**
-   * Whether to dim background windows
-   */
-  dim_background?: boolean;
-  /**
-   * Whether to show intervention overlay
-   */
-  show_overlay?: boolean;
-  /**
-   * Whether to fold unrelated code in editor
-   */
-  fold_unrelated_code?: boolean;
-  /**
-   * Type of intervention
-   */
-  intervention_type?: "overlay_only" | "simplified_workspace" | "guided_mode";
-  /**
-   * Half-window of source lines to keep visible around cursor
-   */
-  max_visible_lines?: number;
-}
-/**
- * A proposed action; only the transaction manifest can make it executable.
- */
-export interface SuggestedAction {
-  /**
-   * Unique action identifier
-   */
-  action_id?: string;
-  /**
-   * Type of executable action
-   */
-  action_type:
-    | "close_tab"
-    | "group_tabs"
-    | "bookmark_and_close"
-    | "open_url"
-    | "search_error"
-    | "highlight_tab"
-    | "save_session"
-    | "copy_to_clipboard"
-    | "start_timer"
-    | "resume_last_active_file"
-    | "prompt_micro_commit"
-    | "suggest_movement_break"
-    | "take_biology_break";
-  /**
-   * Integer index referencing the tab list from context (primary ID for tab actions)
-   */
-  tab_index?: number | null;
-  /**
-   * Search query, URL for open_url, session name, etc.
-   */
-  target?: string;
-  /**
-   * Human-readable button label
-   */
-  label: string;
-  /**
-   * Why this action helps
-   */
-  reason?: string;
-  /**
-   * How strongly recommended
-   */
-  category?: "recommended" | "optional" | "informational";
-  /**
-   * Presentation hint normalised from the transactional capability catalog; never execution authority
-   */
-  reversible?: boolean;
-  /**
-   * Groups related actions together
-   */
-  group_id?: string | null;
-  /**
-   * Action-specific metadata (tab_title, search_query, etc.)
-   */
-  metadata?: {
-    [k: string]: unknown;
-  };
-  /**
-   * Optional curated intervention catalog identifier
-   */
-  catalog_id?: string | null;
-}
-/**
- * LLM analysis of the current error.
- */
-export interface ErrorAnalysis {
-  /**
-   * Classified error type (syntax, import, type, runtime, etc.)
-   */
-  error_type: string;
-  /**
-   * Identified root cause
-   */
-  root_cause: string;
-  /**
-   * Suggested code fix or approach
-   */
-  suggested_fix?: string;
-  /**
-   * Pre-crafted search query for this error
-   */
-  search_query?: string;
-  /**
-   * URL to relevant documentation, if identifiable
-   */
-  relevant_doc_url?: string;
-  /**
-   * The specific abstraction or function that is failing
-   */
-  failing_abstraction?: string;
-  /**
-   * File:line location of the failing symbol
-   */
-  symbol_location?: string;
-  /**
-   * Classified root cause category
-   */
-  root_cause_category?:
-    | "type_mismatch"
-    | "null_reference"
-    | "missing_import"
-    | "logic_error"
-    | "api_misuse"
-    | "concurrency"
-    | "config"
-    | "other";
-  /**
-   * Smallest code change that fixes the issue
-   */
-  minimal_edit?: string;
-}
-/**
- * Complete tab triage from LLM.
- */
-export interface TabRecommendations {
-  tabs?: TabRecommendation[];
-  /**
-   * Summary of tab triage reasoning
-   */
-  summary?: string;
-}
-/**
- * LLM recommendation for a single tab.
- */
-export interface TabRecommendation {
-  /**
-   * Integer index into the context tab list
-   */
-  tab_index: number;
-  /**
-   * Tab title for display
-   */
-  tab_title?: string;
-  /**
-   * Recommended action for this tab
-   */
-  action: "keep" | "close" | "group" | "bookmark_and_close";
-  /**
-   * Why this recommendation
-   */
-  reason?: string;
-  /**
-   * Relevance to current task
-   */
-  relevance_score?: number;
-  /**
-   * Group name if action is 'group'
-   */
-  group_name?: string | null;
-}
-/**
- * P0 §3.9: one ranked driver behind the current state transition.
- *
- * The daemon emits a list of these (top 2-3) alongside each
- * :class:`InterventionPlan` so the UI can render a structured "Why?"
- * drilldown — name, current value, baseline, percent change, and a
- * 60-sample 1-Hz sparkline buffer. Unlike the legacy free-text
- * ``causal_explanation`` string this payload is engine-computed, not
- * LLM-composed, and is therefore safe to compare against observable
- * values in the F09 verifier.
- *
- * Privacy: ``samples_60s`` is the most recent 60 seconds of 1-Hz
- * aggregates only; raw frame data never enters this buffer.
- */
-export interface CausalSignal {
-  /**
-   * Signal label (e.g. 'HRV', 'Tab switches')
-   */
-  name: string;
-  /**
-   * Latest 1-Hz aggregate observed by the daemon
-   */
-  current_value: number;
-  /**
-   * User's personal baseline for this signal (None if unknown)
-   */
-  baseline_value?: number | null;
-  /**
-   * Display unit (ms, bpm, /min, °, …)
-   */
-  unit: string;
-  /**
-   * Percent change vs baseline; sign carries direction
-   */
-  delta_pct?: number | null;
-  /**
-   * Last 60 1-Hz samples for sparkline rendering
-   *
-   * @maxItems 60
-   */
-  samples_60s?: number[];
-  /**
-   * Rank of this signal within the explanation (primary first)
-   */
-  severity?: "primary" | "secondary" | "tertiary";
 }
 export interface InterventionApplyResponse {
   schema_version?: "1.0" | "2.0";
@@ -2509,145 +2847,14 @@ export interface KinematicFeatures {
 export interface LLMPlanRequest {
   state_estimate: StateEstimate;
   task_context: TaskContext;
-}
-/**
- * Complete state estimation output from the state engine.
- *
- * Produced every 500ms from fused feature vectors.
- */
-export interface StateEstimate {
-  estimate_id?: string;
-  state: UserState;
+  constraints?: SimplificationConstraints | null;
+  template_name?: string | null;
+  extra_context?: string;
+  privacy_preview_id?: string | null;
   /**
-   * Canonical decision-support state
+   * One-time confirmation for an exact context preview; the literal phrase is 'SEND PREVIEWED CONTEXT ONCE'.
    */
-  support_state?: SupportState | null;
-  status?: EstimateStatus;
-  /**
-   * Deprecated compatibility name for bounded evidence strength; not a probability or diagnostic confidence.
-   */
-  confidence: number;
-  scores: StateScores;
-  support_scores?: SupportScores | null;
-  evidence_coverage?: number;
-  contributing_features?: FeatureContribution[];
-  exclusions?: string[];
-  model?: InferenceModelIdentity;
-  /**
-   * Only present for a registered model with a calibration artifact.
-   */
-  probabilities?: SupportScores | null;
-  /**
-   * Human-readable reasons for current state
-   */
-  reasons?: string[];
-  signal_quality: SignalQuality;
-  /**
-   * @deprecated
-   * Deprecated v1 state-pipeline monotonic seconds. Prefer the explicit observed_at_* fields.
-   */
-  timestamp: number;
-  schema_version?: "2.0";
-  observed_at_unix_ms?: number | null;
-  observed_at_mono_ns?: number | null;
-  boot_id?: string | null;
-  /**
-   * Seconds in current state
-   */
-  dwell_seconds?: number;
-  /**
-   * Compatibility field; unavailable pending reference validation
-   */
-  stress_integral?: number | null;
-  /**
-   * @deprecated
-   * Deprecated compatibility field; absent for deterministic rules.
-   */
-  calibrated_probabilities?: StateScores1 | null;
-  /**
-   * Classifier source used for this estimate
-   */
-  classifier_source?: ("rule" | "ml" | "ensemble") | null;
-  /**
-   * Ensemble weight on ML branch when used
-   */
-  classifier_alpha?: number | null;
-}
-/**
- * Deprecated uppercase projection of heuristic scores
- */
-export interface StateScores {
-  /**
-   * Legacy flow-like score
-   */
-  flow?: number;
-  /**
-   * Legacy under-engaged score
-   */
-  hypo?: number;
-  /**
-   * Legacy support-likely score
-   */
-  hyper?: number;
-  /**
-   * Legacy recovering score
-   */
-  recovery?: number;
-}
-/**
- * Bounded deterministic support scores; these are not probabilities.
- */
-export interface SupportScores {
-  support_likely?: number;
-  under_engaged?: number;
-  flow_like?: number;
-  recovering?: number;
-}
-/**
- * Signal quality per channel
- */
-export interface SignalQuality {
-  /**
-   * Physiological signal quality
-   */
-  physio?: number;
-  /**
-   * Kinematic signal quality
-   */
-  kinematics?: number;
-  /**
-   * Telemetry signal quality
-   */
-  telemetry?: number;
-  /**
-   * Compute overall signal quality as weighted average.
-   */
-  overall: number;
-  /**
-   * Check if signal quality is acceptable for intervention.
-   */
-  acceptable: boolean;
-}
-/**
- * Scores for each possible user state.
- */
-export interface StateScores1 {
-  /**
-   * Legacy flow-like score
-   */
-  flow?: number;
-  /**
-   * Legacy under-engaged score
-   */
-  hypo?: number;
-  /**
-   * Legacy support-likely score
-   */
-  hyper?: number;
-  /**
-   * Legacy recovering score
-   */
-  recovery?: number;
+  privacy_confirmation?: "SEND PREVIEWED CONTEXT ONCE" | null;
 }
 export interface LLMPlanResponse {
   schema_version?: "1.0" | "2.0";
@@ -3283,31 +3490,6 @@ export interface SignalQuality1 {
    * Check if signal quality is acceptable for intervention.
    */
   acceptable: boolean;
-}
-/**
- * Constraints for workspace simplification.
- */
-export interface SimplificationConstraints {
-  /**
-   * Maximum visible browser tabs
-   */
-  max_visible_tabs?: number;
-  /**
-   * Maximum visible code lines
-   */
-  max_visible_lines?: number;
-  /**
-   * Fold all code except current function
-   */
-  fold_all_except_current?: boolean;
-  /**
-   * Hide terminal output except errors
-   */
-  hide_terminal_history?: boolean;
-  /**
-   * Always keep active tab visible
-   */
-  preserve_active_tab?: boolean;
 }
 export interface StateInferRequest {
   feature_vector: FeatureVector;

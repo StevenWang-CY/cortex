@@ -12,6 +12,11 @@ Capture & Features:
 State & Context:
   POST /state/infer           — Compute state from fused features
   POST /context/build         — Build task context from adapters
+  GET  /privacy/context/status — Inspect local/external planner posture
+  POST /privacy/context/preview — Prepare an exact one-time outbound preview
+  POST /privacy/context/preview/current — Preview the current daemon snapshot
+  POST /privacy/context/confirm — Send one exact prepared payload once
+  DELETE /privacy/context/preview/{id} — Burn a preview without sending
 
 LLM & Intervention:
   POST /llm/plan              — Request intervention plan
@@ -90,6 +95,15 @@ from cortex.libs.schemas.policy import (
     PolicyDiagnosticsResponse,
     policy_payload_sha256,
 )
+from cortex.libs.schemas.privacy import (
+    ContextPreviewCancellationResponse,
+    ContextPreviewConfirmationRequest,
+    ContextPreviewConfirmationResponse,
+    ContextPreviewRequest,
+    ContextPreviewResponse,
+    ContextPrivacyStatusResponse,
+    CurrentContextPreviewRequest,
+)
 from cortex.libs.schemas.realtime import CostResponse
 from cortex.libs.schemas.session_history import (
     SessionDetailResponse,
@@ -126,6 +140,11 @@ from cortex.services.intervention_engine import (
 )
 from cortex.services.intervention_engine import (
     prepare_plan as _engine_prepare_plan,
+)
+from cortex.services.llm_engine.context_broker import (
+    ExternalContextDisabledError,
+    PreviewAuthorizationError,
+    provider_retention_disclosure,
 )
 from cortex.storage.maintenance import ActiveInterventionDataError
 
@@ -889,6 +908,194 @@ async def build_context(
 # =============================================================================
 
 
+def _privacy_planner(registry: Any) -> Any | None:
+    """Resolve the one planner that owns the external context boundary."""
+
+    for key in ("llm_engine", "llm_client"):
+        candidate = registry.get(key) if hasattr(registry, "get") else None
+        if candidate is not None and hasattr(candidate, "generate_intervention_plan"):
+            return candidate
+    return None
+
+
+@router.get(
+    "/privacy/context/status",
+    response_model=ContextPrivacyStatusResponse,
+)
+async def context_privacy_status(request: Request) -> ContextPrivacyStatusResponse:
+    """Return the effective fail-closed planner and retention posture."""
+
+    reg = _get_registry(request)
+    planner = _privacy_planner(reg)
+    if planner is not None and hasattr(planner, "privacy_status"):
+        result = planner.privacy_status()
+        if isinstance(result, ContextPrivacyStatusResponse):
+            return result
+
+    daemon = reg.get("daemon") if hasattr(reg, "get") else None
+    config = getattr(daemon, "config", None)
+    llm_config = getattr(config, "llm", None)
+    if llm_config is None:
+        raise HTTPException(status_code=503, detail="privacy configuration unavailable")
+    return ContextPrivacyStatusResponse.from_clock(
+        _get_clock(request),
+        planner_mode=llm_config.privacy.planner_mode,
+        network_allowed_by_configuration=False,
+        pending_previews=0,
+        provider=llm_config.provider,
+        retention=provider_retention_disclosure(llm_config),
+    )
+
+
+@router.post(
+    "/privacy/context/preview",
+    response_model=ContextPreviewResponse,
+)
+async def preview_external_context(
+    body: ContextPreviewRequest,
+    request: Request,
+) -> ContextPreviewResponse:
+    """Prepare a bounded payload without making an external request."""
+
+    planner = _privacy_planner(_get_registry(request))
+    if planner is None or not hasattr(planner, "preview_external_request"):
+        raise HTTPException(
+            status_code=409,
+            detail="external planning is not enabled",
+        )
+    try:
+        result = await planner.preview_external_request(body)
+    except ExternalContextDisabledError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not isinstance(result, ContextPreviewResponse):
+        raise HTTPException(status_code=503, detail="invalid context preview result")
+    return result
+
+
+@router.post(
+    "/privacy/context/preview/current",
+    response_model=ContextPreviewResponse,
+)
+async def preview_current_external_context(
+    body: CurrentContextPreviewRequest,
+    request: Request,
+) -> ContextPreviewResponse:
+    """Preview the daemon's current snapshots without returning raw inputs.
+
+    Desktop clients submit only their source selections.  Raw editor,
+    terminal, browser, and inferred-state objects stay inside the daemon and
+    enter the broker exactly once.
+    """
+
+    reg = _get_registry(request)
+    planner = _privacy_planner(reg)
+    if planner is None or not hasattr(planner, "preview_external_request"):
+        raise HTTPException(status_code=409, detail="external planning is not enabled")
+    context = reg.get("latest_task_context") if hasattr(reg, "get") else None
+    state = reg.get("latest_state_estimate") if hasattr(reg, "get") else None
+    if not isinstance(context, TaskContext) or not isinstance(state, StateEstimate):
+        raise HTTPException(
+            status_code=409,
+            detail="a current workspace and support snapshot is not available yet",
+        )
+    preview_request = ContextPreviewRequest(
+        task_context=context.model_copy(deep=True),
+        state_estimate=state.model_copy(deep=True),
+        selection=body.selection,
+        constraints=body.constraints,
+        template_name=body.template_name,
+        extra_context=body.extra_context,
+    )
+    try:
+        result = await planner.preview_external_request(preview_request)
+    except ExternalContextDisabledError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not isinstance(result, ContextPreviewResponse):
+        raise HTTPException(status_code=503, detail="invalid context preview result")
+    return result
+
+
+@router.post(
+    "/privacy/context/confirm",
+    response_model=ContextPreviewConfirmationResponse,
+)
+async def confirm_external_context(
+    body: ContextPreviewConfirmationRequest,
+    request: Request,
+) -> ContextPreviewConfirmationResponse:
+    """Consume and send one exact prepared payload, then validate the plan."""
+
+    planner = _privacy_planner(_get_registry(request))
+    if planner is None or not hasattr(planner, "confirm_external_request"):
+        raise HTTPException(status_code=409, detail="external planning is not enabled")
+    try:
+        plan = await planner.confirm_external_request(
+            body.preview_id,
+            body.confirmation_phrase,
+        )
+    except ExternalContextDisabledError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PreviewAuthorizationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="external planner timed out") from exc
+    except Exception as exc:
+        logger.exception("confirmed external planner request failed")
+        raise HTTPException(status_code=503, detail="external planner request failed") from exc
+    if not isinstance(plan, InterventionPlan):
+        raise HTTPException(status_code=503, detail="invalid planner response")
+    return ContextPreviewConfirmationResponse.from_clock(
+        _get_clock(request),
+        preview_id=body.preview_id,
+        plan=plan,
+        fallback_used=_plan_served_fallback(plan),
+    )
+
+
+@router.delete(
+    "/privacy/context/preview/{preview_id}",
+    response_model=ContextPreviewCancellationResponse,
+)
+async def cancel_external_context_preview(
+    preview_id: str,
+    request: Request,
+) -> ContextPreviewCancellationResponse:
+    """Burn one prepared payload without sending it to the provider."""
+
+    if not 20 <= len(preview_id) <= 160 or not preview_id.startswith("ctx_"):
+        raise HTTPException(status_code=422, detail="invalid context preview handle")
+    planner = _privacy_planner(_get_registry(request))
+    if planner is None or not hasattr(planner, "cancel_preview"):
+        raise HTTPException(status_code=409, detail="external planning is not enabled")
+    cancelled = bool(await planner.cancel_preview(preview_id))
+    return ContextPreviewCancellationResponse.from_clock(
+        _get_clock(request),
+        preview_id=preview_id,
+        cancelled=cancelled,
+    )
+
+
+def _planner_request_kwargs(body: LLMPlanRequest) -> dict[str, Any]:
+    """Preserve old two-argument test/client adapters unless extras are used."""
+
+    kwargs: dict[str, Any] = {}
+    if body.constraints is not None:
+        kwargs["constraints"] = body.constraints
+    if body.template_name is not None:
+        kwargs["template_name"] = body.template_name
+    if body.extra_context:
+        kwargs["extra_context"] = body.extra_context
+    if body.privacy_preview_id is not None:
+        kwargs["privacy_preview_id"] = body.privacy_preview_id
+    if body.privacy_confirmation is not None:
+        kwargs["privacy_confirmation"] = body.privacy_confirmation
+    return kwargs
+
+
 def _plan_served_fallback(plan: Any) -> bool:
     """P1 fix: derive whether a returned plan is a rule-based fallback.
 
@@ -951,6 +1158,7 @@ async def request_llm_plan(
                 plan = await llm_engine.generate_intervention_plan(
                     body.task_context,
                     body.state_estimate,
+                    **_planner_request_kwargs(body),
                 )
                 # B11 (Phase 4.1): inspect the discriminated failure_mode
                 # and log a structured entry tagged with the result. The
@@ -997,6 +1205,7 @@ async def request_llm_plan(
             plan = await llm_client.generate_intervention_plan(
                 body.task_context,
                 body.state_estimate,
+                **_planner_request_kwargs(body),
             )
             return LLMPlanResponse.from_clock(
                 _get_clock(request),

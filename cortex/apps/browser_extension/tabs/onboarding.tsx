@@ -27,7 +27,7 @@ const STEPS = [
         title: "Permissions explained",
         body: "Cortex needs a few browser permissions to help you focus:",
         items: [
-            ["Tabs & Tab Groups", "Read tab titles and URLs to understand your workspace context. Group and collapse distracting tabs during interventions."],
+            ["Tabs & Tab Groups", "Read tab titles and origins to understand your workspace. Group or collapse tabs only after you approve the exact proposal."],
             ["Storage", "Persist your focus sessions, daily stats, and preferences locally on your machine."],
             ["Webcam (optional)", "Estimate blink timing and a camera-relative head/neck position proxy. Cortex does not measure shoulders or diagnose posture; video is processed locally and is not stored."],
         ],
@@ -37,11 +37,11 @@ const STEPS = [
         title: "Calibrate your baseline",
         body: "Cortex learns your personal focus patterns over the first few sessions. For the best experience:",
         items: [
-            ["Start a focus session", "Click the Cortex icon in your toolbar, enter what you are working on, and press Start Session."],
+            ["Start a focus session", "Click the Cortex icon, enter what you are working on, and press Return."],
             ["Work normally", "Cortex builds local behavior baselines. Optional camera signals remain experimental and do not trigger support actions."],
             ["Review proposals", "When sustained behavior suggests support may help, Cortex can offer workspace proposals. Break reminders are opt-in and time-based."],
         ],
-        hint: "After 2-3 sessions, Cortex adapts to your rhythm.",
+        hint: "Your local baseline improves as valid sessions accumulate. Cortex stays quiet when evidence is insufficient.",
     },
 ];
 
@@ -115,18 +115,42 @@ function Onboarding(): React.ReactElement {
                 html, body, #__plasmo {
                     margin: 0;
                     padding: 0;
-                    background: #0C0C0E;
+                    background: ${CX.bg};
                     min-height: 100%;
                 }
                 * { box-sizing: border-box; }
                 ${CX_KEYFRAMES}
+                .cortex-onboarding-card { padding: 48px; }
+                button:not(:disabled) {
+                    transition: transform ${CX.durationMicro} ${CX.easeOut},
+                        background-color ${CX.durationFast} ${CX.easeOut},
+                        border-color ${CX.durationFast} ${CX.easeOut},
+                        color ${CX.durationFast} ${CX.easeOut},
+                        opacity ${CX.durationFast} ${CX.easeOut};
+                }
+                button:active:not(:disabled) { transform: scale(.97); }
+                @media (max-width: 560px) {
+                    .cortex-onboarding-card { padding: 28px 24px; border-radius: 16px !important; }
+                }
+                @media (prefers-reduced-motion: reduce) {
+                    button:not(:disabled) { transition-property: background-color, border-color, color, opacity; }
+                    button:active:not(:disabled) { transform: none; }
+                }
             `}</style>
-            <div style={S.container}>
+            <main className="cortex-onboarding-card" style={S.container}>
                 {/* Progress */}
-                <div style={S.progressRow}>
+                <div
+                    style={S.progressRow}
+                    role="progressbar"
+                    aria-label="Onboarding progress"
+                    aria-valuemin={1}
+                    aria-valuemax={STEPS.length}
+                    aria-valuenow={step + 1}
+                >
                     {STEPS.map((_, i) => (
                         <div
                             key={i}
+                            aria-hidden="true"
                             style={{
                                 ...S.progressDot,
                                 background: i <= step ? CX.accent : CX.border,
@@ -146,17 +170,17 @@ function Onboarding(): React.ReactElement {
 
                 {/* Item list */}
                 {current.items && (
-                    <div style={S.itemList}>
+                    <ol style={S.itemList}>
                         {current.items.map(([label, desc], i) => (
-                            <div key={i} style={S.item}>
+                            <li key={i} style={S.item}>
                                 <div style={S.itemNum}>{i + 1}</div>
                                 <div>
                                     <div style={S.itemLabel}>{label}</div>
                                     <div style={S.itemDesc}>{desc}</div>
                                 </div>
-                            </div>
+                            </li>
                         ))}
-                    </div>
+                    </ol>
                 )}
 
                 {/* Phase 4d Task F: daemon connectivity status — only on
@@ -166,6 +190,8 @@ function Onboarding(): React.ReactElement {
                 {isDaemonStep && (
                     <div
                         data-testid="daemon-health-status"
+                        role="status"
+                        aria-live="polite"
                         style={{
                             ...S.hint,
                             marginBottom: 16,
@@ -177,13 +203,7 @@ function Onboarding(): React.ReactElement {
                         }}
                     >
                         <span
-                            aria-label={
-                                daemonConnected === true
-                                    ? "Daemon connected"
-                                    : daemonConnected === false
-                                        ? "Daemon not detected"
-                                        : "Checking daemon"
-                            }
+                            aria-hidden="true"
                             style={{
                                 display: "inline-block",
                                 width: 8,
@@ -218,7 +238,7 @@ function Onboarding(): React.ReactElement {
                                 style={{
                                     background: "transparent",
                                     border: "none",
-                                    color: CX.accent,
+                                    color: CX.accentText,
                                     fontSize: 12,
                                     cursor: "pointer",
                                     textDecoration: "underline",
@@ -241,7 +261,7 @@ function Onboarding(): React.ReactElement {
                         style={{
                             ...S.hint,
                             marginBottom: 16,
-                            color: "#E47A6E",
+                            color: CX.danger,
                             fontStyle: "normal",
                         }}
                     >
@@ -287,7 +307,7 @@ function Onboarding(): React.ReactElement {
                         {isLast ? "Get started" : "Next"}
                     </button>
                 </div>
-            </div>
+            </main>
         </div>
     );
 }
@@ -298,8 +318,9 @@ const S: Record<string, React.CSSProperties> = {
     page: {
         minHeight: "100vh",
         display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
+        alignItems: "stretch",
+        justifyContent: "flex-start",
+        overflowY: "auto",
         background: CX.bg,
         fontFamily: CX.font,
         color: CX.text,
@@ -311,7 +332,7 @@ const S: Record<string, React.CSSProperties> = {
         background: CX.surface,
         borderRadius: 24,
         border: `1px solid ${CX.border}`,
-        padding: 48,
+        margin: "auto",
     },
     progressRow: {
         display: "flex",
@@ -322,7 +343,7 @@ const S: Record<string, React.CSSProperties> = {
         flex: 1,
         height: 3,
         borderRadius: 2,
-        transition: "background 0.3s ease",
+        transition: `background-color ${CX.durationNormal} ${CX.easeOut}`,
     },
     stepLabel: {
         fontSize: 11,
@@ -353,7 +374,7 @@ const S: Record<string, React.CSSProperties> = {
         padding: "14px 18px",
         fontFamily: CX.mono,
         fontSize: 14,
-        color: CX.accent,
+        color: CX.accentText,
         marginBottom: 16,
         overflow: "auto" as const,
     },
@@ -361,7 +382,9 @@ const S: Record<string, React.CSSProperties> = {
         display: "flex",
         flexDirection: "column" as const,
         gap: 16,
-        marginBottom: 20,
+        margin: "0 0 20px",
+        padding: 0,
+        listStyle: "none",
     },
     item: {
         display: "flex",
@@ -373,7 +396,7 @@ const S: Record<string, React.CSSProperties> = {
         height: 24,
         borderRadius: "50%",
         background: CX.accentDim,
-        color: CX.accent,
+        color: CX.accentText,
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -422,7 +445,7 @@ const S: Record<string, React.CSSProperties> = {
         border: "none",
         borderRadius: CX.radiusLg,
         background: CX.accent,
-        color: CX.textInverse,
+        color: CX.light.label_primary,
         fontSize: 13,
         fontWeight: 500,
         cursor: "pointer",

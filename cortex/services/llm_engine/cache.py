@@ -8,12 +8,14 @@ calls when the workspace context hasn't meaningfully changed.
 from __future__ import annotations
 
 import hashlib
+import json
 from collections import OrderedDict
 from dataclasses import dataclass
 
 from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 from cortex.libs.schemas.context import TaskContext
 from cortex.libs.schemas.intervention import InterventionPlan, SimplificationConstraints
+from cortex.libs.schemas.privacy import ContextFieldDisclosure
 from cortex.libs.schemas.state import StateEstimate
 
 
@@ -59,6 +61,9 @@ class LLMCache:
         state: StateEstimate | None = None,
         constraints: SimplificationConstraints | None = None,
         *,
+        template_name: str | None = None,
+        extra_context: str = "",
+        disclosure_manifest: tuple[ContextFieldDisclosure, ...] | None = None,
         now: float | None = None,
     ) -> InterventionPlan | None:
         """
@@ -66,7 +71,14 @@ class LLMCache:
 
         Returns None on cache miss or expiration.
         """
-        key = self._context_key(context, state, constraints)
+        key = self._context_key(
+            context,
+            state,
+            constraints,
+            template_name=template_name,
+            extra_context=extra_context,
+            disclosure_manifest=disclosure_manifest,
+        )
         entry = self._cache.get(key)
 
         if entry is None:
@@ -92,6 +104,9 @@ class LLMCache:
         state: StateEstimate | None = None,
         constraints: SimplificationConstraints | None = None,
         *,
+        template_name: str | None = None,
+        extra_context: str = "",
+        disclosure_manifest: tuple[ContextFieldDisclosure, ...] | None = None,
         ttl: float | None = None,
         now: float | None = None,
     ) -> None:
@@ -100,7 +115,14 @@ class LLMCache:
 
         If the cache is full, the least recently used entry is evicted.
         """
-        key = self._context_key(context, state, constraints)
+        key = self._context_key(
+            context,
+            state,
+            constraints,
+            template_name=template_name,
+            extra_context=extra_context,
+            disclosure_manifest=disclosure_manifest,
+        )
         if now is None:
             now = monotonic_seconds(self._clock)
         if ttl is None:
@@ -121,9 +143,20 @@ class LLMCache:
         context: TaskContext,
         state: StateEstimate | None = None,
         constraints: SimplificationConstraints | None = None,
+        *,
+        template_name: str | None = None,
+        extra_context: str = "",
+        disclosure_manifest: tuple[ContextFieldDisclosure, ...] | None = None,
     ) -> bool:
         """Remove a specific entry. Returns True if it existed."""
-        key = self._context_key(context, state, constraints)
+        key = self._context_key(
+            context,
+            state,
+            constraints,
+            template_name=template_name,
+            extra_context=extra_context,
+            disclosure_manifest=disclosure_manifest,
+        )
         if key in self._cache:
             del self._cache[key]
             return True
@@ -161,9 +194,7 @@ class LLMCache:
         """Remove all expired entries. Returns number removed."""
         if now is None:
             now = monotonic_seconds(self._clock)
-        expired_keys = [
-            k for k, v in self._cache.items() if v.is_expired(now)
-        ]
+        expired_keys = [k for k, v in self._cache.items() if v.is_expired(now)]
         for k in expired_keys:
             del self._cache[k]
         return len(expired_keys)
@@ -173,6 +204,10 @@ class LLMCache:
         context: TaskContext,
         state: StateEstimate | None = None,
         constraints: SimplificationConstraints | None = None,
+        *,
+        template_name: str | None = None,
+        extra_context: str = "",
+        disclosure_manifest: tuple[ContextFieldDisclosure, ...] | None = None,
     ) -> str:
         """
         Generate a hash key from the prompt inputs.
@@ -205,15 +240,27 @@ class LLMCache:
             "context": context.model_dump(exclude_none=True),
             "state": state_key,
             "constraints": (
-                constraints.model_dump(exclude_none=True)
-                if constraints is not None
-                else None
+                constraints.model_dump(exclude_none=True) if constraints is not None else None
             ),
+            "template_name": template_name,
+            # Only the digest enters the cache identity; no extra context or
+            # disclosure preview is retained in a cache key or diagnostic.
+            "extra_context_sha256": hashlib.sha256(extra_context.encode("utf-8")).hexdigest(),
+            "disclosure_sha256": hashlib.sha256(
+                json.dumps(
+                    [
+                        item.model_dump(mode="json", exclude={"value_preview"})
+                        for item in (disclosure_manifest or ())
+                    ],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
             # F28: bind the cache key to the active template-version
             # fingerprint. Cache hits across template edits are not
             # safe — the user would see stale plans generated by the
             # previous prompt for up to the 300-second TTL.
             "prompt_version": PROMPT_TEMPLATE_VERSION,
         }
-        raw = str(payload)
+        raw = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
         return hashlib.sha256(raw.encode()).hexdigest()[:16]

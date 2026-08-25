@@ -6,6 +6,17 @@ llm:
   # AsyncAnthropic (direct) and AsyncAnthropicVertex are escape hatches
   # selected by ANTHROPIC_PROVIDER / config.llm.provider.
   provider: bedrock
+  # Safe by default: local deterministic planning, with no model network call.
+  # External planning additionally requires the current disclosure revision
+  # and a one-time, user-confirmed payload preview for every request.
+  privacy:
+    planner_mode: no_llm
+    external_context_enabled: false
+    consent_revision: ""
+    required_consent_revision: context-disclosure-v1
+    preview_ttl_seconds: 60
+    max_pending_previews: 16
+    provider_retention_mode: unverified
   bedrock:
     aws_region: us-east-2
     keychain_service: cortex.bedrock
@@ -17,7 +28,7 @@ llm:
   max_tokens: 1024
   temperature: 0.3
   timeout_seconds: 30.0
-  cache_ttl_seconds: 300
+  cache_ttl_seconds: 60
   fallback_mode: rule_based
   max_concurrent_requests: 3
   circuit_failure_threshold: 5

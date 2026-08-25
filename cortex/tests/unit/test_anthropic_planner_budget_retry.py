@@ -68,7 +68,12 @@ def _planner(tracker: CostTracker, sdk: MagicMock) -> AnthropicPlanner:
         timeout_seconds=2.0,
         max_concurrent_requests=2,
     )
-    return AnthropicPlanner(cfg, sdk=sdk, cost_tracker=tracker)
+    return AnthropicPlanner(
+        cfg,
+        sdk=sdk,
+        cost_tracker=tracker,
+        _allow_unbrokered_test_requests=True,
+    )
 
 
 def _rate_limit_error() -> RateLimitError:
@@ -276,7 +281,12 @@ async def test_planner_without_cost_tracker_skips_recheck(
         timeout_seconds=2.0,
         max_concurrent_requests=2,
     )
-    planner = AnthropicPlanner(cfg, sdk=sdk, cost_tracker=None)
+    planner = AnthropicPlanner(
+        cfg,
+        sdk=sdk,
+        cost_tracker=None,
+        _allow_unbrokered_test_requests=True,
+    )
 
     import cortex.services.llm_engine.anthropic_planner as _p
 

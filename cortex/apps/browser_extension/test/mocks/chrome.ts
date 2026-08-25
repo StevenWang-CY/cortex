@@ -115,6 +115,13 @@ export interface ChromeFake {
     scripting: {
         executeScript: ReturnType<typeof vi.fn>;
     };
+    permissions: {
+        contains: ReturnType<typeof vi.fn>;
+        request: ReturnType<typeof vi.fn>;
+        remove: ReturnType<typeof vi.fn>;
+        onAdded: ReturnType<typeof makeEvent>;
+        onRemoved: ReturnType<typeof makeEvent>;
+    };
     alarms: {
         create: ReturnType<typeof vi.fn>;
         clear: ReturnType<typeof vi.fn>;
@@ -199,6 +206,13 @@ export function buildChromeFake(): ChromeFake {
         scripting: {
             executeScript: vi.fn(() => Promise.resolve([])),
         },
+        permissions: {
+            contains: vi.fn(() => Promise.resolve(false)),
+            request: vi.fn(() => Promise.resolve(false)),
+            remove: vi.fn(() => Promise.resolve(false)),
+            onAdded: makeEvent(),
+            onRemoved: makeEvent(),
+        },
         alarms: {
             create: vi.fn(),
             clear: vi.fn(),
@@ -271,6 +285,11 @@ export function resetChromeFake(fake: ChromeFake): void {
     fake.tabs.onUpdated.__clear();
     fake.tabs.onActivated.__clear();
     fake.scripting.executeScript.mockClear();
+    fake.permissions.contains.mockClear();
+    fake.permissions.request.mockClear();
+    fake.permissions.remove.mockClear();
+    fake.permissions.onAdded.__clear();
+    fake.permissions.onRemoved.__clear();
     fake.alarms.create.mockClear();
     fake.alarms.clear.mockClear();
     fake.alarms.onAlarm.__clear();

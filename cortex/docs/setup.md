@@ -112,6 +112,23 @@ Cortex sends only the workspace text categories the user has enabled, the
 current support status/evidence strength, and allowed proposal constraints to
 the configured LLM transport. Raw camera frames and biometrics stay local.
 
+Merely configuring credentials does not enable model networking. The safe
+default is `no_llm`. To make the external option available, acknowledge the
+current disclosure revision:
+
+```bash
+CORTEX_LLM__PRIVACY__PLANNER_MODE=external_redacted
+CORTEX_LLM__PRIVACY__EXTERNAL_CONTEXT_ENABLED=true
+CORTEX_LLM__PRIVACY__CONSENT_REVISION=context-disclosure-v1
+CORTEX_LLM__PRIVACY__PROVIDER_RETENTION_MODE=unverified
+```
+
+Each request still requires per-source selection, review of the exact redacted
+payload/provider caveat, and one-time confirmation in the desktop privacy
+sheet. A preview expires within 60 seconds and can be cancelled. Read
+[`privacy.md`](privacy.md) before enabling this mode. `provider_retention_mode`
+is a local declaration, not verification of the provider account or contract.
+
 #### Camera Configuration
 
 Leave `CORTEX_CAPTURE__DEVICE_ID` commented out (the default) for automatic camera selection. Cortex will:

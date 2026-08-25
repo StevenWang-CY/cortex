@@ -212,7 +212,7 @@ export function computeTypeClassification(
  */
 export async function collectAllTabs(): Promise<TabData[]> {
     const chromeTabs = await chrome.tabs.query({});
-    return chromeTabs.map((tab) => ({
+    return chromeTabs.filter((tab) => !tab.incognito).map((tab) => ({
         tabId: tab.id ?? -1,
         title: tab.title ?? "",
         url: tab.url ?? "",
@@ -227,7 +227,7 @@ export async function collectAllTabs(): Promise<TabData[]> {
  */
 export async function collectCurrentWindowTabs(): Promise<TabData[]> {
     const chromeTabs = await chrome.tabs.query({ currentWindow: true });
-    return chromeTabs.map((tab) => ({
+    return chromeTabs.filter((tab) => !tab.incognito).map((tab) => ({
         tabId: tab.id ?? -1,
         title: tab.title ?? "",
         url: tab.url ?? "",

@@ -8,6 +8,7 @@ from cortex.libs.config.settings import (
     InterventionConfig,
     LandmarksConfig,
     LLMConfig,
+    LLMPrivacyConfig,
     LoggingConfig,
     RedisConfig,
     SignalConfig,
@@ -21,6 +22,7 @@ from cortex.libs.config.settings import (
 __all__ = [
     "CortexConfig",
     "LLMConfig",
+    "LLMPrivacyConfig",
     "CaptureConfig",
     "StateConfig",
     "InterventionConfig",

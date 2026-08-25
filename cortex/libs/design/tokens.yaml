@@ -28,6 +28,12 @@ brand:
     # Darker variant for active/pressed states (button press feedback).
     oklch: "oklch(50% 0.13 30)"
     hex:   "#B45638"
+  accent_text:
+    # Foreground-only terracotta for small text on light/grouped surfaces.
+    # The brighter brand accent remains the identity/fill color; this variant
+    # clears WCAG AA against #FFFFFF, #F2F2F7, and #ECECEC.
+    oklch: "oklch(48% 0.13 32)"
+    hex:   "#A4472E"
   accent_dark:
     # Boosted for legibility on dark window backgrounds (the macOS approach —
     # System Accent under dark appearance uses a slightly higher L).
@@ -68,7 +74,10 @@ semantic:
     sidebar_bg:       { hex: "#232326" }
     label_primary:    { hex: "#FFFFFF" }
     label_secondary:  { hex: "#EBEBF599" } # 60% alpha white
-    label_tertiary:   { hex: "#EBEBF54D" }
+    # 55% alpha is the minimum tier used for readable small copy on the
+    # #1E1E1E window surface (5.18:1 after compositing). Lower-alpha semantic
+    # label roles remain available for decoration, never essential text.
+    label_tertiary:   { hex: "#EBEBF58C" }
     label_quaternary: { hex: "#EBEBF528" }
     separator:        { hex: "#5454584C" }
     danger:           { hex: "#FF453A" }
@@ -144,13 +153,13 @@ radius:
   pill: 9999
 
 motion:
-  # ms. swiftui-pro / Reduce-Motion guidance: nothing over 400ms unless explicit
-  # opt-in; the browser-ext ambient breathing canvas already gates on
-  # prefers-reduced-motion.
-  micro: 100
-  fast: 150
+  # Milliseconds. Interaction motion is crisp and finishes inside 300 ms;
+  # continuous ambient motion is explicitly gated by Reduce Motion and
+  # document visibility at its call site.
+  micro: 120
+  fast: 160
   normal: 200
-  slow: 400
+  slow: 280
   ambient: 3000
 
 dimensions:

@@ -16,6 +16,21 @@ describe("tab manager transaction safety", () => {
         expect(globalThis.__cortexChrome.tabGroups.update).not.toHaveBeenCalled();
     });
 
+    it("excludes incognito tabs from collection and mutations", async () => {
+        globalThis.__cortexChrome.tabs.query.mockResolvedValue([
+            { id: 1, active: true, url: "https://docs.example", windowId: 1 },
+            { id: 2, active: false, url: "https://news.example", windowId: 1 },
+            { id: 3, active: false, incognito: true, url: "https://private.example", windowId: 2 },
+        ] as chrome.tabs.Tab[]);
+        const tabManager = await import("../tab-manager");
+        const collected = await tabManager.collectAllTabs();
+        expect(collected.map((tab) => tab.tabId)).toEqual([1, 2]);
+
+        await tabManager.hideNonActiveTabs("regular-only");
+        expect(globalThis.__cortexChrome.tabs.group)
+            .toHaveBeenCalledWith({ tabIds: [2] });
+    });
+
     it("retains the exact group identity when presentation setup is incomplete", async () => {
         globalThis.__cortexChrome.tabs.group.mockResolvedValue(41);
         globalThis.__cortexChrome.tabGroups.update.mockRejectedValue(

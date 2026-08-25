@@ -7791,6 +7791,32 @@ class CortexDaemon:
             self.config.intervention.enable_os_notifications = bool(
                 settings["enable_os_notifications"]
             )
+        # External model transport is a separate, revision-bound privacy
+        # choice from provider selection.  Every update rebuilds the planner
+        # once and burns pending previews from the prior configuration.
+        privacy_changed = False
+        requested_planner_mode = settings.get("llm_planner_mode")
+        if requested_planner_mode is not None:
+            mode = str(requested_planner_mode)
+            if mode in {"no_llm", "no_content", "external_redacted"}:
+                self.config.llm.privacy.planner_mode = mode  # type: ignore[assignment]
+                privacy_changed = True
+
+        if "external_context_enabled" in settings or "llm_context_consent_revision" in settings:
+            requested_enabled = bool(settings.get("external_context_enabled", False))
+            requested_revision = str(settings.get("llm_context_consent_revision") or "")
+            required_revision = self.config.llm.privacy.required_consent_revision
+            acknowledged = requested_enabled and requested_revision == required_revision
+            self.config.llm.privacy.external_context_enabled = acknowledged
+            self.config.llm.privacy.consent_revision = (
+                required_revision if acknowledged else ""
+            )
+            privacy_changed = True
+
+        if self.config.llm.privacy.planner_mode != "external_redacted":
+            self.config.llm.privacy.external_context_enabled = False
+            self.config.llm.privacy.consent_revision = ""
+
         # B.4 fix: accept both "llm_provider" (canonical, new clients) and
         # "llm_mode" (legacy from the SettingsDialog) so the dropdown in
         # the desktop settings actually rebuilds the client.
@@ -7799,12 +7825,23 @@ class CortexDaemon:
             provider_value = str(settings["llm_provider"])
         elif "llm_mode" in settings:
             provider_value = str(settings["llm_mode"])
+        provider_changed = False
         if provider_value is not None:
             if provider_value in {"bedrock", "vertex", "direct"}:
+                provider_changed = self.config.llm.provider != provider_value
                 self.config.llm.provider = provider_value  # type: ignore[assignment]
             elif provider_value == "rule_based":
                 self.config.llm.fallback_mode = "rule_based"
-            self._llm_client = create_llm_client(self.config.llm)
+                self.config.llm.privacy.planner_mode = "no_llm"
+                self.config.llm.privacy.external_context_enabled = False
+                self.config.llm.privacy.consent_revision = ""
+                privacy_changed = True
+        if privacy_changed or provider_changed:
+            old_client = self._llm_client
+            clear_previews = getattr(old_client, "clear_previews", None)
+            if callable(clear_previews):
+                clear_previews()
+            self._llm_client = create_llm_client(self.config.llm, clock=self._clock)
             registry.register("llm_client", self._llm_client)
         # Re-broadcast settings with the values the daemon actually applied,
         # plus any keys clients need to mirror (W-16 cooldown sync).

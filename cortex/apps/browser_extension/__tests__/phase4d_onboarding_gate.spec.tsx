@@ -140,4 +140,41 @@ describe("Phase 4d Task F — onboarding daemon health gate", () => {
         expect((nextBtn as HTMLButtonElement).disabled).toBe(false);
         within(container).getByTestId("onboarding-offline-toast");
     });
+
+    it("exposes progress semantics and truthful permission copy", async () => {
+        const fake = globalThis.__cortexChrome;
+        fake.runtime.sendMessage.mockImplementation(
+            (msg: { type: string }, cb?: (r: unknown) => void) => {
+                if (msg.type === "GET_STATE" && cb) cb({ connected: true });
+                return Promise.resolve(undefined);
+            },
+        );
+
+        const { container } = await mount();
+        await waitFor(() => {
+            expect(
+                (within(container).getByTestId("onboarding-next-btn") as HTMLButtonElement)
+                    .disabled,
+            ).toBe(false);
+        });
+
+        const progress = within(container).getByRole("progressbar");
+        expect(progress.getAttribute("aria-valuenow")).toBe("1");
+        expect(progress.getAttribute("aria-valuemax")).toBe("3");
+
+        await act(async () => {
+            fireEvent.click(within(container).getByTestId("onboarding-next-btn"));
+        });
+        expect(progress.getAttribute("aria-valuenow")).toBe("2");
+        expect(within(container).getByRole("list").tagName).toBe("OL");
+        expect(container.textContent).toContain("titles and origins");
+        expect(container.textContent).toContain("approve the exact proposal");
+
+        await act(async () => {
+            fireEvent.click(within(container).getByTestId("onboarding-next-btn"));
+        });
+        expect(progress.getAttribute("aria-valuenow")).toBe("3");
+        expect(container.textContent).toContain("press Return");
+        expect(container.textContent).not.toContain("2-3 sessions");
+    });
 });

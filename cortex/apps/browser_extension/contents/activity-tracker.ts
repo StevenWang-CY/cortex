@@ -19,9 +19,29 @@
  */
 
 import type { PlasmoCSConfig } from "plasmo";
+import type {
+    ActivityPosition,
+    ActivityRecord,
+} from "../lib/activity-privacy";
 
 export const config: PlasmoCSConfig = {
-    matches: ["<all_urls>"],
+    matches: [
+        "https://*.youtube.com/*",
+        "https://youtu.be/*",
+        "https://*.bilibili.com/*",
+        "https://*.coursera.org/*",
+        "https://*.edx.org/*",
+        "https://*.khanacademy.org/*",
+        "https://*.udemy.com/*",
+        "https://*.udacity.com/*",
+        "https://*.hackerrank.com/*",
+        "https://*.codeforces.com/*",
+        "https://developer.mozilla.org/*",
+        "https://*.readthedocs.io/*",
+        "https://colab.research.google.com/*",
+        "https://docs.google.com/presentation/*",
+        "http://localhost/*",
+    ],
     run_at: "document_idle",
     all_frames: false,
 };
@@ -29,11 +49,6 @@ export const config: PlasmoCSConfig = {
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-
-interface ActivityPosition {
-    type: "video" | "scroll" | "code_problem" | "notebook" | "pdf" | "slides" | "general";
-    [key: string]: unknown;
-}
 
 interface VideoPosition extends ActivityPosition {
     type: "video";
@@ -80,33 +95,6 @@ interface GeneralPosition extends ActivityPosition {
     type: "general";
     scroll_pct: number;
     max_scroll_pct: number;
-}
-
-interface ActivityRecord {
-    content_id: string;
-    platform: string;
-    content_type: "video" | "article" | "code_problem" | "documentation"
-        | "course_lecture" | "notebook" | "pdf" | "slides" | "general";
-    title: string;
-    url: string;
-    favicon_url: string;
-    position: ActivityPosition;
-    content_duration_s: number;
-    duration_spent_s: number;
-    session_duration_s: number;
-    first_visited: number;
-    last_visited: number;
-    context_snapshot: string;
-    topic_tags: string[];
-    completion_pct: number;
-    max_completion_pct: number;
-    cognitive_state: string;
-    visit_count: number;
-    dismissed: boolean;
-    is_playlist: boolean;
-    playlist_id: string;
-    playlist_index: number;
-    related_tabs: string[];
 }
 
 interface PlatformDetector {
@@ -235,30 +223,6 @@ function getScrollPct(): number {
     const scrollHeight = document.documentElement.scrollHeight - window.innerHeight;
     if (scrollHeight <= 0) return 0;
     return Math.min(100, (window.scrollY / scrollHeight) * 100);
-}
-
-function extractContextSnapshot(): string {
-    // Audit-2 fix: refuse to extract page text when a visible password
-    // field is on the document. Even if the URL itself isn't on the
-    // sensitive-domain blocklist, the presence of an active password
-    // input strongly suggests we're on an auth or account page; the
-    // title alone is a safer summary.
-    if (hasVisiblePasswordField()) {
-        return document.title.slice(0, 200);
-    }
-    const candidates = document.querySelectorAll("article, main, [role='main']");
-    let el: Element | null = candidates[0] || null;
-    if (!el) {
-        // Find largest text block
-        const blocks = document.querySelectorAll("p, div");
-        let maxLen = 0;
-        for (const b of blocks) {
-            const text = b.textContent?.trim() || "";
-            if (text.length > maxLen) { maxLen = text.length; el = b; }
-        }
-    }
-    const text = el?.textContent?.trim() || document.title;
-    return text.slice(0, 200);
 }
 
 function extractTopicTags(title: string, url: string): string[] {
@@ -464,22 +428,15 @@ function createHackerRankDetector(): PlatformDetector {
             const cm = document.querySelector(".CodeMirror, .cm-editor");
             if (!monaco && !cm) return null;
 
-            let code = "";
-            if (monaco) {
-                const lines = monaco.querySelectorAll(".view-line");
-                code = Array.from(lines).map(l => l.textContent || "").join("\n").slice(0, 2000);
-            } else if (cm) {
-                const cmInstance = (cm as any).CodeMirror;
-                if (cmInstance) code = cmInstance.getValue().slice(0, 2000);
-            }
-
             return {
                 type: "code_problem",
                 stage: "IMPLEMENT",
                 wrong_answer_count: 0,
                 accepted: false,
                 time_elapsed_s: 0,
-                code_snapshot: code || undefined,
+                // Raw editor text is available only through the explicit
+                // one-site page-context path in the background worker.
+                code_snapshot: undefined,
             };
         },
         getCompletionPct(): number { return 0; },
@@ -674,6 +631,7 @@ function initActivityTracker(): void {
 
     // Immediate exclusion check
     if (isExcludedUrl(currentUrl)) return;
+    if (hasVisiblePasswordField()) return;
 
     // LeetCode: handled entirely by contents/leetcode-observer.ts → background bridge
     try {
@@ -735,7 +693,9 @@ function initActivityTracker(): void {
             session_duration_s: (now - sessionStartTime) / 1000,
             first_visited: sessionStartTime,
             last_visited: now,
-            context_snapshot: extractContextSnapshot(),
+            // Page excerpts are collected only on-demand after an explicit
+            // per-origin grant; periodic activity telemetry stays metadata-only.
+            context_snapshot: "",
             topic_tags: extractTopicTags(activeDetector.getTitle(), location.href),
             completion_pct: completionPct,
             max_completion_pct: maxCompletionPct,

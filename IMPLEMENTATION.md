@@ -1787,6 +1787,42 @@ independent statistical review of a real study.
 
 ### WP-9 — Privacy context broker and planner hardening (`L`)
 
+**Implementation status (2026-08-25): complete at the software and disclosure
+boundary.** Networked planning is off by default (`no_llm`), with a stricter
+`no_content` mode and a revision-bound `external_redacted` mode. Every external
+request now passes through an exhaustive `TaskContext` leaf catalog,
+default-false per-source selection, bounded Unicode/path/URL/secret
+minimization, an exact user-visible prompt/context preview, conservative
+provider-retention disclosure, and a random one-time handle that expires in at
+most 60 seconds. Confirmation requires an exact phrase and burns the handle
+before the provider await; cancellation, changing sources, going back, close,
+expiry, wrong confirmation, or replay also burn it. The raw Anthropic transport
+independently refuses requests without a broker-generated disclosure manifest.
+
+Browser page-body context is exact-origin and requires both browser permission
+and an explicit Cortex consent record, so required learning-site content-script
+access cannot masquerade as an opt-in. Incognito fails closed at content-script
+and background boundaries. Periodic activity telemetry is metadata-only;
+untrusted records are shape-allowlisted, bounded, URL/secret-minimized, and raw
+page/source excerpts are not persisted. Revocation scrubs legacy content fields
+from local activity records. Model output remains an untrusted proposal and
+cannot mint workspace capability; the WP-6 manifest/authorization/receipt
+boundary remains separate.
+
+Truthful privacy, security, provider-retention, API, adapter, setup, and UI
+contracts are tracked in `cortex/docs/`. The cross-surface design refinement is
+also complete against the pinned `emilkowalski/skills` review baseline, with
+one generated token vocabulary, contrast-safe state/accent text, named
+sub-300 ms functional motion, reduced-motion behavior, interruptible overlay
+updates, restrained ambient work, and consistent press/focus/status semantics.
+Completion evidence: 140 focused planner/privacy/API/provider tests; 35
+desktop/UI test modules passing in isolated Qt processes; Ruff and schema/design
+drift gates; all 241 browser tests plus TypeScript and Chrome/Edge production
+builds; and 30 VS Code tests plus TypeScript compilation. Provider policy text
+was checked against primary AWS, Google Cloud, and Anthropic documentation on
+2026-08-25. Account/contract verification remains the deployer's
+responsibility and Cortex never asserts zero retention.
+
 **Files:** task-context schemas/collectors, LLM planner/prompts/parser/cache, browser/editor context providers, onboarding/settings/privacy/security docs
 
 **Changes:**

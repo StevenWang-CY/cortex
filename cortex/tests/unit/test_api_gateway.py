@@ -23,7 +23,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cortex.application.clock import FakeClock
+from cortex.libs.config.settings import LLMConfig, LLMPrivacyConfig
+from cortex.libs.schemas.context import TaskContext
 from cortex.libs.schemas.intervention import InterventionPlan
+from cortex.libs.schemas.privacy import ContextFieldDisclosure
 from cortex.libs.schemas.state import (
     SignalQuality,
     StateEstimate,
@@ -42,6 +45,10 @@ from cortex.services.api_gateway.websocket_server import (
 )
 from cortex.services.intervention_engine.executor import InterventionExecutor
 from cortex.services.intervention_engine.restore import RestoreManager
+from cortex.services.llm_engine.context_broker import (
+    PrivacyAwarePlanner,
+    build_no_content_plan,
+)
 
 # =============================================================================
 # Fixtures
@@ -480,6 +487,172 @@ class TestContextAndLLMEndpoints:
         assert resp.status_code == 200
         data = resp.json()
         assert data["fallback_used"] is True
+
+    def test_external_context_preview_is_unavailable_without_opt_in(
+        self,
+        client: TestClient,
+    ):
+        payload = {
+            "state_estimate": _make_state_estimate(),
+            "task_context": {
+                "mode": "coding_debugging",
+                "active_app": "vscode",
+                "complexity_score": 0.7,
+            },
+        }
+        resp = client.post("/privacy/context/preview", json=payload)
+        assert resp.status_code == 409
+
+    def test_preview_then_exact_one_time_plan(self, client: TestClient):
+        class ExternalTransport:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def model_for_template(self, _template: str | None) -> str:
+                return "test-model"
+
+            async def generate_intervention_plan(
+                self,
+                context: TaskContext,
+                state: StateEstimate,
+                constraints=None,
+                *,
+                template_name: str | None = None,
+                extra_context: str = "",
+                disclosure_manifest: tuple[ContextFieldDisclosure, ...] | None = None,
+            ) -> InterventionPlan:
+                del context, state, constraints, template_name, extra_context
+                assert disclosure_manifest
+                self.calls += 1
+                plan = build_no_content_plan(reason="test")
+                plan.metadata = {"source": "llm"}
+                return plan
+
+            async def health_check(self) -> bool:
+                return True
+
+        transport = ExternalTransport()
+        cfg = LLMConfig(
+            provider="direct",
+            privacy=LLMPrivacyConfig(
+                planner_mode="external_redacted",
+                external_context_enabled=True,
+                consent_revision="context-disclosure-v1",
+            ),
+        )
+        registry.register("llm_client", PrivacyAwarePlanner(cfg, transport))
+        payload = {
+            "state_estimate": _make_state_estimate(),
+            "task_context": {
+                "mode": "coding_debugging",
+                "active_app": "vscode",
+                "complexity_score": 0.7,
+                "editor_context": {
+                    "file_path": "/Users/alice/private/auth.py",
+                    "visible_range": [1, 4],
+                    "visible_code": "token=super-secret-value-123456",
+                },
+            },
+            "selection": {
+                "workspace_aggregates": True,
+                "editor_metadata": True,
+                "editor_content": True,
+            },
+        }
+        preview_resp = client.post("/privacy/context/preview", json=payload)
+        assert preview_resp.status_code == 200
+        preview = preview_resp.json()
+        preview_json = json.dumps(preview)
+        assert "/Users/alice" not in preview_json
+        assert "super-secret-value-123456" not in preview_json
+        assert transport.calls == 0
+
+        plan_payload = {
+            "state_estimate": payload["state_estimate"],
+            "task_context": payload["task_context"],
+            "privacy_preview_id": preview["preview_id"],
+            "privacy_confirmation": "SEND PREVIEWED CONTEXT ONCE",
+        }
+        plan_resp = client.post("/llm/plan", json=plan_payload)
+        assert plan_resp.status_code == 200
+        assert plan_resp.json()["fallback_used"] is False
+        assert transport.calls == 1
+
+        replay_resp = client.post("/llm/plan", json=plan_payload)
+        assert replay_resp.status_code == 200
+        assert replay_resp.json()["fallback_used"] is True
+        assert replay_resp.json()["plan"]["metadata"]["fallback_reason"] == (
+            "context_preview_missing_or_replayed"
+        )
+        assert transport.calls == 1
+
+        registry.register(
+            "latest_task_context",
+            TaskContext.model_validate(payload["task_context"]),
+        )
+        registry.register(
+            "latest_state_estimate",
+            StateEstimate.model_validate(payload["state_estimate"]),
+        )
+        current_resp = client.post(
+            "/privacy/context/preview/current",
+            json={"selection": payload["selection"]},
+        )
+        assert current_resp.status_code == 200
+        current_preview = current_resp.json()
+        assert transport.calls == 1
+        assert "/Users/alice" not in json.dumps(current_preview)
+
+        missing_phrase = client.post(
+            "/privacy/context/confirm",
+            json={"preview_id": current_preview["preview_id"]},
+        )
+        assert missing_phrase.status_code == 422
+        assert transport.calls == 1
+
+        confirm_resp = client.post(
+            "/privacy/context/confirm",
+            json={
+                "preview_id": current_preview["preview_id"],
+                "confirmation_phrase": "SEND PREVIEWED CONTEXT ONCE",
+            },
+        )
+        assert confirm_resp.status_code == 200
+        confirmation = confirm_resp.json()
+        assert confirmation["sent"] is True
+        assert confirmation["authority_granted"] is False
+        assert confirmation["fallback_used"] is False
+        assert transport.calls == 2
+
+        replay_confirm = client.post(
+            "/privacy/context/confirm",
+            json={
+                "preview_id": current_preview["preview_id"],
+                "confirmation_phrase": "SEND PREVIEWED CONTEXT ONCE",
+            },
+        )
+        assert replay_confirm.status_code == 409
+        assert transport.calls == 2
+
+        cancel_preview_resp = client.post(
+            "/privacy/context/preview/current",
+            json={"selection": payload["selection"]},
+        )
+        assert cancel_preview_resp.status_code == 200
+        cancel_id = cancel_preview_resp.json()["preview_id"]
+        cancelled = client.delete(f"/privacy/context/preview/{cancel_id}")
+        assert cancelled.status_code == 200
+        assert cancelled.json()["cancelled"] is True
+        assert cancelled.json()["sent"] is False
+        cancelled_replay = client.post(
+            "/privacy/context/confirm",
+            json={
+                "preview_id": cancel_id,
+                "confirmation_phrase": "SEND PREVIEWED CONTEXT ONCE",
+            },
+        )
+        assert cancelled_replay.status_code == 409
+        assert transport.calls == 2
 
     def test_llm_plan_with_generate_intervention_plan_client(self, client: TestClient):
         class MockLLMClient:

@@ -3,13 +3,14 @@
 Run with:
     ``QT_QPA_PLATFORM=offscreen pytest cortex/tests/unit/test_overlay_animation.py``
 
-The intervention overlay plays two subtle tweens when ``show_intervention``
-is called:
+The intervention overlay plays one concurrent, subtle opacity cue when
+``show_intervention`` is called:
 
-* The headline scales in (geometry tween, 250 ms, OutCubic easing).
-* The causal-explanation row fades in (opacity 0 → 1, 180 ms, InOutSine
-  easing), started AFTER the headline animation completes so the two
-  read as a single continuous motion.
+* The headline and causal-explanation row settle from 72% to full opacity.
+* Both run for 160 ms with OutCubic easing and begin together.
+
+Geometry is never animated. The card is readable and actionable on its first
+frame, and a rapid replacement cannot squash or reflow the text.
 
 The dismiss button and micro-step checkboxes are explicitly NOT animated
 — motion stays purposeful per the audit's "be conservative" rule. The
@@ -25,9 +26,8 @@ Test strategy
 QPropertyAnimation needs a real Qt event loop to tick at 16ms intervals.
 The unit test instead enables ``OverlayWindow._record_animations`` to
 capture the durations the code path would use without spinning the
-animations themselves; that proves the wiring (headline = 250 ms, causal
-= 180 ms, Reduce Motion = 0 ms). A manual QA step is documented in the
-commit body for the live tween verification.
+animations themselves; that proves the wiring (headline = causal = 160 ms,
+Reduce Motion = 0 ms).
 """
 
 from __future__ import annotations
@@ -82,17 +82,18 @@ def overlay(qapp, monkeypatch):
 
 
 def test_animation_durations_match_spec(overlay):
-    """The headline scale-in fires at 250 ms; the causal fade at 180 ms.
+    """Both support-text fades fire concurrently for 160 ms.
+
     These constants are part of the audit-pinned contract — any future
     refactor that "tweens faster" or "slows for elegance" must update
     this test deliberately."""
     from cortex.apps.desktop_shell.overlay import (
         CAUSAL_FADE_DURATION_MS,
-        HEADLINE_SCALE_DURATION_MS,
+        HEADLINE_FADE_DURATION_MS,
     )
 
-    assert HEADLINE_SCALE_DURATION_MS == 250
-    assert CAUSAL_FADE_DURATION_MS == 180
+    assert HEADLINE_FADE_DURATION_MS == 160
+    assert CAUSAL_FADE_DURATION_MS == 160
 
     overlay.show_intervention({
         "intervention_id": "iv_anim_1",
@@ -103,8 +104,8 @@ def test_animation_durations_match_spec(overlay):
         "micro_steps": ["one"],
     })
     log = overlay._last_animation_log
-    assert log["headline_ms"] == 250
-    assert log["causal_ms"] == 180
+    assert log["headline_ms"] == 160
+    assert log["causal_ms"] == 160
     assert log["reduce_motion"] == 0
 
 
@@ -162,6 +163,18 @@ def test_dismiss_button_is_not_animated(overlay):
     # the test runs in _record_animations mode).
     assert hasattr(overlay, "_headline_anim")
     assert hasattr(overlay, "_causal_fade_anim")
+
+
+def test_entrance_animation_never_targets_geometry():
+    """Regression guard: intervention entrances may not reflow the card."""
+    import inspect
+
+    from cortex.apps.desktop_shell.overlay import OverlayWindow
+
+    source = inspect.getsource(OverlayWindow._play_show_animations)
+    assert 'b"geometry"' not in source
+    assert 'b"opacity"' in source
+    assert "setStartValue(0.72)" in source
 
 
 def test_back_to_back_interventions_reuse_animation_slots(overlay):

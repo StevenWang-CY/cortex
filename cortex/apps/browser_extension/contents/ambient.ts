@@ -20,7 +20,14 @@
 import type { PlasmoCSConfig } from "plasmo";
 
 export const config: PlasmoCSConfig = {
-    matches: ["https://*/*", "http://*/*"],
+    matches: [
+        "https://github.com/*",
+        "https://*.youtube.com/*",
+        "https://www.reddit.com/*",
+        "https://news.ycombinator.com/*",
+        "https://x.com/*",
+        "https://twitter.com/*",
+    ],
     run_at: "document_idle",
 };
 
@@ -97,6 +104,9 @@ let flowShieldActive = false;
 let flowDwellStart = 0;
 let animFrameId: number | null = null;
 let shieldedElements: Map<Element, string> = new Map();
+const shieldRestoreTimers = new Map<Element, number>();
+const reducedMotionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
+let reducedMotion = reducedMotionQuery.matches;
 
 // Smoothed values (for slow transitions)
 let smoothedStress = 0;
@@ -143,7 +153,6 @@ function init(): void {
     auraElement = document.createElement("div");
     auraElement.style.cssText = `
         position:absolute;top:0;left:0;right:0;bottom:0;
-        transition: background 3s ease, box-shadow 3s ease;
         pointer-events:none;
     `;
     host.appendChild(auraElement);
@@ -153,7 +162,6 @@ function init(): void {
     filterElement.style.cssText = `
         position:absolute;top:0;left:0;right:0;bottom:0;
         mix-blend-mode:multiply;
-        transition: background-color 45s ease;
         opacity:0;
         pointer-events:none;
     `;
@@ -169,6 +177,7 @@ function init(): void {
     host.appendChild(weatherCanvas);
 
     document.body.appendChild(host);
+    applyMotionPreference();
 
     // Handle resize
     window.addEventListener("resize", () => {
@@ -178,9 +187,10 @@ function init(): void {
         }
     });
 
-    // Start animation loop
+    // The loop starts only after an evidence-eligible state arrives. Keeping
+    // an idle rAF alive on every matched tab needlessly consumes energy.
     lastUpdateTime = performance.now();
-    animFrameId = requestAnimationFrame(tick);
+    syncAnimationLoop();
 }
 
 // --- Main Animation Loop (targets ~15fps for efficiency) ---
@@ -189,6 +199,8 @@ let lastFrameTime = 0;
 const FRAME_INTERVAL = 1000 / 15; // 15fps
 
 function tick(now: number): void {
+    animFrameId = null;
+    if (!shouldRunAnimationLoop()) return;
     animFrameId = requestAnimationFrame(tick);
 
     if (now - lastFrameTime < FRAME_INTERVAL) return;
@@ -218,10 +230,67 @@ function tick(now: number): void {
     updateFlowShield();
 }
 
+function shouldRunAnimationLoop(): boolean {
+    return !reducedMotion
+        && document.visibilityState === "visible"
+        && currentState?.status === "estimated";
+}
+
+function stopAnimationLoop(): void {
+    if (animFrameId !== null) {
+        cancelAnimationFrame(animFrameId);
+        animFrameId = null;
+    }
+}
+
+function renderReducedMotionState(): void {
+    if (!currentState || currentState.status !== "estimated") {
+        clearAmbientEffects();
+        return;
+    }
+    smoothedStress = currentState.scores?.hyper ?? 0;
+    smoothedFlow = currentState.scores?.flow ?? 0;
+    updateAura();
+    updateFilter();
+    if (weatherCanvas && weatherCtx) {
+        weatherCtx.clearRect(0, 0, weatherCanvas.width, weatherCanvas.height);
+    }
+    particles = [];
+    updateFlowShield();
+}
+
+function applyMotionPreference(): void {
+    if (auraElement) {
+        auraElement.style.transition = reducedMotion
+            ? "opacity 160ms cubic-bezier(0.23, 1, 0.32, 1), background-color 160ms cubic-bezier(0.23, 1, 0.32, 1)"
+            : "box-shadow 3s cubic-bezier(0.23, 1, 0.32, 1)";
+    }
+    if (filterElement) {
+        filterElement.style.transition = reducedMotion
+            ? "opacity 160ms cubic-bezier(0.23, 1, 0.32, 1), background-color 160ms cubic-bezier(0.23, 1, 0.32, 1)"
+            : "background-color 45s cubic-bezier(0.77, 0, 0.175, 1), opacity 3s cubic-bezier(0.23, 1, 0.32, 1)";
+    }
+}
+
+function syncAnimationLoop(): void {
+    if (!shouldRunAnimationLoop()) {
+        stopAnimationLoop();
+        if (reducedMotion) renderReducedMotionState();
+        return;
+    }
+    if (animFrameId === null) {
+        lastUpdateTime = performance.now();
+        animFrameId = requestAnimationFrame(tick);
+    }
+}
+
 function clearAmbientEffects(): void {
     smoothedStress = 0;
     smoothedFlow = 0;
-    if (auraElement) auraElement.style.boxShadow = "none";
+    if (auraElement) {
+        auraElement.style.boxShadow = "none";
+        auraElement.style.backgroundColor = "transparent";
+    }
     if (filterElement) filterElement.style.opacity = "0";
     if (weatherCanvas && weatherCtx) {
         weatherCtx.clearRect(0, 0, weatherCanvas.width, weatherCanvas.height);
@@ -255,9 +324,16 @@ function updateAura(): void {
     const lightness = 50 + flowVal * 10;
     const intensity = Math.min(0.02, 0.01 + Math.max(flowVal, stressVal) * 0.01); // max 2% at edge
 
-    auraElement.style.boxShadow =
-        `inset 0 0 120px 40px hsla(${hue}, ${saturation}%, ${lightness}%, ${intensity}),` +
-        `inset 0 0 300px 100px hsla(${hue}, ${saturation}%, ${lightness}%, ${intensity * 0.3})`;
+    if (reducedMotion) {
+        auraElement.style.boxShadow = "none";
+        auraElement.style.backgroundColor =
+            `hsla(${hue}, ${saturation}%, ${lightness}%, ${intensity * 0.3})`;
+    } else {
+        auraElement.style.backgroundColor = "transparent";
+        auraElement.style.boxShadow =
+            `inset 0 0 120px 40px hsla(${hue}, ${saturation}%, ${lightness}%, ${intensity}),` +
+            `inset 0 0 300px 100px hsla(${hue}, ${saturation}%, ${lightness}%, ${intensity * 0.3})`;
+    }
 }
 
 // --- Layer 2: Tone Filter ---
@@ -392,10 +468,17 @@ function activateFlowShield(): void {
                 const htmlEl = el as HTMLElement;
                 if (!shieldedElements.has(el)) {
                     shieldedElements.set(el, htmlEl.style.cssText);
-                    htmlEl.style.transition = "opacity 180s ease-out, filter 180s ease-out";
-                    htmlEl.style.opacity = "0.05";
-                    htmlEl.style.filter = "blur(2px)";
                 }
+                const pendingRestore = shieldRestoreTimers.get(el);
+                if (pendingRestore !== undefined) {
+                    window.clearTimeout(pendingRestore);
+                    shieldRestoreTimers.delete(el);
+                }
+                htmlEl.style.transition = reducedMotion
+                    ? "opacity 160ms cubic-bezier(0.23, 1, 0.32, 1), filter 160ms cubic-bezier(0.23, 1, 0.32, 1)"
+                    : "opacity 180s cubic-bezier(0.23, 1, 0.32, 1), filter 180s cubic-bezier(0.23, 1, 0.32, 1)";
+                htmlEl.style.opacity = "0.05";
+                htmlEl.style.filter = "blur(2px)";
             });
         } catch {
             // Invalid selector
@@ -406,20 +489,31 @@ function activateFlowShield(): void {
 function deactivateFlowShield(): void {
     shieldedElements.forEach((originalStyle, el) => {
         const htmlEl = el as HTMLElement;
-        htmlEl.style.transition = "opacity 5s ease-in, filter 5s ease-in";
+        const pendingRestore = shieldRestoreTimers.get(el);
+        if (pendingRestore !== undefined) window.clearTimeout(pendingRestore);
+        if (reducedMotion) {
+            htmlEl.style.cssText = originalStyle;
+            shieldedElements.delete(el);
+            shieldRestoreTimers.delete(el);
+            return;
+        }
+        htmlEl.style.transition = "opacity 200ms cubic-bezier(0.23, 1, 0.32, 1), filter 200ms cubic-bezier(0.23, 1, 0.32, 1)";
         htmlEl.style.opacity = "";
         htmlEl.style.filter = "";
-        // Restore original styles after transition
-        setTimeout(() => {
+        const timer = window.setTimeout(() => {
             htmlEl.style.cssText = originalStyle;
-        }, 5500);
+            shieldedElements.delete(el);
+            shieldRestoreTimers.delete(el);
+        }, 220);
+        shieldRestoreTimers.set(el, timer);
     });
-    shieldedElements.clear();
 }
 
 // --- Message Listener ---
 
-chrome.runtime.onMessage.addListener(
+const INCOGNITO_CONTEXT = Boolean(chrome.extension?.inIncognitoContext);
+
+if (!INCOGNITO_CONTEXT) chrome.runtime.onMessage.addListener(
     (
         message: Record<string, unknown>,
         _sender: chrome.runtime.MessageSender,
@@ -427,16 +521,26 @@ chrome.runtime.onMessage.addListener(
     ) => {
         if (message.type === "AMBIENT_STATE_UPDATE") {
             currentState = message.payload as CortexAmbientState;
+            if (currentState.status !== "estimated") clearAmbientEffects();
+            syncAnimationLoop();
             sendResponse({ ok: true });
         }
         return false;
     },
 );
 
+reducedMotionQuery.addEventListener("change", (event) => {
+    reducedMotion = event.matches;
+    applyMotionPreference();
+    syncAnimationLoop();
+});
+
+document.addEventListener("visibilitychange", syncAnimationLoop);
+
 // --- Bootstrap ---
 
-if (document.readyState === "complete" || document.readyState === "interactive") {
+if (!INCOGNITO_CONTEXT && (document.readyState === "complete" || document.readyState === "interactive")) {
     init();
-} else {
+} else if (!INCOGNITO_CONTEXT) {
     document.addEventListener("DOMContentLoaded", init);
 }

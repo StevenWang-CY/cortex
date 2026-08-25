@@ -52,7 +52,7 @@ from cortex.apps.desktop_shell.a11y import (
     set_accessible_name,
 )
 from cortex.apps.desktop_shell.tokens import (
-    BRAND_ACCENT,
+    BRAND_ACCENT_TEXT,
     CX_TEXT_SECONDARY,
     FONT_MONO,
     FS_CAPTION,
@@ -301,7 +301,7 @@ class Toast(QFrame):
         self._cid_label.setStyleSheet(
             f"font-family: {FONT_MONO};"
             f"font-size: {FS_CAPTION}px;"
-            f"color: {BRAND_ACCENT};"
+            f"color: {BRAND_ACCENT_TEXT};"
             "background: transparent;"
         )
         # CRITICAL: the cid must be selectable. The audit's user-research

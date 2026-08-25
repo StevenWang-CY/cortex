@@ -66,9 +66,10 @@ The complete target design, migration order, and definition of done are in
   confer execution authority.
 - Client messages are untrusted and must be schema-, authorization-, replay-,
   and target-validated.
-- Workspace excerpts sent to a cloud LLM can be sensitive. Until the WP-9
-  privacy broker makes every category previewable and controllable, cloud
-  planning remains an explicit alpha-risk boundary.
+- Workspace excerpts sent to a cloud LLM can be sensitive. External planning
+  is therefore network-off by default and passes through the WP-9 field
+  catalog, per-source selection, exact redacted preview, one-time confirmation,
+  and provider-retention disclosure. See [`privacy.md`](privacy.md).
 
 ## Time and schema contracts
 

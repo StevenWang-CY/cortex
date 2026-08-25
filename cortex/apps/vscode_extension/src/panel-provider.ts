@@ -605,13 +605,12 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             cursor: pointer;
             font-size: var(--fs-footnote);
             font-weight: 500;
+            transition: background-color 120ms cubic-bezier(.23, 1, .32, 1),
+                border-color 120ms cubic-bezier(.23, 1, .32, 1),
+                transform 120ms cubic-bezier(.23, 1, .32, 1);
         }
 
-        .dismiss-btn:hover {
-            background: var(--cx-dismiss-bg-hover);
-        }
-
-        .dismiss-btn:focus-visible {
+        button:focus-visible {
             outline: 2px solid var(--cx-focus-ring);
             outline-offset: 1px;
         }
@@ -642,9 +641,9 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             cursor: pointer;
             font-size: var(--fs-caption);
             font-weight: 600;
+            transition: filter 120ms cubic-bezier(.23, 1, .32, 1),
+                transform 120ms cubic-bezier(.23, 1, .32, 1);
         }
-
-        .daemon-offline button:hover { filter: brightness(1.08); }
 
         /* P2-6: "Connected, awaiting state" empty state */
         .cx-awaiting-state {
@@ -661,7 +660,7 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             height: 7px;
             border-radius: 50%;
             background: var(--cx-text-tertiary);
-            animation: cx-pulse 1.2s ease-in-out infinite;
+            animation: cx-pulse 1.2s cubic-bezier(.77, 0, .175, 1) infinite;
             vertical-align: middle;
             margin-right: 4px;
         }
@@ -687,9 +686,11 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             padding: 4px 12px;
             font-size: 14px;
             cursor: pointer;
+            transition: background-color 120ms cubic-bezier(.23, 1, .32, 1),
+                border-color 120ms cubic-bezier(.23, 1, .32, 1),
+                transform 120ms cubic-bezier(.23, 1, .32, 1);
         }
 
-        .rating-btn:hover { background: rgba(255, 255, 255, 0.12); }
         .rating-btn.selected { background: var(--cx-accent); color: white; }
 
         .rating-text {
@@ -715,9 +716,39 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             font-size: var(--fs-caption);
             text-decoration: underline;
             cursor: pointer;
+            transition: color 120ms cubic-bezier(.23, 1, .32, 1),
+                transform 120ms cubic-bezier(.23, 1, .32, 1);
         }
 
-        .why-toggle:hover { color: var(--cx-text); }
+        .dismiss-btn:active,
+        .daemon-offline button:active,
+        .rating-btn:active,
+        .why-toggle:active { transform: scale(.97); }
+
+        @media (hover: hover) and (pointer: fine) {
+            .dismiss-btn:hover { background: var(--cx-dismiss-bg-hover); }
+            .daemon-offline button:hover { filter: brightness(1.08); }
+            .rating-btn:hover { background: rgba(255, 255, 255, 0.12); }
+            .why-toggle:hover { color: var(--cx-text); }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .cx-spinner {
+                animation: none;
+                opacity: .75;
+                transform: none;
+                transition: opacity 160ms cubic-bezier(.23, 1, .32, 1),
+                    background-color 160ms cubic-bezier(.23, 1, .32, 1);
+            }
+            .dismiss-btn,
+            .daemon-offline button,
+            .rating-btn,
+            .why-toggle { transition-property: background-color, border-color, color, filter; }
+            .dismiss-btn:active,
+            .daemon-offline button:active,
+            .rating-btn:active,
+            .why-toggle:active { transform: none; }
+        }
 
         .why-panel {
             margin-top: 4px;

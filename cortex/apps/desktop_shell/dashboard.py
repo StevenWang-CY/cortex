@@ -226,6 +226,7 @@ from cortex.apps.desktop_shell.tokens import (
     BIO_HR,
     BRAND_ACCENT,
     BRAND_ACCENT_DARK,
+    BRAND_ACCENT_TEXT,
     BRAND_DISPLAY_FONT,
     CX_TEXT_SECONDARY,
     CX_TEXT_TERTIARY,
@@ -248,6 +249,7 @@ from cortex.apps.desktop_shell.tokens import (
     SP6,
     STATE_COLORS,
     STATE_LABELS,
+    STATE_TEXT_COLORS,
 )
 
 logger = logging.getLogger(__name__)
@@ -483,7 +485,7 @@ QMenu::item {{
 }}
 QMenu::item:selected {{
     background-color: {BRAND_ACCENT};
-    color: #FFFFFF;
+    color: {_LABEL};
 }}
 QMenu::separator {{
     height: 1px;
@@ -856,7 +858,7 @@ class _ConsumerTab(QWidget):
         self._focus_protection_pill.setStyleSheet(
             "QPushButton {"
             f"  background: {BRAND_ACCENT}1A;"
-            f"  color: {BRAND_ACCENT};"
+            f"  color: {BRAND_ACCENT_TEXT};"
             f"  border-radius: {RADIUS_PILL}px;"
             "  padding: 3px 10px;"
             "  margin-left: 8px;"
@@ -919,7 +921,7 @@ class _ConsumerTab(QWidget):
         self._break_pill.setStyleSheet(
             "QPushButton {"
             f"  background: rgba(217, 119, 87, 0.18);"
-            f"  color: {BRAND_ACCENT};"
+            f"  color: {BRAND_ACCENT_TEXT};"
             f"  border-radius: {RADIUS_PILL}px;"
             "  padding: 3px 10px;"
             "  margin-left: 8px;"
@@ -1316,7 +1318,7 @@ class _ConsumerTab(QWidget):
         self._connect_btn.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
         self._connect_btn.setStyleSheet(
             "QPushButton {"
-            f"  color: {BRAND_ACCENT};"
+            f"  color: {BRAND_ACCENT_TEXT};"
             f"  background: transparent;"
             f"  border: none;"
             f"  padding: 4px 0;"
@@ -1475,7 +1477,7 @@ class _ConsumerTab(QWidget):
         if age > 30.0:
             pill.setText("Measured profile is old · Recalibrate?")
             pill.setStyleSheet(
-                f"color: {BRAND_ACCENT}; background: {_GROUPED_BG};"
+                f"color: {BRAND_ACCENT_TEXT}; background: {_GROUPED_BG};"
                 f" border-radius: {RADIUS_PILL}px; padding: 3px 10px;"
                 " margin-left: 8px;"
             )
@@ -1520,7 +1522,7 @@ class _ConsumerTab(QWidget):
         try:
             self._cost_pill.setText(text)
             if ratio >= 0.80:
-                color = BRAND_ACCENT
+                color = BRAND_ACCENT_TEXT
             elif ratio >= 0.50:
                 color = _LABEL_SECONDARY
             else:
@@ -1615,7 +1617,7 @@ class _ConsumerTab(QWidget):
                 f"QMenu#RecentGoalsMenu::item {{"
                 f" padding: 6px 12px; border-radius: 5px; }}"
                 f"QMenu#RecentGoalsMenu::item:selected {{"
-                f" background-color: {BRAND_ACCENT}; color: #FFFFFF; }}"
+                f" background-color: {BRAND_ACCENT}; color: {_LABEL}; }}"
             )
             menu.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
             for g in goals:
@@ -1734,7 +1736,7 @@ class _ConsumerTab(QWidget):
                 self._quiet_capsule.setStyleSheet(
                     "QPushButton {"
                     f"  background: {BRAND_ACCENT}22;"
-                    f"  color: {BRAND_ACCENT};"
+                    f"  color: {BRAND_ACCENT_TEXT};"
                     f"  border-radius: {RADIUS_PILL}px;"
                     "  padding: 3px 12px;"
                     "  margin-left: 8px;"
@@ -2141,7 +2143,8 @@ class _ConsumerTab(QWidget):
         status = str(payload.get("status", "insufficient_evidence"))
         raw_state = str(payload.get("state", "UNKNOWN"))
         state = raw_state if status == "estimated" else "UNKNOWN"
-        color = STATE_COLORS.get(state, _LABEL_TERTIARY)
+        dot_color = STATE_COLORS.get(state, _LABEL_TERTIARY)
+        text_color = STATE_TEXT_COLORS.get(state, _LABEL_TERTIARY)
         if status == "warming_up":
             label = "Still gathering"
         elif status == "insufficient_evidence":
@@ -2149,11 +2152,11 @@ class _ConsumerTab(QWidget):
         else:
             label = STATE_LABELS.get(state, state)
         self._set_style_if_changed(
-            self._state_dot, f"background: {color}; border-radius: 3px;"
+            self._state_dot, f"background: {dot_color}; border-radius: 3px;"
         )
         self._set_text_if_changed(self._state_label, label)
         self._set_style_if_changed(
-            self._state_label, f"color: {color}; background: transparent;"
+            self._state_label, f"color: {text_color}; background: transparent;"
         )
 
         bio = payload.get("biometrics", {})
@@ -3002,7 +3005,7 @@ class ConceptsDialog(QDialog):
                 term = QLabel(key.upper())
                 term.setFont(mac_native.system_font(FS_CAPTION, "semibold"))
                 term.setStyleSheet(
-                    f"color: {BRAND_ACCENT}; background: transparent;"
+                    f"color: {BRAND_ACCENT_TEXT}; background: transparent;"
                 )
                 layout.addWidget(term)
                 desc = QLabel(body)

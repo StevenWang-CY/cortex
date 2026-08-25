@@ -189,6 +189,18 @@ from cortex.libs.schemas.policy import (
     PolicyObservation,
     PolicyRewardRecord,
 )
+from cortex.libs.schemas.privacy import (
+    ContextFieldDisclosure,
+    ContextPreviewCancellationResponse,
+    ContextPreviewConfirmationRequest,
+    ContextPreviewConfirmationResponse,
+    ContextPreviewRequest,
+    ContextPreviewResponse,
+    ContextPrivacyStatusResponse,
+    ContextSourceSelection,
+    CurrentContextPreviewRequest,
+    ProviderRetentionDisclosure,
+)
 from cortex.libs.schemas.protocol import (
     AuthOkPayload,
     AuthRequestPayload,
@@ -371,6 +383,17 @@ __all__ = [
     "TabInfo",
     "BrowserContext",
     "TaskContext",
+    # Explicit external-context disclosure
+    "ContextSourceSelection",
+    "ContextFieldDisclosure",
+    "ProviderRetentionDisclosure",
+    "CurrentContextPreviewRequest",
+    "ContextPreviewRequest",
+    "ContextPreviewResponse",
+    "ContextPreviewCancellationResponse",
+    "ContextPreviewConfirmationRequest",
+    "ContextPreviewConfirmationResponse",
+    "ContextPrivacyStatusResponse",
     # Intervention
     "UIPlan",
     "SimplificationConstraints",

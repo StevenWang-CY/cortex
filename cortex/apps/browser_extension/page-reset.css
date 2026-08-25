@@ -17,10 +17,15 @@
     --cx-grouped-bg: #F2F2F7;
     --cx-label-primary: #1A1A1A;
     --cx-label-secondary: #5C5854;
-    --cx-label-tertiary: #827971;
+    --cx-label-tertiary: #6B6661;
+    --cx-border-subtle: rgba(0, 0, 0, 0.06);
+    --cx-border-emphasis: rgba(0, 0, 0, 0.20);
     --cx-separator: rgba(60, 60, 67, 0.15);
+    --cx-shadow-float: 0 8px 32px rgba(0, 0, 0, 0.08),
+                       0 0 0 1px rgba(0, 0, 0, 0.04);
     --cx-accent: #D97757;
     --cx-accent-hover: #C46547;
+    --cx-accent-text: #A4472E;
     --cx-danger: #D70015;
     --cx-success: #30B257;
     --cx-warning: #D9A100;
@@ -34,10 +39,17 @@
         --cx-grouped-bg: #1C1C1E;
         --cx-label-primary: #FFFFFF;
         --cx-label-secondary: rgba(235, 235, 245, 0.60);
-        --cx-label-tertiary: rgba(235, 235, 245, 0.30);
+        /* 0.55 is the lowest alpha that keeps small tertiary copy above
+           4.5:1 on the #1E1E1E window surface. */
+        --cx-label-tertiary: rgba(235, 235, 245, 0.55);
+        --cx-border-subtle: rgba(255, 255, 255, 0.10);
+        --cx-border-emphasis: rgba(255, 255, 255, 0.24);
         --cx-separator: rgba(84, 84, 88, 0.30);
+        --cx-shadow-float: 0 8px 32px rgba(0, 0, 0, 0.42),
+                           0 0 0 1px rgba(255, 255, 255, 0.06);
         --cx-accent: #E08E6F;          /* boosted L for legibility on dark */
         --cx-accent-hover: #D97757;
+        --cx-accent-text: #E08E6F;
         --cx-danger: #FF453A;
         --cx-success: #32D74B;
         --cx-warning: #FFD60A;
@@ -60,11 +72,26 @@ html, body, #__plasmo {
     text-rendering: optimizeLegibility;
 }
 
+*, *::before, *::after {
+    box-sizing: border-box;
+}
+
+:where(button, a, input, textarea, select):focus-visible {
+    outline: 2px solid var(--cx-accent);
+    outline-offset: 2px;
+}
+
 @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after {
-        animation-duration: 0.01ms !important;
+        animation-delay: 0ms !important;
+        animation-duration: 1ms !important;
         animation-iteration-count: 1 !important;
-        transition-duration: 0.01ms !important;
+        transition-delay: 0ms !important;
         scroll-behavior: auto !important;
+    }
+    .cortex-motion-enter,
+    .cortex-motion-ambient {
+        animation: none !important;
+        transform: none !important;
     }
 }

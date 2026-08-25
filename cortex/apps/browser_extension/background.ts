@@ -22,6 +22,17 @@ import {
 import { getAuthToken } from "./lib/auth";
 import { detectBrowser } from "./lib/browser";
 import {
+    minimizeContextUrl,
+    PAGE_EXCERPT_MAX_CHARS,
+    sanitizeContextText,
+    TAB_TITLE_MAX_CHARS,
+} from "./lib/context-privacy";
+import {
+    sanitizeActivityRecord,
+    type ActivityPosition,
+    type ActivityRecord,
+} from "./lib/activity-privacy";
+import {
     isCortexState,
     isSuggestedAction,
     normaliseInterventionPayload,
@@ -35,6 +46,7 @@ import {
     verifiedPresentedActionIds,
     verifyRestoreCommand,
 } from "./lib/intervention-transaction";
+import { mayExtractPageContent } from "./lib/site-access";
 import {
     DAEMON_WS_URL,
     DAEMON_HTTP_URL,
@@ -882,38 +894,6 @@ const BLINK_ALERT_THRESHOLD = 180_000;  // 3 min low blink rate
 
 // --- Activity Tracking State ---
 
-interface ActivityPosition {
-    type: "video" | "scroll" | "code_problem" | "notebook" | "pdf" | "slides" | "general";
-    [key: string]: unknown;
-}
-
-interface ActivityRecord {
-    content_id: string;
-    platform: string;
-    content_type: "video" | "article" | "code_problem" | "documentation"
-        | "course_lecture" | "notebook" | "pdf" | "slides" | "general";
-    title: string;
-    url: string;
-    favicon_url: string;
-    position: ActivityPosition;
-    content_duration_s: number;
-    duration_spent_s: number;
-    session_duration_s: number;
-    first_visited: number;
-    last_visited: number;
-    context_snapshot: string;
-    topic_tags: string[];
-    completion_pct: number;
-    max_completion_pct: number;
-    cognitive_state: string;
-    visit_count: number;
-    dismissed: boolean;
-    is_playlist: boolean;
-    playlist_id: string;
-    playlist_index: number;
-    related_tabs: string[];
-}
-
 let lastActivitySyncTime = 0;
 const ACTIVITY_SYNC_INTERVAL = 60_000; // Sync to daemon every 60s
 const ACTIVITY_STORAGE_KEY = "cortex_activities";
@@ -926,6 +906,16 @@ async function loadActivities(): Promise<Record<string, ActivityRecord>> {
 
 async function saveActivities(activities: Record<string, ActivityRecord>): Promise<void> {
     await chrome.storage.local.set({ [ACTIVITY_STORAGE_KEY]: activities });
+}
+
+async function scrubStoredActivityContent(): Promise<void> {
+    const activities = await loadActivities();
+    const scrubbed: Record<string, ActivityRecord> = {};
+    for (const record of Object.values(activities)) {
+        const safe = sanitizeActivityRecord(record, false);
+        if (safe) scrubbed[safe.content_id] = safe;
+    }
+    await saveActivities(scrubbed);
 }
 
 async function upsertActivity(record: ActivityRecord): Promise<void> {
@@ -1002,6 +992,15 @@ async function upsertActivity(record: ActivityRecord): Promise<void> {
         lastActivitySyncTime = now;
         syncActivitiesToDaemon(activities);
     }
+}
+
+export async function prepareActivityRecordForStorage(
+    raw: unknown,
+    senderTab: Pick<chrome.tabs.Tab, "url" | "incognito"> | undefined,
+): Promise<ActivityRecord | null> {
+    if (!senderTab || senderTab.incognito) return null;
+    const allowPageContent = await mayExtractPageContent(senderTab);
+    return sanitizeActivityRecord(raw, allowPageContent);
 }
 
 function syncActivitiesToDaemon(activities: Record<string, ActivityRecord>): void {
@@ -1096,7 +1095,9 @@ function canonicalizeUrl(rawUrl: string): string {
 
 async function enrichWithRelatedTabs(record: ActivityRecord): Promise<void> {
     try {
-        const allTabs = await chrome.tabs.query({});
+        const allTabs = (await chrome.tabs.query({})).filter(
+            (tab) => !tab.incognito,
+        );
         const activities = await loadActivities();
         const relatedIds: string[] = [];
         for (const tab of allTabs) {
@@ -2164,12 +2165,17 @@ async function handleMessage(raw: string): Promise<void> {
  * Design: dark, high-end tech (Linear/Raycast-inspired).
  * Consistent with popup and all other Cortex UI.
  */
-function injectOverlay(
+export function injectOverlay(
     payload: Record<string, unknown>,
     executableActionIds: string[] = [],
 ): void {
     const OID = "cortex-somatic-overlay";
-    document.getElementById(OID)?.remove();
+    type ManagedOverlayHost = HTMLElement & {
+        __cortexCleanup?: () => void;
+    };
+    const existingHost = document.getElementById(OID) as ManagedOverlayHost | null;
+    existingHost?.__cortexCleanup?.();
+    const isUpdate = existingHost !== null;
 
     const headline = String(payload.headline || "");
     const summary = String(payload.situation_summary || "");
@@ -2268,18 +2274,22 @@ function injectOverlay(
             ? "Manual review — Cortex won’t close or regroup existing tabs automatically."
             : "";
 
-    const host = document.createElement("div");
-    host.id = OID;
-    host.style.cssText = "position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483647;pointer-events:none;";
+    const host = (existingHost ?? document.createElement("div")) as ManagedOverlayHost;
+    if (!existingHost) {
+        host.id = OID;
+        host.style.cssText = "position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483647;pointer-events:none;";
+    }
 
-    const shadow = host.attachShadow({ mode: "open" });
+    const shadow = host.shadowRoot ?? host.attachShadow({ mode: "open" });
     shadow.innerHTML = `
 <style>
-@keyframes panelIn{from{transform:translateY(12px) scale(.99);opacity:0}to{transform:translateY(0) scale(1);opacity:1}}
+@keyframes panelIn{from{transform:translateY(8px) scale(.98);opacity:0}to{transform:translateY(0) scale(1);opacity:1}}
+@keyframes panelOut{from{transform:translateY(0) scale(1);opacity:1}to{transform:translateY(8px) scale(.98);opacity:0}}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes fadeOut{from{opacity:1}to{opacity:0}}
 *{box-sizing:border-box;margin:0;padding:0}
 
-.bk{position:fixed;inset:0;background:transparent;pointer-events:none;animation:fadeIn .25s ease}
+.bk{position:fixed;inset:0;background:transparent;pointer-events:none;animation:fadeIn 160ms cubic-bezier(.23,1,.32,1)}
 
 .pn{
   position:fixed;bottom:20px;right:20px;width:340px;max-height:calc(100vh - 40px);overflow-y:auto;
@@ -2290,13 +2300,17 @@ function injectOverlay(
   box-shadow:0 0 0 .5px rgba(0,0,0,.3),0 4px 20px rgba(0,0,0,.4),0 16px 40px rgba(0,0,0,.2);
   font-family:-apple-system,BlinkMacSystemFont,'Inter','SF Pro Text',system-ui,sans-serif;
   color:#e4e4e7;padding:18px 16px 14px;
-  animation:panelIn .3s cubic-bezier(.16,1,.3,1);
+  animation:panelIn 200ms cubic-bezier(.23,1,.32,1);
 }
+.pn.cx-update{animation:none}
+.pn.cx-exit{animation:panelOut 160ms cubic-bezier(.4,0,1,1) forwards}
+.bk.cx-exit{animation:fadeOut 160ms cubic-bezier(.4,0,1,1) forwards}
 .pn::-webkit-scrollbar{width:0}
 
 /* Close */
-.xb{position:absolute;top:14px;right:14px;width:22px;height:22px;border:none;background:rgba(255,255,255,.04);border-radius:6px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .12s}
-.xb:hover{background:rgba(255,255,255,.08)}
+.xb{position:absolute;top:10px;right:10px;width:30px;height:30px;border:none;background:rgba(255,255,255,.04);border-radius:7px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background-color 120ms cubic-bezier(.23,1,.32,1),transform 120ms cubic-bezier(.23,1,.32,1)}
+.xb:active{transform:scale(.96)}
+.xb:focus-visible,.btn:focus-visible,.dm:focus-visible,.ul:focus-visible{outline:2px solid #dfb15b;outline-offset:2px}
 .xb svg{width:9px;height:9px;stroke:#71717a;stroke-width:2}
 
 /* Text */
@@ -2328,23 +2342,23 @@ function injectOverlay(
 .si::before{content:'';position:absolute;left:3px;top:8px;width:3px;height:3px;border-radius:50%;background:#3f3f46}
 
 /* CTA */
-.btn{display:block;width:100%;padding:9px;border:none;border-radius:8px;background:#e4e4e7;color:#09090b;font-size:12px;font-weight:600;cursor:pointer;transition:all .12s;letter-spacing:-.1px;text-align:center;font-family:inherit}
-.btn:hover{background:#f4f4f5}
+.btn{display:block;width:100%;padding:9px;border:none;border-radius:8px;background:#e4e4e7;color:#09090b;font-size:12px;font-weight:600;cursor:pointer;transition:background-color 120ms cubic-bezier(.23,1,.32,1),transform 120ms cubic-bezier(.23,1,.32,1);letter-spacing:-.1px;text-align:center;font-family:inherit}
 .btn:active{transform:scale(.98)}
 .btn.ok{background:#10b981;color:#fff;cursor:default;pointer-events:none}
 
 .ur{display:flex;align-items:center;justify-content:center;gap:6px;padding:6px 0;font-size:11px;color:#3f3f46;margin-top:4px}
 .ul{color:#3b82f6;cursor:pointer;font-weight:500;text-decoration:none;border:none;background:none;font-size:11px;font-family:inherit;padding:0}
-.ul:hover{text-decoration:underline}
 
 /* Dismiss */
-.dm{display:block;width:100%;padding:6px;margin-top:6px;border:none;border-radius:6px;background:none;color:#3f3f46;cursor:pointer;font-size:11px;font-family:inherit;transition:color .12s}
-.dm:hover{color:#71717a}
+.dm{display:block;width:100%;padding:8px;margin-top:4px;border:none;border-radius:6px;background:none;color:#a1a1aa;cursor:pointer;font-size:11px;font-family:inherit;transition:color 120ms cubic-bezier(.23,1,.32,1),background-color 120ms cubic-bezier(.23,1,.32,1),transform 120ms cubic-bezier(.23,1,.32,1)}
+.dm:active{transform:scale(.98)}
+@media (hover:hover) and (pointer:fine){.xb:hover{background:rgba(255,255,255,.08)}.btn:hover{background:#f4f4f5}.ul:hover{text-decoration:underline}.dm:hover{color:#e4e4e7;background:rgba(255,255,255,.04)}}
+@media (prefers-reduced-motion:reduce){.pn,.bk{animation:none!important}.btn,.xb,.dm{transition-property:background-color,color!important}.btn:active,.xb:active,.dm:active{transform:none}}
 </style>
 
 <div class="bk" id="bk"></div>
-<div class="pn">
-  <button class="xb" id="xb"><svg viewBox="0 0 10 10" fill="none"><path d="M1 1l8 8M9 1l-8 8"/></svg></button>
+<div class="pn${isUpdate ? " cx-update" : ""}">
+  <button class="xb" id="xb" type="button" aria-label="Dismiss intervention"><svg viewBox="0 0 10 10" fill="none"><path d="M1 1l8 8M9 1l-8 8"/></svg></button>
   <div class="hd">${esc(headline)}</div>
   <div class="ds">${esc(summary)}</div>
   <div class="dv"></div>
@@ -2357,9 +2371,17 @@ function injectOverlay(
   <button class="dm" id="dm">Dismiss</button>
 </div>`;
 
-    document.body.appendChild(host);
+    if (!existingHost) document.body.appendChild(host);
 
     let dismissed = false;
+    let removalTimer = 0;
+    let autoDismissTimer = 0;
+    const reducedMotion = window.matchMedia(
+        "(prefers-reduced-motion: reduce)",
+    ).matches;
+    const handleKeydown = (event: KeyboardEvent) => {
+        if (event.key === "Escape") dismiss();
+    };
     const dismiss = () => {
         if (dismissed) return;
         dismissed = true;
@@ -2375,19 +2397,22 @@ function injectOverlay(
             // see it in the page console; the UI still tears down.
             console.warn("[cortex.overlay] dismiss notify failed:", err);
         });
-        const el = document.getElementById(OID);
-        if (el) {
-            el.style.transition = "opacity .2s ease";
-            el.style.opacity = "0";
-            setTimeout(() => el.remove(), 220);
+        window.clearTimeout(autoDismissTimer);
+        document.removeEventListener("keydown", handleKeydown);
+        const panel = shadow.querySelector<HTMLElement>(".pn");
+        const backdrop = shadow.querySelector<HTMLElement>(".bk");
+        if (reducedMotion || !panel) {
+            host.remove();
+            return;
         }
+        panel.classList.add("cx-exit");
+        backdrop?.classList.add("cx-exit");
+        removalTimer = window.setTimeout(() => host.remove(), 170);
     };
     shadow.getElementById("xb")?.addEventListener("click", dismiss);
     shadow.getElementById("dm")?.addEventListener("click", dismiss);
     shadow.getElementById("bk")?.addEventListener("click", dismiss);
-    document.addEventListener("keydown", (e) => {
-        if (e.key === "Escape") dismiss();
-    }, { once: true });
+    document.addEventListener("keydown", handleKeydown);
 
     // CTA
     const ctaEl = shadow.getElementById("cta");
@@ -2438,7 +2463,12 @@ function injectOverlay(
         });
     }
 
-    setTimeout(dismiss, 5 * 60 * 1000);
+    autoDismissTimer = window.setTimeout(dismiss, 5 * 60 * 1000);
+    host.__cortexCleanup = () => {
+        window.clearTimeout(autoDismissTimer);
+        window.clearTimeout(removalTimer);
+        document.removeEventListener("keydown", handleKeydown);
+    };
 }
 
 
@@ -2449,9 +2479,14 @@ function injectOverlay(
  * payload.duration_s  — lockout duration in seconds
  * payload.reason      — brief message explaining why
  */
-function injectLockoutOverlay(payload: Record<string, unknown>): void {
+export function injectLockoutOverlay(payload: Record<string, unknown>): void {
     const OID = "cortex-lockout-overlay";
-    document.getElementById(OID)?.remove();
+    type ManagedLockoutHost = HTMLElement & {
+        __cortexCleanup?: () => void;
+    };
+    const existingHost = document.getElementById(OID) as ManagedLockoutHost | null;
+    existingHost?.__cortexCleanup?.();
+    const isUpdate = existingHost !== null;
 
     const durationS = Math.max(1, Math.round(Number(payload.duration_s) || 60));
     const reason = String(
@@ -2466,18 +2501,22 @@ function injectLockoutOverlay(payload: Record<string, unknown>): void {
         return `${m}:${String(s).padStart(2, "0")}`;
     }
 
-    const host = document.createElement("div");
-    host.id = OID;
-    host.style.cssText =
-        "position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483647;pointer-events:none;";
+    const host = (existingHost ?? document.createElement("div")) as ManagedLockoutHost;
+    if (!existingHost) {
+        host.id = OID;
+        host.style.cssText =
+            "position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483647;pointer-events:none;";
+    }
 
-    const shadow = host.attachShadow({ mode: "open" });
+    const shadow = host.shadowRoot ?? host.attachShadow({ mode: "open" });
     shadow.innerHTML = `
 <style>
-@keyframes panelIn{from{transform:translateY(12px) scale(.99);opacity:0}to{transform:translateY(0) scale(1);opacity:1}}
+@keyframes panelIn{from{transform:translate(-50%,calc(-50% + 8px)) scale(.98);opacity:0}to{transform:translate(-50%,-50%) scale(1);opacity:1}}
+@keyframes panelOut{from{transform:translate(-50%,-50%) scale(1);opacity:1}to{transform:translate(-50%,calc(-50% + 8px)) scale(.98);opacity:0}}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes fadeOut{from{opacity:1}to{opacity:0}}
 *{box-sizing:border-box;margin:0;padding:0}
-.bk{position:fixed;inset:0;background:rgba(0,0,0,.55);pointer-events:auto;animation:fadeIn .25s ease}
+.bk{position:fixed;inset:0;background:rgba(0,0,0,.55);pointer-events:auto;animation:fadeIn 160ms cubic-bezier(.23,1,.32,1)}
 .pn{
   position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:360px;
   pointer-events:auto;
@@ -2487,29 +2526,49 @@ function injectLockoutOverlay(payload: Record<string, unknown>): void {
   box-shadow:0 0 0 .5px rgba(0,0,0,.3),0 4px 20px rgba(0,0,0,.4),0 16px 40px rgba(0,0,0,.2);
   font-family:-apple-system,BlinkMacSystemFont,'Inter','SF Pro Text',system-ui,sans-serif;
   color:#e4e4e7;padding:28px 24px 22px;text-align:center;
-  animation:panelIn .3s cubic-bezier(.16,1,.3,1);
+  animation:panelIn 200ms cubic-bezier(.23,1,.32,1);
 }
+.pn.cx-update{animation:none}
+.pn.cx-exit{animation:panelOut 160ms cubic-bezier(.4,0,1,1) forwards}
+.bk.cx-exit{animation:fadeOut 160ms cubic-bezier(.4,0,1,1) forwards}
 .hd{font-size:15px;font-weight:600;color:#e4e4e7;margin-bottom:8px;letter-spacing:-.2px}
 .rs{font-size:12px;color:#71717a;line-height:1.5;margin-bottom:20px}
 .tm{font-size:40px;font-weight:700;color:#e4e4e7;font-variant-numeric:tabular-nums;margin-bottom:20px;font-family:'SF Mono','Fira Code',ui-monospace,monospace}
-.sk{display:inline-block;padding:7px 18px;border:1px solid rgba(255,255,255,.08);border-radius:8px;background:none;color:#71717a;font-size:11px;cursor:pointer;font-family:inherit;transition:all .12s}
-.sk:hover{color:#e4e4e7;border-color:rgba(255,255,255,.15)}
+.sk{display:inline-block;padding:7px 18px;border:1px solid rgba(255,255,255,.08);border-radius:8px;background:none;color:#71717a;font-size:11px;cursor:pointer;font-family:inherit;transition:color 120ms cubic-bezier(.23,1,.32,1),border-color 120ms cubic-bezier(.23,1,.32,1),transform 120ms cubic-bezier(.23,1,.32,1)}
+.sk:active{transform:scale(.97)}
+.sk:focus-visible{outline:2px solid #dfb15b;outline-offset:2px}
+@media (hover:hover) and (pointer:fine){.sk:hover{color:#e4e4e7;border-color:rgba(255,255,255,.15)}}
+@media (prefers-reduced-motion:reduce){.pn,.bk{animation:none!important}.sk{transition:color 120ms cubic-bezier(.23,1,.32,1),border-color 120ms cubic-bezier(.23,1,.32,1)!important}.sk:active{transform:none}}
 </style>
 <div class="bk" id="bk"></div>
-<div class="pn">
-  <div class="hd">Lockout Active</div>
+<div class="pn${isUpdate ? " cx-update" : ""}" role="dialog" aria-modal="true" aria-labelledby="cortex-lockout-title">
+  <div class="hd" id="cortex-lockout-title">Lockout Active</div>
   <div class="rs">${esc(reason)}</div>
   <div class="tm" id="countdown">${formatCountdown(durationS)}</div>
   <button class="sk" id="skip">I need to continue</button>
 </div>
 `;
 
-    document.body.appendChild(host);
+    if (!existingHost) document.body.appendChild(host);
 
     let remaining = durationS;
+    let dismissed = false;
+    let removalTimer = 0;
+    const reducedMotion = window.matchMedia(
+        "(prefers-reduced-motion: reduce)",
+    ).matches;
 
     function dismiss(): void {
-        host.remove();
+        if (dismissed) return;
+        dismissed = true;
+        window.clearInterval(timer);
+        if (reducedMotion) {
+            host.remove();
+            return;
+        }
+        shadow.querySelector(".pn")?.classList.add("cx-exit");
+        shadow.querySelector(".bk")?.classList.add("cx-exit");
+        removalTimer = window.setTimeout(() => host.remove(), 170);
     }
 
     const timer = setInterval(() => {
@@ -2525,16 +2584,25 @@ function injectLockoutOverlay(payload: Record<string, unknown>): void {
     // Skip button — no penalty, just dismiss. Lives in injected page-context
     // (executeScript), so the service-worker DEBUG flag is out of scope here.
     shadow.getElementById("skip")?.addEventListener("click", () => {
-        clearInterval(timer);
         dismiss();
     });
+
+    host.__cortexCleanup = () => {
+        window.clearInterval(timer);
+        window.clearTimeout(removalTimer);
+    };
 
     // Clicking backdrop does NOT dismiss — lockout must be waited out or explicitly skipped
 }
 
-function injectLeetCodeCoachOverlay(kind: string, payload: Record<string, unknown>): void {
+export function injectLeetCodeCoachOverlay(kind: string, payload: Record<string, unknown>): void {
     const OID = "cortex-leetcode-coach";
-    document.getElementById(OID)?.remove();
+    type ManagedCoachHost = HTMLElement & {
+        __cortexCleanup?: () => void;
+    };
+    const existingHost = document.getElementById(OID) as ManagedCoachHost | null;
+    existingHost?.__cortexCleanup?.();
+    const isUpdate = existingHost !== null;
 
     const esc = (s: string) =>
         s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -2569,31 +2637,52 @@ function injectLeetCodeCoachOverlay(kind: string, payload: Record<string, unknow
         extra = `<textarea id="lc-note" placeholder="The transferable pattern was..." spellcheck="false"></textarea>`;
     }
 
-    const host = document.createElement("div");
-    host.id = OID;
-    host.style.cssText = "position:fixed;inset:0;z-index:2147483647;pointer-events:none;";
-    const shadow = host.attachShadow({ mode: "open" });
+    const host = (existingHost ?? document.createElement("div")) as ManagedCoachHost;
+    if (!existingHost) {
+        host.id = OID;
+        host.style.cssText = "position:fixed;inset:0;z-index:2147483647;pointer-events:none;";
+    }
+    const shadow = host.shadowRoot ?? host.attachShadow({ mode: "open" });
     shadow.innerHTML = `
 <style>
 *{box-sizing:border-box}
-.card{position:fixed;right:22px;bottom:22px;width:min(380px,calc(100vw - 28px));pointer-events:auto;background:#101112;color:#f3f0e8;border:1px solid rgba(243,240,232,.12);border-radius:18px;box-shadow:0 18px 60px rgba(0,0,0,.35);font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;padding:18px;animation:in .22s cubic-bezier(.16,1,.3,1)}
+.card{position:fixed;right:22px;bottom:22px;width:min(380px,calc(100vw - 28px));pointer-events:auto;background:#101112;color:#f3f0e8;border:1px solid rgba(243,240,232,.12);border-radius:18px;box-shadow:0 18px 60px rgba(0,0,0,.35);font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;padding:18px;animation:in 200ms cubic-bezier(.23,1,.32,1)}
 @keyframes in{from{opacity:0;transform:translateY(10px) scale(.98)}to{opacity:1;transform:translateY(0) scale(1)}}
-.top{display:flex;align-items:center;gap:10px;margin-bottom:10px}.dot{width:9px;height:9px;border-radius:99px;background:#dfb15b;box-shadow:0 0 18px rgba(223,177,91,.55)}.ttl{font-size:14px;font-weight:700;letter-spacing:-.02em;flex:1}.x{border:0;background:transparent;color:#9b9488;font-size:18px;line-height:1;cursor:pointer}.body{font-size:13px;line-height:1.5;color:#cfc7b7;margin-bottom:13px}textarea{width:100%;height:92px;resize:vertical;background:#18191a;color:#f3f0e8;border:1px solid rgba(243,240,232,.14);border-radius:12px;padding:10px;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;outline:none}textarea:focus{border-color:#dfb15b}.tags{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}.tags span{font-size:11px;color:#dfb15b;border:1px solid rgba(223,177,91,.25);border-radius:99px;padding:4px 8px;background:rgba(223,177,91,.08)}button{border:1px solid rgba(243,240,232,.14);background:#dfb15b;color:#15110a;border-radius:10px;padding:8px 11px;font-size:12px;font-weight:700;cursor:pointer}.hint{margin-top:10px;font-size:12px;line-height:1.45;color:#cfc7b7;background:#18191a;border-radius:10px;padding:10px}label{display:flex;gap:8px;align-items:center;font-size:12px;color:#cfc7b7}
+@keyframes out{from{opacity:1;transform:translateY(0) scale(1)}to{opacity:0;transform:translateY(10px) scale(.98)}}
+.card.cx-update{animation:none}.card.cx-exit{animation:out 160ms cubic-bezier(.4,0,1,1) forwards}
+.top{display:flex;align-items:center;gap:10px;margin-bottom:10px}.dot{width:9px;height:9px;border-radius:99px;background:#dfb15b;box-shadow:0 0 18px rgba(223,177,91,.55)}.ttl{font-size:14px;font-weight:700;letter-spacing:-.02em;flex:1}.x{display:grid;place-items:center;width:32px;height:32px;padding:0;border:0;background:transparent;color:#9b9488;font-size:18px;line-height:1;cursor:pointer}.body{font-size:13px;line-height:1.5;color:#cfc7b7;margin-bottom:13px}textarea{width:100%;height:92px;resize:vertical;background:#18191a;color:#f3f0e8;border:1px solid rgba(243,240,232,.14);border-radius:12px;padding:10px;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;outline:none}textarea:focus{border-color:#dfb15b}.tags{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}.tags span{font-size:11px;color:#dfb15b;border:1px solid rgba(223,177,91,.25);border-radius:99px;padding:4px 8px;background:rgba(223,177,91,.08)}button{border:1px solid rgba(243,240,232,.14);background:#dfb15b;color:#15110a;border-radius:10px;padding:8px 11px;font-size:12px;font-weight:700;cursor:pointer;transition:transform 120ms cubic-bezier(.23,1,.32,1),filter 120ms cubic-bezier(.23,1,.32,1),background-color 120ms cubic-bezier(.23,1,.32,1)}button:active{transform:scale(.97)}button:focus-visible{outline:2px solid #f3f0e8;outline-offset:2px}.hint{margin-top:10px;font-size:12px;line-height:1.45;color:#cfc7b7;background:#18191a;border-radius:10px;padding:10px}label{display:flex;gap:8px;align-items:center;font-size:12px;color:#cfc7b7}@media (hover:hover) and (pointer:fine){button:hover{filter:brightness(.94)}.x:hover{background:rgba(243,240,232,.08);filter:none}}@media (prefers-reduced-motion:reduce){.card{animation:none!important}button{transition:filter 120ms cubic-bezier(.23,1,.32,1),background-color 120ms cubic-bezier(.23,1,.32,1)!important}button:active{transform:none}}
 </style>
-<div class="card">
-  <div class="top"><span class="dot"></span><div class="ttl">${esc(title)}</div><button class="x" id="lc-close">×</button></div>
+<div class="card${isUpdate ? " cx-update" : ""}" role="dialog" aria-labelledby="cortex-coach-title">
+  <div class="top"><span class="dot"></span><div class="ttl" id="cortex-coach-title">${esc(title)}</div><button class="x" id="lc-close" type="button" aria-label="Dismiss Cortex coach">×</button></div>
   <div class="body">${body}</div>
   ${extra}
 </div>`;
-    document.body.appendChild(host);
+    if (!existingHost) document.body.appendChild(host);
 
-    shadow.getElementById("lc-close")?.addEventListener("click", () => host.remove());
+    let dismissed = false;
+    let removalTimer = 0;
+    const reducedMotion = window.matchMedia(
+        "(prefers-reduced-motion: reduce)",
+    ).matches;
+    const dismiss = () => {
+        if (dismissed) return;
+        dismissed = true;
+        const card = shadow.querySelector<HTMLElement>(".card");
+        if (reducedMotion || !card) {
+            host.remove();
+            return;
+        }
+        card.classList.add("cx-exit");
+        removalTimer = window.setTimeout(() => host.remove(), 170);
+    };
+    shadow.getElementById("lc-close")?.addEventListener("click", dismiss);
     shadow.getElementById("lc-reveal")?.addEventListener("click", () => {
         const hint = shadow.getElementById("lc-hint");
         if (hint) {
             hint.textContent = "Hint 2: define the state transition and one invariant before writing more code.";
         }
     });
+    host.__cortexCleanup = () => window.clearTimeout(removalTimer);
 }
 
 async function handleIntervention(
@@ -2627,7 +2716,7 @@ async function handleIntervention(
                 active: true,
                 currentWindow: true,
             });
-            if (tab?.id) {
+            if (tab?.id && !tab.incognito) {
                 await chrome.scripting.executeScript({
                     target: { tabId: tab.id },
                     func: injectOverlay,
@@ -2662,13 +2751,16 @@ async function handleContextRequest(msg: WSMessage): Promise<void> {
                     active: true,
                     currentWindow: true,
                 });
-                if (tab?.id) {
+                if (tab?.id && await mayExtractPageContent(tab)) {
                     const results = await chrome.scripting.executeScript({
                         target: { tabId: tab.id },
                         func: extractPageText,
                     });
                     if (results?.[0]?.result) {
-                        contentExcerpt = results[0].result as string;
+                        contentExcerpt = sanitizeContextText(
+                            String(results[0].result),
+                            PAGE_EXCERPT_MAX_CHARS,
+                        ).value;
                     }
                 }
             } catch {
@@ -2684,6 +2776,13 @@ async function handleContextRequest(msg: WSMessage): Promise<void> {
                     active_tab_url: activeTab?.url ?? "",
                     active_tab_content_excerpt: contentExcerpt,
                     all_tabs: tabs,
+                    tab_type_classification: tabs.reduce<Record<string, number>>(
+                        (counts, tab) => {
+                            counts[tab.tab_type] = (counts[tab.tab_type] ?? 0) + 1;
+                            return counts;
+                        },
+                        {},
+                    ),
                     focus_goal: focusSession?.goal ?? null,
                 },
             },
@@ -2782,19 +2881,24 @@ async function collectTabs(): Promise<TabData[]> {
         : [];
 
     const now = Date.now();
-    return chromeTabs.map((tab) => {
+    return chromeTabs.filter((tab) => !tab.incognito).map((tab) => {
+        const rawTitle = tab.title ?? "";
+        const rawUrl = tab.url ?? "";
         // Use goal-aware classification when a focus session is active
         const tabType = goalKeywords.length > 0
-            ? classifyTabTypeWithGoal(tab.url ?? "", tab.title ?? "", goalKeywords)
-            : classifyBrowserTabType(tab.url ?? "");
+            ? classifyTabTypeWithGoal(rawUrl, rawTitle, goalKeywords)
+            : classifyBrowserTabType(rawUrl);
         const lastActive = tabLastActivated.get(tab.id ?? -1);
         return {
-            title: tab.title ?? "",
-            url: tab.url ?? "",
+            title: sanitizeContextText(rawTitle, TAB_TITLE_MAX_CHARS).value,
+            url: minimizeContextUrl(rawUrl),
             tab_type: tabType,
             is_active: tab.active ?? false,
             tab_id: tab.id ?? -1,
-            topic_hint: extractTopicHint(tab.title ?? "", tab.url ?? "", tabType),
+            topic_hint: sanitizeContextText(
+                extractTopicHint(rawTitle, rawUrl, tabType),
+                120,
+            ).value,
             last_activated_ago_seconds: lastActive != null
                 ? Math.floor((now - lastActive) / 1000)
                 : null,
@@ -2805,7 +2909,7 @@ async function collectTabs(): Promise<TabData[]> {
 // --- Content extraction function (injected into page) ---
 
 function extractPageText(): string {
-    const MAX_CHARS = 8000; // ~2000 tokens
+    const MAX_CHARS = 2000;
     const walker = document.createTreeWalker(
         document.body,
         NodeFilter.SHOW_TEXT,
@@ -3348,7 +3452,9 @@ async function snapshotTabsForIntervention(): Promise<void> {
     }
     // Verify all snapshot tab IDs still exist (tabs may have been closed)
     try {
-        const liveTabs = await chrome.tabs.query({});
+        const liveTabs = (await chrome.tabs.query({})).filter(
+            (tab) => !tab.incognito,
+        );
         const liveIds = new Set(liveTabs.map(t => t.id));
         for (const [idx, entry] of interventionTabSnapshot) {
             if (!liveIds.has(entry.chromeTabId)) {
@@ -3496,7 +3602,7 @@ async function verifyBrowserEffect(
         const tabIds = Array.isArray(inverse.hiddenTabIds)
             ? inverse.hiddenTabIds.filter((id): id is number => typeof id === "number")
             : [];
-        const tabs = await chrome.tabs.query({});
+        const tabs = (await chrome.tabs.query({})).filter((tab) => !tab.incognito);
         const grouped = tabs.filter(
             (tab) => typeof tab.id === "number" && tabIds.includes(tab.id),
         );
@@ -3953,12 +4059,18 @@ async function prepareBrowserInverse(
         || suggested.action_type === "search_error"
     ) {
         const query = String((suggested.metadata || {}).search_query || suggested.target || "");
+        const [active] = await chrome.tabs.query({
+            active: true,
+            currentWindow: true,
+        });
         return {
             url: suggested.action_type === "search_error"
                 ? `https://www.google.com/search?q=${encodeURIComponent(query)}`
                 : suggested.target,
             stagingUrl: newCreatedTabStageUrl(),
             createdAfterUnixMs: Date.now(),
+            blockedIncognito: active?.incognito === true,
+            windowId: active?.incognito === true ? null : active?.windowId ?? null,
         };
     }
     if (suggested.action_type === "highlight_tab") {
@@ -5618,11 +5730,26 @@ async function executeOpenUrl(
     if (!action.target) {
         return { action_id: action.action_id, success: false, message: "No URL provided", reversible: false };
     }
+    if (preparedInverse.blockedIncognito === true) {
+        return {
+            action_id: action.action_id,
+            success: false,
+            message: "Cortex never changes incognito windows",
+            reversible: false,
+        };
+    }
     const stagingUrl = preparedInverse.stagingUrl;
     if (!validCreatedTabStageUrl(stagingUrl)) {
         throw new Error("Created-tab recovery marker is missing or invalid");
     }
-    const tab = await chrome.tabs.create({ url: stagingUrl, active: false });
+    const windowId = typeof preparedInverse.windowId === "number"
+        ? preparedInverse.windowId
+        : undefined;
+    const tab = await chrome.tabs.create({
+        url: stagingUrl,
+        active: false,
+        ...(windowId === undefined ? {} : { windowId }),
+    });
     if (typeof tab.id !== "number") {
         throw new IndeterminateBrowserMutationError(
             "Chrome created a staged tab without returning its identity",
@@ -5685,12 +5812,27 @@ async function executeSearchError(
     if (!query) {
         return { action_id: action.action_id, success: false, message: "No search query", reversible: false };
     }
+    if (preparedInverse.blockedIncognito === true) {
+        return {
+            action_id: action.action_id,
+            success: false,
+            message: "Cortex never changes incognito windows",
+            reversible: false,
+        };
+    }
     const url = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
     const stagingUrl = preparedInverse.stagingUrl;
     if (!validCreatedTabStageUrl(stagingUrl)) {
         throw new Error("Created-tab recovery marker is missing or invalid");
     }
-    const tab = await chrome.tabs.create({ url: stagingUrl, active: false });
+    const windowId = typeof preparedInverse.windowId === "number"
+        ? preparedInverse.windowId
+        : undefined;
+    const tab = await chrome.tabs.create({
+        url: stagingUrl,
+        active: false,
+        ...(windowId === undefined ? {} : { windowId }),
+    });
     if (typeof tab.id !== "number") {
         throw new IndeterminateBrowserMutationError(
             "Chrome created a staged search tab without returning its identity",
@@ -6146,32 +6288,97 @@ function showHealthNotification(title: string, body: string): void {
 async function injectToast(title: string, body: string): Promise<void> {
     try {
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (tab?.id && tab.url && !tab.url.startsWith("chrome://")) {
+        if (tab?.id && tab.url && !tab.incognito && !tab.url.startsWith("chrome://")) {
             await chrome.scripting.executeScript({
                 target: { tabId: tab.id },
                 func: (t: string, b: string) => {
                     const id = "cortex-toast";
                     document.getElementById(id)?.remove();
-                    const el = document.createElement("div");
-                    el.id = id;
-                    el.style.cssText =
-                        "position:fixed;top:16px;right:16px;z-index:2147483647;max-width:300px;" +
-                        "padding:12px 14px;border-radius:10px;font-family:-apple-system,BlinkMacSystemFont,'Inter','SF Pro Text',system-ui,sans-serif;" +
-                        "background:#111113;color:#e4e4e7;border:1px solid rgba(255,255,255,.06);" +
-                        "box-shadow:0 4px 20px rgba(0,0,0,.4);animation:cortexSlideIn .25s ease;font-size:12px;line-height:1.5;" +
-                        "cursor:pointer;";
+                    const host = document.createElement("div");
+                    host.id = id;
+                    host.style.cssText =
+                        "position:fixed;top:16px;right:16px;z-index:2147483647;";
+                    host.setAttribute("role", "status");
+                    host.setAttribute("aria-live", "polite");
+                    const shadow = host.attachShadow({ mode: "open" });
                     const style = document.createElement("style");
-                    style.textContent = "@keyframes cortexSlideIn{from{transform:translateY(-12px);opacity:0}to{transform:translateY(0);opacity:1}}";
+                    style.textContent = `
+                        *{box-sizing:border-box}
+                        .toast{position:relative;width:min(320px,calc(100vw - 32px));padding:12px 42px 12px 14px;border-radius:10px;font-family:-apple-system,BlinkMacSystemFont,'Inter','SF Pro Text',system-ui,sans-serif;background:#111113;color:#e4e4e7;border:1px solid rgba(255,255,255,.06);box-shadow:0 4px 20px rgba(0,0,0,.4);font-size:12px;line-height:1.5}
+                        .title{font-weight:600;margin-bottom:3px;font-size:12px;color:#e4e4e7}
+                        .body{color:#a1a1aa;font-size:11px}
+                        .close{position:absolute;top:6px;right:6px;width:32px;height:32px;border:0;border-radius:7px;background:transparent;color:#a1a1aa;font:16px/1 system-ui;cursor:pointer;transition:background-color 120ms cubic-bezier(.23,1,.32,1),color 120ms cubic-bezier(.23,1,.32,1),transform 120ms cubic-bezier(.23,1,.32,1)}
+                        .close:active{transform:scale(.96)}
+                        .close:focus-visible{outline:2px solid #dfb15b;outline-offset:1px}
+                        @media (hover:hover) and (pointer:fine){.close:hover{background:rgba(255,255,255,.07);color:#e4e4e7}}
+                        @media (prefers-reduced-motion:reduce){.close{transition:background-color 120ms cubic-bezier(.23,1,.32,1),color 120ms cubic-bezier(.23,1,.32,1)}.close:active{transform:none}}
+                    `;
+                    const toast = document.createElement("div");
+                    toast.className = "toast";
                     const titleEl = document.createElement("div");
-                    titleEl.style.cssText = "font-weight:600;margin-bottom:3px;font-size:12px;color:#e4e4e7";
+                    titleEl.className = "title";
                     titleEl.textContent = t;
                     const bodyEl = document.createElement("div");
-                    bodyEl.style.cssText = "color:#71717a;font-size:11px";
+                    bodyEl.className = "body";
                     bodyEl.textContent = b;
-                    el.append(style, titleEl, bodyEl);
-                    el.addEventListener("click", () => el.remove());
-                    document.body.appendChild(el);
-                    setTimeout(() => el.remove(), 8000);
+                    const close = document.createElement("button");
+                    close.className = "close";
+                    close.type = "button";
+                    close.setAttribute("aria-label", "Dismiss health notification");
+                    close.textContent = "×";
+                    toast.append(titleEl, bodyEl, close);
+                    shadow.append(style, toast);
+                    document.body.appendChild(host);
+
+                    const reduced = window.matchMedia(
+                        "(prefers-reduced-motion: reduce)",
+                    ).matches;
+                    let dismissed = false;
+                    let timeoutId = 0;
+                    const dismiss = () => {
+                        if (dismissed) return;
+                        dismissed = true;
+                        window.clearTimeout(timeoutId);
+                        toast.getAnimations().forEach((animation) =>
+                            animation.cancel(),
+                        );
+                        if (reduced) {
+                            host.remove();
+                            return;
+                        }
+                        const exit = toast.animate(
+                            [
+                                { opacity: 1, transform: "translateY(0)" },
+                                {
+                                    opacity: 0,
+                                    transform: "translateY(-8px)",
+                                },
+                            ],
+                            {
+                                duration: 140,
+                                easing: "cubic-bezier(.4,0,1,1)",
+                                fill: "forwards",
+                            },
+                        );
+                        exit.onfinish = () => host.remove();
+                    };
+                    close.addEventListener("click", dismiss);
+                    if (!reduced) {
+                        toast.animate(
+                            [
+                                {
+                                    opacity: 0,
+                                    transform: "translateY(-8px)",
+                                },
+                                { opacity: 1, transform: "translateY(0)" },
+                            ],
+                            {
+                                duration: 160,
+                                easing: "cubic-bezier(.23,1,.32,1)",
+                            },
+                        );
+                    }
+                    timeoutId = window.setTimeout(dismiss, 8000);
                 },
                 args: [title, body],
             });
@@ -6330,7 +6537,9 @@ async function broadcastToContentScripts(
     lastAmbientBroadcast = now;
 
     try {
-        const tabs = await chrome.tabs.query({});
+        const tabs = (await chrome.tabs.query({})).filter(
+            (tab) => !tab.incognito,
+        );
         for (const tab of tabs) {
             if (tab.id && tab.url && !tab.url.startsWith("chrome://")) {
                 chrome.tabs.sendMessage(tab.id, message).catch(() => {
@@ -6348,7 +6557,7 @@ async function broadcastToContentScripts(
 chrome.runtime.onMessage.addListener(
     (
         message: Record<string, unknown>,
-        _sender: chrome.runtime.MessageSender,
+        sender: chrome.runtime.MessageSender,
         sendResponse: (response: unknown) => void,
     ) => {
         // F19b: every popup/newtab message can carry a correlation_id minted
@@ -6359,6 +6568,18 @@ chrome.runtime.onMessage.addListener(
             console.debug(`cortex.bg.recv cid=${__cid} type=${String(message.type)}`);
         }
         switch (message.type) {
+            case "SITE_ACCESS_REVOKED":
+                // Drop the only context-time tab snapshot immediately. Page
+                // excerpts are never persisted; subsequent daemon requests
+                // will fail the optional-host check and return an empty
+                // excerpt. Incognito tabs are excluded independently.
+                lastContextTabs = null;
+                lastContextTabsTimestamp = 0;
+                scrubStoredActivityContent()
+                    .then(() => sendResponse({ ok: true }))
+                    .catch(() => sendResponse({ ok: false }));
+                return true;
+
             case "GET_STATE":
                 // If activeIntervention was lost (SW restart), load from session storage
                 if (!activeIntervention) {
@@ -6850,23 +7071,41 @@ chrome.runtime.onMessage.addListener(
 
             case "LEETCODE_CONTEXT_UPDATE": {
                 const payload = (message.payload || {}) as Record<string, unknown>;
-                send({
-                    type: "LEETCODE_CONTEXT_UPDATE",
-                    payload,
-                    timestamp: Date.now() / 1000,
-                    sequence: ++sequence,
-                });
-                sendResponse({ ok: true });
-                break;
+                const tab = sender.tab;
+                (async () => {
+                    const allowPageContent = Boolean(
+                        tab && !tab.incognito && await mayExtractPageContent(tab),
+                    );
+                    const safePayload = { ...payload };
+                    if (!allowPageContent) safePayload.code_snapshot = "";
+                    else safePayload.code_snapshot = sanitizeContextText(
+                        String(payload.code_snapshot ?? ""),
+                        PAGE_EXCERPT_MAX_CHARS,
+                    ).value;
+                    send({
+                        type: "LEETCODE_CONTEXT_UPDATE",
+                        payload: safePayload,
+                        timestamp: Date.now() / 1000,
+                        sequence: ++sequence,
+                    });
+                    sendResponse({ ok: true });
+                })().catch(() => sendResponse({ ok: false }));
+                return true;
             }
 
             case "ACTIVITY_UPDATE": {
-                const record = message.record as ActivityRecord;
-                if (record?.content_id) {
-                    enrichWithRelatedTabs(record).then(() => upsertActivity(record));
-                }
-                sendResponse({ ok: true });
-                break;
+                prepareActivityRecordForStorage(message.record, sender.tab)
+                    .then(async (record) => {
+                        if (!record) {
+                            sendResponse({ ok: false, ignored: true });
+                            return;
+                        }
+                        await enrichWithRelatedTabs(record);
+                        await upsertActivity(record);
+                        sendResponse({ ok: true });
+                    })
+                    .catch(() => sendResponse({ ok: false }));
+                return true;
             }
 
             case "GET_RECENT_ACTIVITIES":
@@ -7186,14 +7425,15 @@ chrome.storage.onChanged.addListener((changes, area) => {
             wrong_answer_count: session.wrong_answer_count || 0,
             accepted: session.accepted || false,
             time_elapsed_s: session.time_elapsed_s || 0,
-            code_snapshot: session.code_snapshot,
+            // Session persistence deliberately excludes raw source text.
+            code_snapshot: undefined,
         },
         content_duration_s: 0,
         duration_spent_s: session.time_elapsed_s || 0,
         session_duration_s: session.time_elapsed_s || 0,
         first_visited: (session.saved_at || Date.now()) - (session.time_elapsed_s || 0) * 1000,
         last_visited: session.saved_at || Date.now(),
-        context_snapshot: `${session.difficulty || ""} — ${session.tags?.join(", ") || ""}`,
+        context_snapshot: "",
         topic_tags: session.tags || [],
         completion_pct: session.accepted ? 100 : Math.min((session.time_elapsed_s || 0) / 1800 * 50, 50),
         max_completion_pct: session.accepted ? 100 : 0,
@@ -7205,7 +7445,8 @@ chrome.storage.onChanged.addListener((changes, area) => {
         playlist_index: -1,
         related_tabs: [],
     };
-    upsertActivity(record);
+    const safeRecord = sanitizeActivityRecord(record, false);
+    if (safeRecord) upsertActivity(safeRecord);
 });
 
 // --- Distraction Blocking (tab navigation listener) ---

@@ -133,7 +133,7 @@ def _make_planner(**config_kwargs: Any) -> AnthropicPlanner:
         max_concurrent_requests=2,
         **config_kwargs,
     )
-    return AnthropicPlanner(cfg, sdk=sdk)
+    return AnthropicPlanner(cfg, sdk=sdk, _allow_unbrokered_test_requests=True)
 
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,9 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from cortex.apps.desktop_shell import mac_native
 from cortex.apps.desktop_shell.break_overlay import BreakOverlayWindow
 from cortex.apps.desktop_shell.connections import ConnectionsPanel
+from cortex.apps.desktop_shell.context_privacy_controller import (
+    ContextPrivacyController,
+)
 from cortex.apps.desktop_shell.dashboard import DashboardWindow
 from cortex.apps.desktop_shell.onboarding import OnboardingWindow, onboarding_marker_path
 from cortex.apps.desktop_shell.overlay import OverlayWindow
@@ -384,6 +387,7 @@ class CortexAppController:
         # boot cost.
         self._break_overlay: BreakOverlayWindow | None = None
         self._settings = SettingsDialog()
+        self._context_privacy_controller = ContextPrivacyController(self._settings)
         self._onboarding = OnboardingWindow()
 
         self._tray = CortexTrayIcon(self._app)
@@ -481,6 +485,30 @@ class CortexAppController:
         if hasattr(self._overlay, "quiet_requested"):
             self._overlay.quiet_requested.connect(self._on_quiet_requested)
         self._settings.settings_changed.connect(self._on_settings_changed)
+        self._settings.context_privacy_status_requested.connect(
+            self._context_privacy_controller.refresh_status
+        )
+        self._settings.context_preview_requested.connect(
+            self._context_privacy_controller.preview_current
+        )
+        self._settings.context_preview_confirm_requested.connect(
+            self._context_privacy_controller.confirm_once
+        )
+        self._settings.context_preview_cancel_requested.connect(
+            self._context_privacy_controller.cancel_preview
+        )
+        self._context_privacy_controller.status_received.connect(
+            self._settings.apply_context_privacy_status
+        )
+        self._context_privacy_controller.preview_received.connect(
+            self._settings.apply_context_preview
+        )
+        self._context_privacy_controller.confirmation_received.connect(
+            self._settings.apply_context_preview_confirmation
+        )
+        self._context_privacy_controller.request_failed.connect(
+            self._settings.apply_context_privacy_error
+        )
         self._settings.back_requested.connect(self._show_dashboard)
         self._connections.back_requested.connect(self._show_dashboard)
         self._onboarding.open_settings_requested.connect(self._show_settings)

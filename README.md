@@ -99,7 +99,9 @@
 - **Evidence-aware support estimates** — fixed-denominator behavior scores,
   explicit unknown/warm-up states, provenance, coverage, and a fail-closed
   rollback; never calibrated probabilities or diagnoses.
-- **LLM-generated proposals** — selected workspace context can be sent to Claude; structured output is schema-validated and presented as suggestions by default.
+- **Preview-gated LLM proposals** — model networking is off by default. In
+  external mode, the user inspects one exact redacted payload and provider
+  caveat, confirms it once, and receives a locally validated proposal.
 - **LeetCode mode** — DOM observer, stage inference (READ / PLAN / IMPLEMENT / DEBUG / REFLECT), amygdala-hijack lockout, pattern-ladder hints, submission-discipline guard.
 - **Suggestion-only authority** — fresh and migrated installs cannot mutate tabs, editors, windows, or files from a proposal. Higher modes remain explicit and guarded while transactional authorization is completed.
 - **Exact consent outcomes** — permit, downgrade, and deny are distinct; a downgraded request cannot execute its original plan.
@@ -288,11 +290,24 @@ notarytool keychain profile before running `make dmg`.
 ## Privacy
 
 - **No video is ever saved.** Frames are processed in memory and immediately discarded.
-- **No biometrics reach the LLM.** The model sees only workspace context: file paths, error messages, tab titles.
+- **No raw biometrics reach the LLM.** Camera frames, landmarks, waveforms,
+  IBIs, and raw physiological observations are absent from the planner
+  contract. An explicitly selected support status is a heuristic label, not a
+  biometric stream.
+- **External context is off by default.** The default deterministic planner
+  makes no model-network call. External mode requires revision-bound setup,
+  per-source selection, an exact redacted preview, and one-time confirmation.
+- **Browser page content is per-site.** Activity telemetry stays
+  metadata-only; page-body excerpts require an explicit grant for the current
+  HTTP(S) origin and are never collected in incognito.
 - **Local-only network surface.** FastAPI, WebSocket, and the launcher agent bind to `127.0.0.1` and require a capability token.
-- **User authority.** The shipped default is suggestion-only. Experimental mutation modes remain disabled until the transactional authorization and durable-receipt gates in [`IMPLEMENTATION.md`](IMPLEMENTATION.md) pass.
+- **User authority.** The shipped default is suggestion-only. A model response
+  never grants authority; any enabled effect needs a separate exact manifest,
+  authorization, receipt, verification, and restore lifecycle.
 
-See [Privacy](https://github.com/StevenWang-CY/cortex/wiki/Privacy) and [SECURITY.md](SECURITY.md) for the full boundary commitments.
+See [Privacy](cortex/docs/privacy.md), [Security](cortex/docs/security.md),
+[UI design](cortex/docs/ui-design.md), and [SECURITY.md](SECURITY.md) for the
+full boundary commitments.
 
 ---
 

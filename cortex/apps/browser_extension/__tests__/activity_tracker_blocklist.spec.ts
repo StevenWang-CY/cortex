@@ -28,16 +28,15 @@ describe("Audit-2 activity-tracker blocklist", () => {
         expect(mod).toBeTruthy();
     });
 
-    // EXT-3: the tracker must live under contents/ and export a
-    // PlasmoCSConfig matching <all_urls>, otherwise Plasmo never bundles
-    // it as a content script and ACTIVITY_UPDATE is never emitted on any
-    // page. The exported ``config`` is the contract Plasmo's analyzer
-    // reads; assert it stays present + correct so a future refactor that
-    // drops the export fails CI rather than silently disabling tracking.
-    it("exports a PlasmoCSConfig matching all urls", async () => {
+    // The tracker remains a declarative Plasmo script only on its explicit
+    // learning-platform allowlist. Arbitrary-site access is optional and is
+    // never reintroduced through a hidden <all_urls> content-script match.
+    it("exports a narrow PlasmoCSConfig without all-sites access", async () => {
         const mod = await import("../contents/activity-tracker");
         expect(mod.config).toBeDefined();
-        expect(mod.config.matches).toContain("<all_urls>");
+        expect(mod.config.matches).not.toContain("<all_urls>");
+        expect(mod.config.matches).toContain("https://*.youtube.com/*");
+        expect(mod.config.matches).toContain("https://*.coursera.org/*");
         expect(mod.config.run_at).toBe("document_idle");
     });
 });

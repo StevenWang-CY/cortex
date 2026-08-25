@@ -221,6 +221,45 @@ class BedrockConfig(BaseModel):
     keychain_account: str = "bearer_token"
 
 
+class LLMPrivacyConfig(BaseModel):
+    """Fail-closed policy for workspace context and external planners.
+
+    ``no_llm`` is the product default: Cortex may use local workspace context
+    in the deterministic rule planner, but it never opens a model-network
+    connection. ``no_content`` is stricter and ignores workspace content
+    entirely. ``external_redacted`` is available only when the separate
+    ``external_context_enabled`` acknowledgement is set; every individual
+    request must still pass through the short-lived preview/confirmation
+    protocol implemented by the context broker.
+
+    The acknowledgement is deliberately revision-bound.  A material change
+    to the disclosure copy or outbound field catalog increments
+    ``required_consent_revision`` and makes old configuration fail closed.
+    """
+
+    planner_mode: Literal["no_llm", "no_content", "external_redacted"] = "no_llm"
+    external_context_enabled: bool = False
+    consent_revision: str = Field(default="", max_length=64)
+    required_consent_revision: Literal["context-disclosure-v1"] = "context-disclosure-v1"
+    preview_ttl_seconds: int = Field(default=60, ge=15, le=60)
+    max_pending_previews: int = Field(default=16, ge=1, le=64)
+    provider_retention_mode: Literal[
+        "unverified",
+        "provider_default",
+        "zero_data_retention_contract",
+    ] = "unverified"
+
+    @property
+    def external_transport_enabled(self) -> bool:
+        """Whether configuration has acknowledged the current disclosure."""
+
+        return (
+            self.planner_mode == "external_redacted"
+            and self.external_context_enabled
+            and self.consent_revision == self.required_consent_revision
+        )
+
+
 class LLMConfig(BaseModel):
     """LLM engine configuration — Anthropic SDK over Bedrock (primary).
 
@@ -239,6 +278,7 @@ class LLMConfig(BaseModel):
 
     provider: Literal["bedrock", "vertex", "direct"] = "bedrock"
     bedrock: BedrockConfig = Field(default_factory=BedrockConfig)
+    privacy: LLMPrivacyConfig = Field(default_factory=LLMPrivacyConfig)
     use_keychain: bool = True
 
     # Three logical tiers — actual model selection per template lives in
@@ -251,7 +291,10 @@ class LLMConfig(BaseModel):
     temperature: float = 0.3
     # Bedrock cold starts can take 5-10s; Opus calls can exceed 20s.
     timeout_seconds: float = 30.0
-    cache_ttl_seconds: int = 300
+    # Plans can echo redacted-but-still-private workspace details. Keep them
+    # in memory briefly and bound configuration so an old environment value
+    # cannot silently turn the cache into long-lived context retention.
+    cache_ttl_seconds: int = Field(default=60, ge=0, le=60)
     # Per-template overrides keyed by template_name (e.g. {"debug_error_summary": "deep"}).
     template_tier_overrides: dict[str, Literal["fast", "default", "deep"]] = Field(
         default_factory=dict,

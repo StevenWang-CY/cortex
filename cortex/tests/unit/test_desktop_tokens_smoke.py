@@ -21,6 +21,7 @@ STRING_TOKEN_NAMES = [
     "BRAND_ACCENT",
     "BRAND_ACCENT_HOVER",
     "BRAND_ACCENT_PRESSED",
+    "BRAND_ACCENT_TEXT",
     "BRAND_ACCENT_DARK",
     "BRAND_ACCENT_DIM",
     "BRAND_ACCENT_SUBTLE",
@@ -43,6 +44,7 @@ STRING_TOKEN_NAMES = [
     "CX_TEXT_INVERSE",
     "CX_ACCENT",
     "CX_ACCENT_HOVER",
+    "CX_ACCENT_TEXT",
     "CX_ACCENT_DIM",
     "CX_ACCENT_SUBTLE",
     "CX_SUCCESS",
@@ -139,6 +141,14 @@ def test_state_color_map_has_canonical_states() -> None:
     assert canonical.issubset(tokens.STATE_COLORS.keys())
     for state in canonical:
         color = tokens.STATE_COLORS[state]
+        assert isinstance(color, str) and color != ""
+
+
+def test_state_text_color_map_has_canonical_states() -> None:
+    canonical = {"FLOW", "HYPER", "HYPO", "RECOVERY"}
+    assert canonical.issubset(tokens.STATE_TEXT_COLORS.keys())
+    for state in canonical:
+        color = tokens.STATE_TEXT_COLORS[state]
         assert isinstance(color, str) and color != ""
 
 

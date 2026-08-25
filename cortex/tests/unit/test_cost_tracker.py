@@ -119,6 +119,7 @@ def _make_planner(
         cfg,
         sdk=sdk or _make_stub_sdk(),
         cost_tracker=cost_tracker,
+        _allow_unbrokered_test_requests=True,
     )
 
 
