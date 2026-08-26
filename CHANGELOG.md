@@ -4,6 +4,41 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.3.5] — 2026-08-26
+
+This patch preserves clean-checkout release provenance while the macOS builder
+stages its key-free bundled environment. It contains no sensing or inference-
+algorithm, authority, privacy, or interaction-policy change from v0.3.0.
+
+### Fixed
+
+* The scrubbed environment that PyInstaller consumes is now created in the
+  runner temporary directory rather than as an untracked `.env.bundled` file
+  inside the checkout. The ignored `.env` build input remains the only
+  temporary repository-path projection and is removed by the existing exit
+  cleanup.
+* A developer's original `.env`, when present, is also backed up outside the
+  checkout. Production evidence generation can therefore require a genuinely
+  clean tree before exit cleanup without ignoring or special-casing any
+  build-created provenance input.
+* Added a release-tooling contract that rejects repository-local scrubbed or
+  backup environment paths and keeps the fail-closed `--require-clean` gate.
+* Mounted deep signature verification now has a command-specific, bounded
+  five-minute budget. The generic 60-second subprocess limit was insufficient
+  for the thousands of nested members in the Intel app on hosted runners and
+  incorrectly reported a timeout after signing, notarization, and stapling had
+  all succeeded.
+
+### Release process
+
+* The immutable v0.3.4 tag is retained as an artifact-free candidate. Its
+  arm64 DMG was signed, accepted by Apple, stapled, accepted by Gatekeeper, and
+  passed mounted frozen-artifact verification before provenance correctly
+  rejected the still-present untracked `.env.bundled` staging file. Its Intel
+  DMG was signed, accepted, and stapled before mounted deep signature
+  verification exceeded the generic 60-second command budget. v0.3.5
+  supersedes both failures; no v0.3.4 tag or artifact is replaced.
+
 ## [v0.3.4] — 2026-08-25
 
 This patch signs and verifies the outer macOS disk-image container before
