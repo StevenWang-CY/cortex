@@ -98,7 +98,7 @@ BIO_BLINK: Final[str] = '#D9B457'
 # --- Typography ---
 FONT_SYSTEM: Final[str] = '-apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", system-ui, sans-serif'
 FONT_DISPLAY: Final[str] = '"Cormorant Garamond", ui-serif, Georgia, serif'
-FONT_MONO: Final[str] = '"SF Mono", ui-monospace, "JetBrains Mono", Menlo, monospace'
+FONT_MONO: Final[str] = 'Menlo, ui-monospace, "SF Mono", "JetBrains Mono", monospace'
 
 # 5-step modular scale (pt)
 FS_CAPTION: Final[int] = 11

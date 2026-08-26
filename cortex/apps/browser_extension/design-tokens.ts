@@ -33,7 +33,7 @@ export const CX = {
     font: "-apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"SF Pro Display\", system-ui, sans-serif",
     fontSerif: "ui-serif, Georgia, Cambria, \"Times New Roman\", serif",
     fontBrand: "\"Cormorant Garamond\", ui-serif, Georgia, serif",
-    mono: "\"SF Mono\", ui-monospace, \"JetBrains Mono\", Menlo, monospace",
+    mono: "Menlo, ui-monospace, \"SF Mono\", \"JetBrains Mono\", monospace",
 
     // Light/dark semantic palette — apply via prefers-color-scheme.
     light: {

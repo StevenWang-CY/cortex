@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import sys
 import threading
@@ -32,10 +33,12 @@ from cortex.apps.desktop_shell.context_privacy_controller import (
     ContextPrivacyController,
 )
 from cortex.apps.desktop_shell.dashboard import DashboardWindow
+from cortex.apps.desktop_shell.font_assets import install_application_fonts
 from cortex.apps.desktop_shell.message_router import DesktopMessageRouter
 from cortex.apps.desktop_shell.onboarding import OnboardingWindow, onboarding_marker_path
 from cortex.apps.desktop_shell.overlay import OverlayWindow
 from cortex.apps.desktop_shell.settings import SettingsDialog
+from cortex.apps.desktop_shell.tokens import FS_FOOTNOTE
 from cortex.apps.desktop_shell.tray import CortexTrayIcon
 from cortex.libs.config.settings import get_config
 
@@ -357,6 +360,7 @@ class CortexAppController:
         # legacy back-compat signal that fans in to the same handler) is
         # then a no-op instead of re-scheduling ``daemon.stop()``.
         self._stopping: bool = False
+        self._quit_when_daemon_stops: bool = False
         # P2 (audit-prod): teardown handle for the light/dark appearance
         # observer; kept alive for the controller lifetime.
         self._appearance_teardown: Callable[[], None] | None = None
@@ -365,11 +369,19 @@ class CortexAppController:
 
     def run(self) -> int:
         """Create the Qt app, start the daemon, and enter the event loop."""
+        logger.info("startup.stage name=storage_directories")
         _ensure_storage_dirs()
 
+        logger.info("startup.stage name=qt_application")
         self._app = QApplication(sys.argv)
         self._app.setApplicationName("Cortex")
         self._app.setOrganizationName("Cortex")
+        # Qt's offscreen backend otherwise defaults to a non-existent
+        # "Sans Serif" alias, and unstyled/native controls can inherit that
+        # fallback in production too. Establish the macOS system font once at
+        # the application boundary; individual semantic weights remain local.
+        self._app.setFont(mac_native.system_font(FS_FOOTNOTE, "regular"))
+        install_application_fonts()
         self._app.setQuitOnLastWindowClosed(False)
         # Phase-3 P0-6 / P1-N1: cached focus state read by the
         # daemon-thread probe ``_desktop_is_focused_probe``. Initialised
@@ -382,6 +394,7 @@ class CortexAppController:
             logger.debug("focusWindowChanged signal wire failed", exc_info=True)
 
         # -- UI components ----------------------------------------------------
+        logger.info("startup.stage name=desktop_surfaces")
         self._dashboard = DashboardWindow()
         self._connections = ConnectionsPanel()
         self._overlay = OverlayWindow()
@@ -657,7 +670,9 @@ class CortexAppController:
             )
 
         # -- Start daemon in background thread --------------------------------
+        logger.info("startup.stage name=daemon_composition")
         self._start_daemon()
+        logger.info("startup.stage name=daemon_thread_started")
 
         # -- Graceful shutdown ------------------------------------------------
         # Phase 4.B fix (#4): ``aboutToQuit`` is non-cancellable, so the
@@ -698,16 +713,17 @@ class CortexAppController:
         # Force the app to activate as a foreground app on macOS.
         # PyInstaller bundles don't always get proper activation, so the
         # dashboard window can be created but hidden behind other windows.
-        try:
-            from AppKit import (
-                NSApp,
-                NSApplicationActivationPolicyRegular,
-            )
+        if mac_native.is_macos():
+            try:
+                from AppKit import (
+                    NSApp,
+                    NSApplicationActivationPolicyRegular,
+                )
 
-            NSApp.setActivationPolicy_(NSApplicationActivationPolicyRegular)
-            NSApp.activateIgnoringOtherApps_(True)
-        except ImportError:
-            pass  # Not on macOS or pyobjc not available
+                NSApp.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+                NSApp.activateIgnoringOtherApps_(True)
+            except ImportError:
+                pass  # Not on macOS or pyobjc not available
 
         # Defer dashboard show to after the event loop starts so that
         # NSApp activation actually takes effect.
@@ -740,6 +756,7 @@ class CortexAppController:
 
         QTimer.singleShot(200, _initial_show)
 
+        logger.info("startup.ready name=qt_event_loop")
         return self._app.exec()
 
     def _install_appearance_observer(self) -> None:
@@ -1075,9 +1092,14 @@ class CortexAppController:
         if loop is not None and loop.is_running():
             future = asyncio.run_coroutine_threadsafe(self._daemon.stop(), loop)
             try:
-                future.result(timeout=5.0)
+                future.result(timeout=20.0)
+            except TimeoutError:
+                logger.error(
+                    "Daemon stop exceeded the 20s shutdown boundary; "
+                    "process exit may leave incomplete cleanup"
+                )
             except Exception:
-                logger.warning("Daemon stop timed out; daemon thread is daemon=True, process will exit")
+                logger.exception("Daemon stop failed during Qt shutdown")
             finally:
                 # F34: notify the UI that the stop attempt resolved (either
                 # successfully or by timeout) so the Stop button re-enables.
@@ -1155,6 +1177,9 @@ class CortexAppController:
             self._tray, "notify_daemon_stopped"
         ):
             self._tray.notify_daemon_stopped()
+        if self._quit_when_daemon_stops:
+            self._quit_when_daemon_stops = False
+            QTimer.singleShot(0, self._on_gui_quit_requested)
 
     @Slot(str, str, str)
     def _on_error_occurred(self, title: str, body: str, cid: str) -> None:
@@ -2195,6 +2220,13 @@ class CortexAppController:
         Otherwise fall through to a direct quit so they don't have to
         wait for a phantom watchdog.
         """
+        if os.environ.get("CORTEX_HEADLESS_STARTUP") == "1":
+            # The automated packaged liveness probe has no person to consume a
+            # recap. Wait for the actual coalesced daemon stop, then leave Qt;
+            # this proves cleanup without a modal/watchdog timing surrogate.
+            self._quit_when_daemon_stops = True
+            self._on_daemon_stop_requested()
+            return
         if not self._session_active():
             logger.debug(
                 "user_initiated_quit: no active session; quitting directly"

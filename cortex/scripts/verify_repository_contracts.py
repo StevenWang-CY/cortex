@@ -18,7 +18,12 @@ from urllib.parse import unquote, urlsplit
 import yaml
 
 from cortex.libs.schemas.ws_message_types import MessageType
-from cortex.scripts import sync_config_docs, sync_design_tokens, sync_versions
+from cortex.scripts import (
+    generate_support_model_identity,
+    sync_config_docs,
+    sync_design_tokens,
+    sync_versions,
+)
 
 _ROOT = Path(__file__).resolve().parents[2]
 _PROJECT = _ROOT / "cortex"
@@ -227,6 +232,7 @@ def check_live_message_catalog() -> list[str]:
 def check_generated_surfaces() -> list[str]:
     problems: list[str] = []
     problems.extend(sync_versions.check(sync_versions.canonical_version()))
+    problems.extend(generate_support_model_identity.check())
     for path, expected in sync_design_tokens.expected_outputs(sync_design_tokens._load()).items():
         actual = path.read_text(encoding="utf-8") if path.exists() else ""
         if actual != expected:

@@ -61,6 +61,18 @@ repos:
             cortex/apps/vscode_extension/src/design-tokens\.ts
           )$
 
+      - id: cortex-support-model-identity
+        name: cortex support-model identity (frozen-safe drift gate)
+        entry: uv run --project cortex --locked --extra dev python -m cortex.scripts.generate_support_model_identity --check
+        language: system
+        pass_filenames: false
+        files: |
+          (?x)^(
+            cortex/services/state_engine/(feature_schema|model_registry|rule_scorer|support_inference)\.py|
+            cortex/services/state_engine/generated_model_identity\.py|
+            cortex/scripts/generate_support_model_identity\.py
+          )$
+
       - id: cortex-repository-contracts
         name: cortex repository contracts (links/config/live schemas/generated docs)
         entry: uv run --project cortex --locked --extra dev --extra codegen python -m cortex.scripts.verify_repository_contracts

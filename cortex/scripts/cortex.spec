@@ -92,6 +92,12 @@ datas = [
     (str(CORTEX / "assets" / "audio"),
      "cortex/assets/audio"),
 
+    # The display typeface is an intentional part of the product identity,
+    # not an optional host-machine dependency. Both variable faces and their
+    # OFL license are registered before desktop surfaces are constructed.
+    (str(CORTEX / "assets" / "fonts"),
+     "cortex/assets/fonts"),
+
     # App icon (used by build script, not runtime)
     (str(CORTEX / "assets" / "logo.svg"), "."),
 ] + mediapipe_datas + keyring_meta
@@ -189,7 +195,7 @@ hiddenimports = [
 # ---------------------------------------------------------------------------
 
 a = Analysis(
-    [str(CORTEX / "apps" / "desktop_shell" / "main.py")],
+    [str(CORTEX / "apps" / "desktop_shell" / "bootstrap.py")],
     pathex=[str(ROOT)],
     binaries=mediapipe_bins,
     datas=datas,
@@ -243,6 +249,11 @@ app = BUNDLE(
             "Cortex needs camera access to monitor focus and attention "
             "via remote photoplethysmography."
         ),
+        # macOS 14+ requires this declaration when AVFoundation enumerates a
+        # Continuity Camera. Cortex still rejects iPhone/iPad devices during
+        # automatic selection; the declaration makes enumeration explicit and
+        # prevents the deprecated external-camera compatibility path.
+        "NSCameraUseContinuityCameraDeviceType": True,
         "NSAppleEventsUsageDescription": (
             "Cortex needs automation access to manage workspace windows."
         ),

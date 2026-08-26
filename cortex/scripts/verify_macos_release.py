@@ -10,9 +10,13 @@ import os
 import platform
 import plistlib
 import re
+import socket
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.error
+import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -346,6 +350,185 @@ def _mounted_app_signature_verification(app: Path) -> tuple[list[str], float]:
     )
 
 
+def _reserve_local_port() -> int:
+    """Ask the kernel for an available loopback port for a launch probe."""
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+def _tail_text(path: Path, limit: int = 8000) -> str:
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8", errors="replace")[-limit:]
+
+
+def _probe_frozen_startup(
+    executable: Path,
+    *,
+    base_env: dict[str, str],
+    timeout_seconds: float = 45.0,
+) -> dict[str, Any]:
+    """Launch the complete packaged app and require a healthy runtime.
+
+    The probe uses an isolated HOME/storage directory and the explicit
+    headless-hardware boundary. It therefore exercises QApplication,
+    CortexAppController, CortexDaemon construction, SQLite migration, service
+    registration, and both local servers without touching a user's state,
+    camera, or input-monitoring authority. A resource-only smoke cannot prove
+    these paths.
+    """
+
+    with tempfile.TemporaryDirectory(prefix="cortex-startup-probe-") as raw_probe:
+        probe_root = Path(raw_probe)
+        home = probe_root / "home"
+        storage = home / "Library" / "Application Support" / "Cortex" / "Data"
+        home.mkdir(parents=True)
+        storage.mkdir(parents=True)
+        stdout_path = probe_root / "stdout.log"
+        stderr_path = probe_root / "stderr.log"
+        http_port = _reserve_local_port()
+        ws_port = _reserve_local_port()
+        while ws_port == http_port:
+            ws_port = _reserve_local_port()
+
+        env = dict(base_env)
+        env.update(
+            {
+                "HOME": str(home),
+                "CORTEX_STORAGE__PATH": str(storage),
+                "CORTEX_API__HOST": "127.0.0.1",
+                "CORTEX_API__PORT": str(http_port),
+                "CORTEX_API__WS_PORT": str(ws_port),
+                # Defense in depth if the explicit headless hardware boundary
+                # ever regresses; this index must never resolve to a device.
+                "CORTEX_CAPTURE__DEVICE_ID": "2147483647",
+                "CORTEX_REDIS__ENABLED": "false",
+                "CORTEX_HEADLESS_STARTUP": "1",
+            }
+        )
+        command = [str(executable)]
+        health_url = f"http://127.0.0.1:{http_port}/health"
+        health_payload: dict[str, Any] | None = None
+        process: subprocess.Popen[str]
+        with stdout_path.open("w", encoding="utf-8") as stdout_handle, stderr_path.open(
+            "w", encoding="utf-8"
+        ) as stderr_handle:
+            process = subprocess.Popen(
+                command,
+                cwd=probe_root,
+                env=env,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                text=True,
+            )
+            deadline = time.monotonic() + timeout_seconds
+            failure: str | None = None
+            while time.monotonic() < deadline:
+                returncode = process.poll()
+                if returncode is not None:
+                    failure = f"packaged app exited before health check (code {returncode})"
+                    break
+                try:
+                    with urllib.request.urlopen(health_url, timeout=0.75) as response:
+                        decoded = json.loads(response.read().decode("utf-8"))
+                    if isinstance(decoded, dict):
+                        health_payload = decoded
+                except (OSError, TimeoutError, urllib.error.URLError, json.JSONDecodeError):
+                    time.sleep(0.20)
+                    continue
+                if health_payload is not None:
+                    raw_services = health_payload.get("services")
+                    services = raw_services if isinstance(raw_services, dict) else {}
+                    if (
+                        health_payload.get("status") == "healthy"
+                        and health_payload.get("version") == __version__
+                        and services.get("support_model_registry") == "up"
+                    ):
+                        break
+                time.sleep(0.20)
+            else:
+                failure = f"packaged app did not become healthy within {timeout_seconds:.0f}s"
+
+            if health_payload is None and failure is None:
+                failure = "packaged app returned no health payload"
+
+            process.terminate()
+            try:
+                returncode = process.wait(timeout=30.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                returncode = process.wait(timeout=5.0)
+                if failure is None:
+                    failure = "packaged app did not stop within 30s after SIGTERM"
+
+        stdout = _tail_text(stdout_path)
+        stderr = _tail_text(stderr_path)
+        startup_log = _tail_text(home / "Library" / "Logs" / "Cortex" / "startup.log")
+        last_error = _tail_text(
+            home / "Library" / "Logs" / "Cortex" / "last-startup-error.txt"
+        )
+        fatal_markers = (
+            "startup.failed",
+            "Task was destroyed but it is pending",
+            "Failed to execute script",
+            "Could not parse stylesheet",
+            "Replace uses of missing font family",
+            "AVCaptureDeviceTypeExternal is deprecated for Continuity Cameras",
+        )
+        combined_diagnostics = "\n".join((stdout, stderr, startup_log))
+        if failure is None and returncode != 0:
+            failure = f"packaged app returned non-zero after graceful stop: {returncode}"
+        if failure is None and last_error:
+            failure = "packaged app produced a startup-failure diagnostic despite health"
+        if failure is None:
+            matched_markers = [
+                marker for marker in fatal_markers if marker in combined_diagnostics
+            ]
+            if matched_markers:
+                failure = "packaged app emitted fatal cleanup/startup markers: " + ", ".join(
+                    matched_markers
+                )
+        required_log_markers = (
+            "startup.ready name=qt_event_loop",
+            "Cortex daemon started",
+            "Cortex daemon stopped",
+        )
+        if failure is None:
+            missing_markers = [
+                marker for marker in required_log_markers if marker not in startup_log
+            ]
+            if missing_markers:
+                failure = "packaged startup log lacks lifecycle evidence: " + ", ".join(
+                    missing_markers
+                )
+        if failure is None:
+            for port in (http_port, ws_port):
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+                    client.settimeout(0.5)
+                    if client.connect_ex(("127.0.0.1", port)) == 0:
+                        failure = f"packaged app left port {port} listening after exit"
+                        break
+        result: dict[str, Any] = {
+            "command": command,
+            "returncode": returncode,
+            "http_port": http_port,
+            "ws_port": ws_port,
+            "health": health_payload,
+            "stdout": stdout,
+            "stderr": stderr,
+            "startup_log": startup_log,
+            "last_startup_error": last_error,
+        }
+        if failure is not None:
+            raise ReleaseVerificationError(
+                f"{failure}\nstdout:\n{stdout[-2000:]}\nstderr:\n{stderr[-2000:]}\n"
+                f"startup log:\n{startup_log[-3000:]}\nlast error:\n{last_error[-3000:]}"
+            )
+        return result
+
+
 def verify(
     artifact: Path,
     *,
@@ -404,6 +587,7 @@ def verify(
                 "CFBundleShortVersionString": __version__,
                 "CFBundleVersion": __version__,
                 "LSMinimumSystemVersion": "13.0",
+                "NSCameraUseContinuityCameraDeviceType": True,
             }
             mismatches = {
                 key: {"expected": expected, "actual": plist.get(key)}
@@ -443,6 +627,12 @@ def verify(
                     [str(executable), "--release-smoke"],
                     timeout=45.0,
                     env=smoke_env,
+                )
+            )
+            commands.append(
+                _probe_frozen_startup(
+                    executable,
+                    base_env=smoke_env,
                 )
             )
         finally:

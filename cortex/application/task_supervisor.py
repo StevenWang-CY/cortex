@@ -21,6 +21,7 @@ class TaskGroupName(StrEnum):
     OPERATIONS = "operations"
     TRANSPORT = "transport"
     BACKGROUND = "background"
+    LIFECYCLE = "lifecycle"
 
 
 @dataclass(frozen=True, slots=True)

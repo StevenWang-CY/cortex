@@ -187,14 +187,25 @@ code audits. The version-control history is the project, not the binary.
 ## Install
 
 1. Download the correct **Cortex-&lt;version&gt;-macos-&lt;arch&gt;.dmg** and its evidence from the [latest release](https://github.com/StevenWang-CY/cortex/releases/latest).
-2. Drag **Cortex.app** to `/Applications`.
-3. Verify the checksum/attestation and open Cortex. A notarized release should not require stripping quarantine.
-4. Follow the setup wizard (Camera, Accessibility, optional BYOK, Extensions).
+2. Open the DMG and drag **Cortex.app** to **Applications**. If Finder asks,
+   replace the older copy; do not leave the new build only on the mounted disk
+   image.
+3. Eject the Cortex disk image, then launch `/Applications/Cortex.app` (not the
+   copy under `/Volumes/Cortex`). Use Finder **Get Info** if you need to confirm
+   the installed version.
+4. Verify the checksum/attestation and open Cortex. A notarized release should not require stripping quarantine.
+5. Follow the setup wizard (Camera, Accessibility, optional BYOK, Extensions).
 
 That's it — no terminal, no Python, no Node.js required. The daemon
 runs in-process inside Cortex.app; the browser extension's
 **Start Cortex** button launches the installed `.app` automatically
 (`open -a Cortex.app`) and reuses its in-process daemon.
+
+If the Dock icon bounces and Cortex does not remain open, inspect
+`~/Library/Logs/Cortex/last-startup-error.txt` and
+`~/Library/Logs/Cortex/startup.log`. Current builds show a startup error dialog
+with the same diagnostic reference; include that reference and the installed
+version in a bug report. Never use `tccutil reset Camera` as a generic fix.
 
 ---
 
