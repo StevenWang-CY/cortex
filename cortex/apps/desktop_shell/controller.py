@@ -19,7 +19,9 @@ import os
 import signal
 import sys
 import threading
+import time
 from collections.abc import Callable
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Any, Literal
 
@@ -361,6 +363,13 @@ class CortexAppController:
         # then a no-op instead of re-scheduling ``daemon.stop()``.
         self._stopping: bool = False
         self._quit_when_daemon_stops: bool = False
+        # Cross-thread shutdown has one controller-owned future. The daemon
+        # coalesces internally too, but retaining the submitting future here
+        # prevents Qt's lastWindowClosed/aboutToQuit sequence from enqueueing
+        # fresh wrapper coroutines while the daemon loop is already exiting.
+        self._daemon_stop_future: Future[None] | None = None
+        self._quitting: bool = False
+        self._qt_shutdown_started: bool = False
         # P2 (audit-prod): teardown handle for the light/dark appearance
         # observer; kept alive for the controller lifetime.
         self._appearance_teardown: Callable[[], None] | None = None
@@ -800,6 +809,13 @@ class CortexAppController:
 
     def _start_daemon(self) -> None:
         """Boot the CortexDaemon in a background thread."""
+        # A future hot-restart creates a new lifecycle identity. Reset the
+        # controller-side shutdown state here rather than when an old daemon
+        # reports stopped, because a terminal Qt quit can arrive in that gap.
+        self._daemon_stop_future = None
+        self._stopping = False
+        self._quitting = False
+        self._qt_shutdown_started = False
         if self._tray is not None and hasattr(self._tray, "set_starting"):
             self._tray.set_starting()
         if self._dashboard is not None and hasattr(self._dashboard, "set_starting"):
@@ -1105,8 +1121,50 @@ class CortexAppController:
                     "trends error envelope dispatch failed", exc_info=True
                 )
 
+    def _schedule_daemon_stop(self) -> Future[None] | None:
+        """Submit exactly one stop coroutine to the owned daemon loop."""
+
+        existing = self._daemon_stop_future
+        if existing is not None:
+            return existing
+        if self._daemon is None:
+            return None
+        loop = self._daemon_loop
+        if loop is None or not loop.is_running():
+            return None
+
+        # Keep a handle to the coroutine until submission succeeds. If the
+        # loop closes between is_running() and run_coroutine_threadsafe(),
+        # explicitly close it so Python cannot emit "was never awaited".
+        stop_coroutine = self._daemon.stop()
+        try:
+            future = asyncio.run_coroutine_threadsafe(stop_coroutine, loop)
+        except BaseException:
+            stop_coroutine.close()
+            raise
+        self._daemon_stop_future = future
+        bridge = self._bridge
+
+        def _on_done(done: Future[None]) -> None:
+            try:
+                done.result()
+            except Exception as exc:
+                logger.warning("daemon.stop() raised: %r", exc, exc_info=False)
+            try:
+                bridge.on_daemon_stopped()
+            except Exception:
+                logger.debug(
+                    "daemon_stopped emit failed (non-fatal)", exc_info=True
+                )
+
+        future.add_done_callback(_on_done)
+        return future
+
     def _shutdown_daemon(self) -> None:
         """Gracefully stop the daemon.  Called from Qt ``aboutToQuit``."""
+        if self._qt_shutdown_started:
+            return
+        self._qt_shutdown_started = True
         if self._daemon is None:
             return
 
@@ -1117,12 +1175,20 @@ class CortexAppController:
         except Exception:
             logger.debug("Camera release during shutdown failed (non-fatal)")
 
-        # Step 2: Schedule async stop on the daemon's event loop
-        loop = self._daemon_loop
-        if loop is not None and loop.is_running():
-            future = asyncio.run_coroutine_threadsafe(self._daemon.stop(), loop)
+        # Step 2: Reuse the controller's original stop submission. In the
+        # two-phase quit path it is normally already complete; scheduling a
+        # new wrapper coroutine here races run_until_complete() returning and
+        # closing the daemon loop.
+        deadline = time.monotonic() + 20.0
+        future = self._daemon_stop_future
+        if future is None:
             try:
-                future.result(timeout=20.0)
+                future = self._schedule_daemon_stop()
+            except Exception:
+                logger.exception("Failed to schedule daemon stop during Qt shutdown")
+        if future is not None:
+            try:
+                future.result(timeout=max(0.0, deadline - time.monotonic()))
             except TimeoutError:
                 logger.error(
                     "Daemon stop exceeded the 20s shutdown boundary; "
@@ -1130,15 +1196,23 @@ class CortexAppController:
                 )
             except Exception:
                 logger.exception("Daemon stop failed during Qt shutdown")
-            finally:
-                # F34: notify the UI that the stop attempt resolved (either
-                # successfully or by timeout) so the Stop button re-enables.
-                try:
-                    self._bridge.on_daemon_stopped()
-                except Exception:
-                    logger.debug(
-                        "daemon_stopped emit failed (non-fatal)", exc_info=True
-                    )
+
+        # Step 3: the submitted stop future can resolve just before the
+        # lifecycle coroutine returns and closes its event loop. Join the
+        # original owner thread within the same total budget so no queued task
+        # can be destroyed during interpreter teardown.
+        daemon_thread = self._daemon_thread
+        if (
+            daemon_thread is not None
+            and daemon_thread is not threading.current_thread()
+            and daemon_thread.is_alive()
+        ):
+            daemon_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if daemon_thread.is_alive():
+                logger.error(
+                    "Daemon thread exceeded the 20s shutdown boundary; "
+                    "process exit may leave incomplete cleanup"
+                )
 
     # -- Qt slots (main thread) -----------------------------------------------
 
@@ -2149,6 +2223,12 @@ class CortexAppController:
             self._overlay.hide()
 
     def _quit(self) -> None:
+        if self._quitting:
+            return
+        # Set the latch before closing any window: DashboardWindow.close()
+        # synchronously emits lastWindowClosed, which otherwise re-enters the
+        # user-quit path before QApplication.quit() is reached.
+        self._quitting = True
         logger.info("Shutting down Cortex desktop shell")
         if self._overlay is not None:
             self._overlay.close()
@@ -2177,6 +2257,18 @@ class CortexAppController:
         # ``stop_requested`` alias for back-compat; only the canonical
         # one is wired in ``run()`` now, but the guard keeps us safe if a
         # future test harness or peer surface fires either signal again.
+        existing = self._daemon_stop_future
+        if existing is not None:
+            if existing.done():
+                logger.debug(
+                    "_on_daemon_stop_requested: controller stop already resolved"
+                )
+                self._on_daemon_stopped()
+            else:
+                logger.debug(
+                    "_on_daemon_stop_requested: controller stop already in flight"
+                )
+            return
         if self._stopping:
             logger.debug(
                 "_on_daemon_stop_requested: stop already in flight; "
@@ -2204,35 +2296,15 @@ class CortexAppController:
         # (the Qt event loop needs to keep ticking so the SESSION_RECAP
         # broadcast can fan out through the wrapper into the bridge
         # signal queue).
-        bridge = self._bridge
-
-        def _on_done(future: Any) -> None:
-            try:
-                exc = future.exception()
-            except Exception:
-                exc = None
-            if exc is not None:
-                logger.warning(
-                    "daemon.stop() raised: %r", exc, exc_info=False,
-                )
-            try:
-                bridge.on_daemon_stopped()
-            except Exception:
-                logger.debug(
-                    "daemon_stopped emit failed (non-fatal)", exc_info=True
-                )
-
         try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._daemon.stop(), self._daemon_loop,
-            )
-            future.add_done_callback(_on_done)
+            self._schedule_daemon_stop()
         except Exception:
             logger.exception("Failed to schedule daemon.stop()")
+            self._stopping = False
             # Schedule the done callback ourselves so the UI doesn't wedge
             # waiting for ``daemon_stopped``.
             try:
-                bridge.on_daemon_stopped()
+                self._bridge.on_daemon_stopped()
             except Exception:
                 logger.debug(
                     "daemon_stopped fallback emit failed", exc_info=True
@@ -2261,6 +2333,9 @@ class CortexAppController:
         Otherwise fall through to a direct quit so they don't have to
         wait for a phantom watchdog.
         """
+        if self._quitting:
+            logger.debug("user_initiated_quit: Qt quit already in progress")
+            return
         if os.environ.get("CORTEX_HEADLESS_STARTUP") == "1":
             # The automated packaged liveness probe has no person to consume a
             # recap. Wait for the actual coalesced daemon stop, then leave Qt;

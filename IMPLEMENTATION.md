@@ -3072,3 +3072,508 @@ clean source gates
 - The local GUI exercise owns visible behavior on the host architecture. The
   native Intel runner owns executable liveness for x86_64; Rosetta is not
   treated as equivalent evidence.
+
+---
+
+## 23. v0.3.8 transactional release teardown and immutable succession
+
+### 23.1 Why v0.3.8 exists
+
+The annotated `v0.3.7` tag points immutably at merge commit `4e8686b`. Its
+locked pre-release gate passed, and both native macOS builders began from that
+exact source tree. The two builders exposed independent terminal-lifecycle
+defects after their artifacts had already crossed the Apple trust boundary.
+
+The arm64 builder completed the product-critical work:
+
+1. built the native arm64 application and DMG;
+2. applied the Developer ID signature;
+3. submitted the artifact to Apple and received an `Accepted` result;
+4. stapled the notarization ticket and validated it;
+5. mounted the DMG read-only;
+6. verified the application bundle and launched the frozen executable for the
+   packaged smoke/health probe;
+7. attempted to detach the verification volume.
+
+The job failed only while Python was leaving the verifier's temporary-directory
+context:
+
+```text
+release verification FAILED:
+[Errno 30] Read-only file system: 'CodeResources'
+```
+
+The error was emitted after the signed/notarized app checks, but before release
+evidence, attestations, and draft assets could be assembled.
+
+The native Intel builder independently completed its x86_64 build, Developer
+ID signing, `hdiutil` integrity check, Apple notarization (`Accepted`), and
+stapling. Its mounted frozen app then:
+
+1. constructed the full Qt and daemon graph;
+2. bound HTTP and WebSocket on isolated random ports;
+3. returned a healthy `0.3.7` payload with the support-model registry up;
+4. received the probe's SIGTERM;
+5. stopped uvicorn, capture, WebSocket, storage, and the daemon;
+6. requested Qt exit;
+7. stranded two newly submitted `CortexDaemon.stop()` wrapper tasks while the
+   already-stopped daemon thread closed its asyncio loop.
+
+The verifier correctly rejected the otherwise zero-exit process because its
+diagnostics contained both:
+
+```text
+RuntimeWarning: coroutine 'CortexDaemon.stop' was never awaited
+Task was destroyed but it is pending!
+```
+
+The arm64 result proved a verifier resource-ownership bug. The Intel result
+proved a product shutdown-coordination bug that faster timing had not exposed.
+Neither is a signing or notarization failure, and neither may be waived simply
+because the application reached health.
+
+Therefore v0.3.7 is a failed release candidate, not a public release. Its tag
+and Actions run are preserved as the incident record. Repointing or reusing the
+tag would make the same version name describe two source trees and would
+invalidate the provenance model. Both corrections advance every synchronized
+product surface to `0.3.8` and require a fresh dual-architecture build.
+
+### 23.2 arm64 DMG-cleanup causal chain
+
+The previous verifier delegated two incompatible resources to one context:
+
+```text
+TemporaryDirectory.__enter__ creates writable host directory
+  -> hdiutil attach -readonly -mountpoint <directory> Cortex.dmg
+  -> verifier reads and launches Cortex.app from mounted filesystem
+  -> hdiutil detach <directory> is invoked with check=False
+  -> transient detach failure is ignored
+  -> TemporaryDirectory.__exit__ recursively deletes <directory>
+  -> recursion has crossed into the still-mounted, read-only DMG
+  -> unlink/chmod reaches Cortex.app/.../_CodeSignature/CodeResources
+  -> EROFS replaces the useful detach diagnostic
+```
+
+`TemporaryDirectory` owns a normal directory tree and fulfills its contract by
+recursively removing that tree. Once a filesystem is mounted on the directory,
+however, the path names a kernel-managed volume whose contents the temporary
+directory neither created nor owns. Recursive cleanup is therefore the wrong
+abstraction even if detach usually succeeds. The latent defect became visible
+when deep signature traversal and packaged launch produced a transiently busy
+volume on the arm64 runner.
+
+There were two correctness failures:
+
+- the return value of an ownership-changing operation (`hdiutil detach`) was
+  recorded but not enforced;
+- cleanup inferred detachment from control flow rather than checking the
+  kernel-visible mount state.
+
+The resulting `EROFS` was secondary damage. Treating it as a code-signing or
+notarization failure would have sent remediation toward the wrong subsystem.
+
+### 23.3 Intel terminal-shutdown causal chain
+
+The in-process desktop has two threads and two event loops with different
+ownership:
+
+- the macOS main thread owns `QApplication` and all windows;
+- the `cortex-daemon` thread owns an asyncio loop and `CortexDaemon.run()`.
+
+A user/headless quit begins on the Qt thread and submits `daemon.stop()` with
+`asyncio.run_coroutine_threadsafe()`. The daemon itself also coalesces every
+caller onto one `_stop_task`, so its services were stopped exactly once. The
+remaining race lived one layer above that coalescing boundary:
+
+```text
+SIGTERM on Qt main thread
+  -> _on_user_initiated_quit (headless branch)
+  -> _on_daemon_stop_requested
+  -> submit wrapper coroutine A: await daemon.stop()
+  -> daemon._stop_once completes
+  -> wrapper A done-callback queues DaemonBridge.daemon_stopped
+  -> Qt _on_daemon_stopped clears _stopping and requests GUI quit
+  -> _quit closes DashboardWindow
+  -> synchronous lastWindowClosed re-enters _on_user_initiated_quit
+  -> cleared _stopping permits wrapper coroutine B to be submitted
+  -> QApplication.quit emits aboutToQuit
+  -> _shutdown_daemon sees loop.is_running() during its final iteration
+  -> wrapper coroutine C is submitted and Qt blocks on C.result(timeout=20)
+  -> daemon run_until_complete returns and closes the loop
+  -> B and C never advance to await the already-complete daemon stop task
+  -> timeout + pending-task destruction + never-awaited warning
+```
+
+There were four distinct mistakes:
+
+- **Daemon-level coalescing was mistaken for submission-level coalescing.**
+  Multiple wrapper coroutines can await one stop task; they are still separate
+  tasks that must each be scheduled before the loop closes.
+- **`_stopping` described an in-flight UI action, not terminal lifecycle
+  identity.** Clearing it when the first future resolved reopened the submit
+  path during the narrow loop-return interval.
+- **Window closure was re-entrant.** Qt emits `lastWindowClosed` synchronously
+  from `DashboardWindow.close()`, before `_quit()` reached
+  `QApplication.quit()`.
+- **`loop.is_running()` was used as a scheduling guarantee.** It is only a
+  snapshot. `run_until_complete()` can be completing on the owner thread while
+  another thread observes `True`; a callback enqueued at that point may never
+  execute.
+
+Intel did not expose a slower or broken daemon stop—the log proves all services
+stopped in about one second. It exposed the post-stop window in which the loop
+was still technically running but no longer had durable work ownership.
+
+### 23.4 Design alternatives considered
+
+#### Add a fixed sleep before detach
+
+A delay can change race frequency but provides no ownership proof. A slow
+runner, antivirus scan, Finder process, or delayed executable teardown could
+outlive any chosen delay. It was rejected as probabilistic correctness.
+
+#### Keep `TemporaryDirectory` and check the detach exit code
+
+This would expose a clearer error, but context-manager unwinding would still
+invoke recursive removal while the mount remained attached. Avoiding that
+would require reaching into private tempfile cleanup behavior and would retain
+the incorrect ownership model. It was rejected.
+
+#### Ignore a busy detach and let the runner clean itself
+
+That would permit leaked mounts to contaminate later steps or jobs and could
+make evidence report success without completing resource teardown. Release
+verification must fail closed, so it was rejected.
+
+#### Force-detach immediately
+
+The verifier owns a disposable read-only image, so a bounded forced detach is
+safe as a final recovery step. Making it the first step would unnecessarily
+interrupt ordinary filesystem quiescence and hide whether the normal path is
+healthy. It was retained only after bounded normal attempts.
+
+#### Recursively remove the path after detach
+
+Even after a successful command, a recursive remover creates a dangerous
+time-of-check/time-of-use surface if the mount state changes or the tool's
+status is stale. The verifier creates only an empty mount-point directory, so
+`rmdir` is both sufficient and a stronger assertion. Recursive removal was
+eliminated.
+
+#### Re-run or move v0.3.7
+
+Rerunning an unchanged workflow could occasionally avoid the race, but would
+leave the bug active. Moving the tag would violate immutable-release identity.
+Both were rejected; v0.3.8 is a new candidate.
+
+#### Rely only on `CortexDaemon.stop()` coalescing
+
+The daemon's `_stop_task` correctly prevents duplicated service teardown, but
+does not prevent creation of multiple outer coroutines or guarantee that a
+closing event loop will schedule them. Keeping only the inner guard would
+retain the exact Intel failure. It was rejected.
+
+#### Leave `_stopping=True` forever
+
+This would block the observed re-entry but overload a presentation flag with
+terminal lifecycle identity and break any future in-process restart. The
+selected design stores the actual cross-thread future and resets it only when a
+new daemon lifecycle begins.
+
+#### Disconnect `lastWindowClosed`
+
+That signal is part of the product's window-close/recap interaction. Removing
+it would avoid one trigger but leave `aboutToQuit`, tray quit, Cmd+Q, signals,
+and future close paths able to race. The quit operation itself must be
+idempotent, so disconnection was rejected.
+
+#### Submit another stop from `aboutToQuit`
+
+`aboutToQuit` remains a necessary safety barrier for direct quits, but blindly
+submitting there creates the loop-closing race. It now reuses the controller's
+existing future and submits only when no earlier stop identity exists.
+
+#### Cancel or suppress pending-task warnings in the verifier
+
+The warnings represented real orphaned coroutines, not harmless log noise.
+Removing the marker would convert a deterministic release rejection into an
+undetected cleanup defect. It was rejected.
+
+### 23.5 Selected mount lifecycle algorithm
+
+The verifier now models attach/detach as a small transaction with explicit
+ownership:
+
+```text
+create dedicated empty mount-point directory with mkdtemp
+  -> attempt read-only hdiutil attach at that exact path
+  -> remember command success, but also consult os.path.ismount
+  -> execute all bundle, architecture, signature, secret-scan, smoke,
+     daemon-health, and shutdown checks
+  -> if attach succeeded OR the path is actually mounted:
+       attempt normal detach up to 3 times
+       wait 0.5 seconds between normal attempts
+       after continued failure, attempt one forced detach
+       after every command, accept actual unmounted state even if the command
+       returned a stale nonzero status
+       if still mounted after force, raise ReleaseVerificationError
+  -> only when the path is not mounted, remove it with Path.rmdir()
+  -> never recursively traverse or delete through the mount point
+```
+
+The bounds are deliberate. Three normal attempts cover short-lived file-handle
+release without making a failed release job hang indefinitely. The total retry
+delay is one second, and every `hdiutil` invocation retains a 60-second process
+timeout. One forced attempt is limited to the exact read-only volume created by
+this verifier; no glob, `/Volumes` sweep, user volume, writable image, or broad
+directory is targeted.
+
+`os.path.ismount()` is the postcondition authority. A nonzero detach status
+with an already absent mount is treated as reconciled because the resource is
+gone. A zero status is accepted as the tool's successful transition; the
+caller checks mount state again before directory cleanup. If the volume is
+still present after the forced attempt, the verifier raises a specific error
+containing the exact mount path and final stderr and deliberately leaves the
+volume untouched for diagnosis.
+
+Attach failure is also reconciled. Some system operations can return failure
+after partially changing state, so the `finally` barrier detaches whenever
+either the successful-attach flag is set or the path is actually a mount. This
+prevents the exception path from leaking a volume.
+
+### 23.6 Selected controller shutdown algorithm
+
+The controller now owns the cross-thread submission identity in
+`_daemon_stop_future`. Its lifecycle is:
+
+```text
+_start_daemon
+  -> reset controller lifecycle flags for the new daemon identity
+
+first stop request on Qt thread
+  -> confirm daemon loop exists and is running
+  -> construct exactly one daemon.stop() coroutine
+  -> submit with run_coroutine_threadsafe
+  -> store returned concurrent.futures.Future before installing callback
+  -> callback reads the result and emits daemon_stopped through the Qt bridge
+
+any later stop request
+  -> return the same stored Future
+  -> never construct or submit another wrapper coroutine
+
+GUI quit
+  -> set _quitting=True before closing the first window
+  -> synchronous lastWindowClosed observes the latch and returns
+  -> QApplication.quit emits aboutToQuit
+
+aboutToQuit safety barrier
+  -> execute at most once via _qt_shutdown_started
+  -> release any blocking capture handle
+  -> reuse stored stop Future, or submit the first one for a direct quit
+  -> wait within a 20-second monotonic deadline
+  -> join the original daemon owner thread using only the remaining deadline
+  -> return only after the loop closes, or emit an explicit bounded error
+```
+
+The future—not `_stopping`, readiness, thread liveness, or an instantaneous
+loop flag—is the identity of the cross-thread operation. `_stopping` can still
+drive UI affordance state and can be cleared for presentation without reopening
+submission. A future hot restart resets the future only in `_start_daemon`, at
+the same boundary that constructs a new `CortexDaemon` and event loop.
+
+There is one unavoidable check/submit race: a loop can close after
+`is_running()` returns and before `run_coroutine_threadsafe()` accepts the
+coroutine. The controller holds the newly created coroutine until submission
+succeeds. If submission raises, it calls `coroutine.close()` before propagating
+the error, preventing Python from later reporting an un-awaited coroutine.
+
+The owner-thread join is separate from the stop future for a reason. The future
+proves the submitted `daemon.stop()` wrapper returned; the thread proves
+`CortexDaemon.run()` completed its own `finally: stop()`,
+`run_until_complete()` returned, and the asyncio loop closed. Both transitions
+must finish before interpreter teardown can be declared clean.
+
+### 23.7 Error and cleanup invariants
+
+The implementation enforces the following invariants:
+
+| Invariant | Enforcement |
+| --- | --- |
+| No recursive deletion can cross into a DMG. | The verifier never calls `TemporaryDirectory`, `rmtree`, or an equivalent recursive remover for its mount path. |
+| A transiently busy volume gets bounded recovery. | Three normal detaches precede one forced detach. |
+| Tool status cannot contradict resource truth silently. | Mount state is checked after nonzero detach results and again before cleanup. |
+| A mounted volume is never treated as an ordinary directory. | `_remove_detached_mountpoint()` fails immediately when `ismount` is true. |
+| Cleanup proves the revealed host directory is empty. | `Path.rmdir()` is the only directory-removal operation. |
+| Partial attach state is reclaimed. | The finalizer uses both the attach flag and actual mount state. |
+| Permanent detach failure cannot publish an artifact. | The verifier raises before evidence/attestation/upload stages. |
+| Failure diagnostics retain causal value. | The explicit detach error replaces secondary read-only traversal errors. |
+| Qt submits one stop wrapper per daemon lifecycle. | `_daemon_stop_future` is retained and returned to every later caller. |
+| Window closing cannot recursively start another quit. | `_quitting` is set before any top-level window is closed. |
+| `aboutToQuit` cannot race a second stop onto a closing loop. | It reuses the stored future and is guarded by `_qt_shutdown_started`. |
+| A rejected coroutine cannot leak a runtime warning. | The unscheduled coroutine is explicitly closed on submission failure. |
+| Stop completion includes event-loop ownership teardown. | The controller joins the daemon thread within the original deadline. |
+
+The last invariant intentionally gives cleanup ownership failure precedence if
+verification and detach fail together. Leaving a mounted filesystem is a
+runner-integrity condition that must be visible; the verifier does not pretend
+the transaction closed successfully.
+
+### 23.8 Deterministic regression proof
+
+Focused unit coverage exercises the state machine without requiring privileged
+mount operations:
+
+- two `Resource busy` normal results followed by a successful forced detach
+  prove the exact bounded command sequence;
+- a nonzero detach result paired with `ismount == False` proves reconciliation
+  uses resource state and avoids needless force;
+- a failed normal attempt and failed forced attempt with `ismount == True`
+  prove the operation fails closed;
+- a synthetic mounted tree containing
+  `Cortex.app/Contents/_CodeSignature/CodeResources` proves cleanup refuses to
+  traverse the path and leaves the signed resource unchanged;
+- parameter guards reject zero attempts and negative retry delays;
+- the existing release-tooling suite continues to cover signature, notary,
+  architecture, evidence, identity, and workflow contracts around the change.
+
+Controller lifecycle coverage proves:
+
+- two controller submissions return the same future and call `daemon.stop()`
+  exactly once;
+- a loop-closing submission failure explicitly closes its coroutine;
+- `_quitting` is set before `DashboardWindow.close()` synchronously re-enters
+  the `lastWindowClosed` handler;
+- `aboutToQuit` reuses a completed future, never calls `daemon.stop()` again,
+  joins the original owner thread, and ignores a second invocation;
+- the existing daemon tests still prove all async callers coalesce onto the one
+  internal `_stop_task` and await its complete teardown.
+
+The focused release-tooling suite contains 72 passing tests after this patch.
+The focused startup/readiness suite contains nine passing tests, including the
+four new controller lifecycle cases. On the final pre-PR tree, Ruff passed,
+strict mypy reported no issues across 521 source files, the wheel contained 285
+verified files, the non-desktop Python suite passed 2,660 tests with three
+intentional skips, and the separately isolated desktop suite passed 64 tests.
+Schema, configuration, version, repository-contract, recorded-trace, and
+diff-integrity gates also pass.
+
+### 23.9 Real-artifact and runtime validation
+
+The corrected verifier was exercised against the exact existing v0.3.6 arm64
+DMG rather than only synthetic fixtures. That artifact is Developer-ID signed,
+Apple-notarized, stapled, and structurally equivalent to the failing release
+path. The canonical version check was temporarily supplied with the artifact's
+own `0.3.6` version; no artifact bytes were modified.
+
+One initial full pass and then three consecutive full passes each completed:
+
+- `hdiutil verify`;
+- read-only attach at the dedicated mount point;
+- `Info.plist` and single-architecture verification;
+- deep application signature verification;
+- forbidden credential/personal-path scan;
+- frozen `--release-smoke` composition;
+- full headless packaged launch, version-matched HTTP health response, and
+  graceful stop;
+- clean normal detach and empty mount-point removal;
+- outer DMG signature, stapled-ticket, and Gatekeeper verification.
+
+All four passes returned success, and the three-run stress sequence observed a
+zero detach return code every time. This proves the new ownership model on a
+real read-only signed/notarized volume and verifies it does not regress the
+application liveness path. It does not substitute for rebuilding v0.3.8 on
+both native architectures.
+
+The corrected v0.3.8 source desktop was then started in the same headless,
+hardware-disabled mode used by the packaged probe, with isolated storage and
+dedicated HTTP/WebSocket ports. It reached a version-matched healthy response,
+received one SIGTERM, returned exit code zero, and left neither listener nor
+process behind. Its output contained no pending-task, never-awaited-coroutine,
+shutdown-boundary, or startup-failure marker. This validates the repaired
+controller ordering on the local arm64 source runtime; the new frozen x86_64
+job remains the authoritative regression gate for the timing that exposed the
+incident.
+
+A new v0.3.8 arm64 application was also frozen with the locked Python 3.11.15
+graph and the repository's exact Node 22.23.2/pnpm 9.15.9 toolchain. The app was
+deep ad-hoc signed for local execution and placed in an APFS compressed test
+DMG whose canonical filename matched the verifier contract. One initial pass
+and three consecutive stress passes each proved:
+
+- thin arm64 executable identity and `0.3.8` bundle versions;
+- deep code-signature validity and a clean credential/personal-path scan;
+- successful frozen resource/composition smoke;
+- a healthy `0.3.8` daemon with support-model registry up;
+- normal zero-code SIGTERM exit without either Intel failure marker;
+- detach return code zero and removal of the dedicated verifier mount;
+- no surviving Cortex executable or verifier mount after the sequence.
+
+The local host refused creation of a test volume named exactly `Cortex` while
+an alternate unique local volume name succeeded with identical application
+bytes. That host-specific disk-arbitration/TCC condition is not hidden: the
+local DMG is lifecycle evidence, not the distributable installer. The tagged
+workflow must still create the production `Cortex` volume on clean native
+runners, use Developer ID rather than ad-hoc signing, notarize and staple the
+exact bytes, and produce the Applications-link layout consumed by Finder.
+
+### 23.10 Product and interaction impact
+
+There is intentionally no visual or interaction change in v0.3.8. The UI work
+in v0.3.7—truthful `Starting…`/`Connected` semantics, explicit permission
+ownership, non-blocking capture degradation, live recovery, and visible fatal
+startup diagnostics—remains the product behavior under test. Changing UI in a
+packaging-only successor would expand the incident fix and invalidate the
+already-reviewed behavioral evidence.
+
+| Before | After | Why |
+| --- | --- | --- |
+| A successfully verified app could still fail the job while implicit tempfile cleanup entered its mounted volume. | Verification owns attach, bounded detach, and empty-directory cleanup as explicit states. | Release status now reflects product evidence rather than a cleanup abstraction mismatch. |
+| The final error named a protected signature file. | Permanent failure names the detach transition and exact mount path. | Operators can act on the true subsystem and preserve useful evidence. |
+| Closing Qt after a successful daemon stop could schedule two invisible stop wrappers and wait 20 seconds. | One stored future spans Stop, window close, signal quit, and `aboutToQuit`; the owner thread is joined once. | Quit is prompt, interruptible before commitment, and terminally deterministic after commitment. |
+| A failed candidate could tempt an identical rerun under the same version. | Immutable v0.3.7 is preserved and the corrected source advances to v0.3.8. | Version, source, artifact, provenance, and incident history stay one-to-one. |
+
+### 23.11 v0.3.8 release proof still required
+
+Local verification of an older notarized artifact proves the cleanup fix, not
+the new release. v0.3.8 remains fail-closed until this entire chain succeeds:
+
+```text
+clean synchronized 0.3.8 source tree
+  -> pull request CI on native arm64 and x86_64
+  -> merge commit and post-merge main CI
+  -> new immutable annotated v0.3.8 tag at that exact merge
+  -> native arm64 + x86_64 build, Developer ID sign, notarize, and staple
+  -> corrected mounted verifier + frozen health/stop probe on each runner
+  -> architecture-bound SBOMs, checksums, evidence, and attestations
+  -> download draft assets and independently re-verify their digests/contracts
+  -> Finder install of the downloaded host artifact into /Applications
+  -> eject volume before launch
+  -> visible installed open, version-matched healthy core, and honest sensor state
+  -> normal quit, zero listeners/processes, relaunch, and repeated cleanup
+  -> complete physical-machine manual records for both supported architectures
+  -> independent reviewer identity and protected publication workflow
+  -> unauthenticated public redownload, digest match, and repeated Finder E2E
+```
+
+The manual evidence gate is intentionally not self-attestable by the builder.
+A local Apple Silicon exercise cannot stand in for a physical Intel run, and
+an automated native runner cannot assert that a human saw the correct window,
+permission ownership, menu behavior, or normal quit interaction. Missing
+architecture evidence or independent review blocks publication rather than
+being replaced with a claim.
+
+### 23.12 Residual boundaries
+
+- Forced detach is appropriate only because the verifier created and owns the
+  exact disposable read-only mount. The helper must not be generalized to user
+  disks or writable volumes without a different authority model.
+- `os.path.ismount()` is a local kernel-state check. If future release runners
+  move artifact verification into a container or remote mount namespace, the
+  check and detach command must execute in the same namespace.
+- A passing packaged health probe proves composition, transport readiness, and
+  graceful lifecycle behavior. It does not prove camera signal validity or
+  physiological model accuracy; those remain governed by explicit permission,
+  calibration, reference-sensor, and evidence-quality programs.
+- v0.3.8 must not be described as public merely because a draft release and
+  downloadable authenticated assets exist. Publication and subsequent
+  unauthenticated redownload are separate evidence-bearing transitions.
