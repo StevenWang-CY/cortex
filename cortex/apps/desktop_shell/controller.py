@@ -542,6 +542,14 @@ class CortexAppController:
         # drive one CalibrationRunner.
         if hasattr(self._settings, "recalibrate_requested"):
             self._settings.recalibrate_requested.connect(self._run_calibration)
+        if hasattr(self._settings, "camera_permission_granted"):
+            self._settings.camera_permission_granted.connect(
+                self._on_camera_permission_granted
+            )
+        if hasattr(self._onboarding, "camera_permission_granted"):
+            self._onboarding.camera_permission_granted.connect(
+                self._on_camera_permission_granted
+            )
         # E.5 (DMG-path completion): step-4 "Open Connections" button.
         # Previously only the WS-mode CortexApp wired this signal, so the
         # DMG-shipping in-process controller left the button dead.
@@ -792,6 +800,11 @@ class CortexAppController:
 
     def _start_daemon(self) -> None:
         """Boot the CortexDaemon in a background thread."""
+        if self._tray is not None and hasattr(self._tray, "set_starting"):
+            self._tray.set_starting()
+        if self._dashboard is not None and hasattr(self._dashboard, "set_starting"):
+            self._dashboard.set_starting()
+
         # Lazy import to keep module-level imports light
         from cortex.services.runtime_daemon import CortexDaemon
 
@@ -826,10 +839,30 @@ class CortexAppController:
         def _run() -> None:
             self._daemon_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._daemon_loop)
+
+            async def _run_until_exit() -> None:
+                daemon_task = asyncio.create_task(
+                    self._daemon.run(),
+                    name="cortex-daemon-lifecycle",
+                )
+                while not daemon_task.done():
+                    if bool(getattr(self._daemon, "is_ready", False)):
+                        logger.info("startup.ready name=desktop_daemon_connection")
+                        self._bridge.connection_changed.emit(True)
+                        break
+                    await asyncio.sleep(0.025)
+                await daemon_task
+
             try:
-                self._daemon_loop.run_until_complete(self._daemon.run())
-            except Exception:
+                self._daemon_loop.run_until_complete(_run_until_exit())
+            except Exception as exc:
                 logger.exception("Daemon thread crashed")
+                self._bridge.on_error(
+                    "Cortex couldn't start",
+                    "Core services stopped before becoming ready. "
+                    "Diagnostic details were saved to the Cortex startup log.",
+                    type(exc).__name__,
+                )
             finally:
                 self._daemon_loop.close()
                 self._daemon_loop = None
@@ -842,9 +875,6 @@ class CortexAppController:
             daemon=True,  # Don't prevent exit if shutdown hangs
         )
         self._daemon_thread.start()
-
-        # Consider connected once daemon thread is alive
-        self._bridge.connection_changed.emit(True)
 
     def _install_ws_broadcast_observer(self) -> None:
         """Subscribe the in-process desktop to transport-neutral events."""
@@ -1598,6 +1628,17 @@ class CortexAppController:
                 self._daemon.apply_settings(settings),
                 self._daemon_loop,
             )
+
+    @Slot()
+    def _on_camera_permission_granted(self) -> None:
+        """Retry optional capture after the user's live TCC grant."""
+
+        if self._daemon is None or self._daemon_loop is None:
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._daemon.apply_settings({"webcam_enabled": True}),
+            self._daemon_loop,
+        )
 
     # ── Audit-prod P0 fix: orphan-signal handlers ──────────────────────
     #

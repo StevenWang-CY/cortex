@@ -105,6 +105,8 @@ def test_initial_render_reports_not_granted_for_both(settings_dialog):
 
 def test_refresh_flips_to_granted_when_probe_returns_true(settings_dialog):
     dlg, set_perms = settings_dialog
+    grants: list[None] = []
+    dlg.camera_permission_granted.connect(lambda: grants.append(None))
 
     # User opens System Settings, flips Camera ON.
     set_perms(True, False)
@@ -116,6 +118,12 @@ def test_refresh_flips_to_granted_when_probe_returns_true(settings_dialog):
     assert dlg._camera_perm_row["granted"] is True
     assert "Accessibility access not granted" in acc_label.text()
     assert dlg._accessibility_perm_row["granted"] is False
+    assert grants == [None]
+
+    # Repeated polling while still granted is idempotent and cannot launch a
+    # second capture retry.
+    dlg._refresh_permission_states()
+    assert grants == [None]
 
 
 def test_refresh_flips_back_when_probe_revokes(settings_dialog):
@@ -210,12 +218,27 @@ def test_open_system_settings_invokes_open_with_deep_link(
 
     import subprocess
 
+    from cortex.libs import utils as _utils
+    from cortex.libs.utils import CameraPermissionState
+
     monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    requested: list[None] = []
+    monkeypatch.setattr(
+        _utils,
+        "request_camera_permission",
+        lambda: requested.append(None),
+    )
+    monkeypatch.setattr(
+        _utils,
+        "get_camera_permission_state",
+        lambda: CameraPermissionState.DENIED,
+    )
 
     dlg._open_system_settings("camera")
     dlg._open_system_settings("accessibility")
     dlg._open_system_settings("nonsense")  # ignored — unknown target
 
+    assert requested == []
     assert len(calls) == 2
     assert calls[0] == [
         "open",
@@ -225,6 +248,43 @@ def test_open_system_settings_invokes_open_with_deep_link(
         "open",
         "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
     ]
+
+
+def test_first_camera_request_does_not_obscure_native_prompt(
+    settings_dialog,
+    monkeypatch,
+):
+    """A not-determined grant requests TCC without foregrounding Settings."""
+
+    dlg, _ = settings_dialog
+    calls: list[list[str]] = []
+
+    class _FakePopen:
+        def __init__(self, args, **_kw):  # type: ignore[no-untyped-def]
+            calls.append(list(args))
+
+    import subprocess
+
+    from cortex.libs import utils as _utils
+    from cortex.libs.utils import CameraPermissionState
+
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    requested: list[None] = []
+    monkeypatch.setattr(
+        _utils,
+        "request_camera_permission",
+        lambda: requested.append(None),
+    )
+    monkeypatch.setattr(
+        _utils,
+        "get_camera_permission_state",
+        lambda: CameraPermissionState.NOT_DETERMINED,
+    )
+
+    dlg._open_system_settings("camera")
+
+    assert requested == [None]
+    assert calls == []
 
 
 def test_permission_timer_started_on_construction(settings_dialog):

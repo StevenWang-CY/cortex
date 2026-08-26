@@ -35,6 +35,7 @@ from typing import Any
 
 import pytest
 
+from cortex.application.task_supervisor import TaskSupervisor
 from cortex.services.runtime_daemon import CortexDaemon
 
 
@@ -51,7 +52,28 @@ def _make_minimal_daemon() -> CortexDaemon:
     # Bypass the rich __init__ — we only need self._shutdown to exist.
     daemon = object.__new__(CortexDaemon)
     daemon._shutdown = asyncio.Event()
+    daemon._task_supervisor = TaskSupervisor()
+    daemon._api_task = None
     return daemon
+
+
+def test_signal_preclassifies_api_exit_as_expected() -> None:
+    """Uvicorn's signal-driven return must not become a false crash alert."""
+    daemon = _make_minimal_daemon()
+    api_task = object()
+    observed: list[object | None] = []
+
+    class _Supervisor:
+        def expect_completion(self, task) -> None:
+            observed.append(task)
+
+    daemon._task_supervisor = _Supervisor()  # type: ignore[assignment]
+    daemon._api_task = api_task  # type: ignore[assignment]
+
+    daemon._on_signal_received()
+
+    assert observed == [api_task]
+    assert daemon._shutdown.is_set()
 
 
 @pytest.mark.skipif(

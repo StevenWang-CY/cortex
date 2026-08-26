@@ -4,6 +4,62 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.3.7] — 2026-08-26
+
+This patch closes the first-launch readiness defect found during the required
+Finder exercise of the v0.3.6 candidate. The deterministic support algorithm,
+weights, evidence gates, intervention authority, and privacy semantics are
+unchanged.
+
+### Fixed
+
+* Camera authorization is no longer requested from the daemon's synchronous
+  startup path. An unresolved macOS TCC prompt previously blocked the daemon
+  loop for exactly 60 seconds, delaying HTTP, WebSocket, and graceful quit.
+  Camera prompts remain explicit user gestures in onboarding or Settings.
+* Core readiness is now independent of optional hardware. Durable storage,
+  WebSocket, the bound HTTP server, recovery, and coordinators become ready
+  before the supervised camera task begins; camera failure produces an honest
+  stale-capture state while telemetry-first operation remains available.
+* The desktop now displays `Starting…` until the daemon's real readiness
+  boundary is crossed. It no longer reports `Connected` merely because a
+  Python thread is alive.
+* OpenCV enumeration/warmup and all MediaPipe create/inference/close calls run
+  off the daemon event loop. MediaPipe operations share one owned worker so
+  the Intel 0.10.21 TaskRunner and newer serial-dispatcher wheels have the same
+  lifecycle guarantee. Camera open is cooperatively cancellable, stop always
+  releases partial resources, and permission is checked before model loading.
+* A camera grant observed live in onboarding or Settings now retries capture
+  in-process. Both camera actions perform the native non-blocking request from
+  the user's click without foregrounding another app over the first TCC prompt;
+  System Settings is used only for the denied/restricted recovery path. A
+  relaunch is no longer required after granting access.
+* A daemon-thread startup failure is surfaced in the existing error UI and
+  startup log instead of leaving a misleading connected dashboard.
+* Development-mode shutdown now joins whichever lifecycle actually receives
+  SIGINT/SIGTERM. The daemon and outer wrapper previously installed competing
+  asyncio signal handlers, so one Ctrl+C could stop uvicorn while stranding the
+  wrapper, WebSocket, camera, MediaPipe, and database until a forced kill.
+  Signal-owned uvicorn completion is also classified as expected rather than a
+  false critical-service crash.
+* Added regression coverage for non-blocking unresolved TCC state, skipped
+  OpenCV work without authority, cancellable camera opening, core readiness
+  during pending capture, truthful desktop lifecycle state, single-shot live
+  permission retry, single-worker MediaPipe ownership, and
+  settings/onboarding permission behavior. The source runtime has also passed
+  two consecutive authorized-camera start/health/single-signal-stop cycles,
+  including MediaPipe release and zero residual listeners/processes.
+
+### Release process
+
+* v0.3.6 remains an unchanged, unpublished draft with its signed artifacts and
+  complete validation evidence preserved for incident traceability.
+* v0.3.7 must pass the dual-architecture source and packaged gates, then a real
+  downloaded-DMG Finder install, ejected-volume launch, visible-window and
+  version-matched health check, normal quit, relaunch, and orphan/port cleanup
+  check before publication. After publication, the public unauthenticated DMG
+  is downloaded and the host-architecture install/open/quit check is repeated.
+
 ## [v0.3.6] — 2026-08-26
 
 This patch closes the packaged-startup failure found in the v0.3.5 candidate.

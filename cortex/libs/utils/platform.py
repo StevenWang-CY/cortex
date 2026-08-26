@@ -25,6 +25,17 @@ class Platform(StrEnum):
     UNKNOWN = "unknown"
 
 
+class CameraPermissionState(StrEnum):
+    """Portable names for macOS AVFoundation authorization states."""
+
+    AUTHORIZED = "authorized"
+    NOT_DETERMINED = "not_determined"
+    RESTRICTED = "restricted"
+    DENIED = "denied"
+    UNAVAILABLE = "unavailable"
+    UNKNOWN = "unknown"
+
+
 def get_platform() -> Platform:
     """Detect the current operating system."""
     if sys.platform == "darwin":
@@ -167,15 +178,11 @@ def check_accessibility_permission() -> bool:
         return False
 
 
-def check_camera_permission() -> bool:
-    """
-    Check if the application has camera permissions (macOS).
+def get_camera_permission_state() -> CameraPermissionState:
+    """Return the current camera authority without requesting access."""
 
-    Returns:
-        True if permission is granted or not required
-    """
     if not is_macos():
-        return True
+        return CameraPermissionState.AUTHORIZED
 
     try:
         import AVFoundation
@@ -183,13 +190,37 @@ def check_camera_permission() -> bool:
         status = AVFoundation.AVCaptureDevice.authorizationStatusForMediaType_(
             AVFoundation.AVMediaTypeVideo
         )
-        # 3 = AVAuthorizationStatusAuthorized. ``status`` is Any (untyped
-        # pyobjc), so coerce the comparison result to a real bool.
-        return bool(status == 3)
     except ImportError:
-        return True
+        return CameraPermissionState.UNAVAILABLE
     except Exception:
-        return False
+        return CameraPermissionState.UNKNOWN
+
+    try:
+        numeric_status = int(status)
+    except (TypeError, ValueError):
+        return CameraPermissionState.UNKNOWN
+    return {
+        0: CameraPermissionState.NOT_DETERMINED,
+        1: CameraPermissionState.RESTRICTED,
+        2: CameraPermissionState.DENIED,
+        3: CameraPermissionState.AUTHORIZED,
+    }.get(numeric_status, CameraPermissionState.UNKNOWN)
+
+
+def check_camera_permission() -> bool:
+    """
+    Check if the application has camera permissions (macOS).
+
+    Returns:
+        True if permission is granted or not required
+    """
+    state = get_camera_permission_state()
+    # Preserve the historical best-effort behavior when the AVFoundation
+    # bridge is unavailable. OpenCV remains the final capability check.
+    return state in {
+        CameraPermissionState.AUTHORIZED,
+        CameraPermissionState.UNAVAILABLE,
+    }
 
 
 def request_camera_permission() -> None:

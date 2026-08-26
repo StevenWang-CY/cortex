@@ -125,6 +125,82 @@ def test_begin_button_emits_signal(wizard) -> None:
     assert received, "Begin click should emit run_calibration_requested"
 
 
+def test_live_camera_grant_emits_one_capture_retry_signal(
+    wizard,
+    monkeypatch,
+) -> None:
+    from cortex.apps.desktop_shell import onboarding as onb_mod
+
+    received: list[None] = []
+    wizard.camera_permission_granted.connect(lambda: received.append(None))
+    wizard._camera_permission_was_granted = False
+    monkeypatch.setattr(onb_mod, "check_camera_permission", lambda: True)
+
+    wizard._refresh_permission_states()
+    wizard._refresh_permission_states()
+
+    assert received == [None]
+
+
+def test_first_camera_grant_keeps_native_prompt_foreground(
+    monkeypatch,
+) -> None:
+    from cortex.apps.desktop_shell import onboarding as onb_mod
+    from cortex.libs.utils import platform as platform_mod
+    from cortex.libs.utils.platform import CameraPermissionState
+
+    requested: list[None] = []
+    opened: list[list[str]] = []
+    monkeypatch.setattr(
+        platform_mod,
+        "get_camera_permission_state",
+        lambda: CameraPermissionState.NOT_DETERMINED,
+    )
+    monkeypatch.setattr(
+        platform_mod,
+        "request_camera_permission",
+        lambda: requested.append(None),
+    )
+    monkeypatch.setattr(onb_mod, "_spawn_permission_open", opened.append)
+
+    onb_mod.request_camera_permission()
+
+    assert requested == [None]
+    assert opened == []
+
+
+def test_denied_camera_grant_opens_system_settings_recovery(
+    monkeypatch,
+) -> None:
+    from cortex.apps.desktop_shell import onboarding as onb_mod
+    from cortex.libs.utils import platform as platform_mod
+    from cortex.libs.utils.platform import CameraPermissionState
+
+    requested: list[None] = []
+    opened: list[list[str]] = []
+    monkeypatch.setattr(
+        platform_mod,
+        "get_camera_permission_state",
+        lambda: CameraPermissionState.DENIED,
+    )
+    monkeypatch.setattr(
+        platform_mod,
+        "request_camera_permission",
+        lambda: requested.append(None),
+    )
+    monkeypatch.setattr(onb_mod, "_spawn_permission_open", opened.append)
+
+    onb_mod.request_camera_permission()
+
+    assert requested == []
+    assert opened == [
+        [
+            "open",
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera",
+        ]
+    ]
+
+
 def test_apply_progress_marks_complete_on_completed(wizard) -> None:
     """A ``status='completed'`` progress event flips the calibration
     step in OnboardingState to complete."""

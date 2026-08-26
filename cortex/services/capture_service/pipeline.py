@@ -18,10 +18,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import cast
+from functools import partial
+from typing import Any, TypeVar, cast
 from uuid import UUID, uuid4
 
 import cv2
@@ -47,6 +50,7 @@ from cortex.services.capture_service.webcam import CapturedFrame, WebcamCapture
 logger = logging.getLogger(__name__)
 
 _CAPTURE_ALGORITHM_VERSION = "capture-integrity/2.0.0"
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
@@ -173,6 +177,14 @@ class CapturePipeline:
         # Pipeline task
         self._pipeline_task: asyncio.Task[None] | None = None
         self._running = False
+        self._start_lock = asyncio.Lock()
+        self._startup_cancel = threading.Event()
+        # MediaPipe 0.10.21 (the Intel macOS compatibility wheel) exposes a
+        # synchronous TaskRunner without the thread-safe serial dispatcher in
+        # newer wheels.  Keep create/detect/close on one owned worker for both
+        # architectures.  This also prevents native inference and font/model
+        # I/O from blocking the daemon's API/quit event loop.
+        self._face_executor: ThreadPoolExecutor | None = None
 
         # Metrics
         self._frames_processed = 0
@@ -313,36 +325,105 @@ class CapturePipeline:
 
     async def start(self) -> None:
         """Start the full capture pipeline."""
-        if self._running:
-            logger.warning("CapturePipeline already running")
-            return
+        async with self._start_lock:
+            if self._running:
+                logger.warning("CapturePipeline already running")
+                return
 
-        # Initialize components
+            self._startup_cancel.clear()
+            # Open the camera first.  A missing TCC grant now fails in
+            # milliseconds, avoiding an expensive MediaPipe/font-cache load
+            # for a channel that cannot produce frames.
+            await self._webcam.start()
+            try:
+                self._ensure_face_executor()
+                await self._run_face_worker(self._initialize_face_tracker)
+            except BaseException:
+                self._startup_cancel.set()
+                await self._webcam.stop()
+                await self._release_face_tracker()
+                raise
+
+            if self._startup_cancel.is_set():
+                await self._webcam.stop()
+                await self._release_face_tracker()
+                raise asyncio.CancelledError
+
+            self._last_captured = None
+
+            # Start pipeline processing loop
+            self._running = True
+            self._pipeline_task = asyncio.create_task(
+                self._pipeline_loop(), name="capture-pipeline"
+            )
+            logger.info("CapturePipeline started")
+
+    def _initialize_face_tracker(self) -> None:
+        """Initialize MediaPipe on its owned worker."""
+
         self._face_tracker.initialize()
-        await self._webcam.start()
-        self._last_captured = None
 
-        # Start pipeline processing loop
-        self._running = True
-        self._pipeline_task = asyncio.create_task(
-            self._pipeline_loop(), name="capture-pipeline"
-        )
-        logger.info("CapturePipeline started")
+    def _ensure_face_executor(self) -> ThreadPoolExecutor:
+        """Return the single worker that owns every MediaPipe operation."""
+
+        executor = self._face_executor
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="cortex-face-tracker",
+            )
+            self._face_executor = executor
+        return executor
+
+    async def _run_face_worker(
+        self,
+        fn: Callable[..., _T],
+        /,
+        *args: Any,
+    ) -> _T:
+        """Run one synchronous capture operation on the MediaPipe owner."""
+
+        executor = self._face_executor
+        if executor is None:
+            raise RuntimeError("MediaPipe worker is not available")
+        return await asyncio.get_running_loop().run_in_executor(executor, fn, *args)
+
+    async def _release_face_tracker(self) -> None:
+        """Close MediaPipe on its owner thread, then retire that worker."""
+
+        executor = self._face_executor
+        if executor is None:
+            # Under the owned-worker contract, no executor means this pipeline
+            # has never initialized MediaPipe or has already released it.
+            return
+        try:
+            await self._run_face_worker(self._face_tracker.release)
+        finally:
+            self._face_executor = None
+            # The release operation above drains all prior work because this
+            # is a single-worker executor.  No loop-blocking join is needed.
+            executor.shutdown(wait=False, cancel_futures=True)
 
     async def stop(self) -> None:
         """Stop the capture pipeline and release all resources."""
-        self._running = False
+        # Signal a camera-open/MediaPipe-start task before waiting for the
+        # lifecycle lock. The in-flight start then performs its own owner-
+        # thread cleanup and releases the lock; teardown below cannot race it
+        # into a second close on the event-loop thread.
+        self._startup_cancel.set()
+        async with self._start_lock:
+            self._running = False
 
-        if self._pipeline_task is not None:
-            self._pipeline_task.cancel()
-            try:
-                await self._pipeline_task
-            except asyncio.CancelledError:
-                pass
-            self._pipeline_task = None
+            if self._pipeline_task is not None:
+                self._pipeline_task.cancel()
+                try:
+                    await self._pipeline_task
+                except asyncio.CancelledError:
+                    pass
+                self._pipeline_task = None
 
-        await self._webcam.stop()
-        self._face_tracker.release()
+            await self._webcam.stop()
+            await self._release_face_tracker()
 
         logger.info(
             "CapturePipeline stopped",
@@ -390,22 +471,27 @@ class CapturePipeline:
                     continue
 
                 for missing in self._synthesize_input_queue_gaps(captured):
-                    await self._publish_output(self._process_frame(missing))
+                    output = await self._run_face_worker(self._process_frame, missing)
+                    await self._publish_output(output)
 
                 # Adaptive frame skip
                 if self._frame_skipper.should_skip(captured.sequence):
-                    await self._publish_output(
-                        self._missing_output(
+                    output = await self._run_face_worker(
+                        partial(
+                            self._missing_output,
                             captured,
                             validity=ObservationValidity.REJECTED,
                             reason=MissingReason.FRAME_DROPPED,
                         )
                     )
+                    await self._publish_output(
+                        output
+                    )
                     continue
 
                 # Process frame
                 t_start = self._clock.monotonic_ns()
-                output = self._process_frame(captured)
+                output = await self._run_face_worker(self._process_frame, captured)
                 processing_time = max(
                     0.0,
                     (self._clock.monotonic_ns() - t_start) / 1_000_000_000.0,

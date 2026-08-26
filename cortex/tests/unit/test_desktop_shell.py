@@ -703,6 +703,13 @@ class TestTrayIcon:
         tray.set_connected(True)
         assert tray._connected
 
+    def test_starting_state_is_not_connected(self):
+        from PySide6.QtWidgets import QApplication
+        tray = CortexTrayIcon(QApplication())
+        tray.set_starting()
+        assert not tray._connected
+        assert tray._state_action._text == "State: Starting…"
+
     def test_set_paused(self):
         from PySide6.QtWidgets import QApplication
         tray = CortexTrayIcon(QApplication())
@@ -754,6 +761,12 @@ class TestDashboard:
         dash = DashboardWindow()
         dash.set_connected(True)
         assert dash._connected
+
+    def test_starting_state_is_not_connected(self):
+        dash = DashboardWindow()
+        dash.set_starting()
+        assert not dash._connected
+        assert dash._consumer._state_label.text() == "Starting…"
 
     def test_undo_surface_requires_verified_transaction_receipts(self):
         dash = DashboardWindow()

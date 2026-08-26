@@ -101,6 +101,12 @@ def test_consumer_empty_state_stays_hidden_after_reconnect(dashboard):
     assert not consumer._bio_empty_state.isVisibleTo(consumer)
 
 
+def test_dashboard_starting_state_does_not_claim_connected(dashboard):
+    dashboard.set_starting()
+    assert dashboard._connected is False
+    assert dashboard._consumer._state_label.text() == "Starting…"
+
+
 def test_advanced_empty_state_visible_before_first_frame(dashboard):
     """The developer-debug tab also gets an empty-state panel."""
     advanced = dashboard._advanced

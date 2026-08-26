@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 # milestones happen on the asyncio loop, so there is no concurrency.
 _STARTUP_MILESTONES: list[tuple[str, float]] = []
 _PROFILE_STARTUP_ENABLED = False
+_DAEMON_READINESS_TIMEOUT_SECONDS = 30.0
 
 
 def record_milestone(label: str) -> None:
@@ -108,15 +109,61 @@ class DevServer:
         self._tasks = [
             asyncio.create_task(self._daemon.start(), name="cortex-daemon"),
         ]
-        await asyncio.sleep(0.5)
-        record_milestone("daemon-warmup-elapsed")
+        await self._wait_for_daemon_readiness()
+        record_milestone("daemon-ready")
         logger.info("Services started: daemon=%s", True)
         logger.info(
             "Cortex dev server ready. Press Ctrl+C to stop."
         )
 
-        # Wait for shutdown signal
-        await self._shutdown_event.wait()
+        # Either the outer development harness or CortexDaemon may own the
+        # process signal handler, depending on which local server installed
+        # its handler last. Waiting on both prevents a SIGINT handled by the
+        # daemon from leaving this wrapper alive forever after core shutdown.
+        await self._wait_for_shutdown_or_daemon_exit()
+
+    async def _wait_for_daemon_readiness(self) -> None:
+        """Publish dev-server readiness only after the daemon is operational."""
+
+        if not self._tasks:
+            raise RuntimeError("daemon task was not created")
+        daemon_task = self._tasks[0]
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _DAEMON_READINESS_TIMEOUT_SECONDS
+        while not self._daemon.is_ready:
+            if daemon_task.done():
+                if daemon_task.cancelled():
+                    raise RuntimeError("daemon task was cancelled during startup")
+                exception = daemon_task.exception()
+                if exception is not None:
+                    raise RuntimeError("daemon failed during startup") from exception
+                raise RuntimeError("daemon exited before becoming ready")
+            if loop.time() >= deadline:
+                raise TimeoutError(
+                    "daemon did not become ready within "
+                    f"{_DAEMON_READINESS_TIMEOUT_SECONDS:.0f}s"
+                )
+            await asyncio.sleep(0.025)
+
+    async def _wait_for_shutdown_or_daemon_exit(self) -> None:
+        """Join either signal owner and propagate daemon task failures."""
+
+        shutdown_waiter = asyncio.create_task(
+            self._shutdown_event.wait(),
+            name="cortex-dev-shutdown-waiter",
+        )
+        try:
+            done, _pending = await asyncio.wait(
+                {*self._tasks, shutdown_waiter},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in self._tasks:
+                if task in done:
+                    await task
+        finally:
+            if not shutdown_waiter.done():
+                shutdown_waiter.cancel()
+            await asyncio.gather(shutdown_waiter, return_exceptions=True)
 
     async def stop(self) -> None:
         """Stop all services gracefully."""
@@ -124,7 +171,8 @@ class DevServer:
 
         await self._daemon.stop()
         for task in self._tasks:
-            task.cancel()
+            if not task.done():
+                task.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
 

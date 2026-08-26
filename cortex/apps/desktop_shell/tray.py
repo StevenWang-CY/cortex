@@ -319,6 +319,16 @@ class CortexTrayIcon(QSystemTrayIcon):
             self.setToolTip("Cortex — Disconnected")
             self._state_action.setText("State: Disconnected")
 
+    def set_starting(self) -> None:
+        """Show lifecycle startup without claiming a live daemon."""
+
+        self._connected = False
+        self.setIcon(_make_heart_icon(DISCONNECTED_COLOR))
+        if self._native_status is not None:
+            self._native_status.set_state_tint(None)
+        self.setToolTip("Cortex — Starting…")
+        self._state_action.setText("State: Starting…")
+
     def set_paused(self, paused: bool) -> None:
         self._paused = paused
         self._pause_action.setText("Resume" if paused else "Pause")

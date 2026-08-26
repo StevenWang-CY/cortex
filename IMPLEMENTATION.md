@@ -2768,3 +2768,307 @@ the assets remain preserved, and the next correction receives a higher version.
 - Running directly from a mounted DMG is tested for crash visibility, but the
   supported installation path remains `/Applications/Cortex.app` because
   native-messaging manifests require a canonical non-translocated location.
+
+---
+
+## 22. v0.3.7 hardware-independent readiness and permission lifecycle
+
+### 22.1 Release-gate observation
+
+The v0.3.6 candidate passed its headless packaged liveness probe, signing,
+notarization, stapling, Gatekeeper, checksum, and provenance gates. The required
+real Finder exercise nevertheless exposed a second first-launch defect:
+
+1. the downloaded arm64 DMG was opened through Finder;
+2. `Cortex.app` was copied to `/Applications` and the DMG was ejected;
+3. the installed Developer-ID-signed v0.3.6 app launched and its dashboard
+   remained visible, proving the v0.3.5 frozen-source crash was fixed;
+4. the dashboard immediately displayed `Connected`;
+5. PID inspection showed the executable was the installed
+   `/Applications/Cortex.app/Contents/MacOS/Cortex`;
+6. neither port 9472 nor 9473 was listening and `/health` was unreachable;
+7. the startup log stopped at `Requesting camera permission from macOS...`;
+8. exactly 60 seconds later the request timed out, camera opening failed, both
+   transports started, and `/health` became version-matched and healthy.
+
+The process did not crash, but the product violated two release-critical
+contracts: visible `Connected` state did not mean operational readiness, and an
+optional privacy-sensitive hardware decision gated the control plane and quit
+path.
+
+### 22.2 Exact causal chain
+
+The blocking sequence was:
+
+```text
+CortexAppController._start_daemon
+  -> start Python daemon thread
+  -> immediately emit connection_changed(True)
+  -> CortexDaemon.start
+  -> CapturePipeline.start
+  -> FaceTracker.initialize
+  -> WebcamCapture.start
+  -> open_video_capture
+  -> _request_macos_camera_permission
+  -> requestAccessForMediaType_completionHandler_
+  -> threading.Event.wait(timeout=60)
+  -> only then start WebSocket and HTTP
+```
+
+Four independent defects compounded:
+
+- **Thread existence was treated as readiness.** The controller emitted
+  `Connected` immediately after `thread.start()`.
+- **Optional hardware preceded the control plane.** WebSocket and HTTP were
+  below capture in the serial startup sequence.
+- **A user-time interaction was implemented as a synchronous wait.** A hidden,
+  ignored, denied, or callback-starved TCC prompt held the daemon event loop.
+- **Expensive work preceded capability proof.** MediaPipe and the initial font
+  cache were loaded before confirming that camera authority existed.
+
+The headless release probe intentionally sets `CORTEX_HEADLESS_STARTUP=1`, so
+it correctly proved the no-hardware path but could not expose ordering inside
+the real TCC branch. This is why both automated and installed-GUI gates are
+required.
+
+### 22.3 Design alternatives considered
+
+#### Shorten the 60-second wait
+
+A five- or ten-second synchronous timeout would reduce the symptom but retain
+false connection state, an unresponsive quit path, and a race against how long
+a person needs to read the permission rationale. It was rejected.
+
+#### Start HTTP first, then block the same event loop on capture
+
+Scheduling a server task before synchronous camera work does not make it
+operational: uvicorn and WebSocket callbacks still need the blocked asyncio
+loop. It would create a listener-shaped readiness illusion rather than a
+responsive control plane. It was rejected.
+
+#### Automatically bypass or grant camera permission
+
+Cortex cannot and must not bypass macOS TCC. Silently approving a camera grant
+would also violate the product's explicit-consent boundary and the release
+test's privacy rules. It was rejected.
+
+#### Remove camera startup entirely
+
+Deferring every camera attempt until calibration would make existing users who
+already granted access lose expected sensing on launch. It was rejected.
+
+#### Selected design: independent core and optional-hardware lifecycles
+
+Durable/core services establish a real readiness boundary. Camera acquisition
+is a separately supervised, cancellable task. Runtime code only observes
+current TCC state; onboarding and Settings own the non-blocking request from an
+explicit user action. A newly observed grant retries capture without a
+relaunch.
+
+### 22.4 Lifecycle state model
+
+Core and capture have deliberately separate state machines:
+
+```text
+desktop:  Starting… -> Connected -> Disconnected
+                         ^
+                         |
+core:     composing -> transports bound -> ready -> stopping -> stopped
+
+capture:  pending -> opening -> ready
+              |         |         |
+              +---------+-------> stale/unavailable
+                                    |
+                         explicit live grant/retry
+                                    |
+                                    +-> opening -> ready
+```
+
+`Connected` means the durable core graph is initialized, WebSocket has bound,
+uvicorn has reported its HTTP server started, recovery has run, and runtime
+coordinators are owned by the supervisor. It does **not** claim that every
+optional sensor is available. Camera unavailability is represented separately
+as stale capture and insufficient evidence.
+
+### 22.5 Runtime implementation
+
+`CortexDaemon` now exposes a read-only `is_ready` lifecycle flag. Startup:
+
+1. configures logging;
+2. opens and verifies SQLite authority and migrations;
+3. provisions the local capability token;
+4. registers the application service graph;
+5. binds WebSocket;
+6. recovers unfinished intervention transactions;
+7. starts uvicorn and waits up to a bounded five seconds for its `started`
+   signal, failing closed on task exit, cancellation, shutdown, or timeout;
+8. starts input/window telemetry and spawns `cortex-capture-startup` as a
+   non-critical supervised background task;
+9. starts coordinators and the scheduler;
+10. sets `is_ready=True`, logs `startup.ready name=daemon_core`, and waits for
+    shutdown.
+
+Capture success clears both the compatibility service-registry marker and the
+typed runtime-status stale flag. Capture failure registers stale state,
+broadcasts an explicit insufficient-evidence update, and leaves the rest of the
+daemon operational. Cancellation propagates; it is not misreported as camera
+failure.
+
+Shutdown clears readiness before teardown, cancels and drains background tasks,
+and still executes the existing unconditional `CapturePipeline.stop()` safety
+barrier. Multiple stop callers continue to coalesce on the one supervised
+lifecycle task.
+
+The development wrapper now treats shutdown as a join over both possible
+signal owners. `DevServer` waits for either its private shutdown event or the
+daemon task to finish, then always enters its `finally: stop()` barrier. This
+closes a bug found only during the hardware-backed source exercise: both the
+wrapper and daemon registered process signal handlers on the same loop, so the
+last registration could receive Ctrl+C, let the daemon task return, and leave
+the wrapper waiting forever on an unrelated event. The daemon also marks the
+uvicorn task as expected at signal receipt, before uvicorn can return, so a
+normal lifecycle transition cannot race into a false critical-task report.
+
+### 22.6 Camera and MediaPipe boundaries
+
+The runtime camera helper was renamed from an imperative request to an
+observational authorization check. Its semantics are:
+
+| macOS authorization state | Runtime behavior |
+| --- | --- |
+| authorized | continue to deterministic camera selection |
+| not determined | return unavailable immediately; onboarding/Settings owns the request |
+| denied or restricted | return unavailable immediately and log the status |
+| AVFoundation query unavailable | retain the prior best-effort OpenCV capability check |
+
+`open_video_capture()` accepts a cooperative cancellation event. It checks the
+event before each candidate, after each native open, between every warm-up read,
+and immediately before returning a live handle. Any cancellation after a
+partial open releases that local handle.
+
+`WebcamCapture.start()` runs enumeration, native open, and warm-up in a worker
+thread rather than on the daemon loop. Cancellation sets the shared event and
+propagates. `stop()` sets the same event before clearing the frame-reader flag
+and retains the unconditional `cap.release()` invariant.
+
+`CapturePipeline.start()` now opens the camera before initializing MediaPipe.
+When permission is absent, the product therefore avoids model loading and
+first-account font-cache construction entirely. When authority exists,
+MediaPipe creation, synchronous inference, and close all run off-loop on one
+pipeline-owned worker. Keeping those operations on the same worker is the
+portable contract across Cortex's two dependency graphs: Intel uses the older
+0.10.21 `TaskRunner`, while current Apple Silicon wheels wrap C calls in a
+thread-safe serial dispatcher. It also prevents per-frame native inference
+from starving HTTP, WebSocket, or quit callbacks. Failure or cancellation
+stops the opened webcam and releases the face tracker on its owning worker
+before propagating.
+
+No frame persistence, camera-selection priority, Continuity Camera exclusion,
+post-open live-name verification, four-read MacBook warm-up policy, signal
+algorithm, or intervention-authority rule changes in v0.3.7.
+
+### 22.7 Explicit permission and live retry
+
+The desktop permission surfaces remain the only prompt owners:
+
+- onboarding's **Grant Access** button invokes the non-blocking AVFoundation
+  request when TCC is not determined and opens System Settings only for a
+  denied/restricted recovery;
+- Settings' camera permission link invokes that same request from the user's
+  click when TCC is not determined and deliberately keeps Cortex foregrounded
+  so the native prompt is visible; already denied/restricted state instead
+  opens the Privacy & Security recovery pane;
+- both surfaces poll TCC every 1.5 seconds only while relevant/visible;
+- only a `False -> True` transition emits `camera_permission_granted`;
+- the controller converts that signal into
+  `apply_settings({"webcam_enabled": True})` on the daemon loop;
+- a successful retry clears stale state; a failed retry re-broadcasts stale
+  state and never claims biometric availability.
+
+Repeated permission polls cannot produce repeated camera opens because the
+transition signal is edge-triggered and `CapturePipeline.start()` is serialized
+by an asyncio lock.
+
+### 22.8 Interaction refinement
+
+| Before | After | Why |
+| --- | --- | --- |
+| Dashboard painted `Connected` as soon as the daemon thread existed. | Dashboard and tray show `Starting…` until core readiness is true. | Status copy must describe a user-observable capability, not an implementation detail. |
+| A hidden/ignored system prompt froze backend readiness for 60 seconds. | Permission requests happen only from explicit onboarding/Settings actions; unresolved state degrades immediately. | Keeps interaction interruptible and preserves user agency over privacy-sensitive access. |
+| Granting camera permission could require a relaunch. | A live grant edge retries capture in-process exactly once. | Immediate feedback closes the action/result loop and avoids making the user infer recovery steps. |
+| Camera failure looked like an empty, possibly broken app during startup. | Core connects independently and stale capture is represented as insufficient evidence. | Separates service health from sensor availability and prevents misleading biometrics. |
+
+The visual treatment intentionally reuses existing semantic tokens. No new
+palette, ornamental animation, or modal interruption was introduced. The
+highest-value polish here is temporal truth: state changes occur at the moment
+their underlying capability becomes real.
+
+### 22.9 Regression and release proof
+
+New deterministic tests prove:
+
+- a not-determined TCC state returns in under 250 ms and never invokes the
+  native request method from runtime startup;
+- unresolved authority skips candidate enumeration and `cv2.VideoCapture`;
+- a pending camera-open worker can be cancelled without blocking the event
+  loop;
+- MediaPipe initialize, frame processing, and release execute on one worker
+  that is distinct from the daemon event-loop thread;
+- core readiness becomes true while capture is intentionally held pending;
+- the desktop emits no connected signal before `daemon.is_ready`;
+- Settings/onboarding emit one live-grant retry signal across repeated polls;
+- the Settings camera link invokes the non-blocking request from the user's
+  action;
+- existing camera warm-up, index-reorder, post-open Continuity Camera,
+  capture-release, and desktop empty-state tests remain green;
+- the development wrapper progresses to its complete stop barrier whether the
+  wrapper event or daemon task observes the process signal;
+- signal-driven uvicorn completion is classified as lifecycle-owned before the
+  daemon shutdown event is set.
+
+The hardware-backed source runtime was then exercised twice consecutively on
+the release host with authorized built-in camera access. In each cycle the
+HTTP and WebSocket transports bound before optional capture, `/health` reported
+healthy version `0.3.7`, the MacBook camera opened, MediaPipe initialized, and
+one Ctrl+C completed graceful teardown in approximately one to two seconds.
+The logs confirmed `WebcamCapture stopped`, `FaceTracker released`,
+`CapturePipeline stopped`, WebSocket close, and `All services stopped`; follow-
+up process and listener checks found neither runtime process nor ports 9471,
+9472, or 9473. The second cycle reused the same durable store, covering clean
+restart after a complete stop rather than only a fresh-profile launch.
+
+Release promotion remains fail-closed. v0.3.6 is preserved as an unpublished
+incident candidate. v0.3.7 must complete:
+
+```text
+clean source gates
+  -> dual-architecture CI
+  -> immutable annotated v0.3.7 tag
+  -> signed + notarized + stapled arm64 and x86_64 DMGs
+  -> mounted frozen composition and liveness on each native runner
+  -> checksum + attestation verification
+  -> downloaded candidate Finder install to /Applications
+  -> eject DMG
+  -> visible installed launch + version-matched healthy core
+  -> honest camera-ready or camera-stale state (no silent permission grant)
+  -> normal quit + ports/process/camera cleanup
+  -> relaunch + repeated cleanup
+  -> publish GitHub release
+  -> unauthenticated public redownload and repeat host-architecture install/open/quit
+```
+
+### 22.10 Residual boundaries
+
+- A no-permission release run proves honest degraded behavior, not biometric
+  signal quality. Camera-quality claims still require an explicit grant and the
+  reference-sensor validation program defined earlier in this document.
+- Worker-thread cancellation is cooperative around vendor native calls. A
+  single native `VideoCapture` constructor cannot be pre-empted safely; the
+  worker checks cancellation immediately after it returns, releases the handle,
+  and process exit remains the final kernel-level reclamation boundary.
+- `Connected` is core readiness, not an assertion that browser/editor
+  extensions, camera, Accessibility, an LLM provider, or calibration are
+  configured. Each remains separately visible and fail-closed.
+- The local GUI exercise owns visible behavior on the host architecture. The
+  native Intel runner owns executable liveness for x86_64; Rosetta is not
+  treated as equivalent evidence.

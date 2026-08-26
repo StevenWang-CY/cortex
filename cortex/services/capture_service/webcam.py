@@ -33,7 +33,11 @@ from cortex.application.clock import SYSTEM_CLOCK, Clock, monotonic_seconds
 from cortex.libs.config.settings import CaptureConfig
 from cortex.libs.schemas.observations import CameraIdentity, MissingReason
 from cortex.libs.schemas.temporal import EventTime
-from cortex.libs.utils.platform import is_macos
+from cortex.libs.utils.platform import (
+    CameraPermissionState,
+    get_camera_permission_state,
+    is_macos,
+)
 
 logger = logging.getLogger(__name__)
 _AUTO_CAMERA_DEVICE_ID = 0
@@ -443,57 +447,47 @@ def _iter_camera_candidates(config: CaptureConfig) -> Iterable[CameraSelection]:
         yield candidate
 
 
-def _request_macos_camera_permission() -> bool:
-    """Explicitly request camera permission from macOS TCC.
+def _macos_camera_permission_is_authorized() -> bool:
+    """Return whether this process already has macOS camera authority.
 
-    On first launch, this triggers the system "Allow camera?" dialog.
-    Returns True if authorized, False if denied or unavailable.
+    The runtime deliberately does **not** request TCC authority here.  The
+    desktop onboarding surface owns that user gesture through the
+    non-blocking helper in :mod:`cortex.libs.utils.platform`.  Blocking the
+    daemon thread on ``requestAccess...`` used to hold every transport and
+    shutdown path for sixty seconds when the prompt was hidden, ignored, or
+    unable to dispatch its callback.
+
+    If AVFoundation cannot be queried we preserve the previous best-effort
+    behaviour and let OpenCV perform the final capability check.
     """
     if not is_macos():
         return True
-    try:
-        import threading
-
-        import objc
-
-        objc.loadBundle(
-            "AVFoundation",
-            bundle_path="/System/Library/Frameworks/AVFoundation.framework",
-            module_globals={},
+    state = get_camera_permission_state()
+    if state == CameraPermissionState.AUTHORIZED:
+        return True
+    if state == CameraPermissionState.NOT_DETERMINED:
+        logger.info(
+            "Camera permission has not been requested; capture remains "
+            "offline until the user grants it from Cortex onboarding or settings"
         )
-        AVCaptureDevice = objc.lookUpClass("AVCaptureDevice")
-
-        # 0=notDetermined, 1=restricted, 2=denied, 3=authorized
-        status = AVCaptureDevice.authorizationStatusForMediaType_("vide")
-        if status == 3:
-            return True
-        if status in (1, 2):
-            logger.warning("Camera access denied (TCC status=%d)", status)
-            return False
-
-        # Status is notDetermined — trigger the system permission dialog
-        logger.info("Requesting camera permission from macOS...")
-        result_event = threading.Event()
-        granted = [False]
-
-        def on_response(was_granted: bool) -> None:
-            granted[0] = was_granted
-            result_event.set()
-
-        AVCaptureDevice.requestAccessForMediaType_completionHandler_(
-            "vide", on_response,
-        )
-        # Wait up to 60s for user to click Allow/Deny
-        result_event.wait(timeout=60)
-        logger.info("Camera permission %s", "granted" if granted[0] else "denied")
-        return granted[0]
-    except Exception:
-        logger.debug("Could not request camera permission via AVFoundation", exc_info=True)
-        return True  # Can't check — proceed and let OpenCV try
+        return False
+    if state in {
+        CameraPermissionState.RESTRICTED,
+        CameraPermissionState.DENIED,
+    }:
+        logger.warning("Camera access unavailable (TCC status=%s)", state.value)
+        return False
+    if state == CameraPermissionState.UNKNOWN:
+        logger.warning("Unknown camera authorization status")
+        return False
+    logger.debug("Camera authorization query unavailable; trying OpenCV")
+    return True
 
 
 def open_video_capture(
     config: CaptureConfig,
+    *,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[cv2.VideoCapture | None, CameraSelection | None]:
     """Open the best matching webcam device for the given configuration.
 
@@ -503,14 +497,30 @@ def open_video_capture(
     """
     import time as _time
 
-    # Request camera permission before trying to open any device.
-    # On first run this triggers the macOS "Allow camera?" dialog.
-    if is_macos():
-        _request_macos_camera_permission()
+    # Permission prompts are an explicit onboarding/settings gesture.  Runtime
+    # startup only checks current authority and fails fast into the product's
+    # telemetry-first mode.  This keeps UI, HTTP, WebSocket, and quit paths
+    # responsive even when TCC is unresolved.
+    if is_macos() and not _macos_camera_permission_is_authorized():
+        return None, None
+
+    def _cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
+    def _warmup_pause(seconds: float) -> bool:
+        """Wait between warmup reads, returning False when cancelled."""
+
+        if cancel_event is None:
+            _time.sleep(seconds)
+            return True
+        return not cancel_event.wait(timeout=seconds)
 
     last_candidate: CameraSelection | None = None
 
     for candidate in _iter_camera_candidates(config):
+        if _cancelled():
+            logger.info("Camera open cancelled before candidate %d", candidate.device_id)
+            return None, last_candidate
         last_candidate = candidate
         logger.info(
             "Trying camera candidate: device_id=%d, source=%s, name=%s, backend=%s",
@@ -534,12 +544,17 @@ def open_video_capture(
             if candidate.backend is not None
             else cv2.VideoCapture(candidate.device_id)
         )
+        if _cancelled():
+            capture.release()
+            return None, last_candidate
         if capture.isOpened():
             # Validate with test frame reads — built-in Mac cameras can need
             # up to ~1.5s to deliver the first frame after opening.
             ret, frame = False, None
             for _attempt in range(4):
-                _time.sleep(0.5)
+                if not _warmup_pause(0.5):
+                    capture.release()
+                    return None, last_candidate
                 ret, frame = capture.read()
                 if ret and frame is not None:
                     break
@@ -596,6 +611,9 @@ def open_video_capture(
                     live_source = "builtin_mac_camera"
                 elif actual_name and is_macos():
                     live_source = "other_camera"
+                if _cancelled():
+                    capture.release()
+                    return None, last_candidate
                 return capture, replace(
                     candidate,
                     source=live_source,
@@ -642,6 +660,10 @@ class WebcamCapture:
         self._running = threading.Event()
         self._stopped = threading.Event()
         self._stopped.set()  # Initially stopped
+        # Cooperative cancellation for the blocking OpenCV/AVFoundation open
+        # worker.  ``start()`` runs that work off the asyncio loop so optional
+        # hardware can never freeze HTTP, WebSocket, or graceful shutdown.
+        self._open_cancel = threading.Event()
 
         # Async queue for cross-thread communication
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -737,9 +759,20 @@ class WebcamCapture:
 
         self._loop = asyncio.get_running_loop()
         self._queue = asyncio.Queue(maxsize=self._queue_maxsize)
+        self._open_cancel.clear()
 
-        # Open camera
-        self._cap, self._camera_selection = open_video_capture(self._config)
+        # Camera enumeration, warmup reads, and AVFoundation can block.  Keep
+        # them off the daemon loop; cancellation is checked between every
+        # candidate and warmup read.
+        try:
+            self._cap, self._camera_selection = await asyncio.to_thread(
+                open_video_capture,
+                self._config,
+                cancel_event=self._open_cancel,
+            )
+        except asyncio.CancelledError:
+            self._open_cancel.set()
+            raise
         if (
             self._cap is None
             or not self._cap.isOpened()
@@ -797,6 +830,7 @@ class WebcamCapture:
         already exited on its own.
         """
         # Signal the capture thread to stop (idempotent)
+        self._open_cancel.set()
         self._running.clear()
 
         # Wait for thread to finish if it's still alive

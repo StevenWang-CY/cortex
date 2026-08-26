@@ -791,6 +791,10 @@ class CortexDaemon:
         self._runtime_data = self._kernel.runtime_data
         self._runtime_status.bind_daemon(self)
         self._stop_started = False
+        # Cross-thread lifecycle truth consumed by the in-process Qt shell.
+        # A live Python thread is not readiness: transports and durable state
+        # must be initialized before the UI may claim "Connected".
+        self._ready = False
         # All callers coalesce onto one cleanup task. A second stop request
         # must await the first rather than returning while camera/database/
         # worker teardown is still in progress (the old behavior let Qt exit
@@ -1553,6 +1557,12 @@ class CortexDaemon:
 
         return self._services
 
+    @property
+    def is_ready(self) -> bool:
+        """Whether durable core services and both local transports are ready."""
+
+        return self._ready
+
     def _current_state_estimate(self) -> Any | None:
         value = self._runtime_data.snapshot().state_estimate
         return value if value is not None else self._services.get("latest_state_estimate")
@@ -1756,6 +1766,35 @@ class CortexDaemon:
                 exc_info=True,
             )
 
+    async def _start_optional_hardware(self) -> None:
+        """Start capture without gating core daemon readiness.
+
+        Camera authority, enumeration, OpenCV warmup, and MediaPipe loading
+        are optional hardware work.  They must never delay the API/WebSocket
+        control plane or make Quit unresponsive.  Failure is contained as an
+        explicit stale-capture state while telemetry and the rest of Cortex
+        remain available.
+        """
+
+        logger.info("startup.hardware_begin name=capture_pipeline")
+        try:
+            await self._capture_pipeline.start()
+            self._capture_available = True
+            self._capture_stale = False
+            self._services.register("capture_stale", False)
+            self._runtime_status.mark_capture_stale(False)
+            logger.info("startup.hardware_ready name=capture_pipeline")
+        except asyncio.CancelledError:
+            logger.info("startup.hardware_cancelled name=capture_pipeline")
+            raise
+        except Exception:
+            logger.exception(
+                "Capture pipeline failed to start; continuing in telemetry-first mode"
+            )
+            self._capture_available = False
+            self._capture_stale = True
+            await self._emit_capture_stale_broadcast()
+
     async def await_apply_confirmation(
         self,
         intervention_id: str,
@@ -1846,6 +1885,7 @@ class CortexDaemon:
 
     async def start(self) -> None:
         """Start the runtime and block until shutdown."""
+        self._ready = False
         # C6 (audit): configure structlog ONCE here, before any logger use,
         # replacing the bare ``logging.basicConfig`` the daemon relied on.
         # Idempotent (see ``configure_logging`` docstring) so the run_dev /
@@ -1912,31 +1952,6 @@ class CortexDaemon:
         # native extension call it can lead to a segfault on resume.
         self._install_loop_signal_handlers()
         self._register_services()
-        hardware_probe_enabled = os.environ.get("CORTEX_HEADLESS_STARTUP") != "1"
-        if hardware_probe_enabled:
-            self._input_hooks.start()
-            self._window_tracker.start()
-            try:
-                await self._capture_pipeline.start()
-                self._capture_available = True
-                self._capture_stale = False
-            except Exception:
-                logger.exception(
-                    "Capture pipeline failed to start; continuing in telemetry-first mode"
-                )
-                self._capture_available = False
-                # B1 (Phase 4.1): the camera channel is permanently offline
-                # for the lifetime of this start attempt. Mark the capture
-                # signal as stale so the next broadcast cycle (and the
-                # synthetic kickoff broadcast below) tells every client.
-                self._capture_stale = True
-        else:
-            # Release CI must prove honest camera-unavailable behavior without
-            # touching a developer/runner camera or requesting TCC authority.
-            # The normal Finder E2E owns the real hardware path.
-            logger.info("Headless startup probe: hardware acquisition disabled")
-            self._capture_available = False
-            self._capture_stale = True
         ws_started = await self._ws_server.start()
         if not ws_started:
             raise RuntimeError(
@@ -1953,13 +1968,26 @@ class CortexDaemon:
             self._pending_startup_restores[restore_command.restore_id] = restore_command
             await self._ws_server.send_restore_command(restore_command)
         self._start_api_server()
+        await self._wait_for_api_server_ready()
 
-        # B1 (Phase 4.1): if the capture pipeline never came up, broadcast
-        # an initial STATE_UPDATE with ``capture.stale=True`` so clients
-        # don't wait indefinitely for a first frame. Idempotent — if a
-        # client connects later it still reads the registry-stored
-        # ``capture_stale=True`` flag via subsequent broadcasts.
-        if not self._capture_available:
+        hardware_probe_enabled = os.environ.get("CORTEX_HEADLESS_STARTUP") != "1"
+        if hardware_probe_enabled:
+            # Input/window hooks are fast and independently useful when the
+            # camera is unavailable.  Capture itself is supervised in the
+            # background because TCC/OpenCV/MediaPipe are optional hardware.
+            self._input_hooks.start()
+            self._window_tracker.start()
+            self._spawn_background_task(
+                self._start_optional_hardware(),
+                name="cortex-capture-startup",
+            )
+        else:
+            # Release CI must prove honest camera-unavailable behavior without
+            # touching a developer/runner camera or requesting TCC authority.
+            # The normal Finder E2E owns the real hardware path.
+            logger.info("Headless startup probe: hardware acquisition disabled")
+            self._capture_available = False
+            self._capture_stale = True
             await self._emit_capture_stale_broadcast()
         # B4 (Phase 4.1): if the store fell back to in-memory at __init__
         # time, fire a one-time broadcast so every connected surface
@@ -1996,6 +2024,8 @@ class CortexDaemon:
         # v2.0: Check for morning briefing on startup
         await self._check_morning_briefing()
 
+        self._ready = True
+        logger.info("startup.ready name=daemon_core")
         logger.info("Cortex daemon started (v2.0)")
         await self._shutdown.wait()
 
@@ -2042,6 +2072,11 @@ class CortexDaemon:
         thread, not the signal frame, so native extensions complete
         their current op cleanly before we proceed to shutdown."""
         logger.info("Shutdown signal received in asyncio loop")
+        # Uvicorn also observes process signals and may return before the
+        # daemon's stop coroutine reaches its normal expect-completion mark.
+        # Classify that transport exit as lifecycle-owned now so an ordinary
+        # Ctrl+C cannot be misreported as a critical API crash.
+        self._task_supervisor.expect_completion(self._api_task)
         self._shutdown.set()
 
     def _request_shutdown(self) -> None:
@@ -2080,6 +2115,7 @@ class CortexDaemon:
         if self._stop_started:
             return
         self._stop_started = True
+        self._ready = False
         self._shutdown.set()
         # Revoke the production path before cancelling proposal producers.
         # Already-consumed effects are handled by the exact restore barrier
@@ -2549,6 +2585,38 @@ class CortexDaemon:
             group=TaskGroupName.TRANSPORT,
             critical=True,
         )
+
+    async def _wait_for_api_server_ready(self, timeout_seconds: float = 5.0) -> None:
+        """Wait until uvicorn has bound before publishing daemon readiness."""
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.1, timeout_seconds)
+        while True:
+            server = self._uvicorn_server
+            if server is not None and bool(getattr(server, "started", False)):
+                logger.info(
+                    "startup.transport_ready name=http address=%s:%s",
+                    self.config.api.host,
+                    self.config.api.port,
+                )
+                return
+
+            task = self._api_task
+            if task is not None and task.done():
+                if task.cancelled():
+                    raise RuntimeError("HTTP API task was cancelled during startup")
+                exception = task.exception()
+                if exception is not None:
+                    raise RuntimeError("HTTP API failed during startup") from exception
+                raise RuntimeError("HTTP API exited before reporting readiness")
+            if self._shutdown.is_set():
+                raise RuntimeError("HTTP API requested shutdown before readiness")
+            if loop.time() >= deadline:
+                raise TimeoutError(
+                    f"HTTP API did not bind {self.config.api.host}:"
+                    f"{self.config.api.port} within {timeout_seconds:.1f}s"
+                )
+            await asyncio.sleep(0.02)
 
     def _current_app_name(self) -> str:
         events = self._window_tracker.get_events_in_window(window_seconds=60.0)
@@ -7807,10 +7875,15 @@ class CortexDaemon:
                 try:
                     await self._capture_pipeline.start()
                     self._capture_available = True
+                    self._capture_stale = False
+                    self._services.register("capture_stale", False)
+                    self._runtime_status.mark_capture_stale(False)
                 except Exception:
                     logger.exception("Failed to enable capture pipeline")
                     self._capture_available = False
                     self._capture_processing_enabled = False
+                    self._capture_stale = True
+                    await self._emit_capture_stale_broadcast()
             elif (
                 not desired_capture
                 and self._capture_available

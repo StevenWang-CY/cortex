@@ -257,6 +257,10 @@ class SettingsDialog(QWidget):
     # palette in the dropdown. Payload is the palette name
     # ("default" / "deuteranopia" / "protanopia" / "tritanopia").
     palette_changed = Signal(str)
+    # Emitted only on the False→True TCC transition observed after the user
+    # activates the camera permission link.  The controller uses it to retry
+    # capture in-process without a relaunch.
+    camera_permission_granted = Signal()
     # WP-9: one shared authenticated loopback controller serves both desktop
     # launch modes.  These signals carry only source booleans, an optional
     # user-authored note, or an opaque one-time preview handle — never raw
@@ -290,6 +294,12 @@ class SettingsDialog(QWidget):
         self._last_error_dialog_ts: float = 0.0
         self._privacy_dialog: ContextPrivacyDialog | None = None
         self._saved_context_sources: dict[str, bool] = {}
+        try:
+            from cortex.libs.utils import check_camera_permission
+
+            self._camera_permission_was_granted = bool(check_camera_permission())
+        except Exception:
+            self._camera_permission_was_granted = False
         self._build_ui()
         self._load_persisted_settings()
 
@@ -1274,6 +1284,9 @@ class SettingsDialog(QWidget):
 
         self._render_permission_row(self._camera_perm_row, cam)
         self._render_permission_row(self._accessibility_perm_row, acc)
+        if cam and not self._camera_permission_was_granted:
+            self.camera_permission_granted.emit()
+        self._camera_permission_was_granted = cam
 
     def _render_permission_row(self, row: dict, granted: bool) -> None:
         """Mutate a row to reflect a fresh poll. Guarded against repeat
@@ -1327,6 +1340,26 @@ class SettingsDialog(QWidget):
         url = urls.get(target)
         if url is None:
             return
+        if target == "camera":
+            # This method is reached only from the user's explicit permission
+            # link. A first request stays in Cortex so the native prompt is not
+            # obscured by another foreground app. Only an already denied or
+            # restricted grant needs the System Settings recovery pane.
+            try:
+                from cortex.libs.utils import (
+                    CameraPermissionState,
+                    get_camera_permission_state,
+                    request_camera_permission,
+                )
+
+                if (
+                    get_camera_permission_state()
+                    == CameraPermissionState.NOT_DETERMINED
+                ):
+                    request_camera_permission()
+                    return
+            except Exception:
+                logger.debug("camera permission state query failed", exc_info=True)
         try:
             import subprocess
 
