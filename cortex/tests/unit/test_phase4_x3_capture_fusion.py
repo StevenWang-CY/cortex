@@ -31,7 +31,6 @@ from cortex.libs.schemas.features import (
     TelemetryFeatures,
 )
 from cortex.services.capture_service.webcam import (
-    _CAPTURE_STALE_THRESHOLD,
     CameraSelection,
     CapturedFrame,
     WebcamCapture,
@@ -186,41 +185,68 @@ class TestCaptureStaleTracking:
     @pytest.mark.asyncio
     async def test_capture_stale_cleared_on_successful_frame(self) -> None:
         capture = WebcamCapture(
-            CaptureConfig(device_id=0, fps=30),
+            CaptureConfig(device_id=0, fps=60),
             queue_maxsize=4,
         )
-        mock_cap = MagicMock()
-        mock_cap.isOpened.return_value = True
+        stalled = MagicMock()
+        stalled.isOpened.return_value = True
+        stalled.read.return_value = (False, None)
+        recovered = MagicMock()
+        recovered.isOpened.return_value = True
+        recovered.read.return_value = (True, _synthetic_bgr_frame())
+        selection = CameraSelection(
+            device_id=0,
+            backend=None,
+            source="test_fixture",
+            device_name="Synthetic Camera",
+        )
 
-        # First N reads fail, then a few good frames recover the loop.
-        fail_count = _CAPTURE_STALE_THRESHOLD + 5
-        # MagicMock side_effect with a list raises StopIteration after
-        # exhaustion which crashes the capture thread. Use a long tail of
-        # success frames so the test never runs out.
-        mock_cap.read.side_effect = [(False, None)] * fail_count + [
-            (True, _synthetic_bgr_frame())
-        ] * 200
-
-        with patch(
-            "cortex.services.capture_service.webcam.open_video_capture",
-            return_value=(mock_cap, MagicMock(device_id=0, source="test")),
+        # Once a handle is confirmed stale, production releases it instead of
+        # continuing to read in the hope that it revives. Model the real
+        # contract with a verified replacement handle that produces the frame
+        # which clears stale state.
+        with (
+            patch(
+                "cortex.services.capture_service.webcam.open_video_capture",
+                side_effect=[(stalled, selection), (recovered, selection)],
+            ) as open_capture,
+            patch(
+                "cortex.services.capture_service.webcam._CAPTURE_STALE_THRESHOLD",
+                3,
+            ),
+            patch(
+                "cortex.services.capture_service.webcam._CAPTURE_STALE_AFTER_SECONDS",
+                60.0,
+            ),
+            patch(
+                "cortex.services.capture_service.webcam."
+                "_CAPTURE_RECOVERY_BACKOFF_SECONDS",
+                (0.2,),
+            ),
         ):
             await capture.start()
             try:
                 # Wait for stale to be set.
-                deadline = time.monotonic() + 5.0
+                deadline = time.monotonic() + 2.0
                 while time.monotonic() < deadline and not capture.capture_stale:
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.01)
                 assert capture.capture_stale is True
 
-                # Wait for recovery.
-                deadline = time.monotonic() + 5.0
-                while time.monotonic() < deadline and capture.capture_stale:
-                    await asyncio.sleep(0.05)
+                # Wait for a frame-confirmed replacement recovery.
+                deadline = time.monotonic() + 2.0
+                while (
+                    time.monotonic() < deadline
+                    and capture.recovery_successes < 1
+                ):
+                    await asyncio.sleep(0.01)
             finally:
                 await capture.stop()
 
         assert capture.capture_stale is False, "capture_stale should clear after a successful frame"
+        assert capture.recovery_successes == 1
+        assert open_capture.call_count == 2
+        stalled.release.assert_called_once()
+        recovered.release.assert_called_once()
 
     def test_capture_stale_property_exists_and_default_false(self) -> None:
         """Daemon polling path requires the property to be available
