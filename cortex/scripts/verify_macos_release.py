@@ -105,6 +105,8 @@ _SCAN_OVERLAP_BYTES = 32 * 1024
 _TEXT_SAMPLE_BYTES = 64 * 1024
 _NON_PERSONAL_BUILD_USERS = frozenset({"root", "runner", "runneradmin"})
 _DEEP_SIGNATURE_TIMEOUT_SECONDS = 300.0
+_DETACH_NORMAL_ATTEMPTS = 3
+_DETACH_RETRY_DELAY_SECONDS = 0.5
 _SENSITIVE_ENV_NAMES = (
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
@@ -350,6 +352,74 @@ def _mounted_app_signature_verification(app: Path) -> tuple[list[str], float]:
     )
 
 
+def _detach_mounted_dmg(
+    mount: Path,
+    *,
+    normal_attempts: int = _DETACH_NORMAL_ATTEMPTS,
+    retry_delay_seconds: float = _DETACH_RETRY_DELAY_SECONDS,
+) -> list[dict[str, Any]]:
+    """Detach a read-only verification mount without traversing it on failure.
+
+    ``hdiutil detach`` can transiently return ``Resource busy`` after deep
+    signature scans or a packaged-app launch. A ``TemporaryDirectory`` must
+    not own that mount point: its recursive cleanup otherwise walks the still
+    mounted, read-only application and fails on files such as
+    ``_CodeSignature/CodeResources``. Retry normal detaches, use one bounded
+    forced detach for this disposable read-only image, and fail explicitly if
+    the volume is still mounted.
+    """
+
+    if normal_attempts < 1:
+        raise ValueError("normal_attempts must be positive")
+    if retry_delay_seconds < 0:
+        raise ValueError("retry_delay_seconds must be non-negative")
+
+    results: list[dict[str, Any]] = []
+    for attempt in range(normal_attempts):
+        result = _run(
+            ["hdiutil", "detach", str(mount)],
+            check=False,
+            timeout=60.0,
+        )
+        results.append(result)
+        if result["returncode"] == 0 or not os.path.ismount(mount):
+            return results
+        if attempt + 1 < normal_attempts and retry_delay_seconds:
+            time.sleep(retry_delay_seconds)
+
+    forced_result = _run(
+        ["hdiutil", "detach", "-force", str(mount)],
+        check=False,
+        timeout=60.0,
+    )
+    results.append(forced_result)
+    if forced_result["returncode"] == 0 or not os.path.ismount(mount):
+        return results
+
+    stderr = str(forced_result.get("stderr", ""))[-2000:]
+    raise ReleaseVerificationError(
+        f"could not detach read-only DMG mount after {normal_attempts} normal "
+        f"attempts and one forced attempt: {mount}\n{stderr}"
+    )
+
+
+def _remove_detached_mountpoint(mount: Path) -> None:
+    """Remove only the empty directory revealed after a successful detach."""
+
+    if os.path.ismount(mount):
+        raise ReleaseVerificationError(
+            f"refusing to remove a mount point that is still attached: {mount}"
+        )
+    try:
+        mount.rmdir()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ReleaseVerificationError(
+            f"detached DMG mount point was not removable as an empty directory: {mount}"
+        ) from exc
+
+
 def _reserve_local_port() -> int:
     """Ask the kernel for an available loopback port for a launch probe."""
 
@@ -558,8 +628,12 @@ def verify(
     commands: list[dict[str, Any]] = evidence["commands"]
     commands.append(_run(["hdiutil", "verify", str(artifact)], timeout=180.0))
 
-    with tempfile.TemporaryDirectory(prefix="cortex-release-") as raw_mount:
-        mount = Path(raw_mount)
+    # The mount point deliberately is not owned by TemporaryDirectory. If a
+    # transiently busy image remains attached, recursive tempfile cleanup
+    # would traverse the read-only volume and obscure the real detach error.
+    mount = Path(tempfile.mkdtemp(prefix="cortex-release-"))
+    attached = False
+    try:
         commands.append(
             _run(
                 [
@@ -574,69 +648,80 @@ def verify(
                 timeout=180.0,
             )
         )
-        try:
-            app = mount / "Cortex.app"
-            plist_path = app / "Contents/Info.plist"
-            executable = app / "Contents/MacOS/Cortex"
-            if not plist_path.is_file() or not executable.is_file():
-                raise ReleaseVerificationError("DMG does not contain a valid Cortex.app")
-            with plist_path.open("rb") as handle:
-                plist = plistlib.load(handle)
-            required_plist = {
-                "CFBundleIdentifier": "com.cortex.daemon",
-                "CFBundleShortVersionString": __version__,
-                "CFBundleVersion": __version__,
-                "LSMinimumSystemVersion": "13.0",
-                "NSCameraUseContinuityCameraDeviceType": True,
-            }
-            mismatches = {
-                key: {"expected": expected, "actual": plist.get(key)}
-                for key, expected in required_plist.items()
-                if plist.get(key) != expected
-            }
-            if mismatches:
-                raise ReleaseVerificationError(f"Info.plist mismatch: {mismatches}")
-            evidence["info_plist"] = required_plist
+        attached = True
+        app = mount / "Cortex.app"
+        plist_path = app / "Contents/Info.plist"
+        executable = app / "Contents/MacOS/Cortex"
+        if not plist_path.is_file() or not executable.is_file():
+            raise ReleaseVerificationError("DMG does not contain a valid Cortex.app")
+        with plist_path.open("rb") as handle:
+            plist = plistlib.load(handle)
+        required_plist = {
+            "CFBundleIdentifier": "com.cortex.daemon",
+            "CFBundleShortVersionString": __version__,
+            "CFBundleVersion": __version__,
+            "LSMinimumSystemVersion": "13.0",
+            "NSCameraUseContinuityCameraDeviceType": True,
+        }
+        mismatches = {
+            key: {"expected": expected, "actual": plist.get(key)}
+            for key, expected in required_plist.items()
+            if plist.get(key) != expected
+        }
+        if mismatches:
+            raise ReleaseVerificationError(f"Info.plist mismatch: {mismatches}")
+        evidence["info_plist"] = required_plist
 
-            arch_result = _run(["lipo", "-archs", str(executable)])
-            commands.append(arch_result)
-            architectures = arch_result["stdout"].strip().split()
-            if architectures != [expected_arch]:
-                raise ReleaseVerificationError(
-                    f"expected only architecture {expected_arch}, got {architectures}"
-                )
-            signature_command, signature_timeout = _mounted_app_signature_verification(app)
-            commands.append(_run(signature_command, timeout=signature_timeout))
-            commands.append(_run(["codesign", "-dv", "--verbose=4", str(app)]))
-
-            findings = _scan_forbidden(app)
-            if findings:
-                raise ReleaseVerificationError(
-                    "release bundle contains forbidden credential/personal-path patterns: "
-                    + "; ".join(findings[:20])
-                )
-            evidence["forbidden_pattern_scan"] = "passed"
-
-            smoke_env = {
-                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-                "QT_QPA_PLATFORM": "offscreen",
-                "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
-            }
-            commands.append(
-                _run(
-                    [str(executable), "--release-smoke"],
-                    timeout=45.0,
-                    env=smoke_env,
-                )
+        arch_result = _run(["lipo", "-archs", str(executable)])
+        commands.append(arch_result)
+        architectures = arch_result["stdout"].strip().split()
+        if architectures != [expected_arch]:
+            raise ReleaseVerificationError(
+                f"expected only architecture {expected_arch}, got {architectures}"
             )
-            commands.append(
-                _probe_frozen_startup(
-                    executable,
-                    base_env=smoke_env,
-                )
+        signature_command, signature_timeout = _mounted_app_signature_verification(app)
+        commands.append(_run(signature_command, timeout=signature_timeout))
+        commands.append(_run(["codesign", "-dv", "--verbose=4", str(app)]))
+
+        findings = _scan_forbidden(app)
+        if findings:
+            raise ReleaseVerificationError(
+                "release bundle contains forbidden credential/personal-path patterns: "
+                + "; ".join(findings[:20])
             )
-        finally:
-            commands.append(_run(["hdiutil", "detach", str(mount)], check=False, timeout=60.0))
+        evidence["forbidden_pattern_scan"] = "passed"
+
+        smoke_env = {
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "QT_QPA_PLATFORM": "offscreen",
+            "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+        }
+        commands.append(
+            _run(
+                [str(executable), "--release-smoke"],
+                timeout=45.0,
+                env=smoke_env,
+            )
+        )
+        commands.append(
+            _probe_frozen_startup(
+                executable,
+                base_env=smoke_env,
+            )
+        )
+    finally:
+        detach_error: ReleaseVerificationError | None = None
+        # A failed attach can still leave a partially mounted image. Inspect
+        # the kernel-visible mount state as well as the successful-return flag.
+        if attached or os.path.ismount(mount):
+            try:
+                commands.extend(_detach_mounted_dmg(mount))
+            except ReleaseVerificationError as exc:
+                detach_error = exc
+        if not os.path.ismount(mount):
+            _remove_detached_mountpoint(mount)
+        if detach_error is not None:
+            raise detach_error
 
     if require_notarized:
         # A stapled ticket proves Apple accepted the submission, but it is not

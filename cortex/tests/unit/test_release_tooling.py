@@ -33,9 +33,12 @@ from cortex.scripts.validate_release_records import (
     validate_release_records,
 )
 from cortex.scripts.verify_macos_release import (
+    ReleaseVerificationError,
     _default_personal_roots,
+    _detach_mounted_dmg,
     _mounted_app_signature_verification,
     _notarized_container_verification_commands,
+    _remove_detached_mountpoint,
     _scan_forbidden,
 )
 
@@ -157,6 +160,137 @@ def test_mounted_app_deep_signature_verification_has_bounded_intel_budget() -> N
         ["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app)],
         300.0,
     )
+
+
+def test_read_only_dmg_detach_retries_then_forces_without_recursive_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from cortex.scripts import verify_macos_release as verifier
+
+    mount = tmp_path / "mounted-image"
+    mount.mkdir()
+    responses = iter(
+        (
+            {"returncode": 16, "stdout": "", "stderr": "Resource busy"},
+            {"returncode": 16, "stdout": "", "stderr": "Resource busy"},
+            {"returncode": 0, "stdout": "detached", "stderr": ""},
+        )
+    )
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs: Any) -> dict[str, Any]:
+        commands.append(command)
+        return next(responses)
+
+    monkeypatch.setattr(verifier, "_run", fake_run)
+    monkeypatch.setattr(verifier.os.path, "ismount", lambda _path: True)
+
+    results = _detach_mounted_dmg(mount, normal_attempts=2, retry_delay_seconds=0)
+
+    assert [result["returncode"] for result in results] == [16, 16, 0]
+    assert commands == [
+        ["hdiutil", "detach", str(mount)],
+        ["hdiutil", "detach", str(mount)],
+        ["hdiutil", "detach", "-force", str(mount)],
+    ]
+
+
+def test_read_only_dmg_detach_accepts_nonzero_exit_after_volume_disappears(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from cortex.scripts import verify_macos_release as verifier
+
+    mount = tmp_path / "mounted-image"
+    mount.mkdir()
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs: Any) -> dict[str, Any]:
+        commands.append(command)
+        return {"returncode": 16, "stdout": "", "stderr": "not mounted"}
+
+    monkeypatch.setattr(verifier, "_run", fake_run)
+    monkeypatch.setattr(verifier.os.path, "ismount", lambda _path: False)
+
+    results = _detach_mounted_dmg(mount, retry_delay_seconds=0)
+
+    assert [result["returncode"] for result in results] == [16]
+    assert commands == [["hdiutil", "detach", str(mount)]]
+
+
+def test_read_only_dmg_detach_fails_closed_when_force_cannot_unmount(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from cortex.scripts import verify_macos_release as verifier
+
+    mount = tmp_path / "mounted-image"
+    mount.mkdir()
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs: Any) -> dict[str, Any]:
+        commands.append(command)
+        return {"returncode": 16, "stdout": "", "stderr": "Resource busy"}
+
+    monkeypatch.setattr(verifier, "_run", fake_run)
+    monkeypatch.setattr(verifier.os.path, "ismount", lambda _path: True)
+
+    with pytest.raises(ReleaseVerificationError, match="one forced attempt"):
+        _detach_mounted_dmg(mount, normal_attempts=1, retry_delay_seconds=0)
+
+    assert commands == [
+        ["hdiutil", "detach", str(mount)],
+        ["hdiutil", "detach", "-force", str(mount)],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("normal_attempts", "retry_delay_seconds", "message"),
+    (
+        (0, 0.0, "normal_attempts must be positive"),
+        (1, -0.1, "retry_delay_seconds must be non-negative"),
+    ),
+)
+def test_read_only_dmg_detach_rejects_invalid_retry_policy(
+    normal_attempts: int,
+    retry_delay_seconds: float,
+    message: str,
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _detach_mounted_dmg(
+            tmp_path / "mounted-image",
+            normal_attempts=normal_attempts,
+            retry_delay_seconds=retry_delay_seconds,
+        )
+
+
+def test_read_only_dmg_cleanup_refuses_to_walk_an_attached_mount(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from cortex.scripts import verify_macos_release as verifier
+
+    mount = tmp_path / "mounted-image"
+    mount.mkdir()
+    code_resources = mount / "Cortex.app/Contents/_CodeSignature/CodeResources"
+    code_resources.parent.mkdir(parents=True)
+    code_resources.write_text("signed", encoding="utf-8")
+    monkeypatch.setattr(verifier.os.path, "ismount", lambda _path: True)
+
+    with pytest.raises(ReleaseVerificationError, match="still attached"):
+        _remove_detached_mountpoint(mount)
+
+    assert code_resources.read_text(encoding="utf-8") == "signed"
+
+
+def test_release_verifier_does_not_delegate_mount_to_recursive_tempfile_cleanup() -> None:
+    source = (_ROOT / "cortex/scripts/verify_macos_release.py").read_text(encoding="utf-8")
+
+    assert 'with tempfile.TemporaryDirectory(prefix="cortex-release-")' not in source
+    assert 'tempfile.mkdtemp(prefix="cortex-release-")' in source
+    assert "mount.rmdir()" in source
 
 
 def test_macos_spec_packages_only_sql_migration_resources() -> None:

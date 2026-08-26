@@ -4,6 +4,71 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.3.8] — 2026-08-26
+
+This patch supersedes the immutable v0.3.7 release candidate after its native
+arm64 and Intel packaging jobs exposed two independent release-finalization
+races. Both artifacts passed Developer ID signing, Apple notarization, and
+stapling; the Intel app also reached a version-matched healthy core before its
+terminal Qt cleanup race was detected. No v0.3.7 release was published. The
+support algorithm, evidence thresholds, intervention authority, and privacy
+semantics are unchanged from v0.3.7.
+
+### Fixed
+
+* DMG verification no longer gives a mounted read-only volume to Python's
+  recursively deleting `TemporaryDirectory`. A transient `hdiutil detach`
+  failure previously caused tempfile cleanup to walk into
+  `Cortex.app/Contents/_CodeSignature/CodeResources`, replacing the useful
+  detach condition with `[Errno 30] Read-only file system` and failing the
+  release after notarization.
+* Read-only verifier mounts now have an explicit lifecycle: three bounded
+  normal detach attempts, one bounded forced detach for the disposable image,
+  a kernel-visible mount-state check, and empty-directory-only cleanup after
+  detachment. A volume that remains attached fails closed with the mount path
+  and final diagnostic; release code never recursively removes or traverses it.
+* Partial `hdiutil attach` failures are also reconciled against actual mount
+  state, preventing a failed attach command from leaking a volume.
+* The in-process desktop controller now retains exactly one cross-thread daemon
+  stop future. `lastWindowClosed` and `aboutToQuit` reuse that lifecycle instead
+  of submitting new `CortexDaemon.stop()` wrappers while the background asyncio
+  loop is returning from `run_until_complete()`.
+* Qt quit is latched before any window closes, preventing the synchronous
+  `lastWindowClosed` signal from re-entering the headless or user quit path.
+  `aboutToQuit` waits for the original stop future and joins its owner thread
+  within one shared 20-second budget. A loop that rejects submission has its
+  unscheduled coroutine explicitly closed, eliminating both pending-task and
+  never-awaited-coroutine teardown warnings.
+* Regression tests cover transient-busy recovery, successful unmount despite a
+  stale nonzero tool status, permanent forced-detach failure, and refusal to
+  touch a mounted `CodeResources` fixture. Controller tests cover single stop
+  submission, loop-close rejection, synchronous window-close re-entry, reuse of
+  a completed stop, bounded owner-thread join, and idempotent `aboutToQuit`.
+* The patched verifier completed three consecutive full passes against the
+  existing signed, notarized, and stapled v0.3.6 arm64 DMG. Every pass mounted
+  read-only, verified the deep signature and bundle contract, ran both frozen
+  smoke paths including a version-matched healthy daemon, detached cleanly,
+  and left no mounted image behind.
+* The corrected source desktop completed a full isolated headless
+  start/version-matched-health/SIGTERM/normal-exit exercise with zero residual
+  HTTP/WebSocket listeners or processes and without pending-task,
+  never-awaited-coroutine, shutdown-timeout, or startup-failure diagnostics.
+* A freshly frozen, deep ad-hoc-signed v0.3.8 arm64 app then completed four
+  consecutive mounted-DMG verification passes. Each pass returned healthy
+  version 0.3.8, exited normally after SIGTERM, detached with status zero, and
+  left no app process, listener, or verifier mount. Production Developer ID and
+  notarization proof remains owned by the clean tagged release workflow.
+
+### Release process
+
+* v0.3.7 remains an immutable failed candidate tag for incident traceability;
+  its GitHub Actions evidence is not rewritten or rerun as another release.
+* v0.3.8 must independently pass the locked source gate, native arm64 and
+  x86_64 signed/notarized/stapled packaged gates, provenance and checksum gates,
+  real downloaded-DMG Finder install/open/quit/relaunch validation, independent
+  manual evidence review, protected publication, and unauthenticated public
+  redownload validation before it can be called released.
+
 ## [v0.3.7] — 2026-08-26
 
 This patch closes the first-launch readiness defect found during the required

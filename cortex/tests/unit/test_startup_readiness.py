@@ -6,6 +6,7 @@ import asyncio
 import os
 import threading
 import time
+from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -283,3 +284,134 @@ def test_controller_surfaces_startup_failure_without_false_connection(
         "Diagnostic details were saved to the Cortex startup log.",
         "RuntimeError",
     )
+
+
+def test_controller_submits_exactly_one_cross_thread_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cortex.apps.desktop_shell.controller import CortexAppController
+
+    async def _stop() -> None:
+        return None
+
+    stop_coroutine = _stop()
+    daemon = SimpleNamespace(stop=MagicMock(return_value=stop_coroutine))
+    loop = MagicMock()
+    loop.is_running.return_value = True
+    bridge = SimpleNamespace(on_daemon_stopped=MagicMock())
+    submitted: list[object] = []
+    completed: Future[None] = Future()
+    completed.set_result(None)
+
+    def _submit(coroutine: object, target_loop: object) -> Future[None]:
+        submitted.append(coroutine)
+        assert target_loop is loop
+        stop_coroutine.close()
+        return completed
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", _submit)
+    controller = CortexAppController.__new__(CortexAppController)
+    controller._daemon = daemon
+    controller._daemon_loop = loop
+    controller._daemon_stop_future = None
+    controller._bridge = bridge
+
+    first = controller._schedule_daemon_stop()
+    second = controller._schedule_daemon_stop()
+
+    assert first is completed
+    assert second is completed
+    assert submitted == [stop_coroutine]
+    daemon.stop.assert_called_once_with()
+    bridge.on_daemon_stopped.assert_called_once_with()
+
+
+def test_controller_closes_stop_coroutine_when_loop_rejects_submission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cortex.apps.desktop_shell.controller import CortexAppController
+
+    async def _stop() -> None:
+        return None
+
+    stop_coroutine = _stop()
+    loop = MagicMock()
+    loop.is_running.return_value = True
+
+    def _reject(_coroutine: object, _loop: object) -> Future[None]:
+        raise RuntimeError("loop is closing")
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", _reject)
+    controller = CortexAppController.__new__(CortexAppController)
+    controller._daemon = SimpleNamespace(
+        stop=MagicMock(return_value=stop_coroutine)
+    )
+    controller._daemon_loop = loop
+    controller._daemon_stop_future = None
+    controller._bridge = SimpleNamespace(on_daemon_stopped=MagicMock())
+
+    with pytest.raises(RuntimeError, match="loop is closing"):
+        controller._schedule_daemon_stop()
+
+    assert stop_coroutine.cr_frame is None
+
+
+def test_controller_quit_latches_before_last_window_closed_reentry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cortex.apps.desktop_shell.controller import CortexAppController
+
+    monkeypatch.setenv("CORTEX_HEADLESS_STARTUP", "1")
+    controller = CortexAppController.__new__(CortexAppController)
+    controller._quitting = False
+    controller._overlay = MagicMock()
+    controller._dashboard = MagicMock()
+    controller._app = MagicMock()
+    controller._on_daemon_stop_requested = MagicMock()  # type: ignore[method-assign]
+    controller._dashboard.close.side_effect = controller._on_user_initiated_quit
+
+    controller._quit()
+
+    assert controller._quitting is True
+    controller._on_daemon_stop_requested.assert_not_called()
+    controller._app.quit.assert_called_once_with()
+
+
+def test_qt_shutdown_reuses_completed_stop_and_joins_owner_thread() -> None:
+    from cortex.apps.desktop_shell.controller import CortexAppController
+
+    class _OwnerThread:
+        def __init__(self) -> None:
+            self.alive = True
+            self.join_timeouts: list[float] = []
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def join(self, timeout: float | None = None) -> None:
+            self.join_timeouts.append(float(timeout or 0.0))
+            self.alive = False
+
+    completed: Future[None] = Future()
+    completed.set_result(None)
+    capture_pipeline = SimpleNamespace(release=MagicMock())
+    daemon = SimpleNamespace(
+        _capture_pipeline=capture_pipeline,
+        stop=MagicMock(),
+    )
+    owner_thread = _OwnerThread()
+    controller = CortexAppController.__new__(CortexAppController)
+    controller._qt_shutdown_started = False
+    controller._daemon = daemon
+    controller._daemon_loop = MagicMock()
+    controller._daemon_stop_future = completed
+    controller._daemon_thread = owner_thread  # type: ignore[assignment]
+    controller._bridge = SimpleNamespace(on_daemon_stopped=MagicMock())
+
+    controller._shutdown_daemon()
+    controller._shutdown_daemon()
+
+    daemon.stop.assert_not_called()
+    capture_pipeline.release.assert_called_once_with()
+    assert len(owner_thread.join_timeouts) == 1
+    assert 0.0 <= owner_thread.join_timeouts[0] <= 20.0
