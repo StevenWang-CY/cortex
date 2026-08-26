@@ -21,6 +21,7 @@ rings only; the Cortex terracotta accent is layered on top.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from collections.abc import Callable
 from typing import Any, Literal
@@ -35,7 +36,12 @@ logger = logging.getLogger(__name__)
 
 
 def is_macos() -> bool:
-    return sys.platform == "darwin"
+    # The release liveness probe intentionally uses Qt's offscreen platform.
+    # AppKit requires a WindowServer-backed Cocoa application and aborts at the
+    # CoreGraphics layer when mixed with that plugin. Suppress only native
+    # decoration/observers in the explicit probe; real Finder launches retain
+    # the complete macOS path and are verified separately.
+    return sys.platform == "darwin" and os.environ.get("CORTEX_HEADLESS_STARTUP") != "1"
 
 
 # Vibrancy materials. Names match the AppKit enum
@@ -314,7 +320,12 @@ def system_font(point_size: float, weight: str = "regular") -> Any:
         from PySide6.QtGui import QFont
 
         font = QFont()
-        if is_macos():
+        # QFont's platform system family does not require AppKit and remains
+        # valid under Qt's offscreen plugin. ``is_macos()`` intentionally
+        # returns False for the packaged headless probe to suppress AppKit
+        # calls, so using it here incorrectly selected missing web-style font
+        # aliases and left Qt on its unavailable "Sans Serif" fallback.
+        if sys.platform == "darwin":
             font.setFamily(".AppleSystemUIFont")
         else:
             # Linux/Windows fallback chain (frontend-design system stack).

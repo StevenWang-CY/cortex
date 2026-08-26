@@ -2071,8 +2071,9 @@ README/wiki pages, finding ledger, ADRs, model cards, and release templates
    version/architecture identity, bundle plist, single-architecture Mach-O,
    nested signing, exact exported secrets in every byte stream, complete
    high-confidence credential forms in text-like members, actual non-generic
-   build-home identifiers, frozen resources, the outer DMG's Developer ID
-   signature, notarization/stapling, and Gatekeeper when requested. Secret
+   build-home identifiers, frozen resources, frozen inference construction,
+   full packaged-process health and bounded termination, the outer DMG's
+   Developer ID signature, notarization/stapling, and Gatekeeper when requested. Secret
    scanning is streaming, fails closed on
    unreadable bundle members, rejects official provider fixtures and native
    parser-marker collisions, and catches patterns spanning read boundaries.
@@ -2503,3 +2504,267 @@ These boundaries keep urgent fixes reviewable and avoid mixing behavior repair w
 11. **PR 11 onward — one capability at a time:** overlay, tab visibility, editor folds, focus actions; each enabled only after its authorization/receipt fault matrix passes.
 
 At the end of every PR, update the tracked finding ledger with one of `open`, `contained`, `implemented`, or `validated`. “Implemented” is not “validated”; signal accuracy, human-state meaning, and causal benefit stay open until their respective evidence gates pass.
+
+---
+
+## 21. v0.3.6 packaged-startup incident closure
+
+### 21.1 Observed failure and exact root cause
+
+The signed and notarized v0.3.5 arm64 application was launched from the mounted
+release DMG. macOS created the process normally—the Dock icon bounced—then the
+process exited before the Qt event loop could display a window. Unified logging
+captured an unhandled `FileNotFoundError` originating from
+`deterministic_support_identity()` during `CortexDaemon` construction:
+
+```text
+CortexAppController.run
+  -> CortexAppController._start_daemon
+  -> CortexDaemon.__init__
+  -> SupportModelRegistry.__init__
+  -> deterministic_support_identity
+  -> Path(rule_scorer.py).read_bytes
+  -> FileNotFoundError
+```
+
+This was an application defect, not a Gatekeeper, notarization, architecture,
+camera-permission, or code-signing failure. The executable had already passed
+Apple assessment and begun executing Python code. The missing path was inside
+`Cortex.app/Contents/Frameworks/cortex/services/state_engine/`, where PyInstaller
+represented an importable archived module through `__file__` but did not ship
+the original `.py` file as data.
+
+PyInstaller's runtime documentation distinguishes importable bundled modules
+from separately collected data files and requires data to be added explicitly
+when code intends to open it as a file: [PyInstaller run-time information](https://pyinstaller.org/en/stable/runtime-information.html),
+[PyInstaller spec-file data guidance](https://pyinstaller.org/en/stable/spec-files.html#adding-data-files).
+The v0.3.5 registry violated that distinction.
+
+### 21.2 Why the previous release proof produced a false pass
+
+The v0.3.5 `--release-smoke` checked static files and directories only:
+configuration, SQL migrations, MediaPipe assets, audio, native-host scripts,
+browser bundles, and the VSIX. It never constructed `SupportModelRegistry`,
+`RuleScorer`, `SupportInferenceEngine`, `CortexDaemon`, or the desktop
+controller. The exact failing method was therefore unreachable from the test.
+
+The evidence accurately proved the claims it encoded—resource presence,
+signature integrity, notarization, Gatekeeper acceptance, architecture, and
+secret scanning—but the release decision incorrectly treated those claims as
+equivalent to application startup. v0.3.6 separates the following propositions:
+
+| Proposition | Required proof |
+| --- | --- |
+| Required data is present | frozen resource inspection |
+| Frozen inference imports and provenance work | registry/scorer/inference construction inside the executable |
+| The production composition root starts | complete packaged-process launch |
+| The runtime is operational | version-matched `/health` with the registry registered `up` |
+| Shutdown is bounded | process termination probe and no surviving listeners |
+| A person can install and see the app | quarantined download + Finder replace/install + normal GUI launch |
+
+No single row may stand in for another.
+
+### 21.3 Identity-design options considered
+
+#### Ship Python source as a data file
+
+Adding `rule_scorer.py` to `datas` would make the old path exist, but it would
+retain an undocumented runtime dependency on source layout, duplicate code
+already stored in the PyInstaller archive, and allow packaging configuration to
+change model identity availability. It fixes the symptom rather than the
+provenance boundary and was rejected.
+
+#### Hash the loaded bytecode or inspect the module loader
+
+Loader/bytecode hashing couples an externally visible model identity to Python
+minor version, optimization mode, marshal format, PyInstaller archive behavior,
+and build toolchain details. Two semantically identical implementations could
+receive different identities, while introspection failure would still occur at
+runtime. It was rejected.
+
+#### Fall back to a fixed hash only when `sys.frozen`
+
+A frozen-only fallback creates two provenance semantics for the same release.
+It can also conceal stale metadata, precisely where the release requires the
+strongest evidence. It was rejected.
+
+#### Generate a canonical implementation manifest before packaging
+
+The selected design hashes a sorted, relative-path manifest of the reviewed
+feature schema, model registry, deterministic scorer, and inference boundary.
+The generator commits an ordinary Python module containing each component hash
+and the aggregate SHA-256. Runtime code imports the constant; it performs no
+filesystem access. Source and frozen executions therefore expose the same
+identity.
+
+The digest is a reproducibility identifier, not a claim of statistical
+validation, correctness, secrecy, or artifact authenticity. Artifact
+authenticity remains the job of code signatures, checksums, attestations, and
+the immutable release tag.
+
+### 21.4 Generated provenance contract
+
+The implementation is owned by:
+
+| File | Responsibility |
+| --- | --- |
+| `cortex/scripts/generate_support_model_identity.py` | canonical relative-path manifest, per-file hashes, aggregate hash, apply/check CLI |
+| `cortex/services/state_engine/generated_model_identity.py` | committed frozen-safe constants; never hand edited |
+| `cortex/services/state_engine/model_registry.py` | imports the generated digest and exposes model identity `2.1.1` |
+| `cortex/scripts/verify_repository_contracts.py` | rejects generated drift in CI/release repository gates |
+| `.pre-commit-config.yaml` | runs the drift check whenever an input, generator, or output changes |
+
+Invariant:
+
+```text
+changed reviewed component
+  => generated source differs
+  => pre-commit/repository contract fails
+  => contributor regenerates and reviews the new identity
+  => source smoke and frozen smoke assert the same aggregate digest
+```
+
+The scoring weights, transforms, minimum evidence counts, coverage floor,
+warm-up rule, abstention semantics, and fail-closed safety-null rollback are
+unchanged. `2.1.1` records the repaired identity contract; it does not relabel
+heuristic scores as probabilities or validated cognitive states.
+
+### 21.5 Crash-visible desktop bootstrap
+
+The PyInstaller executable now starts at
+`cortex/apps/desktop_shell/bootstrap.py`, a standard-library-only boundary that
+runs before Qt and the runtime graph are imported. It:
+
+1. creates `~/Library/Logs/Cortex` with current-user-only permissions where the
+   filesystem supports POSIX modes;
+2. installs a 2 MiB rotating startup log with three backups;
+3. records version, frozen/source mode, architecture, executable, and named
+   startup stages without recording environment values or API keys;
+4. captures top-level and unhandled-thread tracebacks;
+5. writes the latest complete failure atomically to
+   `last-startup-error.txt` with a short diagnostic reference;
+6. shows a Qt fatal dialog explaining that sensing/workspace changes did not
+   start, where the diagnostic is stored, and that mounted-DMG users should
+   install the app in Applications.
+
+The alert and AppKit-only window decoration/appearance hooks are deliberately
+disabled only for the explicit headless release probe. Qt's offscreen platform
+has no WindowServer-backed Cocoa application, so invoking AppKit decoration
+there aborts in CoreGraphics and tests the harness rather than Cortex. The
+release verifier instead captures stdout, stderr, the rotating log, and the
+last-error file in its failure report; the Finder gate exercises the complete
+AppKit path.
+
+Controller milestones distinguish failures in storage-directory setup, Qt
+construction, desktop-surface construction, daemon composition, daemon-thread
+start, and event-loop readiness. A future report can therefore identify the
+last completed boundary even when no traceback is available.
+
+### 21.6 Layered startup verification
+
+#### Layer A — source and frozen contract smoke
+
+`release_smoke.py` still checks every required resource, then constructs:
+
+- `SupportModelRegistry`;
+- `RuleScorer`;
+- `SupportInferenceEngine`;
+- the active registered identity and its generated aggregate digest.
+
+This phase has no camera, input hook, database, socket, or user-storage side
+effects. It is the fast, deterministic regression for the v0.3.5 defect.
+
+#### Layer B — complete packaged liveness probe
+
+`verify_macos_release.py` mounts the exact DMG and executes its Cortex binary
+with an isolated temporary HOME and storage root. It allocates loopback ports,
+sets the explicit headless hardware boundary (plus an invalid camera index as
+defense in depth), and requires the application to publish honest stale-camera
+state without acquiring camera or input-monitoring authority. Within a bounded
+window it must publish:
+
+- HTTP health status `healthy`;
+- exactly the candidate application version;
+- `support_model_registry: up` in the production service registry.
+
+The verifier then sends SIGTERM, waits up to 30 seconds for cleanup, and fails
+if forced termination is required, the return code is non-zero, either port is
+still listening, the daemon-start/daemon-stop markers are absent, a fatal
+marker appears, a Qt stylesheet cannot be parsed, a requested font family is
+missing, the deprecated Continuity Camera compatibility path is used, or a
+last-startup-error file exists. The application establishes the native system
+font at its root, the sensitivity-slider rules are syntax-checked, and the
+bundle explicitly declares Continuity Camera device typing while automatic
+selection continues to exclude phone/tablet cameras. The intended Cormorant
+Garamond Roman/italic variable faces are vendored from a pinned Google Fonts
+commit with their OFL license, registered before surface construction, and
+treated as required resources; Menlo is the deterministic desktop mono face
+because SF Mono is not guaranteed on a clean Mac. Captured evidence includes
+the health payload, assigned ports, return code, process output, startup log,
+and any fatal diagnostic. This runs independently on native Apple Silicon and
+Intel release runners.
+
+#### Layer C — installed, quarantined GUI exercise
+
+Automation cannot infer human-visible success from `/health`, so the promotion
+gate includes a real macOS workflow against the exact candidate digest:
+
+1. download the architecture-correct DMG through GitHub;
+2. verify its release checksum and GitHub attestation;
+3. open the downloaded quarantined DMG in Finder;
+4. replace any existing `/Applications/Cortex.app` via Finder and retain the
+   old copy recoverably until the test passes;
+5. eject the DMG so `/Volumes/Cortex/Cortex.app` cannot satisfy the launch;
+6. open the installed app through Finder/LaunchServices;
+7. confirm the Dock process persists and a Cortex window/onboarding surface is
+   visible;
+8. confirm Finder/Info.plist reports v0.3.6 and Developer ID signing,
+   notarization ticket, and Gatekeeper assessment pass;
+9. confirm `/health` and WebSocket listeners belong to the installed app;
+10. exercise stop/quit and prove ports 9471–9473, camera ownership, and named
+    daemon processes are gone;
+11. relaunch once to detect first-run-only and stale-state failures.
+
+New camera, accessibility, input-monitoring, or automation permission grants
+remain user decisions. A release test may deny or leave them ungranted and must
+verify honest degraded behavior; it cannot silently approve privacy-sensitive
+permissions merely to turn a gate green.
+
+### 21.7 Release immutability and quarantine policy
+
+v0.3.5 remains an unchanged draft with its signed artifacts and evidence. It is
+an incident artifact, not a distributable. No asset, tag, or checksum is
+overwritten. The repair is released only under the later v0.3.6 tag.
+
+Publication is fail-closed:
+
+```text
+source gates
+  -> PR CI on both Python/macOS architectures
+  -> merge commit CI
+  -> annotated immutable v0.3.6 tag
+  -> signed/notarized/stapled dual-architecture draft artifacts
+  -> automated mounted resource + composition + liveness verification
+  -> exact-digest Finder installation/open/stop/relaunch evidence
+  -> public GitHub release
+```
+
+If any post-publication check fails, the release returns to draft immediately;
+the assets remain preserved, and the next correction receives a higher version.
+
+### 21.8 Residual risks and boundaries
+
+- A headless CI runner proves process composition and degraded runtime health,
+  not camera quality, TCC wording, or visual layout. Those require installed
+  hardware/UI evidence.
+- An arm64 machine cannot natively execute the x86_64 build without Rosetta;
+  the Intel release runner therefore owns native packaged liveness for that
+  artifact, while the local Finder exercise owns the host architecture.
+- A visible window does not validate physiological accuracy. Reference-sensor
+  and participant-held-out validation gates in sections 13 and 18 remain open.
+- Startup diagnostics are local operational data. They are permission-limited,
+  bounded, contain no raw camera frames by design, and must still be reviewed
+  before a user attaches them to a public issue.
+- Running directly from a mounted DMG is tested for crash visibility, but the
+  supported installation path remains `/Applications/Cortex.app` because
+  native-messaging manifests require a canonical non-translocated location.

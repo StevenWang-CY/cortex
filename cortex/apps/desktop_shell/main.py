@@ -1810,4 +1810,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Source-mode launches receive the same visible failure boundary as the
+    # PyInstaller bootstrap. Import-time failures are covered by the frozen
+    # entry point; runtime failures are covered here as well.
+    from cortex.apps.desktop_shell.bootstrap import run_guarded
+
+    sys.exit(run_guarded(main))

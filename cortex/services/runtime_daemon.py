@@ -12,13 +12,14 @@ import asyncio
 import copy
 import json
 import logging
+import os
 import queue
 import threading
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -790,6 +791,11 @@ class CortexDaemon:
         self._runtime_data = self._kernel.runtime_data
         self._runtime_status.bind_daemon(self)
         self._stop_started = False
+        # All callers coalesce onto one cleanup task. A second stop request
+        # must await the first rather than returning while camera/database/
+        # worker teardown is still in progress (the old behavior let Qt exit
+        # with a pending daemon.stop task).
+        self._stop_task: asyncio.Task[None] | None = None
         self._tasks: list[asyncio.Task[Any]] = []
         # F03: every dynamically-spawned background task (intervention
         # dispatch, in-flight LLM call, etc.) is tracked here so stop()
@@ -1906,19 +1912,30 @@ class CortexDaemon:
         # native extension call it can lead to a segfault on resume.
         self._install_loop_signal_handlers()
         self._register_services()
-        self._input_hooks.start()
-        self._window_tracker.start()
-        try:
-            await self._capture_pipeline.start()
-            self._capture_available = True
-            self._capture_stale = False
-        except Exception:
-            logger.exception("Capture pipeline failed to start; continuing in telemetry-first mode")
+        hardware_probe_enabled = os.environ.get("CORTEX_HEADLESS_STARTUP") != "1"
+        if hardware_probe_enabled:
+            self._input_hooks.start()
+            self._window_tracker.start()
+            try:
+                await self._capture_pipeline.start()
+                self._capture_available = True
+                self._capture_stale = False
+            except Exception:
+                logger.exception(
+                    "Capture pipeline failed to start; continuing in telemetry-first mode"
+                )
+                self._capture_available = False
+                # B1 (Phase 4.1): the camera channel is permanently offline
+                # for the lifetime of this start attempt. Mark the capture
+                # signal as stale so the next broadcast cycle (and the
+                # synthetic kickoff broadcast below) tells every client.
+                self._capture_stale = True
+        else:
+            # Release CI must prove honest camera-unavailable behavior without
+            # touching a developer/runner camera or requesting TCC authority.
+            # The normal Finder E2E owns the real hardware path.
+            logger.info("Headless startup probe: hardware acquisition disabled")
             self._capture_available = False
-            # B1 (Phase 4.1): the camera channel is permanently offline
-            # for the lifetime of this start attempt. Mark the capture
-            # signal as stale so the next broadcast cycle (and the
-            # synthetic kickoff broadcast below) tells every client.
             self._capture_stale = True
         ws_started = await self._ws_server.start()
         if not ws_started:
@@ -2042,7 +2059,24 @@ class CortexDaemon:
         loop.call_later(0.3, os.kill, os.getpid(), _signal.SIGTERM)
 
     async def stop(self) -> None:
-        """Gracefully stop all runtime services."""
+        """Coalesce every caller onto one complete graceful-stop task."""
+
+        task = self._stop_task
+        if task is None:
+            task = cast(
+                "asyncio.Task[None]",
+                self._task_supervisor.spawn(
+                    self._stop_once(),
+                    name="cortex-daemon-stop",
+                    group=TaskGroupName.LIFECYCLE,
+                ),
+            )
+            self._stop_task = task
+        await asyncio.shield(task)
+
+    async def _stop_once(self) -> None:
+        """Gracefully stop all runtime services exactly once."""
+
         if self._stop_started:
             return
         self._stop_started = True

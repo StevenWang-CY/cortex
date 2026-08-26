@@ -17,6 +17,9 @@ from cortex.scripts.generate_release_evidence import (
     generate,
     sha256_file,
 )
+from cortex.scripts.generate_support_model_identity import (
+    check as check_support_model_identity,
+)
 from cortex.scripts.release_smoke import inspect_release_resources
 from cortex.scripts.select_notary_auth import (
     API_KEY_VARIABLES,
@@ -163,6 +166,37 @@ def test_macos_spec_packages_only_sql_migration_resources() -> None:
     assert f'(str({migration_root}), "cortex/storage/migrations")' not in spec
 
 
+def test_macos_spec_uses_crash_visible_bootstrap_entrypoint() -> None:
+    spec = (_ROOT / "cortex/scripts/cortex.spec").read_text(encoding="utf-8")
+
+    assert '"desktop_shell" / "bootstrap.py"' in spec
+    assert '"desktop_shell" / "main.py"' not in spec
+
+
+def test_macos_spec_declares_continuity_camera_device_type() -> None:
+    spec = (_ROOT / "cortex/scripts/cortex.spec").read_text(encoding="utf-8")
+
+    assert '"NSCameraUseContinuityCameraDeviceType": True' in spec
+
+
+def test_macos_spec_packages_bundled_display_fonts() -> None:
+    spec = (_ROOT / "cortex/scripts/cortex.spec").read_text(encoding="utf-8")
+
+    assert 'CORTEX / "assets" / "fonts"' in spec
+    assert '"cortex/assets/fonts"' in spec
+
+
+def test_settings_slider_stylesheet_has_balanced_rule_boundaries() -> None:
+    from cortex.apps.desktop_shell.settings import _SLIDER_QSS
+
+    assert _SLIDER_QSS.count("{") == _SLIDER_QSS.count("}")
+    assert "}}" not in _SLIDER_QSS
+
+
+def test_generated_support_model_identity_is_current() -> None:
+    assert check_support_model_identity() == []
+
+
 def _write_approved_release_record(
     root: Path,
     *,
@@ -233,8 +267,16 @@ def test_source_release_smoke_covers_critical_resources() -> None:
     report = inspect_release_resources(_ROOT, frozen=False)
     assert report.cortex_version == __version__
     assert report.checks["face_landmarker"] != ""
+    assert report.checks["font_display"] != ""
+    assert report.checks["font_display_italic"] != ""
+    assert report.checks["font_license"] != ""
     assert report.checks["migration_0002"] != ""
     assert report.checks["browser_source"] == "present"
+    assert len(report.checks["support_model_identity"]) == 64
+    assert report.checks["support_model_registry"].startswith(
+        "deterministic-support/"
+    )
+    assert report.checks["support_inference"] == "constructed"
 
 
 def test_frozen_release_smoke_rejects_secret_bearing_env(tmp_path: Path) -> None:
@@ -246,6 +288,9 @@ def test_frozen_release_smoke_rejects_secret_bearing_env(tmp_path: Path) -> None
         "cortex/scripts/install_native_host.py",
         "cortex/models/face_landmarker.task",
         "cortex/assets/audio/box_4s.wav",
+        "cortex/assets/fonts/CormorantGaramond[wght].ttf",
+        "cortex/assets/fonts/CormorantGaramond-Italic[wght].ttf",
+        "cortex/assets/fonts/OFL.txt",
     )
     for relative in required:
         path = tmp_path / relative

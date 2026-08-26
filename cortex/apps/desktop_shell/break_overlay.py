@@ -39,7 +39,6 @@ from typing import Literal
 from PySide6.QtCore import QEventLoop, QPointF, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
-    QFont,
     QKeyEvent,
     QLinearGradient,
     QPainter,
@@ -48,6 +47,7 @@ from PySide6.QtGui import (
 from PySide6.QtMultimedia import QSoundEffect
 from PySide6.QtWidgets import QPushButton, QWidget
 
+from cortex.apps.desktop_shell import mac_native
 from cortex.apps.desktop_shell.tokens import (
     FONT_SYSTEM,
     FS_CAPTION,
@@ -165,9 +165,7 @@ class _BreathingCanvas(QWidget):
 
             # Phase label in the center.
             painter.setPen(QColor(*TEXT_HUD_PRIMARY))
-            phase_font = QFont(FONT_SYSTEM.split(",")[0].strip(), 28)
-            phase_font.setWeight(QFont.Weight.Medium)
-            painter.setFont(phase_font)
+            painter.setFont(mac_native.system_font(28, "medium"))
             painter.drawText(
                 rect, Qt.AlignmentFlag.AlignCenter, self._phase_label,
             )

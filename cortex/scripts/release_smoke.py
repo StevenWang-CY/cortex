@@ -51,7 +51,7 @@ def _sha256(path: Path) -> str:
 
 
 def inspect_release_resources(root: Path, *, frozen: bool) -> ReleaseSmokeReport:
-    """Verify all resources needed for first launch without starting Qt/daemon."""
+    """Verify resources and construct the critical startup inference graph."""
 
     if frozen:
         expected_files = {
@@ -62,6 +62,13 @@ def inspect_release_resources(root: Path, *, frozen: bool) -> ReleaseSmokeReport
             "native_host_installer": root / "cortex/scripts/install_native_host.py",
             "face_landmarker": root / "cortex/models/face_landmarker.task",
             "audio_box": root / "cortex/assets/audio/box_4s.wav",
+            "font_display": (
+                root / "cortex/assets/fonts/CormorantGaramond[wght].ttf"
+            ),
+            "font_display_italic": (
+                root / "cortex/assets/fonts/CormorantGaramond-Italic[wght].ttf"
+            ),
+            "font_license": root / "cortex/assets/fonts/OFL.txt",
         }
         expected_directories = {
             "browser_chrome": root / "browser_extension_chrome",
@@ -78,6 +85,13 @@ def inspect_release_resources(root: Path, *, frozen: bool) -> ReleaseSmokeReport
             "native_host_installer": project / "scripts/install_native_host.py",
             "face_landmarker": project / "models/face_landmarker.task",
             "audio_box": project / "assets/audio/box_4s.wav",
+            "font_display": (
+                project / "assets/fonts/CormorantGaramond[wght].ttf"
+            ),
+            "font_display_italic": (
+                project / "assets/fonts/CormorantGaramond-Italic[wght].ttf"
+            ),
+            "font_license": project / "assets/fonts/OFL.txt",
         }
         expected_directories = {
             "browser_source": project / "apps/browser_extension",
@@ -111,6 +125,32 @@ def inspect_release_resources(root: Path, *, frozen: bool) -> ReleaseSmokeReport
                     "bundled .env contains forbidden credential/path names: " + ", ".join(matched)
                 )
             checks["bundled_env"] = _sha256(bundled_env)
+
+    # This construction is intentionally inside the executable smoke path.
+    # v0.3.5 only checked data files, so its model registry crash remained
+    # invisible until a user launched the app. These imports and constructors
+    # exercise the frozen module archive and the exact provenance boundary
+    # reached by CortexDaemon.__init__, without opening a camera, input hook,
+    # database, socket, or user storage. The separate liveness probe in
+    # verify_macos_release launches the complete application graph.
+    from cortex.services.state_engine.generated_model_identity import (
+        DETERMINISTIC_SUPPORT_IMPLEMENTATION_SHA256,
+        SUPPORT_MODEL_COMPONENT_SHA256,
+    )
+    from cortex.services.state_engine.model_registry import SupportModelRegistry
+    from cortex.services.state_engine.rule_scorer import RuleScorer
+    from cortex.services.state_engine.support_inference import SupportInferenceEngine
+
+    registry = SupportModelRegistry()
+    inference = SupportInferenceEngine(RuleScorer(), registry)
+    active = inference.registry.active
+    if active.identity.implementation_sha256 != DETERMINISTIC_SUPPORT_IMPLEMENTATION_SHA256:
+        raise RuntimeError("support-model registry identity differs from generated metadata")
+    if len(SUPPORT_MODEL_COMPONENT_SHA256) < 4:
+        raise RuntimeError("support-model generated manifest is incomplete")
+    checks["support_model_identity"] = DETERMINISTIC_SUPPORT_IMPLEMENTATION_SHA256
+    checks["support_model_registry"] = f"{active.identity.name}/{active.identity.version}"
+    checks["support_inference"] = "constructed"
     return ReleaseSmokeReport(
         schema_version="1.0",
         cortex_version=__version__,

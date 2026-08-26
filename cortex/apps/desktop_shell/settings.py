@@ -141,15 +141,15 @@ _SPINBOX_QSS = (
 
 _SLIDER_QSS = (
     f"QSlider::groove:horizontal {{ background: {_GROUPED_BG};"
-    " height: 6px; border-radius: 3px; }}"
+    " height: 6px; border-radius: 3px; }"
     f"QSlider::handle:horizontal {{ background: {BRAND_ACCENT};"
     " width: 18px; height: 18px; margin: -6px 0; border-radius: 9px;"
     " border: 0.5px solid rgba(0,0,0,0.12);"
-    " /* subtle drop shadow via border trick */ }}"
+    " }"
     f"QSlider::handle:horizontal:hover {{ background: {BRAND_ACCENT_HOVER}; }}"
     f"QSlider::handle:horizontal:pressed {{ background: {BRAND_ACCENT_HOVER}; }}"
     f"QSlider::sub-page:horizontal {{ background: {BRAND_ACCENT};"
-    " border-radius: 3px; }}"
+    " border-radius: 3px; }"
 )
 
 _PAGE_TITLE_QSS = (

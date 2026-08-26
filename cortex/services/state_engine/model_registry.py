@@ -10,8 +10,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-from hashlib import sha256
-from pathlib import Path
 from typing import Literal
 
 from cortex.libs.schemas.state import InferenceModelIdentity
@@ -19,14 +17,12 @@ from cortex.services.state_engine.feature_schema import (
     FEATURE_SCHEMA_VERSION,
     feature_schema_sha256,
 )
+from cortex.services.state_engine.generated_model_identity import (
+    DETERMINISTIC_SUPPORT_IMPLEMENTATION_SHA256,
+)
 
-DETERMINISTIC_SUPPORT_VERSION = "2.1.0"
+DETERMINISTIC_SUPPORT_VERSION = "2.1.1"
 NO_INFERENCE_VERSION = "safety-null-v1"
-
-
-def _implementation_digest() -> str:
-    scorer_path = Path(__file__).with_name("rule_scorer.py")
-    return sha256(scorer_path.read_bytes()).hexdigest()
 
 
 @lru_cache(maxsize=1)
@@ -37,7 +33,7 @@ def deterministic_support_identity() -> InferenceModelIdentity:
         name="deterministic-support",
         version=DETERMINISTIC_SUPPORT_VERSION,
         feature_schema_version=FEATURE_SCHEMA_VERSION,
-        implementation_sha256=_implementation_digest(),
+        implementation_sha256=DETERMINISTIC_SUPPORT_IMPLEMENTATION_SHA256,
         validation_status="deterministic_rules",
     )
 

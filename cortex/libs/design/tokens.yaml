@@ -111,7 +111,9 @@ typography:
   # produces a QFont via cortex/apps/desktop_shell/mac_native.system_font().
   system_stack: "-apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"SF Pro Display\", system-ui, sans-serif"
   display_stack: "\"Cormorant Garamond\", ui-serif, Georgia, serif"
-  mono_stack: "\"SF Mono\", ui-monospace, \"JetBrains Mono\", Menlo, monospace"
+  # Menlo is present on every supported macOS release. SF Mono is an optional
+  # developer-tool font and cannot be assumed on a clean user machine.
+  mono_stack: "Menlo, ui-monospace, \"SF Mono\", \"JetBrains Mono\", monospace"
 
   # 5-step modular scale (collapsed from previous 9-step muddle).
   # Apple HIG nominal sizes: caption 11, footnote 13, body 15, title 22, large title 34.

@@ -4,6 +4,66 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.3.6] — 2026-08-26
+
+This patch closes the packaged-startup failure found in the v0.3.5 candidate.
+The deterministic support scoring rules, weights, evidence gates, intervention
+authority, and privacy behavior are unchanged. The model metadata version is
+`2.1.1` because its implementation-identity mechanism is now an explicit
+generated contract rather than a runtime source-file read.
+
+### Fixed
+
+* The model registry no longer reads `rule_scorer.py` from the filesystem at
+  application startup. PyInstaller imports Python modules from its embedded
+  archive, so the source path represented by `__file__` was not a materialized
+  file in Cortex.app. The resulting `FileNotFoundError` occurred before the Qt
+  event loop, making the Dock icon bounce briefly and disappear.
+* Deterministic support provenance is now generated from a canonical,
+  path-independent manifest of the reviewed feature schema, registry, scorer,
+  and inference boundary. The committed generated module works identically in
+  source and frozen execution.
+* Added repository-contract, CI, and pre-commit drift gates. Editing a hashed
+  algorithm component without regenerating its identity now fails closed.
+* PyInstaller now enters through a minimal standard-library bootstrap. It
+  installs a bounded private log at `~/Library/Logs/Cortex/startup.log`, writes
+  the latest full traceback to `last-startup-error.txt`, and presents an
+  actionable fatal dialog instead of silently disappearing when startup fails.
+* Startup stages are logged across storage, Qt, desktop-surface construction,
+  daemon composition, daemon-thread start, and Qt event-loop readiness.
+* Corrected an extra closing brace in every sensitivity-slider QSS rule and
+  established the native macOS system font at the application boundary. The
+  packaged verifier now rejects stylesheet parse failures and missing-font
+  fallbacks instead of allowing visually degraded controls to ship.
+* Bundled and startup-validated the Roman and italic Cormorant Garamond 4.001
+  variable faces from a pinned Google Fonts commit, including their OFL 1.1
+  license and source digests. The desktop mono token now prefers macOS-shipped
+  Menlo instead of assuming the optional developer font SF Mono is installed.
+* Declared the modern Continuity Camera device type in the app metadata. Cortex
+  continues to prefer and re-verify the built-in Mac camera, while avoiding the
+  deprecated AVFoundation compatibility path during device enumeration.
+* The frozen resource smoke now constructs the real support registry, scorer,
+  and inference boundary and verifies the generated identity. This directly
+  covers the code path v0.3.5 omitted.
+* Mounted-DMG verification now launches the complete packaged app in an
+  isolated HOME, forces camera-unavailable degradation, waits for a healthy
+  version-matched HTTP service graph containing the support registry, and then
+  verifies bounded process termination. Resource presence alone can no longer
+  qualify a DMG.
+* Installation guidance now explicitly requires replacing an older copy in
+  `/Applications`, ejecting the DMG, and launching the installed copy, avoiding
+  ambiguity between a stale Dock item and a newly downloaded mounted app.
+
+### Release process
+
+* v0.3.5 is retained unchanged as a quarantined draft candidate with its
+  artifacts and evidence preserved for incident traceability. It must not be
+  republished or have assets replaced.
+* v0.3.6 requires both architecture release jobs, signing, Apple acceptance,
+  stapling, Gatekeeper assessment, frozen resource/composition smoke, packaged
+  health/termination probe, and a clean-profile Finder download/install/open
+  exercise before publication.
+
 ## [v0.3.5] — 2026-08-26
 
 This patch preserves clean-checkout release provenance while the macOS builder
