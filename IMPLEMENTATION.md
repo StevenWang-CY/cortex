@@ -8,7 +8,7 @@ gates remain external
 on `main`, reviewed 2026-08-24
 
 **Implementation record:** `implementation-hardening`, implemented and verified
-through 2026-08-25; immutable WP commits are listed in
+through 2026-08-26; immutable WP commits are listed in
 [`audit/execution-log.md`](audit/execution-log.md)
 
 **Scope:** macOS application, in-process daemon, HTTP/WebSocket gateways, webcam physiology and kinematics, state inference, intervention planning/execution/restoration, adaptive policy evaluation, Chrome/Edge extension, optional VS Code extension, persistence, packaging, tests, documentation, privacy, and supply chain
@@ -102,11 +102,36 @@ were unchanged. The diagnostic and remediation are retained in
 [`audit/execution-log.md`](audit/execution-log.md) rather than hiding the failed
 run.
 
-No signed DMG, Apple notarization response, physical camera/TCC matrix,
-reference-sensor dataset, participant study, penetration test, or independent
-statistical review was fabricated during this work. The repository now makes
-those gates executable and evidence-bearing; the parties with credentials,
-hardware, data authority, or independence must execute them.
+Credentialed release execution subsequently exercised the software boundary
+without converting partial success into a publication claim. The immutable
+v0.3.3 arm64 and Intel candidates were accepted by Apple's notarization
+service and stapled, but the final disk-image Gatekeeper assessment found no
+usable outer-container signature. v0.3.4 corrected the inside-out signature
+order: its arm64 DMG was Developer ID signed, accepted, stapled, accepted by
+Gatekeeper, mounted, and passed the frozen smoke before evidence generation
+correctly rejected the checkout as dirty. Root-cause analysis identified the
+untracked `.env.bundled` staging file, which remained present until shell exit
+while provenance necessarily ran before exit. The v0.3.4 Intel DMG was also
+signed, accepted, and stapled, but its mounted deep signature verification
+exceeded the verifier's generic 60-second subprocess limit after the earlier
+unbounded deep verification had passed.
+
+v0.3.5 keeps both the scrubbed bundle environment and any developer `.env`
+backup in the runner temporary directory outside the checkout; only the
+ignored `.env` projection expected by PyInstaller exists briefly. The
+fail-closed clean-tree check is retained unchanged. Mounted deep signature
+verification has a command-specific, bounded five-minute budget for the much
+larger Intel verification surface. Its source validation on
+native arm64/Python 3.11.15 passed Ruff, strict mypy over 512 files, a verified
+281-file wheel, 2,606 non-Qt tests with three declared dataset/platform skips,
+62 isolated Qt tests, 248 browser tests plus Chrome/Edge production builds,
+and 30 VS Code tests plus a zero-vulnerability 0.3.5 VSIX.
+
+No physical camera/TCC matrix, reference-sensor dataset, participant study,
+penetration test, independent statistical review, or public release was
+fabricated. The repository makes those gates executable and evidence-bearing;
+the parties with the required hardware, data authority, or independence must
+execute them against the exact staged candidate artifacts.
 
 ## 1. Executive determination
 
@@ -1998,10 +2023,12 @@ ownership, browser module boundaries, and shared desktop routing/view models.
 
 ### WP-11 — Validation, documentation, and reproducible release (`L`, continuous)
 
-**Implementation status (2026-08-25): complete at the repository/software
-boundary.** The remaining work is evidence that cannot truthfully be produced
-from source alone: a signed/notarized release candidate on both architectures,
-the physical permission/device matrix, participant/reference-sensor data, and
+**Implementation status (2026-08-26): complete at the repository/software
+boundary.** Credentialed signing, notarization, stapling, Gatekeeper, mounted
+verification, and failure preservation have been exercised. The remaining
+work for any public candidate is evidence that cannot truthfully be produced
+from source alone: complete staged artifacts on both architectures, the
+physical permission/device matrix, participant/reference-sensor data, and
 independent review.
 
 **Files:** CI/release workflows, `uv.lock`, toolchain pins, build scripts/spec,
@@ -2057,7 +2084,10 @@ README/wiki pages, finding ledger, ADRs, model cards, and release templates
    draft-staging guard. A separately protected promotion workflow refuses an
    already-public target, verifies both provenance attestations, and publishes
    only after machine-validating the complete physical-test record. All
-   third-party actions are full-commit pinned.
+   third-party actions are full-commit pinned. Scrubbed bundle configuration
+   and developer environment backups remain outside the checkout so the
+   pre-exit provenance check observes a genuinely clean tag rather than an
+   ignore-list exception for build-created inputs.
 7. Added a release-record JSON Schema and promotion validator whose `release`
    decision is impossible unless all 14 fixed cases passed on clean arm64 and
    Intel profiles, artifact/tag/commit/hash bindings agree, every dedicated

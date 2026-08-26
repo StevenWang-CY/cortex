@@ -31,6 +31,7 @@ from cortex.scripts.validate_release_records import (
 )
 from cortex.scripts.verify_macos_release import (
     _default_personal_roots,
+    _mounted_app_signature_verification,
     _notarized_container_verification_commands,
     _scan_forbidden,
 )
@@ -89,6 +90,21 @@ def test_macos_builder_preserves_caller_selected_node_before_gui_fallbacks() -> 
     assert 'export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"' not in build_script
 
 
+def test_macos_builder_keeps_temporary_env_inputs_outside_checkout() -> None:
+    build_script = (_ROOT / "cortex/scripts/build_macos_app.sh").read_text(encoding="utf-8")
+
+    assert '"${ROOT_DIR}/.env.bundled"' not in build_script
+    assert (
+        'BUNDLED_ENV_PATH="$(mktemp "${TMPDIR:-/tmp}/cortex-bundled-env.XXXXXX")"'
+        in build_script
+    )
+    assert 'ENV_BACKUP_PATH="$(mktemp "${TMPDIR:-/tmp}/cortex-env-backup.XXXXXX")"' in (
+        build_script
+    )
+    assert 'cp "${BUNDLED_ENV_PATH}" "${ROOT_DIR}/.env"' in build_script
+    assert '--require-clean' in build_script
+
+
 def test_production_macos_builder_signs_outer_dmg_before_notarization() -> None:
     build_script = (_ROOT / "cortex/scripts/build_macos_app.sh").read_text(encoding="utf-8")
     integrity_check = 'if ! hdiutil verify "${DMG_PATH}"; then'
@@ -128,6 +144,15 @@ def test_notarized_dmg_verification_requires_signature_ticket_and_gatekeeper() -
             "context:primary-signature",
             str(artifact),
         ],
+    )
+
+
+def test_mounted_app_deep_signature_verification_has_bounded_intel_budget() -> None:
+    app = Path("/tmp/Cortex.app")
+
+    assert _mounted_app_signature_verification(app) == (
+        ["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app)],
+        300.0,
     )
 
 

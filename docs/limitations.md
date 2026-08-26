@@ -1,6 +1,6 @@
 # Product and evidence limitations
 
-Last reviewed: 2026-08-25. Cortex 0.3.4 is an alpha research prototype for
+Last reviewed: 2026-08-26. Cortex 0.3.5 is an alpha research prototype for
 local, user-controlled workspace support. It is not a medical device, clinical
 tool, productivity judge, accessibility accommodation, or validated estimator
 of cognition.

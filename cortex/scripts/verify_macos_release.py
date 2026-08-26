@@ -100,6 +100,7 @@ _CREDENTIAL_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
 _SCAN_OVERLAP_BYTES = 32 * 1024
 _TEXT_SAMPLE_BYTES = 64 * 1024
 _NON_PERSONAL_BUILD_USERS = frozenset({"root", "runner", "runneradmin"})
+_DEEP_SIGNATURE_TIMEOUT_SECONDS = 300.0
 _SENSITIVE_ENV_NAMES = (
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
@@ -329,6 +330,22 @@ def _notarized_container_verification_commands(artifact: Path) -> tuple[list[str
     )
 
 
+def _mounted_app_signature_verification(app: Path) -> tuple[list[str], float]:
+    """Return the deep app verification command and its bounded timeout.
+
+    Intel release bundles contain thousands of nested native members and have
+    exceeded the generic 60-second subprocess budget on hosted macOS runners.
+    Five minutes remains bounded by the workflow deadline while allowing the
+    authoritative deep verification to finish instead of misreporting a slow
+    valid signature as a signing failure.
+    """
+
+    return (
+        ["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app)],
+        _DEEP_SIGNATURE_TIMEOUT_SECONDS,
+    )
+
+
 def verify(
     artifact: Path,
     *,
@@ -404,9 +421,8 @@ def verify(
                 raise ReleaseVerificationError(
                     f"expected only architecture {expected_arch}, got {architectures}"
                 )
-            commands.append(
-                _run(["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app)])
-            )
+            signature_command, signature_timeout = _mounted_app_signature_verification(app)
+            commands.append(_run(signature_command, timeout=signature_timeout))
             commands.append(_run(["codesign", "-dv", "--verbose=4", str(app)]))
 
             findings = _scan_forbidden(app)

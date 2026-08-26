@@ -78,12 +78,17 @@ if ! command -v npm &>/dev/null && [ -s "${HOME}/.nvm/nvm.sh" ]; then
 fi
 
 ENV_BACKUP_PATH=""
+BUNDLED_ENV_PATH=""
 BUNDLED_ENV_ACTIVE="0"
 DMG_STAGE_DIR=""
 
 cleanup() {
-    # Always remove temporary bundled env.
-    rm -f "${ROOT_DIR}/.env.bundled"
+    # Always remove the scrubbed build input kept outside the checkout. Keeping
+    # this temporary file out of ROOT_DIR is required: production provenance is
+    # generated before EXIT cleanup and must observe a genuinely clean tree.
+    if [ -n "${BUNDLED_ENV_PATH}" ]; then
+        rm -f "${BUNDLED_ENV_PATH}"
+    fi
 
     # Restore developer .env if we temporarily replaced it.
     if [ "${BUNDLED_ENV_ACTIVE}" = "1" ]; then
@@ -180,10 +185,11 @@ echo "→ Generating bundled .env (allowlist scrub)..."
 #   CORTEX_LLM__MODEL_FAST      — LLMConfig.model_fast; fast-tier model
 #   CORTEX_LLM__MODEL_DEEP      — LLMConfig.model_deep; deep-tier model
 ALLOWED_KEYS='^(CORTEX_API__HOST|CORTEX_API__PORT|CORTEX_API__WS_PORT|CORTEX_LLM__PROVIDER|CORTEX_LLM__BEDROCK__AWS_REGION|CORTEX_LLM__USE_KEYCHAIN|CORTEX_LLM__MODEL_DEFAULT|CORTEX_LLM__MODEL_FAST|CORTEX_LLM__MODEL_DEEP)='
+BUNDLED_ENV_PATH="$(mktemp "${TMPDIR:-/tmp}/cortex-bundled-env.XXXXXX")"
 if [ -f "${ROOT_DIR}/.env" ]; then
-    grep -E "${ALLOWED_KEYS}" "${ROOT_DIR}/.env" > "${ROOT_DIR}/.env.bundled" || true
+    grep -E "${ALLOWED_KEYS}" "${ROOT_DIR}/.env" > "${BUNDLED_ENV_PATH}" || true
 else
-    : > "${ROOT_DIR}/.env.bundled"
+    : > "${BUNDLED_ENV_PATH}"
 fi
 # Always force these defaults in the bundled .env regardless of dev .env state.
 {
@@ -193,20 +199,22 @@ fi
     echo "CORTEX_API__HOST=127.0.0.1"
     echo "CORTEX_API__PORT=9472"
     echo "CORTEX_API__WS_PORT=9473"
-} >> "${ROOT_DIR}/.env.bundled"
+} >> "${BUNDLED_ENV_PATH}"
 # Defence-in-depth: fail without echoing the suspect file into CI logs.
-if grep -qiE "AWS_BEARER_TOKEN_BEDROCK|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|api_key=|sk-ant-|openai\.com|/Users/|/home/" "${ROOT_DIR}/.env.bundled"; then
+if grep -qiE "AWS_BEARER_TOKEN_BEDROCK|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|api_key=|sk-ant-|openai\.com|/Users/|/home/" "${BUNDLED_ENV_PATH}"; then
     echo "ERROR: bundled .env contains a forbidden pattern; aborting build." >&2
     exit 1
 fi
 
-# Rename .env.bundled → .env so PyInstaller bundles it with the right name
-# (saved back after build)
+# Copy the scrubbed tempfile to the ignored .env path PyInstaller expects. A
+# developer's original .env is also backed up outside the checkout so neither
+# temporary input can invalidate the production clean-tree provenance gate.
 if [ -f "${ROOT_DIR}/.env" ]; then
-    ENV_BACKUP_PATH="$(mktemp "${ROOT_DIR}/.env.backup.XXXXXX")"
+    ENV_BACKUP_PATH="$(mktemp "${TMPDIR:-/tmp}/cortex-env-backup.XXXXXX")"
+    rm -f "${ENV_BACKUP_PATH}"
     mv "${ROOT_DIR}/.env" "${ENV_BACKUP_PATH}"
 fi
-cp "${ROOT_DIR}/.env.bundled" "${ROOT_DIR}/.env"
+cp "${BUNDLED_ENV_PATH}" "${ROOT_DIR}/.env"
 BUNDLED_ENV_ACTIVE="1"
 
 # ── Step 5: Convert SVG → .icns ───────────────────────────────────────────

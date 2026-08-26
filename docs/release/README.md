@@ -52,6 +52,13 @@ decoded only into the runner temporary directory, imported into a temporary
 Keychain, removed after import even when credential validation fails, and the
 Keychain is deleted in an `always()` cleanup step.
 
+The scrubbed key-free environment consumed by PyInstaller and any developer
+environment backup are also staged in the runner temporary directory, outside
+the Git checkout. Only the ignored `.env` projection exists briefly at the
+path expected by the bundle spec. This keeps the repository genuinely clean
+when provenance is generated before shell exit cleanup; the clean-tree gate is
+not weakened with an ignore or exception for build-created inputs.
+
 The separate protected `production-publish` environment controls public
 promotion. Its required approver must inspect the real-device evidence and must
 not be an artifact builder. This separates possession of Apple credentials from
@@ -92,11 +99,17 @@ For each architecture, the tag workflow:
    both DMGs, checksum files, and evidence bundles in a GitHub draft release
    only after both matrix jobs pass.
 
+The mounted app's authoritative deep signature verification has a bounded
+five-minute command budget. Intel bundles contain thousands of nested native
+members and can exceed the generic 60-second subprocess budget on hosted
+runners; a timeout is not treated as signature success, but a valid slow check
+is given enough time to complete within the enclosing 90-minute job deadline.
+
 Run the same artifact verifier locally:
 
 ```bash
 uv run --project cortex --locked python -m cortex.scripts.verify_macos_release \
-  dist/Cortex-0.3.4-macos-arm64.dmg \
+  dist/Cortex-0.3.5-macos-arm64.dmg \
   --expected-arch arm64 \
   --require-notarized \
   --output dist/evidence-arm64/release-verification.json
@@ -110,13 +123,13 @@ the checksum file before running:
 
 ```bash
 shasum -a 256 -c SHA256SUMS-arm64
-gh attestation verify Cortex-0.3.4-macos-arm64.dmg \
+gh attestation verify Cortex-0.3.5-macos-arm64.dmg \
   --repo StevenWang-CY/cortex
-codesign --verify --strict --verbose=2 Cortex-0.3.4-macos-arm64.dmg
-codesign -dv --verbose=4 Cortex-0.3.4-macos-arm64.dmg
-xcrun stapler validate Cortex-0.3.4-macos-arm64.dmg
+codesign --verify --strict --verbose=2 Cortex-0.3.5-macos-arm64.dmg
+codesign -dv --verbose=4 Cortex-0.3.5-macos-arm64.dmg
+xcrun stapler validate Cortex-0.3.5-macos-arm64.dmg
 spctl -a -vv --type open --context context:primary-signature \
-  Cortex-0.3.4-macos-arm64.dmg
+  Cortex-0.3.5-macos-arm64.dmg
 ```
 
 The checksum file covers the DMG, metadata, SBOMs, verifier output, and command
