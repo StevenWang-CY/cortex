@@ -43,10 +43,30 @@ logger = logging.getLogger(__name__)
 _AUTO_CAMERA_DEVICE_ID = 0
 
 # Phase 4 fix #3: how many consecutive failed ``cap.read()`` calls before we
-# flag capture as stale. ~1 s at 30 FPS — long enough to ride out a single
-# transient hiccup, short enough to surface a stuck camera before the UI
-# notices on its own.
+# flag capture as stale.  Count alone is not sufficient because AVFoundation
+# may block for roughly a second before returning one failed read.  The
+# wall-clock bound below prevents a nominal "30 frames" threshold from taking
+# 30 seconds on a genuinely stalled device.
 _CAPTURE_STALE_THRESHOLD: int = 30
+_CAPTURE_STALE_AFTER_SECONDS: float = 2.0
+
+# A camera that validated during ``open_video_capture`` can still be
+# interrupted after startup.  OpenCV exposes that interruption only as
+# repeated ``read()`` failures, so the capture owner must release and reopen
+# the device.  The first retry is quick; subsequent attempts are capped to
+# avoid thrashing AVFoundation or repeatedly waking a Continuity Camera.
+_CAPTURE_RECOVERY_BACKOFF_SECONDS: tuple[float, ...] = (
+    0.5,
+    1.0,
+    2.0,
+    4.0,
+    8.0,
+    15.0,
+)
+_CAPTURE_POST_REOPEN_FAILURE_THRESHOLD: int = 3
+_FAILED_READ_LOG_INTERVAL_SECONDS: float = 5.0
+_CAPTURE_THREAD_STOP_TIMEOUT_SECONDS: float = 2.0
+_CAPTURE_EMERGENCY_RELEASE_GRACE_SECONDS: float = 0.5
 _BUILTIN_MAC_CAMERA_KEYWORDS = (
     "facetime",
     "built-in",
@@ -297,7 +317,12 @@ def _find_builtin_macos_camera() -> tuple[int | None, str | None]:
     # Try LLM-based selection first
     llm_pick = _llm_pick_builtin_camera(names)
     if llm_pick is not None:
-        return llm_pick, names[llm_pick]
+        llm_name = names[llm_pick]
+        if not any(
+            keyword in llm_name.casefold()
+            for keyword in _CONTINUITY_CAMERA_KEYWORDS
+        ):
+            return llm_pick, llm_name
 
     # Keyword fallback — first pass: match built-in keywords, skip Continuity Camera
     for index, name in enumerate(names):
@@ -320,13 +345,14 @@ def _iter_camera_candidates(config: CaptureConfig) -> Iterable[CameraSelection]:
     Yield camera candidates in preference order.
 
     When no device_id is configured on macOS, we enumerate all cameras and
-    yield built-in Mac cameras first, then other non-phone cameras, then
-    Continuity Camera (iPhone/iPad) last.  This ensures the Mac's own camera
-    is always preferred over Continuity Camera.
+    yield built-in Mac cameras first, followed by other verified non-phone
+    cameras. Continuity Camera (iPhone/iPad) and unnamed devices are excluded
+    before OpenCV is called.
 
     Because AVFoundation's device enumeration index doesn't always match the
     OpenCV device index (especially when Continuity Camera is present), we
-    try ALL available device indices — not just the one AVFoundation reports.
+    try all currently verified non-Continuity device indices, not anonymous
+    indices or any index currently associated with a phone or tablet.
     """
     requested_device_id = (
         _AUTO_CAMERA_DEVICE_ID if config.device_id is None else config.device_id
@@ -335,8 +361,10 @@ def _iter_camera_candidates(config: CaptureConfig) -> Iterable[CameraSelection]:
     candidates: list[CameraSelection] = []
     names: list[str] = []
 
-    if config.device_id is None and is_macos():
+    if is_macos():
         names = _list_macos_video_device_names()
+
+    if config.device_id is None and is_macos():
         if names:
             # Try LLM-based selection first — if it picks a non-Continuity camera, use it
             llm_pick = _llm_pick_builtin_camera(names)
@@ -352,25 +380,27 @@ def _iter_camera_candidates(config: CaptureConfig) -> Iterable[CameraSelection]:
                         )
                     )
 
-            # Partition into builtin, other, and continuity camera groups
+            # Partition verified non-Continuity devices. Phone/tablet cameras
+            # are intentionally omitted from the candidate list so this
+            # function cannot accidentally hand one to OpenCV.
             builtin: list[tuple[int, str]] = []
             other: list[tuple[int, str]] = []
-            continuity: list[tuple[int, str]] = []
 
             for idx, name in enumerate(names):
                 normalized = name.casefold()
-                if any(kw in normalized for kw in _CONTINUITY_CAMERA_KEYWORDS):
-                    continuity.append((idx, name))
+                if not normalized.strip() or any(
+                    kw in normalized for kw in _CONTINUITY_CAMERA_KEYWORDS
+                ):
+                    continue
                 elif any(kw in normalized for kw in _BUILTIN_MAC_CAMERA_KEYWORDS):
                     builtin.append((idx, name))
                 else:
                     other.append((idx, name))
 
-            # Yield in order: builtin first, then other, then continuity last
+            # Yield in order: builtin first, then other verified cameras.
             for group, source in [
                 (builtin, "builtin_mac_camera"),
                 (other, "other_camera"),
-                (continuity, "continuity_camera"),
             ]:
                 for idx, name in group:
                     candidates.append(
@@ -382,11 +412,10 @@ def _iter_camera_candidates(config: CaptureConfig) -> Iterable[CameraSelection]:
                         )
                     )
 
-            # Also try ALL indices without explicit backend (in same order)
+            # Also try the same verified indices without an explicit backend.
             for group, source in [
                 (builtin, "builtin_mac_camera"),
                 (other, "other_camera"),
-                (continuity, "continuity_camera"),
             ]:
                 for idx, name in group:
                     candidates.append(
@@ -398,36 +427,78 @@ def _iter_camera_candidates(config: CaptureConfig) -> Iterable[CameraSelection]:
                         )
                     )
 
-    # Fallback: probe device indices to handle cases where AVFoundation and
-    # OpenCV disagree on index ordering.  When the enumeration returned a
-    # non-empty names list, restrict probing to indices that are NOT known
-    # Continuity Cameras — this prevents accidentally opening an iPhone camera
-    # whose cv2 index isn't covered by the named candidates above.
-    # When enumeration failed entirely, probe 0-4 as a last resort.
+    # Fallback: probe only indices backed by a current, non-Continuity
+    # AVFoundation identity. Blind probing when discovery returned no names
+    # could briefly wake an iPhone and could never produce an accepted handle:
+    # the mandatory post-open identity check would reject that unnamed device.
+    # Failing closed is both safer and logically equivalent.
     if is_macos():
-        if names:
+        if config.device_id is not None:
+            if 0 <= requested_device_id < len(names):
+                requested_name = names[requested_device_id]
+                if not requested_name.strip():
+                    logger.warning(
+                        "Configured camera index %d has no verified device name; "
+                        "capture remains offline",
+                        requested_device_id,
+                    )
+                elif any(
+                    keyword in requested_name.casefold()
+                    for keyword in _CONTINUITY_CAMERA_KEYWORDS
+                ):
+                    logger.warning(
+                        "Configured device %d (%s) is Continuity Camera; "
+                        "refusing to open it",
+                        requested_device_id,
+                        requested_name,
+                    )
+                else:
+                    for backend in (cv2.CAP_AVFOUNDATION, None):
+                        candidates.append(
+                            CameraSelection(
+                                device_id=requested_device_id,
+                                backend=backend,
+                                source="configured_device",
+                                device_name=requested_name,
+                            )
+                        )
+            else:
+                logger.warning(
+                    "Configured camera index %d has no live AVFoundation identity; "
+                    "capture remains offline",
+                    requested_device_id,
+                )
+        elif names:
             probe_indices = [
                 idx
                 for idx, name in enumerate(names)
-                if not any(kw in name.casefold() for kw in _CONTINUITY_CAMERA_KEYWORDS)
+                if name.strip()
+                and not any(
+                    kw in name.casefold() for kw in _CONTINUITY_CAMERA_KEYWORDS
+                )
             ]
+            for probe_idx in probe_indices:
+                candidates.append(
+                    CameraSelection(
+                        device_id=probe_idx,
+                        backend=cv2.CAP_AVFOUNDATION,
+                        source="probe_device",
+                        device_name=names[probe_idx],
+                    )
+                )
+            for probe_idx in probe_indices:
+                candidates.append(
+                    CameraSelection(
+                        device_id=probe_idx,
+                        backend=None,
+                        source="probe_device",
+                        device_name=names[probe_idx],
+                    )
+                )
         else:
-            probe_indices = list(range(5))
-        for probe_idx in probe_indices:
-            candidates.append(
-                CameraSelection(
-                    device_id=probe_idx,
-                    backend=cv2.CAP_AVFOUNDATION,
-                    source="probe_device",
-                )
-            )
-        for probe_idx in probe_indices:
-            candidates.append(
-                CameraSelection(
-                    device_id=probe_idx,
-                    backend=None,
-                    source="probe_device",
-                )
+            logger.warning(
+                "No verified macOS camera identities are available; refusing "
+                "blind device-index probes"
             )
     else:
         candidates.append(
@@ -495,8 +566,6 @@ def open_video_capture(
     open but fail to deliver frames (e.g. when permissions are denied or the
     device is in an incompatible mode).
     """
-    import time as _time
-
     # Permission prompts are an explicit onboarding/settings gesture.  Runtime
     # startup only checks current authority and fails fast into the product's
     # telemetry-first mode.  This keeps UI, HTTP, WebSocket, and quit paths
@@ -511,7 +580,7 @@ def open_video_capture(
         """Wait between warmup reads, returning False when cancelled."""
 
         if cancel_event is None:
-            _time.sleep(seconds)
+            time.sleep(seconds)
             return True
         return not cancel_event.wait(timeout=seconds)
 
@@ -530,7 +599,8 @@ def open_video_capture(
             candidate.backend,
         )
 
-        # Skip Continuity Camera candidates entirely — never open them
+        # Defense in depth for injected/custom candidate iterators: a known
+        # Continuity Camera must never reach OpenCV.
         if candidate.source == "continuity_camera":
             logger.info(
                 "Skipping device %d (%s) — Continuity Camera",
@@ -562,13 +632,13 @@ def open_video_capture(
                 # ALWAYS re-enumerate to verify the camera at this index.
                 # Camera order can change dynamically (iPhone Continuity Camera
                 # can appear/disappear between our initial enum and now).
-                live_names = _list_macos_video_device_names()
-                actual_name = None
-                if live_names and candidate.device_id < len(live_names):
-                    actual_name = live_names[candidate.device_id]
-                # Fall back to cached name only if live enum returned nothing
-                if actual_name is None:
-                    actual_name = candidate.device_name
+                actual_name: str | None = candidate.device_name
+                if is_macos():
+                    live_names = _list_macos_video_device_names()
+                    actual_name = None
+                    if 0 <= candidate.device_id < len(live_names):
+                        live_name = live_names[candidate.device_id].strip()
+                        actual_name = live_name or None
 
                 if actual_name and any(
                     kw in actual_name.casefold()
@@ -589,9 +659,8 @@ def open_video_capture(
                 # from the AVFoundation device list.
                 if is_macos() and actual_name is None:
                     logger.info(
-                        "Skipping device %d — cannot verify camera identity "
-                        "(index beyond live enumeration; likely Continuity Camera). "
-                        "Set CORTEX_CAPTURE__DEVICE_ID to override.",
+                        "Skipping device %d — live post-open camera identity "
+                        "could not be verified",
                         candidate.device_id,
                     )
                     capture.release()
@@ -660,10 +729,11 @@ class WebcamCapture:
         self._running = threading.Event()
         self._stopped = threading.Event()
         self._stopped.set()  # Initially stopped
-        # Cooperative cancellation for the blocking OpenCV/AVFoundation open
-        # worker.  ``start()`` runs that work off the asyncio loop so optional
-        # hardware can never freeze HTTP, WebSocket, or graceful shutdown.
+        # Cooperative cancellation for the blocking OpenCV/AVFoundation
+        # worker.  All backend operations stay on one serial camera thread;
+        # the event loop receives only startup completion.
         self._open_cancel = threading.Event()
+        self._startup_future: asyncio.Future[None] | None = None
 
         # Async queue for cross-thread communication
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -688,11 +758,21 @@ class WebcamCapture:
 
         # Phase 4 fix #3: consecutive-failure tracking. Incremented on each
         # ``cap.read()`` False/raise, reset on a successful frame. When the
-        # counter exceeds ``_CAPTURE_STALE_THRESHOLD`` (~1 s at 30 FPS) we
-        # set ``_capture_stale`` so the daemon's poll path can broadcast a
-        # capture-stale signal to the UI.
+        # count or elapsed-time bound is exceeded, ``_capture_stale`` is set so
+        # the daemon's poll path can broadcast a capture-stale signal to the UI.
         self._consecutive_failed_reads: int = 0
         self._capture_stale: bool = False
+        self._failed_read_started_mono: float | None = None
+        self._last_failed_read_log_mono: float | None = None
+
+        # Recovery is deliberately owned by the same thread that calls
+        # ``cap.read()``.  No second worker can read or replace the handle at
+        # the same time.  A new source-instance id forces all downstream
+        # temporal buffers to reset after a reopen.
+        self._recovery_attempts: int = 0
+        self._recovery_successes: int = 0
+        self._recovery_attempts_since_frame: int = 0
+        self._recovery_pending_frame: bool = False
 
     @property
     def is_running(self) -> bool:
@@ -724,15 +804,26 @@ class WebcamCapture:
 
     @property
     def capture_stale(self) -> bool:
-        """Phase 4 fix #3: True when the capture thread has seen
-        :data:`_CAPTURE_STALE_THRESHOLD` consecutive failed ``cap.read()``
-        calls without a successful frame in between.
+        """Whether failed reads exceeded the count or elapsed-time bound.
 
         The runtime daemon polls this in its capture-health watchdog and
         emits a ``capture_stale`` broadcast plus a registry flag when set.
-        Cleared automatically the moment a successful frame is enqueued.
+        Recovery keeps it set through reopen and clears it only when the new
+        source actually delivers a successful frame.
         """
         return self._capture_stale
+
+    @property
+    def recovery_attempts(self) -> int:
+        """Number of physical reopen attempts since the latest ``start``."""
+
+        return self._recovery_attempts
+
+    @property
+    def recovery_successes(self) -> int:
+        """Reopens that subsequently delivered a live frame."""
+
+        return self._recovery_successes
 
     @property
     def camera_identity(self) -> CameraIdentity | None:
@@ -761,67 +852,68 @@ class WebcamCapture:
         self._queue = asyncio.Queue(maxsize=self._queue_maxsize)
         self._open_cancel.clear()
 
-        # Camera enumeration, warmup reads, and AVFoundation can block.  Keep
-        # them off the daemon loop; cancellation is checked between every
-        # candidate and warmup read.
-        try:
-            self._cap, self._camera_selection = await asyncio.to_thread(
-                open_video_capture,
-                self._config,
-                cancel_event=self._open_cancel,
-            )
-        except asyncio.CancelledError:
-            self._open_cancel.set()
-            raise
-        if (
-            self._cap is None
-            or not self._cap.isOpened()
-            or self._camera_selection is None
-        ):
-            raise RuntimeError(
-                f"Cannot open webcam device {describe_requested_camera(self._config)}"
-            )
-
-        # Configure camera
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._config.width)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._config.height)
-        self._cap.set(cv2.CAP_PROP_FPS, self._config.fps)
-        self._camera_identity = self._camera_selection.identity(
-            width=self._config.width,
-            height=self._config.height,
-        )
-        self._source_instance_id = uuid4()
-
         # Reset counters
+        self._cap = None
+        self._camera_selection = None
+        self._camera_identity = None
+        self._source_instance_id = None
         self._sequence = 0
         self._frames_captured = 0
         self._input_queue_drops = 0
         self._consecutive_failed_reads = 0
         self._capture_stale = False
+        self._failed_read_started_mono = None
+        self._last_failed_read_log_mono = None
+        self._recovery_attempts = 0
+        self._recovery_successes = 0
+        self._recovery_attempts_since_frame = 0
+        self._recovery_pending_frame = False
         self._has_successful_frame = False
         self._last_fps_time = monotonic_seconds(self._clock)
         self._fps_frame_count = 0
 
-        # Start capture thread
+        # Enumeration, warmup, configuration, reads, recovery, and release all
+        # belong to one serial worker. Passing an opened AVFoundation handle
+        # from an ``asyncio.to_thread`` worker into a second thread created an
+        # intermittent lifecycle hazard after app relaunch.
         self._stopped.clear()
         self._running.set()
+        self._startup_future = self._loop.create_future()
         self._thread = threading.Thread(
             target=self._capture_loop,
             name="cortex-webcam",
             daemon=True,
         )
         self._thread.start()
-        logger.info(
-            "WebcamCapture started",
-            extra={
-                "requested_device_id": describe_requested_camera(self._config),
-                "device_id": self._camera_selection.device_id,
-                "camera_source": self._camera_selection.source,
-                "camera_name": self._camera_selection.device_name,
-                "resolution": f"{self._config.width}x{self._config.height}",
-                "target_fps": self._config.fps,
-            },
-        )
+        try:
+            await self._startup_future
+        except asyncio.CancelledError:
+            self._open_cancel.set()
+            self._running.clear()
+            raise
+
+    def _signal_startup(self, error: Exception | None) -> None:
+        """Resolve the event-loop startup future from the camera thread."""
+
+        loop = self._loop
+        if loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(self._resolve_startup, error)
+        except RuntimeError:
+            # Event loop closed during process teardown.
+            return
+
+    def _resolve_startup(self, error: Exception | None) -> None:
+        """Event-loop side of :meth:`_signal_startup`."""
+
+        future = self._startup_future
+        if future is None or future.done():
+            return
+        if error is None:
+            future.set_result(None)
+        else:
+            future.set_exception(error)
 
     async def stop(self) -> None:
         """Stop the webcam capture and release resources.
@@ -833,32 +925,191 @@ class WebcamCapture:
         self._open_cancel.set()
         self._running.clear()
 
-        # Wait for thread to finish if it's still alive
-        if self._thread is not None:
-            self._stopped.wait(timeout=2.0)
-            self._thread = None
+        # Wait off-loop so a blocking backend read cannot freeze the Qt/API
+        # event loop during Quit.  The camera thread normally observes the
+        # cancellation event immediately.  If a backend call ignores it, an
+        # emergency release is the bounded last resort that unblocks the read.
+        thread = self._thread
+        if thread is not None:
+            stopped = await asyncio.to_thread(
+                self._stopped.wait,
+                _CAPTURE_THREAD_STOP_TIMEOUT_SECONDS,
+            )
+            if not stopped:
+                logger.warning(
+                    "Camera thread did not stop within %.1fs; forcing handle release",
+                    _CAPTURE_THREAD_STOP_TIMEOUT_SECONDS,
+                )
+                self._release_active_capture()
+                await asyncio.to_thread(
+                    self._stopped.wait,
+                    _CAPTURE_EMERGENCY_RELEASE_GRACE_SECONDS,
+                )
+            if not thread.is_alive():
+                self._thread = None
+            else:
+                logger.warning("Camera thread remains alive after emergency release")
 
         # ALWAYS release the camera — this is the critical cleanup
         # (CLAUDE.md rule 15). If release() raises, that is serious enough to
         # log at WARNING with traceback — a leaked handle blocks future
         # opens until the OS reaps the process.
-        if self._cap is not None:
-            try:
-                self._cap.release()
-            except Exception:
-                logger.warning(
-                    "cap.release() raised; camera handle may leak",
-                    exc_info=True,
-                )
-            self._cap = None
+        self._release_active_capture()
 
         logger.info(
             "WebcamCapture stopped",
             extra={
                 "total_captured": self._frames_captured,
                 "total_dropped": self._input_queue_drops,
+                "recovery_attempts": self._recovery_attempts,
+                "recovery_successes": self._recovery_successes,
             },
         )
+
+    def _configure_capture(self, capture: cv2.VideoCapture) -> None:
+        """Apply the requested format to an opened capture handle.
+
+        Backends are allowed to reject individual properties.  That is not a
+        reason to discard an otherwise working camera: downstream processing
+        already consumes the actual frame dimensions.  Exceptions are logged
+        once per property and recovery continues with the backend default.
+        """
+
+        properties = (
+            (cv2.CAP_PROP_FRAME_WIDTH, self._config.width, "width"),
+            (cv2.CAP_PROP_FRAME_HEIGHT, self._config.height, "height"),
+            (cv2.CAP_PROP_FPS, self._config.fps, "fps"),
+        )
+        for property_id, value, name in properties:
+            try:
+                accepted = capture.set(property_id, value)
+            except Exception:
+                logger.warning(
+                    "Camera backend raised while setting %s=%s; using backend default",
+                    name,
+                    value,
+                    exc_info=True,
+                )
+                continue
+            if accepted is False:
+                logger.debug(
+                    "Camera backend rejected %s=%s; using backend default",
+                    name,
+                    value,
+                )
+
+    def _release_active_capture(self) -> None:
+        """Release and clear the active handle exactly once."""
+
+        capture = self._cap
+        self._cap = None
+        if capture is None:
+            return
+        self._safe_release_capture(capture, context="active camera handle")
+
+    @staticmethod
+    def _safe_release_capture(
+        capture: cv2.VideoCapture,
+        *,
+        context: str,
+    ) -> None:
+        """Best-effort release for active, rejected, or cancelled handles."""
+
+        try:
+            capture.release()
+        except Exception:
+            logger.warning(
+                "cap.release() raised for %s; camera handle may leak",
+                context,
+                exc_info=True,
+            )
+
+    def _attempt_camera_recovery(self) -> bool:
+        """Release, re-enumerate, and reopen a stalled camera.
+
+        Returns ``True`` when a new handle has been installed.  The stale flag
+        intentionally remains set until that handle delivers a frame; an open
+        handle is not evidence that pixels are flowing.  Cancellation uses the
+        same event as startup so shutdown interrupts both backoff and warmup.
+        """
+
+        self._capture_stale = True
+        self._release_active_capture()
+
+        backoff_index = min(
+            self._recovery_attempts_since_frame,
+            len(_CAPTURE_RECOVERY_BACKOFF_SECONDS) - 1,
+        )
+        delay = _CAPTURE_RECOVERY_BACKOFF_SECONDS[backoff_index]
+        next_attempt = self._recovery_attempts + 1
+        logger.warning(
+            "Camera recovery scheduled: attempt=%d backoff_seconds=%.1f "
+            "failed_reads=%d",
+            next_attempt,
+            delay,
+            self._consecutive_failed_reads,
+        )
+        if self._open_cancel.wait(timeout=delay) or not self._running.is_set():
+            logger.info("Camera recovery cancelled before reopen")
+            return False
+
+        self._recovery_attempts += 1
+        self._recovery_attempts_since_frame += 1
+        try:
+            capture, selection = open_video_capture(
+                self._config,
+                cancel_event=self._open_cancel,
+            )
+        except Exception:
+            logger.warning(
+                "Camera recovery attempt %d raised during reopen",
+                self._recovery_attempts,
+                exc_info=True,
+            )
+            return False
+
+        if not self._running.is_set() or self._open_cancel.is_set():
+            if capture is not None:
+                self._safe_release_capture(
+                    capture,
+                    context="recovered handle during shutdown",
+                )
+            return False
+
+        if capture is None or selection is None or not capture.isOpened():
+            if capture is not None:
+                self._safe_release_capture(
+                    capture,
+                    context="rejected recovery handle",
+                )
+            logger.warning(
+                "Camera recovery attempt %d could not open a verified device",
+                self._recovery_attempts,
+            )
+            return False
+
+        self._configure_capture(capture)
+        self._cap = capture
+        self._camera_selection = selection
+        self._camera_identity = selection.identity(
+            width=self._config.width,
+            height=self._config.height,
+        )
+        self._source_instance_id = uuid4()
+        self._has_successful_frame = False
+        self._consecutive_failed_reads = 0
+        self._failed_read_started_mono = None
+        self._last_failed_read_log_mono = None
+        self._recovery_pending_frame = True
+        logger.info(
+            "Camera recovery reopened verified device: attempt=%d device_id=%d "
+            "source=%s name=%s; awaiting live frame",
+            self._recovery_attempts,
+            selection.device_id,
+            selection.source,
+            selection.device_name or "unknown",
+        )
+        return True
 
     async def get_frame(self, timeout: float = 1.0) -> CapturedFrame | None:
         """
@@ -892,26 +1143,78 @@ class WebcamCapture:
             return None
 
     def _capture_loop(self) -> None:
-        """Main capture loop running in a dedicated thread."""
+        """Own the complete camera lifecycle on one dedicated thread."""
         target_interval = 1.0 / self._config.fps
         next_capture_time = monotonic_seconds(self._clock)
+        startup_succeeded = False
 
         try:
+            capture, selection = open_video_capture(
+                self._config,
+                cancel_event=self._open_cancel,
+            )
+            if self._open_cancel.is_set() or not self._running.is_set():
+                if capture is not None:
+                    self._safe_release_capture(
+                        capture,
+                        context="cancelled startup handle",
+                    )
+                raise RuntimeError("Camera startup cancelled")
+            if capture is None or selection is None or not capture.isOpened():
+                if capture is not None:
+                    self._safe_release_capture(
+                        capture,
+                        context="rejected startup handle",
+                    )
+                raise RuntimeError(
+                    "Cannot open webcam device "
+                    f"{describe_requested_camera(self._config)}"
+                )
+
+            self._cap = capture
+            self._camera_selection = selection
+            self._configure_capture(capture)
+            self._camera_identity = selection.identity(
+                width=self._config.width,
+                height=self._config.height,
+            )
+            self._source_instance_id = uuid4()
+            startup_succeeded = True
+            logger.info(
+                "WebcamCapture started",
+                extra={
+                    "requested_device_id": describe_requested_camera(self._config),
+                    "device_id": selection.device_id,
+                    "camera_source": selection.source,
+                    "camera_name": selection.device_name,
+                    "resolution": f"{self._config.width}x{self._config.height}",
+                    "target_fps": self._config.fps,
+                },
+            )
+            self._signal_startup(None)
+
             while self._running.is_set():
                 now = monotonic_seconds(self._clock)
 
                 # FPS timing: wait until next frame is due
                 sleep_time = next_capture_time - now
                 if sleep_time > 0.001:  # Only sleep if > 1ms
-                    time.sleep(sleep_time)
+                    if self._open_cancel.wait(timeout=sleep_time):
+                        break
 
                 # Read frame
                 if self._cap is None or not self._cap.isOpened():
-                    logger.error("Webcam lost")
+                    if not self._capture_stale:
+                        self._capture_stale = True
+                        logger.warning(
+                            "Camera handle is unavailable; entering recovery"
+                        )
                     self._enqueue_frame(
                         self._missing_capture(MissingReason.SOURCE_DISCONNECTED)
                     )
-                    break
+                    self._attempt_camera_recovery()
+                    next_capture_time = monotonic_seconds(self._clock) + target_interval
+                    continue
 
                 # Phase 4 fix #1: ``CapturedFrame.timestamp`` MUST be UNIX
                 # epoch seconds (``time.time()``) to match the
@@ -920,6 +1223,7 @@ class WebcamCapture:
                 # (FPS, next-capture scheduling) keeps using
                 # ``time.monotonic()`` because that clock is drift-free.
                 read_failed = False
+                read_started_mono = monotonic_seconds(self._clock)
                 try:
                     ret, frame = self._cap.read()
                 except Exception:
@@ -940,19 +1244,41 @@ class WebcamCapture:
                     # daemon's capture-health watchdog can surface a stale
                     # camera before the UI notices on its own.
                     self._consecutive_failed_reads += 1
-                    if (
+                    if self._failed_read_started_mono is None:
+                        self._failed_read_started_mono = read_started_mono
+                    failed_for = max(0.0, mono_ts - self._failed_read_started_mono)
+                    recovery_due = (
                         self._consecutive_failed_reads >= _CAPTURE_STALE_THRESHOLD
-                        and not self._capture_stale
-                    ):
+                        or failed_for >= _CAPTURE_STALE_AFTER_SECONDS
+                        or (
+                            self._recovery_pending_frame
+                            and self._consecutive_failed_reads
+                            >= _CAPTURE_POST_REOPEN_FAILURE_THRESHOLD
+                        )
+                    )
+                    if recovery_due and not self._capture_stale:
                         self._capture_stale = True
                         logger.warning(
-                            "Capture stalled: %d consecutive failed reads "
-                            "(threshold=%d); flagging capture_stale=True",
+                            "Capture stalled: failed_reads=%d failed_for_seconds=%.2f "
+                            "count_threshold=%d time_threshold_seconds=%.2f; "
+                            "flagging capture_stale=True",
                             self._consecutive_failed_reads,
+                            failed_for,
                             _CAPTURE_STALE_THRESHOLD,
+                            _CAPTURE_STALE_AFTER_SECONDS,
                         )
-                    if not read_failed:
-                        logger.warning("Failed to read frame from webcam")
+                    if not read_failed and (
+                        self._last_failed_read_log_mono is None
+                        or mono_ts - self._last_failed_read_log_mono
+                        >= _FAILED_READ_LOG_INTERVAL_SECONDS
+                    ):
+                        logger.warning(
+                            "Failed to read frame from webcam: consecutive=%d "
+                            "failed_for_seconds=%.2f",
+                            self._consecutive_failed_reads,
+                            failed_for,
+                        )
+                        self._last_failed_read_log_mono = mono_ts
                     reason = (
                         MissingReason.CAMERA_WARMUP
                         if not self._has_successful_frame
@@ -971,6 +1297,8 @@ class WebcamCapture:
                             missing_reason=reason,
                         )
                     )
+                    if recovery_due:
+                        self._attempt_camera_recovery()
                     next_capture_time = mono_ts + target_interval
                     continue
 
@@ -983,6 +1311,21 @@ class WebcamCapture:
                         )
                     self._consecutive_failed_reads = 0
                     self._capture_stale = False
+                    self._failed_read_started_mono = None
+                    self._last_failed_read_log_mono = None
+
+                if self._recovery_pending_frame:
+                    self._recovery_pending_frame = False
+                    self._recovery_successes += 1
+                    self._capture_stale = False
+                    self._failed_read_started_mono = None
+                    self._last_failed_read_log_mono = None
+                    logger.info(
+                        "Camera recovery completed: attempts=%d successes=%d",
+                        self._recovery_attempts,
+                        self._recovery_successes,
+                    )
+                self._recovery_attempts_since_frame = 0
 
                 # Create captured frame (wall-clock timestamp per schema).
                 captured = CapturedFrame(
@@ -1015,10 +1358,14 @@ class WebcamCapture:
                 if next_capture_time < mono_ts - target_interval:
                     next_capture_time = mono_ts + target_interval
 
-        except Exception:
-            logger.exception("Error in capture loop")
+        except Exception as exc:
+            if startup_succeeded:
+                logger.exception("Error in capture loop")
+            else:
+                self._signal_startup(exc)
         finally:
             self._running.clear()
+            self._release_active_capture()
             self._stopped.set()
 
     def _missing_capture(self, reason: MissingReason) -> CapturedFrame:

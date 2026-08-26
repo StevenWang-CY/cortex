@@ -230,6 +230,179 @@ class TestCaptureStaleTracking:
         assert capture.capture_stale is False
 
 
+class TestCaptureAutomaticRecovery:
+    """A validated camera may stall later; recovery must replace its handle.
+
+    Every test patches the camera-open boundary.  No physical camera or macOS
+    permission prompt is touched.
+    """
+
+    @staticmethod
+    def _selection(name: str) -> CameraSelection:
+        return CameraSelection(
+            device_id=0,
+            backend=None,
+            source="test_fixture",
+            device_name=name,
+        )
+
+    @staticmethod
+    def _opened_cap(*, succeeds: bool) -> MagicMock:
+        cap = MagicMock()
+        cap.isOpened.return_value = True
+        cap.read.return_value = (
+            (True, _synthetic_bgr_frame()) if succeeds else (False, None)
+        )
+        return cap
+
+    @pytest.mark.asyncio
+    async def test_stalled_handle_is_released_reopened_and_recovers(self) -> None:
+        stalled = self._opened_cap(succeeds=False)
+        recovered = self._opened_cap(succeeds=True)
+        first_selection = self._selection("Synthetic Camera A")
+        second_selection = self._selection("Synthetic Camera B")
+        capture = WebcamCapture(CaptureConfig(device_id=0, fps=60))
+
+        with (
+            patch(
+                "cortex.services.capture_service.webcam.open_video_capture",
+                side_effect=[
+                    (stalled, first_selection),
+                    (recovered, second_selection),
+                ],
+            ) as open_capture,
+            patch(
+                "cortex.services.capture_service.webcam._CAPTURE_STALE_THRESHOLD",
+                3,
+            ),
+            patch(
+                "cortex.services.capture_service.webcam._CAPTURE_STALE_AFTER_SECONDS",
+                60.0,
+            ),
+            patch(
+                "cortex.services.capture_service.webcam."
+                "_CAPTURE_RECOVERY_BACKOFF_SECONDS",
+                (0.0,),
+            ),
+        ):
+            await capture.start()
+            initial_source = capture.source_instance_id
+            try:
+                deadline = time.monotonic() + 2.0
+                while (
+                    time.monotonic() < deadline
+                    and capture.recovery_successes < 1
+                ):
+                    await asyncio.sleep(0.01)
+            finally:
+                await capture.stop()
+
+        assert capture.recovery_attempts == 1
+        assert capture.recovery_successes == 1
+        assert capture.capture_stale is False
+        assert capture.source_instance_id != initial_source
+        assert capture.camera_identity is not None
+        assert capture.camera_identity.device_name == "Synthetic Camera B"
+        assert open_capture.call_count == 2
+        stalled.release.assert_called_once()
+        recovered.release.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_failed_reopen_reenumerates_until_verified_camera_returns(
+        self,
+    ) -> None:
+        stalled = self._opened_cap(succeeds=False)
+        recovered = self._opened_cap(succeeds=True)
+        selection = self._selection("Synthetic Camera")
+        capture = WebcamCapture(CaptureConfig(device_id=0, fps=60))
+
+        with (
+            patch(
+                "cortex.services.capture_service.webcam.open_video_capture",
+                side_effect=[
+                    (stalled, selection),
+                    (None, None),
+                    (recovered, selection),
+                ],
+            ) as open_capture,
+            patch(
+                "cortex.services.capture_service.webcam._CAPTURE_STALE_THRESHOLD",
+                1,
+            ),
+            patch(
+                "cortex.services.capture_service.webcam._CAPTURE_STALE_AFTER_SECONDS",
+                60.0,
+            ),
+            patch(
+                "cortex.services.capture_service.webcam."
+                "_CAPTURE_RECOVERY_BACKOFF_SECONDS",
+                (0.0,),
+            ),
+        ):
+            await capture.start()
+            try:
+                deadline = time.monotonic() + 2.0
+                while (
+                    time.monotonic() < deadline
+                    and capture.recovery_successes < 1
+                ):
+                    await asyncio.sleep(0.01)
+            finally:
+                await capture.stop()
+
+        # Initial open + one failed recovery + one successful recovery.  Each
+        # call crosses the live enumeration/post-open verification boundary.
+        assert open_capture.call_count == 3
+        assert capture.recovery_attempts == 2
+        assert capture.recovery_successes == 1
+        assert capture.capture_stale is False
+
+    @pytest.mark.asyncio
+    async def test_elapsed_stall_bound_and_recovery_backoff_are_cancellable(
+        self,
+    ) -> None:
+        stalled = self._opened_cap(succeeds=False)
+        selection = self._selection("Synthetic Camera")
+        capture = WebcamCapture(CaptureConfig(device_id=0, fps=60))
+
+        with (
+            patch(
+                "cortex.services.capture_service.webcam.open_video_capture",
+                return_value=(stalled, selection),
+            ) as open_capture,
+            patch(
+                "cortex.services.capture_service.webcam._CAPTURE_STALE_THRESHOLD",
+                999,
+            ),
+            patch(
+                "cortex.services.capture_service.webcam._CAPTURE_STALE_AFTER_SECONDS",
+                0.05,
+            ),
+            patch(
+                "cortex.services.capture_service.webcam."
+                "_CAPTURE_RECOVERY_BACKOFF_SECONDS",
+                (5.0,),
+            ),
+        ):
+            await capture.start()
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline and not capture.capture_stale:
+                await asyncio.sleep(0.01)
+
+            assert capture.capture_stale is True
+            assert capture._consecutive_failed_reads < 999
+            stop_started = time.monotonic()
+            await capture.stop()
+            stop_elapsed = time.monotonic() - stop_started
+
+        assert stop_elapsed < 0.5
+        # Shutdown cancelled the five-second backoff before any physical
+        # reopen call could begin.
+        assert open_capture.call_count == 1
+        assert capture.recovery_attempts == 0
+        stalled.release.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # Fix #5 — FeatureFusion timestamp/feature assignment ordering
 # ---------------------------------------------------------------------------

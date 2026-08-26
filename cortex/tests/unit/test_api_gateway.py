@@ -290,6 +290,30 @@ class TestHealthEndpoint:
         assert "capture" in data["services"]
         assert "physio" in data["services"]
 
+    def test_health_exports_frame_confirmed_camera_recovery_counts(
+        self,
+        client: TestClient,
+    ) -> None:
+        pipeline = SimpleNamespace(
+            frames_dropped_total=4,
+            capture_stale=True,
+            camera_recovery_attempts=3,
+            camera_recovery_successes=2,
+        )
+        daemon = SimpleNamespace(
+            _duplicate_intervention_ack_count=0,
+            _store_degraded=False,
+            _capture_pipeline=pipeline,
+        )
+        registry.register("daemon", daemon)
+
+        response = client.get("/health")
+
+        assert response.status_code == 200
+        assert response.json()["capture_stale"] is True
+        assert response.json()["camera_recovery_attempts"] == 3
+        assert response.json()["camera_recovery_successes"] == 2
+
     def test_storage_health_status_export_and_confirmed_delete(
         self,
         client: TestClient,

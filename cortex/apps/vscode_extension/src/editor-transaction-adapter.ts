@@ -764,7 +764,7 @@ export class EditorTransactionAdapter {
             const existing = journal.operations[key];
             if (existing) {
                 let existingInverse: Record<string, unknown> = {};
-                let durableRecordValid = true;
+                let durableRecordValid: boolean;
                 try {
                     const parsed = JSON.parse(existing.inverse_payload_json) as unknown;
                     durableRecordValid = (
@@ -997,7 +997,7 @@ export class EditorTransactionAdapter {
         const key = operationKey(command.intervention_id, action.action_id);
         let inverse: ResumeInverse | Record<string, unknown> = {};
         let status: "succeeded" | "failed" | "already_complete" = "failed";
-        let detail = "Restore failed";
+        let detail: string;
         let fingerprint: string | null = null;
         try {
             const journal = this._readJournal();

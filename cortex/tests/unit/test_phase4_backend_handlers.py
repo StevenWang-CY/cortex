@@ -104,6 +104,61 @@ async def test_b1_capture_unavailable_reaches_in_process_desktop() -> None:
     assert payload["_seq"] == payload["sequence"] == 1
 
 
+def test_b1_fresh_missing_observation_is_not_reported_as_frames_flowing() -> None:
+    """Scheduler activity is distinct from a camera-delivered pixel frame."""
+
+    from uuid import UUID
+
+    from cortex.application.clock import FakeClock
+    from cortex.libs.schemas.features import FrameMeta
+    from cortex.libs.schemas.observations import MissingReason
+    from cortex.libs.schemas.state import SignalQuality, StateEstimate, StateScores
+    from cortex.services.api_gateway import app as app_module
+    from cortex.services.api_gateway.websocket_server import WebSocketServer
+
+    boot_id = UUID("00000000-0000-0000-0000-000000000411")
+    clock = FakeClock(
+        wall_unix_ms=1_800_000_000_000,
+        mono_ns=5_000_000_000,
+        _boot_id=boot_id,
+    )
+    missing = FrameMeta(
+        timestamp=1_800_000_000.0,
+        observed_at_unix_ms=clock.unix_ms(),
+        observed_at_mono_ns=clock.monotonic_ns(),
+        boot_id=boot_id,
+        frame_available=False,
+        missing_reason=MissingReason.SOURCE_DISCONNECTED,
+        face_detected=False,
+        face_confidence=0.0,
+        brightness_score=0.0,
+        blur_score=0.0,
+        motion_score=0.0,
+        low_quality=True,
+    )
+    estimate = StateEstimate(
+        state="UNKNOWN",
+        support_state="unknown",
+        status="insufficient_evidence",
+        confidence=0.0,
+        scores=StateScores(flow=0.0, hypo=0.0, hyper=0.0, recovery=0.0),
+        evidence_coverage=0.0,
+        signal_quality=SignalQuality(physio=0.0, kinematics=0.0, telemetry=0.0),
+        timestamp=5.0,
+        reasons=["capture_missing"],
+    )
+
+    app_module.registry.register("latest_frame_meta", missing)
+    app_module.registry.register("capture_stale", False)
+    try:
+        message = WebSocketServer(clock=clock)._make_state_update(estimate)
+    finally:
+        app_module.registry.reset()
+
+    assert message.payload["capture"]["frames_flowing"] is False
+    assert message.payload["capture"]["face_detected"] is False
+
+
 # ---------------------------------------------------------------------
 # B2 — INTERVENTION_APPLIED dedup counter
 # ---------------------------------------------------------------------
@@ -212,6 +267,8 @@ async def test_b3_pipeline_frame_drop_counter(caplog: pytest.LogCaptureFixture) 
     # Initial state: no drops.
     diag = pipeline.get_diagnostics()
     assert diag["frames_dropped_total"] == 0
+    assert diag["camera_recovery_attempts"] == 0
+    assert diag["camera_recovery_successes"] == 0
 
     with caplog.at_level(logging.WARNING, logger="cortex.services.capture_service.pipeline"):
         # Lower threshold for the test so 12 drops definitely fires.

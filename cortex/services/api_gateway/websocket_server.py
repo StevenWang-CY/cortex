@@ -3604,7 +3604,13 @@ class WebSocketServer:
                             0.0,
                             self._clock.unix_ms() / 1000.0 - fm_ts,
                         )
-                frames_flowing = age_seconds < 2.0
+                # Missing scheduled observations still carry a fresh timestamp.
+                # They are evidence that the scheduler is alive, not that the
+                # camera delivered pixels.
+                frame_available = bool(
+                    getattr(frame_meta, "frame_available", True)
+                )
+                frames_flowing = age_seconds < 2.0 and frame_available
                 face_detected = bool(
                     getattr(frame_meta, "face_detected", False)
                 )

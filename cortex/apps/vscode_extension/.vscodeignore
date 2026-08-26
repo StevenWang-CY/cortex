@@ -3,5 +3,6 @@ src/**
 out/__tests__/**
 **/*.map
 tsconfig.json
+eslint.config.mjs
 package-lock.json
 npm-debug.log

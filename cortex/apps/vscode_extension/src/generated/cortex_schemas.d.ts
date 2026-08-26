@@ -3,7 +3,7 @@
 //
 // Source of truth: cortex/libs/schemas/*.py (Pydantic v2 models).
 // Schema package: cortex-wire/2.0
-// Source SHA-256: 27c81d048a583bed79a062f355edd33e3abbbb6e1e4c3433a6ad782e6bd737fa
+// Source SHA-256: 00a40d7212d61c633207b493f22ebe4c2792a635560e79c9898772c8ed03d872
 // Drift-gate: a pre-commit hook and the GitHub Actions CI run
 //   `python -m cortex.scripts.generate_ts_schemas --check`
 // and fail if this file is out of sync with the Python models.
@@ -2235,6 +2235,14 @@ export interface FrameMeta {
    */
   boot_id?: string | null;
   /**
+   * Whether this scheduled observation contains pixels. False means the timestamp represents a missing camera read, not a live frame.
+   */
+  frame_available?: boolean;
+  /**
+   * Reason pixels were unavailable for this scheduled observation.
+   */
+  missing_reason?: MissingReason | null;
+  /**
    * Whether a face was detected
    */
   face_detected: boolean;
@@ -2292,6 +2300,9 @@ export interface HealthResponse {
   version?: string | null;
   duplicate_intervention_acks?: number;
   frames_dropped_total?: number;
+  capture_stale?: boolean;
+  camera_recovery_attempts?: number;
+  camera_recovery_successes?: number;
   store_degraded?: boolean;
   storage?: StorageHealthReport | null;
   feedback_log_read_failures?: number;

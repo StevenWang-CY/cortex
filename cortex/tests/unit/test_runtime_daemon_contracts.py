@@ -113,6 +113,27 @@ def test_store_not_degraded_for_default_inmemory(daemon) -> None:  # type: ignor
     assert daemon._store_degraded is False
 
 
+def test_dynamic_capture_health_projects_stall_and_recovery(daemon) -> None:  # type: ignore[no-untyped-def]
+    """A post-start stall must reach both registry and typed runtime status."""
+
+    daemon._services = MagicMock()
+    daemon._runtime_status = MagicMock()
+
+    daemon._capture_pipeline = SimpleNamespace(capture_stale=True)
+    daemon._synchronize_capture_health()
+    assert daemon._capture_stale is True
+    daemon._services.register.assert_called_with("capture_stale", True)
+    daemon._runtime_status.mark_capture_stale.assert_called_with(True)
+
+    daemon._services.reset_mock()
+    daemon._runtime_status.reset_mock()
+    daemon._capture_pipeline = SimpleNamespace(capture_stale=False)
+    daemon._synchronize_capture_health()
+    assert daemon._capture_stale is False
+    daemon._services.register.assert_called_with("capture_stale", False)
+    daemon._runtime_status.mark_capture_stale.assert_called_with(False)
+
+
 # ─── C5: blink_suppression forwarded with 1-frame lag ────────────────────
 
 

@@ -536,6 +536,114 @@ class TestWebcamCapture:
             mock_cap.release.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_backend_lifecycle_stays_on_one_camera_thread(self) -> None:
+        """Open, configure, read, and release must share one serial owner."""
+
+        main_thread = threading.get_ident()
+        owner_threads: list[tuple[str, int]] = []
+        frame = make_synthetic_frame()
+        mock_cap, selection = make_opened_mock_camera(frame)
+
+        def _open(_config, *, cancel_event):
+            del _config, cancel_event
+            owner_threads.append(("open", threading.get_ident()))
+            return mock_cap, selection
+
+        def _set(_property, _value):
+            owner_threads.append(("configure", threading.get_ident()))
+            return True
+
+        def _read():
+            owner_threads.append(("read", threading.get_ident()))
+            return True, frame
+
+        def _release():
+            owner_threads.append(("release", threading.get_ident()))
+
+        mock_cap.set.side_effect = _set
+        mock_cap.read.side_effect = _read
+        mock_cap.release.side_effect = _release
+
+        capture = WebcamCapture(CaptureConfig(device_id=0, fps=30))
+        with patch(
+            "cortex.services.capture_service.webcam.open_video_capture",
+            side_effect=_open,
+        ):
+            await capture.start()
+            captured = await capture.get_frame(timeout=1.0)
+            await capture.stop()
+
+        assert captured is not None
+        assert {name for name, _ in owner_threads} == {
+            "open",
+            "configure",
+            "read",
+            "release",
+        }
+        thread_ids = {thread_id for _, thread_id in owner_threads}
+        assert len(thread_ids) == 1
+        assert main_thread not in thread_ids
+
+    @pytest.mark.asyncio
+    async def test_blocked_read_shutdown_keeps_event_loop_responsive(self) -> None:
+        """Emergency release is bounded and the async loop keeps advancing."""
+
+        read_started = threading.Event()
+        release_unblocks_read = threading.Event()
+        mock_cap, selection = make_opened_mock_camera()
+
+        def _read():
+            read_started.set()
+            release_unblocks_read.wait(timeout=1.0)
+            return False, None
+
+        def _release():
+            release_unblocks_read.set()
+
+        mock_cap.read.side_effect = _read
+        mock_cap.release.side_effect = _release
+        capture = WebcamCapture(CaptureConfig(device_id=0, fps=30))
+
+        with (
+            patch(
+                "cortex.services.capture_service.webcam.open_video_capture",
+                return_value=(mock_cap, selection),
+            ),
+            patch(
+                "cortex.services.capture_service.webcam."
+                "_CAPTURE_THREAD_STOP_TIMEOUT_SECONDS",
+                0.05,
+            ),
+            patch(
+                "cortex.services.capture_service.webcam."
+                "_CAPTURE_EMERGENCY_RELEASE_GRACE_SECONDS",
+                0.2,
+            ),
+        ):
+            await capture.start()
+            assert await asyncio.to_thread(read_started.wait, 0.5)
+
+            heartbeat_count = 0
+
+            async def _heartbeat() -> None:
+                nonlocal heartbeat_count
+                deadline = time.monotonic() + 0.1
+                while time.monotonic() < deadline:
+                    heartbeat_count += 1
+                    await asyncio.sleep(0.005)
+
+            heartbeat = asyncio.create_task(_heartbeat())
+            stop_started = time.monotonic()
+            await capture.stop()
+            stop_elapsed = time.monotonic() - stop_started
+            await heartbeat
+
+        assert stop_elapsed < 0.3
+        assert heartbeat_count >= 5
+        assert not capture.is_running
+        mock_cap.release.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_default_device_prefers_builtin_macos_camera(self) -> None:
         """Default camera selection should prefer the built-in macOS camera."""
         capture = WebcamCapture(CaptureConfig(device_id=None, fps=30))
@@ -618,6 +726,129 @@ class TestWebcamCapture:
         assert selection is None
         candidates.assert_not_called()
         video_capture.assert_not_called()
+
+    def test_empty_macos_discovery_never_blind_probes_device_indices(self) -> None:
+        """An unnamed index cannot pass post-open identity verification."""
+
+        from cortex.services.capture_service import webcam as webcam_mod
+
+        with (
+            patch.object(webcam_mod, "is_macos", return_value=True),
+            patch.object(
+                webcam_mod,
+                "_macos_camera_permission_is_authorized",
+                return_value=True,
+            ),
+            patch.object(
+                webcam_mod,
+                "_list_macos_video_device_names",
+                return_value=[],
+            ),
+            patch.object(webcam_mod.cv2, "VideoCapture") as video_capture,
+        ):
+            opened, selection = webcam_mod.open_video_capture(CaptureConfig())
+
+        assert opened is None
+        assert selection is None
+        video_capture.assert_not_called()
+
+    def test_configured_continuity_camera_is_rejected_before_open(self) -> None:
+        """An explicit reorder-prone index cannot bypass phone-camera safety."""
+
+        from cortex.services.capture_service import webcam as webcam_mod
+
+        with (
+            patch.object(webcam_mod, "is_macos", return_value=True),
+            patch.object(
+                webcam_mod,
+                "_macos_camera_permission_is_authorized",
+                return_value=True,
+            ),
+            patch.object(
+                webcam_mod,
+                "_list_macos_video_device_names",
+                return_value=["Test User's iPhone Camera", "FaceTime HD Camera"],
+            ),
+            patch.object(webcam_mod.cv2, "VideoCapture") as video_capture,
+        ):
+            opened, selection = webcam_mod.open_video_capture(
+                CaptureConfig(device_id=0)
+            )
+
+        assert opened is None
+        assert selection is None
+        video_capture.assert_not_called()
+
+    def test_auto_selection_with_only_continuity_camera_never_opens_it(self) -> None:
+        """Auto-selection must not pass a phone-only device list to OpenCV."""
+
+        from cortex.services.capture_service import webcam as webcam_mod
+
+        with (
+            patch.object(webcam_mod, "is_macos", return_value=True),
+            patch.object(
+                webcam_mod,
+                "_macos_camera_permission_is_authorized",
+                return_value=True,
+            ),
+            patch.object(
+                webcam_mod,
+                "_list_macos_video_device_names",
+                return_value=["Test User's iPhone Camera"],
+            ),
+            patch.object(webcam_mod, "_llm_pick_builtin_camera", return_value=0),
+            patch.object(webcam_mod.cv2, "VideoCapture") as video_capture,
+        ):
+            opened, selection = webcam_mod.open_video_capture(CaptureConfig())
+
+        assert opened is None
+        assert selection is None
+        video_capture.assert_not_called()
+
+    def test_post_open_empty_discovery_releases_candidate_and_fails_closed(
+        self,
+    ) -> None:
+        """A cached pre-open name cannot substitute for live verification."""
+
+        from cortex.services.capture_service import webcam as webcam_mod
+
+        candidate = webcam_mod.CameraSelection(
+            device_id=0,
+            backend=None,
+            source="builtin_mac_camera",
+            device_name="FaceTime HD Camera",
+        )
+        capture = MagicMock()
+        capture.isOpened.return_value = True
+        capture.read.return_value = (
+            True,
+            np.zeros((48, 64, 3), dtype=np.uint8),
+        )
+        with (
+            patch.object(webcam_mod, "is_macos", return_value=True),
+            patch.object(
+                webcam_mod,
+                "_macos_camera_permission_is_authorized",
+                return_value=True,
+            ),
+            patch.object(
+                webcam_mod,
+                "_iter_camera_candidates",
+                return_value=iter([candidate]),
+            ),
+            patch.object(
+                webcam_mod,
+                "_list_macos_video_device_names",
+                return_value=[],
+            ),
+            patch.object(webcam_mod.cv2, "VideoCapture", return_value=capture),
+            patch.object(webcam_mod.time, "sleep"),
+        ):
+            opened, selection = webcam_mod.open_video_capture(CaptureConfig())
+
+        assert opened is None
+        assert selection is candidate
+        capture.release.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_camera_open_is_cancellable_without_blocking_event_loop(self) -> None:

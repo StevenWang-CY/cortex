@@ -4,6 +4,66 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.3.11] — 2026-08-26
+
+This patch supersedes the unpublished v0.3.10 candidate after its required
+quarantine-aware Finder install, clean shutdown, and second Finder launch
+exposed an intermittent AVFoundation stream stall. The app and control plane
+remained healthy, but the already-validated camera handle returned no further
+frames. v0.3.10 had no reopen path, so it could remain alive while sensing was
+offline.
+
+### Fixed
+
+* One dedicated camera thread now owns the complete backend lifecycle: live
+  enumeration, open, warmup, configuration, reads, recovery, and release. An
+  opened AVFoundation handle is no longer transferred between unrelated worker
+  threads after startup.
+* Sustained read failure is bounded by both count and elapsed time. This closes
+  the real case where each failed AVFoundation read blocked for roughly one
+  second and stretched a nominal 30-frame threshold to about 30 seconds.
+* A stalled handle is released and reopened through cancellable capped backoff.
+  Every attempt re-enumerates current devices and repeats post-open Continuity
+  Camera rejection; a new source-instance identity resets downstream temporal
+  buffers.
+* macOS camera discovery now fails closed when no device identity can be
+  enumerated. Cortex no longer probes anonymous indices that cannot pass the
+  mandatory identity check and could briefly wake Continuity Camera.
+* Known Continuity Camera and unnamed identities are removed before candidate
+  generation. Post-open verification no longer trusts a cached pre-open name
+  when the live AVFoundation identity cannot be resolved.
+* Reopen success is not declared when a handle merely opens. Capture remains
+  stale until the replacement source delivers a real frame, and shutdown can
+  interrupt backoff/warmup without blocking the event loop.
+* `FrameMeta.frame_available` distinguishes a fresh missing observation from a
+  fresh pixel frame. Missing scheduler events no longer make
+  `capture.frames_flowing` appear true.
+* Dynamic stale and recovered transitions now reach the service registry,
+  typed runtime status, desktop/WebSocket state, and `/health`. Health exposes
+  `capture_stale`, reopen attempts, and frame-confirmed recovery successes.
+* Failed-read logging is rate-limited while stall/recovery transitions retain
+  structured diagnostics.
+* The legacy process-global PySide6 stub suite now runs behind a subprocess
+  boundary. Real-Qt accessibility, onboarding, dashboard, overlay, and
+  settings tests are no longer dependent on collection order.
+* The VS Code extension's previously non-runnable `lint` script now has a
+  locked flat ESLint/TypeScript-ESLint configuration. Lint is enforced in both
+  pull-request CI and the tag release gate.
+
+### Verification
+
+* Camera-free regression tests prove single-thread backend ownership,
+  release/re-enumerate/reopen, retry after a failed verified-device lookup,
+  elapsed-time detection, cancellable backoff, responsive blocked-read
+  shutdown, stale-until-frame semantics, and honest state/health projection.
+* The complete Python suite passes with 2,681 tests and three documented
+  dataset/tool-availability skips; the isolated legacy Qt child suite passes
+  all 64 tests. Ruff, strict mypy (522 files), browser tests/type/builds, and VS
+  Code tests/lint/compile/package are clean.
+* No additional local Cortex launch or physical-camera access is performed
+  without explicit user permission. The final Finder/live-camera exercise
+  remains a mandatory manual publication gate.
+
 ## [v0.3.10] — 2026-08-26
 
 This patch supersedes the unpublished v0.3.9 candidate after its required
