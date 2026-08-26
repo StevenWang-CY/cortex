@@ -19,5 +19,9 @@ trap cleanup EXIT
 "${UV_RUN[@]}" python cortex/scripts/verify_python_artifact.py "${WHEEL_DIR}"/cortex-*.whl
 
 export QT_QPA_PLATFORM=offscreen
+# The parent suite includes test_desktop_shell_isolation.py, which executes all
+# 64 process-global Qt-stub tests in a dedicated child interpreter. Do not run
+# test_desktop_shell.py again here: without that wrapper's isolation flag it can
+# bind real PySide6/AppKit under the offscreen platform and crash in native
+# window decoration code.
 "${UV_RUN[@]}" pytest cortex/tests/ --ignore=cortex/tests/unit/test_desktop_shell.py
-"${UV_RUN[@]}" pytest cortex/tests/unit/test_desktop_shell.py
