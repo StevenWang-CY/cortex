@@ -73,6 +73,37 @@ async def test_b1_capture_unavailable_emits_stale_broadcast() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_b1_capture_unavailable_reaches_in_process_desktop() -> None:
+    """The packaged desktop bridge receives the same stale marker as WS.
+
+    The DMG runs ``CortexDaemon`` in-process.  A WS-only stale broadcast
+    leaves that dashboard on its benign fallback copy ("Reading your
+    pulse…") even though no camera frames can arrive.
+    """
+    from cortex.libs.config.settings import CortexConfig
+    from cortex.services.runtime_daemon import CortexDaemon
+
+    daemon = CortexDaemon(config=CortexConfig())
+    received: list[dict[str, Any]] = []
+    subscription = daemon.subscribe_state(received.append)
+    try:
+        await daemon._emit_capture_stale_broadcast()
+    finally:
+        subscription.cancel()
+
+    assert len(received) == 1
+    payload = received[0]
+    assert payload["status"] == "insufficient_evidence"
+    assert payload["capture"] == {
+        "frames_flowing": False,
+        "face_detected": False,
+        "stale": True,
+        "sequence": None,
+    }
+    assert payload["_seq"] == payload["sequence"] == 1
+
+
 # ---------------------------------------------------------------------
 # B2 — INTERVENTION_APPLIED dedup counter
 # ---------------------------------------------------------------------

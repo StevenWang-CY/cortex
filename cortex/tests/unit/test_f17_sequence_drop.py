@@ -219,18 +219,25 @@ def test_daemon_state_callback_stamps_monotonic_seq() -> None:
     recorded: list[dict] = []
     daemon.set_state_callback(recorded.append)
 
-    # Simulate the inner-loop callback invocation directly. The actual
-    # state-loop construction has many side dependencies (camera,
-    # feature-fusion, etc.); we exercise just the public contract:
-    # set_state_callback receives a dict whose ``_seq`` is monotonic.
-    for i in range(3):
-        daemon._state_callback_seq += 1
-        if daemon._state_callback is not None:
-            daemon._state_callback({
-                "_seq": daemon._state_callback_seq,
-                "state": "FLOW",
-            })
+    from cortex.libs.schemas.state import SignalQuality, StateEstimate, StateScores
+
+    estimate = StateEstimate(
+        state="FLOW",
+        confidence=0.8,
+        scores=StateScores(flow=0.8, hypo=0.0, hyper=0.0, recovery=0.0),
+        reasons=[],
+        signal_quality=SignalQuality(physio=0.8, kinematics=0.7, telemetry=0.9),
+        timestamp=1.0,
+        dwell_seconds=0.0,
+    )
+    # Exercise the production projector instead of hand-simulating its
+    # counter. This also pins local/WS shape parity for capture health.
+    daemon._runtime_status.mark_capture_stale()
+    for _ in range(3):
+        daemon._publish_state_to_local_subscribers(estimate, None)
     assert [p["_seq"] for p in recorded] == [1, 2, 3]
+    assert [p["sequence"] for p in recorded] == [1, 2, 3]
+    assert all(p["capture"]["stale"] is True for p in recorded)
 
 
 @pytest.mark.asyncio

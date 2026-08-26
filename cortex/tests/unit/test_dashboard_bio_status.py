@@ -140,3 +140,17 @@ def test_status_defaults_to_warmup_when_capture_block_missing(consumer):
     assert consumer._bio_status_label.isVisibleTo(consumer)
     text = consumer._bio_status_label.text().lower()
     assert "pulse" in text or "reading" in text
+
+
+def test_offline_health_banner_offers_settings_recovery(consumer):
+    requested: list[bool] = []
+    consumer.open_settings_requested.connect(lambda: requested.append(True))
+
+    payload = _payload(hr=None, frames_flowing=False, face_detected=False)
+    payload["capture"]["stale"] = True
+    consumer.update_state(payload)
+
+    assert consumer._health_banner.isVisibleTo(consumer)
+    assert "Open Settings" in consumer._health_banner.text()
+    consumer._health_banner.linkActivated.emit("cortex-settings")
+    assert requested == [True]

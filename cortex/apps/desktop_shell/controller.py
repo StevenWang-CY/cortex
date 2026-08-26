@@ -420,6 +420,7 @@ class CortexAppController:
         self._tray.show_dashboard_requested.connect(self._show_dashboard)
         self._tray.show_connections_requested.connect(self._show_connections)
         self._tray.show_settings_requested.connect(self._show_settings)
+        self._dashboard.open_settings_requested.connect(self._show_settings)
         self._tray.pause_requested.connect(self._toggle_pause)
         self._tray.restore_requested.connect(self._restore_workspace)
         self._tray.snooze_requested.connect(self._snooze_fifteen_minutes)

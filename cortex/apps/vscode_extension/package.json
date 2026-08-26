@@ -2,7 +2,7 @@
   "name": "cortex-somatic",
   "displayName": "Cortex — Workspace Support",
   "description": "Local workspace context and conservative, user-controlled support proposals.",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "publisher": "cortex",
   "license": "MIT",
   "repository": {

@@ -3517,13 +3517,40 @@ class WebSocketServer:
         estimate: StateEstimate,
         biometrics: dict[str, float | None] | None = None,
     ) -> WSMessage:
-        """Create a STATE_UPDATE message.
+        """Create a STATE_UPDATE message from the canonical payload builder."""
+        self._sequence += 1
+        payload_model = self.make_state_update_payload(
+            estimate,
+            biometrics,
+            sequence=self._sequence,
+        )
+        return WSMessage.from_clock(
+            clock=self._clock,
+            type=MessageType.STATE_UPDATE,
+            payload=payload_model.model_dump(mode="json"),
+            sequence=self._sequence,
+            source_client_type="daemon",
+        )
+
+    def make_state_update_payload(
+        self,
+        estimate: StateEstimate,
+        biometrics: dict[str, Any] | None = None,
+        *,
+        sequence: int | None = None,
+    ) -> StateUpdatePayload:
+        """Build the canonical state payload for every local transport.
 
         Surfaces the canonical support state, evidence status/coverage,
         deterministic scores, exclusions, and model identity. Probability
         fields remain absent unless a future registered calibrated model runs.
+
+        Both the WebSocket transport and the in-process desktop bridge use
+        this method.  Keeping capture/store health projection here prevents a
+        packaged ``--in-process`` app from silently drifting from the browser
+        wire shape (the root cause of an offline camera being rendered as
+        ``Reading your pulse…`` after a denied or missing TCC grant).
         """
-        self._sequence += 1
         # Mirror availability onto the WS envelope. ``rules`` means the
         # registered deterministic engine ran; ``fallback`` is fail-closed.
         # A rules frame can still be degraded while evidence warms or is
@@ -3669,16 +3696,9 @@ class WebSocketServer:
             capture=capture_status,
             store=store_health,
             biometrics=biometrics_model,
-            sequence=self._sequence,
+            sequence=sequence,
         )
-
-        return WSMessage.from_clock(
-            clock=self._clock,
-            type=MessageType.STATE_UPDATE,
-            payload=payload_model.model_dump(mode="json"),
-            sequence=self._sequence,
-            source_client_type="daemon",
-        )
+        return payload_model
 
     def _make_intervention_trigger(
         self,

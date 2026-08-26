@@ -614,6 +614,7 @@ class CortexApp:
         self._tray = CortexTrayIcon(self._app)
         self._tray.show_dashboard_requested.connect(self._show_dashboard)
         self._tray.show_settings_requested.connect(self._show_settings)
+        self._dashboard.open_settings_requested.connect(self._show_settings)
         # E.4: wire the Connect Extensions menu entry in WS mode too —
         # previously only the in-process CortexAppController hooked it,
         # so the menu item silently did nothing under --ws mode.
