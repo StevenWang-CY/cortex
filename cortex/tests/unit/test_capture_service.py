@@ -543,6 +543,11 @@ class TestWebcamCapture:
         with (
             patch("cortex.services.capture_service.webcam.is_macos", return_value=True),
             patch(
+                "cortex.services.capture_service.webcam."
+                "_macos_camera_permission_is_authorized",
+                return_value=True,
+            ),
+            patch(
                 "cortex.services.capture_service.webcam._list_macos_video_device_names",
                 return_value=["Logitech BRIO", "FaceTime HD Camera"],
             ),
