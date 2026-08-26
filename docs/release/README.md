@@ -63,15 +63,22 @@ runtime; Developer ID release signing does.
 
 ## Automated release path
 
+The container order follows Apple's
+[macOS distribution-packaging guidance](https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution):
+sign code and each signable nested container from the inside out, then notarize
+the outermost artifact that users receive.
+
 For each architecture, the tag workflow:
 
 1. checks tag/version, generated schemas/docs/tokens, links, config keys, and
    the full Python/browser/editor gates from committed locks;
 2. builds Chrome, Edge, VSIX, then PyInstaller `Cortex.app`;
 3. signs the app with hardened runtime and verifies the signature;
-4. creates `Cortex-<version>-macos-<arch>.dmg`;
-5. submits to Apple with `notarytool --wait`, requires `Accepted`, captures the
-   request log, staples, and validates the ticket;
+4. creates `Cortex-<version>-macos-<arch>.dmg`, signs that outer disk image
+   with the same Developer ID Application identity and a secure timestamp, and
+   verifies the DMG signature before upload;
+5. submits the signed DMG to Apple with `notarytool --wait`, requires
+   `Accepted`, captures the request log, staples, and validates the ticket;
 6. verifies DMG integrity, mounts read-only, validates bundle ID/version/minimum
    OS/single architecture/signature, scans generic credential forms only in
    text-like members, scans exact exported secrets and actual non-generic build
@@ -89,7 +96,7 @@ Run the same artifact verifier locally:
 
 ```bash
 uv run --project cortex --locked python -m cortex.scripts.verify_macos_release \
-  dist/Cortex-0.3.3-macos-arm64.dmg \
+  dist/Cortex-0.3.4-macos-arm64.dmg \
   --expected-arch arm64 \
   --require-notarized \
   --output dist/evidence-arm64/release-verification.json
@@ -103,11 +110,13 @@ the checksum file before running:
 
 ```bash
 shasum -a 256 -c SHA256SUMS-arm64
-gh attestation verify Cortex-0.3.3-macos-arm64.dmg \
+gh attestation verify Cortex-0.3.4-macos-arm64.dmg \
   --repo StevenWang-CY/cortex
-xcrun stapler validate Cortex-0.3.3-macos-arm64.dmg
+codesign --verify --strict --verbose=2 Cortex-0.3.4-macos-arm64.dmg
+codesign -dv --verbose=4 Cortex-0.3.4-macos-arm64.dmg
+xcrun stapler validate Cortex-0.3.4-macos-arm64.dmg
 spctl -a -vv --type open --context context:primary-signature \
-  Cortex-0.3.3-macos-arm64.dmg
+  Cortex-0.3.4-macos-arm64.dmg
 ```
 
 The checksum file covers the DMG, metadata, SBOMs, verifier output, and command

@@ -2044,13 +2044,15 @@ README/wiki pages, finding ledger, ADRs, model cards, and release templates
    version/architecture identity, bundle plist, single-architecture Mach-O,
    nested signing, exact exported secrets in every byte stream, complete
    high-confidence credential forms in text-like members, actual non-generic
-   build-home identifiers, frozen resources, notarization/stapling, and
-   Gatekeeper when requested. Secret scanning is streaming, fails closed on
+   build-home identifiers, frozen resources, the outer DMG's Developer ID
+   signature, notarization/stapling, and Gatekeeper when requested. Secret
+   scanning is streaming, fails closed on
    unreadable bundle members, rejects official provider fixtures and native
    parser-marker collisions, and catches patterns spanning read boundaries.
 6. Hardened the release workflow around a protected environment, temporary
-   Keychain, Developer ID hardened-runtime signing, accepted Apple notary log,
-   stapling, per-architecture names/checksums/evidence, application and Python
+   Keychain, inside-out Developer ID signing of the hardened-runtime app and
+   outer DMG, accepted Apple notary log, stapling, per-architecture
+   names/checksums/evidence, application and Python
    SBOMs, GitHub attestations, clean-tag evidence hashing, and a two-architecture
    draft-staging guard. A separately protected promotion workflow refuses an
    already-public target, verifies both provenance attestations, and publishes
@@ -2450,7 +2452,7 @@ This plan uses research to constrain claims and study design, not to imply that 
 | local durability              | [SQLite transactions](https://sqlite.org/lang_transaction.html) and [WAL guidance/current bug notice](https://sqlite.org/wal.html)                                                                                                                                                                                                            | single-writer transactional lifecycle; gate SQLite version/concurrency; do not enable unsafe WAL assumptions                                           |
 | browser lifecycle/permissions | [MV3 service-worker lifecycle](https://developer.chrome.com/docs/extensions/develop/concepts/service-workers/lifecycle), [extension privacy guidance](https://developer.chrome.com/docs/extensions/develop/security-privacy/user-privacy), [native messaging](https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging) | persist authoritative worker state, minimize/optionally request host access, and contract-test native framing                                          |
 | AI/privacy risk               | [NIST AI RMF](https://www.nist.gov/itl/ai-risk-management-framework), [NIST GenAI Profile](https://nvlpubs.nist.gov/nistpubs/ai/NIST.AI.600-1.pdf), [Anthropic retention](https://privacy.anthropic.com/en/articles/7996866-how-long-do-you-store-my-organization-s-data)                                                                     | govern context categories, disclose provider handling, test injection/redaction, retain deterministic authority                                        |
-| secure delivery               | [NIST SSDF](https://csrc.nist.gov/pubs/sp/800/218/final)                                                                                                                                                                                                                                                                                      | locked inputs, vulnerability policy, SBOM/provenance, secret and release-artifact verification                                                         |
+| secure delivery               | [NIST SSDF](https://csrc.nist.gov/pubs/sp/800/218/final), [Apple macOS distribution packaging](https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution), and [Apple notarization guidance](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)                                                                                   | locked inputs, vulnerability policy, SBOM/provenance, secret and release-artifact verification; sign nested macOS code/containers inside-out and notarize the outer DMG                                            |
 
 ---
 

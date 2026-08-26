@@ -3,7 +3,7 @@
 # Cortex macOS Build Pipeline
 #
 # Produces dist/Cortex.dmg from the project source.
-# Steps: build extensions → generate .env → icns → PyInstaller → sign → DMG
+# Steps: extensions → key-free env → PyInstaller → sign app → DMG → sign → notarize → verify
 # =============================================================================
 set -euo pipefail
 
@@ -400,6 +400,28 @@ fi
 if ! hdiutil verify "${DMG_PATH}"; then
     echo "[FATAL] hdiutil verify failed for ${DMG_PATH}" >&2
     exit 1
+fi
+
+# The DMG is the outermost distributable container. Apple requires each
+# signable nested container to be signed from the inside out, so a Developer
+# ID release must sign the finished disk image before submitting that exact
+# byte sequence for notarization. A notarization ticket alone is not a DMG
+# signature: Gatekeeper otherwise reports ``source=no usable signature``.
+if [ "${SIGN_IDENTITY}" != "-" ]; then
+    echo "→ Code signing DMG..."
+    codesign --sign "${SIGN_IDENTITY}" \
+        --timestamp \
+        --identifier "com.cortex.daemon.dmg" \
+        "${DMG_PATH}"
+    if ! codesign --verify --strict --verbose=2 "${DMG_PATH}" \
+        2>&1 | tee "${EVIDENCE_DIR}/codesign-verify-dmg.txt"; then
+        echo "[FATAL] codesign --verify failed for ${DMG_PATH}" >&2
+        exit 1
+    fi
+    codesign -dv --verbose=4 "${DMG_PATH}" \
+        2>&1 | tee "${EVIDENCE_DIR}/codesign-display-dmg.txt"
+else
+    echo "→ Skipping DMG signing (ad-hoc development build)"
 fi
 
 # ── Step 9: Notarize (if credentials available) ───────────────────────────

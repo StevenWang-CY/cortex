@@ -29,7 +29,11 @@ from cortex.scripts.validate_release_records import (
     ReleaseRecordError,
     validate_release_records,
 )
-from cortex.scripts.verify_macos_release import _default_personal_roots, _scan_forbidden
+from cortex.scripts.verify_macos_release import (
+    _default_personal_roots,
+    _notarized_container_verification_commands,
+    _scan_forbidden,
+)
 
 _ROOT = Path(__file__).resolve().parents[3]
 
@@ -83,6 +87,48 @@ def test_macos_builder_preserves_caller_selected_node_before_gui_fallbacks() -> 
     build_script = (_ROOT / "cortex/scripts/build_macos_app.sh").read_text(encoding="utf-8")
     assert 'export PATH="${PATH}:/opt/homebrew/bin:/usr/local/bin"' in build_script
     assert 'export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"' not in build_script
+
+
+def test_production_macos_builder_signs_outer_dmg_before_notarization() -> None:
+    build_script = (_ROOT / "cortex/scripts/build_macos_app.sh").read_text(encoding="utf-8")
+    integrity_check = 'if ! hdiutil verify "${DMG_PATH}"; then'
+    production_guard = 'if [ "${SIGN_IDENTITY}" != "-" ]; then'
+    dmg_signature = 'codesign --sign "${SIGN_IDENTITY}" \\'
+    secure_timestamp = '--timestamp \\'
+    stable_identifier = '--identifier "com.cortex.daemon.dmg" \\'
+    signature_check = 'codesign --verify --strict --verbose=2 "${DMG_PATH}"'
+    notary_submission = 'submit "${DMG_PATH}"'
+
+    integrity_index = build_script.index(integrity_check)
+    production_guard_index = build_script.index(production_guard, integrity_index)
+    signature_index = build_script.index(dmg_signature, production_guard_index)
+    verification_index = build_script.index(signature_check, signature_index)
+    notary_index = build_script.index(notary_submission, verification_index)
+
+    assert secure_timestamp in build_script[signature_index:verification_index]
+    assert stable_identifier in build_script[signature_index:verification_index]
+    assert integrity_index < production_guard_index < signature_index
+    assert signature_index < verification_index < notary_index
+
+
+def test_notarized_dmg_verification_requires_signature_ticket_and_gatekeeper() -> None:
+    artifact = Path(f"/tmp/Cortex-{__version__}-macos-arm64.dmg")
+
+    assert _notarized_container_verification_commands(artifact) == (
+        ["codesign", "--verify", "--strict", "--verbose=2", str(artifact)],
+        ["codesign", "-dv", "--verbose=4", str(artifact)],
+        ["xcrun", "stapler", "validate", str(artifact)],
+        [
+            "spctl",
+            "-a",
+            "-vv",
+            "--type",
+            "open",
+            "--context",
+            "context:primary-signature",
+            str(artifact),
+        ],
+    )
 
 
 def test_macos_spec_packages_only_sql_migration_resources() -> None:
