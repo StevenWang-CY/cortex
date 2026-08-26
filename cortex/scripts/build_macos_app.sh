@@ -364,38 +364,23 @@ echo "${BUILT_ARCHS}" > "${EVIDENCE_DIR}/architectures.txt"
 
 # ── Step 8: Create DMG ────────────────────────────────────────────────────
 DMG_PATH="${DIST_DIR}/Cortex-${CORTEX_VERSION}-macos-${ARTIFACT_ARCH}.dmg"
+DMG_VOLUME_NAME="Cortex ${CORTEX_VERSION}"
 echo "→ Creating DMG..."
 DMG_STAGE_DIR="$(mktemp -d /tmp/cortex_dmg_stage.XXXXXX)"
 cp -R "${APP_PATH}" "${DMG_STAGE_DIR}/Cortex.app"
+# The payload layout is owned by Cortex, not by a presentation tool. Keep one
+# canonical image builder locally and in CI so tool availability cannot change
+# either the volume contents or the code-signature preservation behavior.
+ln -s /Applications "${DMG_STAGE_DIR}/Applications"
 rm -f "${DMG_PATH}"
 
-if command -v create-dmg &>/dev/null; then
-    if ! create-dmg \
-        --volname "Cortex" \
-        --window-pos 200 120 \
-        --window-size 600 400 \
-        --icon-size 100 \
-        --icon "Cortex.app" 175 190 \
-        --app-drop-link 425 190 \
-        "${DMG_PATH}" \
-        "${DMG_STAGE_DIR}"; then
-        echo "WARNING: create-dmg failed; falling back to hdiutil" >&2
-        rm -f "${DMG_PATH}"
-        # I8: previously the hdiutil fallback's exit code was discarded,
-        # so a second failure left the DMG missing and the build appeared
-        # green until the final ``[ ! -f "${DMG_PATH}" ]`` check fired.
-        # Surface the failure at source with a single FATAL line.
-        if ! hdiutil create -volname "Cortex" -srcfolder "${DMG_STAGE_DIR}" -ov -format UDZO "${DMG_PATH}"; then
-            echo "[FATAL] DMG creation failed via both create-dmg and hdiutil" >&2
-            exit 1
-        fi
-    fi
-else
-    # Fallback to hdiutil
-    if ! hdiutil create -volname "Cortex" -srcfolder "${DMG_STAGE_DIR}" -ov -format UDZO "${DMG_PATH}"; then
-        echo "[FATAL] DMG creation failed via hdiutil (create-dmg not installed)" >&2
-        exit 1
-    fi
+# A versioned volume label prevents a prior quarantined Finder exercise from
+# reserving the next release's exact /Volumes/<label>/Cortex.app identity under
+# macOS App Management/System Policy. A changed candidate must use a changed
+# version, so the release build never reuses the failed candidate's mount path.
+if ! hdiutil create -volname "${DMG_VOLUME_NAME}" -srcfolder "${DMG_STAGE_DIR}" -ov -format UDZO "${DMG_PATH}"; then
+    echo "[FATAL] DMG creation failed via canonical hdiutil builder" >&2
+    exit 1
 fi
 
 if [ ! -f "${DMG_PATH}" ]; then

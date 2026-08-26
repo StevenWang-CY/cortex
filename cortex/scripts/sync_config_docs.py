@@ -112,7 +112,7 @@ OPERATIONAL_VARIABLES: tuple[OperationalVariable, ...] = (
         "Directory for checksums and release-verification evidence.",
     ),
     OperationalVariable(
-        "CORTEX_RELEASE_TAG", "v0.3.9", "Exact checked-out tag required by release provenance."
+        "CORTEX_RELEASE_TAG", "v0.3.10", "Exact checked-out tag required by release provenance."
     ),
     OperationalVariable(
         "CORTEX_SKIP_EXT_BUILD",

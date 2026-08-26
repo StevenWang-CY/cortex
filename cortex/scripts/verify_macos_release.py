@@ -352,6 +352,26 @@ def _mounted_app_signature_verification(app: Path) -> tuple[list[str], float]:
     )
 
 
+def _verify_installer_layout(mount: Path) -> dict[str, str]:
+    """Require the Finder-visible drag-to-Applications installation contract.
+
+    The former ``create-dmg`` path added this link as a presentation side
+    effect, while ``hdiutil`` only packaged the supplied staging directory. An
+    image containing just ``Cortex.app`` is technically mountable while
+    silently dropping the primary installation affordance users expect.
+    """
+
+    applications_link = mount / "Applications"
+    if not applications_link.is_symlink():
+        raise ReleaseVerificationError("DMG does not contain the required Applications symlink")
+    link_target = os.readlink(applications_link)
+    if link_target != "/Applications":
+        raise ReleaseVerificationError(
+            f"DMG Applications symlink targets {link_target!r}, expected '/Applications'"
+        )
+    return {"applications_link": link_target}
+
+
 def _detach_mounted_dmg(
     mount: Path,
     *,
@@ -654,6 +674,7 @@ def verify(
         executable = app / "Contents/MacOS/Cortex"
         if not plist_path.is_file() or not executable.is_file():
             raise ReleaseVerificationError("DMG does not contain a valid Cortex.app")
+        evidence["installer_layout"] = _verify_installer_layout(mount)
         with plist_path.open("rb") as handle:
             plist = plistlib.load(handle)
         required_plist = {

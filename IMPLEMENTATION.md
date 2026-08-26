@@ -3796,3 +3796,231 @@ Automated notarization and a successful local Apple Silicon Finder run cannot
 substitute for the physical Intel record, independent reviewer, or explicit
 privacy-permission interactions. Until those records exist, the truthful state
 is a verified draft candidate—not a public release.
+
+## 25. v0.3.10 deterministic DMG installation contract
+
+### 25.1 The Finder exercise falsified the automated release claim
+
+The v0.3.9 release was tagged only after PR 53, the pull-request matrix, and the
+exact merge SHA's seven-job main matrix were green. Release run `32951120795`
+then produced an ARM artifact at commit
+`b68e3c7758f4b80949efca147be92d06714cbf72`. That artifact passed:
+
+- Developer ID signing for the application and outer disk image;
+- Apple notarization with status `Accepted`, a stapled ticket, and zero notary
+  errors;
+- `hdiutil verify`, deep bundle signature verification, exact ARM architecture,
+  Gatekeeper assessment of the distributable DMG, frozen-resource inspection,
+  and isolated packaged startup/health/shutdown;
+- a complete checksum manifest, SPDX application SBOM, CycloneDX locked-Python
+  graph, SLSA provenance, and signed evidence-bundle provenance; and
+- a second local run of the canonical verifier against the downloaded workflow
+  artifact, whose SHA-256 was
+  `3c22bd4f67d33d10b036850c5a7ac02efeb5388e0d50f146ac2b873552c3d77c`.
+
+The next required step deliberately did not execute the app from a verifier
+mount. It added a quarantine attribute without changing the file digest,
+opened the exact DMG in Finder, and inspected the user-visible installer. The
+volume contained only `Cortex.app`; the expected Applications shortcut was
+absent. A technically valid image was therefore not a complete, conventional
+drag-to-install experience. The release was cancelled before its Intel job
+could finish and before the draft-staging job could run. v0.3.9 is an immutable
+failed candidate, not a release.
+
+This is why operational E2E is a separate gate from build smoke tests. A test
+that starts the executable can prove runtime viability while saying nothing
+about whether a person can correctly install that executable.
+
+### 25.2 Root cause
+
+The former build graph assigned semantic installer content to an optional
+presentation dependency:
+
+```text
+stage directory
+  └── Cortex.app
+
+create-dmg available
+  -> --app-drop-link attempts to add Applications
+
+create-dmg unavailable or fails
+  -> hdiutil packages the stage directory exactly
+  -> Cortex.app only
+```
+
+GitHub's clean macOS release runner did not have `create-dmg`. The build log
+therefore showed the direct `hdiutil` `created:` path, not the tool's normal
+mount/decorate/compress transcript. The fallback was intentionally checked for
+command failure, artifact existence, image integrity, signature, notarization,
+and packaged startup, but its input directory had no Applications link.
+
+Three design errors combined:
+
+1. **Branch-asymmetric payloads.** The primary and fallback image builders did
+   not receive the same semantic source tree.
+2. **Presentation owned structure.** A cosmetic tool option was allowed to
+   create a required installer object.
+3. **The verifier modeled the app, not the installation.** It required a valid
+   `Cortex.app` but did not encode the volume-level user contract.
+
+No runtime algorithm, state estimator, capture path, or shutdown path caused
+this defect. The earlier Dock-bounce investigation remains addressed by the
+crash-visible bootstrap, packaged state parity, and truthful hardware state;
+this newly observed failure was one layer earlier in the distribution chain.
+
+### 25.3 Corrected architecture
+
+The source tree now owns the complete installer payload before choosing a disk
+image implementation:
+
+```text
+assemble deterministic, tool-independent stage
+  ├── Cortex.app
+  └── Applications -> /Applications
+           |
+           `--> built-in hdiutil: canonical local + CI image builder
+                    volume label = Cortex <release version>
+
+mount exact output read-only
+  -> require Cortex.app contract
+  -> require Applications is a symlink
+  -> require readlink(Applications) == /Applications
+  -> continue architecture/signature/resource/startup checks
+```
+
+The first correction retained `create-dmg` as an optional view decorator. A
+fresh full-app build then exposed a second branch hazard: after the exact
+quarantined v0.3.9 image had been opened and ejected, macOS logged `System
+Policy: copy-helper deny(1) file-write-create /Volumes/Cortex/Cortex.app`.
+Both the optional builder and its alleged `hdiutil` fallback invoked the same
+mounted-path copy mechanism with the same unversioned volume label, so both
+failed identically. A fallback that repeats the failed mechanism is not fault
+containment.
+
+The release script consequently has one canonical image implementation:
+macOS's built-in `hdiutil`, which is also the implementation present on clean
+GitHub runners. The volume label is `Cortex <release version>`, preventing the
+next immutable candidate from reusing a quarantined predecessor's exact mount
+identity. A changed release candidate already requires a new version, so this
+also aligns filesystem identity with the project's immutable-tag policy. The
+presentation dependency, AppleScript/Automation side effects, and misleading
+same-mechanism fallback are gone.
+
+The artifact verifier records the accepted layout in its JSON evidence:
+
+```json
+{
+  "installer_layout": {
+    "applications_link": "/Applications"
+  }
+}
+```
+
+The check uses `is_symlink()` and `readlink()` rather than `exists()` or
+resolved-path equality. That distinction is intentional:
+
+- a real directory named `Applications` is not a drag target;
+- a broken or relative link is not accepted accidentally;
+- a link to `/System/Applications` or another writable destination is rejected;
+- the verifier does not follow the link and mistake the host's Applications
+  directory for content inside the image.
+
+### 25.4 Failure containment
+
+| Failure mode | Former result | v0.3.10 result |
+| --- | --- | --- |
+| `create-dmg` absent on a clean runner | Valid one-icon DMG passed | No optional branch exists; built-in `hdiutil` is canonical |
+| Optional builder fails | Fallback repeated its copy mechanism | Optional builder and misleading fallback are removed |
+| Prior Finder run reserves `/Volumes/Cortex/Cortex.app` | Both builders receive a System Policy denial | Versioned label gives each immutable candidate a distinct mount identity |
+| A builder drops the link | Signing/notarization/startup could still pass | Mounted artifact verification fails before evidence can be staged |
+| `Applications` is a directory | Could look superficially plausible | Exact symlink-type check fails |
+| Link targets another path | No volume-level policy | Exact `/Applications` target check fails |
+| Runtime starts directly from a mount | Mistaken for installation proof | Kept as a smoke layer; Finder copy/open remains a separate gate |
+
+This preserves the useful defense layers without conflating them:
+
+- checksum and signature answer whether bytes are intact and authentic;
+- notarization answers whether Apple scanned and ticketed the submitted nested
+  distribution;
+- frozen startup answers whether the packaged process can initialize and stop;
+- layout verification answers whether the installer has the required objects;
+- Finder E2E answers whether a user can mount, copy, eject, and launch it.
+
+Apple's current documentation recommends signing nested code inside-out while
+notarizing and stapling the outermost nested distribution. The v0.3.9 accepted
+notary log contained the exact Cortex app and executable CDHash, so the
+standalone pre-notarization `spctl-app.txt` diagnostic was not the layout
+failure. The authoritative distribution assessment is the signed, stapled DMG
+plus the real Finder path. See [Packaging Mac software for
+distribution](https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution)
+and [Customizing the notarization
+workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow).
+
+### 25.5 Regression proof
+
+The focused release-tooling suite contains 77 passing tests after this change.
+New coverage proves:
+
+- the stage copies `Cortex.app` and creates the Applications symlink before the
+  sole image builder runs;
+- the canonical builder uses a release-versioned volume label and no optional
+  `create-dmg` or `--app-drop-link` branch remains;
+- the verifier accepts exactly `Applications -> /Applications`;
+- a missing entry, real directory, or wrong symlink target fails with a bounded
+  actionable error; and
+- the exact v0.3.9 candidate is now rejected as the negative fixture with
+  `DMG does not contain the required Applications symlink`.
+
+Two real minimal disk images initially exercised both construction mechanisms
+independently of mocks. Both preserved the staged link, but the subsequent full
+app exercise proved that this was insufficient: System Policy denied the
+reused unversioned copy destination, and a `makehybrid` alternative introduced
+forbidden Finder metadata that invalidated the mounted app's strict signature.
+The selected native APFS `hdiutil -srcfolder` image with the exact versioned
+`Cortex 0.3.10` label preserved the link and the full app's strict signature.
+This negative testing is why neither the same-mechanism fallback nor the
+signature-breaking hybrid path remains in release code.
+
+The complete fresh ad-hoc ARM64 build then passed the canonical mounted-artifact
+verifier. Its local-only SHA-256 was
+`95ab7b79754a0df11fa67fff268fd7deef0f87c49a10e9f7e5cb48c66e429610`;
+the evidence reports `status: passed`, exact ARM64 architecture, version
+`0.3.10`, healthy non-degraded SQLite storage, every registered service `up`,
+successful isolated startup and shutdown, and
+`installer_layout.applications_link: /Applications`. Finder independently
+opened that same image as the versioned `Cortex 0.3.10` volume and visibly
+exposed both the Applications shortcut and Cortex app before clean ejection.
+No Cortex process, release mount, or listener on ports 9471–9473 remained.
+This is regression evidence for the construction—not the identity of the later
+Developer ID-signed release asset, which must be rebuilt and reverified from
+the exact merge SHA.
+
+### 25.6 v0.3.10 completion and publication gate
+
+v0.3.10 must be built from a fresh merge SHA and may not inherit v0.3.9's
+positive evidence. The complete path is:
+
+```text
+focused release/layout tests
+  -> complete local source/type/schema/config/extension gates
+  -> clean PR and exact-merge main CI
+  -> new immutable v0.3.10 tag
+  -> fresh ARM64 + Intel signed/notarized artifacts and attestations
+  -> exact draft asset download and digest/evidence verification
+  -> quarantine-aware Finder mount
+  -> visibly confirm both Cortex.app and Applications shortcut
+  -> drag Cortex.app onto that shortcut, eject, launch from /Applications
+  -> prove the app remains visible and healthy instead of bouncing away
+  -> verify truthful camera-offline recovery without silently granting TCC
+  -> Dashboard / History / Advanced interactions, Stop, Cmd+Q, relaunch
+  -> zero residual processes, listeners, mounts, or crash reports
+  -> permission deny/grant/revoke only with explicit user approval
+  -> physical Intel run and globally independent review
+  -> exactly two schema-valid 14-case manual evidence records
+  -> protected publication workflow
+  -> unauthenticated public browser redownload, digest match, and repeat E2E
+```
+
+Until both manual architecture records and independent review exist, even a
+fully automated, signed, notarized, locally verified v0.3.10 artifact remains a
+draft candidate. That gate is an integrity property, not release ceremony.

@@ -4,6 +4,45 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.3.10] — 2026-08-26
+
+This patch supersedes the unpublished v0.3.9 candidate after its required
+quarantine-aware Finder mount exposed an incomplete installer layout. The
+v0.3.9 ARM artifact was correctly signed, notarized, stapled, checksummed,
+attested, and capable of a healthy packaged startup, but its DMG contained only
+`Cortex.app`; GitHub's clean runner used the supported `hdiutil` path, where the
+optional `create-dmg --app-drop-link` side effect never runs. The candidate was
+cancelled before a draft or public release could be staged.
+
+### Fixed
+
+* The DMG staging directory now deterministically contains both `Cortex.app`
+  and an `Applications -> /Applications` symlink before image creation. The
+  release now uses one built-in `hdiutil` builder locally and in CI; optional
+  tool availability can no longer change the installer or its
+  signature-preservation behavior.
+* DMG volume labels now include the release version. This prevents a prior
+  quarantine-aware Finder exercise from colliding with the next candidate's
+  exact `/Volumes/.../Cortex.app` identity under macOS System Policy.
+* The canonical macOS artifact verifier now mounts the image read-only and
+  fails closed unless `Applications` is a symlink whose exact target is
+  `/Applications`. A mountable, signed, notarized one-icon DMG can no longer
+  pass release verification.
+* Release-tooling regression coverage proves builder ordering, accepts the
+  correct drag target, and rejects a missing shortcut, a directory masquerading
+  as the shortcut, and a link to the wrong destination.
+
+### Release process
+
+* The exact v0.3.9 ARM candidate now serves as a negative regression fixture:
+  the strengthened verifier rejects it with `DMG does not contain the required
+  Applications symlink`.
+* Native `hdiutil` and optional `create-dmg` construction were exercised with
+  minimal fixtures while selecting the canonical path; only the built-in
+  `hdiutil` path remains in release code. v0.3.10 must still repeat all source,
+  dual-architecture signing/notarization, evidence, Finder installation,
+  independent review, protected publication, and public-redownload gates.
+
 ## [v0.3.9] — 2026-08-26
 
 This patch supersedes the unpublished v0.3.8 candidate after its required real
