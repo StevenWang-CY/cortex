@@ -52,6 +52,7 @@ jobs:
         run: |
           uv sync --project cortex --locked --extra dev --extra codegen
           pnpm --dir cortex/apps/browser_extension install --frozen-lockfile
+          npm --prefix cortex/apps/vscode_extension ci
       - name: Tag, schema, config, docs, and version contracts
         run: |
           uv run --project cortex --locked --extra dev --extra codegen python -m cortex.scripts.sync_versions --check --tag "${RELEASE_TAG}"
@@ -59,6 +60,11 @@ jobs:
           uv run --project cortex --locked --extra dev --extra codegen python -m cortex.scripts.verify_repository_contracts
       - name: Canonical Python gate
         run: ./cortex/scripts/run_python_gate.sh
+      - name: VS Code extension lint, compile, and test
+        run: |
+          npm --prefix cortex/apps/vscode_extension run lint
+          npm --prefix cortex/apps/vscode_extension run compile
+          npm --prefix cortex/apps/vscode_extension test
 
   build-dmg:
     name: Signed notarized DMG (${{ matrix.arch }})

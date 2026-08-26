@@ -10,12 +10,20 @@ injection rule).
 from __future__ import annotations
 
 import hashlib
+import os
 import sys
 import types
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+# ``test_desktop_shell.py`` is a legacy, deliberately stubbed Qt suite. Its
+# stubs replace process-global PySide6 modules and therefore must never be
+# collected in the same interpreter as the real-Qt tests. A dedicated wrapper
+# runs it in a child process with this opt-in flag.
+if os.environ.get("CORTEX_LEGACY_QT_ISOLATED") != "1":
+    collect_ignore = ["unit/test_desktop_shell.py"]
 
 
 @pytest.fixture(autouse=True)

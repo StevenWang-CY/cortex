@@ -56,6 +56,9 @@ class HealthResponse(DualClockModel):
     version: str | None = None
     duplicate_intervention_acks: int = 0
     frames_dropped_total: int = 0
+    capture_stale: bool = False
+    camera_recovery_attempts: int = 0
+    camera_recovery_successes: int = 0
     store_degraded: bool = False
     storage: StorageHealthReport | None = None
     feedback_log_read_failures: int = 0

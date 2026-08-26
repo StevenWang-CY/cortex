@@ -4024,3 +4024,446 @@ focused release/layout tests
 Until both manual architecture records and independent review exist, even a
 fully automated, signed, notarized, locally verified v0.3.10 artifact remains a
 draft candidate. That gate is an integrity property, not release ceremony.
+
+## 26. v0.3.11 — relaunch-safe camera ownership and bounded self-recovery
+
+v0.3.11 supersedes the unpublished v0.3.10 candidate. The v0.3.10 ARM64 draft
+artifact was correctly signed, notarized, stapled, mounted, copied through the
+Finder installer surface, and launched from `/Applications`. Its desktop UI,
+HTTP server, WebSocket server, state stream, authenticated shutdown, cleanup,
+and Finder relaunch all remained alive. The required relaunch exercise then
+revealed a more subtle failure: the second process stayed healthy while its
+AVFoundation-backed OpenCV handle returned only failed reads. The UI could
+therefore remain visible while sensing had silently stopped.
+
+This finding invalidates v0.3.10 as a publishable candidate. It remains a draft
+and must not be relabelled, have its assets reused, or be represented as a
+successful release. v0.3.11 requires a new immutable tag, new artifacts, new
+digests, and new evidence from the exact merge commit.
+
+### 26.1 Incident evidence and scope
+
+The observed sequence was:
+
+1. Download the exact ARM64 v0.3.10 draft DMG and verify its digest.
+2. Apply download quarantine and confirm Gatekeeper acceptance.
+3. Mount the versioned `Cortex 0.3.10` volume in Finder.
+4. Confirm `Cortex.app` and the exact `Applications -> /Applications` link.
+5. Copy Cortex into `/Applications`, eject the DMG, and launch the installed
+   app.
+6. Confirm healthy UI/control-plane operation and live WebSocket state.
+7. Stop through the authenticated shutdown path; confirm capture, MediaPipe,
+   hooks, ports, and process are released.
+8. Relaunch the same installed app through Finder.
+9. Observe that the process, UI, HTTP API, and WebSocket API remain healthy,
+   but `VideoCapture.read()` returns `(False, None)` approximately once per
+   second.
+10. Observe that the old count-only threshold requires 30 failures and thus
+    takes roughly 30 seconds—not the intended one second—to declare capture
+    stale.
+11. Observe no release/re-enumerate/reopen transition after the stall.
+
+There was no corresponding macOS crash report. This is therefore not the
+original “Dock icon bounces and disappears” process-termination symptom. It is
+a distinct acquisition-liveness defect found only because the release test
+required stop, complete cleanup, and relaunch. Both defects are release
+blocking because either one makes the downloaded product appear nonfunctional.
+
+After the user requested that Cortex stop activating the phone camera, the app
+was stopped and ports 9472 and 9473 were confirmed closed. All v0.3.11 source
+validation described below is camera-free and patches the camera-open boundary.
+No further local app launch or physical-camera exercise is authorized by this
+document.
+
+### 26.2 Root-cause chain
+
+The defect was not one isolated bad return value. Five implementation choices
+combined into a silent, non-recovering failure:
+
+1. **Cross-thread backend ownership.** `start()` opened, warmed, and configured
+   the `cv2.VideoCapture` on an `asyncio.to_thread` worker and then transferred
+   the live handle to a different `cortex-webcam` thread for reads and release.
+   That split lifecycle is an avoidable hazard for a stateful AVFoundation
+   backend whose capture session work is expected to be serialized.
+2. **Open success was treated as permanent.** A handle that was open and
+   produced a warm-up frame was assumed to remain usable for the process
+   lifetime. Device interruption, reconnection, index reshuffling, or backend
+   invalidation after relaunch had no recovery path.
+3. **Staleness was count-only.** Thirty failed reads was intended as about one
+   second at 30 FPS. A blocking backend can take about one second to return a
+   single failure, stretching detection to about 30 seconds.
+4. **Missing observations looked fresh.** The scheduler correctly created a
+   current timestamp for every failed observation, but `frames_flowing` used
+   timestamp age alone. A fresh failure was therefore misreported as fresh
+   pixels.
+5. **Runtime state was start-biased.** The daemon projected capture availability
+   during startup but did not continuously synchronize later stale/recovered
+   transitions from the resource owner.
+
+The resulting causal chain was:
+
+```text
+validated backend handle
+  -> handle changes thread ownership
+  -> later backend interruption or invalidation
+  -> read() repeatedly returns no pixels
+  -> count-only timer reacts very late
+  -> no release/reopen transition exists
+  -> fresh missing timestamps still imply “frames flowing”
+  -> app stays alive while capture is permanently unavailable
+```
+
+OpenCV documents that `read()` returns false and an empty image when no frame
+has been grabbed, that `release()` closes the device, and that `open()` first
+releases an already-open capture. Those semantics require an application-level
+recovery policy; they do not promise automatic device recovery. See
+[OpenCV VideoCapture](https://docs.opencv.org/doc/doxygen/html/d8/dfe/classcv_1_1VideoCapture.html).
+Apple likewise models capture start/stop, interruption, and runtime error as a
+session lifecycle and recommends serialized session work. See
+[AVCaptureSession](https://developer.apple.com/documentation/avfoundation/avcapturesession).
+
+### 26.3 Required invariants
+
+The v0.3.11 design is governed by the following invariants:
+
+| ID | Invariant | Enforced by |
+|---|---|---|
+| C1 | One dedicated thread owns open, configuration, read, recovery, and normal release for a camera handle. | `WebcamCapture._capture_loop` |
+| C2 | A successful open is provisional; recovery is complete only after the replacement handle delivers a real frame. | `_recovery_pending_frame` and recovery counters |
+| C3 | Staleness is bounded by elapsed monotonic time as well as failure count. | 2-second time bound or 30 consecutive failures |
+| C4 | Recovery cannot reuse a cached AVFoundation index map. | Every attempt calls `open_video_capture()` and performs live post-open enumeration |
+| C5 | Continuity Camera is rejected before open when known and again after open using the live device list. | candidate filter plus post-open identity verification |
+| C6 | Missing scheduler observations never count as flowing pixels. | `FrameMeta.frame_available` and WebSocket state builder |
+| C7 | A new physical open is a new temporal source. | New `source_instance_id` after every reopen |
+| C8 | Shutdown cancels sleep, warm-up, and recovery backoff and never waits synchronously on the UI/event-loop thread. | shared cancellation event and `asyncio.to_thread` wait |
+| C9 | Stale/recovered state and recovery counts are externally observable. | runtime registry, runtime status, diagnostics, and `/health` |
+| C10 | Runtime capture code does not silently request TCC access. | authorization check only; onboarding/settings owns the user gesture |
+
+These are correctness properties, not best-effort logging goals. A future
+implementation may replace OpenCV with native AVFoundation, but it must retain
+the same observable guarantees.
+
+### 26.4 Architecture before and after
+
+Before v0.3.11:
+
+```text
+async event loop
+  -> asyncio.to_thread(open + warm-up + configure)
+       -> returns a live VideoCapture handle
+  -> create cortex-webcam thread
+       -> read forever
+       -> on failure: enqueue missing observation forever
+       -> release at shutdown
+```
+
+After v0.3.11:
+
+```text
+async event loop
+  -> create startup Future
+  -> create cortex-webcam thread
+       -> enumerate + open + warm-up + configure
+       -> resolve startup Future thread-safely
+       -> read
+          -> live frame: publish pixels and clear confirmed stale state
+          -> bounded failure: publish missing observation and enter recovery
+       -> release active handle
+       -> cancellable capped backoff
+       -> live re-enumeration + verified reopen + configure
+       -> assign new camera identity/source instance
+       -> require a real frame before recording recovery success
+       -> release in finally
+  -> stop: signal cancellation and wait off-loop
+       -> emergency release only if the backend remains blocked
+```
+
+The event loop owns coordination and queues. The camera thread owns the
+backend. The only normal cross-thread camera operation is the event loop asking
+the owner to stop. Emergency release is deliberately exceptional and bounded:
+it exists to break a backend call that ignores cooperative cancellation.
+
+### 26.5 Recovery state machine
+
+| State | Entry evidence | Action | Exit condition |
+|---|---|---|---|
+| `STARTING` | `start()` requested | Open and verify on `cortex-webcam`; apply requested format | Verified handle → `STREAMING`; error/cancel → `OFFLINE` |
+| `STREAMING` | At least one real frame or verified initial open | Schedule reads and publish observations | Successful read stays; bounded failure → `STALE_BACKOFF`; stop → `STOPPING` |
+| `SUSPECT` | One or more failed reads below the bound | Publish explicit missing observations; preserve scheduler time | Real frame → `STREAMING`; 30 failures or 2 seconds → `STALE_BACKOFF` |
+| `STALE_BACKOFF` | Count/time bound exceeded, or handle absent | Set stale, release handle, wait 0.5/1/2/4/8/15 seconds | Cancellation → `STOPPING`; timer → `REOPENING` |
+| `REOPENING` | Backoff completed | Re-enumerate devices and run full open/warm-up/post-open verification | No verified device → `STALE_BACKOFF`; verified handle → `VERIFYING` |
+| `VERIFYING` | Replacement handle installed | Assign new source instance; keep stale true; request frames | First real frame → `STREAMING`; 3 failures → `STALE_BACKOFF` |
+| `STOPPING` | Stop/cancel requested | Cancel waits, release active handle, signal stopped | Worker exit → `OFFLINE` |
+| `OFFLINE` | Worker exited or startup failed | No camera handle retained | New explicit start → `STARTING` |
+
+The backoff index is based on reopen attempts since the most recent real frame.
+It resets only when pixels flow again. The 15-second cap avoids hot-looping a
+missing camera while still allowing unattended recovery after reconnection.
+Every delay uses the shared cancellation event, so quit does not wait for a
+sleep interval to expire.
+
+### 26.6 Resource ownership and startup
+
+`WebcamCapture.start()` now initializes state and starts the one named camera
+thread. The thread performs enumeration, backend construction, warm-up reads,
+format configuration, acquisition, reopen, and final release. It signals
+startup completion through `loop.call_soon_threadsafe`; the live backend object
+never travels through the Future.
+
+Startup remains fail-fast to callers: no verified camera results in a
+`RuntimeError`, allowing the daemon's existing capture-degraded mode to keep
+the desktop/API usable. Cancellation during enumeration or warm-up releases
+the provisional handle before returning. The same cancellation event is passed
+through every open attempt so stop can interrupt retries.
+
+Backend format setters are advisory. A camera that rejects width, height, or
+FPS remains usable because downstream code consumes the actual frame shape.
+Setter exceptions are isolated and logged per property instead of discarding a
+working stream.
+
+### 26.7 Bounded stall detection and reopen
+
+Each read records its monotonic start time. A failure becomes recovery-eligible
+when any of the following is true:
+
+- 30 consecutive reads have failed;
+- failures have covered at least 2.0 monotonic seconds, including time blocked
+  inside `read()`; or
+- a just-reopened handle has failed three consecutive validation reads.
+
+This dual count/time policy preserves fast detection for nonblocking failures
+and a real wall-time bound for blocking failures. Failed-read logs are limited
+to one per five seconds to prevent a disconnected camera from flooding the
+diagnostic log. Missing observations continue to be queued so downstream
+windows preserve cadence and can reason about explicit absence.
+
+Recovery always performs these steps in order:
+
+1. Set `capture_stale=True`.
+2. Release and clear the active handle.
+3. Wait on the cancellation-aware capped backoff.
+4. Call `open_video_capture()` again—not a cached index or old handle.
+5. Reapply format preferences.
+6. Install the live, post-open camera selection and identity.
+7. Generate a new `source_instance_id` so temporal windows cannot bridge two
+   physical acquisition sessions.
+8. Keep capture stale until a real frame arrives.
+9. Increment `recovery_successes` only on that first confirmed frame.
+
+`recovery_attempts` therefore counts physical reopen attempts;
+`recovery_successes` counts frame-confirmed recoveries. The difference is an
+operator-visible signal of reopen failures or replacement handles that never
+delivered pixels.
+
+### 26.8 Camera identity and Continuity Camera safety
+
+AVFoundation discovery is dynamic: a phone waking, sleeping, connecting, or
+disconnecting can change the device list and indices. Apple exposes discovery
+as a current session rather than a permanent index registry; see
+[AVCaptureDevice.DiscoverySession](https://developer.apple.com/documentation/avfoundation/avcapturedevice/discoverysession).
+Accordingly, recovery reuses the established safety boundary:
+
+- known iPhone, iPad, and Continuity candidates are not opened;
+- fallback probes exclude indices currently identified as Continuity Camera;
+- an empty discovery list fails closed without opening anonymous indices;
+- an explicitly configured index is still rejected before open when its live
+  identity is a Continuity Camera;
+- after a candidate returns a frame, the live AVFoundation list is queried
+  again;
+- a device now identified as Continuity Camera is immediately released and
+  rejected;
+- on macOS, an identity that cannot be verified after open is rejected; and
+- camera identity hashes use the verified name/source/format rather than a
+  reorder-prone numeric index.
+
+The runtime authorization check does not trigger a permission prompt. If TCC
+is not determined, denied, or restricted, capture remains offline while the
+rest of Cortex starts. Only the user-facing onboarding/settings action may ask
+macOS for authority.
+
+### 26.9 Truthful frame and transport semantics
+
+The old transport could not distinguish these two observations:
+
+```text
+real camera frame, but no face detected
+scheduled camera read, but no pixels arrived
+```
+
+Both had `face_detected=false` and a fresh timestamp. `FrameMeta` now adds:
+
+- `frame_available: bool` — true only when pixels were delivered; and
+- `missing_reason: MissingReason | null` — the canonical absence reason.
+
+The model rejects impossible combinations:
+
+- `frame_available=false` without a missing reason;
+- `frame_available=true` with a missing reason; and
+- `frame_available=false` with `face_detected=true`.
+
+A real no-face frame remains `frame_available=true`. A dropped, warm-up, or
+disconnected observation is `frame_available=false` with its exact reason.
+The WebSocket state builder now reports `frames_flowing=true` only when the
+latest observation is under two seconds old **and** contains pixels. Scheduler
+liveness can no longer masquerade as camera liveness.
+
+The generated TypeScript declarations for the browser and VS Code extensions
+are regenerated from this Pydantic source of truth. No hand-written transport
+type is introduced.
+
+### 26.10 Runtime and health observability
+
+The pipeline exposes live pass-through properties for:
+
+- `capture_stale`;
+- `camera_recovery_attempts`; and
+- `camera_recovery_successes`.
+
+Its diagnostic snapshot includes both recovery counters. The daemon compares
+pipeline stale state on every processed output and projects only transitions
+to the service registry and typed runtime status. This handles both directions:
+a post-start stall becomes visible and the first live frame after reopen clears
+the state.
+
+`GET /health` includes the same three fields. The endpoint reads the pipeline's
+live state when available rather than relying only on a potentially older
+daemon snapshot. Operators can therefore distinguish:
+
+| Health shape | Meaning |
+|---|---|
+| `capture_stale=false`, attempts `0` | No confirmed stall since start |
+| `capture_stale=true`, attempts `0` | Stall detected; first backoff not yet completed |
+| `capture_stale=true`, attempts greater than successes | Recovery is retrying or a reopened handle has not produced pixels |
+| `capture_stale=false`, attempts greater than `0`, attempts equal or greater than successes | At least one recovery was frame-confirmed; earlier attempts may have failed |
+
+These metrics contain no image data, device frames, or biometric values.
+
+### 26.11 Responsive and idempotent shutdown
+
+Stop sets both cooperative signals immediately. Waiting for the camera thread
+is moved to `asyncio.to_thread`, so a blocking backend cannot freeze Qt, HTTP,
+or WebSocket shutdown. The normal worker has two seconds to observe the signal,
+cancel any backoff/warm-up wait, and release in `finally`.
+
+If the backend remains blocked, stop clears and releases the active handle as a
+bounded emergency action, then gives the worker another 0.5 seconds. Final
+cleanup calls release again through an idempotent clear-first helper; only the
+first caller sees a handle. Exceptions from `release()` are logged as warnings
+because a leaked camera handle affects the next app launch.
+
+This design preserves the project-wide shutdown chain while ensuring the new
+recovery loop cannot make Stop or Cmd+Q wait for a 15-second backoff.
+
+### 26.12 Camera-free regression proof
+
+The focused v0.3.11 capture/runtime suite has 182 passing tests. Every
+camera-open boundary is patched; these tests do not access a physical camera,
+request TCC, or launch Cortex. New coverage proves:
+
+- open, format configuration, read, and normal release run on one non-main
+  `cortex-webcam` thread;
+- a blocked read does not block the asyncio event loop during stop;
+- emergency release unblocks the synthetic backend within the configured
+  shutdown bound;
+- a stalled handle is released, reopened, and declared recovered only after a
+  replacement frame arrives;
+- a failed reopen is followed by another full open boundary, representing live
+  re-enumeration and post-open verification;
+- elapsed time can declare a stall before the count threshold;
+- a five-second recovery backoff is cancelled immediately by stop;
+- empty macOS discovery performs zero blind `VideoCapture` probes;
+- an explicitly configured Continuity Camera index is rejected before open;
+- a phone-only automatic device list performs zero `VideoCapture` opens;
+- a candidate is released when its live post-open identity cannot be resolved,
+  even if a cached pre-open name was available;
+- source instance and camera identity change after replacement;
+- actual no-face frames remain available while synthetic missing observations
+  do not;
+- incoherent frame-availability combinations are schema errors;
+- a fresh missing observation does not produce `frames_flowing=true`;
+- stale and recovered transitions reach the runtime registry/status; and
+- `/health` reports live stale state plus frame-confirmed recovery counts.
+
+The complete parent Python suite has 2,681 passing tests and three documented
+dataset/tool-availability skips. A legacy 64-test desktop-shell module formerly
+installed fake `PySide6` modules during collection, contaminating subsequent
+real-Qt tests and making the result depend on file order. It now runs in a
+dedicated child process; the parent suite never imports its global stubs, and
+all 64 child tests pass. The real-Qt accessibility, onboarding, dashboard,
+overlay, and settings cluster passes 94/94 in the uncontaminated parent
+process.
+
+Strict Ruff passes across the repository and strict mypy passes across 522
+source files when invoked with the canonical `cortex/pyproject.toml`. Browser
+verification passes 54 suites / 248 tests, TypeScript, and Chrome/Edge MV3
+builds. VS Code verification passes seven suites / 30 tests, TypeScript
+compilation, locked VSIX packaging, and a new reproducible ESLint gate.
+
+The VS Code package had declared `npm run lint` without installing ESLint or
+providing configuration, so clean-checkout lint failed before inspecting any
+source. v0.3.11 adopts the current official flat configuration with locked
+`eslint`, `@eslint/js`, and `typescript-eslint` development dependencies. It
+ignores generated schema declarations and build output, accepts intentionally
+underscore-prefixed unused callback arguments, and found two real redundant
+assignments in the durable editor transaction adapter. Both were removed.
+Pull-request CI and the tag release gate now execute lint before compile/test;
+the development config is excluded from the shipped VSIX.
+
+### 26.13 Better long-term architecture options
+
+The v0.3.11 design is the smallest safe correction within the existing OpenCV
+architecture. Research identifies four follow-on improvements with real value:
+
+1. **Native AVFoundation capture adapter.** A small Objective-C/Swift or PyObjC
+   adapter could subscribe directly to interruption and runtime-error
+   notifications, own an explicit serial session queue, select devices by
+   stable unique ID, and deliver frames without probing numeric OpenCV indices.
+   This removes heuristic failure detection but is a material backend rewrite
+   requiring its own performance, signing, TCC, and Intel/ARM validation.
+2. **Dynamic device-change observer.** Discovery-session updates could trigger
+   recovery immediately when the current device disconnects and could refresh
+   candidate identities before the next open. The existing live re-enumeration
+   remains necessary as a race-safe final check.
+3. **First-class acquisition health schema.** A versioned `CaptureHealth`
+   object could combine state, last-live-frame time, failure duration, current
+   backoff, selected non-sensitive device class, and recovery counters. This
+   would replace several scalar fields once browser/desktop consumers need a
+   richer diagnostic surface.
+4. **Deterministic backend fault harness.** A fake VideoCapture backend that can
+   block, throw, reorder devices, disappear, return empty frames, and recover
+   on a scripted clock would expand property/state-machine coverage without
+   touching TCC or a physical camera.
+
+The native adapter has the highest eventual reliability ceiling, but it should
+not be rushed into this patch: replacing the capture backend and repairing its
+lifecycle simultaneously would make regression evidence less attributable.
+The current single-owner recovery boundary is intentionally compatible with a
+future adapter.
+
+### 26.14 Release and publication gate
+
+The safe v0.3.11 path is:
+
+```text
+camera-free focused tests
+  -> complete source, schema, config, type, UI, extension, and release-tool gates
+  -> reviewed PR and exact-merge main CI
+  -> new immutable v0.3.11 tag
+  -> fresh signed/notarized ARM64 and Intel artifacts on clean headless runners
+  -> verify attestations, digests, signatures, notarization, staple, architecture
+  -> download and inspect the exact draft DMGs without launching locally
+  -> STOP: no local live launch/camera test without explicit user authorization
+  -> authorized physical ARM and Intel install/launch/relaunch/cleanup tests
+  -> independent reviewer and two complete schema-valid manual evidence records
+  -> protected publication workflow
+  -> unauthenticated public redownload and authorized repeat verification
+```
+
+Remote headless packaging can prove build provenance, bundle structure,
+architecture, signing, notarization, stapling, and camera-free startup. It
+cannot prove TCC prompts, a real built-in camera, phone-camera avoidance, Finder
+interaction, repeated live-frame recovery, or cleanup on physical ARM and Intel
+Macs. Those cases remain mandatory before publication, but the current user
+instruction prohibits running them locally. The correct state is therefore a
+verified draft—not a public release—until explicit authorization and the
+independent physical evidence exist.

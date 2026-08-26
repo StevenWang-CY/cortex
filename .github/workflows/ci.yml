@@ -236,9 +236,10 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
           cache-dependency-path: cortex/apps/vscode_extension/package-lock.json
-      - name: Frozen install, compile, and test
+      - name: Frozen install, lint, compile, and test
         run: |
           npm ci
+          npm run lint
           npm run compile
           npm test
       - name: Package locked VSIX

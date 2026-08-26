@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from cortex.application.clock import FakeClock
 from cortex.libs.config.settings import CaptureConfig, get_config
+from cortex.libs.schemas.features import FrameMeta
 from cortex.libs.schemas.observations import (
     CameraIdentity,
     CameraObservationEnvelope,
@@ -323,6 +324,7 @@ def test_pipeline_emits_missing_no_face_low_light_and_intentional_skip() -> None
     pipeline._face_tracker.process_frame = MagicMock(return_value=no_face)  # type: ignore[method-assign]
     no_face_output = pipeline._process_frame(captured)
     assert no_face_output.observation.missing_reason == MissingReason.NO_FACE.value
+    assert no_face_output.frame_meta.frame_available is True
 
     tracked = FaceTrackingResult(
         face_detected=True,
@@ -345,6 +347,38 @@ def test_pipeline_emits_missing_no_face_low_light_and_intentional_skip() -> None
         reason=MissingReason.FRAME_DROPPED,
     )
     assert skipped.observation.missing_reason == MissingReason.FRAME_DROPPED.value
+    assert skipped.frame_meta.frame_available is False
+    assert skipped.frame_meta.missing_reason == MissingReason.FRAME_DROPPED
+
+
+def test_frame_meta_rejects_incoherent_frame_availability() -> None:
+    """Pixel availability, missing reason, and face state form one invariant."""
+
+    common = {
+        "timestamp": 1_800_000_000.0,
+        "face_detected": False,
+        "face_confidence": 0.0,
+        "brightness_score": 0.0,
+        "blur_score": 0.0,
+        "motion_score": 0.0,
+    }
+
+    with pytest.raises(ValueError, match="missing frames require a missing_reason"):
+        FrameMeta(frame_available=False, **common)
+
+    with pytest.raises(ValueError, match="available frames cannot carry"):
+        FrameMeta(
+            frame_available=True,
+            missing_reason=MissingReason.SOURCE_DISCONNECTED,
+            **common,
+        )
+
+    with pytest.raises(ValueError, match="cannot report a detected face"):
+        FrameMeta(
+            frame_available=False,
+            missing_reason=MissingReason.SOURCE_DISCONNECTED,
+            **{**common, "face_detected": True},
+        )
 
 
 @pytest.mark.asyncio
@@ -408,7 +442,7 @@ def test_post_open_continuity_wake_is_rejected_and_live_name_is_exposed() -> Non
         ),
         patch(
             "cortex.services.capture_service.webcam._list_macos_video_device_names",
-            return_value=["Chuyue's iPhone Camera", "FaceTime HD Camera"],
+            return_value=["Test User's iPhone Camera", "FaceTime HD Camera"],
         ),
         patch(
             "cortex.services.capture_service.webcam.cv2.VideoCapture",

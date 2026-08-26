@@ -10,6 +10,7 @@ the actual Qt framework to be installed.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import types
 
@@ -243,6 +244,7 @@ def _setup_pyside6_mocks() -> bool:
             self._enabled = True
         def setEnabled(self, e): self._enabled = e
         def setText(self, t): self._text = t
+        def text(self): return self._text
         def setShortcut(self, *_args): pass
 
     qtgui.QColor = MockQColor
@@ -634,13 +636,33 @@ def _setup_pyside6_mocks() -> bool:
     return True
 
 
-# Install mocks before importing desktop shell modules
-_mocked = _setup_pyside6_mocks()
+# Prefer the real Qt dependency when it is installed. Installing process-global
+# fake ``PySide6`` modules during pytest collection contaminated every real-Qt
+# test collected after this file and made the complete suite order-dependent.
+# The legacy stubs remain only as a fallback for minimal environments.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+if os.environ.get("CORTEX_LEGACY_QT_ISOLATED") == "1":
+    _mocked = _setup_pyside6_mocks()
+    _real_qt_app = None
 
-# Now remove any cached desktop_shell imports so they pick up our mocks
-_to_remove = [k for k in sys.modules if "desktop_shell" in k and k != __name__]
-for k in _to_remove:
-    del sys.modules[k]
+    # The subprocess owns these module bindings, so rebinding production
+    # imports cannot affect any real-Qt test.
+    _to_remove = [k for k in sys.modules if "desktop_shell" in k and k != __name__]
+    for k in _to_remove:
+        del sys.modules[k]
+else:
+    try:
+        import PySide6  # noqa: F401
+    except ImportError:  # pragma: no cover - minimal direct invocation only
+        _mocked = _setup_pyside6_mocks()
+        _real_qt_app = None
+    else:
+        _mocked = False
+        from PySide6.QtWidgets import QApplication as _RealQApplication
+
+        # Direct invocation remains useful for debugging, but the normal suite
+        # never collects this branch (see tests/conftest.py).
+        _real_qt_app = _RealQApplication.instance() or _RealQApplication([])
 
 from cortex.apps.desktop_shell.main import CortexApp, WebSocketBridge
 from cortex.apps.desktop_shell.overlay import (
@@ -670,6 +692,12 @@ from cortex.apps.desktop_shell.dashboard import (
 
 class TestTrayIcon:
 
+    @staticmethod
+    def _application():
+        from PySide6.QtWidgets import QApplication
+
+        return QApplication() if _mocked else _real_qt_app
+
     def test_state_colors_defined(self):
         assert "FLOW" in STATE_COLORS
         assert "HYPER" in STATE_COLORS
@@ -682,8 +710,7 @@ class TestTrayIcon:
         assert icon is not None
 
     def test_tray_init(self):
-        from PySide6.QtWidgets import QApplication
-        app = QApplication()
+        app = self._application()
         tray = CortexTrayIcon(app)
         assert tray._state == "UNKNOWN"
         assert tray._confidence == 0.0
@@ -691,34 +718,30 @@ class TestTrayIcon:
         assert not tray._paused
 
     def test_update_state(self):
-        from PySide6.QtWidgets import QApplication
-        tray = CortexTrayIcon(QApplication())
+        tray = CortexTrayIcon(self._application())
         tray.update_state("HYPER", 0.92)
         assert tray._state == "HYPER"
         assert tray._confidence == 0.92
 
     def test_set_connected(self):
-        from PySide6.QtWidgets import QApplication
-        tray = CortexTrayIcon(QApplication())
+        tray = CortexTrayIcon(self._application())
         tray.set_connected(True)
         assert tray._connected
 
     def test_starting_state_is_not_connected(self):
-        from PySide6.QtWidgets import QApplication
-        tray = CortexTrayIcon(QApplication())
+        tray = CortexTrayIcon(self._application())
         tray.set_starting()
         assert not tray._connected
-        assert tray._state_action._text == "State: Starting…"
+        assert tray._state_action.text() == "State: Starting…"
 
     def test_set_paused(self):
-        from PySide6.QtWidgets import QApplication
-        tray = CortexTrayIcon(QApplication())
+        tray = CortexTrayIcon(self._application())
         tray.set_paused(True)
         assert tray._paused
-        assert tray._pause_action._text == "Resume"
+        assert tray._pause_action.text() == "Resume"
         tray.set_paused(False)
         assert not tray._paused
-        assert tray._pause_action._text == "Pause"
+        assert tray._pause_action.text() == "Pause"
 
 
 # ===========================================================================
@@ -946,22 +969,22 @@ class TestSettings:
     def test_sensitivity_to_threshold(self):
         settings = SettingsDialog()
 
-        settings._sensitivity_slider._value = 1
+        settings._sensitivity_slider.setValue(1)
         assert settings.get_settings()["entry_threshold"] == pytest.approx(0.95, abs=0.01)
 
-        settings._sensitivity_slider._value = 5
+        settings._sensitivity_slider.setValue(5)
         assert settings.get_settings()["entry_threshold"] == pytest.approx(0.75, abs=0.01)
 
     def test_llm_mode_mapping(self):
         # v0.2.1: combo box order is bedrock / vertex / direct / rule_based.
         settings = SettingsDialog()
-        settings._llm_backend._index = 0
+        settings._llm_backend.setCurrentIndex(0)
         assert settings.get_settings()["llm_mode"] == "bedrock"
-        settings._llm_backend._index = 1
+        settings._llm_backend.setCurrentIndex(1)
         assert settings.get_settings()["llm_mode"] == "vertex"
-        settings._llm_backend._index = 2
+        settings._llm_backend.setCurrentIndex(2)
         assert settings.get_settings()["llm_mode"] == "direct"
-        settings._llm_backend._index = 3
+        settings._llm_backend.setCurrentIndex(3)
         assert settings.get_settings()["llm_mode"] == "rule_based"
 
     def test_apply_emits_signal(self):

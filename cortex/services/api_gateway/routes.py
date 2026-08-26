@@ -429,15 +429,26 @@ async def health_check(request: Request) -> HealthResponse:
     # daemon (unit tests of the routes themselves).
     duplicate_acks = 0
     frames_dropped_total = 0
+    capture_stale = False
+    camera_recovery_attempts = 0
+    camera_recovery_successes = 0
     store_degraded = False
     storage_report: StorageHealthReport | None = None
     daemon = reg.get("daemon") if hasattr(reg, "get") else None
     if daemon is not None:
         duplicate_acks = int(getattr(daemon, "_duplicate_intervention_ack_count", 0) or 0)
         store_degraded = bool(getattr(daemon, "_store_degraded", False))
+        capture_stale = bool(getattr(daemon, "_capture_stale", False))
         pipeline = getattr(daemon, "_capture_pipeline", None)
         if pipeline is not None:
             frames_dropped_total = int(getattr(pipeline, "frames_dropped_total", 0) or 0)
+            capture_stale = bool(getattr(pipeline, "capture_stale", capture_stale))
+            camera_recovery_attempts = int(
+                getattr(pipeline, "camera_recovery_attempts", 0) or 0
+            )
+            camera_recovery_successes = int(
+                getattr(pipeline, "camera_recovery_successes", 0) or 0
+            )
     storage_maintenance = reg.get("storage_maintenance") if hasattr(reg, "get") else None
     if storage_maintenance is not None and hasattr(storage_maintenance, "health"):
         try:
@@ -463,6 +474,9 @@ async def health_check(request: Request) -> HealthResponse:
         version=_resolve_daemon_version(),
         duplicate_intervention_acks=duplicate_acks,
         frames_dropped_total=frames_dropped_total,
+        capture_stale=capture_stale,
+        camera_recovery_attempts=camera_recovery_attempts,
+        camera_recovery_successes=camera_recovery_successes,
         store_degraded=store_degraded,
         storage=storage_report,
         feedback_log_read_failures=int(_feedback_log_read_failures),

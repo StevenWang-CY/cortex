@@ -3281,7 +3281,27 @@ class CortexDaemon:
             timestamp=mono_seconds,
         )
 
+    def _synchronize_capture_health(self) -> None:
+        """Project live acquisition health into daemon and transport state."""
+
+        # Dynamic acquisition health must follow the camera owner, not merely
+        # pipeline startup. A backend can validate one frame and stall later;
+        # conversely, automatic reopen clears stale only after a new frame.
+        capture_stale = bool(
+            getattr(self._capture_pipeline, "capture_stale", False)
+        )
+        if capture_stale != self._capture_stale:
+            self._capture_stale = capture_stale
+            self._services.register("capture_stale", capture_stale)
+            self._runtime_status.mark_capture_stale(capture_stale)
+            if capture_stale:
+                logger.warning("Capture health transitioned to stale")
+            else:
+                logger.info("Capture health recovered after live frame")
+
     async def _process_capture_output(self, output: PipelineOutput) -> None:
+        self._synchronize_capture_health()
+
         self._services.register("latest_frame_meta", output.frame_meta)
         self._runtime_status.publish_frame(output.frame_meta)
         observation = self._observation_from_output(output)

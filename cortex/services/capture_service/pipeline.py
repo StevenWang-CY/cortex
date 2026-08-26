@@ -260,6 +260,24 @@ class CapturePipeline:
         return int(getattr(self._webcam, "frames_dropped", 0) or 0)
 
     @property
+    def camera_recovery_attempts(self) -> int:
+        """Physical camera reopen attempts made by the acquisition owner."""
+
+        return int(getattr(self._webcam, "recovery_attempts", 0) or 0)
+
+    @property
+    def camera_recovery_successes(self) -> int:
+        """Reopens confirmed by a subsequently delivered live frame."""
+
+        return int(getattr(self._webcam, "recovery_successes", 0) or 0)
+
+    @property
+    def capture_stale(self) -> bool:
+        """Live acquisition-stall state from the camera resource owner."""
+
+        return bool(getattr(self._webcam, "capture_stale", False))
+
+    @property
     def observations(self) -> tuple[CameraObservationEnvelope, ...]:
         """Bounded acquisition-order observation snapshot for diagnostics/replay."""
 
@@ -284,6 +302,8 @@ class CapturePipeline:
             "frames_skipped": self._frame_skipper.total_skipped,
             "frames_dropped_total": self._frames_dropped_total,
             "frames_dropped_input": self.frames_dropped_input,
+            "camera_recovery_attempts": self.camera_recovery_attempts,
+            "camera_recovery_successes": self.camera_recovery_successes,
             "observations_buffered": len(self._observation_buffer),
             "observations_missing": self._observations_missing,
             "observations_rejected": self._observations_rejected,
@@ -564,6 +584,8 @@ class CapturePipeline:
             observed_at_unix_ms=event[0],
             observed_at_mono_ns=event[1],
             boot_id=event[2],
+            frame_available=True,
+            missing_reason=None,
             face_detected=tracking.face_detected,
             face_confidence=tracking.confidence,
             brightness_score=quality.brightness_score,
@@ -708,6 +730,8 @@ class CapturePipeline:
             observed_at_unix_ms=event[0],
             observed_at_mono_ns=event[1],
             boot_id=event[2],
+            frame_available=False,
+            missing_reason=reason,
             face_detected=False,
             face_confidence=0.0,
             brightness_score=0.0,

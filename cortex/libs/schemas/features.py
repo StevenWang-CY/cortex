@@ -95,6 +95,17 @@ class FrameMeta(BaseModel):
         None,
         description="Producer boot ID; required when observed_at_mono_ns is present.",
     )
+    frame_available: bool = Field(
+        True,
+        description=(
+            "Whether this scheduled observation contains pixels. False means "
+            "the timestamp represents a missing camera read, not a live frame."
+        ),
+    )
+    missing_reason: MissingReason | None = Field(
+        None,
+        description="Reason pixels were unavailable for this scheduled observation.",
+    )
     face_detected: bool = Field(..., description="Whether a face was detected")
     face_confidence: float = Field(
         ..., ge=0.0, le=1.0, description="Face detection confidence score"
@@ -131,6 +142,20 @@ class FrameMeta(BaseModel):
                 "observed_at_unix_ms, observed_at_mono_ns, and boot_id "
                 "must be supplied together"
             )
+        if self.frame_available:
+            if self.missing_reason is not None:
+                raise ValueError(
+                    "available frames cannot carry a missing_reason"
+                )
+        else:
+            if self.missing_reason is None:
+                raise ValueError(
+                    "missing frames require a missing_reason"
+                )
+            if self.face_detected:
+                raise ValueError(
+                    "missing frames cannot report a detected face"
+                )
         return self
 
 
