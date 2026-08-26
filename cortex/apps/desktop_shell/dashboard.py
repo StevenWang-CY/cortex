@@ -650,6 +650,10 @@ class _ConsumerTab(QWidget):
     # forwards INTERVENTION_RESTORE to the daemon. Payload is the
     # intervention_id of the action being undone.
     undo_action_requested = Signal(str)
+    # Contextual recovery: an offline-camera banner must provide an obvious
+    # path back to Cortex Settings instead of relying on discovery of the
+    # menu-bar item.
+    open_settings_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1006,6 +1010,18 @@ class _ConsumerTab(QWidget):
             f"  border-radius: 6px;"
             f"  padding: 6px 10px;"
             "}"
+        )
+        self._health_banner.setOpenExternalLinks(False)
+        self._health_banner.setTextInteractionFlags(
+            Qt.TextInteractionFlag.LinksAccessibleByMouse
+            | Qt.TextInteractionFlag.LinksAccessibleByKeyboard
+        )
+        self._health_banner.linkActivated.connect(
+            lambda href: (
+                self.open_settings_requested.emit()
+                if href == "cortex-settings"
+                else None
+            )
         )
         self._health_banner.setVisible(False)
         _set_accessible_name(self._health_banner, "Health warning")
@@ -2122,7 +2138,14 @@ class _ConsumerTab(QWidget):
         # degraded SQLite store.
         try:
             if view.health_message is not None:
-                self._set_text_if_changed(self._health_banner, view.health_message)
+                health_text = view.health_message
+                if health_text.startswith("Camera offline"):
+                    health_text = (
+                        f"{health_text} · "
+                        f'<a style="color: {_DANGER};" '
+                        'href="cortex-settings">Open Settings</a>'
+                    )
+                self._set_text_if_changed(self._health_banner, health_text)
                 self._health_banner.setVisible(True)
             else:
                 self._health_banner.setVisible(False)
@@ -3036,6 +3059,7 @@ class DashboardWindow(QWidget):
     # P0 §3.21 global shortcuts re-emit.
     force_recap_requested = Signal()
     dismiss_overlay_requested = Signal()
+    open_settings_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -3148,6 +3172,10 @@ class DashboardWindow(QWidget):
         if hasattr(self._consumer, "dismiss_overlay_requested"):
             self._consumer.dismiss_overlay_requested.connect(
                 self.dismiss_overlay_requested.emit,
+            )
+        if hasattr(self._consumer, "open_settings_requested"):
+            self._consumer.open_settings_requested.connect(
+                self.open_settings_requested.emit,
             )
 
         # P0 §3.1 + §3.2: forward history-tab outgoing signals so the

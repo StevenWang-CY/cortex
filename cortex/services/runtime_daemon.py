@@ -113,7 +113,7 @@ from cortex.libs.schemas.session_history import (
     SessionListResponse,
     TrendsResponse,
 )
-from cortex.libs.schemas.state import UserBaselines
+from cortex.libs.schemas.state import StateEstimate, UserBaselines
 from cortex.libs.schemas.temporal import EventTime
 from cortex.libs.schemas.ws_message_types import MessageType
 
@@ -1587,6 +1587,32 @@ class CortexDaemon:
     ) -> Subscription:
         return self._events.state.subscribe(listener)
 
+    def _publish_state_to_local_subscribers(
+        self,
+        estimate: StateEstimate,
+        biometrics: dict[str, Any] | None,
+    ) -> int:
+        """Publish one canonical STATE_UPDATE to in-process consumers.
+
+        The desktop DMG runs the daemon in-process, while browser/editor
+        clients consume the WebSocket form.  Both transports must receive the
+        same typed payload—including capture and store health—or first-run
+        permission failures become invisible in the desktop UI.
+        """
+
+        if not self._events.state.subscriber_count:
+            return 0
+        self._state_callback_seq += 1
+        payload = self._ws_server.make_state_update_payload(
+            estimate,
+            biometrics,
+            sequence=self._state_callback_seq,
+        ).model_dump(mode="json")
+        # Private bridge sequence retained for the existing Qt-side stale
+        # frame guard; ``sequence`` above is the public transport field.
+        payload["_seq"] = self._state_callback_seq
+        return self._events.state.publish(payload)
+
     def subscribe_intervention(
         self,
         listener: Callable[[dict[str, Any]], None],
@@ -1759,6 +1785,7 @@ class CortexDaemon:
             # unchanged.
             self._services.register("capture_stale", True)
             self._runtime_status.mark_capture_stale()
+            self._publish_state_to_local_subscribers(estimate, None)
             await self._ws_server.broadcast_state(estimate, None)
         except Exception:
             logger.warning(
@@ -1787,10 +1814,45 @@ class CortexDaemon:
         except asyncio.CancelledError:
             logger.info("startup.hardware_cancelled name=capture_pipeline")
             raise
-        except Exception:
-            logger.exception(
-                "Capture pipeline failed to start; continuing in telemetry-first mode"
-            )
+        except Exception as exc:
+            # A missing/denied macOS TCC grant is an expected degraded mode,
+            # not a daemon fault.  Preserve ERROR + traceback for genuine
+            # capture initialization failures, but make the common first-run
+            # state explicit and searchable in support logs.
+            expected_permission_state: str | None = None
+            try:
+                from cortex.libs.utils.platform import (
+                    CameraPermissionState,
+                    get_camera_permission_state,
+                    is_macos,
+                )
+
+                if is_macos():
+                    permission_state = get_camera_permission_state()
+                    if permission_state in {
+                        CameraPermissionState.NOT_DETERMINED,
+                        CameraPermissionState.RESTRICTED,
+                        CameraPermissionState.DENIED,
+                    }:
+                        expected_permission_state = permission_state.value
+            except Exception:
+                logger.debug(
+                    "Camera permission status lookup failed after capture startup",
+                    exc_info=True,
+                )
+
+            if expected_permission_state is not None:
+                logger.warning(
+                    "startup.hardware_unavailable name=capture_pipeline "
+                    "reason=camera_permission_%s detail=%s",
+                    expected_permission_state,
+                    exc,
+                )
+            else:
+                logger.exception(
+                    "Capture pipeline failed to start; continuing in "
+                    "telemetry-first mode"
+                )
             self._capture_available = False
             self._capture_stale = True
             await self._emit_capture_stale_broadcast()
@@ -3886,69 +3948,10 @@ class CortexDaemon:
                     self._latest_biometrics = biometrics
                     self._latest_broadcast_snapshot = (estimate, biometrics)
 
-                    if self._events.state.subscriber_count:
-                        # F17: stamp a monotonic sequence into the payload so
-                        # the in-process bridge can drop reordered frames.
-                        # ``_seq`` underscore-prefix marks this as a wire
-                        # implementation detail, not a domain field.
-                        self._state_callback_seq += 1
-                        # Audit-2 fix: parity with the WS-mode STATE_UPDATE
-                        # envelope. Previously the in-process callback
-                        # dropped the F18 ``degraded``/``source``/
-                        # ``stress_integral``/``timestamp`` fields, so the
-                        # dashboard's degraded-classifier badge never lit
-                        # up in DMG ``--in-process`` mode.
-                        _scores_dump: dict[str, Any] = (
-                            estimate.scores.model_dump()
-                            if hasattr(estimate.scores, "model_dump")
-                            else {}
-                        )
-                        _payload: dict[str, Any] = {
-                            "_seq": self._state_callback_seq,
-                            "state": estimate.state,
-                            "support_state": estimate.support_state,
-                            "status": estimate.status,
-                            "confidence": estimate.confidence,
-                            "scores": _scores_dump,
-                            "support_scores": (
-                                estimate.support_scores.model_dump()
-                                if estimate.support_scores is not None
-                                else None
-                            ),
-                            "evidence_coverage": estimate.evidence_coverage,
-                            "contributing_features": [
-                                item.model_dump(mode="json")
-                                for item in estimate.contributing_features
-                            ],
-                            "exclusions": list(estimate.exclusions),
-                            "model": estimate.model.model_dump(mode="json"),
-                            "probabilities": None,
-                            "signal_quality": estimate.signal_quality.model_dump(),
-                            "dwell_seconds": estimate.dwell_seconds,
-                            "reasons": estimate.reasons,
-                            "biometrics": biometrics,
-                            "timestamp": float(
-                                getattr(estimate, "timestamp", timestamp) or timestamp
-                            ),
-                            "stress_integral": getattr(estimate, "stress_integral", None),
-                            "source": "rules",
-                            "degraded": estimate.status != "estimated",
-                            "calibrated_probabilities": estimate.__dict__.get(
-                                "calibrated_probabilities"
-                            ),
-                            "classifier_source": getattr(estimate, "classifier_source", None),
-                            "classifier_alpha": getattr(estimate, "classifier_alpha", None),
-                            # G1 (audit-prod): forward the WS server's view of
-                            # currently-IDENTIFY-ed clients so the dashboard
-                            # dots react in real time even on the in-process
-                            # DMG path (no WS roundtrip).
-                            "connected_clients": (
-                                self._ws_server.connected_client_types()
-                                if hasattr(self._ws_server, "connected_client_types")
-                                else []
-                            ),
-                        }
-                        self._events.state.publish(_payload)
+                    self._publish_state_to_local_subscribers(
+                        estimate,
+                        biometrics,
+                    )
 
                     # v2.0: Copilot throttle on state transitions
                     if estimate.state != self._prev_state:

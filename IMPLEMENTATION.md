@@ -3577,3 +3577,222 @@ being replaced with a claim.
 - v0.3.8 must not be described as public merely because a draft release and
   downloadable authenticated assets exist. Publication and subsequent
   unauthenticated redownload are separate evidence-bearing transitions.
+
+## 24. v0.3.9 packaged-state parity and permission recovery
+
+### 24.1 Why the signed v0.3.8 candidate is superseded
+
+The v0.3.8 release workflow completed its native arm64 and x86_64 jobs: both
+DMGs were Developer-ID signed, accepted by Apple notarization, stapled, and
+verified by the automated frozen-runtime gate. The exact arm64 draft artifact
+was then downloaded by asset ID, hash-checked, mounted through Finder, copied
+to `/Applications`, ejected, and launched as a normal application. Repeated
+launch, navigation, in-app Stop, `Cmd+Q`, relaunch, HTTP/WebSocket health, and
+process/listener cleanup all succeeded. The reported bounce-and-disappear
+failure did not reproduce in the corrected candidate.
+
+That physical exercise nevertheless exposed a release-blocking truthfulness
+defect on a host whose Cortex camera authority was `not_determined`: the core
+remained healthy and visible, but the consumer dashboard rendered `Reading
+your pulse…` although capture could not start. The release therefore remains
+unpublished. v0.3.8 is immutable evidence of the startup/teardown correction;
+v0.3.9 is the first candidate eligible to include the discovered contract and
+recovery fix.
+
+### 24.2 Root cause
+
+Cortex has two delivery paths for the same state event:
+
+```text
+StateEstimate + biometrics + RuntimeStatus
+  |-- WebSocketServer._make_state_update -> browser/editor/WS desktop
+  `-- RuntimeDaemon hand-built dict      -> packaged in-process desktop
+```
+
+The WebSocket builder projected `capture`, `store`, classifier provenance,
+v2 timestamps, connected clients, and sequence through the typed
+`StateUpdatePayload`. The in-process branch independently constructed a plain
+dictionary. It had already drifted once and still omitted `capture` and
+`store`. A second asymmetry existed in the failure path:
+`_emit_capture_stale_broadcast()` sent the synthetic offline estimate only
+through `WebSocketServer.broadcast_state()`, not through the local
+`ApplicationEventHub` subscription used by the DMG.
+
+The desktop view model intentionally treats a missing `capture` block as an
+older-daemon compatibility case and chooses the benign warm-up copy. That
+fallback behaved as designed; the producer violated the current transport
+contract. The complete causal chain was therefore:
+
+```text
+macOS camera authority not determined
+  -> optional capture startup declines to request TCC implicitly
+  -> camera open returns unavailable quickly
+  -> runtime marks capture stale and keeps the healthy core alive
+  -> WS receives typed stale payload
+  -> packaged local bridge receives no stale event / no capture block
+  -> compatibility fallback says "Reading your pulse…"
+```
+
+This was not the original process-liveness failure. It was found only because
+the release test checked the visible meaning of the running app after proving
+its process, ports, health version, and clean shutdown.
+
+### 24.3 Canonical payload architecture
+
+`WebSocketServer.make_state_update_payload()` is now the single typed
+projection boundary. It accepts the domain estimate, optional biometrics, and
+an optional transport-owned sequence, then derives:
+
+- abstention-safe state/support state and evidence fields;
+- canonical deterministic scores, exclusions, model identity, and reasons;
+- calibrated-probability fields only when their registered artifact contract
+  permits them;
+- classifier source and degraded/fallback status;
+- legacy and v2 time provenance;
+- identified client surfaces;
+- fresh-frame, face-detection, stale-capture, and capture-sequence status;
+- durable-store backend/health/degradation status; and
+- validated optional biometrics.
+
+`_make_state_update()` now owns only WebSocket envelope concerns: increment the
+WS sequence, invoke the canonical builder, and wrap the dumped model in a
+`WSMessage`. `CortexDaemon._publish_state_to_local_subscribers()` owns only
+local transport concerns: increment the local sequence, invoke the same
+builder, retain the private `_seq` bridge guard for one-release compatibility,
+and publish through `ApplicationEventHub`.
+
+This separation preserves transport-specific ordering without duplicating the
+state contract. A schema addition can no longer silently reach the browser but
+not the packaged desktop simply because a second dictionary was forgotten.
+
+### 24.4 Capture-unavailable state transition
+
+Optional camera startup remains deliberately outside the core-readiness
+boundary. Its state machine is:
+
+```text
+CORE_READY
+  -> HARDWARE_STARTING
+      -> CAPTURE_FLOWING
+      -> CAPTURE_UNAVAILABLE
+           -> mark RuntimeStatus.capture_stale
+           -> publish canonical local STATE_UPDATE
+           -> broadcast canonical WS STATE_UPDATE
+           -> remain healthy in telemetry-first mode
+```
+
+The local publication occurs after the runtime-status marker is planted, so
+the canonical builder observes `capture.stale=True` on the first event. A
+later valid frame still clears stale through the existing live-recovery path.
+The event carries `UNKNOWN` plus `insufficient_evidence`; no unavailable
+physiology can be converted into a supported cognitive-state claim.
+
+Expected macOS authority states (`not_determined`, `restricted`, `denied`) are
+now logged as an explicit `startup.hardware_unavailable` degradation with the
+permission reason. They do not emit a misleading ERROR traceback. Exceptions
+when authority is available—camera driver failure, invalid capture
+composition, or MediaPipe initialization faults—retain the complete exception
+diagnostic. This distinction makes support logs high-signal without hiding
+real faults.
+
+### 24.5 Recovery interaction
+
+The consumer health banner remains compact and nonmodal. When capture is stale
+it now contains a direct `Open Settings` link. The label exposes mouse and
+keyboard link interaction, does not open arbitrary external URLs, and emits a
+bounded `open_settings_requested` intent. `_ConsumerTab` forwards that intent
+through `DashboardWindow`; both the in-process controller and WS-mode app
+route it to their existing `_show_settings()` surface. The Settings dialog
+already owns the explicit camera request/recovery action and live daemon retry.
+
+This preserves authority boundaries:
+
+- daemon startup never requests privacy permission;
+- a status render never opens System Settings on its own;
+- only an explicit user action enters the existing permission UI;
+- a grant triggers the existing live capture retry without an app restart;
+- denial leaves the core available and the recovery path visible.
+
+| Before | After | Why |
+| --- | --- | --- |
+| Packaged desktop and WS clients consumed independently assembled state shapes. | Every transport consumes one typed payload projection. | Contract parity is structural, not dependent on review remembering two dictionaries. |
+| Missing camera authority could appear as `Reading your pulse…`. | The first local failure event renders `Camera offline` with abstained state. | Status copy now reflects evidence that actually exists. |
+| Recovery depended on discovering the menu-bar heart and its Settings menu. | The warning itself offers a keyboard-accessible `Open Settings` action. | Recovery is adjacent to the problem and requires an explicit, understandable gesture. |
+| Expected TCC absence produced an ERROR traceback after an INFO explanation. | Permission absence has a named degraded-hardware warning; unexpected initialization still has a traceback. | Logs distinguish a user-controlled capability state from a software failure. |
+
+### 24.6 Regression proof
+
+The regression suite exercises production paths rather than recreating their
+logic in a test:
+
+- the local publisher builds a real `StateEstimate`, reads the real
+  `RuntimeStatus`, emits three events, and proves monotonic `_seq` and public
+  `sequence` values plus `capture.stale=True` on every payload;
+- `_emit_capture_stale_broadcast()` is invoked on a constructed daemon with a
+  real local subscription and must deliver exactly one typed offline event;
+- existing WebSocket capture-unavailable coverage continues to require the
+  same stale block;
+- the consumer renders its offline status and health banner from the payload;
+- activating only the `cortex-settings` link emits the bounded recovery
+  signal; and
+- the dashboard, controller, and WS-mode wiring retain the same Settings
+  destination.
+
+The first focused post-change run passed 100 tests across payload assembly,
+capture-failure propagation, desktop view models, dashboard status rendering,
+sequence guards, and API gateway behavior. The subsequent canonical local gate
+also passed:
+
+- Ruff and strict mypy across 521 source files;
+- a `0.3.9` wheel containing 285 verified files;
+- 2,661 non-desktop Python tests with four intentional skips;
+- the separately isolated 64-test desktop-shell suite;
+- browser TypeScript plus 54 files / 248 tests and Chrome + Edge MV3 builds;
+- VS Code compile, 7 suites / 30 tests, and a locked `0.3.9` VSIX;
+- schema codegen, 203-setting configuration sync, design-token sync, version
+  sync, links/security/dependency repository contracts, and recorded-trace
+  regression;
+- Python and VS Code dependency audits with no findings, plus the browser
+  audit with every finding covered by the repository's reviewed exception
+  policy; and
+- an isolated-storage source launch that returned a version-matched healthy
+  `0.3.9` response with every service and durable SQLite storage up, then
+  handled SIGTERM with a normal zero exit and no remaining listener/process.
+
+The first source launch intentionally reused the repository's ignored
+`./storage` override and failed closed on an old development database whose
+recorded schema-2 checksum predates the now-committed immutable migration.
+Inspection proved the installed App Support database matches both committed
+migration hashes. The release-relevant source probe was therefore repeated
+with an explicit empty storage directory; no user data was modified or
+discarded. Fresh frozen artifacts remain mandatory below.
+
+### 24.7 v0.3.9 completion and publication gate
+
+The v0.3.9 candidate must repeat—not inherit—the release evidence chain:
+
+```text
+full source/type/schema/config/extension tests
+  -> clean PR + main CI at one merge SHA
+  -> immutable annotated v0.3.9 tag at that SHA
+  -> native arm64 and x86_64 Developer-ID builds
+  -> Apple notarization + stapling + Gatekeeper verification
+  -> checksums, SBOMs, SLSA provenance, and signed evidence
+  -> download the exact draft arm64 DMG and verify its digest
+  -> Finder mount/copy/eject/open from /Applications
+  -> visibly confirm Camera offline + Open Settings with authority absent
+  -> confirm healthy 0.3.9 core and owned 9472/9473 listeners
+  -> exercise Dashboard/History/Advanced, Stop, Cmd+Q, and relaunch
+  -> confirm zero processes/listeners/mounts and no teardown diagnostics
+  -> permission deny/grant/revoke tests only with explicit user approval
+  -> corresponding physical Intel exercise and independent review
+  -> exactly two complete 14-case manual evidence records
+  -> protected publication workflow
+  -> unauthenticated public browser download, digest match, quarantine-aware
+     Finder install/open/quit repetition
+```
+
+Automated notarization and a successful local Apple Silicon Finder run cannot
+substitute for the physical Intel record, independent reviewer, or explicit
+privacy-permission interactions. Until those records exist, the truthful state
+is a verified draft candidate—not a public release.

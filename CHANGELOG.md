@@ -4,6 +4,44 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.3.9] — 2026-08-26
+
+This patch supersedes the unpublished v0.3.8 candidate after its required real
+Finder install exposed a packaged in-process state-contract gap. The app no
+longer disappears after launch, and an unavailable camera is now represented
+truthfully and recoverably on the desktop surface. The deterministic support
+algorithm, evidence thresholds, intervention authority, and privacy semantics
+are unchanged.
+
+### Fixed
+
+* Desktop and WebSocket consumers now share one typed `STATE_UPDATE` payload
+  builder. The in-process DMG path no longer omits `capture`, `store`, source,
+  probability, timestamp, or sequence fields from a separately maintained
+  hand-written projection.
+* Capture-start failure now reaches in-process desktop subscribers as well as
+  browser/editor WebSocket clients. A missing, denied, or restricted camera
+  grant renders “Camera offline” instead of the false warm-up message “Reading
+  your pulse…”.
+* The camera-offline health banner includes a direct, keyboard-accessible
+  “Open Settings” recovery action. Users no longer have to discover the Cortex
+  menu-bar item before restoring sensing.
+* Expected macOS permission states are logged as an explicit degraded hardware
+  condition without a misleading exception traceback. Unexpected capture or
+  MediaPipe initialization failures retain full error diagnostics.
+* Regression coverage now exercises the actual local publisher, asserts
+  monotonic public/private sequences, verifies capture-health parity, proves
+  the synthetic stale event reaches the packaged bridge, and tests the
+  contextual Settings action.
+
+### Release process
+
+* v0.3.8 remains an immutable unpublished candidate with its signed/notarized
+  artifacts and evidence preserved. v0.3.9 receives a fresh source tag,
+  dual-architecture build, notarization, attestations, Finder install/open/quit
+  exercise, manual architecture records, protected publication, and public
+  redownload verification; no v0.3.8 artifact is relabeled.
+
 ## [v0.3.8] — 2026-08-26
 
 This patch supersedes the immutable v0.3.7 release candidate after its native
