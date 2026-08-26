@@ -40,6 +40,7 @@ from cortex.scripts.verify_macos_release import (
     _notarized_container_verification_commands,
     _remove_detached_mountpoint,
     _scan_forbidden,
+    _verify_installer_layout,
 )
 
 _ROOT = Path(__file__).resolve().parents[3]
@@ -133,6 +134,26 @@ def test_production_macos_builder_signs_outer_dmg_before_notarization() -> None:
     assert signature_index < verification_index < notary_index
 
 
+def test_macos_builder_owns_drag_to_applications_layout_before_image_creation() -> None:
+    build_script = (_ROOT / "cortex/scripts/build_macos_app.sh").read_text(encoding="utf-8")
+    staging_copy = 'cp -R "${APP_PATH}" "${DMG_STAGE_DIR}/Cortex.app"'
+    applications_link = 'ln -s /Applications "${DMG_STAGE_DIR}/Applications"'
+    versioned_volume = 'DMG_VOLUME_NAME="Cortex ${CORTEX_VERSION}"'
+    canonical_hdiutil = (
+        'hdiutil create -volname "${DMG_VOLUME_NAME}" -srcfolder "${DMG_STAGE_DIR}" '
+        '-ov -format UDZO "${DMG_PATH}"'
+    )
+
+    volume_index = build_script.index(versioned_volume)
+    copy_index = build_script.index(staging_copy)
+    link_index = build_script.index(applications_link, copy_index)
+    hdiutil_index = build_script.index(canonical_hdiutil, link_index)
+
+    assert volume_index < copy_index < link_index < hdiutil_index
+    assert "create-dmg" not in build_script
+    assert "--app-drop-link" not in build_script
+
+
 def test_notarized_dmg_verification_requires_signature_ticket_and_gatekeeper() -> None:
     artifact = Path(f"/tmp/Cortex-{__version__}-macos-arm64.dmg")
 
@@ -160,6 +181,36 @@ def test_mounted_app_deep_signature_verification_has_bounded_intel_budget() -> N
         ["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app)],
         300.0,
     )
+
+
+def test_installer_layout_requires_applications_symlink(tmp_path: Path) -> None:
+    applications_link = tmp_path / "Applications"
+    applications_link.symlink_to("/Applications")
+
+    assert _verify_installer_layout(tmp_path) == {"applications_link": "/Applications"}
+
+
+@pytest.mark.parametrize(
+    ("kind", "message"),
+    (
+        ("missing", "required Applications symlink"),
+        ("directory", "required Applications symlink"),
+        ("wrong-target", "expected '/Applications'"),
+    ),
+)
+def test_installer_layout_rejects_incomplete_or_misdirected_drag_target(
+    tmp_path: Path,
+    kind: str,
+    message: str,
+) -> None:
+    applications_link = tmp_path / "Applications"
+    if kind == "directory":
+        applications_link.mkdir()
+    elif kind == "wrong-target":
+        applications_link.symlink_to("/System/Applications")
+
+    with pytest.raises(ReleaseVerificationError, match=message):
+        _verify_installer_layout(tmp_path)
 
 
 def test_read_only_dmg_detach_retries_then_forces_without_recursive_cleanup(
