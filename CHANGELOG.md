@@ -4,6 +4,36 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.3.4] — 2026-08-25
+
+This patch signs and verifies the outer macOS disk-image container before
+notarization. It contains no sensing or inference-algorithm, authority,
+privacy, or interaction-policy change from v0.3.0.
+
+### Fixed
+
+* The production builder now signs the finished DMG with the Developer ID
+  Application identity, a secure Apple timestamp, and the stable
+  `com.cortex.daemon.dmg` identifier before submitting that exact artifact to
+  Apple. This implements Apple's inside-out container-signing guidance and
+  gives Gatekeeper a usable primary signature for the disk image itself.
+* DMG signature verification and signature metadata are captured before
+  notarization. The mounted-artifact verifier independently checks the outer
+  signature again after stapling, before ticket validation and Gatekeeper
+  assessment.
+* Added a release-tooling ordering contract that requires DMG integrity
+  verification, production-only outer signing, secure timestamping, a stable
+  identifier, signature verification, and only then notary submission.
+* Release guidance now makes the outer signature an explicit producer and
+  consumer invariant, including standalone `codesign` verification commands.
+
+### Release process
+
+* The immutable v0.3.3 tag is retained as the artifact-free candidate whose
+  arm64 and Intel DMGs were independently signed at the app layer, accepted by
+  Apple, stapled, and then rejected by the final Gatekeeper DMG assessment with
+  `source=no usable signature`. v0.3.4 supersedes it.
+
 ## [v0.3.3] — 2026-08-25
 
 This patch makes the post-notarization bundle scanner distinguish genuine

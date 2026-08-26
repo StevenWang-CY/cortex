@@ -308,6 +308,27 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _notarized_container_verification_commands(artifact: Path) -> tuple[list[str], ...]:
+    """Return the fail-closed verification order for a notarized outer DMG."""
+
+    artifact_path = str(artifact)
+    return (
+        ["codesign", "--verify", "--strict", "--verbose=2", artifact_path],
+        ["codesign", "-dv", "--verbose=4", artifact_path],
+        ["xcrun", "stapler", "validate", artifact_path],
+        [
+            "spctl",
+            "-a",
+            "-vv",
+            "--type",
+            "open",
+            "--context",
+            "context:primary-signature",
+            artifact_path,
+        ],
+    )
+
+
 def verify(
     artifact: Path,
     *,
@@ -412,20 +433,12 @@ def verify(
             commands.append(_run(["hdiutil", "detach", str(mount)], check=False, timeout=60.0))
 
     if require_notarized:
-        commands.append(_run(["xcrun", "stapler", "validate", str(artifact)]))
-        commands.append(
-            _run(
-                [
-                    "spctl",
-                    "-a",
-                    "-vv",
-                    "--type",
-                    "open",
-                    "--context",
-                    "context:primary-signature",
-                    str(artifact),
-                ]
-            )
+        # A stapled ticket proves Apple accepted the submission, but it is not
+        # the outer disk image's Developer ID signature. Verify both before
+        # asking Gatekeeper to assess the exact distributable container.
+        commands.extend(
+            _run(command)
+            for command in _notarized_container_verification_commands(artifact)
         )
     evidence["status"] = "passed"
     return evidence
