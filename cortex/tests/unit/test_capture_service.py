@@ -14,6 +14,7 @@ All tests use synthetic/mock frames — no real webcam required.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from unittest.mock import MagicMock, patch
 
@@ -25,8 +26,12 @@ from cortex.libs.config.settings import CaptureConfig
 from cortex.services.capture_service.face_tracker import (
     BoundingBox,
     FaceTracker,
+    FaceTrackingResult,
 )
-from cortex.services.capture_service.pipeline import AdaptiveFrameSkipper
+from cortex.services.capture_service.pipeline import (
+    AdaptiveFrameSkipper,
+    CapturePipeline,
+)
 from cortex.services.capture_service.quality import FrameQualityScorer
 from cortex.services.capture_service.webcam import (
     CameraSelection,
@@ -566,6 +571,78 @@ class TestWebcamCapture:
             with pytest.raises(RuntimeError, match="Cannot open webcam"):
                 await capture.start()
 
+    def test_unresolved_macos_permission_is_non_blocking_and_never_prompts(
+        self,
+    ) -> None:
+        """Runtime startup only observes TCC; onboarding owns the prompt."""
+
+        from cortex.libs.utils.platform import CameraPermissionState
+        from cortex.services.capture_service import webcam as webcam_mod
+
+        with (
+            patch.object(webcam_mod, "is_macos", return_value=True),
+            patch.object(
+                webcam_mod,
+                "get_camera_permission_state",
+                return_value=CameraPermissionState.NOT_DETERMINED,
+            ),
+        ):
+            started = time.monotonic()
+            authorized = webcam_mod._macos_camera_permission_is_authorized()
+            elapsed = time.monotonic() - started
+
+        assert authorized is False
+        assert elapsed < 0.25
+
+    def test_unresolved_permission_skips_enumeration_and_opencv(self) -> None:
+        from cortex.services.capture_service import webcam as webcam_mod
+
+        with (
+            patch.object(webcam_mod, "is_macos", return_value=True),
+            patch.object(
+                webcam_mod,
+                "_macos_camera_permission_is_authorized",
+                return_value=False,
+            ),
+            patch.object(webcam_mod, "_iter_camera_candidates") as candidates,
+            patch.object(webcam_mod.cv2, "VideoCapture") as video_capture,
+        ):
+            opened, selection = webcam_mod.open_video_capture(CaptureConfig())
+
+        assert opened is None
+        assert selection is None
+        candidates.assert_not_called()
+        video_capture.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_camera_open_is_cancellable_without_blocking_event_loop(self) -> None:
+        """Quit can interrupt a pending hardware open in well under a second."""
+
+        started = asyncio.Event()
+
+        def _pending_open(
+            _config: CaptureConfig,
+            *,
+            cancel_event,
+        ):
+            started_loop.call_soon_threadsafe(started.set)
+            cancel_event.wait(timeout=5.0)
+            return None, None
+
+        capture = WebcamCapture(CaptureConfig(device_id=0))
+        started_loop = asyncio.get_running_loop()
+        with patch(
+            "cortex.services.capture_service.webcam.open_video_capture",
+            side_effect=_pending_open,
+        ):
+            task = asyncio.create_task(capture.start())
+            await asyncio.wait_for(started.wait(), timeout=1.0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=0.5)
+
+        assert capture._open_cancel.is_set()
+
     @pytest.mark.asyncio
     async def test_frame_retrieval(self) -> None:
         """Frames should be retrievable from the async queue."""
@@ -666,3 +743,129 @@ class TestCapturedFrame:
         assert np.array_equal(frame.frame, arr)
         assert frame.timestamp == ts
         assert frame.sequence == 42
+
+
+@pytest.mark.asyncio
+async def test_pipeline_owns_mediapipe_on_one_non_loop_worker() -> None:
+    """Create, inference, and close stay on one worker on every wheel."""
+
+    main_thread_id = threading.get_ident()
+    operation_threads: list[tuple[str, int]] = []
+
+    class _Webcam:
+        def __init__(self) -> None:
+            self._delivered = False
+            self.frames_dropped = 0
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+        async def get_frame(self, timeout: float = 1.0) -> CapturedFrame | None:
+            del timeout
+            if not self._delivered:
+                self._delivered = True
+                return CapturedFrame(
+                    frame=make_synthetic_frame(),
+                    timestamp=time.monotonic(),
+                    sequence=0,
+                )
+            await asyncio.sleep(60)
+            return None
+
+    class _Tracker:
+        face_stable = False
+
+        def initialize(self) -> None:
+            operation_threads.append(("initialize", threading.get_ident()))
+
+        def process_frame(self, *_args, **_kwargs) -> FaceTrackingResult:
+            operation_threads.append(("process", threading.get_ident()))
+            return FaceTrackingResult(
+                face_detected=False,
+                confidence=0.0,
+                landmarks=None,
+                landmarks_px=None,
+                bounding_box=None,
+                face_stable=False,
+            )
+
+        def release(self) -> None:
+            operation_threads.append(("release", threading.get_ident()))
+
+    pipeline = CapturePipeline(CaptureConfig(face_mesh_subsample_n=1))
+    pipeline._webcam = _Webcam()  # type: ignore[assignment]
+    pipeline._face_tracker = _Tracker()  # type: ignore[assignment]
+
+    await pipeline.start()
+    output = await pipeline.get_output(timeout=1.0)
+    await pipeline.stop()
+
+    assert output is not None
+    assert [operation for operation, _thread in operation_threads] == [
+        "initialize",
+        "process",
+        "release",
+    ]
+    owner_threads = {thread_id for _operation, thread_id in operation_threads}
+    assert len(owner_threads) == 1
+    assert owner_threads != {main_thread_id}
+
+
+@pytest.mark.asyncio
+async def test_pipeline_stop_serializes_with_inflight_mediapipe_start() -> None:
+    """Stop cannot race startup into a cross-thread or duplicate close."""
+
+    main_thread_id = threading.get_ident()
+    initialize_entered = threading.Event()
+    allow_initialize = threading.Event()
+    operation_threads: list[tuple[str, int]] = []
+
+    class _Webcam:
+        frames_dropped = 0
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+        async def get_frame(self, timeout: float = 1.0) -> None:
+            del timeout
+            return None
+
+    class _Tracker:
+        face_stable = False
+
+        def initialize(self) -> None:
+            operation_threads.append(("initialize", threading.get_ident()))
+            initialize_entered.set()
+            assert allow_initialize.wait(timeout=1.0)
+
+        def release(self) -> None:
+            operation_threads.append(("release", threading.get_ident()))
+
+    pipeline = CapturePipeline(CaptureConfig(face_mesh_subsample_n=1))
+    pipeline._webcam = _Webcam()  # type: ignore[assignment]
+    pipeline._face_tracker = _Tracker()  # type: ignore[assignment]
+
+    start_task = asyncio.create_task(pipeline.start())
+    assert await asyncio.to_thread(initialize_entered.wait, 1.0)
+    stop_task = asyncio.create_task(pipeline.stop())
+    await asyncio.sleep(0.01)
+    assert [operation for operation, _thread in operation_threads] == ["initialize"]
+
+    allow_initialize.set()
+    with pytest.raises(asyncio.CancelledError):
+        await start_task
+    await asyncio.wait_for(stop_task, timeout=1.0)
+
+    assert [operation for operation, _thread in operation_threads] == [
+        "initialize",
+        "release",
+    ]
+    owner_threads = {thread_id for _operation, thread_id in operation_threads}
+    assert len(owner_threads) == 1
+    assert owner_threads != {main_thread_id}

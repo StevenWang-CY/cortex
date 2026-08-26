@@ -364,14 +364,23 @@ def drain_pending_permission_procs(timeout: float = 3.0) -> None:
 
 
 def request_camera_permission() -> None:
-    """Trigger the native AVFoundation camera permission dialog."""
+    """Request first-use TCC authority or open denied-state recovery."""
+
     try:
+        from cortex.libs.utils.platform import (
+            CameraPermissionState,
+            get_camera_permission_state,
+        )
         from cortex.libs.utils.platform import (
             request_camera_permission as _request_camera_permission,
         )
 
-        _request_camera_permission()
-        return
+        state = get_camera_permission_state()
+        if state == CameraPermissionState.AUTHORIZED:
+            return
+        if state == CameraPermissionState.NOT_DETERMINED:
+            _request_camera_permission()
+            return
     except Exception:
         pass
     try:
@@ -585,6 +594,10 @@ class OnboardingWindow(QWidget):
     # user to restart Cortex. Without this, the first session after
     # onboarding silently uses the rule-based fallback.
     byok_token_saved = Signal()
+    # Permission polling observes the transition produced by the user's
+    # explicit Grant Access click.  The controller retries optional capture
+    # immediately, so a successful TCC grant never requires an app relaunch.
+    camera_permission_granted = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -609,6 +622,10 @@ class OnboardingWindow(QWidget):
             self._onboarding_cid: str = new_correlation_id()
         except Exception:
             self._onboarding_cid = ""
+        try:
+            self._camera_permission_was_granted = check_camera_permission()
+        except Exception:
+            self._camera_permission_was_granted = False
         self._build_ui()
 
         # Permissions are granted in System Settings out-of-process — there's
@@ -624,6 +641,9 @@ class OnboardingWindow(QWidget):
         try:
             cam = check_camera_permission()
             getattr(self._camera_step, "_cortex_set_state", lambda _b: None)(cam)
+            if cam and not self._camera_permission_was_granted:
+                self.camera_permission_granted.emit()
+            self._camera_permission_was_granted = cam
         except Exception:
             pass
         try:

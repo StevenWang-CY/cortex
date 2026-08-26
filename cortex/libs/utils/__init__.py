@@ -10,10 +10,12 @@ from cortex.libs.utils.async_helpers import (
     with_timeout,
 )
 from cortex.libs.utils.platform import (
+    CameraPermissionState,
     Platform,
     check_accessibility_permission,
     check_camera_permission,
     ensure_dir,
+    get_camera_permission_state,
     get_config_dir,
     get_data_dir,
     get_log_dir,
@@ -28,6 +30,7 @@ from cortex.libs.utils.secrets import get_keychain_password
 
 __all__ = [
     # Platform utilities
+    "CameraPermissionState",
     "Platform",
     "get_platform",
     "is_macos",
@@ -39,6 +42,7 @@ __all__ = [
     "ensure_dir",
     "check_accessibility_permission",
     "check_camera_permission",
+    "get_camera_permission_state",
     "request_camera_permission",
     "get_permissions",
     # Async utilities

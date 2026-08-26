@@ -12,10 +12,12 @@ Tests cover:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -42,6 +44,57 @@ class TestDevServer:
         config = CortexConfig()
         server = DevServer(config)
         assert server.config is config
+
+    @pytest.mark.asyncio
+    async def test_readiness_waits_for_operational_daemon(self):
+        """A spawned daemon task is not itself a successful startup."""
+        from cortex.scripts.run_dev import DevServer
+
+        server = DevServer.__new__(DevServer)
+        server._daemon = SimpleNamespace(is_ready=False)
+        keep_running = asyncio.Event()
+        daemon_task = asyncio.create_task(keep_running.wait())
+        server._tasks = [daemon_task]
+
+        async def _publish_readiness() -> None:
+            await asyncio.sleep(0.01)
+            server._daemon.is_ready = True
+
+        publisher = asyncio.create_task(_publish_readiness())
+        try:
+            await asyncio.wait_for(server._wait_for_daemon_readiness(), timeout=0.5)
+            assert daemon_task.done() is False
+            assert server._daemon.is_ready is True
+        finally:
+            keep_running.set()
+            await asyncio.gather(daemon_task, publisher, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_daemon_owned_signal_cannot_strand_dev_wrapper(self):
+        """Daemon completion joins even when the wrapper event never fires.
+
+        This is the exact single-Ctrl+C regression: whichever component owns
+        the process signal may end first, and the other lifecycle must still
+        progress to ``DevServer.stop()`` rather than holding camera/ports.
+        """
+        from cortex.scripts.run_dev import DevServer
+
+        server = DevServer.__new__(DevServer)
+        server._shutdown_event = asyncio.Event()
+        daemon_shutdown = asyncio.Event()
+        daemon_task = asyncio.create_task(daemon_shutdown.wait())
+        server._tasks = [daemon_task]
+
+        join_task = asyncio.create_task(server._wait_for_shutdown_or_daemon_exit())
+        await asyncio.sleep(0)
+        assert join_task.done() is False
+        assert server._shutdown_event.is_set() is False
+
+        daemon_shutdown.set()
+        await asyncio.wait_for(join_task, timeout=0.5)
+
+        assert daemon_task.done() is True
+        assert server._shutdown_event.is_set() is False
 
 
 class TestRunDevMain:

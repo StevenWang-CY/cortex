@@ -2338,6 +2338,17 @@ class _ConsumerTab(QWidget):
                 f"background: {_LABEL_TERTIARY}; border-radius: 3px;",
             )
 
+    def set_starting(self) -> None:
+        """Render a truthful pre-readiness state during daemon startup."""
+
+        for name in list(self._conn_dots.keys()):
+            self.set_extension_connected(name, False)
+        self._set_text_if_changed(self._state_label, "Starting…")
+        self._set_style_if_changed(
+            self._state_dot,
+            f"background: {_LABEL_TERTIARY}; border-radius: 3px;",
+        )
+
     # ------------------------------------------------------------------
     # F34 — Stop button state machine
     # ------------------------------------------------------------------
@@ -3197,6 +3208,10 @@ class DashboardWindow(QWidget):
     def set_connected(self, connected: bool) -> None:
         self._connected = connected
         self._consumer.set_connected(connected)
+
+    def set_starting(self) -> None:
+        self._connected = False
+        self._consumer.set_starting()
 
     def set_extension_connected(self, name: str, connected: bool) -> None:
         """Audit-2 fix: update the Chrome / Edge / Editor connection

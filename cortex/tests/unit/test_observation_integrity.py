@@ -398,7 +398,10 @@ def test_post_open_continuity_wake_is_rejected_and_live_name_is_exposed() -> Non
     ]
     with (
         patch("cortex.services.capture_service.webcam.is_macos", return_value=True),
-        patch("cortex.services.capture_service.webcam._request_macos_camera_permission"),
+        patch(
+            "cortex.services.capture_service.webcam._macos_camera_permission_is_authorized",
+            return_value=True,
+        ),
         patch(
             "cortex.services.capture_service.webcam._iter_camera_candidates",
             return_value=iter(candidates),
