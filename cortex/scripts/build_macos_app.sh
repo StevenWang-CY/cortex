@@ -372,13 +372,16 @@ cp -R "${APP_PATH}" "${DMG_STAGE_DIR}/Cortex.app"
 # canonical image builder locally and in CI so tool availability cannot change
 # either the volume contents or the code-signature preservation behavior.
 ln -s /Applications "${DMG_STAGE_DIR}/Applications"
-rm -f "${DMG_PATH}"
 
 # A versioned volume label prevents a prior quarantined Finder exercise from
 # reserving the next release's exact /Volumes/<label>/Cortex.app identity under
 # macOS App Management/System Policy. A changed candidate must use a changed
 # version, so the release build never reuses the failed candidate's mount path.
-if ! hdiutil create -volname "${DMG_VOLUME_NAME}" -srcfolder "${DMG_STAGE_DIR}" -ov -format UDZO "${DMG_PATH}"; then
+if ! "${PYTHON_BIN}" -m cortex.scripts.create_macos_dmg \
+    --volume-name "${DMG_VOLUME_NAME}" \
+    --source-dir "${DMG_STAGE_DIR}" \
+    --output "${DMG_PATH}" \
+    --evidence-dir "${EVIDENCE_DIR}"; then
     echo "[FATAL] DMG creation failed via canonical hdiutil builder" >&2
     exit 1
 fi

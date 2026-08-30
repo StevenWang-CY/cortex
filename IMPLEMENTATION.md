@@ -1,7 +1,8 @@
 # Cortex: Rigorous Algorithm, Architecture, and Implementation Plan
 
 **Status:** release-relevant software implementation complete through the
-v0.3.13 release-workflow correction; credentialed release-candidate, reference-sensor,
+v0.3.14 DMG-creation resilience correction; credentialed dual-architecture
+release-candidate, reference-sensor,
 participant, and independent-review gates remain external
 
 **Historical audit snapshot:** `fac5db965b0568a73ea64d78fbb6eb594080073c`
@@ -4909,3 +4910,86 @@ records exist for the exact signed candidate.
 These results authorize review and hosted CI for the corrective source. They do
 not authorize a public release without the signed candidate and physical
 evidence sequence in Section 28.3.
+
+## 29. v0.3.14 — bounded canonical DMG creation
+
+The immutable v0.3.13 release workflow proved the Section 28 correction: its
+locked audit gate passed and the ARM64 candidate completed signing,
+notarization, stapling, mounted verification, evidence generation, checksum,
+SBOM, and provenance attestation. The Intel builder also completed PyInstaller
+and deep Developer ID app signing, then the macOS image service returned
+`hdiutil: create failed - Resource busy`. Because image creation was a one-shot
+shell command, the matrix failed, the draft stage was skipped, and no GitHub
+release was created. This is an infrastructure-transient handling gap at the
+packaging boundary; it is not evidence of an app, architecture, signature, or
+notarization defect.
+
+### 29.1 Retry policy and safety invariants
+
+Retrying every failure would conceal malformed arguments, unavailable source
+content, permission problems, and real disk-image corruption. The implemented
+coordinator therefore enforces all of these invariants:
+
+1. The exact canonical command remains `hdiutil create`, with the versioned
+   volume label, owned staging directory, overwrite flag, and compressed UDZO
+   output.
+2. Only case-insensitive `Resource busy` / `temporarily unavailable` output or
+   verbose numeric macOS `EBUSY` (16) / `EAGAIN` (35) diagnostics are classified
+   as transient. Numeric detection keeps the decision independent of the
+   builder account's display language.
+3. At most three attempts are made, with bounded linear delays of five and ten
+   seconds under production defaults.
+4. A partial output file or symlink is removed before execution and immediately
+   after every failed attempt; a directory at the output path is refused rather
+   than recursively removed.
+5. Merged stdout/stderr from every attempt is written to a distinct evidence
+   file before the decision to retry or fail.
+6. Any non-transient nonzero exit fails immediately, and a zero exit without a
+   real DMG also fails.
+7. The existing independent `hdiutil verify`, outer-container signature,
+   notarization, staple, Gatekeeper, mount-layout, frozen-startup, and evidence
+   gates remain unchanged after creation.
+
+| Before | After | Why |
+| --- | --- | --- |
+| One `hdiutil create` call terminated the architecture job on any host error | A typed coordinator permits three bounded attempts for two explicit transient markers | Recover from real macOS image-service contention without normalizing arbitrary failure |
+| Failed creation could leave a partial output for a later attempt | Each attempt removes only the exact DMG file/symlink and refuses directory replacement | Prevent stale bytes while preserving destructive-operation safety |
+| Only the final workflow log described creation failure | Each attempt writes `hdiutil-create-attempt-N.txt` into the architecture evidence directory | Make recovery and repeated contention visible to reviewers and checksum binding |
+| A broad retry could mask invalid configuration | Non-transient exits fail on the first attempt; exhausted contention still fails closed | Retain diagnostic precision and release integrity |
+| v0.3.13 could have been rerun by moving its tag | All version projections advance to 0.3.14 while v0.3.13 remains historical | Preserve immutable source/artifact provenance |
+| Packaging correction risked reopening product/UI behavior | The helper is confined to post-sign image creation; app, camera, motion, accessibility, and interaction code is unchanged | Retain the fully reviewed Emil/Apple UI and camera-privacy implementation |
+
+### 29.2 Verification and release boundary
+
+Focused unit tests inject deterministic command results rather than invoking
+the local macOS image service. They prove third-attempt recovery, exact command
+arguments, two-step backoff, partial-output removal, three evidence files,
+non-transient fail-fast behavior, and bounded exhaustion. Bash syntax and
+ShellCheck continue to cover the calling build script; the complete source and
+client gates must be repeated on the replacement version.
+
+The release sequence remains immutable and dual-architecture: PR CI, exact
+merge CI, new v0.3.14 tag, locked tag gate, both production builders, draft
+download, complete artifact/evidence inspection, then the separately authorized
+physical 14-case matrix. No normal app launch or physical camera use is part of
+the corrective source verification.
+
+### 29.3 Corrective working-tree and package verification (2026-08-30)
+
+| Gate | Observed result |
+| --- | --- |
+| Retry coordinator | 86 release-tooling tests passed, including numeric `EBUSY`, English-marker recovery, partial cleanup, exact command, backoff, evidence, fail-fast, and exhaustion paths |
+| Real image-service smoke | A small real UDZO image was created on attempt 1, its verbose transcript retained, and `hdiutil verify` passed |
+| Static source | Ruff passed; strict mypy passed over 524 files; Bash syntax and ShellCheck passed |
+| Python artifact/behavior | 0.3.14 wheel contained 286 verified members; 2,707 tests passed with 3 documented skips and 47 deprecation warnings |
+| Browser | The privacy budget passed three isolated repetitions at 28–30 ms; the full 54-suite / 253-test run and Chrome/Edge MV3 builds passed without changing the 250 ms budget |
+| VS Code | Frozen install, lint, compile, 7 suites / 32 tests, and 32-file 0.3.14 VSIX passed |
+| Contracts/evaluation | Schema, 203-setting config, version, design, repository, and all four exact recorded-trace baselines passed |
+| Dependencies | Python 0 findings; VS Code 0; browser 11 exact reviewed build/test-only exceptions |
+| Full local package | 243 MiB ARM64 ad-hoc DMG created on attempt 1; SHA-256 `291b86a0a97a726b874a97b11a17b1b2c68e75cd92dfbdf51b5cb1fa71fc8301`; image/layout/signature/resource/secret scans and frozen startup verifier passed |
+| Hardware silence/cleanup | Startup logged `hardware acquisition disabled`; no enumeration/candidate/open marker appeared; clean shutdown, closed ports, no Cortex process, and no mounted 0.3.14 image remained |
+
+The local package is deliberately ad-hoc and is not a distributable substitute
+for the Developer ID/notarized native matrix. It proves the changed packaging
+path and hardware-disabled frozen startup on ARM64; the hosted release workflow
+must still produce and validate both credentialed architectures.

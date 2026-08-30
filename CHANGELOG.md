@@ -4,6 +4,27 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.3.14] — 2026-08-30
+
+This patch supersedes the immutable `v0.3.13` tag. Its locked pre-release gate
+and ARM64 production candidate passed, but the Intel host returned
+`hdiutil: create failed - Resource busy`; the dual-architecture draft stage was
+therefore skipped and no release was created.
+
+### Fixed
+
+* Canonical DMG creation now retries a bounded three times only for recognized
+  transient host errors (`Resource busy` or temporary unavailability), with
+  linear backoff and per-attempt evidence transcripts.
+* Non-transient `hdiutil` failures still fail immediately, partial DMG output is
+  removed after every failed attempt, and success without an actual output file
+  is rejected.
+* `hdiutil` runs in verbose mode and recognizes macOS `EBUSY`/`EAGAIN` numeric
+  return diagnostics as well as English markers, so retry classification does
+  not depend on the builder account's display language.
+* Focused tests cover transient recovery, partial-output cleanup, exact command
+  construction, non-transient fail-fast behavior, and bounded exhaustion.
+
 ## [v0.3.13] — 2026-08-30
 
 This patch supersedes the immutable `v0.3.12` tag, whose release workflow

@@ -382,7 +382,7 @@ wheels = [
 
 [[package]]
 name = "cortex"
-version = "0.3.13"
+version = "0.3.14"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic", extra = ["bedrock", "vertex"] },
