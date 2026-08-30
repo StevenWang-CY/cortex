@@ -7,12 +7,27 @@
 The daemon failed to find a usable camera.
 
 1. Check the camera is not in use by another app (Zoom, FaceTime, etc.)
-2. Verify camera permission: `System Settings → Privacy & Security → Camera → Terminal.app` should be allowed
-3. Test the camera directly:
+2. Verify camera permission for the process you actually launched: Cortex for
+   the installed app, or Terminal/iTerm for a source run.
+3. Enumerate descriptors without opening any camera:
    ```bash
-   python3 -c "import cv2; cap = cv2.VideoCapture(0); print(cap.read()[0]); cap.release()"
+   python3 - <<'PY'
+   from cortex.services.capture_service.webcam import _list_macos_video_devices
+
+   for device in _list_macos_video_devices():
+       print({
+           "index": device.index,
+           "built_in": device.is_builtin,
+           "continuity": device.is_continuity,
+           "connected": device.is_connected,
+           "type": device.device_type,
+       })
+   PY
    ```
-4. If you have multiple cameras, try hardcoding: add `CORTEX_CAPTURE__DEVICE_ID=0` (or `1`, `2`) to `.env`
+4. Leave `CORTEX_CAPTURE__DEVICE_ID` unset unless diagnosing a specific
+   currently enumerated device. Numeric AVFoundation indices are temporary and
+   can change whenever an iPhone or camera connects; Cortex still refuses a
+   configured index if it resolves to Continuity Camera or cannot be verified.
 
 ### "ModuleNotFoundError" on startup
 
@@ -33,19 +48,32 @@ Check the log output for the specific error. Common causes:
 
 ## Camera Issues
 
-### Camera opens iPhone instead of MacBook camera
+### iPhone camera activates unexpectedly
 
-Cortex automatically skips Continuity Camera (iPhone/iPad) and verifies each camera by name before accepting it.
+Cortex excludes Continuity Camera with AVFoundation's explicit device property
+both before opening and after warm-up. It does not rely only on an English
+device name.
 
-- **Restart the daemon** after turning off your iPhone — camera selection runs once at startup
-- If it still picks wrong: set `CORTEX_CAPTURE__DEVICE_ID=0` in `.env` (or try `1`, `2`)
-- Debug what cameras are visible:
+- Stop Cortex immediately from its menu or dashboard.
+- Remove any `CORTEX_CAPTURE__DEVICE_ID` override and restart only when ready.
+- Enumerate without opening hardware:
   ```bash
-  python3 -c "
-  from cortex.services.capture_service.webcam import _list_macos_video_device_names
-  print(_list_macos_video_device_names())
-  "
+  python3 - <<'PY'
+  from cortex.services.capture_service.webcam import _list_macos_video_devices
+
+  for device in _list_macos_video_devices():
+      print({
+          "index": device.index,
+          "built_in": device.is_builtin,
+          "continuity": device.is_continuity,
+          "connected": device.is_connected,
+          "type": device.device_type,
+      })
+  PY
   ```
+- Save `~/Library/Logs/Cortex/startup.log` and file a bug with the Cortex
+  version and this privacy-safe descriptor output. Do not include localized
+  device names, credentials, or private page content.
 
 ### Camera permission denied
 
@@ -181,15 +209,11 @@ The daemon will start without input monitoring but mouse/keyboard telemetry will
 
 ### OpenCV camera index errors
 
-```bash
-python3 -c "
-import cv2
-for i in range(4):
-    cap = cv2.VideoCapture(i)
-    print(f'Device {i}: opened={cap.isOpened()}')
-    cap.release()
-"
-```
+Do not sweep numeric OpenCV indices on macOS: probing an index opens the device
+and may wake Continuity Camera. Use the descriptor-only enumeration under
+“Cannot open webcam device.” If a temporary configured index is necessary,
+select it only from the current descriptor output and expect Cortex's mandatory
+post-open identity check to fail closed if the array changes.
 
 ---
 
@@ -207,10 +231,24 @@ for i in range(4):
 
 ### App bounces then disappears
 
-macOS Gatekeeper is blocking the app because it was downloaded from the internet:
+Do not remove quarantine attributes or bypass Gatekeeper. First confirm the app
+came from the current GitHub release, was dragged to `/Applications`, and the
+DMG checksum matches its attached `SHA256SUMS-<arch>` file. Then run:
+
 ```bash
-xattr -cr /Applications/Cortex.app
+spctl -a -vv --type execute /Applications/Cortex.app
+codesign --verify --deep --strict --verbose=2 /Applications/Cortex.app
+tail -n 200 "$HOME/Library/Logs/Cortex/startup.log"
+cat "$HOME/Library/Logs/Cortex/last-startup-error.txt" 2>/dev/null
 ```
+
+An official signed/notarized build should pass Gatekeeper without `xattr -cr`.
+If signature verification or Gatekeeper fails, delete that app, redownload the
+release asset, verify its checksum and GitHub attestation, and report the exact
+output. If those checks pass, attach the two startup logs and the newest
+`Cortex` crash report from `~/Library/Logs/DiagnosticReports/` to a bug report.
+Do not repeatedly relaunch: one failed launch plus its logs is enough for
+diagnosis and avoids repeatedly acquiring camera hardware.
 
 ### Dashboard doesn't show
 

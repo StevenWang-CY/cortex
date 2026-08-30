@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from pydantic.fields import FieldInfo
 from pydantic_core import PydanticUndefined
 
+from cortex import __version__
 from cortex.libs.config.settings import CortexConfig
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -112,7 +113,9 @@ OPERATIONAL_VARIABLES: tuple[OperationalVariable, ...] = (
         "Directory for checksums and release-verification evidence.",
     ),
     OperationalVariable(
-        "CORTEX_RELEASE_TAG", "v0.3.11", "Exact checked-out tag required by release provenance."
+        "CORTEX_RELEASE_TAG",
+        f"v{__version__}",
+        "Exact checked-out tag required by release provenance.",
     ),
     OperationalVariable(
         "CORTEX_SKIP_EXT_BUILD",

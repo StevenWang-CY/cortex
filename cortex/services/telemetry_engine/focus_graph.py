@@ -99,7 +99,12 @@ class FocusGraphBuilder:
         """Create a stable node ID from app name and title."""
         # Use first 50 chars of title to group similar windows
         title_key = window_title[:50].strip().lower()
-        title_hash = hashlib.md5(title_key.encode()).hexdigest()[:8]
+        # Non-security grouping key.  Preserve the persisted graph identity
+        # format while declaring the use explicitly for FIPS-aware runtimes.
+        title_hash = hashlib.md5(
+            title_key.encode(),
+            usedforsecurity=False,
+        ).hexdigest()[:8]
         return f"{app_name}:{title_hash}"
 
     def add_event(

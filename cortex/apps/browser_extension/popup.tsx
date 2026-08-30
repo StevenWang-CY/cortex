@@ -2762,7 +2762,7 @@ function CortexPopup(): React.ReactElement {
                                         : `1px solid ${CX.borderDefault}`,
                                     borderRadius: CX.radiusMd,
                                     cursor: "pointer",
-                                    transition: `background ${CX.durationFast} ${CX.easeDefault}`,
+                                    transition: `background-color ${CX.durationFast} ${CX.easeDefault}`,
                                 }}
                             >
                                 {opt.label}
@@ -3174,7 +3174,7 @@ const S: Record<string, React.CSSProperties> = {
         fontSize: 13,
         fontWeight: 500,
         fontFamily: CX.font,
-        transition: `background ${CX.durationNormal} ${CX.easeDefault}`,
+        transition: `background-color ${CX.durationNormal} ${CX.easeDefault}`,
     },
     statusRow: { display: "flex", alignItems: "center", gap: 8, paddingRight: 4 },
     statusLabel: {
@@ -3491,7 +3491,7 @@ const S: Record<string, React.CSSProperties> = {
         fontSize: 11,
         fontWeight: 600,
         cursor: "pointer",
-        transition: `background ${CX.durationFast} ${CX.easeDefault}, border-color ${CX.durationFast} ${CX.easeDefault}, opacity ${CX.durationFast} ${CX.easeDefault}`,
+        transition: `background-color ${CX.durationFast} ${CX.easeDefault}, border-color ${CX.durationFast} ${CX.easeDefault}, opacity ${CX.durationFast} ${CX.easeDefault}`,
     },
     toggleTrack: {
         position: "relative" as const,
@@ -3504,7 +3504,7 @@ const S: Record<string, React.CSSProperties> = {
         cursor: "pointer",
         padding: 0,
         flexShrink: 0,
-        transition: `background ${CX.durationNormal} ${CX.easeDefault}`,
+        transition: `background-color ${CX.durationNormal} ${CX.easeDefault}`,
     },
     toggleThumb: {
         position: "absolute" as const,

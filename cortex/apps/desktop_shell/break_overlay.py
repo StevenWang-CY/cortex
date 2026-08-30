@@ -15,9 +15,11 @@ Design notes:
   via :class:`QSoundEffect` (lighter than ``QMediaPlayer`` and avoids
   the FFmpeg dependency in PyInstaller bundles). Audio defaults on but
   is gated by the controller's ``audio_cue`` flag.
-* The overlay grabs the keyboard so Escape ends early; an "End early"
-  button materialises after ``_END_EARLY_REVEAL_SECONDS`` (60 s) so
-  the user can't accidentally bail out in the first minute.
+* The overlay grabs the keyboard so Escape always ends early. An immediately
+  visible "End early" button preserves user agency for keyboard, pointer, and
+  assistive-technology users.
+* Reduce Motion keeps the guidance and phase labels but holds the disc at one
+  radius and lowers the timer cadence from 30 Hz to 4 Hz.
 * The ``run`` method is a blocking call (``QEventLoop.exec()``) — the
   desktop controller invokes it on the Qt thread via a queued
   ``QMetaObject.invokeMethod`` call from the asyncio bridge.
@@ -48,6 +50,10 @@ from PySide6.QtMultimedia import QSoundEffect
 from PySide6.QtWidgets import QPushButton, QWidget
 
 from cortex.apps.desktop_shell import mac_native
+from cortex.apps.desktop_shell.a11y import (
+    set_accessible_description,
+    set_accessible_name,
+)
 from cortex.apps.desktop_shell.tokens import (
     FONT_SYSTEM,
     FS_CAPTION,
@@ -76,10 +82,9 @@ _SURFACE_EMPHASIS_CSS = _rgba_css(HUD_SURFACE_EMPHASIS)
 _ACCENT_RING_CSS = _rgba_css(HUD_ACCENT_RING)
 _TEXT_HUD_PRIMARY_CSS = _rgba_css(TEXT_HUD_PRIMARY)
 
-# Reveal the "End early" affordance only after this many seconds so the
-# user does not bail before the breathing pattern has any chance of
-# moving the needle. Matches the P0 design spec.
-_END_EARLY_REVEAL_SECONDS = 60
+_ANIMATION_INTERVAL_MS = 33
+_REDUCED_MOTION_INTERVAL_MS = 250
+_REDUCED_MOTION_RADIUS_RATIO = 0.46
 
 # Breathing pattern cycles. Each value is a list of ``(phase_label,
 # seconds)`` tuples; the canvas drives the circle's radius from these
@@ -196,6 +201,11 @@ class BreakOverlayWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setStyleSheet(f"background-color: {_BG_PRIMARY_CSS};")
+        set_accessible_name(self, "Guided breathing break")
+        set_accessible_description(
+            self,
+            "Follow the breathing prompt. Press Escape or choose End early to exit.",
+        )
 
         self._canvas = _BreathingCanvas(self)
         self._end_early_btn: QPushButton | None = None
@@ -206,6 +216,7 @@ class BreakOverlayWindow(QWidget):
         self._duration: float = 240.0
         self._start_monotonic: float = 0.0
         self._completed: bool = False
+        self._reduced_motion: bool = False
         self._loop: QEventLoop | None = None
         # Avoid double-finished emission when both the timer's
         # duration-reached path and the user's Escape race.
@@ -231,6 +242,10 @@ class BreakOverlayWindow(QWidget):
         self._cycle_total = sum(seconds for _, seconds in cycle) or 1.0
         self._completed = False
         self._already_finished = False
+        try:
+            self._reduced_motion = bool(mac_native.prefers_reduced_motion())
+        except Exception:
+            self._reduced_motion = False
 
         # Load audio (if enabled) — best-effort; if the file is missing
         # we silently proceed without sound rather than aborting.
@@ -250,8 +265,8 @@ class BreakOverlayWindow(QWidget):
                     audio_file,
                 )
 
-        # Build the End early button. Hidden until 60 s elapse so the
-        # user doesn't bail in the first minute.
+        # Keep a visible escape affordance from the first frame. Full-screen
+        # guidance must never trap a user for a minimum duration.
         if self._end_early_btn is None:
             btn = QPushButton("End early", self)
             btn.setStyleSheet(
@@ -267,22 +282,36 @@ class BreakOverlayWindow(QWidget):
                 f"QPushButton:hover {{ background: {_SURFACE_EMPHASIS_CSS}; }}"
             )
             btn.clicked.connect(self._end_early)
-            btn.hide()
+            set_accessible_name(btn, "End breathing break")
+            set_accessible_description(
+                btn,
+                "Stops the breathing break and returns to your workspace.",
+            )
             self._end_early_btn = btn
 
         # Lay out — canvas spans the whole window, button anchored bottom.
         self._layout_children()
+        # Paint a preference-correct first frame before the window becomes
+        # visible instead of waiting 33/250 ms for the first timer event.
+        initial_phase, initial_ratio = self.display_radius_ratio(
+            self._cycle,
+            0.0,
+            reduced_motion=self._reduced_motion,
+        )
+        self._canvas.set_state(initial_ratio, initial_phase)
 
         # Fullscreen. Grab keyboard so Escape exits even without focus.
         self.showFullScreen()
         self.activateWindow()
         self.raise_()
+        self._end_early_btn.show()
+        self._end_early_btn.raise_()
         self.grabKeyboard()
         self.setFocus(Qt.FocusReason.OtherFocusReason)
 
         self._start_monotonic = time.monotonic()
         self._timer = QTimer(self)
-        self._timer.setInterval(33)  # ~30 Hz animation
+        self._timer.setInterval(self.timer_interval_ms(self._reduced_motion))
         self._timer.timeout.connect(self._tick)
         self._timer.start()
 
@@ -304,31 +333,11 @@ class BreakOverlayWindow(QWidget):
             self._completed = True
             self._finish()
             return
-        # Reveal the End early button once the threshold passes.
-        if (
-            elapsed >= _END_EARLY_REVEAL_SECONDS
-            and self._end_early_btn is not None
-            and not self._end_early_btn.isVisible()
-        ):
-            self._end_early_btn.show()
-            self._end_early_btn.raise_()
-        # Animate the circle's radius from the cycle table.
-        cycle_t = elapsed % self._cycle_total
-        cursor = 0.0
-        phase = self._cycle[0][0]
-        ratio = 0.40
-        for label, seconds in self._cycle:
-            if cycle_t < cursor + seconds:
-                local = (cycle_t - cursor) / max(seconds, 1e-3)
-                phase = label
-                if label == "Inhale":
-                    ratio = 0.32 + 0.30 * local  # 0.32 → 0.62
-                elif label == "Exhale":
-                    ratio = 0.62 - 0.30 * local  # 0.62 → 0.32
-                else:  # Hold
-                    ratio = 0.62 if cursor > 0 and self._cycle[0][0] == "Inhale" else 0.32
-                break
-            cursor += seconds
+        phase, ratio = self.display_radius_ratio(
+            self._cycle,
+            elapsed,
+            reduced_motion=self._reduced_motion,
+        )
         self._canvas.set_state(ratio, phase)
 
     def _end_early(self) -> None:
@@ -363,16 +372,7 @@ class BreakOverlayWindow(QWidget):
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
         if event.key() == Qt.Key.Key_Escape:
-            elapsed = time.monotonic() - self._start_monotonic
-            if elapsed >= _END_EARLY_REVEAL_SECONDS:
-                self._end_early()
-                return
-            # Within the protective window, the Escape key only flashes
-            # the button so the user understands what to look for.
-            if self._end_early_btn is not None:
-                self._end_early_btn.show()
-                self._end_early_btn.raise_()
-            event.accept()
+            self._end_early()
             return
         super().keyPressEvent(event)
 
@@ -390,9 +390,15 @@ class BreakOverlayWindow(QWidget):
             x = (self.width() - btn_width) // 2
             y = self.height() - btn_height - margin_bottom
             self._end_early_btn.setGeometry(x, y, btn_width, btn_height)
-            # Keep its current visibility — _tick decides when to reveal.
 
     # Mathematical helper exposed for unit tests (no Qt mock needed).
+    @staticmethod
+    def timer_interval_ms(reduced_motion: bool) -> int:
+        """Return the status/animation timer cadence for the preference."""
+        if reduced_motion:
+            return _REDUCED_MOTION_INTERVAL_MS
+        return _ANIMATION_INTERVAL_MS
+
     @staticmethod
     def expected_radius_ratio(
         cycle: list[tuple[str, float]],
@@ -412,6 +418,20 @@ class BreakOverlayWindow(QWidget):
                 return label, 0.62
             cursor += seconds
         return cycle[-1][0], 0.32
+
+    @classmethod
+    def display_radius_ratio(
+        cls,
+        cycle: list[tuple[str, float]],
+        elapsed: float,
+        *,
+        reduced_motion: bool,
+    ) -> tuple[str, float]:
+        """Return the current phase and preference-aware display radius."""
+        phase, ratio = cls.expected_radius_ratio(cycle, elapsed)
+        if reduced_motion:
+            ratio = _REDUCED_MOTION_RADIUS_RATIO
+        return phase, ratio
 
     # Convenience helper exposed for math-only tests.
     @staticmethod

@@ -113,3 +113,36 @@ def test_pacer_phase_math_uses_configured_cadence(qapp: QApplication) -> None:
     pacer._elapsed_ms = 5100
     phase, remaining, _ = pacer._get_phase()
     assert phase == "Exhale"
+    pacer.stop()
+
+
+def test_pacer_runs_configured_timer_in_ordinary_mode(qapp: QApplication) -> None:
+    from cortex.apps.desktop_shell.overlay import BreathingPacer
+
+    pacer = BreathingPacer(pattern=(2, 3, 5))
+    try:
+        pacer.start(reduced_motion=False)
+        assert pacer._reduced_motion is False
+        assert pacer._timer.isActive() is True
+        assert pacer._display_state() == ("Inhale", "2s", pytest.approx(0.3))
+    finally:
+        pacer.stop()
+
+
+def test_pacer_is_static_and_countdown_free_under_reduced_motion(
+    qapp: QApplication,
+) -> None:
+    from cortex.apps.desktop_shell.overlay import BreathingPacer
+
+    pacer = BreathingPacer(pattern=(2, 3, 5))
+    pacer.start(reduced_motion=True)
+    try:
+        assert pacer.is_active is True
+        assert pacer._reduced_motion is True
+        assert pacer._timer.isActive() is False
+        assert pacer._display_state() == ("Breathe", "at your pace", 0.46)
+
+        pacer._tick()
+        assert pacer._elapsed_ms == 0
+    finally:
+        pacer.stop()

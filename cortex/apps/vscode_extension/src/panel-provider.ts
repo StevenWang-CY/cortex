@@ -427,8 +427,8 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                     <div class="steps">
                         ${stepsHtml}
                     </div>
-                    <div class="pacer" id="pacer">
-                        <canvas id="pacer-canvas" width="140" height="140"></canvas>
+                    <div class="pacer" id="pacer" role="group" aria-label="Breathing guide">
+                        <canvas id="pacer-canvas" width="140" height="140" aria-hidden="true"></canvas>
                         <div id="pacer-label">Inhale</div>
                         <div id="pacer-timer">4s</div>
                     </div>
@@ -1002,13 +1002,55 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
             const INHALE = 4, HOLD = 7, EXHALE = 8;
             const CYCLE = INHALE + HOLD + EXHALE;
             let startTime = performance.now();
+            let pacerFrameId = null;
+            const reducedPacerMotion = window.matchMedia(
+                '(prefers-reduced-motion: reduce)'
+            );
 
-            function drawPacer() {
-                const elapsed = (performance.now() - startTime) / 1000;
-                const cyclePos = elapsed % CYCLE;
+            function drawPacerDisc(scale) {
                 const w = canvas.width, h = canvas.height;
                 const cx = w / 2, cy = h / 2;
                 const maxR = Math.min(w, h) / 2 - 10;
+                const r = maxR * scale;
+
+                ctx.clearRect(0, 0, w, h);
+
+                // Brand accent (terracotta) — RGB matches CX.accent so the
+                // pacer reads as Cortex on any VS Code theme.
+                for (let i = 0; i < 3; i++) {
+                    const ri = r - i * 3;
+                    if (ri < 5) break;
+                    const alpha = 0.5 - i * 0.12;
+                    ctx.beginPath();
+                    ctx.arc(cx, cy, ri, 0, Math.PI * 2);
+                    ctx.fillStyle = 'rgba(217, 119, 87, ' + alpha + ')';
+                    ctx.fill();
+                }
+            }
+
+            function renderStaticPacer() {
+                drawPacerDisc(0.46);
+                labelEl.textContent = 'Breathe at your pace';
+                timerEl.textContent = '';
+            }
+
+            function shouldRunPacer() {
+                return !reducedPacerMotion.matches
+                    && document.visibilityState === 'visible';
+            }
+
+            function stopPacer() {
+                if (pacerFrameId !== null) {
+                    cancelAnimationFrame(pacerFrameId);
+                    pacerFrameId = null;
+                }
+            }
+
+            function drawPacer() {
+                pacerFrameId = null;
+                if (!shouldRunPacer()) return;
+                const elapsed = (performance.now() - startTime) / 1000;
+                const cyclePos = elapsed % CYCLE;
 
                 let phase, remaining, scale;
                 if (cyclePos < INHALE) {
@@ -1026,29 +1068,32 @@ export class CortexPanelProvider implements vscode.WebviewViewProvider {
                     scale = 1.0 - 0.7 * (exhalePos / EXHALE);
                 }
 
-                const r = maxR * scale;
-
-                ctx.clearRect(0, 0, w, h);
-
-                // Brand accent (terracotta) — RGB matches CX.accent so the
-                // pacer reads as Cortex on any VS Code theme.
-                for (let i = 0; i < 3; i++) {
-                    const ri = r - i * 3;
-                    if (ri < 5) break;
-                    const alpha = 0.5 - i * 0.12;
-                    ctx.beginPath();
-                    ctx.arc(cx, cy, ri, 0, Math.PI * 2);
-                    ctx.fillStyle = 'rgba(217, 119, 87, ' + alpha + ')';
-                    ctx.fill();
-                }
+                drawPacerDisc(scale);
 
                 labelEl.textContent = phase;
                 timerEl.textContent = Math.ceil(remaining) + 's';
 
-                requestAnimationFrame(drawPacer);
+                pacerFrameId = requestAnimationFrame(drawPacer);
             }
 
-            requestAnimationFrame(drawPacer);
+            function startPacer() {
+                if (pacerFrameId !== null || !shouldRunPacer()) return;
+                startTime = performance.now();
+                pacerFrameId = requestAnimationFrame(drawPacer);
+            }
+
+            function syncPacer() {
+                stopPacer();
+                if (reducedPacerMotion.matches) {
+                    renderStaticPacer();
+                } else if (document.visibilityState === 'visible') {
+                    startPacer();
+                }
+            }
+
+            reducedPacerMotion.addEventListener('change', syncPacer);
+            document.addEventListener('visibilitychange', syncPacer);
+            syncPacer();
         }
     </script>
 </body>

@@ -37,7 +37,10 @@ def _goal_hash(goal: str) -> str:
     """Create a stable hash from goal keywords for storage key."""
     words = sorted(set(goal.lower().split()))
     key = " ".join(w for w in words if len(w) > 1)
-    return hashlib.md5(key.encode()).hexdigest()[:8]
+    # This digest is a compact, non-security storage namespace.  Keep MD5 for
+    # backward compatibility with existing 90-day relevance records while
+    # explicitly preventing FIPS/security semantics from being inferred.
+    return hashlib.md5(key.encode(), usedforsecurity=False).hexdigest()[:8]
 
 
 def _store_key(domain: str, goal: str) -> str:

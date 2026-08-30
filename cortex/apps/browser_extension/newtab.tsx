@@ -107,7 +107,11 @@ function PulseRoom(): React.ReactElement {
 
     const [displayHR, setDisplayHR] = useState(0);
     const [displayConnected, setDisplayConnected] = useState(false);
-    const [reducedMotion, setReducedMotion] = useState(false);
+    // Resolve before the first paint/effect pass so a reduced-motion user
+    // never briefly schedules the ordinary canvas loop during hydration.
+    const [reducedMotion, setReducedMotion] = useState(
+        () => window.matchMedia("(prefers-reduced-motion: reduce)").matches,
+    );
     // P2-7: pacer phase label for the aria-live accessibility region.
     // Derived from pulsePhase so screen readers can announce the
     // current breathing cue without coupling to canvas internals.
@@ -153,12 +157,14 @@ function PulseRoom(): React.ReactElement {
                 outline-offset: 3px;
             }
             .cortex-resume-card {
-                flex: 0 0 220px;
-                scroll-snap-align: start;
                 opacity: 0;
                 animation: activityFadeIn 240ms ${CX.easeOut} both;
                 transition: transform ${CX.durationMicro} ${CX.easeOut},
                     box-shadow ${CX.durationFast} ${CX.easeOut};
+            }
+            .cortex-resume-item {
+                flex: 0 0 220px;
+                scroll-snap-align: start;
             }
             @media (hover: hover) and (pointer: fine) {
                 .cortex-resume-card:hover {
@@ -195,6 +201,13 @@ function PulseRoom(): React.ReactElement {
                     animation: none !important;
                     opacity: 1 !important;
                     transform: none !important;
+                }
+            }
+            @media (prefers-reduced-transparency: reduce) {
+                .cortex-translucent-material {
+                    background: var(--cx-control-bg) !important;
+                    -webkit-backdrop-filter: none !important;
+                    backdrop-filter: none !important;
                 }
             }
         `;
@@ -305,7 +318,7 @@ function PulseRoom(): React.ReactElement {
         const ctx = canvas.getContext("2d");
         if (!ctx) return;
 
-        let rafId: number;
+        let rafId: number | null = null;
 
         function resize() {
             if (!canvas) return;
@@ -321,7 +334,8 @@ function PulseRoom(): React.ReactElement {
         window.addEventListener("resize", resize);
 
         function draw(now: number) {
-            rafId = requestAnimationFrame(draw);
+            rafId = null;
+            if (document.visibilityState !== "visible") return;
             if (!ctx || !canvas) return;
 
             const w = window.innerWidth;
@@ -422,12 +436,35 @@ function PulseRoom(): React.ReactElement {
                 const glowAlpha = 0.05 + dampened * 0.15;
                 auraRef.current.style.filter = `drop-shadow(0px 0px ${glowSize}px rgba(${col.r}, ${col.g}, ${col.b}, ${glowAlpha}))`;
             }
+
+            rafId = requestAnimationFrame(draw);
         }
 
-        rafId = requestAnimationFrame(draw);
+        function startAnimationLoop() {
+            if (rafId !== null || document.visibilityState !== "visible") return;
+            rafId = requestAnimationFrame(draw);
+        }
+
+        function stopAnimationLoop() {
+            if (rafId === null) return;
+            cancelAnimationFrame(rafId);
+            rafId = null;
+        }
+
+        function syncAnimationLoop() {
+            if (document.visibilityState === "visible") {
+                startAnimationLoop();
+            } else {
+                stopAnimationLoop();
+            }
+        }
+
+        document.addEventListener("visibilitychange", syncAnimationLoop);
+        startAnimationLoop();
 
         return () => {
-            cancelAnimationFrame(rafId);
+            stopAnimationLoop();
+            document.removeEventListener("visibilitychange", syncAnimationLoop);
             window.removeEventListener("resize", resize);
         };
     }, [reducedMotion]);
@@ -590,7 +627,7 @@ function PulseRoom(): React.ReactElement {
                             VISUAL ENGINE OFFLINE
                         </div>
                             <button
-                                className="cortex-launch-button"
+                                className="cortex-launch-button cortex-translucent-material"
                             onClick={handleLaunch}
                             disabled={launching}
                             style={{
@@ -626,6 +663,7 @@ function PulseRoom(): React.ReactElement {
             {showActivities && activities.length > 0 && (
                 <div
                     className="cortex-resume-list"
+                    role="list"
                     aria-label="Recent activities"
                     style={{
                         WebkitOverflowScrolling: "touch",
@@ -636,45 +674,53 @@ function PulseRoom(): React.ReactElement {
                         const posLabel = formatActivityPosition(a.position);
                         const resumeUrl = getResumeUrl(a);
                         return (
-                            <a
+                            <div
                                 key={a.content_id}
-                                href={resumeUrl}
-                                className="cortex-resume-card cortex-motion-enter"
+                                role="listitem"
+                                className="cortex-resume-item"
                                 style={{
-                                    display: "block",
-                                    textDecoration: "none",
                                     width: 220,
-                                    padding: 16,
-                                    borderRadius: 20,
-                                    background: "rgba(255, 255, 255, 0.65)",
-                                    backdropFilter: "blur(24px)",
-                                    WebkitBackdropFilter: "blur(24px)",
-                                    boxShadow: "0 8px 32px rgba(0, 0, 0, 0.05), inset 0 0 0 1px rgba(255,255,255,0.6)",
-                                    cursor: "pointer",
-                                    animationDelay: `${index * 50}ms`,
                                 }}
-                                title={a.title}
                             >
-                                <div style={{
-                                    fontSize: 14,
-                                    fontWeight: 500,
-                                    color: CX.text,
-                                    whiteSpace: "nowrap",
-                                    overflow: "hidden",
-                                    textOverflow: "ellipsis",
-                                    fontFamily: CX.font,
-                                    marginBottom: 10,
-                                    letterSpacing: "-0.01em",
-                                }}>{a.title}</div>
-                                {/* Progress bar — 3px, sleek */}
-                                <div style={{ height: 3, borderRadius: 1.5, background: "rgba(0,0,0,0.06)", marginBottom: 10, overflow: "hidden" }}>
-                                    <div style={{ height: "100%", borderRadius: 1.5, background: CX.accent, width: `${pct}%` }} />
-                                </div>
-                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                                    <span style={{ fontSize: 10, color: CX.textTertiary, fontFamily: CX.mono, letterSpacing: "0.05em" }}>{posLabel}</span>
-                                    <span style={{ fontSize: 10, fontWeight: 600, color: CX.textSecondary, letterSpacing: "0.08em", textTransform: "uppercase" }}>Resume &rarr;</span>
-                                </div>
-                            </a>
+                                <a
+                                    href={resumeUrl}
+                                    className="cortex-resume-card cortex-motion-enter cortex-translucent-material"
+                                    style={{
+                                        display: "block",
+                                        textDecoration: "none",
+                                        width: "100%",
+                                        padding: 16,
+                                        borderRadius: 20,
+                                        background: "rgba(255, 255, 255, 0.65)",
+                                        backdropFilter: "blur(24px)",
+                                        WebkitBackdropFilter: "blur(24px)",
+                                        boxShadow: "0 8px 32px rgba(0, 0, 0, 0.05), inset 0 0 0 1px rgba(255,255,255,0.6)",
+                                        cursor: "pointer",
+                                        animationDelay: `${index * 50}ms`,
+                                    }}
+                                    title={a.title}
+                                >
+                                    <div style={{
+                                        fontSize: 14,
+                                        fontWeight: 500,
+                                        color: CX.text,
+                                        whiteSpace: "nowrap",
+                                        overflow: "hidden",
+                                        textOverflow: "ellipsis",
+                                        fontFamily: CX.font,
+                                        marginBottom: 10,
+                                        letterSpacing: "-0.01em",
+                                    }}>{a.title}</div>
+                                    {/* Progress bar — 3px, sleek */}
+                                    <div style={{ height: 3, borderRadius: 1.5, background: "rgba(0,0,0,0.06)", marginBottom: 10, overflow: "hidden" }}>
+                                        <div style={{ height: "100%", borderRadius: 1.5, background: CX.accent, width: `${pct}%` }} />
+                                    </div>
+                                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                                        <span style={{ fontSize: 10, color: CX.textTertiary, fontFamily: CX.mono, letterSpacing: "0.05em" }}>{posLabel}</span>
+                                        <span style={{ fontSize: 10, fontWeight: 600, color: CX.textSecondary, letterSpacing: "0.08em", textTransform: "uppercase" }}>Resume &rarr;</span>
+                                    </div>
+                                </a>
+                            </div>
                         );
                     })}
                 </div>

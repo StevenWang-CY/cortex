@@ -36,6 +36,7 @@ from cortex.services.capture_service.quality import FrameQualityScorer
 from cortex.services.capture_service.webcam import (
     CameraSelection,
     CapturedFrame,
+    MacCameraDevice,
     WebcamCapture,
 )
 
@@ -98,6 +99,27 @@ def make_opened_mock_camera(
         device_name="Synthetic Camera",
     )
     return mock_cap, selection
+
+
+def make_mac_camera(
+    index: int,
+    name: str,
+    *,
+    device_key: str | None = None,
+    is_continuity: bool = False,
+    is_connected: bool | None = True,
+    device_type: str = "",
+) -> MacCameraDevice:
+    """Build a synthetic AVFoundation descriptor without touching hardware."""
+
+    return MacCameraDevice(
+        index=index,
+        name=name,
+        device_key=device_key or f"device-{index}",
+        is_continuity=is_continuity,
+        is_connected=is_connected,
+        device_type=device_type,
+    )
 
 
 # =============================================================================
@@ -656,8 +678,11 @@ class TestWebcamCapture:
                 return_value=True,
             ),
             patch(
-                "cortex.services.capture_service.webcam._list_macos_video_device_names",
-                return_value=["Logitech BRIO", "FaceTime HD Camera"],
+                "cortex.services.capture_service.webcam._list_macos_video_devices",
+                return_value=[
+                    make_mac_camera(0, "Logitech BRIO"),
+                    make_mac_camera(1, "FaceTime HD Camera"),
+                ],
             ),
             patch("cortex.services.capture_service.webcam.cv2.VideoCapture") as MockCap,
         ):
@@ -741,7 +766,7 @@ class TestWebcamCapture:
             ),
             patch.object(
                 webcam_mod,
-                "_list_macos_video_device_names",
+                "_list_macos_video_devices",
                 return_value=[],
             ),
             patch.object(webcam_mod.cv2, "VideoCapture") as video_capture,
@@ -766,8 +791,15 @@ class TestWebcamCapture:
             ),
             patch.object(
                 webcam_mod,
-                "_list_macos_video_device_names",
-                return_value=["Test User's iPhone Camera", "FaceTime HD Camera"],
+                "_list_macos_video_devices",
+                return_value=[
+                    make_mac_camera(
+                        0,
+                        "Studio Camera",
+                        is_continuity=True,
+                    ),
+                    make_mac_camera(1, "FaceTime HD Camera"),
+                ],
             ),
             patch.object(webcam_mod.cv2, "VideoCapture") as video_capture,
         ):
@@ -793,10 +825,15 @@ class TestWebcamCapture:
             ),
             patch.object(
                 webcam_mod,
-                "_list_macos_video_device_names",
-                return_value=["Test User's iPhone Camera"],
+                "_list_macos_video_devices",
+                return_value=[
+                    make_mac_camera(
+                        0,
+                        "Studio Camera",
+                        is_continuity=True,
+                    )
+                ],
             ),
-            patch.object(webcam_mod, "_llm_pick_builtin_camera", return_value=0),
             patch.object(webcam_mod.cv2, "VideoCapture") as video_capture,
         ):
             opened, selection = webcam_mod.open_video_capture(CaptureConfig())
@@ -838,7 +875,7 @@ class TestWebcamCapture:
             ),
             patch.object(
                 webcam_mod,
-                "_list_macos_video_device_names",
+                "_list_macos_video_devices",
                 return_value=[],
             ),
             patch.object(webcam_mod.cv2, "VideoCapture", return_value=capture),

@@ -25,6 +25,7 @@ from __future__ import annotations
 import collections
 import json
 import logging
+import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -152,29 +153,29 @@ _WHY_COPY: dict[str, str] = {
 
 
 def _detect_continuity_camera() -> bool:
-    """Return True when AVFoundation is currently advertising at least
-    one iPhone / iPad / Continuity Camera device.
+    """Return whether AVFoundation advertises a Continuity Camera device.
 
-    The existing webcam.py logic already skips Continuity Camera devices
-    silently, but the user has no visibility into that — first-runners
-    plugged in to an iPhone for a meeting wonder whether Cortex is
-    about to grab the wrong feed. Surfacing the skip here closes the
-    feedback gap.
+    Detection uses AVFoundation's explicit ``isContinuityCamera`` property,
+    with the capture service's name fallback only on older bridges where the
+    property is unavailable.  The same descriptor boundary drives candidate
+    filtering and post-open verification, so onboarding never presents a
+    weaker safety claim than runtime capture enforces.
 
     Defensive: failures (no AVFoundation, non-mac, enumeration crash)
     return False so the callout simply doesn't appear.
     """
+    # The packaged release probe promises a hardware-silent startup: it must
+    # neither open nor enumerate cameras.  Constructing the onboarding camera
+    # card happens before the daemon applies its capture guard, so enforce the
+    # same boundary here before importing the AVFoundation-backed service.
+    if os.environ.get("CORTEX_HEADLESS_STARTUP") == "1":
+        return False
     try:
         from cortex.services.capture_service.webcam import (
-            _CONTINUITY_CAMERA_KEYWORDS,
-            _list_macos_video_device_names,
+            _list_macos_video_devices,
         )
 
-        names = _list_macos_video_device_names() or []
-        for name in names:
-            normalized = (name or "").lower()
-            if any(kw in normalized for kw in _CONTINUITY_CAMERA_KEYWORDS):
-                return True
+        return any(device.is_continuity for device in _list_macos_video_devices())
     except Exception:
         logger.debug("Continuity Camera detection failed", exc_info=True)
     return False

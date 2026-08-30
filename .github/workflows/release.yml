@@ -58,13 +58,47 @@ jobs:
           uv run --project cortex --locked --extra dev --extra codegen python -m cortex.scripts.sync_versions --check --tag "${RELEASE_TAG}"
           uv run --project cortex --locked --extra dev --extra codegen python -m cortex.scripts.generate_ts_schemas --check
           uv run --project cortex --locked --extra dev --extra codegen python -m cortex.scripts.verify_repository_contracts
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor HEAD origin/main
       - name: Canonical Python gate
         run: ./cortex/scripts/run_python_gate.sh
+      - name: Browser extension typecheck, contract tests, and dual-browser builds
+        run: |
+          pnpm --dir cortex/apps/browser_extension exec tsc --noEmit
+          pnpm --dir cortex/apps/browser_extension test
+          pnpm --dir cortex/apps/browser_extension exec plasmo build
+          pnpm --dir cortex/apps/browser_extension exec plasmo build --target=edge-mv3
       - name: VS Code extension lint, compile, and test
         run: |
           npm --prefix cortex/apps/vscode_extension run lint
           npm --prefix cortex/apps/vscode_extension run compile
           npm --prefix cortex/apps/vscode_extension test
+          npm --prefix cortex/apps/vscode_extension run package:vsix
+      - name: Enforce release dependency policy
+        run: |
+          mkdir -p "${RUNNER_TEMP}/cortex-audit"
+          uv run --project cortex --locked --extra dev pip-audit \
+            --format json \
+            --output "${RUNNER_TEMP}/cortex-audit/python.json" || true
+          pnpm --dir cortex/apps/browser_extension audit --json \
+            > "${RUNNER_TEMP}/cortex-audit/browser.json" || true
+          npm --prefix cortex/apps/vscode_extension audit --json \
+            > "${RUNNER_TEMP}/cortex-audit/vscode.json" || true
+          status=0
+          uv run --project cortex --locked --extra dev python \
+            cortex/scripts/verify_dependency_audit.py \
+            --ecosystem pip \
+            --report "${RUNNER_TEMP}/cortex-audit/python.json" || status=1
+          uv run --project cortex --locked --extra dev python \
+            cortex/scripts/verify_dependency_audit.py \
+            --ecosystem pnpm \
+            --report "${RUNNER_TEMP}/cortex-audit/browser.json" \
+            --exceptions cortex/security/node-audit-exceptions.json || status=1
+          uv run --project cortex --locked --extra dev python \
+            cortex/scripts/verify_dependency_audit.py \
+            --ecosystem npm \
+            --report "${RUNNER_TEMP}/cortex-audit/vscode.json" || status=1
+          exit "${status}"
 
   build-dmg:
     name: Signed notarized DMG (${{ matrix.arch }})
@@ -254,6 +288,10 @@ jobs:
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
           subject-path: dist/Cortex-*-macos-${{ matrix.arch }}-evidence.zip
+      - name: Attest checksum manifest provenance
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: dist/evidence-${{ matrix.arch }}/SHA256SUMS-${{ matrix.arch }}
 
       - name: Upload architecture artifact and evidence
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0

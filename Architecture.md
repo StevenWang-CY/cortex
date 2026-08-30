@@ -112,7 +112,9 @@ specific arm64/x86_64 DMGs include Chrome/Edge builds, VSIX, native-host
 installer, migrations, model/resource files, and a secret-free configuration.
 Release tags require locked inputs, Developer ID hardened-runtime signing,
 Apple notarization/stapling, mounted-artifact smoke, SBOMs, checksums, and
-GitHub attestations.
+GitHub attestations. The tag commit must be reachable from `main`; promotion
+verifies provenance for both DMGs, both evidence bundles, and both standalone
+architecture checksum manifests.
 
 Canonical detail: [cortex/docs/architecture.md](cortex/docs/architecture.md),
 [ADRs](docs/adr/README.md), [data flow](docs/data-flow.md), and

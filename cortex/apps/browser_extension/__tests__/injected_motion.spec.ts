@@ -21,6 +21,11 @@ describe("injected surface motion", () => {
         injectOverlay(PAYLOAD);
         const original = document.getElementById("cortex-somatic-overlay");
         expect(original).not.toBeNull();
+        expect(original?.shadowRoot?.querySelector('.pn[role="region"]')).not.toBeNull();
+        expect(
+            original?.shadowRoot?.getElementById("cortex-intervention-summary")
+                ?.getAttribute("aria-live"),
+        ).toBe("polite");
         expect(original?.shadowRoot?.querySelector(".pn.cx-update")).toBeNull();
 
         injectOverlay({ ...PAYLOAD, headline: "Updated support" });
@@ -53,6 +58,43 @@ describe("injected surface motion", () => {
         expect(document.getElementById("cortex-lockout-overlay")).toBeNull();
     });
 
+    it("treats lockout as a keyboard modal and restores prior focus", async () => {
+        const trigger = document.createElement("button");
+        trigger.textContent = "Continue reading";
+        document.body.appendChild(trigger);
+        trigger.focus();
+
+        const { injectLockoutOverlay } = await import("../background");
+        injectLockoutOverlay({ duration_s: 10, reason: "Pause briefly." });
+
+        const host = document.getElementById("cortex-lockout-overlay");
+        const dialog = host?.shadowRoot?.querySelector('[role="dialog"]');
+        const skip = host?.shadowRoot?.getElementById("skip") as HTMLButtonElement;
+        const timer = host?.shadowRoot?.querySelector('[role="timer"]');
+        expect(dialog?.getAttribute("aria-modal")).toBe("true");
+        expect(dialog?.getAttribute("aria-describedby")).toContain("cortex-lockout-countdown");
+        expect(timer).not.toBeNull();
+        expect(timer?.textContent).toBe("0:10");
+        expect(host?.shadowRoot?.activeElement).toBe(skip);
+
+        vi.advanceTimersByTime(1000);
+        expect(timer?.textContent).toBe("0:09");
+
+        document.dispatchEvent(new KeyboardEvent("keydown", {
+            key: "Tab",
+            bubbles: true,
+        }));
+        expect(host?.shadowRoot?.activeElement).toBe(skip);
+
+        document.dispatchEvent(new KeyboardEvent("keydown", {
+            key: "Escape",
+            bubbles: true,
+        }));
+        vi.advanceTimersByTime(170);
+        expect(document.getElementById("cortex-lockout-overlay")).toBeNull();
+        expect(document.activeElement).toBe(trigger);
+    });
+
     it("gives the coach card a symmetric dismissal and static reduced path", async () => {
         Object.defineProperty(window, "matchMedia", {
             configurable: true,
@@ -75,6 +117,8 @@ describe("injected surface motion", () => {
         const css = host?.shadowRoot?.querySelector("style")?.textContent ?? "";
         expect(css).toContain("@keyframes out");
         expect(css).toContain("prefers-reduced-motion");
+        expect(host?.shadowRoot?.querySelector('.card[role="region"]')).not.toBeNull();
+        expect(host?.shadowRoot?.querySelector('.card[role="dialog"]')).toBeNull();
 
         (host?.shadowRoot?.getElementById("lc-close") as HTMLButtonElement).click();
         expect(document.getElementById("cortex-leetcode-coach")).toBeNull();

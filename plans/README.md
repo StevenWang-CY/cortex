@@ -12,15 +12,20 @@ or actionable content.
 | 003 | Restrain new-tab motion and keep interaction immediate | MEDIUM | DONE | 001 |
 | 004 | Bound ambient motion and make flow-shield release responsive | MEDIUM | DONE | 001 |
 | 005 | Normalize press and status feedback across surfaces | LOW | DONE | 001–004 |
+| 006 | Stop continuous pacers under reduced motion and hidden views | HIGH | DONE | 001, 004 |
 
-Recommended execution order is the table order. Plan 001 establishes the
-shared vocabulary; 002 closes the highest-impact interaction delay; 003 and
-004 can then proceed independently; 005 is the final cohesion sweep.
+Plans 001–006 are complete. Plan 006 was the only actionable result from the
+2026-08-29 full motion re-audit; it extends the established preference/lifecycle
+contracts to the three remaining canvas/timer pacers and restores immediate
+exit agency to the full-screen break. A follow-through search also closed the
+Pulse Room canvas's hidden-tab lifecycle instead of preserving a false audit
+assumption.
 
 Completion evidence (2026-08-25): generated design-token parity and contrast
 contracts pass; 35 selected desktop/UI modules pass in isolated Qt processes;
-the browser passes TypeScript, 241 tests, and Chrome/Edge production builds;
-the VS Code extension passes 30 tests and TypeScript compilation. Mechanical
+the browser passes TypeScript, 253 tests, and Chrome/Edge production builds;
+the VS Code extension passes lint, compilation, packaging, and 32 tests. The
+canonical Python gate passes 2,703 tests with three documented skips. Mechanical
 search finds no UI `transition: all`, geometry animation, legacy `easeIn`
 token, or global `0.01ms` reduced-motion reset. Interaction semantics and the
 pinned upstream reference are recorded in
@@ -35,3 +40,7 @@ Deliberately rejected motion candidates:
   from immediate, legible state changes rather than flourish.
 - Continuous bounce or celebration after an external request: the outcome is
   a privacy-sensitive network send, not a celebratory moment.
+- Recap-sheet position movement: it is an occasional, spatially anchored
+  200 ms sheet transition with an immediate Reduce Motion path. Qt has no
+  transform-only QWidget equivalent, so replacing it would add complexity
+  without a user-visible gain.

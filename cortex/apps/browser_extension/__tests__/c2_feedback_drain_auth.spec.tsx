@@ -8,9 +8,8 @@
  * and asserts the drain fetch attaches the cached capability token.
  */
 
-import React from "react";
+import React, { act } from "react";
 import { createRoot } from "react-dom/client";
-import { act } from "react-dom/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import CortexPopup from "../popup";
 

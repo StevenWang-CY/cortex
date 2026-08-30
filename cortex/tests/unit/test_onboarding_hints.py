@@ -148,32 +148,58 @@ def test_continuity_callout_absent_when_no_iphone(wizard):
     assert getattr(wizard._camera_step, "_cortex_continuity_callout", None) is None
 
 
-def test_detect_continuity_camera_keywords(monkeypatch):
-    """The detector returns True for any AVFoundation device whose name
-    contains an iPhone / iPad / Continuity keyword."""
+def test_detect_continuity_camera_descriptor(monkeypatch):
+    """Onboarding consumes the same explicit descriptor as capture safety."""
     from cortex.apps.desktop_shell import onboarding as onb_mod
     from cortex.services.capture_service import webcam as webcam_mod
 
+    def device(name: str, *, is_continuity: bool):
+        return webcam_mod.MacCameraDevice(
+            index=0,
+            name=name,
+            device_key="synthetic-device",
+            is_continuity=is_continuity,
+            is_connected=True,
+        )
+
     monkeypatch.setattr(
         webcam_mod,
-        "_list_macos_video_device_names",
-        lambda: ["FaceTime HD Camera"],
+        "_list_macos_video_devices",
+        lambda: [device("FaceTime HD Camera", is_continuity=False)],
     )
     assert onb_mod._detect_continuity_camera() is False
 
     monkeypatch.setattr(
         webcam_mod,
-        "_list_macos_video_device_names",
-        lambda: ["FaceTime HD Camera", "Chuyue's iPhone"],
+        "_list_macos_video_devices",
+        lambda: [device("Studio Camera", is_continuity=True)],
     )
     assert onb_mod._detect_continuity_camera() is True
 
     monkeypatch.setattr(
         webcam_mod,
-        "_list_macos_video_device_names",
-        lambda: ["iPad Pro"],
+        "_list_macos_video_devices",
+        lambda: [device("Continuity Lab Camera", is_continuity=False)],
     )
-    assert onb_mod._detect_continuity_camera() is True
+    assert onb_mod._detect_continuity_camera() is False
+
+
+def test_detect_continuity_camera_headless_never_enumerates(monkeypatch):
+    """Release probes must not even discover Continuity Camera metadata."""
+    from cortex.apps.desktop_shell import onboarding as onb_mod
+    from cortex.services.capture_service import webcam as webcam_mod
+
+    monkeypatch.setenv("CORTEX_HEADLESS_STARTUP", "1")
+
+    def fail_if_enumerated():
+        raise AssertionError("headless onboarding must not enumerate cameras")
+
+    monkeypatch.setattr(
+        webcam_mod,
+        "_list_macos_video_devices",
+        fail_if_enumerated,
+    )
+    assert onb_mod._detect_continuity_camera() is False
 
 
 def test_why_button_has_accessible_name(wizard):

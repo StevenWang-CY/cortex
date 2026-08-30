@@ -7,9 +7,8 @@
  * - handshake_failed: WS up, daemon rejected handshake
  */
 
-import React from "react";
+import React, { act } from "react";
 import { createRoot } from "react-dom/client";
-import { act } from "react-dom/test-utils";
 import { describe, expect, it } from "vitest";
 import CortexPopup, { classifyConnectivity } from "../popup";
 
