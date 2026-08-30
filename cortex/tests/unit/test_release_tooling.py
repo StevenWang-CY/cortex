@@ -43,6 +43,9 @@ from cortex.scripts.verify_macos_release import (
     _scan_forbidden,
     _verify_installer_layout,
 )
+from cortex.scripts.verify_repository_contracts import (
+    _dependency_audit_calls_missing_summary,
+)
 
 _ROOT = Path(__file__).resolve().parents[3]
 
@@ -128,7 +131,19 @@ def test_release_tag_gate_rechecks_all_shipped_client_surfaces() -> None:
     assert "plasmo build --target=edge-mv3" in workflow
     assert "npm --prefix cortex/apps/vscode_extension test" in workflow
     assert "npm --prefix cortex/apps/vscode_extension run package:vsix" in workflow
-    assert workflow.count("verify_dependency_audit.py") >= 3
+    verifier_segments = workflow.split("verify_dependency_audit.py")[1:]
+    assert len(verifier_segments) >= 3
+    assert all("--summary-out" in segment for segment in verifier_segments)
+
+
+def test_dependency_audit_workflow_contract_identifies_the_exact_missing_call() -> None:
+    run_block = """
+    python verify_dependency_audit.py --ecosystem pip --summary-out pip.json
+    python verify_dependency_audit.py --ecosystem pnpm
+    python verify_dependency_audit.py --ecosystem npm --summary-out npm.json
+    """
+
+    assert _dependency_audit_calls_missing_summary(run_block) == (2,)
 
 
 def test_release_workflow_attests_every_standalone_checksum_manifest() -> None:

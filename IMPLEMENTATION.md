@@ -1,7 +1,7 @@
 # Cortex: Rigorous Algorithm, Architecture, and Implementation Plan
 
 **Status:** release-relevant software implementation complete through the
-v0.3.12 source refinement; credentialed release-candidate, reference-sensor,
+v0.3.13 release-workflow correction; credentialed release-candidate, reference-sensor,
 participant, and independent-review gates remain external
 
 **Historical audit snapshot:** `fac5db965b0568a73ea64d78fbb6eb594080073c`
@@ -4821,3 +4821,91 @@ Before commit/tag creation, the complete local release-candidate gate reports:
 This is strong source and packaging-input evidence, but it is not substituted
 for exact-commit hosted CI, signed/notarized dual-architecture artifacts, or
 the permissioned physical 14-case matrix.
+
+## 28. v0.3.13 — release-workflow contract closure
+
+`v0.3.12` reached the correct fail-closed outcome: its immutable tag named the
+reviewed `main` merge, but release run `33290952009` stopped in the pre-release
+dependency-policy step before any signing identity was exposed and before any
+DMG, evidence bundle, or GitHub release was created. The failed tag is retained
+for traceability and is never moved, deleted for reuse, or represented as a
+downloadable release. `v0.3.13` is the replacement candidate.
+
+### 28.1 Root cause and containment
+
+The dependency verifier intentionally requires `--summary-out` so a successful
+policy decision always leaves machine-readable evidence. Ordinary CI had been
+migrated to that interface, as had the architecture-specific release audit,
+but the tag-only pre-release job still invoked the verifier three times with
+only `--ecosystem`, `--report`, and (for the browser) `--exceptions`. Argument
+parsing therefore rejected all three calls. This was workflow-interface drift,
+not a newly discovered package vulnerability: the hosted log first reported
+zero Python findings and then showed the missing required argument.
+
+Containment was complete:
+
+- the failure occurred before both native matrix builders;
+- neither Apple credentials nor notarization submission ran;
+- no draft or public release was created;
+- no artifact existed to download or accidentally promote; and
+- the replacement version advances rather than rewriting the failed tag.
+
+### 28.2 Implemented prevention
+
+| Before | After | Why |
+| --- | --- | --- |
+| Three pre-release verifier calls omitted `--summary-out` | Python, browser, and VS Code calls each write a distinct JSON summary in the runner audit directory | Preserve an auditable policy decision and satisfy the verifier's explicit interface |
+| Normal CI covered its own arguments but not every invocation in other workflows | Repository contracts parse every workflow job and require at least one `--summary-out` for each verifier call in a run block | Make cross-workflow CLI drift fail in ordinary PR CI, before tag creation |
+| The release tooling unit contract checked only that verifier calls existed | It also asserts summary-output coverage is no lower than verifier-call coverage | Keep a small, direct regression test beside the release workflow expectations |
+| Re-running would have required moving an immutable tag | Canonical and projected versions advance together to `0.3.13`; `v0.3.12` remains historical | Preserve tag-to-source provenance and prevent artifact substitution |
+| The replacement changes no application interaction behavior | The complete v0.3.12 Emil/Apple UI contract, accessibility behavior, motion preferences, camera privacy, and startup fix carry forward unchanged | Minimize the corrective diff and retain the already-reviewed product tree |
+
+The workflow check is deliberately general rather than naming only the failed
+step. If a future CI, release, or promotion job adds multiple verifier calls in
+one shell block, every call must have a corresponding summary argument. The
+existing functional policy tests continue to validate the summary contents;
+the new contract validates workflow wiring.
+
+### 28.3 Replacement release protocol
+
+The corrective branch must repeat the full path rather than relying on the
+successful v0.3.12 application tests:
+
+```text
+focused workflow/tooling tests and repository contracts
+  -> full local canonical source/client gates
+  -> PR CI on arm64 and Intel
+  -> merge without changing the reviewed tree
+  -> exact-merge main CI on arm64 and Intel
+  -> immutable v0.3.13 tag
+  -> tag-only locked gate, including all three summary-producing audits
+  -> native Developer ID/notarized arm64 and x86_64 candidate builds
+  -> draft asset download and independent hash/signature/staple/Gatekeeper/
+     attestation/evidence inspection
+  -> physical 14-case records and independent review before public promotion
+```
+
+The user's no-camera instruction remains controlling. Automated source checks,
+offscreen Qt rendering, synthetic capture handles, and an explicit packaged
+camera-disabled probe are permitted; a normal app launch, AVFoundation device
+discovery, or physical-camera exercise is not. Public promotion therefore
+remains fail-closed until independently reviewed arm64 and Intel physical
+records exist for the exact signed candidate.
+
+### 28.4 Corrective working-tree verification (2026-08-29)
+
+| Gate | Observed result |
+| --- | --- |
+| Failed-step reproduction | Exact Bash audit sequence passed and emitted three distinct summary JSON files |
+| Dependency policy | Python 0 findings; VS Code 0; browser 11 exact reviewed build/test-only exceptions |
+| Focused tooling regression | 90 release-tooling and dependency-policy tests passed |
+| Python canonical gate | Ruff passed; strict mypy passed over 523 files; 0.3.13 wheel contained 285 verified members; 2,703 tests passed with 3 documented skips |
+| Browser client | TypeScript passed; 54 suites / 253 tests passed; Chrome and Edge MV3 production builds passed |
+| VS Code client | Frozen install, lint, compile, 7 suites / 32 tests, and 32-file 0.3.13 VSIX passed |
+| Generated contracts | Python-to-TypeScript schemas, 203-setting config surfaces, version projections, design tokens, links, action pins, and dependency boundaries passed |
+| Deterministic evaluation | All four committed trace metrics exactly matched their baselines |
+| Hardware silence | No normal Cortex launch, camera enumeration, or camera capture was performed |
+
+These results authorize review and hosted CI for the corrective source. They do
+not authorize a public release without the signed candidate and physical
+evidence sequence in Section 28.3.

@@ -88,16 +88,19 @@ jobs:
           uv run --project cortex --locked --extra dev python \
             cortex/scripts/verify_dependency_audit.py \
             --ecosystem pip \
-            --report "${RUNNER_TEMP}/cortex-audit/python.json" || status=1
+            --report "${RUNNER_TEMP}/cortex-audit/python.json" \
+            --summary-out "${RUNNER_TEMP}/cortex-audit/python-summary.json" || status=1
           uv run --project cortex --locked --extra dev python \
             cortex/scripts/verify_dependency_audit.py \
             --ecosystem pnpm \
             --report "${RUNNER_TEMP}/cortex-audit/browser.json" \
-            --exceptions cortex/security/node-audit-exceptions.json || status=1
+            --exceptions cortex/security/node-audit-exceptions.json \
+            --summary-out "${RUNNER_TEMP}/cortex-audit/browser-summary.json" || status=1
           uv run --project cortex --locked --extra dev python \
             cortex/scripts/verify_dependency_audit.py \
             --ecosystem npm \
-            --report "${RUNNER_TEMP}/cortex-audit/vscode.json" || status=1
+            --report "${RUNNER_TEMP}/cortex-audit/vscode.json" \
+            --summary-out "${RUNNER_TEMP}/cortex-audit/vscode-summary.json" || status=1
           exit "${status}"
 
   build-dmg:

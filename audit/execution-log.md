@@ -165,8 +165,27 @@ evidence. The headless onboarding path returns before AVFoundation discovery,
 and packaged verification now rejects either camera enumeration or open
 markers rather than relying only on an impossible configured device index.
 
-This entry is intentionally not assigned an immutable commit until the final
-diff, complete source gates, and exact-commit CI pass. Likewise it makes no
-claim about Developer ID artifacts, clean-machine Finder/TCC/camera behavior,
-Intel physical execution, independent review, or public release. Those results
-must be appended only from the exact v0.3.12 tag and attached evidence.
+The reviewed tree was merged as `64c16b6417ed791f573085035da05ef2e3fa9ec0`.
+PR run `33290096876` and exact-merge `main` run `33290576709` both passed all
+seven jobs on arm64 and Intel. Immutable tag `v0.3.12` then failed closed in
+release run `33290952009` before signing, building, or attaching any artifact:
+the tag-only dependency gate omitted the verifier's newly required
+`--summary-out` arguments. The tag is retained as historical evidence and is
+not moved or reused. Candidate artifact results must therefore be appended only
+from the replacement `v0.3.13` tag and its attached evidence.
+
+## v0.3.13 release-workflow contract correction
+
+The corrective working tree adds the three missing release summary paths, a
+repository-wide one-summary-per-verifier-call contract, and a focused unit
+regression. The exact formerly failing Bash sequence now passes with Python and
+VS Code at zero findings and the browser's 11 reviewed build/test-only
+exceptions. The complete camera-free source/client gates were then repeated:
+Ruff, strict mypy over 523 files, a verified 285-member v0.3.13 wheel, 2,703
+passing Python tests (3 documented skips), 253 browser tests and dual MV3
+builds, 32 VS Code tests and VSIX packaging, generated schema/config/version/
+design/repository contracts, and all four exact recorded-trace baselines.
+
+No normal Cortex launch, AVFoundation enumeration, or physical camera was used.
+Hosted PR/main, signed candidate, artifact-download, and physical-review results
+must be appended only after they exist for the exact corrective commits.

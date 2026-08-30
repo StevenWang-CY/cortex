@@ -4,6 +4,21 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.3.13] — 2026-08-29
+
+This patch supersedes the immutable `v0.3.12` tag, whose release workflow
+failed closed before signing or artifact creation. The application, camera,
+and UI/UX refinements remain unchanged from the fully reviewed candidate.
+
+### Fixed
+
+* The release-only dependency-policy gate now supplies the required
+  machine-readable `--summary-out` path to every Python, browser, and VS Code
+  audit-verifier invocation.
+* Repository contracts now reject any workflow that invokes the dependency
+  audit verifier without one summary output per call. This prevents ordinary
+  CI and tag-only release workflow arguments from drifting again.
+
 ## [v0.3.12] — 2026-08-29
 
 This patch is a fresh release candidate built on v0.3.11. It focuses on the
