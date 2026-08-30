@@ -123,7 +123,7 @@ describe("F54 popup renders distinct UI per connectivity state", () => {
             });
             const title = container.querySelector('[data-testid="conn-state-not_installed"]');
             expect(title).not.toBeNull();
-            expect(title?.textContent).toContain("Native host not installed");
+            expect(title?.textContent).toContain("Browser bridge unavailable");
         } finally {
             await cleanup();
         }

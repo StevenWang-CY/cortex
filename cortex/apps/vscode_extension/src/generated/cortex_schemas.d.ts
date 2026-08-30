@@ -3,7 +3,7 @@
 //
 // Source of truth: cortex/libs/schemas/*.py (Pydantic v2 models).
 // Schema package: cortex-wire/2.0
-// Source SHA-256: 35dd53b9f4b538bf972a569adb56de1617c5df7b9fa467c927575be19d540f50
+// Source SHA-256: c6f2209847e6f2ed7f8ccc2d0cb1e719991404a568efd4f0228d5421ad9a7dd9
 // Drift-gate: a pre-commit hook and the GitHub Actions CI run
 //   `python -m cortex.scripts.generate_ts_schemas --check`
 // and fail if this file is out of sync with the Python models.

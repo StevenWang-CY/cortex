@@ -277,6 +277,10 @@ python -m cortex.scripts.install_native_host
 
 Then load `cortex/apps/browser_extension/build/chrome-mv3-prod/` (or `edge-mv3-prod/`) at `chrome://extensions` with Developer mode enabled.
 
+The command above is for source development. DMG users connect from Cortex's
+**Connect Extensions** panel; the packaged app installs and protocol-verifies a
+signed self-contained native host, so no external Python is required.
+
 ### Tests + quality
 
 ```bash

@@ -22,17 +22,19 @@ import subprocess
 import sys
 import time
 import traceback
+from pathlib import Path
 
-LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native_host_debug.log")
+_LOG_DIRECTORY = Path.home() / "Library" / "Logs" / "Cortex"
+LOG_FILE = _LOG_DIRECTORY / "native-host.log"
+_LOG_MAX_BYTES = 512 * 1024
+_LOG_BACKUP_COUNT = 2
 
 
 # P1 (audit Phase 4d): centralise the port literals so a future port
 # migration only touches ``cortex/libs/config/ports.py``. Import is
-# wrapped in try/except because this script may be invoked by Chrome
-# native-messaging with a Python interpreter that doesn't have the
-# project installed (the installer copies the script out of the .app
-# but does NOT carry the package); the fallback defaults match the
-# constants in that module verbatim.
+# wrapped in try/except so source-mode diagnostic invocations remain usable
+# even if the checkout is incomplete. Packaged releases execute this module
+# inside the self-contained ``CortexNativeHost`` binary.
 try:
     from cortex.libs.config.ports import HTTP_API_PORT, WEBSOCKET_PORT
 except Exception:  # pragma: no cover - import-path dependent
@@ -41,10 +43,39 @@ except Exception:  # pragma: no cover - import-path dependent
 
 
 def log(msg: str) -> None:
-    """Append a debug line to the log file."""
+    """Append one bounded diagnostic line outside the signed app bundle.
+
+    Native messaging starts a fresh host for every ``sendNativeMessage`` call.
+    A persistent import failure therefore used to append full tracebacks forever
+    (the v0.3.14 failure produced a 61 MB file). Keep two 512 KiB backups and
+    never let logging interfere with the stdio protocol.
+    """
     try:
-        with open(LOG_FILE, "a") as f:
+        _LOG_DIRECTORY.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            _LOG_DIRECTORY.chmod(0o700)
+        except OSError:
+            pass
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size >= _LOG_MAX_BYTES:
+            oldest = LOG_FILE.with_name(f"{LOG_FILE.name}.{_LOG_BACKUP_COUNT}")
+            try:
+                oldest.unlink()
+            except FileNotFoundError:
+                pass
+            for index in range(_LOG_BACKUP_COUNT - 1, 0, -1):
+                source = LOG_FILE.with_name(f"{LOG_FILE.name}.{index}")
+                target = LOG_FILE.with_name(f"{LOG_FILE.name}.{index + 1}")
+                try:
+                    source.replace(target)
+                except FileNotFoundError:
+                    pass
+            LOG_FILE.replace(LOG_FILE.with_name(f"{LOG_FILE.name}.1"))
+        with LOG_FILE.open("a", encoding="utf-8") as f:
             f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+        try:
+            LOG_FILE.chmod(0o600)
+        except OSError:
+            pass
     except Exception:
         pass
 

@@ -8,11 +8,9 @@
  * Python/TypeScript field-name drift fails at this boundary.
  */
 
-import { decodeGetAuthTokenResponse } from "./native-contract";
+import { sendNativeHostMessage } from "./native-messaging";
 
 const SESSION_KEY = "cortex_auth_token";
-const NATIVE_APP = "com.cortex.launcher";
-
 let inFlight: Promise<string> | null = null;
 
 interface SessionGetResult {
@@ -45,24 +43,14 @@ async function writeCachedToken(token: string): Promise<void> {
 }
 
 async function fetchFromNativeHost(): Promise<string> {
-  return new Promise((resolve, reject) => {
-    try {
-      chrome.runtime.sendNativeMessage(
-        NATIVE_APP,
-        { command: "get_auth_token" },
-        (resp: unknown) => {
-          try {
-            const response = decodeGetAuthTokenResponse(resp);
-            resolve(response.auth_token);
-          } catch (error) {
-            reject(error instanceof Error ? error : new Error(String(error)));
-          }
-        },
-      );
-    } catch (err) {
-      reject(err instanceof Error ? err : new Error(String(err)));
-    }
-  });
+  const response = await sendNativeHostMessage(
+    { command: "get_auth_token" },
+    { timeoutMs: 8_000 },
+  );
+  if (response.command !== "get_auth_token") {
+    throw new Error("unexpected_native_host_response");
+  }
+  return response.auth_token;
 }
 
 /**

@@ -46,6 +46,7 @@ check_node_version() {
 CORTEX_VERSION=$("${PYTHON_BIN}" -m cortex.scripts.sync_versions --print)
 ARTIFACT_ARCH="${CORTEX_ARTIFACT_ARCH:-$(uname -m)}"
 REQUIRE_NOTARIZATION="${CORTEX_REQUIRE_NOTARIZATION:-0}"
+SKIP_APP_PROBES="${CORTEX_SKIP_APP_PROBES:-0}"
 SIGN_IDENTITY="${CORTEX_SIGN_IDENTITY:--}"
 EVIDENCE_DIR="${CORTEX_RELEASE_EVIDENCE_DIR:-${DIST_DIR}/evidence-${ARTIFACT_ARCH}}"
 
@@ -59,6 +60,10 @@ esac
 if [ "${REQUIRE_NOTARIZATION}" = "1" ]; then
     if [ "${SIGN_IDENTITY}" = "-" ] || [ -z "${CORTEX_NOTARIZE_PROFILE:-}" ]; then
         echo "[FATAL] Production release requires CORTEX_SIGN_IDENTITY and CORTEX_NOTARIZE_PROFILE" >&2
+        exit 1
+    fi
+    if [ "${SKIP_APP_PROBES}" = "1" ]; then
+        echo "[FATAL] Production notarized builds cannot skip app executable probes" >&2
         exit 1
     fi
 fi
@@ -306,6 +311,11 @@ if [ ! -d "${APP_PATH}" ]; then
     echo "ERROR: App bundle not found at ${APP_PATH}" >&2
     exit 1
 fi
+NATIVE_HOST_PATH="${APP_PATH}/Contents/MacOS/CortexNativeHost"
+if [ ! -x "${NATIVE_HOST_PATH}" ]; then
+    echo "ERROR: Self-contained native messaging host not found at ${NATIVE_HOST_PATH}" >&2
+    exit 1
+fi
 
 # Inject .icns if available
 if [ -f "${ICON_ICNS}" ]; then
@@ -332,12 +342,26 @@ if [ "${SIGN_IDENTITY}" = "-" ]; then
     if [ -n "${PYTHON_FW}" ]; then
         codesign --force --sign - "${PYTHON_FW}"
     fi
-    # Sign main executable and bundle
+    # Sign both executable entry points and then the bundle. The native host is
+    # invoked directly by Chrome/Edge, so it needs a valid nested signature of
+    # its own even though it shares the app's Frameworks directory.
+    codesign --force --sign - "${NATIVE_HOST_PATH}"
     codesign --force --sign - --entitlements "${ENTITLEMENTS}" "${APP_PATH}/Contents/MacOS/Cortex"
     codesign --force --sign - --entitlements "${ENTITLEMENTS}" "${APP_PATH}"
 else
-    # Developer ID: use --deep --options runtime for notarization
+    # Developer ID: recursively establish valid nested signatures first. Then
+    # replace the native host's recursive signature without GUI hardware
+    # entitlements and reseal the outer app without --deep. This ordering keeps
+    # the final browser helper least-privileged while preserving the GUI's TCC
+    # declarations.
     codesign --force --options runtime --deep \
+        --sign "${SIGN_IDENTITY}" \
+        --entitlements "${ENTITLEMENTS}" \
+        "${APP_PATH}"
+    codesign --force --options runtime \
+        --sign "${SIGN_IDENTITY}" \
+        "${NATIVE_HOST_PATH}"
+    codesign --force --options runtime \
         --sign "${SIGN_IDENTITY}" \
         --entitlements "${ENTITLEMENTS}" \
         "${APP_PATH}"
@@ -352,12 +376,21 @@ if ! codesign --verify --deep --strict --verbose=2 "${APP_PATH}" \
     echo "[FATAL] codesign --verify failed for ${APP_PATH}" >&2
     exit 1
 fi
+if ! codesign --verify --strict --verbose=2 "${NATIVE_HOST_PATH}"; then
+    echo "[FATAL] codesign --verify failed for ${NATIVE_HOST_PATH}" >&2
+    exit 1
+fi
 spctl -a -vv --type execute "${APP_PATH}" \
     > "${EVIDENCE_DIR}/spctl-app.txt" 2>&1 || true
 
 BUILT_ARCHS=$(lipo -archs "${APP_PATH}/Contents/MacOS/Cortex")
 if [ "${BUILT_ARCHS}" != "${ARTIFACT_ARCH}" ]; then
     echo "[FATAL] Built architecture ${BUILT_ARCHS} does not equal ${ARTIFACT_ARCH}" >&2
+    exit 1
+fi
+NATIVE_HOST_ARCHS=$(lipo -archs "${NATIVE_HOST_PATH}")
+if [ "${NATIVE_HOST_ARCHS}" != "${ARTIFACT_ARCH}" ]; then
+    echo "[FATAL] Native host architecture ${NATIVE_HOST_ARCHS} does not equal ${ARTIFACT_ARCH}" >&2
     exit 1
 fi
 echo "${BUILT_ARCHS}" > "${EVIDENCE_DIR}/architectures.txt"
@@ -474,6 +507,9 @@ VERIFY_ARGS=(
 )
 if [ "${REQUIRE_NOTARIZATION}" = "1" ]; then
     VERIFY_ARGS+=(--require-notarized)
+fi
+if [ "${SKIP_APP_PROBES}" = "1" ]; then
+    VERIFY_ARGS+=(--skip-app-probes)
 fi
 "${PYTHON_BIN}" -m cortex.scripts.verify_macos_release "${VERIFY_ARGS[@]}"
 

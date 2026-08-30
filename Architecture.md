@@ -107,9 +107,11 @@ authority boundary.
 
 ## Release topology
 
-PyInstaller bundles the in-process daemon and desktop shell. Architecture-
+PyInstaller bundles the in-process daemon, desktop shell, and a separately
+signed self-contained `CortexNativeHost` stdin/stdout executable. Architecture-
 specific arm64/x86_64 DMGs include Chrome/Edge builds, VSIX, native-host
-installer, migrations, model/resource files, and a secret-free configuration.
+installer logic, migrations, model/resource files, and a secret-free
+configuration.
 Release tags require locked inputs, Developer ID hardened-runtime signing,
 Apple notarization/stapling, mounted-artifact smoke, SBOMs, checksums, and
 GitHub attestations. The tag commit must be reachable from `main`; promotion

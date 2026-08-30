@@ -31,8 +31,9 @@ describe("G2 CONNECTIVITY_DIAGNOSTIC emission", () => {
         const fake = installChromeFake();
         fake.runtime.sendNativeMessage = vi.fn(
             (_app: string, _msg: unknown, cb?: (r: unknown) => void) => {
-                if (cb) cb({ status: "ok", running: false });
-                return Promise.resolve({ status: "ok", running: false });
+                const response = { command: "status", status: "stopped" };
+                if (cb) cb(response);
+                return Promise.resolve(response);
             },
         );
 

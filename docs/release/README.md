@@ -79,8 +79,10 @@ For each architecture, the tag workflow:
 
 1. checks tag/version, generated schemas/docs/tokens, links, config keys, and
    the full Python/browser/editor gates from committed locks;
-2. builds Chrome, Edge, VSIX, then PyInstaller `Cortex.app`;
-3. signs the app with hardened runtime and verifies the signature;
+2. builds Chrome, Edge, VSIX, then PyInstaller `Cortex.app` with the dedicated
+   console-capable `CortexNativeHost` entry point;
+3. signs the native host and app with hardened runtime and verifies both
+   nested and outer signatures;
 4. creates `Cortex-<version>-macos-<arch>.dmg`, signs that outer disk image
    with the same Developer ID Application identity and a secure timestamp, and
    verifies the DMG signature before upload;
@@ -90,7 +92,8 @@ For each architecture, the tag workflow:
    OS/single architecture/signature, scans generic credential forms only in
    text-like members, scans exact exported secrets and actual non-generic build
    home roots across all bytes, and runs
-   `Cortex --release-smoke` before any UI/network/camera;
+   a framed native-host `status` exchange and `Cortex --release-smoke` before
+   any UI/network/camera;
 7. generates application SPDX and locked-Python CycloneDX SBOMs,
    architecture-specific `SHA256SUMS-<arch>`, `release-metadata.json`, and
    command evidence;
@@ -109,7 +112,7 @@ Run the same artifact verifier locally:
 
 ```bash
 uv run --project cortex --locked python -m cortex.scripts.verify_macos_release \
-  dist/Cortex-0.3.14-macos-arm64.dmg \
+  dist/Cortex-0.3.15-macos-arm64.dmg \
   --expected-arch arm64 \
   --require-notarized \
   --output dist/evidence-arm64/release-verification.json
@@ -123,13 +126,13 @@ the checksum file before running:
 
 ```bash
 shasum -a 256 -c SHA256SUMS-arm64
-gh attestation verify Cortex-0.3.14-macos-arm64.dmg \
+gh attestation verify Cortex-0.3.15-macos-arm64.dmg \
   --repo StevenWang-CY/cortex
-codesign --verify --strict --verbose=2 Cortex-0.3.14-macos-arm64.dmg
-codesign -dv --verbose=4 Cortex-0.3.14-macos-arm64.dmg
-xcrun stapler validate Cortex-0.3.14-macos-arm64.dmg
+codesign --verify --strict --verbose=2 Cortex-0.3.15-macos-arm64.dmg
+codesign -dv --verbose=4 Cortex-0.3.15-macos-arm64.dmg
+xcrun stapler validate Cortex-0.3.15-macos-arm64.dmg
 spctl -a -vv --type open --context context:primary-signature \
-  Cortex-0.3.14-macos-arm64.dmg
+  Cortex-0.3.15-macos-arm64.dmg
 ```
 
 The checksum file covers the DMG, metadata, SBOMs, verifier output, and command

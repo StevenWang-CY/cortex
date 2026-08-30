@@ -1,6 +1,6 @@
 # Security model
 
-Last reviewed: 2026-08-25.
+Last reviewed: 2026-08-30.
 
 Cortex is a local macOS application with browser/editor clients and optional
 cloud planning. Its security model is capability-based and fail-closed, but it
@@ -35,13 +35,21 @@ token or instrument the app is inside the threat boundary.
 
 ## Native messaging and macOS
 
-The native-host manifest has a deterministic extension allowlist and an
-installer-patched absolute interpreter path. Chrome/Edge must be fully
-restarted after manifest changes. Terminal.app foreground launch is a macOS
-TCC requirement for camera permission, not a privilege-separation boundary.
-Never reset global Camera TCC state. Bundled apps use the canonical installed
-path to avoid App Translocation ambiguity, and GUI-launched tools are resolved
-through known application-bundle paths rather than a shell `PATH`.
+Packaged native messaging uses the separately signed, self-contained
+`/Applications/Cortex.app/Contents/MacOS/CortexNativeHost` executable and has
+no external Python dependency. The installer writes one atomic manifest per
+browser with an exact browser-local extension allowlist, refuses untrusted
+manifest executable paths, and requires a real framed status response before
+reporting success. Chrome/Edge must be fully restarted after manifest changes.
+
+Source-development installs copy the host outside the checkout and patch its
+shebang to an absolute project interpreter. In that mode, Terminal.app
+foreground launch is a macOS TCC requirement for camera permission, not a
+privilege-separation boundary. Packaged launch opens the signed application so
+the GUI owns its TCC context. Never reset global Camera TCC state. Bundled apps
+use the canonical installed path to avoid App Translocation ambiguity, and
+GUI-launched tools are resolved through known application-bundle paths rather
+than a shell `PATH`.
 
 ## Browser and editor clients
 

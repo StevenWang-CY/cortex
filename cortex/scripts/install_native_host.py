@@ -16,15 +16,22 @@ Usage:
 
 from __future__ import annotations
 
-import glob
 import json
 import os
+import re
 import shutil
+import struct
 import subprocess
 import sys
+import tempfile
+from collections.abc import Iterable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 HOST_NAME = "com.cortex.launcher"
-NATIVE_HOST_DIR = os.path.expanduser(
+PACKAGED_HOST_EXECUTABLE = "CortexNativeHost"
+DEVELOPMENT_HOST_DIR = os.path.expanduser(
     "~/Library/Application Support/Cortex/NativeMessaging"
 )
 
@@ -57,109 +64,55 @@ BROWSER_PROFILES = {
     ),
 }
 
+_BROWSER_ALIASES = {
+    "chrome": "Google Chrome",
+    "google chrome": "Google Chrome",
+    "edge": "Microsoft Edge",
+    "microsoft edge": "Microsoft Edge",
+}
+
 # Keywords to identify the Cortex extension in browser profiles
 _CORTEX_KEYWORDS = ["cortex", "somatic", "biofeedback", "workspace engine"]
+_EXTENSION_ID_PATTERN = re.compile(r"^[a-p]{32}$")
 
 
-def _find_bundled_framework_python(project_root: str) -> str | None:
-    """Resolve the PyInstaller-bundled framework Python inside ``.app``.
+@dataclass(frozen=True)
+class NativeHostVerification:
+    """Observable state for one browser's native-host registration.
 
-    PyInstaller emits ``Python.framework`` under
-    ``Contents/Frameworks/Python.framework/Versions/<X.Y>/bin/pythonX.Y``.
-    The minor version (``<X.Y>``) tracks whatever interpreter built the
-    bundle, so it MUST NOT be hardcoded — bumping the Python pin in
-    pyproject.toml would silently break native-messaging launch. We glob
-    the ``Versions/*`` directory and pick the highest matching
-    ``pythonX.Y`` binary so the path keeps resolving across version bumps.
-
-    Returns an absolute path to an executable Python, or ``None`` if no
-    bundled framework Python is present (caller falls back to system
-    Python discovery).
+    A manifest merely existing is not proof that Chrome or Edge can execute its
+    target.  The desktop shell consumes this result so it can distinguish an
+    absent manifest, a malformed/stale manifest, and a host that completed a
+    real framed protocol round-trip.
     """
-    versions_dir = os.path.join(
-        project_root,
-        "Contents",
-        "Frameworks",
-        "Python.framework",
-        "Versions",
-    )
-    if not os.path.isdir(versions_dir):
-        return None
 
-    candidates: list[tuple[tuple[int, ...], str]] = []
-    for version_dir in glob.glob(os.path.join(versions_dir, "*")):
-        version_name = os.path.basename(version_dir)
-        # Skip the ``Current`` symlink and any non version-numbered entries.
-        if not version_name[:1].isdigit():
-            continue
-        python_bin = os.path.join(version_dir, "bin", f"python{version_name}")
-        if os.path.isfile(python_bin) and os.access(python_bin, os.X_OK):
-            try:
-                sort_key = tuple(int(p) for p in version_name.split("."))
-            except ValueError:
-                sort_key = (0,)
-            candidates.append((sort_key, os.path.abspath(python_bin)))
+    browser: str
+    manifest_path: Path
+    manifest_valid: bool
+    host_path: Path | None
+    host_executable: bool
+    host_responded: bool
+    extension_ids: tuple[str, ...]
+    error: str | None = None
 
-    if not candidates:
-        return None
-    # Highest version wins when multiple framework versions coexist.
-    candidates.sort()
-    return candidates[-1][1]
+    @property
+    def ok(self) -> bool:
+        return self.manifest_valid and self.host_executable and self.host_responded
 
 
 def _find_python(project_root: str | None = None) -> str:
-    """Find an absolute Python path for the native-host shebang.
+    """Find the absolute development interpreter for a source host script."""
 
-    Important: in bundled-app mode, ``sys.executable`` points to
-    ``.../Cortex.app/Contents/MacOS/Cortex`` (the app executable), not a
-    Python interpreter. Native messaging must point to a real Python binary.
-    """
+    if getattr(sys, "frozen", False) or _is_app_bundle(project_root):
+        raise RuntimeError(
+            "Packaged native messaging must use CortexNativeHost, not an "
+            "external Python interpreter"
+        )
+
     # Explicit override for power users / debugging.
     env_python = os.environ.get("CORTEX_NATIVE_HOST_PYTHON")
     if env_python and os.path.isfile(env_python) and os.access(env_python, os.X_OK):
         return os.path.abspath(env_python)
-
-    requested_app_bundle = bool(project_root and project_root.endswith(".app"))
-
-    # Frozen app OR explicit .app target: do not use sys.executable
-    # (bundled binary) and avoid dev-venv coupling.
-    if getattr(sys, "frozen", False) or requested_app_bundle:
-        # Audit-2 fix: macOS 12.3+ ships ``/usr/bin/python3`` only as a
-        # Command Line Tools shim that prompts to install Xcode when
-        # exec'd. ``os.path.isfile`` passes on the shim — but native
-        # messaging silently fails the first time Chrome tries to run
-        # it. Prefer the bundled framework Python (PyInstaller emits
-        # one under Contents/Frameworks/) before falling back to system
-        # Python, and only use ``/usr/bin/python3`` when we can verify
-        # it executes (not just exists).
-        if requested_app_bundle and project_root:
-            framework_py = _find_bundled_framework_python(project_root)
-            if framework_py is not None:
-                return framework_py
-        for candidate in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3"):
-            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-                return candidate
-        found = shutil.which("python3")
-        if found:
-            return os.path.abspath(found)
-        # ``/usr/bin/python3`` is only a CLT installer stub on a fresh
-        # Mac. Only use it after probing that it actually runs.
-        usr_bin = "/usr/bin/python3"
-        if os.path.isfile(usr_bin):
-            try:
-                import subprocess
-
-                subprocess.check_call(
-                    [usr_bin, "-c", "import sys"],
-                    timeout=2.0,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                return usr_bin
-            except Exception:
-                # Falls through — caller should surface a setup error.
-                pass
-        return "/usr/bin/python3"
 
     # Dev checkout: prefer local venv.
     dev_root = os.path.dirname(
@@ -196,23 +149,110 @@ def _patch_shebang(script_path: str, python_path: str) -> None:
 
 
 def _is_app_bundle(project_root: str | None) -> bool:
-    return bool(project_root and project_root.endswith(".app"))
+    if not project_root:
+        return False
+    return Path(project_root.rstrip(os.sep)).suffix.lower() == ".app"
+
+
+def _packaged_host_path(project_root: str) -> str:
+    """Return the signed native-host executable embedded in ``Cortex.app``."""
+
+    return os.path.abspath(
+        os.path.join(
+            project_root,
+            "Contents",
+            "MacOS",
+            PACKAGED_HOST_EXECUTABLE,
+        )
+    )
+
+
+def _probe_native_host(host_path: str, *, timeout: float = 8.0) -> dict[str, Any]:
+    """Require a real native-messaging ``status`` round-trip.
+
+    Chrome and Edge execute the manifest's path directly and exchange framed
+    JSON over stdio.  Running the same contract here catches missing dynamic
+    libraries, invalid shebangs, broken imports, non-executable files, and
+    malformed stdout before a manifest is ever reported as installed.  The
+    ``status`` command is side-effect-free: it does not launch Cortex or touch
+    camera hardware.
+    """
+
+    request_body = json.dumps({"command": "status"}, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    framed_request = struct.pack("<I", len(request_body)) + request_body
+    try:
+        completed = subprocess.run(
+            [
+                host_path,
+                f"chrome-extension://{FIXED_EXTENSION_ID}/",
+            ],
+            input=framed_request,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"native host could not be executed: {exc}") from exc
+
+    stderr = completed.stderr.decode("utf-8", errors="replace")[-4096:].strip()
+    if completed.returncode != 0:
+        detail = f": {stderr}" if stderr else ""
+        raise RuntimeError(
+            f"native host exited with code {completed.returncode}{detail}"
+        )
+    if len(completed.stdout) < 4:
+        detail = f"; stderr: {stderr}" if stderr else ""
+        raise RuntimeError(f"native host returned no framed response{detail}")
+
+    response_length = struct.unpack("<I", completed.stdout[:4])[0]
+    response_bytes = completed.stdout[4:]
+    if response_length != len(response_bytes):
+        raise RuntimeError(
+            "native host response length mismatch "
+            f"(declared {response_length}, received {len(response_bytes)})"
+        )
+    try:
+        response = json.loads(response_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("native host returned invalid JSON") from exc
+    if not isinstance(response, dict):
+        raise RuntimeError("native host response was not an object")
+    if response.get("command") != "status" or response.get("status") not in {
+        "running",
+        "stopped",
+    }:
+        raise RuntimeError(f"native host returned an invalid status response: {response!r}")
+    return response
 
 
 def _prepare_host_script(source_script: str, *, project_root: str | None = None) -> str:
     """Prepare the executable host script path for the browser manifest.
 
-    In packaged mode this deliberately copies the script outside
-    ``/Applications/Cortex.app`` before patching its shebang. Mutating files
-    inside the app bundle can invalidate code signatures and can fail for
-    non-admin installs.
+    Packaged releases use a dedicated PyInstaller executable embedded in the
+    signed app.  They must never fall back to a Homebrew/Xcode interpreter:
+    those interpreters do not contain the frozen ``cortex`` package.  Source
+    checkouts retain the absolute-shebang development path.
     """
     if _is_app_bundle(project_root):
-        os.makedirs(NATIVE_HOST_DIR, exist_ok=True)
-        host_script = os.path.join(NATIVE_HOST_DIR, "native_host.py")
-        shutil.copyfile(source_script, host_script)
-    else:
-        host_script = source_script
+        assert project_root is not None
+        packaged_host = _packaged_host_path(project_root)
+        if not os.path.isfile(packaged_host):
+            raise RuntimeError(
+                "Packaged native host is missing from Cortex.app: "
+                f"{packaged_host}"
+            )
+        if not os.access(packaged_host, os.X_OK):
+            raise RuntimeError(f"Packaged native host is not executable: {packaged_host}")
+        _probe_native_host(packaged_host)
+        print(f"Native host: {packaged_host}")
+        print("Runtime:     self-contained signed executable")
+        return packaged_host
+
+    os.makedirs(DEVELOPMENT_HOST_DIR, exist_ok=True)
+    host_script = os.path.join(DEVELOPMENT_HOST_DIR, "native_host.py")
+    shutil.copyfile(source_script, host_script)
 
     python_path = _find_python(project_root=project_root)
     _patch_shebang(host_script, python_path)
@@ -256,9 +296,18 @@ def _scan_browser_for_cortex_ids(browser_root: str) -> set[str]:
     """
     ids: set[str] = set()
 
+    root = Path(browser_root)
     profile_dirs = ["Default"]
-    for i in range(1, 10):
-        profile_dirs.append(f"Profile {i}")
+    try:
+        profile_dirs.extend(
+            sorted(
+                entry.name
+                for entry in root.iterdir()
+                if entry.is_dir() and entry.name.startswith("Profile ")
+            )
+        )
+    except OSError:
+        pass
 
     for profile in profile_dirs:
         for pref_file in ["Secure Preferences", "Preferences"]:
@@ -268,10 +317,36 @@ def _scan_browser_for_cortex_ids(browser_root: str) -> set[str]:
             try:
                 with open(pref_path) as f:
                     data = json.load(f)
-                exts = data.get("extensions", {}).get("settings", {})
+                if not isinstance(data, dict):
+                    continue
+                extensions = data.get("extensions")
+                if not isinstance(extensions, dict):
+                    continue
+                exts = extensions.get("settings")
+                if not isinstance(exts, dict):
+                    continue
                 for ext_id, info in exts.items():
-                    name = info.get("manifest", {}).get("name", "")
+                    if (
+                        not isinstance(ext_id, str)
+                        or _EXTENSION_ID_PATTERN.fullmatch(ext_id) is None
+                        or not isinstance(info, dict)
+                    ):
+                        continue
+                    # The release key makes this ID deterministic. Recognise it
+                    # even when Chromium stores a localised ``__MSG_*`` name or
+                    # omits the unpacked path from Preferences.
+                    if ext_id == FIXED_EXTENSION_ID:
+                        ids.add(ext_id)
+                        continue
+                    embedded_manifest = info.get("manifest")
+                    name = (
+                        embedded_manifest.get("name", "")
+                        if isinstance(embedded_manifest, dict)
+                        else ""
+                    )
                     path = info.get("path", "")
+                    if not isinstance(name, str) or not isinstance(path, str):
+                        continue
                     searchable = (name + " " + path).lower()
                     if any(kw in searchable for kw in _CORTEX_KEYWORDS):
                         ids.add(ext_id)
@@ -281,31 +356,237 @@ def _scan_browser_for_cortex_ids(browser_root: str) -> set[str]:
     return ids
 
 
-def install(*, project_root: str | None = None) -> bool:
+def _canonical_browser_name(browser: str) -> str:
+    canonical = _BROWSER_ALIASES.get(browser.strip().lower(), browser.strip())
+    if canonical not in BROWSER_PROFILES:
+        supported = ", ".join(sorted(BROWSER_PROFILES))
+        raise ValueError(f"Unsupported Chromium browser {browser!r}; expected one of {supported}")
+    return canonical
+
+
+def _selected_browsers(target_browsers: Iterable[str] | None) -> tuple[str, ...]:
+    if target_browsers is None:
+        return tuple(
+            browser
+            for browser, browser_root in BROWSER_PROFILES.items()
+            if os.path.isdir(browser_root)
+        )
+    canonical = {_canonical_browser_name(browser) for browser in target_browsers}
+    return tuple(browser for browser in BROWSER_PROFILES if browser in canonical)
+
+
+def _manifest_path(browser: str) -> Path:
+    canonical = _canonical_browser_name(browser)
+    return (
+        Path(BROWSER_PROFILES[canonical])
+        / "NativeMessagingHosts"
+        / f"{HOST_NAME}.json"
+    )
+
+
+def _write_manifest_atomic(path: Path, manifest: dict[str, Any]) -> None:
+    """Write one host manifest atomically with browser-readable permissions."""
+
+    path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    temporary_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_name = handle.name
+            json.dump(manifest, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_name, 0o644)
+        os.replace(temporary_name, path)
+        temporary_name = None
+    finally:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+
+
+def _trusted_host_paths() -> set[Path]:
+    """Return the only host locations Cortex itself can provision."""
+
+    return {
+        Path(DEVELOPMENT_HOST_DIR).resolve() / "native_host.py",
+        (
+            Path("/Applications/Cortex.app/Contents/MacOS")
+            / PACKAGED_HOST_EXECUTABLE
+        ).resolve(),
+    }
+
+
+def verify_browser_installation(
+    browser: str,
+    *,
+    expected_host_path: str | Path | None = None,
+) -> NativeHostVerification:
+    """Validate one browser manifest and execute its registered host.
+
+    This is deliberately stronger than ``Path.exists()``.  It checks the
+    manifest contract, every Cortex origin currently found in that browser,
+    executable permissions, and a framed ``status`` response from the exact
+    path the browser will launch.
+    """
+
+    canonical = _canonical_browser_name(browser)
+    browser_root = BROWSER_PROFILES[canonical]
+    manifest_path = _manifest_path(canonical)
+    extension_ids = tuple(sorted(_scan_browser_for_cortex_ids(browser_root)))
+    required_ids = {FIXED_EXTENSION_ID, *extension_ids}
+    required_origins = {f"chrome-extension://{extension_id}/" for extension_id in required_ids}
+
+    if not manifest_path.is_file():
+        return NativeHostVerification(
+            browser=canonical,
+            manifest_path=manifest_path,
+            manifest_valid=False,
+            host_path=None,
+            host_executable=False,
+            host_responded=False,
+            extension_ids=extension_ids,
+            error="native messaging manifest is missing",
+        )
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return NativeHostVerification(
+            browser=canonical,
+            manifest_path=manifest_path,
+            manifest_valid=False,
+            host_path=None,
+            host_executable=False,
+            host_responded=False,
+            extension_ids=extension_ids,
+            error=f"native messaging manifest is unreadable: {exc}",
+        )
+
+    raw_host_path = payload.get("path") if isinstance(payload, dict) else None
+    host_path = Path(raw_host_path) if isinstance(raw_host_path, str) else None
+    origins = payload.get("allowed_origins") if isinstance(payload, dict) else None
+    origin_set = set(origins) if isinstance(origins, list) and all(
+        isinstance(origin, str) for origin in origins
+    ) else set()
+    trusted_paths = (
+        {Path(expected_host_path).resolve()}
+        if expected_host_path is not None
+        else _trusted_host_paths()
+    )
+    normalized_host_path = (
+        host_path.resolve() if host_path is not None and host_path.is_absolute() else None
+    )
+    manifest_valid = bool(
+        isinstance(payload, dict)
+        and payload.get("name") == HOST_NAME
+        and payload.get("type") == "stdio"
+        and host_path is not None
+        and host_path.is_absolute()
+        and normalized_host_path in trusted_paths
+        and origin_set == required_origins
+        and isinstance(origins, list)
+        and len(origins) == len(origin_set)
+    )
+    if not manifest_valid:
+        return NativeHostVerification(
+            browser=canonical,
+            manifest_path=manifest_path,
+            manifest_valid=False,
+            host_path=host_path,
+            host_executable=False,
+            host_responded=False,
+            extension_ids=extension_ids,
+            error="native messaging manifest has stale or invalid fields",
+        )
+
+    assert host_path is not None
+    host_executable = host_path.is_file() and os.access(host_path, os.X_OK)
+    if not host_executable:
+        return NativeHostVerification(
+            browser=canonical,
+            manifest_path=manifest_path,
+            manifest_valid=True,
+            host_path=host_path,
+            host_executable=False,
+            host_responded=False,
+            extension_ids=extension_ids,
+            error=f"registered native host is missing or not executable: {host_path}",
+        )
+    try:
+        _probe_native_host(str(host_path))
+    except RuntimeError as exc:
+        return NativeHostVerification(
+            browser=canonical,
+            manifest_path=manifest_path,
+            manifest_valid=True,
+            host_path=host_path,
+            host_executable=True,
+            host_responded=False,
+            extension_ids=extension_ids,
+            error=str(exc),
+        )
+    return NativeHostVerification(
+        browser=canonical,
+        manifest_path=manifest_path,
+        manifest_valid=True,
+        host_path=host_path,
+        host_executable=True,
+        host_responded=True,
+        extension_ids=extension_ids,
+    )
+
+
+def install(
+    *,
+    project_root: str | None = None,
+    target_browsers: Iterable[str] | None = None,
+) -> bool:
     """Install the native messaging host manifest for all detected browsers.
 
     Args:
-        project_root: Override the project root directory.  Used by the
+        project_root: Override the project root directory. Used by the
             desktop app's ConnectionsPanel to pass the canonical
             ``/Applications/Cortex.app`` path instead of the running
             (possibly translocated) path.
+        target_browsers: Optional browser display names. When supplied, the
+            corresponding user-data roots are created even before first browser
+            launch. This prevents a Connect Chrome action from succeeding only
+            because an unrelated Edge profile happened to exist.
     """
     if project_root is not None:
-        script_dir = os.path.join(project_root, "Contents", "Resources", "cortex", "scripts")
+        # Packaged mode resolves the dedicated executable in Contents/MacOS.
+        # ``source_script`` remains an inert compatibility argument to keep the
+        # source/dev preparation helper's API narrow.
+        host_script = os.path.join(
+            project_root,
+            "Contents",
+            "Resources",
+            "cortex",
+            "scripts",
+            "native_host.py",
+        )
     else:
         script_dir = os.path.dirname(os.path.abspath(__file__))
-    host_script = os.path.join(script_dir, "native_host.py")
+        host_script = os.path.join(script_dir, "native_host.py")
 
-    if not os.path.exists(host_script):
+    if project_root is None and not os.path.exists(host_script):
         print(f"Error: Native host script not found at {host_script}")
-        if project_root is None:
-            sys.exit(1)
-        return False
+        sys.exit(1)
 
     host_script = _prepare_host_script(host_script, project_root=project_root)
 
-    # Collect all extension IDs: fixed + auto-detected from browser profiles
-    all_ids: set[str] = {FIXED_EXTENSION_ID}
+    # Collect browser-local extension IDs. A Chrome-only legacy extension ID
+    # must never be authorised in Edge (or vice versa).
+    detected_ids: dict[str, set[str]] = {}
 
     print()
     print("Scanning browser profiles for existing Cortex extensions...")
@@ -314,36 +595,29 @@ def install(*, project_root: str | None = None) -> bool:
             continue
         found = _scan_browser_for_cortex_ids(browser_root)
         if found:
-            all_ids.update(found)
+            detected_ids[browser] = found
             for eid in found:
                 print(f"  Found in {browser}: {eid}")
-
-    allowed_origins = [f"chrome-extension://{eid}/" for eid in sorted(all_ids)]
-
-    print()
-    print(f"Extension IDs ({len(all_ids)}): {', '.join(sorted(all_ids))}")
     print()
 
-    manifest = {
-        "name": HOST_NAME,
-        "description": "Cortex daemon launcher for browser extension",
-        "path": host_script,
-        "type": "stdio",
-        "allowed_origins": allowed_origins,
-    }
+    selected_browsers = _selected_browsers(target_browsers)
+    installed_browsers: list[str] = []
 
-    installed_browsers = []
-
-    for browser, browser_root in BROWSER_PROFILES.items():
-        if not os.path.isdir(browser_root):
-            continue
-
-        host_dir = os.path.join(browser_root, "NativeMessagingHosts")
-        os.makedirs(host_dir, exist_ok=True)
-        manifest_path = os.path.join(host_dir, f"{HOST_NAME}.json")
-
-        with open(manifest_path, "w") as f:
-            json.dump(manifest, f, indent=2)
+    for browser in selected_browsers:
+        browser_ids = {FIXED_EXTENSION_ID, *detected_ids.get(browser, set())}
+        allowed_origins = [
+            f"chrome-extension://{extension_id}/"
+            for extension_id in sorted(browser_ids)
+        ]
+        manifest = {
+            "name": HOST_NAME,
+            "description": "Cortex daemon launcher for browser extension",
+            "path": host_script,
+            "type": "stdio",
+            "allowed_origins": allowed_origins,
+        }
+        manifest_path = _manifest_path(browser)
+        _write_manifest_atomic(manifest_path, manifest)
 
         installed_browsers.append(browser)
         print(f"  Installed for {browser}")
@@ -353,7 +627,22 @@ def install(*, project_root: str | None = None) -> bool:
         return False
     else:
         print()
-        print(f"Installed for {len(installed_browsers)} browser(s). No manual configuration needed.")
+        failed_verifications: list[str] = []
+        for browser in installed_browsers:
+            verification = verify_browser_installation(
+                browser,
+                expected_host_path=host_script,
+            )
+            if not verification.ok:
+                failed_verifications.append(
+                    f"{browser}: {verification.error or 'verification failed'}"
+                )
+        if failed_verifications:
+            raise RuntimeError(
+                "Native messaging installation did not pass its protocol probe: "
+                + "; ".join(failed_verifications)
+            )
+        print(f"Installed and verified for {len(installed_browsers)} browser(s).")
         print()
         print("IMPORTANT: Restart your browser (Cmd+Q, reopen) for changes to take effect.")
         return True

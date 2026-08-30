@@ -58,8 +58,6 @@ def inspect_release_resources(root: Path, *, frozen: bool) -> ReleaseSmokeReport
             "defaults": root / "cortex/libs/config/defaults.yaml",
             "migration_0001": root / "cortex/storage/migrations/0001_initial.sql",
             "migration_0002": root / "cortex/storage/migrations/0002.sql",
-            "native_host": root / "cortex/scripts/native_host.py",
-            "native_host_installer": root / "cortex/scripts/install_native_host.py",
             "face_landmarker": root / "cortex/models/face_landmarker.task",
             "audio_box": root / "cortex/assets/audio/box_4s.wav",
             "font_display": (

@@ -129,6 +129,7 @@ export function connectivityViewModel(input: {
     expectedVersion: string;
     daemonVersion: string | null;
     handshakeError: string | null;
+    nativeHostError?: string | null;
 }): ConnectivityViewModel {
     if (input.launching) {
         return {
@@ -141,10 +142,13 @@ export function connectivityViewModel(input: {
         };
     }
     if (input.state === "not_installed") {
+        const diagnostic = input.nativeHostError
+            ? ` Browser check: ${input.nativeHostError}.`
+            : "";
         return {
-            title: "Native host not installed",
-            body: "Cortex needs its native messaging host registered. Run `python -m cortex.scripts.install_native_host` once, then relaunch your browser.",
-            ctaLabel: "Open install instructions",
+            title: "Browser bridge unavailable",
+            body: "Open Cortex → Connect Extensions, choose this browser, and finish the setup steps. Fully quit the browser with Cmd+Q before reopening it." + diagnostic,
+            ctaLabel: "Open connection guide",
             action: "install",
             testId: "conn-state-not_installed",
             disabled: false,

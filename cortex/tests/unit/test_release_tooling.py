@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,7 @@ from cortex.scripts.verify_macos_release import (
     _headless_camera_activity_markers,
     _mounted_app_signature_verification,
     _notarized_container_verification_commands,
+    _probe_native_host_executable,
     _remove_detached_mountpoint,
     _scan_forbidden,
     _verify_installer_layout,
@@ -193,6 +195,50 @@ def test_macos_builder_keeps_temporary_env_inputs_outside_checkout() -> None:
     )
     assert 'cp "${BUNDLED_ENV_PATH}" "${ROOT_DIR}/.env"' in build_script
     assert '--require-clean' in build_script
+
+
+def test_macos_builder_signs_and_architecture_checks_native_host() -> None:
+    build_script = (_ROOT / "cortex/scripts/build_macos_app.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'NATIVE_HOST_PATH="${APP_PATH}/Contents/MacOS/CortexNativeHost"' in (
+        build_script
+    )
+    assert 'if [ ! -x "${NATIVE_HOST_PATH}" ]; then' in build_script
+    assert 'codesign --force --sign - "${NATIVE_HOST_PATH}"' in build_script
+    assert 'codesign --verify --strict --verbose=2 "${NATIVE_HOST_PATH}"' in (
+        build_script
+    )
+    assert 'NATIVE_HOST_ARCHS=$(lipo -archs "${NATIVE_HOST_PATH}")' in build_script
+    assert "Production notarized builds cannot skip app executable probes" in (
+        build_script
+    )
+
+
+def test_production_signing_reseals_least_privileged_native_host() -> None:
+    build_script = (_ROOT / "cortex/scripts/build_macos_app.sh").read_text(
+        encoding="utf-8"
+    )
+    verifier = (_ROOT / "cortex/scripts/verify_macos_release.py").read_text(
+        encoding="utf-8"
+    )
+    production_start = build_script.index("else\n    # Developer ID:")
+    production_end = build_script.index("\nfi\n", production_start)
+    production_block = build_script[production_start:production_end]
+
+    deep_index = production_block.index("--deep")
+    helper_index = production_block.index('"${NATIVE_HOST_PATH}"', deep_index)
+    final_outer_index = production_block.rindex('"${APP_PATH}"')
+
+    assert deep_index < helper_index < final_outer_index
+    assert "--deep" not in production_block[helper_index:final_outer_index]
+    for entitlement in (
+        "com.apple.security.device.camera",
+        "com.apple.security.device.audio-input",
+        "com.apple.security.automation.apple-events",
+    ):
+        assert entitlement in verifier
 
 
 def test_production_macos_builder_signs_outer_dmg_before_notarization() -> None:
@@ -579,6 +625,45 @@ def test_macos_spec_packages_bundled_display_fonts() -> None:
 
     assert 'CORTEX / "assets" / "fonts"' in spec
     assert '"cortex/assets/fonts"' in spec
+
+
+def test_macos_spec_builds_console_native_host_as_a_nested_executable() -> None:
+    spec = (_ROOT / "cortex/scripts/cortex.spec").read_text(encoding="utf-8")
+
+    assert '[str(CORTEX / "scripts" / "native_host.py")]' in spec
+    assert 'name="CortexNativeHost"' in spec
+    native_exe = spec[spec.index("native_host_exe = EXE(") :]
+    assert "console=True" in native_exe
+    collect = spec[spec.index("coll = COLLECT(") :]
+    assert "native_host_exe" in collect
+    assert "native_host_a.binaries" in collect
+    assert "native_host_a.datas" in collect
+
+
+def test_release_native_host_probe_validates_real_framing(tmp_path: Path) -> None:
+    host = tmp_path / "CortexNativeHost"
+    host.write_text(
+        f"""#!{sys.executable}
+import json
+import struct
+import sys
+size = struct.unpack('<I', sys.stdin.buffer.read(4))[0]
+request = json.loads(sys.stdin.buffer.read(size))
+response = json.dumps({{'command': request['command'], 'status': 'stopped'}}).encode()
+sys.stdout.buffer.write(struct.pack('<I', len(response)) + response)
+sys.stdout.buffer.flush()
+""",
+        encoding="utf-8",
+    )
+    host.chmod(0o755)
+
+    evidence = _probe_native_host_executable(
+        host,
+        base_env={"PATH": "/usr/bin:/bin", "TMPDIR": str(tmp_path)},
+    )
+
+    assert evidence["response"] == {"command": "status", "status": "stopped"}
+    assert evidence["returncode"] == 0
 
 
 def test_settings_slider_stylesheet_has_balanced_rule_boundaries() -> None:
