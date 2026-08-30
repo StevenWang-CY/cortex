@@ -30,6 +30,7 @@ from cortex.services.capture_service.pipeline import CapturePipeline
 from cortex.services.capture_service.webcam import (
     CameraSelection,
     CapturedFrame,
+    MacCameraDevice,
     WebcamCapture,
     open_video_capture,
 )
@@ -37,12 +38,17 @@ from cortex.services.capture_service.webcam import (
 _BOOT = UUID("11111111-1111-1111-1111-111111111111")
 
 
-def _identity(name: str = "FaceTime HD Camera", device_id: int = 0) -> CameraIdentity:
+def _identity(
+    name: str = "FaceTime HD Camera",
+    device_id: int = 0,
+    device_key: str | None = "builtin-camera-a",
+) -> CameraIdentity:
     return CameraSelection(
         device_id=device_id,
         backend=None,
         source="builtin_mac_camera",
         device_name=name,
+        device_key=device_key,
     ).identity(width=640, height=480)
 
 
@@ -413,7 +419,11 @@ async def test_webcam_failed_read_and_success_are_both_sequenced_observations() 
 def test_camera_identity_survives_index_reorder_but_changes_with_device() -> None:
     first = _identity(device_id=0)
     reordered = _identity(device_id=3)
-    external = _identity(name="Logitech BRIO", device_id=0)
+    external = _identity(
+        name="FaceTime HD Camera",
+        device_id=0,
+        device_key="builtin-camera-b",
+    )
     assert first.identity_key == reordered.identity_key
     assert first.device_id != reordered.device_id
     assert first.identity_key != external.identity_key
@@ -441,8 +451,23 @@ def test_post_open_continuity_wake_is_rejected_and_live_name_is_exposed() -> Non
             return_value=iter(candidates),
         ),
         patch(
-            "cortex.services.capture_service.webcam._list_macos_video_device_names",
-            return_value=["Test User's iPhone Camera", "FaceTime HD Camera"],
+            "cortex.services.capture_service.webcam._list_macos_video_devices",
+            return_value=[
+                MacCameraDevice(
+                    index=0,
+                    name="Studio Camera",
+                    device_key="continuity-camera",
+                    is_continuity=True,
+                    is_connected=True,
+                ),
+                MacCameraDevice(
+                    index=1,
+                    name="FaceTime HD Camera",
+                    device_key="builtin-camera-a",
+                    is_continuity=False,
+                    is_connected=True,
+                ),
+            ],
         ),
         patch(
             "cortex.services.capture_service.webcam.cv2.VideoCapture",
@@ -455,6 +480,7 @@ def test_post_open_continuity_wake_is_rejected_and_live_name_is_exposed() -> Non
     assert selection is not None
     assert selection.device_id == 1
     assert selection.device_name == "FaceTime HD Camera"
+    assert selection.device_key == "builtin-camera-a"
     iphone.release.assert_called_once()
 
 

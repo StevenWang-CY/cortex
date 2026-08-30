@@ -1955,10 +1955,10 @@ export function injectOverlay(
 </style>
 
 <div class="bk" id="bk"></div>
-<div class="pn${isUpdate ? " cx-update" : ""}">
+<div class="pn${isUpdate ? " cx-update" : ""}" role="region" aria-labelledby="cortex-intervention-title" aria-describedby="cortex-intervention-summary">
   <button class="xb" id="xb" type="button" aria-label="Dismiss intervention"><svg viewBox="0 0 10 10" fill="none"><path d="M1 1l8 8M9 1l-8 8"/></svg></button>
-  <div class="hd">${esc(headline)}</div>
-  <div class="ds">${esc(summary)}</div>
+  <div class="hd" id="cortex-intervention-title" role="heading" aria-level="2">${esc(headline)}</div>
+  <div class="ds" id="cortex-intervention-summary" aria-live="polite">${esc(summary)}</div>
   <div class="dv"></div>
   ${closingHtml ? `<div class="sh">Review ${closeCount} tab suggestion${closeCount !== 1 ? "s" : ""}</div>${closingHtml}` : ""}
   ${keepCount > 0 ? `<div class="kn">Keeping <span class="kc">${keepCount}</span> you need</div>` : ""}
@@ -2081,6 +2081,7 @@ export function injectLockoutOverlay(payload: Record<string, unknown>): void {
     const OID = "cortex-lockout-overlay";
     type ManagedLockoutHost = HTMLElement & {
         __cortexCleanup?: () => void;
+        __cortexPreviousFocus?: HTMLElement | null;
     };
     const existingHost = document.getElementById(OID) as ManagedLockoutHost | null;
     existingHost?.__cortexCleanup?.();
@@ -2100,6 +2101,11 @@ export function injectLockoutOverlay(payload: Record<string, unknown>): void {
     }
 
     const host = (existingHost ?? document.createElement("div")) as ManagedLockoutHost;
+    const previousFocus = existingHost?.__cortexPreviousFocus
+        ?? (document.activeElement instanceof HTMLElement
+            ? document.activeElement
+            : null);
+    host.__cortexPreviousFocus = previousFocus;
     if (!existingHost) {
         host.id = OID;
         host.style.cssText =
@@ -2139,10 +2145,10 @@ export function injectLockoutOverlay(payload: Record<string, unknown>): void {
 @media (prefers-reduced-motion:reduce){.pn,.bk{animation:none!important}.sk{transition:color 120ms cubic-bezier(.23,1,.32,1),border-color 120ms cubic-bezier(.23,1,.32,1)!important}.sk:active{transform:none}}
 </style>
 <div class="bk" id="bk"></div>
-<div class="pn${isUpdate ? " cx-update" : ""}" role="dialog" aria-modal="true" aria-labelledby="cortex-lockout-title">
+<div class="pn${isUpdate ? " cx-update" : ""}" role="dialog" aria-modal="true" aria-labelledby="cortex-lockout-title" aria-describedby="cortex-lockout-reason cortex-lockout-countdown">
   <div class="hd" id="cortex-lockout-title">Lockout Active</div>
-  <div class="rs">${esc(reason)}</div>
-  <div class="tm" id="countdown">${formatCountdown(durationS)}</div>
+  <div class="rs" id="cortex-lockout-reason">${esc(reason)}</div>
+  <div class="tm" id="cortex-lockout-countdown" role="timer">${formatCountdown(durationS)}</div>
   <button class="sk" id="skip">I need to continue</button>
 </div>
 `;
@@ -2156,22 +2162,34 @@ export function injectLockoutOverlay(payload: Record<string, unknown>): void {
         "(prefers-reduced-motion: reduce)",
     ).matches;
 
+    function removeAndRestoreFocus(): void {
+        host.remove();
+        const target = host.__cortexPreviousFocus;
+        if (!target?.isConnected) return;
+        try {
+            target.focus({ preventScroll: true });
+        } catch {
+            target.focus();
+        }
+    }
+
     function dismiss(): void {
         if (dismissed) return;
         dismissed = true;
         window.clearInterval(timer);
+        document.removeEventListener("keydown", handleKeydown);
         if (reducedMotion) {
-            host.remove();
+            removeAndRestoreFocus();
             return;
         }
         shadow.querySelector(".pn")?.classList.add("cx-exit");
         shadow.querySelector(".bk")?.classList.add("cx-exit");
-        removalTimer = window.setTimeout(() => host.remove(), 170);
+        removalTimer = window.setTimeout(removeAndRestoreFocus, 170);
     }
 
     const timer = setInterval(() => {
         remaining--;
-        const el = shadow.getElementById("countdown");
+        const el = shadow.getElementById("cortex-lockout-countdown");
         if (el) el.textContent = formatCountdown(remaining);
         if (remaining <= 0) {
             clearInterval(timer);
@@ -2181,16 +2199,33 @@ export function injectLockoutOverlay(payload: Record<string, unknown>): void {
 
     // Skip button — no penalty, just dismiss. Lives in injected page-context
     // (executeScript), so the service-worker DEBUG flag is out of scope here.
-    shadow.getElementById("skip")?.addEventListener("click", () => {
+    const skipButton = shadow.getElementById("skip") as HTMLButtonElement | null;
+    skipButton?.addEventListener("click", () => {
         dismiss();
     });
+
+    const handleKeydown = (event: KeyboardEvent) => {
+        if (event.key === "Escape") {
+            event.preventDefault();
+            dismiss();
+            return;
+        }
+        if (event.key === "Tab") {
+            event.preventDefault();
+            skipButton?.focus({ preventScroll: true });
+        }
+    };
+    document.addEventListener("keydown", handleKeydown);
+    skipButton?.focus({ preventScroll: true });
 
     host.__cortexCleanup = () => {
         window.clearInterval(timer);
         window.clearTimeout(removalTimer);
+        document.removeEventListener("keydown", handleKeydown);
     };
 
-    // Clicking backdrop does NOT dismiss — lockout must be waited out or explicitly skipped
+    // Clicking the backdrop does not dismiss. The explicit skip control and
+    // standard Escape key both preserve user agency and restore prior focus.
 }
 
 export function injectLeetCodeCoachOverlay(kind: string, payload: Record<string, unknown>): void {
@@ -2250,7 +2285,7 @@ export function injectLeetCodeCoachOverlay(kind: string, payload: Record<string,
 .card.cx-update{animation:none}.card.cx-exit{animation:out 160ms cubic-bezier(.4,0,1,1) forwards}
 .top{display:flex;align-items:center;gap:10px;margin-bottom:10px}.dot{width:9px;height:9px;border-radius:99px;background:#dfb15b;box-shadow:0 0 18px rgba(223,177,91,.55)}.ttl{font-size:14px;font-weight:700;letter-spacing:-.02em;flex:1}.x{display:grid;place-items:center;width:32px;height:32px;padding:0;border:0;background:transparent;color:#9b9488;font-size:18px;line-height:1;cursor:pointer}.body{font-size:13px;line-height:1.5;color:#cfc7b7;margin-bottom:13px}textarea{width:100%;height:92px;resize:vertical;background:#18191a;color:#f3f0e8;border:1px solid rgba(243,240,232,.14);border-radius:12px;padding:10px;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;outline:none}textarea:focus{border-color:#dfb15b}.tags{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}.tags span{font-size:11px;color:#dfb15b;border:1px solid rgba(223,177,91,.25);border-radius:99px;padding:4px 8px;background:rgba(223,177,91,.08)}button{border:1px solid rgba(243,240,232,.14);background:#dfb15b;color:#15110a;border-radius:10px;padding:8px 11px;font-size:12px;font-weight:700;cursor:pointer;transition:transform 120ms cubic-bezier(.23,1,.32,1),filter 120ms cubic-bezier(.23,1,.32,1),background-color 120ms cubic-bezier(.23,1,.32,1)}button:active{transform:scale(.97)}button:focus-visible{outline:2px solid #f3f0e8;outline-offset:2px}.hint{margin-top:10px;font-size:12px;line-height:1.45;color:#cfc7b7;background:#18191a;border-radius:10px;padding:10px}label{display:flex;gap:8px;align-items:center;font-size:12px;color:#cfc7b7}@media (hover:hover) and (pointer:fine){button:hover{filter:brightness(.94)}.x:hover{background:rgba(243,240,232,.08);filter:none}}@media (prefers-reduced-motion:reduce){.card{animation:none!important}button{transition:filter 120ms cubic-bezier(.23,1,.32,1),background-color 120ms cubic-bezier(.23,1,.32,1)!important}button:active{transform:none}}
 </style>
-<div class="card${isUpdate ? " cx-update" : ""}" role="dialog" aria-labelledby="cortex-coach-title">
+<div class="card${isUpdate ? " cx-update" : ""}" role="region" aria-labelledby="cortex-coach-title">
   <div class="top"><span class="dot"></span><div class="ttl" id="cortex-coach-title">${esc(title)}</div><button class="x" id="lc-close" type="button" aria-label="Dismiss Cortex coach">×</button></div>
   <div class="body">${body}</div>
   ${extra}

@@ -166,11 +166,11 @@ def _hash_payload(value: Any) -> str:
     payload contains non-JSON-able objects (datetimes are stringified by
     ``model_dump(mode='json')`` so this should rarely trigger)."""
     try:
-        return hashlib.sha1(
+        return hashlib.sha256(
             json.dumps(value, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
     except Exception:
-        return hashlib.sha1(repr(value).encode("utf-8")).hexdigest()
+        return hashlib.sha256(repr(value).encode("utf-8")).hexdigest()
 
 
 def _format_duration(seconds: float) -> str:

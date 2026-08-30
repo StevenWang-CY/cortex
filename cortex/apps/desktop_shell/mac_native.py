@@ -1,10 +1,12 @@
 """macOS AppKit bridge — keeps the desktop shell visually native.
 
 This module is the single point where Qt widgets cross over into AppKit so
-windows pick up real ``NSVisualEffectView`` translucency, a unified title bar,
-the user's effective appearance (light/dark), the system menu bar, and SF
-system fonts. Every entry point is guarded so non-mac harnesses + headless
-tests stub cleanly — see :func:`is_macos`.
+windows pick up a safe system background tint, a unified title bar, the user's
+effective appearance (light/dark), the system menu bar, and SF system fonts.
+It deliberately leaves Qt's content view in place: replacing it with an
+``NSVisualEffectView`` caused packaged windows to disappear during launch.
+Every entry point is guarded so non-mac harnesses + headless tests stub cleanly
+— see :func:`is_macos`.
 
 Usage pattern (called once per window after construction)::
 
@@ -44,8 +46,9 @@ def is_macos() -> bool:
     return sys.platform == "darwin" and os.environ.get("CORTEX_HEADLESS_STARTUP") != "1"
 
 
-# Vibrancy materials. Names match the AppKit enum
-# ``NSVisualEffectMaterial`` values exposed by pyobjc.
+# Compatibility material vocabulary retained at call sites. The current safe
+# implementation applies only ``NSColor.windowBackgroundColor`` and never
+# installs an ``NSVisualEffectView``; see :func:`apply_vibrancy`.
 Material = Literal[
     "window_background",  # ``NSVisualEffectMaterialWindowBackground`` (default chrome)
     "sidebar",            # ``NSVisualEffectMaterialSidebar`` (Mail-style sidebar)

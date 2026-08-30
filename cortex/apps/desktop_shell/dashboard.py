@@ -10,8 +10,8 @@ The visual layer is now driven by:
 * :mod:`cortex.apps.desktop_shell.tokens` (emitted from
   ``cortex/libs/design/tokens.yaml``) — semantic palette, 5-step type scale,
   HIG-compliant spacing & radii.
-* :mod:`cortex.apps.desktop_shell.mac_native` — system font, NSVisualEffectView
-  vibrancy, unified title bar. Brand identity (terracotta accent +
+* :mod:`cortex.apps.desktop_shell.mac_native` — system font, safe native
+  background tint, unified title bar. Brand identity (terracotta accent +
   Cormorant Garamond wordmark/numerics + ECG heartbeat motif) is preserved on
   top of native materials.
 

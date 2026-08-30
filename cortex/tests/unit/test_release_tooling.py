@@ -36,6 +36,7 @@ from cortex.scripts.verify_macos_release import (
     ReleaseVerificationError,
     _default_personal_roots,
     _detach_mounted_dmg,
+    _headless_camera_activity_markers,
     _mounted_app_signature_verification,
     _notarized_container_verification_commands,
     _remove_detached_mountpoint,
@@ -48,6 +49,22 @@ _ROOT = Path(__file__).resolve().parents[3]
 
 def _credential_environment(names: tuple[str, ...]) -> dict[str, str]:
     return {name: f"fixture-for-{name.lower()}" for name in names}
+
+
+def test_headless_release_probe_rejects_camera_discovery_and_opening() -> None:
+    diagnostics = "\n".join(
+        (
+            "Enumerated 2 camera(s): built_in=1 other=0 continuity=1",
+            "Trying camera candidate: device_id=0",
+            "Opened camera device 0 (builtin_mac_camera)",
+        )
+    )
+    assert _headless_camera_activity_markers(diagnostics) == [
+        "Enumerated ",
+        "Trying camera candidate:",
+        "Opened camera device ",
+    ]
+    assert _headless_camera_activity_markers("WebcamCapture stopped") == []
 
 
 def test_notary_auth_selector_accepts_each_complete_mode() -> None:
@@ -89,6 +106,55 @@ def test_release_workflow_stages_versioned_changelog_notes() -> None:
     assert 'HEADING="## [${RELEASE_TAG}]"' in workflow
     assert "body_path: ${{ env.CORTEX_RELEASE_NOTES }}" in workflow
     assert "generate_release_notes: false" in workflow
+
+
+def test_generated_release_tag_example_tracks_the_canonical_version() -> None:
+    from cortex.scripts.sync_config_docs import OPERATIONAL_VARIABLES
+
+    release_tag = next(
+        variable
+        for variable in OPERATIONAL_VARIABLES
+        if variable.name == "CORTEX_RELEASE_TAG"
+    )
+    assert release_tag.example == f"v{__version__}"
+
+
+def test_release_tag_gate_rechecks_all_shipped_client_surfaces() -> None:
+    workflow = (_ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+
+    assert "git merge-base --is-ancestor HEAD origin/main" in workflow
+    assert "pnpm --dir cortex/apps/browser_extension exec tsc --noEmit" in workflow
+    assert "pnpm --dir cortex/apps/browser_extension test" in workflow
+    assert "plasmo build --target=edge-mv3" in workflow
+    assert "npm --prefix cortex/apps/vscode_extension test" in workflow
+    assert "npm --prefix cortex/apps/vscode_extension run package:vsix" in workflow
+    assert workflow.count("verify_dependency_audit.py") >= 3
+
+
+def test_release_workflow_attests_every_standalone_checksum_manifest() -> None:
+    release_workflow = (_ROOT / ".github/workflows/release.yml").read_text(
+        encoding="utf-8"
+    )
+    publish_workflow = (_ROOT / ".github/workflows/publish-release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert (
+        "subject-path: dist/evidence-${{ matrix.arch }}/SHA256SUMS-${{ matrix.arch }}"
+        in release_workflow
+    )
+    assert "release-assets/SHA256SUMS-arm64" in publish_workflow
+    assert "release-assets/SHA256SUMS-x86_64" in publish_workflow
+    assert "release-assets/Cortex-*-macos-arm64-evidence.zip" in publish_workflow
+    assert "release-assets/Cortex-*-macos-x86_64-evidence.zip" in publish_workflow
+
+
+def test_make_targets_never_run_process_global_qt_stubs_in_parent() -> None:
+    makefile = (_ROOT / "Makefile").read_text(encoding="utf-8")
+
+    unsafe_invocation = "$(PYTEST) cortex/tests/unit/test_desktop_shell.py"
+    assert unsafe_invocation not in makefile
+    assert makefile.count("--ignore=cortex/tests/unit/test_desktop_shell.py") == 2
 
 
 def test_macos_builder_preserves_caller_selected_node_before_gui_fallbacks() -> None:

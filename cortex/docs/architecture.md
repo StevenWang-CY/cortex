@@ -148,7 +148,13 @@ authority for v2 intervention or policy lifecycles.
 Camera and shutdown behavior are part of the architecture:
 
 - smart selection re-enumerates AVFoundation devices after open to avoid
-  Continuity Camera index changes;
+  Continuity Camera index changes, using the explicit `isContinuityCamera`
+  property rather than an LLM or localized name when the property is available;
+- the raw AVFoundation unique ID is reduced to a one-way stable device key, so
+  numeric reordering cannot alias calibration while the platform identifier is
+  never logged or persisted;
+- macOS discovery fails closed rather than blind-probing indices, and every
+  configured or automatic handle must pass live post-warm-up identity checks;
 - warm-up reads are retried;
 - browser native messaging launches the foreground daemon through Terminal.app
   to obtain the correct TCC lineage;

@@ -43,11 +43,9 @@ dev: ## Start the daemon (FastAPI :9472, WebSocket :9473)
 
 test: ## Full pytest suite — mirrors ci.yml exactly (unit+integration+services+state_engine+eval+physio+performance; desktop_shell isolated)
 	QT_QPA_PLATFORM=offscreen $(PYTEST) cortex/tests/ --ignore=cortex/tests/unit/test_desktop_shell.py
-	QT_QPA_PLATFORM=offscreen $(PYTEST) cortex/tests/unit/test_desktop_shell.py
 
-test-unit: ## Unit tests only (desktop_shell pass runs last to avoid PySide6 sys.modules pollution)
-	$(PYTEST) cortex/tests/unit/ --ignore=cortex/tests/unit/test_desktop_shell.py
-	$(PYTEST) cortex/tests/unit/test_desktop_shell.py
+test-unit: ## Unit tests only (legacy desktop-shell stubs run in their isolation wrapper)
+	QT_QPA_PLATFORM=offscreen $(PYTEST) cortex/tests/unit/ --ignore=cortex/tests/unit/test_desktop_shell.py
 
 test-eval: ## Deterministic policy, MRT, OPE diagnostics, and inference eval suite
 	$(PYTEST) cortex/tests/eval/ cortex/tests/state_engine/

@@ -568,62 +568,98 @@ def test_b11_classify_plan_failure_mode_budget_killed() -> None:
 
 
 # ---------------------------------------------------------------------
-# B12 — webcam camera-classifier retry
+# B12 — deterministic AVFoundation camera descriptors
 # ---------------------------------------------------------------------
 
 
-def test_b12_camera_classifier_retries_5xx() -> None:
-    """A 503 response is retried; a subsequent 200 selects the camera."""
+def test_b12_explicit_continuity_property_beats_benign_localized_name() -> None:
+    """A renamed iPhone must remain excluded even without name keywords."""
+
+    from types import SimpleNamespace
+
     from cortex.services.capture_service import webcam as webcam_mod
 
-    call_log: list[int] = []
+    raw_unique_id = "not-retained-platform-camera-id"
+    descriptor = webcam_mod._device_from_avfoundation(
+        4,
+        SimpleNamespace(
+            localizedName=lambda: "Studio Camera",
+            uniqueID=lambda: raw_unique_id,
+            isContinuityCamera=lambda: True,
+            isConnected=lambda: True,
+            deviceType=lambda: "AVCaptureDeviceTypeContinuityCamera",
+        ),
+    )
 
-    class _FakeResp:
-        def __init__(self, status: int, payload: dict[str, Any]) -> None:
-            self.status_code = status
-            self._payload = payload
-
-        def json(self) -> dict[str, Any]:
-            return self._payload
-
-    sequence = [
-        _FakeResp(503, {}),
-        _FakeResp(200, {"response": "0"}),
-    ]
-
-    def _fake_post(url: str, **kwargs: Any) -> _FakeResp:
-        call_log.append(1)
-        return sequence.pop(0)
-
-    with patch("httpx.post", _fake_post):
-        result = webcam_mod._llm_pick_builtin_camera(
-            ["FaceTime HD Camera", "iPhone"]
-        )
-    assert result == 0
-    assert len(call_log) == 2, f"expected 2 attempts (1 retry), got {len(call_log)}"
+    assert descriptor.index == 4
+    assert descriptor.name == "Studio Camera"
+    assert descriptor.is_continuity is True
+    assert descriptor.device_key is not None
+    assert raw_unique_id not in descriptor.device_key
 
 
-def test_b12_camera_classifier_does_not_retry_4xx() -> None:
-    """A 400 response is NOT retried — falls through to keyword fallback."""
+def test_b12_continuity_name_is_only_a_legacy_property_fallback() -> None:
+    """Older bridges remain safe, while an explicit False is authoritative."""
+
+    from types import SimpleNamespace
+
     from cortex.services.capture_service import webcam as webcam_mod
 
-    call_log: list[int] = []
+    fallback = webcam_mod._device_from_avfoundation(
+        0,
+        SimpleNamespace(
+            localizedName=lambda: "Test iPhone Camera",
+            uniqueID=lambda: "phone-a",
+        ),
+    )
+    explicit_non_continuity = webcam_mod._device_from_avfoundation(
+        1,
+        SimpleNamespace(
+            localizedName=lambda: "Continuity Lab Camera",
+            uniqueID=lambda: "usb-a",
+            isContinuityCamera=lambda: False,
+            isConnected=lambda: True,
+        ),
+    )
 
-    class _FakeResp:
-        status_code = 400
+    assert fallback.is_continuity is True
+    assert explicit_non_continuity.is_continuity is False
 
-        def json(self) -> dict[str, Any]:
-            return {}
 
-    def _fake_post(url: str, **kwargs: Any) -> _FakeResp:
-        call_log.append(1)
-        return _FakeResp()
+def test_b12_camera_device_key_is_stable_and_one_way() -> None:
+    from cortex.services.capture_service import webcam as webcam_mod
 
-    with patch("httpx.post", _fake_post):
-        result = webcam_mod._llm_pick_builtin_camera(["a", "b"])
+    first = webcam_mod._camera_device_key("camera-a")
+    repeated = webcam_mod._camera_device_key("camera-a")
+    second = webcam_mod._camera_device_key("camera-b")
 
-    assert result is None
-    assert len(call_log) == 1, f"expected exactly 1 attempt; got {len(call_log)}"
+    assert first == repeated
+    assert first != second
+    assert first is not None and len(first) == 24
+    assert "camera-a" not in first
+
+
+def test_b12_failing_optional_objc_string_property_fails_closed() -> None:
+    from types import SimpleNamespace
+
+    from cortex.services.capture_service import webcam as webcam_mod
+
+    def broken_unique_id() -> str:
+        raise RuntimeError("bridge unavailable")
+
+    descriptor = webcam_mod._device_from_avfoundation(
+        2,
+        SimpleNamespace(
+            localizedName=lambda: "Built-in Camera",
+            uniqueID=broken_unique_id,
+            isContinuityCamera=lambda: False,
+            isConnected=lambda: True,
+        ),
+    )
+
+    assert descriptor.name == "Built-in Camera"
+    assert descriptor.device_key is None
+    assert descriptor.is_continuity is False
 
 
 # ---------------------------------------------------------------------

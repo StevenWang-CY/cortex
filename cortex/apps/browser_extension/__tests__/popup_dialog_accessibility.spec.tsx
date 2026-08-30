@@ -1,5 +1,4 @@
-import React from "react";
-import { act } from "react";
+import React, { act } from "react";
 import { createRoot } from "react-dom/client";
 import { fireEvent, within } from "@testing-library/dom";
 import { afterEach, describe, expect, it } from "vitest";

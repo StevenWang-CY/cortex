@@ -61,21 +61,26 @@ jobs:
             --expected-version "${VERSION}" \
             --expected-commit "${COMMIT}" \
             --output release-assets/release-promotion-validation.json
-      - name: Verify GitHub provenance attestations for both reviewed DMGs
+      - name: Verify GitHub provenance attestations for all reviewed release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           COMMIT="$(git rev-parse HEAD)"
-          gh attestation verify release-assets/Cortex-*-macos-arm64.dmg \
-            --repo "${GITHUB_REPOSITORY}" \
-            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
-            --source-ref "refs/tags/${RELEASE_TAG}" \
-            --source-digest "${COMMIT}"
-          gh attestation verify release-assets/Cortex-*-macos-x86_64.dmg \
-            --repo "${GITHUB_REPOSITORY}" \
-            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
-            --source-ref "refs/tags/${RELEASE_TAG}" \
-            --source-digest "${COMMIT}"
+          for subject in \
+            release-assets/Cortex-*-macos-arm64.dmg \
+            release-assets/Cortex-*-macos-x86_64.dmg \
+            release-assets/Cortex-*-macos-arm64-evidence.zip \
+            release-assets/Cortex-*-macos-x86_64-evidence.zip \
+            release-assets/SHA256SUMS-arm64 \
+            release-assets/SHA256SUMS-x86_64
+          do
+            test -f "${subject}"
+            gh attestation verify "${subject}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
+              --source-ref "refs/tags/${RELEASE_TAG}" \
+              --source-digest "${COMMIT}"
+          done
       - name: Attach promotion decision and publish the draft
         env:
           GH_TOKEN: ${{ github.token }}

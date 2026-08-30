@@ -7,9 +7,8 @@
  * different reference, leaking N listeners.
  */
 
-import React from "react";
+import React, { act } from "react";
 import { createRoot } from "react-dom/client";
-import { act } from "react-dom/test-utils";
 import { describe, expect, it } from "vitest";
 
 // Import the popup module for its side-effect-free CortexPopup export.

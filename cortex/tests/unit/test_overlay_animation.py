@@ -14,7 +14,8 @@ frame, and a rapid replacement cannot squash or reflow the text.
 
 The dismiss button and micro-step checkboxes are explicitly NOT animated
 — motion stays purposeful per the audit's "be conservative" rule. The
-breathing pacer keeps its existing rhythm independently.
+breathing pacer keeps its existing rhythm in ordinary mode and becomes a
+static prompt under Reduce Motion.
 
 Reduce Motion: when the macOS "Reduce Motion" accessibility preference is
 enabled (System Settings → Accessibility → Display → Reduce motion),
@@ -107,6 +108,8 @@ def test_animation_durations_match_spec(overlay):
     assert log["headline_ms"] == 160
     assert log["causal_ms"] == 160
     assert log["reduce_motion"] == 0
+    assert overlay._pacer._reduced_motion is False
+    assert overlay._pacer._timer.isActive() is True
 
 
 def test_reduce_motion_zeroes_both_durations(qapp, monkeypatch):
@@ -138,6 +141,13 @@ def test_reduce_motion_zeroes_both_durations(qapp, monkeypatch):
         assert log["headline_ms"] == 0, "Reduce Motion must zero the headline tween"
         assert log["causal_ms"] == 0, "Reduce Motion must zero the causal fade"
         assert log["reduce_motion"] == 1
+        assert w._pacer._reduced_motion is True
+        assert w._pacer._timer.isActive() is False
+        assert w._pacer._display_state() == (
+            "Breathe",
+            "at your pace",
+            0.46,
+        )
     finally:
         try:
             w.deleteLater()
@@ -163,6 +173,32 @@ def test_dismiss_button_is_not_animated(overlay):
     # the test runs in _record_animations mode).
     assert hasattr(overlay, "_headline_anim")
     assert hasattr(overlay, "_causal_fade_anim")
+
+
+def test_footer_labels_fit_the_production_overlay_width(overlay, qapp):
+    """The three escape controls remain readable at the shipped 460 px width."""
+    overlay.show_intervention({
+        "intervention_id": "iv_footer_fit",
+        "headline": "Take a breath",
+        "situation_summary": "summary",
+        "primary_focus": "focus",
+        "causal_explanation": "",
+        "micro_steps": [],
+    })
+    qapp.processEvents()
+
+    assert overlay.width() == 460
+    for button in (
+        overlay._dismiss_btn,
+        overlay._snooze_btn,
+        overlay._quiet_session_btn,
+    ):
+        text_width = button.fontMetrics().horizontalAdvance(button.text())
+        assert text_width + 20 <= button.width(), (
+            button.text(),
+            text_width,
+            button.width(),
+        )
 
 
 def test_entrance_animation_never_targets_geometry():
@@ -233,3 +269,40 @@ def test_prefers_reduced_motion_helper_returns_bool(monkeypatch):
     # On non-mac platforms the helper short-circuits to False.
     monkeypatch.setattr(mac_native, "_appkit", lambda: None)
     assert mac_native.prefers_reduced_motion() is False
+
+
+def test_privacy_suppressed_overlay_stops_hidden_pacer(overlay, monkeypatch):
+    """A privacy transition hides prior content and owns no hidden timers."""
+    sharing = False
+    monkeypatch.setattr(overlay, "_screen_share_active", lambda: sharing)
+
+    overlay.show_intervention({
+        "intervention_id": "iv_anim_before_share",
+        "headline": "Take a breath",
+        "situation_summary": "s",
+        "primary_focus": "f",
+        "causal_explanation": "",
+        "micro_steps": [],
+        "level": "guided_mode",
+    })
+    assert overlay.isVisible() is True
+    assert overlay._pacer._timer.isActive() is True
+    assert overlay._timeout_timer.isActive() is True
+    assert overlay._feedback_reveal_timer.isActive() is True
+
+    sharing = True
+    overlay.show_intervention({
+        "intervention_id": "iv_anim_during_share",
+        "headline": "Private new guidance",
+        "situation_summary": "s",
+        "primary_focus": "f",
+        "causal_explanation": "",
+        "micro_steps": [],
+        "level": "guided_mode",
+    })
+
+    assert overlay.isVisible() is False
+    assert overlay._pacer.is_active is False
+    assert overlay._pacer._timer.isActive() is False
+    assert overlay._timeout_timer.isActive() is False
+    assert overlay._feedback_reveal_timer.isActive() is False

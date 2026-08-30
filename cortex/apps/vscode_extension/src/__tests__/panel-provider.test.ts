@@ -170,3 +170,49 @@ describe("CortexPanelProvider – P0-4 subscription resilience", () => {
         expect(htmlSetCount).toBeGreaterThanOrEqual(3);
     });
 });
+
+describe("CortexPanelProvider – reduced-motion pacer lifecycle", () => {
+    function getFullHtml(): string {
+        const provider = makeProvider(new FakeWSClient());
+        (
+            provider as unknown as Record<string, unknown>
+        )["_currentPayload"] = {
+            intervention_id: "iv-motion",
+            headline: "Take a breath",
+            situation_summary: "Pause briefly",
+            primary_focus: "Breathe",
+            micro_steps: [],
+        };
+        const fn = (
+            provider as unknown as Record<string, () => string>
+        )["_getWebviewContent"];
+        return fn.call(provider);
+    }
+
+    it("owns one cancelable frame loop and stops it while hidden", () => {
+        const html = getFullHtml();
+
+        expect(html).toContain("let pacerFrameId = null");
+        expect(html).toContain("cancelAnimationFrame(pacerFrameId)");
+        expect(html).toContain("document.visibilityState === 'visible'");
+        expect(html).toContain(
+            "document.addEventListener('visibilitychange', syncPacer)",
+        );
+        expect(html).not.toMatch(
+            /^\s*requestAnimationFrame\(drawPacer\);/m,
+        );
+    });
+
+    it("renders a static, countdown-free guide under Reduce Motion", () => {
+        const html = getFullHtml();
+
+        expect(html).toContain("'(prefers-reduced-motion: reduce)'");
+        expect(html).toContain(
+            "reducedPacerMotion.addEventListener('change', syncPacer)",
+        );
+        expect(html).toContain("drawPacerDisc(0.46)");
+        expect(html).toContain("Breathe at your pace");
+        expect(html).toContain("timerEl.textContent = ''");
+        expect(html).toContain('aria-label="Breathing guide"');
+    });
+});

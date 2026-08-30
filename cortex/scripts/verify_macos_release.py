@@ -454,6 +454,23 @@ def _tail_text(path: Path, limit: int = 8000) -> str:
     return path.read_text(encoding="utf-8", errors="replace")[-limit:]
 
 
+_HEADLESS_CAMERA_ACTIVITY_MARKERS: tuple[str, ...] = (
+    "Enumerated ",
+    "Could not enumerate macOS cameras via AVFoundation",
+    "Failed to enumerate macOS cameras via AVFoundation",
+    "Trying camera candidate:",
+    "Opened camera device ",
+)
+
+
+def _headless_camera_activity_markers(diagnostics: str) -> list[str]:
+    """Return camera discovery/open markers forbidden in a headless probe."""
+
+    return [
+        marker for marker in _HEADLESS_CAMERA_ACTIVITY_MARKERS if marker in diagnostics
+    ]
+
+
 def _probe_frozen_startup(
     executable: Path,
     *,
@@ -579,6 +596,13 @@ def _probe_frozen_startup(
             if matched_markers:
                 failure = "packaged app emitted fatal cleanup/startup markers: " + ", ".join(
                     matched_markers
+                )
+        if failure is None:
+            camera_markers = _headless_camera_activity_markers(combined_diagnostics)
+            if camera_markers:
+                failure = (
+                    "headless packaged probe touched camera discovery/acquisition: "
+                    + ", ".join(camera_markers)
                 )
         required_log_markers = (
             "startup.ready name=qt_event_loop",

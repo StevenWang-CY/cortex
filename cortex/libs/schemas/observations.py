@@ -54,9 +54,11 @@ class MissingReason(StrEnum):
 class CameraIdentity(BaseModel):
     """Non-secret identity of the physical/logical camera in use.
 
-    ``identity_key`` is derived from the live post-open device name and
-    source classification, not the AVFoundation index.  Device indices can
-    reorder whenever Continuity Camera appears or disappears.
+    On macOS, ``identity_key`` is derived from a one-way digest of the live
+    post-open AVFoundation unique ID plus capture geometry, never the numeric
+    index or raw platform identifier. Device indices can reorder whenever
+    Continuity Camera appears or disappears. Other platforms retain a
+    normalized name/source fallback.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -141,4 +143,3 @@ class ObservationEnvelope(BaseModel, Generic[ObservationValue]):
 
 class CameraObservationEnvelope(ObservationEnvelope[CameraFrameObservation]):
     """Concrete camera specialization emitted by cross-client codegen."""
-

@@ -4,6 +4,90 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.3.12] — 2026-08-29
+
+This patch is a fresh release candidate built on v0.3.11. It focuses on the
+remaining privacy-sensitive camera-selection boundary, cross-surface UI/UX
+contracts, and a stricter tag-to-publication chain. It does not relabel or
+reuse an older artifact.
+
+### Fixed
+
+* macOS camera selection no longer asks a local LLM to infer which device is
+  built in. Cortex now consumes AVFoundation's explicit
+  `isContinuityCamera`, `isConnected`, `deviceType`, and `uniqueID`
+  properties from the exact device array indexed by OpenCV.
+* The raw AVFoundation unique ID is never logged or retained. A one-way
+  SHA-256 device key gives calibration and observation boundaries a stable
+  physical identity even when an iPhone connection reshuffles indices.
+* Automatic and configured camera paths exclude Continuity Camera,
+  disconnected, unnamed, and unverified devices before OpenCV. The mandatory
+  post-warm-up enumeration rejects a device that changed identity while the
+  handle opened.
+* Onboarding uses the same explicit Continuity descriptor as capture instead
+  of a weaker localized-name heuristic.
+* The browser lockout is a complete keyboard modal: it has a labelled timer,
+  deterministic initial focus, Tab containment, Escape, and focus restoration.
+  Non-modal intervention and coach surfaces expose region semantics without
+  stealing the user's editing focus. Its countdown now updates the real
+  labelled timer node instead of a nonexistent legacy ID.
+* Pulse Room glass controls honor `prefers-reduced-transparency`; recent
+  activity cards expose list/list-item/link semantics; popup transitions name
+  `background-color` rather than animating a shorthand; React tests use the
+  supported `act` API. Its ordinary canvas now cancels while the tab is hidden
+  and resumes through one idempotent frame owner.
+* Desktop and VS Code breathing pacers now honor Reduce Motion with a static,
+  countdown-free `Breathe at your pace` frame. The editor owns one cancelable
+  animation-frame loop and stops it while its webview is hidden; a
+  screen-share-suppressed desktop intervention hides any prior private card
+  and owns no hidden presentation timer.
+* The full-screen breathing break no longer withholds its exit for 60 seconds.
+  `End early` is visible on the first frame, Escape always exits, and the
+  overlay plus exit control expose assistive-technology descriptions.
+* The desktop intervention footer no longer clips all three escape controls at
+  its shipped 460 px width. Concise equal-width labels keep full meanings and
+  shortcuts in accessible descriptions/tooltips, with an offscreen text-fit
+  regression.
+* Desktop documentation now matches the crash-safe implementation: Qt's
+  content view is retained and receives a native system tint. It no longer
+  claims that an `NSVisualEffectView` is installed after that approach was
+  shown to orphan packaged windows.
+* Cache-only SHA-1 use was replaced with SHA-256. Legacy persisted MD5 key
+  derivations are explicitly marked `usedforsecurity=False`, eliminating
+  ambiguous high-severity static-analysis findings without breaking stored
+  identities.
+* The real Python native-host contract tests have bounded subprocess cleanup
+  and a realistic per-test budget, avoiding load-dependent false timeouts.
+
+### Release integrity
+
+* A release tag must resolve to a commit reachable from `origin/main`.
+* The tag gate now reruns browser TypeScript, all browser tests, Chrome and
+  Edge production bundles, VS Code lint/compile/tests/package, and all three
+  dependency-audit policies before any signing job can start.
+* GitHub attestations now cover each standalone architecture checksum manifest
+  as well as both DMGs and evidence bundles. Public promotion independently
+  verifies all six reviewed subjects against the exact tag commit.
+* Process-global legacy Qt stubs remain isolated from the parent pytest
+  process in both canonical Make targets.
+
+### Verification boundary
+
+* Camera safety is tested with synthetic AVFoundation descriptors and mocked
+  OpenCV handles; the refinement does not open a local physical camera.
+* The packaged headless probe now returns before onboarding can enumerate
+  AVFoundation devices, and the release verifier fails on any camera-discovery
+  or camera-open marker. Camera-disabled evidence therefore means zero device
+  discovery as well as zero capture.
+* Ruff, strict mypy over 523 source files, a verified 285-member wheel, and the
+  complete camera-free Python suite (2,703 passed / 3 documented skips) pass.
+  Browser TypeScript, 253 tests, and Chrome/Edge MV3 builds pass; VS Code lint,
+  compile, 32 tests, and VSIX packaging pass. Schema/config/version/design/link
+  contracts, deterministic evaluation, and all dependency policies pass.
+* The final exact-commit hosted CI, dual-architecture signed/notarized artifact,
+  public-redownload, and clean-machine manual gates remain mandatory before
+  this entry can describe a public release.
+
 ## [v0.3.11] — 2026-08-26
 
 This patch supersedes the unpublished v0.3.10 candidate after its required

@@ -1,6 +1,6 @@
 # UI design and interaction contract
 
-Last reviewed: 2026-08-25.
+Last reviewed: 2026-08-29.
 
 This contract applies to the PySide6 desktop shell, Chrome/Edge extension,
 injected browser surfaces, and VS Code webview. The refinement pass was
@@ -23,6 +23,7 @@ authority explicit, and motion subordinate to comprehension.
 | Keyframes replayed on dynamic updates | Interruptible transitions or in-place updates | Rapid changes should retarget, not restart |
 | Motion everywhere | Animate only feedback, spatial continuity, state legibility, or a jarring discontinuity | Functional dashboards benefit from restraint |
 | Reduced motion removes all feedback | Remove movement/continuous decoration; retain brief opacity/color feedback | Accessibility without making state changes invisible |
+| Blur-only glass surfaces | Opaque semantic-control fallback under reduced transparency | Material must not reduce legibility or violate an OS preference |
 | Accent color used as small text | Contrast-safe accent text token | Brand color and readable foreground are different jobs |
 | Ambiguous “Allow” copy | Name the data, scope, destination, and consequence | Consent must be informed and current |
 | Disabled-looking pending state with no semantics | Busy/disabled state plus status text | Visual treatment and accessibility tree must agree |
@@ -74,6 +75,9 @@ Under `prefers-reduced-motion: reduce` or macOS Reduce Motion:
 
 - disable transforms, particle fields, ripples, breathing/aura motion, and
   staged entrances;
+- keep breathing guidance available as a fixed disc with non-counting copy
+  (``Breathe at your pace`` or the current phase); desktop timers do not run
+  solely to animate;
 - render readable/actionable content immediately;
 - retain 120–200 ms opacity, foreground, background, and border transitions
   where they make state changes legible;
@@ -81,6 +85,14 @@ Under `prefers-reduced-motion: reduce` or macOS Reduce Motion:
 
 Shadow DOM owns its reduced-motion block because document CSS cannot cross the
 shadow boundary. Canvas loops must stop work, not merely hide their output.
+Every loop has one cancelable owner and stops whenever its document is hidden.
+
+Under `prefers-reduced-transparency: reduce`, every browser material that uses
+`backdrop-filter` removes the blur and becomes the opaque semantic control
+surface. Desktop windows retain Qt's content view and use the safe AppKit
+window-background tint; `NSVisualEffectView` replacement is prohibited unless
+a future packaged-app experiment proves visible first launch, quit, and
+relaunch without orphaning Qt's content view.
 
 ## Interaction semantics
 
@@ -114,21 +126,31 @@ it is centered. Anchored popovers originate from their trigger.
 
 - **Desktop dashboard:** prioritize live status, signal quality, and explicit
   unavailable states. No geometry animation in data rows. Advanced diagnostics
-  are visually subordinate to the consumer summary.
+  are visually subordinate to the consumer summary. A full-screen break always
+  exposes an immediate "End early" control and Escape route. Intervention
+  footer controls must fit the production 460 px overlay width; shortcut hints
+  belong in tooltips/accessibility descriptions when visible copy would clip.
 - **Desktop privacy sheet:** source selection → exact preview → explicit send.
   The review step shows destination, retention caveat, expiry, byte size,
   redactions, and exact outbound prompt; changing sources burns the preview.
 - **Browser popup:** fast, compact controls; current-site page-context status;
   truthful disconnected and suggestion-only states; no marketing entrance.
 - **Injected overlays:** one coherent 200 ms entrance, in-place content update,
-  quick symmetric exit, no replay on a replacement proposal.
+  quick symmetric exit, no replay on a replacement proposal. Blocking
+  surfaces use labelled modal semantics, initial focus, Tab containment,
+  Escape where safe, and restoration; non-blocking cards use named regions and
+  never steal focus from the active page.
 - **Pulse Room/new tab:** decorative motion gets the available delight budget,
-  but interactive controls are immediate and reduced-motion stops canvas work.
+  but interactive controls are immediate, reduced-motion stops canvas work,
+  hidden tabs cancel canvas work, reduced-transparency removes blur, and resume
+  cards retain native link semantics inside a real labelled list.
 - **Onboarding:** progress is semantic, copy states what is detected versus
   configured, Return/click behavior is explicit, and no time-to-result promise
   substitutes for evidence requirements.
 - **VS Code:** use theme variables, never assume light/dark colors, keep action
-  authority and errors visible, and mirror reduced-motion semantics.
+  authority and errors visible, and mirror reduced-motion semantics. The pacer
+  owns one requestAnimationFrame loop, cancels it while hidden, and renders a
+  static countdown-free guide under Reduce Motion.
 
 ## Review gate
 
@@ -150,13 +172,19 @@ Reduce Motion.
 python -m cortex.scripts.sync_design_tokens --check
 pytest -q cortex/tests/unit/test_ui_contrast_contract.py \
   cortex/tests/unit/test_desktop_tokens_smoke.py \
-  cortex/tests/unit/test_overlay_animation.py
+  cortex/tests/unit/test_overlay_animation.py \
+  cortex/tests/unit/test_breathing_pacer_config.py \
+  cortex/tests/unit/test_break_overlay_reduced_motion.py
 
 cd cortex/apps/browser_extension
 pnpm exec tsc --noEmit
 pnpm exec vitest run __tests__/ambient_motion.spec.ts \
   __tests__/injected_motion.spec.ts \
+  __tests__/newtab_a11y.spec.tsx \
   __tests__/popup_dialog_accessibility.spec.tsx
+
+cd ../vscode_extension
+npm run lint && npm run compile && npm test
 ```
 
 The implementation plans and acceptance evidence for this refinement live in

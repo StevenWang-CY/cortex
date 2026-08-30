@@ -3,7 +3,7 @@
 //
 // Source of truth: cortex/libs/schemas/*.py (Pydantic v2 models).
 // Schema package: cortex-wire/2.0
-// Source SHA-256: 00a40d7212d61c633207b493f22ebe4c2792a635560e79c9898772c8ed03d872
+// Source SHA-256: 35dd53b9f4b538bf972a569adb56de1617c5df7b9fa467c927575be19d540f50
 // Drift-gate: a pre-commit hook and the GitHub Actions CI run
 //   `python -m cortex.scripts.generate_ts_schemas --check`
 // and fail if this file is out of sync with the Python models.
@@ -734,9 +734,11 @@ export interface CameraFrameObservation {
 /**
  * Non-secret identity of the physical/logical camera in use.
  *
- * ``identity_key`` is derived from the live post-open device name and
- * source classification, not the AVFoundation index.  Device indices can
- * reorder whenever Continuity Camera appears or disappears.
+ * On macOS, ``identity_key`` is derived from a one-way digest of the live
+ * post-open AVFoundation unique ID plus capture geometry, never the numeric
+ * index or raw platform identifier. Device indices can reorder whenever
+ * Continuity Camera appears or disappears. Other platforms retain a
+ * normalized name/source fallback.
  */
 export interface CameraIdentity {
   identity_key: string;

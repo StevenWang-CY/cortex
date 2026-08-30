@@ -9,6 +9,8 @@ import {
 } from "../lib/native-contract";
 
 const EXPECTED_TOKEN = "ab".repeat(32);
+const HOST_PROCESS_TIMEOUT_MS = 15_000;
+const CONTRACT_TEST_TIMEOUT_MS = HOST_PROCESS_TIMEOUT_MS + 5_000;
 
 function frame(payload: Record<string, unknown>): Buffer {
   const body = Buffer.from(JSON.stringify(payload), "utf8");
@@ -36,9 +38,15 @@ function runActualPythonHost(payload: Record<string, unknown>): unknown {
     },
     input: frame(payload),
     maxBuffer: 1024 * 1024,
+    timeout: HOST_PROCESS_TIMEOUT_MS,
+    killSignal: "SIGKILL",
   });
 
-  if (result.error) throw result.error;
+  if (result.error) {
+    throw new Error(
+      `native host process failed within ${HOST_PROCESS_TIMEOUT_MS}ms: ${result.error.message}`,
+    );
+  }
   if (result.status !== 0) {
     throw new Error(
       `native host exited ${String(result.status)}: ${result.stderr.toString("utf8")}`,
@@ -52,14 +60,18 @@ function runActualPythonHost(payload: Record<string, unknown>): unknown {
 }
 
 describe("native host Python↔TypeScript contract", () => {
-  it("decodes the actual framed get_auth_token response", () => {
-    const raw = runActualPythonHost({ command: "get_auth_token" });
-    const response = decodeGetAuthTokenResponse(raw);
+  it(
+    "decodes the actual framed get_auth_token response",
+    () => {
+      const raw = runActualPythonHost({ command: "get_auth_token" });
+      const response = decodeGetAuthTokenResponse(raw);
 
-    expect(response.command).toBe("get_auth_token");
-    expect(response.status).toBe("ok");
-    expect(response.auth_token).toBe(EXPECTED_TOKEN);
-  });
+      expect(response.command).toBe("get_auth_token");
+      expect(response.status).toBe("ok");
+      expect(response.auth_token).toBe(EXPECTED_TOKEN);
+    },
+    CONTRACT_TEST_TIMEOUT_MS,
+  );
 
   it("rejects the legacy Python token field", () => {
     expect(() =>
@@ -71,11 +83,15 @@ describe("native host Python↔TypeScript contract", () => {
     ).toThrow("invalid_auth_token_response");
   });
 
-  it("decodes a framed status response from the actual host", () => {
-    const raw = runActualPythonHost({ command: "status" });
-    const response = decodeNativeHostResponse(raw);
+  it(
+    "decodes a framed status response from the actual host",
+    () => {
+      const raw = runActualPythonHost({ command: "status" });
+      const response = decodeNativeHostResponse(raw);
 
-    expect(response.command).toBe("status");
-    expect(["running", "stopped"]).toContain(response.status);
-  });
+      expect(response.command).toBe("status");
+      expect(["running", "stopped"]).toContain(response.status);
+    },
+    CONTRACT_TEST_TIMEOUT_MS,
+  );
 });

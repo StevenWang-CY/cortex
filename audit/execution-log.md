@@ -136,3 +136,37 @@ review, reference-sensor/participant validation, and independent statistical
 review remain mandatory external gates. The Intel Protobuf exception must be
 replaced by a patched compatible backend or Intel support must be removed before
 its 2026-09-22 expiry; expiry causes CI/release failure by design.
+
+## v0.3.12 deterministic identity and release-integrity pass
+
+The 2026-08-29 working tree adds deterministic AVFoundation device descriptors,
+stable privacy-preserving camera identity, explicit Continuity Camera rejection
+before and after open, aligned onboarding detection, UI preference/semantic/focus
+contracts, and stricter tag/promotion provenance. It also removes ambiguous
+security-hash findings and isolates the real native-host subprocess test budget.
+
+Camera-free focused evidence on the versioned working tree:
+
+- 106 camera, observation-integrity, onboarding, backend-handler, and packaged
+  hardware-silence tests;
+- Ruff and strict mypy over 523 source files, a verified 285-member wheel, and
+  the complete Python suite (2,703 passed / 3 documented skips);
+- browser TypeScript, 54 suites / 253 tests, and Chrome/Edge MV3 builds; and
+- 36 focused offscreen Qt motion/agency tests plus VS Code lint, compile, and
+  32 tests covering static reduced-motion and hidden-loop ownership; and
+- a production-source Bandit review with zero high, 10 reviewed medium, and
+  239 low findings.
+
+The same working tree also passes schema, config, version, design-token,
+repository/link, and deterministic evaluation contracts; Chrome and Edge MV3
+production builds; VSIX packaging; and Python/browser/editor dependency policy.
+No physical camera or normal Cortex application launch was used for this
+evidence. The headless onboarding path returns before AVFoundation discovery,
+and packaged verification now rejects either camera enumeration or open
+markers rather than relying only on an impossible configured device index.
+
+This entry is intentionally not assigned an immutable commit until the final
+diff, complete source gates, and exact-commit CI pass. Likewise it makes no
+claim about Developer ID artifacts, clean-machine Finder/TCC/camera behavior,
+Intel physical execution, independent review, or public release. Those results
+must be appended only from the exact v0.3.12 tag and attached evidence.

@@ -1,14 +1,14 @@
 # Cortex: Rigorous Algorithm, Architecture, and Implementation Plan
 
-**Status:** release-relevant software implementation complete through WP-11;
-credentialed release-candidate, reference-sensor, participant, and independent-review
-gates remain external
+**Status:** release-relevant software implementation complete through the
+v0.3.12 source refinement; credentialed release-candidate, reference-sensor,
+participant, and independent-review gates remain external
 
 **Historical audit snapshot:** `fac5db965b0568a73ea64d78fbb6eb594080073c`
 on `main`, reviewed 2026-08-24
 
 **Implementation record:** `implementation-hardening`, implemented and verified
-through 2026-08-26; immutable WP commits are listed in
+through 2026-08-29; immutable WP commits are listed in
 [`audit/execution-log.md`](audit/execution-log.md)
 
 **Scope:** macOS application, in-process daemon, HTTP/WebSocket gateways, webcam physiology and kinematics, state inference, intervention planning/execution/restoration, adaptive policy evaluation, Chrome/Edge extension, optional VS Code extension, persistence, packaging, tests, documentation, privacy, and supply chain
@@ -4467,3 +4467,357 @@ Macs. Those cases remain mandatory before publication, but the current user
 instruction prohibits running them locally. The correct state is therefore a
 verified draft—not a public release—until explicit authorization and the
 independent physical evidence exist.
+
+## 27. v0.3.12 — deterministic device identity, UI integrity, and release provenance
+
+v0.3.12 is a new release candidate based on the public v0.3.11 source, not a
+relabelled artifact. This section records a second repository-wide review on
+2026-08-29: Git state and public releases; architecture and algorithm flow;
+camera/TCC behavior; desktop, browser, and editor implementations; dependency
+and static-security posture; UI/UX and accessibility; packaging; CI; and the
+draft-to-public evidence boundary.
+
+The review deliberately keeps Cortex stopped. Source tests use synthetic
+AVFoundation descriptors and mocked capture handles. Qt review uses the
+offscreen platform with permission probes stubbed. Packaged startup validation
+must use the explicit headless/camera-disabled boundary. No local physical
+camera, iPhone, or TCC prompt is part of the automated evidence.
+
+### 27.1 Current architectural determination
+
+The correct deployment remains a **local modular monolith**. One user, one
+camera owner, one authoritative SQLite store, and loopback transports do not
+benefit from network microservices. Splitting capture, state, or authorization
+into separate daemons would increase TCC-lineage, authentication, ordering,
+shutdown, privacy, and recovery failure modes.
+
+The implemented path is:
+
+```text
+physical devices + aggregate client telemetry
+  -> typed observations with quality, missingness, sequence, and dual clocks
+  -> experimental camera diagnostics + deterministic telemetry evidence
+  -> abstaining support hypothesis (never a diagnosis or probability)
+  -> eligibility, cooldown, quiet mode, and deterministic product policy
+  -> local plan or explicitly previewed external-redacted plan
+  -> inert proposal
+  -> optional manifest-bound one-time authorization
+  -> apply -> durable receipt -> postcondition -> idempotent restore
+```
+
+`cortex/application/` is the target ownership boundary: typed kernel,
+coordinators, gateways, clocks, events, and task supervision. The large
+`RuntimeDaemon` is still a compatibility/composition facade. Infrastructure
+adapters live behind domain/application contracts: OpenCV/AVFoundation,
+MediaPipe, SQLite, Keychain, provider SDKs, browser/editor APIs, and PySide6.
+Pydantic models are canonical for process boundaries; generated TypeScript and
+repository contracts guard browser/editor drift.
+
+The full algorithm review confirms these evidence boundaries:
+
+| Stage | Implemented decision | Release invariant |
+| --- | --- | --- |
+| Acquisition | One camera thread owns enumerate/open/warm-up/read/recover/release | No handle transfer, anonymous macOS probe, or accepted unverified identity |
+| Observation | Missing/rejected/stale intervals remain typed events | Missing data never becomes fabricated physiological evidence |
+| Physiology | rPPG is experimental and quality-gated | It cannot influence the production support decision |
+| Behavior | Fixed-denominator deterministic rules with abstention | Scores are evidence strengths, not cognition/health probabilities |
+| Planning | Rule fallback is local; external provider is optional BYOK | Model output remains untrusted proposal data |
+| Authority | Exact manifest, capability, target, consent revision, expiry, nonce | A proposal, policy arm, or consent downgrade never grants mutation |
+| Persistence | Single-owner SQLite intent/receipt/recovery lifecycle | One durable authority; caches cannot manufacture execution state |
+| Evaluation | Fixed, consented research MRT/OPE path | Research output never becomes an online production learner |
+
+This is a defensible product design, but it does not establish physiological
+accuracy or intervention efficacy. Reference-sensor data, participant-held-out
+analysis, usability work, and independent statistical review remain external.
+
+### 27.2 Camera root-cause analysis
+
+The prior camera chooser combined three weak signals: a numeric index, a
+localized device name, and an optional local Ollama classification. That design
+had five independent defects:
+
+1. an LLM added latency and availability failure to a deterministic hardware
+   identity problem;
+2. names are localized and user/device-vendor controlled;
+3. “built in” classification did not prove “not Continuity Camera”;
+4. numeric indices change when an iPhone wakes, sleeps, connects, or
+   disconnects; and
+5. a cached name could describe a different physical device by the time the
+   warmed OpenCV handle produced a frame.
+
+Apple exposes explicit device identity on
+[`AVCaptureDevice`](https://developer.apple.com/documentation/avfoundation/avcapturedevice),
+including
+[`isContinuityCamera`](https://developer.apple.com/documentation/avfoundation/avcapturedevice/iscontinuitycamera)
+and
+[`uniqueID`](https://developer.apple.com/documentation/avfoundation/avcapturedevice/uniqueid).
+OpenCV's macOS backend indexes the legacy `devicesWithMediaType:` array. Cortex
+therefore enumerates that exact array rather than assuming a separate discovery
+session has identical ordering, while consuming modern properties from each
+device object.
+
+The accepted algorithm is:
+
+```text
+enumerate exact AVFoundation/OpenCV-indexed descriptors
+  -> remove unnamed, disconnected, and explicit Continuity devices
+  -> order built-in descriptors before other verified cameras
+  -> open one candidate on the sole camera thread
+  -> perform four cancellable 500 ms warm-up reads
+  -> re-enumerate the exact array
+  -> resolve the current descriptor at the opened index
+  -> reject if missing, unnamed, disconnected, or Continuity
+  -> accept the live descriptor and hashed stable device key
+```
+
+The same post-open verification applies to an explicitly configured index.
+`CORTEX_CAPTURE__DEVICE_ID` is a temporary selection hint, never authority to
+open an iPhone. Empty discovery fails closed because blind OpenCV probing can
+wake hardware before a later identity check rejects it.
+
+### 27.3 Stable identity without identifier disclosure
+
+AVFoundation's raw `uniqueID` is useful for physical-device continuity but is
+not appropriate telemetry. Cortex normalizes it in memory and derives:
+
+```text
+SHA-256("cortex-avfoundation-device" NUL raw_unique_id)[0:24]
+```
+
+Only that one-way `device_key` can reach `CameraSelection` and the camera
+identity boundary. The raw value is not logged, persisted, or exposed to the
+browser/editor; localized device names are also excluded from runtime capture
+logs. Resolution adds frame dimensions, so incompatible capture
+geometry cannot silently reuse calibration state. The numeric index is
+excluded, so an index reorder preserves the same device identity; two same-name
+physical cameras with different stable keys no longer collide.
+
+Name-keyword matching survives only as an old-bridge fallback when
+`isContinuityCamera` is genuinely unavailable. An explicit `False` always wins
+over a misleading name, and an explicit `True` rejects a benign or renamed
+device. Onboarding now consumes the identical descriptor function, preventing
+the UI from making a weaker safety claim than runtime capture.
+
+Long-term, a native AVFoundation adapter selected directly by unique ID and
+subscribed to
+[`wasConnectedNotification`](https://developer.apple.com/documentation/avfoundation/avcapturedevice/wasconnectednotification)
+has the highest reliability ceiling. It is not mixed into this patch because
+changing both backend and lifecycle would make failure attribution poor and
+requires fresh ARM/Intel performance, signing, TCC, sleep/wake, and physical
+device validation.
+
+### 27.4 UI/UX reference and full cross-surface review
+
+The UI review used the exact upstream
+[`emilkowalski/skills`](https://github.com/emilkowalski/skills) main commit
+`d23d7f88a2e21c9e4b1418c7abe420f5c1052ba7` (2026-08-21), specifically the
+`emil-design-eng` and `apple-design` decision frameworks. The local instruction
+files were byte-compared to that commit. The reference is applied as an
+interaction-quality framework, not copied as a theme: Cortex retains its warm
+semantic palette, restrained information density, and explicit authority
+model.
+
+| Before | After | Why |
+| --- | --- | --- |
+| Glass buttons/cards always depended on backdrop blur | `prefers-reduced-transparency` removes blur and uses the opaque semantic control surface | Material respects system preference and remains legible |
+| Recent activity container only had an `aria-label` | A labelled list contains list items, each retaining a native anchor | Assistive structure and navigation semantics now agree |
+| Lockout looked modal but did not own focus | Label/description/timer, initial focus, Tab containment, Escape, and focus restoration | A blocking surface must behave like a keyboard modal |
+| Lockout interval queried a nonexistent `countdown` ID | The interval updates the labelled `cortex-lockout-countdown` timer and a fake-clock test observes `0:10` → `0:09` | Accessible structure is insufficient if the visible state silently stays stale |
+| Non-blocking support cards used dialog semantics or no landmark | Named regions announce/support discovery without modal focus theft | Guidance must not interrupt the user's current editing locus |
+| Popup controls transitioned the `background` shorthand | Transitions name `background-color`, border, opacity, or transform only | Prevents accidental property interpolation and makes intent reviewable |
+| Tests used deprecated `react-dom/test-utils` `act` | Tests import the supported React `act` | Removes warning noise that could conceal real interaction failures |
+| Desktop comments claimed true native blur | Documentation states the safe tint-only AppKit boundary | Reintroducing `NSVisualEffectView` can orphan Qt and recreate the bounce/no-window incident |
+| Desktop and VS Code breathing pacers ignored Reduce Motion; the editor loop also ran while hidden | Pacers render a fixed non-counting guidance frame under Reduce Motion; the editor owns and cancels one frame loop on visibility/preference changes | Motion accessibility must stop the work itself, prevent parallel loops, and preserve useful guidance |
+| The full-screen break withheld its exit affordance and ignored Escape for 60 seconds | `End early` is visible from the first frame, Escape always exits, and the overlay/control expose accessible names and descriptions | A wellbeing prompt cannot trap the user or override agency to increase engagement |
+| Pulse Room stopped for Reduce Motion but kept an ordinary frame loop in hidden tabs | One nullable frame owner cancels on hidden visibility and resumes idempotently | Decorative background work must not consume energy when no user can see it |
+| Overlay footer accelerator hints overflowed and clipped all three visible labels at the shipped 460 px width | Concise equal-width labels retain complete meanings and shortcuts in accessible descriptions and tooltips; an offscreen text-fit contract covers the production width | Escape controls must stay legible at the exact size users receive, not only exist in the widget tree |
+
+The cross-surface audit also confirmed:
+
+- no `transition: all` or `scale(0)` remains on reviewed browser surfaces;
+- ordinary entries use strong ease-out at 200–240 ms and exits use faster
+  160 ms ease-in;
+- hover movement is gated to fine pointers;
+- updates reuse hosts and do not replay entrance animation;
+- reduced motion stops canvas/ambient/pacer work, removes transforms, and keeps
+  breathing guidance readable without a decrementing countdown;
+- privacy-suppressed/hidden surfaces stop their pacer timer or frame loop,
+  including the Pulse Room tab;
+- focus-visible, Escape, accessible names, live status, and contrast have
+  mechanical coverage; and
+- the desktop tint-only path preserves Qt's content view, title-bar drag
+  behavior, first-frame visibility, and packaged liveness.
+
+Decorative Pulse Room motion retains the product's small delight budget. The
+dashboard, popup, onboarding, privacy, and authority surfaces prioritize
+immediacy and state legibility. No large-scale visual rewrite was justified;
+the highest-value work was to close preference, semantics, focus, and launch
+integrity gaps.
+
+### 27.5 Release-chain hardening
+
+The previous release workflow did extensive Python and artifact verification,
+but the tag boundary did not independently rerun every shipped JavaScript
+surface or dependency policy. Standalone checksum manifests also lacked their
+own attestations. v0.3.12 changes the chain as follows:
+
+1. the checked-out tag commit must be reachable from `origin/main`;
+2. schema, config, design-token, version, link, and protocol contracts run on
+   that exact commit;
+3. Python lint/type/test/wheel/evaluation gates rerun;
+4. browser frozen install, TypeScript, all Vitest suites, Chrome MV3, and Edge
+   MV3 rerun;
+5. VS Code frozen install, lint, compile, tests, and package rerun;
+6. Python, browser, and VS Code dependency policies are regenerated and
+   enforced at the tag;
+7. each native architecture builds, Developer ID signs, notarizes, staples,
+   mounts, and camera-free smoke-tests its own DMG;
+8. DMG, evidence ZIP, SBOM, release metadata, and standalone
+   `SHA256SUMS-<arch>` are bound to the exact tag/build evidence;
+9. GitHub attestations cover both checksum manifests as independent subjects;
+   and
+10. promotion verifies provenance for both DMGs, both evidence bundles, and
+    both checksum manifests before attaching its validation decision.
+
+GitHub's official artifact-attestation model verifies an artifact subject
+against repository/workflow identity; it does not replace signatures,
+notarization, hashes, or physical testing. The release follows the combined
+boundary described in
+[`Using artifact attestations`](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations)
+and Apple's
+[`Notarizing macOS software before distribution`](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution).
+
+The packaged `--release-smoke` entry executes before ordinary UI startup and
+cannot request camera access. The deeper frozen startup probe runs with an
+isolated home/storage root, loopback ports, Qt offscreen mode,
+`CORTEX_HEADLESS_STARTUP=1`, and an impossible capture device. It exercises
+QApplication construction, controller/daemon composition, SQLite, service
+startup, HTTP/WebSocket liveness, SIGTERM shutdown, log evidence, and port
+cleanup while keeping the hardware boundary disabled.
+
+The final packaged review found that constructing the first-run camera card
+still enumerated AVFoundation metadata before the daemon reached that hardware
+guard. No capture device was opened, but metadata discovery was weaker than the
+stated camera-silent boundary and could still involve Continuity Camera. The
+onboarding detector now returns before importing the AVFoundation-backed
+service whenever `CORTEX_HEADLESS_STARTUP=1`. The frozen verifier independently
+rejects discovery, candidate-open, or successful-open log markers. The
+impossible device index remains defense in depth, not the primary guarantee.
+
+### 27.6 Security and dependency review
+
+The 2026-08-29 production-source Bandit pass reports **zero high**, 10 medium,
+and 239 low findings. The medium set is reviewed rather than blindly hidden:
+fixed-scheme/local URL opens, executable native-host mode, canonical temporary
+paths guarded by ownership/containment checks, and SQL fragments selected from
+closed internal catalogs. No high-severity finding remains after:
+
+- replacing a render-cache SHA-1 key with SHA-256; and
+- marking legacy persisted MD5 compatibility keys `usedforsecurity=False` so
+  their non-security purpose is explicit without invalidating stored data.
+
+The locked Python graph and VS Code graph have no known findings under the
+repository audit policy. The browser graph retains 11 path- and expiry-bound
+exceptions in Plasmo/Vitest build dependencies: two high image-processing
+findings, eight moderate Svelte/Parcel development-server findings, and one
+low tsup finding. Cortex ships no Svelte or Less source, and the build tools are
+not extension runtime members. Current Plasmo remains `0.90.5` and still pins
+those transitive lines; an unvalidated React/Vite/Plasmo major migration would
+increase release risk without removing the governing Plasmo paths. The policy
+continues to fail on scope, severity, package, advisory, or expiry drift.
+
+Secret-pattern review found only deliberate test fixtures. Environment files,
+private-key containers, logs, databases, build output, `.plasmo`, VSIX, and app
+bundles remain excluded from version control and independently rejected from
+the Python artifact. BYOK material stays in Keychain/provider-standard stores
+and is never bundled.
+
+### 27.7 Structural debt and recommended implementation order
+
+Static structure is not a release blocker by itself, but it identifies where
+future changes are hardest to reason about. Production code currently contains
+2,840 Radon-scored callables: 2,217 A, 396 B, 157 C, 37 D, 19 E, and 14 F.
+Seventy callables are D or worse. AST measurement finds 2,980 functions/methods,
+113 over 100 lines and 49 over 150 lines.
+
+The highest-risk seams are not arbitrary file size; they combine state,
+authority, recovery, or protocol dispatch:
+
+| Priority | Seam | Current risk | Safe decomposition |
+| --- | --- | --- | --- |
+| 1 | Intervention aggregate validator (complexity 119) | Cross-field lifecycle invariants are difficult to audit | Pure per-transition validators plus one small aggregate dispatcher and property/state-machine tests |
+| 2 | `record_receipts` (92) | Persistence, validation, and recovery outcomes are intertwined | Validate receipt batch, persist atomically, derive postconditions, and emit events in separate typed steps |
+| 3 | Runtime trigger/action/state loops (82/69/65) | Composition facade still coordinates too many concerns | Move one use case at a time into existing application coordinators behind parity tests |
+| 4 | WebSocket dispatch (59) | Large switch couples schema catalog and handlers | Typed handler registry with exhaustive message catalog and shared auth/order middleware |
+| 5 | Live calibration (57) | Hardware, scheduling, validity, and persistence share one routine | Acquisition session, evidence reducer, and atomic calibration writer |
+| 6 | Large Qt builders (up to 823 lines) | Visual structure and interaction wiring are hard to review | Extract semantic sections/view-model bindings without changing window ownership or native content view |
+
+These refactors should not be combined with v0.3.12 packaging. Each must retain
+behavioral golden tests, fault injection, and exact state-transition contracts.
+A broad “clean architecture” rewrite would erase attribution and is less safe
+than incremental extraction from the already-established application ports.
+
+### 27.8 Verification matrix and confidence boundary
+
+| Layer | Required proof | Hardware policy |
+| --- | --- | --- |
+| Source | Ruff, strict mypy, wheel inspection, complete pytest, schema/config/version/design/link/contracts, deterministic eval | No camera |
+| Browser/editor | Frozen installs, type/lint/tests, Chrome/Edge builds, VSIX, dependency audit | No camera |
+| UI | Offscreen Qt accessibility/contrast/render guards; browser semantics/motion/preferences; static reduced-motion pacers; immediate full-screen exit | No camera |
+| Synthetic capture | Descriptor reorder, renamed Continuity, stable key, warm-up, release/reopen/stop | Mock handles only |
+| Local package | Ad-hoc DMG static verification and explicit frozen startup that rejects device discovery/open markers | No camera discovery or capture |
+| Credentialed package | Dual native architecture, signing, notarization, staple, Gatekeeper, mount, SBOM, hash, attestation | CI camera disabled |
+| Installed product | Finder drag, visible launch/relaunch, TCC, built-in camera, iPhone appearance, browser/editor install, stop/cleanup | Explicit permission; clean ARM and Intel hosts |
+| Public distribution | Unauthenticated release-page download, digest/attestation match, repeat installed checks | Only after manual records and independent review |
+
+Automated success must not be restated as physical E2E success. Conversely, a
+manual screenshot without exact tag, artifact hash, architecture, case catalog,
+and independent reviewer is not release evidence. The promotion schema
+requires the fixed 14-case catalog on both ARM and Intel and global separation
+between builders and reviewers.
+
+### 27.9 v0.3.12 acceptance and release sequence
+
+The candidate may advance only through this order:
+
+```text
+complete camera-free source and client gates
+  -> review diff and prove no generated/private artifact is tracked
+  -> commit + PR + exact-merge main CI
+  -> immutable v0.3.12 tag on the merge commit
+  -> dual native signed/notarized draft assets
+  -> download both exact draft DMGs, evidence ZIPs, and checksum manifests
+  -> verify signatures, staple, Gatekeeper, hashes, attestations, architecture,
+     mounted layout, resource membership, and camera-disabled frozen startup
+  -> stop at draft status
+  -> explicitly authorized clean ARM + Intel physical 14-case runs
+  -> independent review and schema-valid evidence upload
+  -> protected promotion workflow
+  -> public release-page download and repeat verification
+```
+
+The public release page is the only supported end-user distribution surface.
+A workflow artifact, local `dist/` file, draft asset, source archive, or old DMG
+must not be represented as the release. If the physical gate cannot be run
+without violating the user's no-camera instruction, the rigorous outcome is a
+fully verified **draft**, accompanied by the exact remaining evidence request,
+not an unverified public promotion.
+
+### 27.10 Camera-free working-tree verification (2026-08-29)
+
+Before commit/tag creation, the complete local release-candidate gate reports:
+
+| Gate | Result |
+| --- | --- |
+| Python source | Ruff passed; strict mypy passed over 523 source files |
+| Python artifact | v0.3.12 wheel verified with 285 members and no forbidden/private material |
+| Python behavior | 2,703 passed; 3 documented dataset/tool-availability skips; 47 deprecation warnings |
+| Browser | TypeScript passed; 54 suites / 253 tests passed; Chrome and Edge MV3 production builds passed |
+| VS Code | Frozen install, lint, compile, 7 suites / 32 tests, and 32-file VSIX package passed |
+| Contracts | Schema, config, version, design-token, repository/link, live-message, action/tool-pin, and dependency boundaries passed |
+| Evaluation | All four recorded-trace regression metrics equal their baselines |
+| Dependencies | Python 0 findings; VS Code 0; browser 11 exact reviewed build/test-only exceptions with no policy drift |
+
+This is strong source and packaging-input evidence, but it is not substituted
+for exact-commit hosted CI, signed/notarized dual-architecture artifacts, or
+the permissioned physical 14-case matrix.

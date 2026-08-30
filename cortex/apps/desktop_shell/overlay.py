@@ -1,9 +1,10 @@
-"""Desktop Shell — Intervention Overlay (HUD-vibrancy refactor).
+"""Desktop Shell — Intervention Overlay (native HUD styling).
 
 A frameless, always-on-top panel that renders LLM-generated intervention
-content. On macOS the window is backed by ``NSVisualEffectMaterialHUDWindow``
-(the same dark vibrancy used by Spotlight / Notification Center), so the
-overlay feels like a native HUD instead of a custom-drawn dark rectangle.
+content. On macOS the window retains Qt's content view and receives the safe
+native window tint from :mod:`cortex.apps.desktop_shell.mac_native`; its dark
+HUD tokens provide the visual material. True ``NSVisualEffectView`` replacement
+is intentionally unavailable because it can orphan the packaged Qt window.
 
 The terracotta brand accent + breathing-pacer animation + causal_explanation
 row are all preserved from the previous implementation. ``BreathingPacer``'s
@@ -127,6 +128,11 @@ def _set_accessible_name(widget: object, name: str) -> None:
     _safe_call(widget, "setAccessibleName", name)
 
 
+def _set_accessible_description(widget: object, description: str) -> None:
+    """Defensive companion to :func:`_set_accessible_name`."""
+    _safe_call(widget, "setAccessibleDescription", description)
+
+
 def _set_tab_order(first: object, second: object) -> None:
     """Wrapper for ``QWidget.setTabOrder`` — see :func:`_set_accessible_name`."""
     fn = getattr(QWidget, "setTabOrder", None)
@@ -147,10 +153,9 @@ _INHALE_SECONDS, _HOLD_SECONDS, _EXHALE_SECONDS = _DEFAULT_BREATHING_PATTERN
 _CYCLE_SECONDS = _INHALE_SECONDS + _HOLD_SECONDS + _EXHALE_SECONDS
 
 # HUD palette — resolved from :mod:`cortex.apps.desktop_shell.tokens` (F47).
-# The vibrancy view below the window provides the actual dark blur; these
-# QColors are how the overlay's content layers itself on top of that
-# material. The token values are the spec; do not introduce hex literals
-# in this module — extend ``tokens.py`` instead.
+# These QColors provide the complete safe material; there is no native blur
+# view below Qt's content. The token values are the spec; do not introduce hex
+# literals in this module — extend ``tokens.py`` instead.
 _ACCENT = QColor(*HUD_ACCENT)
 _TEXT_PRIMARY = QColor(*TEXT_HUD_PRIMARY)
 _TEXT_SECONDARY = QColor(*TEXT_HUD_SECONDARY)
@@ -163,6 +168,10 @@ class BreathingPacer(QWidget):
     at construction time and falls back to the 4-7-8 default if no config
     is supplied (test stubs, ad-hoc previews).
 
+    Under Reduce Motion the pacer remains useful as a static breathing prompt:
+    no timer runs, the disc stays at a fixed scale, and the decrementing
+    countdown is replaced with ``at your pace``.
+
     Geometry unchanged from prior revision; only label fonts swap to the
     SF system stack."""
 
@@ -174,6 +183,7 @@ class BreathingPacer(QWidget):
     ) -> None:
         super().__init__(parent)
         self._active = False
+        self._reduced_motion = False
         self._elapsed_ms = 0
         # F48: resolve the breathing pattern. Explicit ``pattern`` arg
         # wins (used by tests + future user-supplied profiles); otherwise
@@ -195,13 +205,24 @@ class BreathingPacer(QWidget):
         self._timer.timeout.connect(self._tick)
         self.setFixedSize(160, 160)
 
-    def start(self) -> None:
+    def start(self, *, reduced_motion: bool = False) -> None:
         self._active = True
+        self._reduced_motion = bool(reduced_motion)
         self._elapsed_ms = 0
-        self._timer.start()
+        if self._reduced_motion:
+            self._timer.stop()
+            _set_accessible_name(
+                self,
+                "Breathing guide, breathe at your pace",
+            )
+        else:
+            self._timer.start()
+            _set_accessible_name(self, "Breathing guide")
+        self.update()
 
     def stop(self) -> None:
         self._active = False
+        self._reduced_motion = False
         self._timer.stop()
         self.update()
 
@@ -210,6 +231,8 @@ class BreathingPacer(QWidget):
         return self._active
 
     def _tick(self) -> None:
+        if self._reduced_motion:
+            return
         self._elapsed_ms += 33
         self.update()
 
@@ -230,6 +253,13 @@ class BreathingPacer(QWidget):
         scale = 1.0 - 0.7 * progress
         return "Exhale", remaining, scale
 
+    def _display_state(self) -> tuple[str, str, float]:
+        """Return the two labels and scale for the current rendered frame."""
+        if self._reduced_motion:
+            return "Breathe", "at your pace", 0.46
+        phase, remaining, scale = self._get_phase()
+        return phase, f"{remaining:.0f}s", scale
+
     def paintEvent(self, event: object) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -247,7 +277,7 @@ class BreathingPacer(QWidget):
             painter.end()
             return
 
-        phase, remaining, scale = self._get_phase()
+        phase, secondary_label, scale = self._display_state()
 
         max_radius = min(w, h) // 2 - 10
         radius = int(max_radius * scale)
@@ -278,7 +308,7 @@ class BreathingPacer(QWidget):
         painter.drawText(
             QRect(0, cy + 15, w, 30),
             Qt.AlignmentFlag.AlignCenter,
-            f"{remaining:.0f}s",
+            secondary_label,
         )
 
         painter.end()
@@ -328,7 +358,7 @@ class _SparklineWidget(QWidget):
 
 
 class OverlayWindow(QWidget):
-    """Frameless always-on-top intervention overlay backed by HUD vibrancy."""
+    """Frameless always-on-top intervention overlay with native HUD styling."""
 
     dismissed = Signal(str)
     # G4 (audit-prod): emitted when the user clicks a suggested-action
@@ -384,8 +414,9 @@ class OverlayWindow(QWidget):
         # ``show_intervention`` and consulted by ``_reveal_feedback_row``.
         self._wants_rating: bool = False
 
-        # Frameless + always-on-top. Translucent background lets the
-        # NSVisualEffectView under the window show through.
+        # Frameless + always-on-top. The translucent Qt surface lets the
+        # NSWindow's safe system background tint remain continuous beneath
+        # the HUD scrim; no native content-view replacement is involved.
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -415,6 +446,9 @@ class OverlayWindow(QWidget):
         # is not free to tick at 16ms intervals.
         self._record_animations: bool = False
         self._last_animation_log: dict[str, int] = {}
+        # Resolved once per presentation so the text cue and pacer cannot
+        # disagree if the system preference changes between two probes.
+        self._current_reduce_motion: bool = False
 
         self._build_ui()
 
@@ -676,26 +710,35 @@ class OverlayWindow(QWidget):
         footer_row = QHBoxLayout()
         footer_row.setContentsMargins(0, 0, 0, 0)
         footer_row.setSpacing(SP3)
-        footer_row.addStretch()
 
         # Dismiss button — HUD-style capsule.
-        self._dismiss_btn = QPushButton("Dismiss (Esc)")
+        self._dismiss_btn = QPushButton("Dismiss")
         self._dismiss_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         # F55: accessible name for VoiceOver.
         _set_accessible_name(self._dismiss_btn, "Dismiss intervention")
+        _set_accessible_description(
+            self._dismiss_btn,
+            "Close this intervention. Keyboard shortcut: Escape.",
+        )
+        _safe_call(self._dismiss_btn, "setToolTip", "Dismiss (Escape)")
         self._dismiss_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
         self._dismiss_btn.setStyleSheet(self._footer_btn_stylesheet())
         self._dismiss_btn.clicked.connect(self._user_dismiss)
-        footer_row.addWidget(self._dismiss_btn)
+        footer_row.addWidget(self._dismiss_btn, 1)
 
         # P0 §3.11: "Snooze 15" — overlay-only 15 min suppression. The
         # daemon keeps sensing but no new overlays fire during the
         # window. Reused across the spec where the spec says "snooze".
         # Phase-3 / Audit-1.2 F7: in-label accelerator hint + Qt
         # shortcut so keyboard-only users can reach the snooze action.
-        self._snooze_btn = QPushButton("Snooze 15 (S)")
+        self._snooze_btn = QPushButton("Snooze 15m")
         self._snooze_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         _set_accessible_name(self._snooze_btn, "Snooze interventions for 15 minutes")
+        _set_accessible_description(
+            self._snooze_btn,
+            "Hide interventions for 15 minutes. Keyboard shortcut: S.",
+        )
+        _safe_call(self._snooze_btn, "setToolTip", "Snooze 15 minutes (S)")
         self._snooze_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
         self._snooze_btn.setStyleSheet(self._footer_btn_stylesheet())
         self._snooze_btn.clicked.connect(self._on_snooze_clicked)
@@ -703,16 +746,21 @@ class OverlayWindow(QWidget):
             self._snooze_btn.setShortcut("S")
         except Exception:
             pass
-        footer_row.addWidget(self._snooze_btn)
+        footer_row.addWidget(self._snooze_btn, 1)
 
         # P0 §3.11: "Quiet for session" — overlay-only suppression
         # until the user explicitly clears it (or until daemon stop).
-        self._quiet_session_btn = QPushButton("Quiet for session (Q)")
+        self._quiet_session_btn = QPushButton("Quiet")
         self._quiet_session_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         _set_accessible_name(
             self._quiet_session_btn,
             "Quiet interventions for the rest of this session",
         )
+        _set_accessible_description(
+            self._quiet_session_btn,
+            "Hide interventions for the rest of this session. Keyboard shortcut: Q.",
+        )
+        _safe_call(self._quiet_session_btn, "setToolTip", "Quiet for session (Q)")
         self._quiet_session_btn.setFont(mac_native.system_font(FS_FOOTNOTE, "medium"))
         self._quiet_session_btn.setStyleSheet(self._footer_btn_stylesheet())
         self._quiet_session_btn.clicked.connect(self._on_quiet_session_clicked)
@@ -720,8 +768,7 @@ class OverlayWindow(QWidget):
             self._quiet_session_btn.setShortcut("Q")
         except Exception:
             pass
-        footer_row.addWidget(self._quiet_session_btn)
-        footer_row.addStretch()
+        footer_row.addWidget(self._quiet_session_btn, 1)
         card_layout.addLayout(footer_row)
 
         # P0 §3.8: feedback row — 👍 / 👎 buttons rendered after any
@@ -907,6 +954,7 @@ class OverlayWindow(QWidget):
         )
         # Fresh intervention — clear dismissed flag so this one can dismiss.
         self._dismissed = False
+        self._current_reduce_motion = self._reduce_motion_enabled()
 
         self._headline.setText(payload.get("headline", "Take a moment"))
         self._summary.setText(payload.get("situation_summary", ""))
@@ -1012,12 +1060,7 @@ class OverlayWindow(QWidget):
 
         ui_plan = payload.get("ui_plan", {})
         level = payload.get("level", "overlay_only")
-        if level == "overlay_only" or ui_plan.get("show_overlay", True):
-            self._pacer.start()
-            self._pacer.show()
-        else:
-            self._pacer.stop()
-            self._pacer.hide()
+        show_pacer = level == "overlay_only" or ui_plan.get("show_overlay", True)
 
         # FE-3 (P2-FE-MULTIMON): place the overlay on the display under
         # the cursor, not whatever ``self.screen()`` reports for the
@@ -1071,11 +1114,38 @@ class OverlayWindow(QWidget):
         # card content was still prepared above, so the next, non-shared
         # intervention shows instantly.
         if self._screen_share_active():
+            # A privacy transition can arrive while an earlier intervention is
+            # visible. Hide the complete window and stop every presentation
+            # timer; merely skipping the new ``show`` would leave old private
+            # content on the captured display.
+            self._timeout_timer.stop()
+            self._stop_feedback_reveal_timer()
+            self._pacer.stop()
+            self._pacer.hide()
+            for animation in (self._headline_anim, self._causal_fade_anim):
+                stop = getattr(animation, "stop", None)
+                if callable(stop):
+                    try:
+                        stop()
+                    except Exception:
+                        logger.debug(
+                            "Suppressed overlay animation stop failed",
+                            exc_info=True,
+                        )
+            self._reset_text_opacity_to_full()
+            self.hide()
             logger.info(
                 "Overlay suppressed for intervention %s — screen sharing active",
                 self._intervention_id,
             )
             return
+
+        if show_pacer:
+            self._pacer.start(reduced_motion=self._current_reduce_motion)
+            self._pacer.show()
+        else:
+            self._pacer.stop()
+            self._pacer.hide()
 
         self.show()
         self.raise_()
@@ -1083,7 +1153,8 @@ class OverlayWindow(QWidget):
 
         # Phase J-4: concurrent opacity feedback for newly presented text.
         # Skipped under Reduce Motion or when Qt lacks QPropertyAnimation.
-        # The breathing pacer remains independent; controls do not move.
+        # The breathing pacer uses the same preference to select its static
+        # guidance state; controls do not move.
         self._play_show_animations()
 
         logger.info(f"Overlay shown for intervention {self._intervention_id}")
@@ -1150,7 +1221,7 @@ class OverlayWindow(QWidget):
         # Always record the durations we *would* use so the unit test
         # can assert against the wired-up constants without spinning a
         # real event loop.
-        reduced = self._reduce_motion_enabled()
+        reduced = self._current_reduce_motion
         if reduced:
             headline_ms = 0
             causal_ms = 0
@@ -1299,10 +1370,10 @@ class OverlayWindow(QWidget):
             super().keyPressEvent(event)
 
     def paintEvent(self, event: object) -> None:
-        # The NSVisualEffectView provides the actual blur. We paint only
-        # a very faint translucent scrim on top so the card edge reads
-        # cleanly against bright wallpapers; on Linux/Windows fallback
-        # this is what gives the dim effect.
+        # On macOS the unchanged Qt content view sits over the NSWindow's
+        # system background tint. Paint only a faint HUD scrim so the card
+        # edge reads cleanly. On Linux/Windows this fill supplies the complete
+        # dim material.
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         if not mac_native.is_macos():
@@ -1874,7 +1945,7 @@ class OverlayWindow(QWidget):
             "  color: rgba(255, 255, 255, 0.85);"
             "  border: 0.5px solid rgba(255, 255, 255, 0.14);"
             f"  border-radius: {RADIUS_BUTTON}px;"
-            "  padding: 8px 18px;"
+            "  padding: 8px 10px;"
             "}"
             "QPushButton:hover {"
             "  background-color: rgba(255, 255, 255, 0.16);"
