@@ -264,6 +264,17 @@ def check_workflow_action_pins() -> list[str]:
     return problems
 
 
+def _dependency_audit_calls_missing_summary(run_block: str) -> tuple[int, ...]:
+    """Return one-based verifier calls that lack their own summary argument."""
+
+    verifier_segments = run_block.split("verify_dependency_audit.py")[1:]
+    return tuple(
+        call_number
+        for call_number, verifier_segment in enumerate(verifier_segments, start=1)
+        if "--summary-out" not in verifier_segment
+    )
+
+
 def check_toolchain_pins() -> list[str]:
     """Keep release and CI runtimes aligned with repository-owned pins."""
 
@@ -318,6 +329,12 @@ def check_toolchain_pins() -> list[str]:
         for job_name, job in payload.get("jobs", {}).items():
             steps = job.get("steps", []) if isinstance(job, dict) else []
             run_blocks = [str(step.get("run") or "") for step in steps if isinstance(step, dict)]
+            for block in run_blocks:
+                for call_number in _dependency_audit_calls_missing_summary(block):
+                    problems.append(
+                        f"{workflow.relative_to(_ROOT)} job {job_name} dependency-audit "
+                        f"verifier call {call_number} lacks required --summary-out"
+                    )
             invokes_pnpm = any(
                 re.search(r"(^|\s)pnpm(?:\s|$)", block, re.MULTILINE) for block in run_blocks
             )
