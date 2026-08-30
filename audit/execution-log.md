@@ -189,3 +189,45 @@ design/repository contracts, and all four exact recorded-trace baselines.
 No normal Cortex launch, AVFoundation enumeration, or physical camera was used.
 Hosted PR/main, signed candidate, artifact-download, and physical-review results
 must be appended only after they exist for the exact corrective commits.
+
+The corrective tree was merged as `2bafb7228912685c2f7c4b06fcb526491cfe45ef`.
+PR run `33291541268` and exact-merge `main` run `33291924014` passed all seven
+jobs. Immutable tag `v0.3.13` then ran release workflow `33292306593`: the
+previously failing locked audit gate passed, as did the complete signed,
+notarized, stapled, verified, and attested ARM64 matrix job. The Intel job built
+and deep-signed the app but received `hdiutil: create failed - Resource busy`
+from its one-shot disk-image creation. The dual-architecture draft stage was
+skipped, so no GitHub release or downloadable candidate was created. The tag is
+retained and is not moved or reused.
+
+## v0.3.14 bounded canonical DMG creation
+
+The replacement adds a typed `hdiutil` coordinator that allows three attempts
+only for recognized transient host errors, removes a partial file before each
+retry, uses bounded linear backoff, records every transcript in release
+evidence, rejects success without a real DMG, and immediately propagates
+non-transient failures. Verbose macOS `EBUSY`/`EAGAIN` errno diagnostics make
+classification independent of localized display text. Focused tests exercise
+recovery on the third attempt,
+exact command construction, cleanup, evidence retention, non-transient
+fail-fast behavior, and bounded exhaustion. Product behavior and the reviewed
+Emil/Apple UI contract are unchanged.
+
+No normal Cortex launch, AVFoundation enumeration, or physical camera is
+authorized for this corrective pass. Hosted and candidate results must be
+appended only after they exist for the exact v0.3.14 commits and tag.
+
+Camera-free local verification then passed Ruff, strict mypy over 524 files,
+2,707 Python tests (3 documented skips), a verified 286-member wheel, 253
+browser tests plus dual MV3 builds, 32 VS Code tests plus VSIX, generated
+contracts, dependency policy, and the four exact replay baselines. The privacy
+performance case passed three isolated repetitions at 28–30 ms after one
+parallel-load run exceeded its 250 ms host-time budget; no threshold changed.
+
+The full ARM64 ad-hoc pipeline used checksum-verified Node 22.23.2, created the
+0.3.14 DMG through the new helper on attempt 1, and passed the packaged verifier.
+The artifact SHA-256 was
+`291b86a0a97a726b874a97b11a17b1b2c68e75cd92dfbdf51b5cb1fa71fc8301`.
+The frozen probe logged hardware acquisition disabled, no camera discovery/open
+markers, then shut down with no listener, process, or mounted image remaining.
+This local ad-hoc artifact is evidence for the changed path, not a release.

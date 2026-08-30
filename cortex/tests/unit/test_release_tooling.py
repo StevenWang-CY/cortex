@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ import pytest
 from jsonschema import Draft202012Validator, FormatChecker
 
 from cortex import __version__
+from cortex.scripts.create_macos_dmg import DmgCreationError, create_macos_dmg
 from cortex.scripts.generate_release_evidence import (
     ReleaseEvidenceError,
     _command,
@@ -220,19 +222,146 @@ def test_macos_builder_owns_drag_to_applications_layout_before_image_creation() 
     staging_copy = 'cp -R "${APP_PATH}" "${DMG_STAGE_DIR}/Cortex.app"'
     applications_link = 'ln -s /Applications "${DMG_STAGE_DIR}/Applications"'
     versioned_volume = 'DMG_VOLUME_NAME="Cortex ${CORTEX_VERSION}"'
-    canonical_hdiutil = (
-        'hdiutil create -volname "${DMG_VOLUME_NAME}" -srcfolder "${DMG_STAGE_DIR}" '
-        '-ov -format UDZO "${DMG_PATH}"'
-    )
+    canonical_builder = '"${PYTHON_BIN}" -m cortex.scripts.create_macos_dmg \\'
 
     volume_index = build_script.index(versioned_volume)
     copy_index = build_script.index(staging_copy)
     link_index = build_script.index(applications_link, copy_index)
-    hdiutil_index = build_script.index(canonical_hdiutil, link_index)
+    builder_index = build_script.index(canonical_builder, link_index)
 
-    assert volume_index < copy_index < link_index < hdiutil_index
+    assert volume_index < copy_index < link_index < builder_index
+    assert '--volume-name "${DMG_VOLUME_NAME}"' in build_script[builder_index:]
+    assert '--source-dir "${DMG_STAGE_DIR}"' in build_script[builder_index:]
+    assert '--output "${DMG_PATH}"' in build_script[builder_index:]
+    assert '--evidence-dir "${EVIDENCE_DIR}"' in build_script[builder_index:]
     assert "create-dmg" not in build_script
     assert "--app-drop-link" not in build_script
+
+
+def test_macos_dmg_creation_retries_resource_busy_and_keeps_evidence(
+    tmp_path: Path,
+) -> None:
+    source_dir = tmp_path / "stage"
+    source_dir.mkdir()
+    output = tmp_path / "Cortex.dmg"
+    evidence_dir = tmp_path / "evidence"
+    commands: list[list[str]] = []
+    delays: list[float] = []
+
+    def fake_runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+        assert not output.exists(), "partial DMG was not removed before retry"
+        commands.append(command)
+        if len(commands) < 3:
+            output.write_bytes(b"partial")
+            transcript = (
+                "DIHLDiskImageCreate() returned 16\n"
+                if len(commands) == 1
+                else "hdiutil: create failed - Resource busy\n"
+            )
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                stdout=transcript,
+            )
+        output.write_bytes(b"dmg")
+        return subprocess.CompletedProcess(command, 0, stdout="created: Cortex.dmg\n")
+
+    attempt = create_macos_dmg(
+        volume_name=f"Cortex {__version__}",
+        source_dir=source_dir,
+        output=output,
+        evidence_dir=evidence_dir,
+        max_attempts=3,
+        retry_delay_seconds=2,
+        runner=fake_runner,
+        sleeper=delays.append,
+    )
+
+    assert attempt == 3
+    assert len(commands) == 3
+    assert commands[0] == [
+        "hdiutil",
+        "create",
+        "-verbose",
+        "-volname",
+        f"Cortex {__version__}",
+        "-srcfolder",
+        str(source_dir),
+        "-ov",
+        "-format",
+        "UDZO",
+        str(output),
+    ]
+    assert delays == [2, 4]
+    assert output.read_bytes() == b"dmg"
+    assert sorted(path.name for path in evidence_dir.iterdir()) == [
+        "hdiutil-create-attempt-1.txt",
+        "hdiutil-create-attempt-2.txt",
+        "hdiutil-create-attempt-3.txt",
+    ]
+
+
+def test_macos_dmg_creation_does_not_retry_non_transient_failure(
+    tmp_path: Path,
+) -> None:
+    source_dir = tmp_path / "stage"
+    source_dir.mkdir()
+    output = tmp_path / "Cortex.dmg"
+    calls = 0
+
+    def fake_runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal calls
+        calls += 1
+        output.write_bytes(b"partial")
+        return subprocess.CompletedProcess(
+            command,
+            1,
+            stdout=(
+                "DIHLDiskImageCreate() returned 2\n"
+                "hdiutil: create failed - localized missing-file error\n"
+            ),
+        )
+
+    with pytest.raises(DmgCreationError, match="non-transient exit 1"):
+        create_macos_dmg(
+            volume_name=f"Cortex {__version__}",
+            source_dir=source_dir,
+            output=output,
+            evidence_dir=tmp_path / "evidence",
+            runner=fake_runner,
+            sleeper=lambda _delay: pytest.fail("non-transient failure retried"),
+        )
+
+    assert calls == 1
+    assert not output.exists()
+
+
+def test_macos_dmg_creation_fails_after_bounded_busy_retries(tmp_path: Path) -> None:
+    source_dir = tmp_path / "stage"
+    source_dir.mkdir()
+    output = tmp_path / "Cortex.dmg"
+    calls = 0
+
+    def fake_runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal calls
+        calls += 1
+        output.write_bytes(b"partial")
+        return subprocess.CompletedProcess(command, 1, stdout="Resource busy\n")
+
+    with pytest.raises(DmgCreationError, match="remained busy after 2 attempts"):
+        create_macos_dmg(
+            volume_name=f"Cortex {__version__}",
+            source_dir=source_dir,
+            output=output,
+            evidence_dir=tmp_path / "evidence",
+            max_attempts=2,
+            retry_delay_seconds=0,
+            runner=fake_runner,
+            sleeper=lambda _delay: None,
+        )
+
+    assert calls == 2
+    assert not output.exists()
 
 
 def test_notarized_dmg_verification_requires_signature_ticket_and_gatekeeper() -> None:

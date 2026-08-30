@@ -85,6 +85,7 @@ Status meanings:
 | F66 | Desktop overlay footer labels clipped at the shipped window width | v0.3.12; concise equal-width controls, accessible shortcut descriptions, offscreen text-fit contract, and visual reinspection | Closed |
 | F67 | Camera-disabled packaged startup still enumerated AVFoundation metadata while constructing onboarding | v0.3.12; pre-import headless guard plus release-verifier rejection of discovery/open markers | Closed |
 | F68 | Tag-only dependency audit calls drifted from the verifier's required summary-output contract | v0.3.13; all release calls emit summaries and the repository contract enforces one `--summary-out` per verifier call | Closed |
+| F69 | Canonical DMG creation failed immediately on transient Intel-host `Resource busy` | v0.3.14; typed bounded retry helper, transient allowlist, partial-output cleanup, evidence transcripts, and fail-fast negative contracts | Closed |
 
 ## Current cross-cutting work packages
 
