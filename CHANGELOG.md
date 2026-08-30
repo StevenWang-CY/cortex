@@ -4,7 +4,7 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [v0.3.13] — 2026-08-29
+## [v0.3.13] — 2026-08-30
 
 This patch supersedes the immutable `v0.3.12` tag, whose release workflow
 failed closed before signing or artifact creation. The application, camera,
