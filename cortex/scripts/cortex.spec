@@ -43,10 +43,10 @@ keyring_meta = copy_metadata("keyring")
 # NOTE on destination paths: PyInstaller's macOS bundle maps MEIPASS to
 # ``Contents/Resources/`` (not ``Contents/Frameworks/``), and the desktop
 # shell's ConnectionsPanel resolves paths like
-# ``Contents/Resources/browser_extension_chrome`` and
-# ``Contents/Resources/cortex/scripts/native_host.py``. Keep the data
-# destinations here aligned with those expectations — do NOT add an extra
-# ``resources/`` prefix.
+# ``Contents/Resources/browser_extension_chrome``. The native messaging host
+# is a dedicated executable under ``Contents/MacOS`` and is intentionally not
+# mutable resource data. Keep the data destinations here aligned with those
+# expectations — do NOT add an extra ``resources/`` prefix.
 datas = [
     # Configuration
     (str(CORTEX / "libs" / "config" / "defaults.yaml"), "cortex/libs/config"),
@@ -69,14 +69,6 @@ datas = [
     # from ConnectionsPanel. Version tracks pyproject.toml.
     (str(CORTEX / "apps" / "vscode_extension" / f"cortex-somatic-{CORTEX_VERSION}.vsix"),
      "."),
-
-    # Native messaging host — Chrome invokes a copied host script from the
-    # user's Application Support directory. The installer reads this bundled
-    # source script and writes the executable copy outside the signed app bundle.
-    (str(CORTEX / "scripts" / "native_host.py"),
-     "cortex/scripts"),
-    (str(CORTEX / "scripts" / "install_native_host.py"),
-     "cortex/scripts"),
 
     # MediaPipe task model used by FaceTracker. Without this data file the
     # frozen app falls back to telemetry-only mode even when camera access works.
@@ -207,7 +199,27 @@ a = Analysis(
     noarchive=False,
 )
 
+# Native messaging must not depend on a Python installation outside the app.
+# Build a second, console-capable executable that shares the app's collected
+# libraries but has its own minimal Python module archive. Chrome and Edge
+# launch this binary directly and communicate over stdin/stdout; ``console=True``
+# preserves those file descriptors while the desktop executable remains a
+# normal GUI application.
+native_host_a = Analysis(
+    [str(CORTEX / "scripts" / "native_host.py")],
+    pathex=[str(ROOT)],
+    binaries=[],
+    datas=[],
+    hiddenimports=[],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+)
+
 pyz = PYZ(a.pure, a.zipped_data)
+native_host_pyz = PYZ(native_host_a.pure, native_host_a.zipped_data)
 
 exe = EXE(
     pyz,
@@ -225,10 +237,29 @@ exe = EXE(
     entitlements_file=None,  # Signing handled by build_macos_app.sh
 )
 
+native_host_exe = EXE(
+    native_host_pyz,
+    native_host_a.scripts,
+    [],
+    exclude_binaries=True,
+    name="CortexNativeHost",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=True,
+    target_arch=os.environ.get("CORTEX_ARTIFACT_ARCH") or None,
+    codesign_identity=None,
+    entitlements_file=None,
+)
+
 coll = COLLECT(
     exe,
+    native_host_exe,
     a.binaries,
     a.datas,
+    native_host_a.binaries,
+    native_host_a.datas,
     strip=False,
     upx=False,
     name="Cortex",

@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -1495,19 +1496,23 @@ class TestConnectionsVerify:
         return ConnectionsPanel.__new__(ConnectionsPanel)
 
     def test_manifest_check_uses_launcher_host_name(self, tmp_path, monkeypatch):
-        from cortex.apps.desktop_shell import connections as conn
+        from cortex.scripts import install_native_host
+        from types import SimpleNamespace
 
-        monkeypatch.setattr(conn.Path, "home", staticmethod(lambda: tmp_path))
         panel = self._panel()
-        # No manifest present → False.
-        assert panel._native_host_manifest_installed("Chrome") is False
-        # Create the canonical manifest where the installer writes it.
-        manifest = (
-            tmp_path / "Library" / "Application Support" / "Google" / "Chrome"
-            / "NativeMessagingHosts" / "com.cortex.launcher.json"
+        monkeypatch.setattr(
+            install_native_host,
+            "verify_browser_installation",
+            lambda _browser: SimpleNamespace(ok=False),
         )
-        manifest.parent.mkdir(parents=True, exist_ok=True)
-        manifest.write_text("{}")
+        assert panel._native_host_manifest_installed("Chrome") is False
+        monkeypatch.setattr(
+            install_native_host,
+            "verify_browser_installation",
+            lambda browser: SimpleNamespace(
+                ok=browser == "Google Chrome",
+            ),
+        )
         assert panel._native_host_manifest_installed("Chrome") is True
 
     def test_daemon_reachable_false_on_closed_port(self):
@@ -1515,18 +1520,145 @@ class TestConnectionsVerify:
         # Port 1 is reserved/unbound → not reachable, returns False fast.
         assert panel._daemon_reachable(port=1) is False
 
+    @pytest.mark.parametrize(
+        ("display_name", "expected_browser"),
+        (("Chrome", "Google Chrome"), ("Edge", "Microsoft Edge")),
+    )
+    def test_connect_targets_only_selected_browser_and_requires_protocol_success(
+        self,
+        display_name,
+        expected_browser,
+        monkeypatch,
+    ):
+        from types import SimpleNamespace
+
+        from cortex.apps.desktop_shell import connections as conn
+        from cortex.scripts import install_native_host
+
+        panel = self._panel()
+        install_calls: list[dict] = []
+        monkeypatch.setattr(conn, "canonical_app_path", lambda: Path("/Applications/Cortex.app"))
+        monkeypatch.setattr(
+            install_native_host,
+            "install",
+            lambda **kwargs: install_calls.append(kwargs) or True,
+        )
+        monkeypatch.setattr(
+            install_native_host,
+            "verify_browser_installation",
+            lambda browser: SimpleNamespace(
+                ok=False,
+                error=f"{browser} protocol probe failed",
+            ),
+        )
+        warnings: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            conn.QMessageBox,
+            "warning",
+            staticmethod(
+                lambda _parent, title, message: warnings.append((title, message))
+            ),
+        )
+        monkeypatch.setattr(
+            conn.subprocess,
+            "run",
+            lambda *_args, **_kwargs: pytest.fail(
+                "browser must not open after a failed protocol verification"
+            ),
+        )
+
+        panel._connect_browser(display_name, "chrome://extensions")
+
+        assert install_calls == [
+            {
+                "project_root": "/Applications/Cortex.app",
+                "target_browsers": (expected_browser,),
+            }
+        ]
+        assert warnings
+        assert "No connection was reported as successful" in warnings[0][1]
+
+    def test_connect_success_shows_exact_browser_restart_steps(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from types import SimpleNamespace
+
+        from cortex.apps.desktop_shell import connections as conn
+        from cortex.scripts import install_native_host
+
+        panel = self._panel()
+        app_path = tmp_path / "Cortex.app"
+        extension_path = (
+            app_path / "Contents" / "Resources" / "browser_extension_chrome"
+        )
+        extension_path.mkdir(parents=True)
+        clipboard_values: list[str] = []
+        messages: list[str] = []
+        monkeypatch.setattr(conn, "canonical_app_path", lambda: app_path)
+        monkeypatch.setattr(install_native_host, "install", lambda **_kwargs: True)
+        monkeypatch.setattr(
+            install_native_host,
+            "verify_browser_installation",
+            lambda _browser: SimpleNamespace(ok=True, error=None),
+        )
+        monkeypatch.setattr(
+            conn.QApplication,
+            "clipboard",
+            staticmethod(
+                lambda: SimpleNamespace(
+                    setText=lambda value: clipboard_values.append(value)
+                )
+            ),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            conn.subprocess,
+            "run",
+            lambda args, **_kwargs: SimpleNamespace(
+                returncode=0,
+                stdout="",
+                stderr="",
+                args=args,
+            ),
+        )
+        monkeypatch.setattr(
+            conn.QMessageBox,
+            "information",
+            staticmethod(
+                lambda _parent, _title, message: messages.append(message)
+            ),
+        )
+
+        panel._connect_browser("Chrome", "chrome://extensions")
+
+        assert clipboard_values == [str(extension_path)]
+        assert messages
+        assert "Cmd+Shift+G" in messages[0]
+        assert "Cmd+Q" in messages[0]
+        assert "protocol check" in messages[0]
+
     def test_verify_reports_each_prerequisite(self, monkeypatch):
         from cortex.apps.desktop_shell import connections as conn
+        from cortex.scripts import install_native_host
+        from types import SimpleNamespace
 
         panel = self._panel()
         monkeypatch.setattr(
-            panel, "_native_host_manifest_installed", lambda name: False
+            install_native_host,
+            "verify_browser_installation",
+            lambda _name: SimpleNamespace(
+                ok=False,
+                extension_ids=(),
+                error="registered native host did not respond",
+            ),
         )
         monkeypatch.setattr(panel, "_daemon_reachable", lambda: False)
         warnings: list = []
         monkeypatch.setattr(
             conn.QMessageBox, "warning",
-            staticmethod(lambda *a, **kw: warnings.append(a)),
+            staticmethod(lambda _parent, title, message, **kw: warnings.append((title, message))),
         )
         monkeypatch.setattr(
             conn.QMessageBox, "information",
@@ -1537,7 +1669,7 @@ class TestConnectionsVerify:
         # because neither prerequisite is satisfied.
         assert warnings
         joined = " ".join(str(x) for x in warnings)
-        assert "NOT installed" in joined or "not reachable" in joined
+        assert "FAILED" in joined or "not reachable" in joined
 
 
 # ===========================================================================

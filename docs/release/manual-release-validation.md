@@ -36,9 +36,15 @@ when one redacted recording or log genuinely covers them.
 
 ## Browser/editor installation
 
-- Install Chrome and Edge packages from the app, inspect the native-host
-  manifest/copy and allowed origin, then fully quit with Cmd+Q and reopen.
-- Verify native `get_status`, authenticated launch, reconnect, and stop framing.
+- Install Chrome and Edge packages from the app. Confirm each manifest points
+  exactly to `/Applications/Cortex.app/Contents/MacOS/CortexNativeHost`, has
+  only that browser's expected origins, and that the nested executable's
+  signature and architecture match the application. Fully quit with Cmd+Q and
+  reopen after each registration change.
+- Verify framed `status`, authenticated launch, reconnect, `get_auth_token`,
+  dashboard raise, and stop behavior. Confirm a missing/malformed helper is
+  reported as failure rather than connected, and confirm native-host logs stay
+  bounded without leaking the token.
 - Revoke optional page-context permission and confirm content is immediately
   cleared while metadata-only telemetry remains bounded.
 - Install/update/uninstall the VS Code VSIX from a Finder-launched app whose
@@ -92,7 +98,7 @@ uv run --project cortex --locked --extra dev \
   python -m cortex.scripts.validate_release_records \
   --records-dir release-assets \
   --asset-dir release-assets \
-  --expected-version 0.3.14 \
+  --expected-version 0.3.15 \
   --expected-commit "$(git rev-parse HEAD)" \
   --output release-assets/release-promotion-validation.json
 ```

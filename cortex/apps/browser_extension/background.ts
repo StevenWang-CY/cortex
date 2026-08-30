@@ -87,11 +87,11 @@ import {
 } from "./lib/capability-executor";
 import { InterventionPresentationState } from "./lib/intervention-presentation";
 import { TabActivationTelemetry } from "./lib/browser-telemetry";
+import { sendNativeHostMessage } from "./lib/native-messaging";
 import {
     DAEMON_WS_URL,
     DAEMON_HTTP_URL,
     LAUNCHER_HTTP_URL,
-    NATIVE_HOST_ID,
 } from "./config";
 
 // --- Types (generated from Pydantic — Debt-1 closure) ---
@@ -971,32 +971,19 @@ function handleDisconnect(): void {
  */
 async function probeConnectivity(trigger: string): Promise<void> {
     let nativeHostStatus: "present" | "missing" = "missing";
+    let nativeHostError: string | null = null;
     try {
-        await new Promise<void>((resolve, reject) => {
-            const timeout = setTimeout(() => reject(new Error("native_host_ping_timeout")), 1500);
-            try {
-                chrome.runtime.sendNativeMessage(
-                    NATIVE_HOST_ID,
-                    { command: "status" },
-                    (response) => {
-                        clearTimeout(timeout);
-                        if (chrome.runtime.lastError) {
-                            reject(new Error(chrome.runtime.lastError.message || "native_host_error"));
-                        } else if (response) {
-                            nativeHostStatus = "present";
-                            resolve();
-                        } else {
-                            reject(new Error("native_host_empty_response"));
-                        }
-                    },
-                );
-            } catch (e) {
-                clearTimeout(timeout);
-                reject(e instanceof Error ? e : new Error(String(e)));
-            }
-        });
-    } catch {
+        const response = await sendNativeHostMessage(
+            { command: "status" },
+            { timeoutMs: 5_000 },
+        );
+        if (response.command !== "status") {
+            throw new Error("unexpected_native_host_response");
+        }
+        nativeHostStatus = "present";
+    } catch (error) {
         nativeHostStatus = "missing";
+        nativeHostError = error instanceof Error ? error.message : String(error);
     }
 
     let daemonVersion: string | null = null;
@@ -1028,6 +1015,7 @@ async function probeConnectivity(trigger: string): Promise<void> {
         type: "CONNECTIVITY_DIAGNOSTIC",
         payload: {
             native_host_status: nativeHostStatus,
+            native_host_error: nativeHostError,
             daemon_version: daemonVersion,
             handshake_error: handshakeError,
         },
@@ -2520,23 +2508,21 @@ async function runLaunchCortex(): Promise<LaunchResult> {
         }
 
         // Path 2: Native messaging
-        const nativeResult = await new Promise<Record<string, string>>((resolve) => {
-            try {
-                chrome.runtime.sendNativeMessage(
-                    NATIVE_HOST_ID,
-                    { command: "launch" },
-                    (response) => {
-                        if (chrome.runtime.lastError) {
-                            resolve({ status: "native_error", error: chrome.runtime.lastError.message || "Native messaging failed" });
-                        } else {
-                            resolve(response || { status: "no_response" });
-                        }
-                    },
-                );
-            } catch {
-                resolve({ status: "native_unavailable", error: "Native messaging not available" });
-            }
-        });
+        let nativeResult: { status: string; error?: string };
+        try {
+            const response = await sendNativeHostMessage(
+                { command: "launch" },
+                { timeoutMs: 30_000 },
+            );
+            nativeResult = response.command === "launch"
+                ? { status: response.status, error: response.error ?? undefined }
+                : { status: "native_error", error: "Unexpected native host response" };
+        } catch (error) {
+            nativeResult = {
+                status: "native_unavailable",
+                error: error instanceof Error ? error.message : String(error),
+            };
+        }
 
         if (nativeResult.status === "launched" || nativeResult.status === "already_running") {
             if (await waitAndEnableCamera(10)) {
@@ -6111,10 +6097,9 @@ chrome.runtime.onMessage.addListener(
                     // daemon process by PID. This is the most reliable kill mechanism
                     // because it works even when HTTP/WebSocket are unresponsive.
                     try {
-                        chrome.runtime.sendNativeMessage(
-                            NATIVE_HOST_ID,
+                        await sendNativeHostMessage(
                             { command: "stop" },
-                            () => { /* ignore response */ }
+                            { timeoutMs: 15_000 },
                         );
                     } catch { /* native messaging may not be available */ }
                     // Step 6: HTTP stop via launcher agent (port 9471) as final backup
@@ -6723,36 +6708,26 @@ chrome.runtime.onMessage.addListener(
                 // host is not installed (Chrome-only install, no desktop
                 // app), respond ``unavailable`` so the popup can show
                 // "Install desktop app to view history".
-                try {
-                    chrome.runtime.sendNativeMessage(
-                        NATIVE_HOST_ID,
-                        { command: "raise_dashboard", target: "history" },
-                        (response) => {
-                            if (chrome.runtime.lastError) {
-                                sendResponse({
-                                    status: "unavailable",
-                                    error:
-                                        chrome.runtime.lastError.message ??
-                                        "native_host_unavailable",
-                                });
-                                return;
-                            }
-                            const status =
-                                response &&
-                                typeof (response as Record<string, unknown>)
-                                    .status === "string"
-                                    ? ((response as Record<string, unknown>)
-                                          .status as string)
-                                    : "ok";
-                            sendResponse({ status });
-                        },
-                    );
-                } catch (e) {
-                    sendResponse({
-                        status: "unavailable",
-                        error: e instanceof Error ? e.message : String(e),
-                    });
-                }
+                void (async () => {
+                    try {
+                        const response = await sendNativeHostMessage(
+                            { command: "raise_dashboard", target: "history" },
+                            { timeoutMs: 8_000 },
+                        );
+                        sendResponse({
+                            status: response.command === "raise_dashboard"
+                                ? response.status
+                                : "unavailable",
+                        });
+                    } catch (error) {
+                        sendResponse({
+                            status: "unavailable",
+                            error: error instanceof Error
+                                ? error.message
+                                : String(error),
+                        });
+                    }
+                })();
                 return true; // async
             }
         }
@@ -7058,27 +7033,14 @@ function handleCommandDismissOverlay(): void {
 }
 
 function handleCommandViewHistory(): void {
-    try {
-        chrome.runtime.sendNativeMessage(
-            NATIVE_HOST_ID,
-            { command: "raise_dashboard", target: "history" },
-            () => {
-                const lastErr = (chrome as unknown as {
-                    runtime?: { lastError?: { message?: string } };
-                }).runtime?.lastError;
-                if (lastErr && DEBUG) {
-                    console.warn(
-                        "[cortex.bg] view-history shortcut native_host unavailable",
-                        lastErr.message,
-                    );
-                }
-            },
-        );
-    } catch (e) {
-        if (DEBUG) {
-            console.warn("[cortex.bg] view-history shortcut threw", e);
-        }
-    }
+    void sendNativeHostMessage(
+        { command: "raise_dashboard", target: "history" },
+        { timeoutMs: 8_000 },
+    )
+        .catch((error: unknown) => {
+            if (!DEBUG) return;
+            console.warn("[cortex.bg] view-history shortcut threw", error);
+        });
 }
 
 // chrome.commands is only present in MV3 contexts that actually

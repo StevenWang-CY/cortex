@@ -4,6 +4,68 @@ All notable changes to Cortex. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.3.15] — 2026-08-30
+
+This patch supersedes the staged `v0.3.14` candidate after an installed-app
+exercise exposed that both Chrome and Edge could find the native-messaging
+manifest but could not execute a working Cortex host. The desktop application
+was not repeatedly launched while diagnosing this correction, so local camera
+hardware was not activated.
+
+### Fixed
+
+* Packaged releases now include a dedicated, signed, self-contained
+  `CortexNativeHost` executable. Browser integration no longer depends on a
+  Homebrew, Xcode, system, or project-virtual-environment Python installation.
+* Schema and configuration package façades now load public exports lazily while
+  shipping matching type stubs. This removes the unrelated application graph
+  from each short-lived native-host process and keeps cold protocol probes
+  inside the browser diagnostic budget.
+* The packaged installer points each manifest directly at
+  `/Applications/Cortex.app/Contents/MacOS/CortexNativeHost`. It rejects a
+  missing/non-executable helper and requires a real little-endian framed
+  `status` round trip before and after manifest installation.
+* Chrome and Edge installation are target-specific. Each browser receives
+  only its fixed release origin and the validated Cortex extension IDs found
+  in that browser's own profiles; IDs discovered in one browser no longer
+  widen the other browser's allowlist.
+* Manifest writes are atomic and mode `0644`. Runtime verification requires
+  the canonical host name, `stdio` transport, an exact trusted absolute path,
+  an exact browser-local origin set, executable permissions, and a valid
+  protocol response. A stale file's mere existence never reports success.
+* Profile discovery covers every `Profile *` directory, validates Chromium
+  extension-ID syntax and nested preference types, and recognizes the fixed ID
+  even when Chromium stores a localized `__MSG_*` manifest name.
+* The browser extension now uses one native-messaging client with command
+  matching, runtime response decoding, bounded timeouts, and
+  `runtime.lastError` reads inside the callback where Chromium guarantees it.
+  Status, launch, stop, authentication, and dashboard commands share that
+  boundary.
+* Native-host diagnostics moved to `~/Library/Logs/Cortex/native-host.log`,
+  mode `0600`, with a 512 KiB active-file limit and two bounded backups. This
+  replaces the unbounded failure loop that produced a 61 MB legacy log during
+  the v0.3.14 incident.
+
+### UI and release integrity
+
+* Desktop browser cards distinguish “Browser found” from connected state.
+  Connect targets exactly Chrome or Edge, surfaces the failing layer, copies
+  the correct unpacked-extension path, and gives exact `Cmd+Shift+G` and
+  mandatory `Cmd+Q` restart steps.
+* Verify reports browser-bridge protocol, extension-profile detection, and
+  daemon reachability separately. It claims readiness only when all locally
+  observable layers pass and names the extension popup as the authority for
+  live WebSocket state.
+* Packaged release verification now requires the helper in the mounted DMG,
+  the same architecture as the GUI executable, a valid nested signature, and
+  a hardware-free framed status exchange. It also rejects camera, audio-input,
+  or Apple-events entitlements on the browser helper. Production notarized
+  builds cannot skip the existing GUI startup probes.
+* Regression tests cover malformed and cross-command responses, timeout and
+  Chromium error paths, untrusted manifest targets, browser-local allowlists,
+  localized fixed-ID discovery, targeted installation, log bounds, desktop
+  no-false-success behavior, and the actual packaged protocol.
+
 ## [v0.3.14] — 2026-08-30
 
 This patch supersedes the immutable `v0.3.13` tag. Its locked pre-release gate

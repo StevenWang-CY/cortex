@@ -130,9 +130,11 @@ uv run --project cortex --locked python -m cortex.scripts.install_native_host
 
 Load `cortex/apps/browser_extension/build/chrome-mv3-prod/` or the Edge build
 from the browser's extension page. Fully quit and relaunch the browser after
-native-host installation. The installer discovers supported profiles and
-patches the installed host shebang to the absolute locked interpreter; the
-tracked source shebang remains portable.
+native-host installation. In source mode the installer discovers supported
+profiles and patches the copied host's shebang to the absolute locked
+interpreter; the tracked source shebang remains portable. Packaged users should
+instead use Cortex's **Connect Extensions** panel, which registers and probes
+the signed self-contained helper without requiring Python or Terminal.
 
 Build the optional VS Code extension with:
 

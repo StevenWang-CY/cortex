@@ -135,6 +135,10 @@ it is centered. Anchored popovers originate from their trigger.
   redactions, and exact outbound prompt; changing sources burns the preview.
 - **Browser popup:** fast, compact controls; current-site page-context status;
   truthful disconnected and suggestion-only states; no marketing entrance.
+  “Browser found,” native-host protocol, extension-profile detection, daemon
+  reachability, and live WebSocket connection are distinct states. Repair copy
+  names **Connect Extensions**, `Cmd+Shift+G`, and the mandatory `Cmd+Q`
+  restart; it never sends a packaged user to a Python/Terminal command.
 - **Injected overlays:** one coherent 200 ms entrance, in-place content update,
   quick symmetric exit, no replay on a replacement proposal. Blocking
   surfaces use labelled modal semantics, initial focus, Tab containment,

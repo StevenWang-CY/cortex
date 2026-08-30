@@ -195,15 +195,24 @@ npm run package:vsix
 
 ### Native messaging on macOS
 
+Packaged DMG users should open **Cortex → Connect Extensions**, choose Chrome
+or Edge, load the copied unpacked extension folder, then fully quit that
+browser with Cmd+Q and reopen it. The app registers and protocol-verifies its
+signed self-contained native host; no Terminal command or separate Python
+installation is required.
+
+For a source checkout:
+
 ```bash
 uv run --project cortex --locked python -m cortex.scripts.install_native_host
 ```
 
 Fully quit the Chromium browser with Cmd+Q and relaunch it after installing or
-updating the host. The installer patches the tracked portable shebang to the
-active interpreter in the installed copy. The host launches the daemon in the
-foreground through Terminal.app because processes directly spawned by Chrome
-inherit Chrome's camera-permission context.
+updating the host. Development installation copies the tracked portable script
+to Application Support and patches its shebang to the active interpreter. The
+development host launches the daemon in the foreground through Terminal.app
+because processes directly spawned by Chrome inherit Chrome's camera-permission
+context.
 
 Do not use a broad `tccutil reset Camera`; if debugging requires a reset, scope
 it to Cortex's bundle identifier.

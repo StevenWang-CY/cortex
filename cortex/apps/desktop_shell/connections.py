@@ -501,7 +501,12 @@ class ConnectionsPanel(QWidget):
         )
         header.addWidget(title)
         header.addStretch()
-        header.addWidget(self._status_pill("Available" if installed else "Not found", ok=installed))
+        header.addWidget(
+            self._status_pill(
+                "Browser found" if installed else "Not found",
+                ok=installed,
+            )
+        )
         layout.addLayout(header)
 
         desc = QLabel(
@@ -605,25 +610,37 @@ class ConnectionsPanel(QWidget):
     # -- Actions --------------------------------------------------------
 
     def _connect_browser(self, name: str, scheme: str) -> None:
+        app_name = "Google Chrome" if "chrome" in name.lower() else "Microsoft Edge"
         try:
-            from cortex.scripts.install_native_host import install
+            from cortex.scripts.install_native_host import (
+                install,
+                verify_browser_installation,
+            )
 
             app_root = str(canonical_app_path())
-            if not install(project_root=app_root):
+            if not install(
+                project_root=app_root,
+                target_browsers=(app_name,),
+            ):
                 QMessageBox.warning(
                     self,
                     f"Connect {name}",
-                    "Native messaging host installation did not find a Chromium "
-                    "browser profile. Open the browser once, then click Connect again.",
+                    f"Cortex could not register its native messaging host for {name}.",
                 )
                 return
-        except Exception:
+            verification = verify_browser_installation(app_name)
+            if not verification.ok:
+                raise RuntimeError(
+                    verification.error or "native host protocol verification failed"
+                )
+        except Exception as exc:
             logger.exception("Failed to install native messaging host")
             QMessageBox.warning(
                 self,
-                f"Connect {name}",
-                "Failed to install the native messaging host. Check the Cortex log "
-                "and try again.",
+                f"Couldn’t connect {name}",
+                "Cortex could not install and verify the browser bridge. "
+                "No connection was reported as successful.\n\n"
+                f"Details: {str(exc)[:500]}",
             )
             return
 
@@ -641,25 +658,42 @@ class ConnectionsPanel(QWidget):
         if clipboard is not None:
             clipboard.setText(str(ext_path))
 
-        app_name = "Google Chrome" if "chrome" in name.lower() else "Microsoft Edge"
         try:
-            subprocess.Popen(["open", "-a", app_name, scheme])
-        except Exception:
+            opened = subprocess.run(
+                ["/usr/bin/open", "-a", app_name, scheme],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+            if opened.returncode != 0:
+                detail = (opened.stderr or opened.stdout or "unknown error").strip()
+                raise RuntimeError(detail)
+        except Exception as exc:
             logger.exception("Failed to open %s", app_name)
+            QMessageBox.warning(
+                self,
+                f"Open {name}",
+                f"The browser bridge is installed and verified, but Cortex "
+                f"could not open {name}'s extensions page. Open {scheme} "
+                f"manually.\n\nDetails: {str(exc)[:300]}",
+            )
+            return
 
         QMessageBox.information(
             self,
             f"Finish connecting {name}",
-            "The native messaging host is installed and the extension "
-            "path is copied to your clipboard.\n\n"
-            "Loading an unpacked extension is a manual step Cortex cannot "
-            "do for you — follow these steps in the window that just "
-            "opened:\n\n"
+            "The browser bridge passed a real protocol check. The Cortex "
+            "extension folder is copied to your clipboard.\n\n"
+            "Finish these browser-required steps:\n\n"
             "1. Enable Developer Mode (top-right toggle)\n"
             "2. Click 'Load unpacked'\n"
-            "3. Paste the path (Cmd+V) and choose the folder\n"
-            "4. Pin the Cortex extension\n\n"
-            "When you're done, click 'Verify connection' to confirm.",
+            "3. In the folder picker, press Cmd+Shift+G\n"
+            "4. Paste the copied path, press Return, then click Open\n"
+            "5. Fully quit the browser with Cmd+Q, then reopen it\n"
+            "6. Pin Cortex and open its popup\n\n"
+            "The full quit is required after native-host registration. "
+            "When the popup is open, click 'Verify connection' here.",
         )
 
     def _verify_browser_connection(self, name: str) -> None:
@@ -669,30 +703,41 @@ class ConnectionsPanel(QWidget):
         extension to connect to. Loading the unpacked extension is a
         manual step the shell cannot observe directly, so we never claim
         the extension is 'connected' — we report each verifiable piece."""
-        manifest_ok = self._native_host_manifest_installed(name)
+        from cortex.scripts.install_native_host import verify_browser_installation
+
+        app_name = "Google Chrome" if "chrome" in name.lower() else "Microsoft Edge"
+        verification = verify_browser_installation(app_name)
+        host_ok = verification.ok
+        extension_found = bool(verification.extension_ids)
         daemon_ok = self._daemon_reachable()
 
-        if manifest_ok and daemon_ok:
+        if host_ok and extension_found and daemon_ok:
             QMessageBox.information(
                 self,
                 f"Verify {name}",
-                "Native messaging host: installed ✓\n"
+                "Browser bridge: protocol verified ✓\n"
+                "Cortex extension: found in browser profile ✓\n"
                 "Cortex daemon: running ✓\n\n"
-                "Both prerequisites are in place. If the Cortex extension "
-                "is loaded and pinned, it will connect automatically. The "
-                "extension popup shows the live connection status.",
+                "All locally verifiable connection layers are ready. The "
+                "extension popup is the final authority for live WebSocket status.",
             )
             return
 
         lines = [
-            f"Native messaging host: {'installed ✓' if manifest_ok else 'NOT installed ✗'}",
+            f"Browser bridge: {'protocol verified ✓' if host_ok else 'FAILED ✗'}",
+            f"Cortex extension: {'found in browser profile ✓' if extension_found else 'not detected ✗'}",
             f"Cortex daemon: {'running ✓' if daemon_ok else 'not reachable ✗'}",
             "",
         ]
-        if not manifest_ok:
+        if not host_ok:
             lines.append(
-                "Click 'Connect' to (re)install the native messaging host, "
-                "then fully quit and relaunch the browser."
+                "Click Connect to repair the browser bridge. "
+                f"Details: {verification.error or 'verification failed'}"
+            )
+        if not extension_found:
+            lines.append(
+                "Load the copied extension folder, then fully quit with Cmd+Q "
+                "and reopen the browser."
             )
         if not daemon_ok:
             lines.append(
@@ -702,26 +747,20 @@ class ConnectionsPanel(QWidget):
         QMessageBox.warning(self, f"Verify {name}", "\n".join(lines))
 
     def _native_host_manifest_installed(self, name: str) -> bool:
-        """Return True iff the Cortex native-messaging manifest exists in
-        the browser's NativeMessagingHosts directory for this user.
+        """Compatibility wrapper for the strong native-host verification.
 
-        Host name + profile roots mirror
-        ``cortex.scripts.install_native_host`` exactly so a successful
-        install is reflected here."""
-        host_name = "com.cortex.launcher"
-        support = Path.home() / "Library" / "Application Support"
-        if "edge" in name.lower():
-            roots = [support / "Microsoft Edge"]
-        else:
-            roots = [
-                support / "Google" / "Chrome",
-                support / "Chromium",
-            ]
-        for root in roots:
-            manifest = root / "NativeMessagingHosts" / f"{host_name}.json"
-            if manifest.exists():
-                return True
-        return False
+        The historical method name is retained for callers/tests, but a file's
+        mere existence no longer counts as installed. The exact manifest target
+        must complete a framed protocol round-trip.
+        """
+
+        from cortex.scripts.install_native_host import verify_browser_installation
+
+        browser = "Microsoft Edge" if "edge" in name.lower() else "Google Chrome"
+        try:
+            return verify_browser_installation(browser).ok
+        except (OSError, RuntimeError, ValueError):
+            return False
 
     def _daemon_reachable(self, *, host: str = "127.0.0.1", port: int = 9473) -> bool:
         """Best-effort TCP reachability probe for the daemon WebSocket

@@ -64,7 +64,9 @@ The complete target design, migration order, and definition of done are in
 - WebSocket connections must authenticate before identifying or exchanging
   application messages.
 - Native messaging uses a generated request/response union and the canonical
-  `auth_token` response field.
+  `auth_token` response field. Packaged manifests point only to the signed
+  self-contained helper, carry browser-local exact origins, and are accepted
+  only after a real framed status exchange.
 - LLM output is untrusted data. Schema validation is necessary but does not
   confer execution authority.
 - Client messages are untrusted and must be schema-, authorization-, replay-,
@@ -156,8 +158,10 @@ Camera and shutdown behavior are part of the architecture:
 - macOS discovery fails closed rather than blind-probing indices, and every
   configured or automatic handle must pass live post-warm-up identity checks;
 - warm-up reads are retried;
-- browser native messaging launches the foreground daemon through Terminal.app
-  to obtain the correct TCC lineage;
+- packaged browser native messaging uses a self-contained signed helper that
+  opens `/Applications/Cortex.app`, preserving the GUI bundle's TCC identity;
+  source-development hosts launch the foreground daemon through Terminal.app
+  to obtain a development-safe camera lineage;
 - shutdown releases camera resources and uses multiple bounded termination
   mechanisms;
 - ad-hoc application signing does not enable hardened runtime.

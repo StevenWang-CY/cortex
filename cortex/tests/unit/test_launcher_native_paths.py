@@ -3,23 +3,15 @@ from __future__ import annotations
 import os
 from types import SimpleNamespace
 
+import pytest
+
 from cortex.scripts import install_native_host, launcher_agent, native_host
 
 
-def test_find_python_prefers_system_for_app_bundle(monkeypatch):
+def test_find_python_rejects_external_runtime_for_app_bundle(monkeypatch):
     monkeypatch.delenv("CORTEX_NATIVE_HOST_PYTHON", raising=False)
-
-    def fake_isfile(path: str) -> bool:
-        return path == "/usr/bin/python3"
-
-    def fake_access(path: str, _mode: int) -> bool:
-        return path == "/usr/bin/python3"
-
-    monkeypatch.setattr(install_native_host.os.path, "isfile", fake_isfile)
-    monkeypatch.setattr(install_native_host.os, "access", fake_access)
-    monkeypatch.setattr(install_native_host.shutil, "which", lambda _name: None)
-
-    assert install_native_host._find_python(project_root="/Applications/Cortex.app") == "/usr/bin/python3"
+    with pytest.raises(RuntimeError, match="CortexNativeHost"):
+        install_native_host._find_python(project_root="/Applications/Cortex.app")
 
 
 def test_find_python_prefers_dev_venv(monkeypatch):

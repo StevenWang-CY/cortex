@@ -19,9 +19,9 @@ const STEPS = [
         // no terminal command required. Onboarding copy was stuck on the
         // dev-mode instructions which confused first-run users on the DMG
         // install path.
-        title: "Launch the Cortex desktop app",
-        body: "Launch the Cortex desktop app — the daemon starts automatically. The extension will connect on its own as soon as the app is running.",
-        hint: "Don't have the desktop app yet? Install Cortex.dmg from your download or grab it from cortex.so.",
+        title: "Connect the Cortex desktop app",
+        body: "Open Cortex from Applications. If this browser still shows as unavailable, open Connect Extensions in Cortex, choose Chrome or Edge, and follow every setup step. Fully quit the browser with Cmd+Q before reopening it.",
+        hint: "The desktop app installs and verifies the signed browser bridge. No Terminal command or separate Python installation is required.",
     },
     {
         title: "Permissions explained",

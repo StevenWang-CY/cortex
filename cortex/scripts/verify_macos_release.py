@@ -11,6 +11,7 @@ import platform
 import plistlib
 import re
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -471,6 +472,76 @@ def _headless_camera_activity_markers(diagnostics: str) -> list[str]:
     ]
 
 
+def _probe_native_host_executable(
+    executable: Path,
+    *,
+    base_env: dict[str, str],
+    timeout_seconds: float = 12.0,
+) -> dict[str, Any]:
+    """Execute the bundled browser bridge and validate one framed response.
+
+    This is the exact stdio boundary Chrome and Edge use. The ``status`` command
+    is hardware-free and never launches Cortex, so it is safe in release CI and
+    catches missing imports/dynamic libraries that a file-existence check misses.
+    """
+
+    request = json.dumps({"command": "status"}, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    framed_request = struct.pack("<I", len(request)) + request
+    with tempfile.TemporaryDirectory(prefix="cortex-native-host-probe-") as raw_home:
+        env = dict(base_env)
+        env["HOME"] = raw_home
+        completed = subprocess.run(
+            [
+                str(executable),
+                "chrome-extension://khbaagicippibonmgcnhpbagjloilknd/",
+            ],
+            input=framed_request,
+            capture_output=True,
+            timeout=timeout_seconds,
+            env=env,
+            check=False,
+        )
+    stderr = completed.stderr.decode("utf-8", errors="replace")[-4000:]
+    if completed.returncode != 0:
+        raise ReleaseVerificationError(
+            "bundled native host returned non-zero "
+            f"({completed.returncode}): {stderr}"
+        )
+    if len(completed.stdout) < 4:
+        raise ReleaseVerificationError(
+            f"bundled native host returned no framed response: {stderr}"
+        )
+    response_length = struct.unpack("<I", completed.stdout[:4])[0]
+    response_body = completed.stdout[4:]
+    if response_length != len(response_body):
+        raise ReleaseVerificationError(
+            "bundled native host frame length mismatch "
+            f"({response_length} != {len(response_body)})"
+        )
+    try:
+        response = json.loads(response_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseVerificationError(
+            "bundled native host returned invalid JSON"
+        ) from exc
+    if not isinstance(response, dict) or response.get("command") != "status":
+        raise ReleaseVerificationError(
+            f"bundled native host returned the wrong command: {response!r}"
+        )
+    if response.get("status") not in {"running", "stopped"}:
+        raise ReleaseVerificationError(
+            f"bundled native host returned invalid status: {response!r}"
+        )
+    return {
+        "command": [str(executable), "<extension-origin>"],
+        "returncode": completed.returncode,
+        "response": response,
+        "stderr": stderr,
+    }
+
+
 def _probe_frozen_startup(
     executable: Path,
     *,
@@ -648,12 +719,17 @@ def verify(
     *,
     expected_arch: str,
     require_notarized: bool,
+    skip_app_probes: bool = False,
 ) -> dict[str, Any]:
     if platform.system() != "Darwin":
         raise ReleaseVerificationError("macOS artifact verification requires Darwin")
     artifact = artifact.resolve()
     if not artifact.is_file() or artifact.suffix.lower() != ".dmg":
         raise ReleaseVerificationError(f"DMG is missing: {artifact}")
+    if require_notarized and skip_app_probes:
+        raise ReleaseVerificationError(
+            "notarized release verification cannot skip app executable probes"
+        )
     expected_name = f"Cortex-{__version__}-macos-{expected_arch}.dmg"
     if artifact.name != expected_name:
         raise ReleaseVerificationError(
@@ -696,7 +772,12 @@ def verify(
         app = mount / "Cortex.app"
         plist_path = app / "Contents/Info.plist"
         executable = app / "Contents/MacOS/Cortex"
-        if not plist_path.is_file() or not executable.is_file():
+        native_host_executable = app / "Contents/MacOS/CortexNativeHost"
+        if (
+            not plist_path.is_file()
+            or not executable.is_file()
+            or not native_host_executable.is_file()
+        ):
             raise ReleaseVerificationError("DMG does not contain a valid Cortex.app")
         evidence["installer_layout"] = _verify_installer_layout(mount)
         with plist_path.open("rb") as handle:
@@ -724,6 +805,36 @@ def verify(
             raise ReleaseVerificationError(
                 f"expected only architecture {expected_arch}, got {architectures}"
             )
+        native_arch_result = _run(["lipo", "-archs", str(native_host_executable)])
+        commands.append(native_arch_result)
+        native_architectures = native_arch_result["stdout"].strip().split()
+        if native_architectures != [expected_arch]:
+            raise ReleaseVerificationError(
+                "expected native host architecture "
+                f"{expected_arch}, got {native_architectures}"
+            )
+        native_entitlements = _run(
+            ["codesign", "-d", "--entitlements", "-", str(native_host_executable)]
+        )
+        commands.append(native_entitlements)
+        native_entitlement_text = (
+            native_entitlements["stdout"] + native_entitlements["stderr"]
+        )
+        forbidden_native_entitlements = {
+            "com.apple.security.device.camera",
+            "com.apple.security.device.audio-input",
+            "com.apple.security.automation.apple-events",
+        }
+        leaked_entitlements = sorted(
+            entitlement
+            for entitlement in forbidden_native_entitlements
+            if entitlement in native_entitlement_text
+        )
+        if leaked_entitlements:
+            raise ReleaseVerificationError(
+                "native host must not carry GUI hardware entitlements: "
+                + ", ".join(leaked_entitlements)
+            )
         signature_command, signature_timeout = _mounted_app_signature_verification(app)
         commands.append(_run(signature_command, timeout=signature_timeout))
         commands.append(_run(["codesign", "-dv", "--verbose=4", str(app)]))
@@ -742,18 +853,28 @@ def verify(
             "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
         }
         commands.append(
-            _run(
-                [str(executable), "--release-smoke"],
-                timeout=45.0,
-                env=smoke_env,
-            )
-        )
-        commands.append(
-            _probe_frozen_startup(
-                executable,
+            _probe_native_host_executable(
+                native_host_executable,
                 base_env=smoke_env,
             )
         )
+        if skip_app_probes:
+            evidence["app_executable_probes"] = "skipped_by_explicit_local_request"
+        else:
+            commands.append(
+                _run(
+                    [str(executable), "--release-smoke"],
+                    timeout=45.0,
+                    env=smoke_env,
+                )
+            )
+            commands.append(
+                _probe_frozen_startup(
+                    executable,
+                    base_env=smoke_env,
+                )
+            )
+            evidence["app_executable_probes"] = "passed"
     finally:
         detach_error: ReleaseVerificationError | None = None
         # A failed attach can still leave a partially mounted image. Inspect
@@ -785,6 +906,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("artifact", type=Path)
     parser.add_argument("--expected-arch", choices=("arm64", "x86_64"), default=platform.machine())
     parser.add_argument("--require-notarized", action="store_true")
+    parser.add_argument(
+        "--skip-app-probes",
+        action="store_true",
+        help="local hardware-isolation mode; forbidden for notarized releases",
+    )
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
@@ -796,6 +922,7 @@ def main() -> int:
             args.artifact,
             expected_arch=args.expected_arch,
             require_notarized=args.require_notarized,
+            skip_app_probes=args.skip_app_probes,
         )
     except (OSError, ReleaseVerificationError, subprocess.SubprocessError) as exc:
         print(f"release verification FAILED: {exc}", file=sys.stderr)

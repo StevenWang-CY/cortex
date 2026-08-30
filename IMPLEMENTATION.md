@@ -1,7 +1,7 @@
 # Cortex: Rigorous Algorithm, Architecture, and Implementation Plan
 
 **Status:** release-relevant software implementation complete through the
-v0.3.14 DMG-creation resilience correction; credentialed dual-architecture
+v0.3.15 Chrome/Edge native-bridge correction; credentialed dual-architecture
 release-candidate, reference-sensor,
 participant, and independent-review gates remain external
 
@@ -133,6 +133,152 @@ penetration test, independent statistical review, or public release was
 fabricated. The repository makes those gates executable and evidence-bearing;
 the parties with the required hardware, data authority, or independence must
 execute them against the exact staged candidate artifacts.
+
+### 0.2 v0.3.15 browser-bridge incident and corrective architecture
+
+The v0.3.14 installed-artifact exercise found a false-positive connection
+state that source-mode tests did not expose. Read-only inspection established
+all of the following facts on the affected Mac:
+
+- Chrome and Edge both had `com.cortex.launcher.json` manifests;
+- both manifests pointed to a copied
+  `~/Library/Application Support/Cortex/NativeMessaging/native_host.py`;
+- that copy had an absolute Homebrew Python shebang, but the interpreter did
+  not contain the `cortex` package when Chromium launched it from the native
+  host directory;
+- each invocation failed at the `cortex.libs.schemas.native_messaging` import
+  with `ModuleNotFoundError`;
+- recurring browser probes grew the legacy debug log to 61,290,497 bytes; and
+- the v0.3.14 application bundle contained no native-host executable.
+
+The old installer imported the copied script while its process still had the
+repository working directory on `sys.path`. That probe tested the installer's
+environment rather than Chromium's execution boundary and therefore certified
+a host that failed from the browser. Changing the shebang to a bundled
+framework interpreter would still leave import/resource discovery coupled to
+PyInstaller internals and would not make the host a supported standalone
+program.
+
+The implemented release path is now:
+
+```text
+Chrome or Edge extension
+  -> chrome.runtime.sendNativeMessage("com.cortex.launcher", request)
+  -> browser-specific user manifest
+  -> /Applications/Cortex.app/Contents/MacOS/CortexNativeHost
+  -> 4-byte little-endian length + schema-validated JSON
+  -> status | launch | stop | get_auth_token | raise_dashboard
+  -> strict, matching, schema-decoded response
+```
+
+`CortexNativeHost` is a second console-capable PyInstaller entry point inside
+the same signed application. It preserves stdin/stdout, carries its Python
+module archive, resolves shared app frameworks through the bundle, and needs no
+machine-global Python. The main GUI remains the bundle's `CFBundleExecutable`;
+the helper is an explicitly signed nested executable without camera/input
+entitlements. Packaged launch opens the installed Cortex application, so the
+GUI retains its own TCC identity. Only source-development mode retains the
+Terminal foreground launch required for a development daemon's camera lineage.
+
+The `cortex.libs.schemas` and `cortex.libs.config` package façades now resolve
+their established public exports lazily, with `.pyi` stubs preserving the
+static type surface. Directly importing the native-message schema and port
+constants previously initialized the complete schema and settings graphs in
+every short-lived browser host. The optimized source import fell from roughly
+2.6 seconds to 0.17 seconds and no longer loads unrelated API, intervention,
+NumPy, or Matplotlib modules. A subprocess regression test enforces that
+boundary while compatibility tests exercise the prior package-level imports.
+
+#### Installation and verification invariants
+
+One desktop Connect action performs this fail-closed sequence:
+
+1. Map the pressed card to exactly `Google Chrome` or `Microsoft Edge`.
+2. Resolve the canonical installed application, never a translocated runtime
+   path or external interpreter.
+3. Require the helper to exist, be executable, and answer a real framed
+   hardware-free `status` request.
+4. Scan every browser `Default`/`Profile *` preference file defensively. Keep
+   only syntactically valid extension IDs, always include the deterministic
+   release ID, and retain recognized legacy unpacked IDs for that browser.
+5. Write one browser-local manifest through tempfile, flush, `fsync`, mode
+   `0644`, and atomic replace.
+6. Read the installed manifest back. Require the exact host name, `stdio`, an
+   absolute trusted host path, no missing or extra allowed origins, executable
+   permission, and a second framed response from the exact registered target.
+7. Only then copy the packaged extension directory and open that browser's
+   extensions page. Browser-required unpacked loading remains manual.
+8. Require a full `Cmd+Q` quit/reopen because Chromium caches native-host
+   registrations across ordinary window/tab closure.
+
+Verification never executes an arbitrary absolute path read from a modified
+manifest. Without an explicit expected path supplied by the installer, only
+the canonical signed packaged helper and the known development-host copy are
+eligible. Chrome IDs never widen Edge's allowlist and Edge IDs never widen
+Chrome's.
+
+#### Client and UI state model
+
+The extension has one `sendNativeHostMessage` adapter. It reads
+`runtime.lastError` synchronously inside Chromium's callback, decodes the
+generated response union at runtime, rejects native errors and cross-command
+responses, and applies operation-specific budgets (5 seconds for diagnostics,
+8 seconds for ordinary calls, 15 seconds for shutdown, and 30 seconds for
+application launch). A native process that hangs can no longer hold a popup or
+MV3 worker action indefinitely.
+
+The desktop and popup no longer collapse discovery, installation, protocol,
+daemon, and live WebSocket state into one green label:
+
+| Before | After | Why |
+| --- | --- | --- |
+| Browser executable shown as `Available` | Browser card says `Browser found` | Discovery is not connection proof |
+| Manifest file existence counted as installed | Exact manifest plus executable protocol round trip | Prevents the v0.3.14 false success |
+| One Connect action could succeed because another browser existed | Each action targets and verifies only its named browser | Keeps cause and repair local |
+| Generic “check logs” failure | Bounded failing-layer detail beside the action | Gives an actionable retry without exposing secrets |
+| Folder-paste instruction omitted Finder navigation | `Cmd+Shift+G`, paste, Return, Open | Matches the actual macOS picker interaction |
+| Browser reload treated as sufficient | Mandatory full `Cmd+Q` and reopen | Matches Chromium host-registration caching |
+| Desktop inferred live extension connectivity | Bridge, profile extension, daemon, and popup authority are distinct | Reports only observable state |
+
+Native-host logging is outside the sealed app at
+`~/Library/Logs/Cortex/native-host.log`, owner-only, with a 512 KiB active
+limit and two backups. Logging failures never write to stdout or corrupt native
+framing. The obsolete v0.3.14 log is not used by the new manifest and therefore
+stops growing after repair.
+
+#### Release evidence and limits
+
+The PyInstaller spec and release verifier treat the helper as a first-class
+artifact. Both architectures must contain it, match the GUI architecture,
+pass nested signature verification, mount from the final DMG, and answer a
+framed request from an isolated home and minimal GUI-style `PATH`. The final
+helper signature is also required to omit camera, audio-input, and Apple-events
+entitlements. The status probe checks only loopback port state and never
+launches Cortex or enumerates a camera. Notarized production builds are
+forbidden from skipping the existing GUI release-smoke and frozen-startup
+probes.
+
+The final local v0.3.15 ARM64 development candidate passed DMG integrity,
+mounted bundle layout, deep ad-hoc signature verification, helper architecture,
+and the framed helper probe. Twenty isolated packaged-helper starts under a
+fresh home and minimal GUI-style `PATH` produced a 0.114-second median and a
+2.974-second first/cold maximum, below both the five-second diagnostic and
+eight-second installation budgets. The packaged helper also returned a valid
+owner-only 64-hex capability token from an isolated home and a structured
+error for an invalid command. Temporary Chrome and Edge profiles both passed
+installation and read-back verification with distinct per-browser origins.
+The canonical Python gate also passed Ruff, strict mypy across 525 source
+files, wheel inspection, and 2,723 tests with three intentional skips.
+This is strong software-boundary evidence, not a substitute for the
+signed/notarized dual-architecture and real-profile manual release records.
+
+Chromium does not permit a desktop app to silently install a public consumer
+extension outside supported store/enterprise mechanisms. Until Cortex has
+Chrome Web Store and Edge Add-ons listings, `Load unpacked` and Developer Mode
+are explicit browser-owned steps. The release gate therefore still requires
+real Chrome and Edge profile exercises against the exact staged DMGs and an
+independent reviewer; no automated result or source checkout is represented as
+that external evidence.
 
 ## 1. Executive determination
 

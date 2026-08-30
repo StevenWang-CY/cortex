@@ -530,6 +530,7 @@ function TrendsMiniStrip(): React.ReactElement {
 function CortexPopup(): React.ReactElement {
     const [connected, setConnected] = useState(false);
     const [nativeHostStatus, setNativeHostStatus] = useState<"present" | "missing" | "unknown">("unknown");
+    const [nativeHostError, setNativeHostError] = useState<string | null>(null);
     const [daemonVersion, setDaemonVersion] = useState<string | null>(null);
     const [handshakeError, setHandshakeError] = useState<string | null>(null);
     // F21 (Phase-4 audit / §3.15): BYOK cost indicator — hidden when
@@ -1007,7 +1008,7 @@ function CortexPopup(): React.ReactElement {
                 setLaunching(false);
                 setLaunchError(true);
                 const errorMsg = resp?.error || "Could not reach daemon";
-                setLaunchStatus(`Start failed: ${errorMsg}. Run in terminal: python -m cortex.scripts.run_dev`);
+                setLaunchStatus(`Start failed: ${errorMsg}. Open Cortex from Applications, then retry.`);
                 setTimeout(() => { setLaunchError(false); setLaunchStatus(""); }, 30000);
             }
         });
@@ -1368,6 +1369,10 @@ function CortexPopup(): React.ReactElement {
                 if (d.native_host_status === "present" || d.native_host_status === "missing") {
                     setNativeHostStatus(d.native_host_status as "present" | "missing");
                 }
+                if (typeof d.native_host_error === "string") {
+                    setNativeHostError(d.native_host_error.slice(0, 240));
+                }
+                if (d.native_host_error === null) setNativeHostError(null);
                 if (typeof d.daemon_version === "string") setDaemonVersion(d.daemon_version);
                 if (d.daemon_version === null) setDaemonVersion(null);
                 if (typeof d.handshake_error === "string") setHandshakeError(d.handshake_error);
@@ -1741,6 +1746,7 @@ function CortexPopup(): React.ReactElement {
         expectedVersion: EXPECTED_VERSION,
         daemonVersion,
         handshakeError,
+        nativeHostError,
     });
     const handleConnectivityAction = (): void => {
         if (connectivityView.action === "install") {
