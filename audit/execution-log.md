@@ -259,3 +259,20 @@ toolchain):
 The local signed (Developer ID, not notarized) arm64 build, the on-device
 exercise, and the CI release evidence are appended below as they complete.
 
+The local signed (not notarized) arm64 build passed the packaged verifier after
+one correction: the first attempt was rejected by the frozen-startup probe
+because the newly adopted button recipes put the CSS system font stack into Qt
+stylesheets, which Qt cannot resolve. The Qt token output now emits
+`.AppleSystemUIFont` and a regression test forbids the web aliases.
+
+Tag `v0.4.0` at `96cfd21e6155cc5da707a22bf7182d43f4ecd4b0` completed all four
+release jobs: the locked CI gate, both notarized DMG builders, and the draft
+stage. The arm64 artifact was downloaded, checksum- and attestation-verified,
+installed, and exercised on an Apple-silicon MacBook Pro (macOS 15.6); the
+seven catalogued cases that can be exercised unattended passed and the other
+seven were recorded `not_run` with reasons. `validate_release_records` accepted
+the record at the `self-attested` tier and the publish workflow promoted the
+draft, so v0.4.0 is the public *Latest* release with an Assurance section that
+names the tier, the CI-only Intel artifact, and the absence of an independent
+reviewer.
+

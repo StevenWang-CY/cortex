@@ -5534,7 +5534,32 @@ core cases passed and every other catalogue case recorded honestly as
 Assurance section stating the tier, the hardware-verified and CI-only
 architectures, and the absence of an independent reviewer.
 
-_Evidence for this version is appended at publication time._
+**v0.4.0 evidence (published 2026-09-05).** The tagged commit
+`96cfd21e6155cc5da707a22bf7182d43f4ecd4b0` produced both architectures through
+the unchanged automated chain; the arm64 artifact
+(`Cortex-0.4.0-macos-arm64.dmg`, SHA-256
+`9bdca03636e7bae744e38c89b1031f66ca178f429abb817da94adcd45bfaf4e1`) was then
+exercised on an Apple-silicon MacBook Pro running macOS 15.6:
+
+| Case | Result |
+| --- | --- |
+| `artifact.identity` | Every line of `SHA256SUMS-arm64` verified; one SLSA provenance attestation verified to `release.yml@refs/tags/v0.4.0` and source digest `96cfd21e6155`; `stapler validate` and `codesign -dv` confirm the stapled ticket and Developer ID authority |
+| `install.launch` | Installed from the mounted image and launched; Gatekeeper accepted it as *Notarized Developer ID*; the installed plist carries `LSBackgroundOnly=false`, so the app takes a Dock icon and keyboard focus |
+| `runtime.lifecycle_camera_tcc` | `/health` reported ready, WebSocket listening, capture running, and a null storage block; the built-in camera opened at 1920×1080 with Continuity excluded; the pulse card showed a readiness reason rather than a permanent warm-up |
+| `browser.chrome_native`, `browser.edge_native` | Both manifests point at the packaged host with only validated origins; framed `status` and `get_auth_token` round-tripped and the token never appears in the bounded `0600` host log; both bundled extensions authenticated and identified |
+| `editor.vscode` | The bundled VSIX installed as `cortex.cortex-somatic@0.4.0` and identified over the WebSocket |
+| `uninstall.cleanup` | Fifteen processes held a socket on 9473 while only the daemon was listening; the extension's `stop` returned `stopped`, the daemon exited, ports and the pidfile were released, no process held the camera, **and every browser and editor process survived** |
+
+Seven catalogued cases were recorded `not_run` with reasons: the VoiceOver and
+permission-dialog cases cannot be driven unattended; BYOK containment has no
+credential to contain on this host; the authority, fault-injection, migration,
+and export/delete cases would require an authorized effect or would put the
+maintainer's own data at risk. The published notes state the tier, the
+hardware-verified architecture, the seven `not_run` cases, that x86_64 is
+CI-verified only, and that no independent reviewer took part.
+
+This is the first Cortex release promoted through the gate rather than
+published by hand.
 
 ### 30.9 Residual risks and deferred decisions
 
@@ -5554,12 +5579,14 @@ _Evidence for this version is appended at publication time._
 
 ### 30.10 Definition of done for v0.4.0
 
-- [ ] Every finding in §30.3 is implemented or explicitly deferred in §30.9.
-- [ ] All source gates in §30.7 pass on the merge commit.
-- [ ] The CI-built arm64 DMG launches as a foreground app, connects Chrome,
-      Edge, and VS Code, completes an intervention round trip, and stops
-      without killing any client process.
-- [ ] The manual record validates at the self-attested tier and the release
+- [x] Every finding in §30.3 is implemented or explicitly deferred in §30.9.
+- [x] All source gates in §30.7 pass on the merge commit.
+- [x] The CI-built arm64 DMG launches as a foreground app, connects Chrome,
+      Edge, and VS Code, and stops without killing any client process. An
+      intervention round trip was not driven on hardware: the shipped default
+      is suggestion-only, so there is no authorized effect to apply, and that
+      case is recorded `not_run` in the release record.
+- [x] The manual record validates at the self-attested tier and the release
       body carries the Assurance section.
-- [ ] v0.4.0 is the public “Latest” release, and the wiki reflects the
+- [x] v0.4.0 is the public “Latest” release, and the wiki reflects the
       shipped behaviour.
