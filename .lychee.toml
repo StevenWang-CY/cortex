@@ -13,6 +13,13 @@ exclude = [
   # excluded, and it is re-checked whenever this list is reviewed.
   "^https://docs\\.opencv\\.org",
   "^https?://(127\\.0\\.0\\.1|localhost)",
+  # Pages under wiki/ link to each other by bare page name ("](Setup)"),
+  # which is the only form the published GitHub wiki resolves. lychee cannot
+  # apply the ".md" fallback for those file targets, so it is excluded here
+  # and the same links are verified in this job by
+  # ``verify_repository_contracts.check_local_markdown_links``, which does
+  # resolve "wiki/Setup" to "wiki/Setup.md".
+  "^file:.*/wiki/[^/.]+$",
   "^https://github\\.com/StevenWang-CY/cortex/security/advisories/new$"
 ]
 exclude_path = [
